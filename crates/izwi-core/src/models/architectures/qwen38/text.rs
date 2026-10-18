@@ -1315,7 +1315,10 @@ impl Qwen38TextModel {
             layers,
             output_norm,
             output,
-            finite_diagnostics_enabled: qwen38_env_bool("IZWI_QWEN38_FINITE_DIAGNOSTICS", false),
+            finite_diagnostics_enabled: crate::env::flag_or(
+                "IZWI_QWEN38_FINITE_DIAGNOSTICS",
+                false,
+            ),
             fused_norm_path: Qwen38FastPath::default(),
             decode_graphs: None,
             decode_graphs_path: Qwen38FastPath::default(),
@@ -5969,18 +5972,6 @@ fn repeat_interleave_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tenso
         .map_err(Error::from)
 }
 
-fn qwen38_env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
 fn qwen38_decode_epilogues_policy(is_cuda: bool, requested: bool) -> bool {
     is_cuda && requested
 }
@@ -5994,18 +5985,15 @@ fn qwen38_deltanet_decode_policy(is_cuda: bool, requested: bool) -> bool {
 }
 
 fn qwen38_tiled_recurrence_enabled() -> bool {
-    qwen38_env_bool("IZWI_QWEN38_TILED_RECURRENCE", true)
+    crate::env::flag_or("IZWI_QWEN38_TILED_RECURRENCE", true)
 }
 
 fn qwen38_rope_kernel_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN38_ROPE_KERNEL")
-        .ok()
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        });
-    qwen38_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+    qwen38_rope_kernel_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        crate::env::flag("IZWI_QWEN38_ROPE_KERNEL"),
+    )
 }
 
 fn qwen38_rope_kernel_policy(
@@ -6191,7 +6179,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn owned_recurrent_states_do_not_alias_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "owned_recurrent_states_do_not_alias_on_metal",
+        ) else {
             return;
         };
         let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)
@@ -6747,8 +6737,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn mrope_plan_keeps_long_position_angles_in_f32_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; qwen38 mrope metal leg not run");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "mrope_plan_keeps_long_position_angles_in_f32_on_metal",
+        ) else {
             return;
         };
         assert_mrope_plan_rounds_only_cos_sin(&device, &[(DType::F32, 1e-5), (DType::F16, 1e-3)]);

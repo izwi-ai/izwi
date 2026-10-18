@@ -15,7 +15,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
 use izwi_core::{
@@ -517,7 +517,11 @@ pub async fn download_model(
     }
 
     // Spawn non-blocking download
-    state.runtime.spawn_download(variant).await?;
+    state
+        .runtime
+        .spawn_download(variant)
+        .await
+        .map_err(core_api_error)?;
 
     Ok(Json(DownloadResponse {
         status: "started",
@@ -533,7 +537,11 @@ pub async fn load_model(
     let variant = parse_variant(&variant)?;
     info!("Loading model: {}", variant);
 
-    state.runtime.load_model(variant).await?;
+    state
+        .runtime
+        .load_model(variant)
+        .await
+        .map_err(core_api_error)?;
 
     Ok(Json(DownloadResponse {
         status: "loaded",
@@ -579,7 +587,8 @@ pub async fn delete_model(
             .runtime
             .model_manager()
             .delete_removed_model(removed)
-            .await?
+            .await
+            .map_err(core_api_error)?
         {
             return Err(ApiError::not_found(format!(
                 "Removed model {} has no download to delete",
@@ -601,7 +610,12 @@ pub async fn delete_model(
     unload_after_audio_job_cancellation(&state, variant, cancelled_jobs).await?;
 
     // Delete the model files
-    state.runtime.model_manager().delete_model(variant).await?;
+    state
+        .runtime
+        .model_manager()
+        .delete_model(variant)
+        .await
+        .map_err(core_api_error)?;
 
     Ok(Json(DownloadResponse {
         status: "deleted",
@@ -621,14 +635,14 @@ async fn unload_after_audio_job_cancellation(
     loop {
         match state.runtime.unload_model(variant).await {
             Ok(()) => return Ok(()),
-            Err(izwi_core::Error::InferenceError(message))
+            Err(err)
                 if cancelled_jobs > 0
-                    && message.contains("active inference lease")
+                    && err.kind() == izwi_core::ErrorKind::ModelBusy
                     && Instant::now() < deadline =>
             {
                 tokio::time::sleep(CANCEL_SETTLE_POLL).await;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(core_api_error(err)),
         }
     }
 }

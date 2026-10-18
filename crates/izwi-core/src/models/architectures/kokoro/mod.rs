@@ -462,7 +462,9 @@ fn validate_kokoro_output_contract(config: &KokoroConfig) -> Result<()> {
 }
 
 fn kokoro_profile_enabled() -> bool {
-    std::env::var_os("IZWI_KOKORO_PROFILE").is_some()
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_PROFILE", false));
+    ENABLED.get()
 }
 
 fn log_kokoro_profile(stage: &str, dur: Duration) {
@@ -475,13 +477,9 @@ fn log_kokoro_profile(stage: &str, dur: Duration) {
 }
 
 fn kokoro_cpu_predecoder_parallel_enabled() -> bool {
-    match std::env::var("IZWI_KOKORO_CPU_PREDECODER") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "serial" | "sequential"
-        ),
-        Err(_) => true,
-    }
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_CPU_PREDECODER", true));
+    ENABLED.get()
 }
 
 #[derive(Debug, Clone)]
@@ -1765,6 +1763,10 @@ mod tests {
             return;
         };
 
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "kokoro_local_generate_metal_smoke_if_env_set",
+        );
         let Ok(device) = DeviceSelector::detect_with_preference(Some("metal")) else {
             return;
         };

@@ -565,18 +565,6 @@ pub(crate) struct NemotronRealtimeBatchRow<'a> {
     pub(crate) input: NemotronRealtimeBatchInput<'a>,
 }
 
-#[derive(Clone)]
-pub(crate) struct NemotronRealtimePreparedChunk {
-    encoded: Tensor,
-    pub(crate) frames: usize,
-    pub(crate) is_final: bool,
-}
-
-pub(crate) struct NemotronRealtimeDecodeBatchRow<'a> {
-    pub(crate) state: &'a mut NemotronStreamingState,
-    pub(crate) chunk: &'a NemotronRealtimePreparedChunk,
-}
-
 #[derive(Clone, Debug, Default)]
 struct NemotronStreamingResampler {
     source_rate: Option<u32>,
@@ -1117,20 +1105,26 @@ fn realtime_max_samples_for_seconds(sample_rate: u32, seconds: usize) -> Result<
 }
 
 fn configured_realtime_max_samples(sample_rate: u32) -> Result<usize> {
-    let seconds = match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
-        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
-            Error::ConfigError(format!(
-                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
-            ))
-        })?,
-        Err(std::env::VarError::NotPresent) => DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(Error::ConfigError(format!(
-                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
-            )));
-        }
-    };
+    // Read once, so every stream's reservation and the retained-state
+    // contract agree on the limit.
+    static SECONDS: crate::env::ReadOnce<std::result::Result<usize, String>> =
+        crate::env::ReadOnce::new(configured_realtime_max_seconds);
+    let seconds = SECONDS.get().map_err(Error::ConfigError)?;
     realtime_max_samples_for_seconds(sample_rate, seconds)
+}
+
+fn configured_realtime_max_seconds() -> std::result::Result<usize, String> {
+    match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
+        )),
+    }
 }
 
 fn state_dtype(dtype: DType) -> Result<StateDType> {
@@ -2332,169 +2326,6 @@ impl NemotronAsrModel {
             input: NemotronRealtimeBatchInput::Finish,
         }])
         .map(|mut rows| rows.pop().unwrap_or_default())
-    }
-
-    pub(crate) fn prepare_realtime_input(
-        &self,
-        state: &mut NemotronStreamingState,
-        input: NemotronRealtimeBatchInput<'_>,
-    ) -> Result<Vec<NemotronRealtimePreparedChunk>> {
-        let checkpoint = state.clone();
-        let result = self.prepare_realtime_input_inner(state, input);
-        if result.is_err() {
-            *state = checkpoint;
-        }
-        result
-    }
-
-    fn prepare_realtime_input_inner(
-        &self,
-        state: &mut NemotronStreamingState,
-        input: NemotronRealtimeBatchInput<'_>,
-    ) -> Result<Vec<NemotronRealtimePreparedChunk>> {
-        match input {
-            NemotronRealtimeBatchInput::Push {
-                samples,
-                sample_rate,
-            } => {
-                if state.input_finished {
-                    return Err(Error::InvalidInput(
-                        "Cannot push audio into a finalized Nemotron streaming state".into(),
-                    ));
-                }
-                let (next_resampler, samples) = state.resampler.resample_chunk(
-                    samples,
-                    sample_rate,
-                    state.sample_rate,
-                    state.max_samples,
-                )?;
-                state.push_samples(&samples)?;
-                state.resampler = next_resampler;
-            }
-            NemotronRealtimeBatchInput::Finish => {
-                let (next_resampler, tail) = state.resampler.finish()?;
-                if !tail.is_empty() {
-                    state.push_samples(&tail)?;
-                }
-                state.resampler = next_resampler;
-                state.finish_input();
-            }
-        }
-
-        let mut prepared = Vec::new();
-        while let Some(chunk) = state.next_ready_chunk() {
-            state.feed_ready_chunk(&chunk)?;
-            self.drain_streaming_encoder(state, &mut prepared)?;
-        }
-        self.drain_streaming_encoder(state, &mut prepared)?;
-        Ok(prepared)
-    }
-
-    fn drain_streaming_encoder(
-        &self,
-        state: &mut NemotronStreamingState,
-        prepared: &mut Vec<NemotronRealtimePreparedChunk>,
-    ) -> Result<()> {
-        loop {
-            let mut progressed = false;
-            if let Some(feature_chunk) = self
-                .network
-                .compute_streaming_features(&mut state.feature_state)?
-            {
-                state.pre_encode_state.push_features(feature_chunk)?;
-                progressed = true;
-            } else if state.input_finished {
-                state.pre_encode_state.finish_input();
-            }
-            if let Some(pre_encoded) = self
-                .network
-                .pre_encode_streaming_chunk(&mut state.pre_encode_state)?
-            {
-                state.encoder_state.push_pre_encoded(pre_encoded)?;
-                progressed = true;
-            } else if state.input_finished {
-                state.encoder_state.finish_input();
-            }
-            let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
-            if let Some(chunk) = self
-                .network
-                .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
-            {
-                prepared.push(NemotronRealtimePreparedChunk {
-                    encoded: chunk.encoded,
-                    frames: chunk.frames,
-                    is_final: chunk.is_final,
-                });
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn decode_realtime_prepared_batch(
-        &self,
-        rows: &mut [NemotronRealtimeDecodeBatchRow<'_>],
-    ) -> Result<Vec<Vec<NemotronRealtimeStreamEvent>>> {
-        if rows.is_empty() {
-            return Err(Error::InvalidInput(
-                "Nemotron RNNT prepared cohort cannot be empty".into(),
-            ));
-        }
-        let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
-        let result = (|| {
-            let mut event_batches = rows
-                .iter()
-                .map(|row| NemotronRealtimeEventBatch::new(row.state))
-                .collect::<Vec<_>>();
-            let encoded = rows
-                .iter()
-                .map(|row| row.chunk.encoded.clone())
-                .collect::<Vec<_>>();
-            let encoded_refs = encoded.iter().collect::<Vec<_>>();
-            let encoded_lens = rows.iter().map(|row| row.chunk.frames).collect::<Vec<_>>();
-            let mut rnnt_states = rows
-                .iter_mut()
-                .map(|row| {
-                    row.state.rnnt_state.as_mut().ok_or_else(|| {
-                        Error::InferenceError(
-                            "Nemotron prepared cohort row has no RNNT state".into(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.network.decode_rnnt_streaming_cohort(
-                &mut rnnt_states,
-                &encoded_refs,
-                &encoded_lens,
-            )?;
-            drop(rnnt_states);
-            let mut outputs = Vec::with_capacity(rows.len());
-            for (row, mut batch) in rows.iter_mut().zip(event_batches.drain(..)) {
-                let tokens = row
-                    .state
-                    .rnnt_state
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Error::InferenceError("Nemotron prepared row lost RNNT state".into())
-                    })?
-                    .token_ids()
-                    .len();
-                let text = row.state.advance_text(&self.decoder, row.chunk.is_final)?;
-                row.state.emitted_tokens = tokens;
-                batch.record_decoded_text(row.state, text, row.chunk.is_final)?;
-                outputs.push(batch.into_events(row.state));
-            }
-            Ok(outputs)
-        })();
-        if result.is_err() {
-            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
-                *row.state = checkpoint;
-            }
-        }
-        result
     }
 
     pub(crate) fn run_realtime_batch(
@@ -4360,6 +4191,10 @@ mod tests {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "cpu".to_string());
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "nemotron_local_silence_forward_smoke_if_available",
+        );
         let device =
             DeviceSelector::detect_with_preference(Some(&backend)).expect("requested device");
         if backend.eq_ignore_ascii_case("metal") && device.kind != DeviceKind::Metal {

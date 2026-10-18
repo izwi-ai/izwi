@@ -40,7 +40,7 @@ fn trace_variant(name: &str) -> ModelVariant {
 
 /// One arena with room for `sequences` disjoint sequences, plus a physical
 /// cache per sequence. Batched decode requires the rows to share an arena.
-fn trace_caches(
+pub(super) fn trace_caches(
     config: &Qwen35TextConfig,
     device: &DeviceProfile,
     sequences: u32,
@@ -146,6 +146,8 @@ fn qwen35_local_decode_trace() {
     let model_dir = std::path::PathBuf::from(home)
         .join("Library/Application Support/izwi/models")
         .join(&name);
+    #[cfg(feature = "metal")]
+    let _lease = crate::backends::metal_test_device_or_skip("qwen35_local_decode_trace");
     let device = DeviceSelector::detect_for_preference(BackendPreference::Metal)
         .ok()
         .filter(|profile| profile.kind != crate::backends::DeviceKind::Cpu)
@@ -273,4 +275,227 @@ fn qwen35_local_decode_trace() {
         "trace written to {out}: tokens {tokens:?}, batch diff {batch_max_diff}, \
          median decode {median_decode_ms:.2} ms"
     );
+}
+
+const WIDTH_ROWS: usize = 8;
+const WIDTH_STEPS: usize = 32;
+const WIDTH_TIMED_STEPS: usize = 48;
+/// Solo steps whose top-2 margin is below this are near ties that a
+/// different op shape may legitimately flip.
+const WIDTH_NEAR_TIE: f32 = 0.5;
+
+/// Decode parity and throughput across tensor batch widths over a real
+/// Qwen3.5 checkpoint (`IZWI_QWEN35_TRACE_MODEL`, default `Qwen3.5-0.8B`),
+/// for the certified widths in `catalog::batch_width`.
+///
+/// Parity: eight prompts decode greedily one row at a time (width 1), then
+/// together at widths 2, 4 and 8, teacher-forced with the solo tokens. Every
+/// decisive step must pick the solo token, and the solo top-16 logits may
+/// move by at most `max_logit_delta`. Throughput: widths 1, 2, 4 and 8
+/// decode greedily side by side, one step of each width in turn (an
+/// interleaved A/B, so machine load hits every width alike), each step ending
+/// in the one argmax readback serving makes.
+fn width_leg(device: DeviceProfile, max_logit_delta: f32) {
+    let name =
+        std::env::var("IZWI_QWEN35_TRACE_MODEL").unwrap_or_else(|_| "Qwen3.5-0.8B".to_string());
+    let home = std::env::var("HOME").expect("HOME");
+    let model_dir = std::path::PathBuf::from(home)
+        .join("Library/Application Support/izwi/models")
+        .join(&name);
+    if !model_dir.exists() {
+        eprintln!("skipping: {} is missing", model_dir.display());
+        return;
+    }
+    let model = Qwen35ChatModel::load(&model_dir, trace_variant(&name), device.clone())
+        .expect("load checkpoint");
+    let text = &model.exec.text_model;
+    let vocab = model.exec.tokenizer.vocab_size;
+    let backend = format!("{:?}", device.kind);
+    let topics = [
+        "why the sky is blue",
+        "how bread rises",
+        "what a prime number is",
+        "how tides work",
+        "why leaves change colour",
+        "how a bicycle stays upright",
+        "what makes ice float",
+        "how bees make honey",
+    ];
+    let prompts: Vec<Vec<u32>> = topics
+        .iter()
+        .map(|topic| {
+            model
+                .prompt_token_ids(&[ChatMessage {
+                    role: ChatRole::User,
+                    content: format!("Explain {topic} in three sentences."),
+                }])
+                .expect("prompt ids")
+        })
+        .collect();
+    let argmax = |values: &[f32]| top_logits(values, vocab)[0].0;
+    // Prefill `rows` (indices into `prompts`) into fresh caches; returns the
+    // states, caches and each row's first token.
+    let start = |rows: &[usize]| {
+        let mut caches = trace_caches(model.text_config(), &device, rows.len() as u32);
+        let mut states = Vec::with_capacity(rows.len());
+        let mut first = Vec::with_capacity(rows.len());
+        for (cache, &index) in caches.iter_mut().zip(rows) {
+            let prompt = &prompts[index];
+            let mut state = text.new_state();
+            let logits = text
+                .prefill_token_ids_physical(
+                    prompt,
+                    &build_text_positions(prompt.len()),
+                    &mut state,
+                    cache,
+                    true,
+                )
+                .expect("prefill")
+                .expect("prefill logits");
+            first.push(argmax(&logits_row(&logits)));
+            states.push(state);
+        }
+        (states, caches, first)
+    };
+    let step = |rows: &[usize],
+                states: &mut [Qwen35TextRuntimeState],
+                caches: &mut [PhysicalPagedKvCache],
+                tokens: &[u32],
+                position: &[usize]| {
+        let positions: Vec<[usize; 3]> = rows
+            .iter()
+            .zip(position)
+            .map(|(&index, offset)| [prompts[index].len() + offset; 3])
+            .collect();
+        let mut state_refs = states.iter_mut().collect::<Vec<_>>();
+        let mut cache_refs = caches.iter_mut().collect::<Vec<_>>();
+        text.forward_token_ids_batch_at_physical(
+            tokens,
+            &positions,
+            &mut state_refs,
+            &mut cache_refs,
+        )
+        .expect("batch decode")
+    };
+
+    // Width 1: each row alone, greedy.
+    let mut solo: Vec<Vec<(u32, f32, Vec<(u32, f32)>)>> = Vec::with_capacity(WIDTH_ROWS);
+    for index in 0..WIDTH_ROWS {
+        let (mut states, mut caches, first) = start(&[index]);
+        let mut token = first[0];
+        let mut steps = Vec::with_capacity(WIDTH_STEPS);
+        for offset in 0..WIDTH_STEPS {
+            let logits = step(&[index], &mut states, &mut caches, &[token], &[offset]);
+            let top = top_logits(&logits_row(&logits.i((0, 0)).expect("row")), vocab);
+            token = top[0].0;
+            steps.push((token, top[0].1 - top[1].1, top));
+        }
+        solo.push(steps);
+    }
+    for width in [2usize, 4, 8] {
+        let (mut decisive, mut worst) = (0usize, 0f32);
+        for group in (0..WIDTH_ROWS).collect::<Vec<_>>().chunks(width) {
+            let (mut states, mut caches, mut tokens) = start(group);
+            for offset in 0..WIDTH_STEPS {
+                let logits = step(
+                    group,
+                    &mut states,
+                    &mut caches,
+                    &tokens,
+                    &vec![offset; width],
+                );
+                for (slot, &index) in group.iter().enumerate() {
+                    let values = logits_row(&logits.i((slot, 0)).expect("row"));
+                    let (next, margin, top) = &solo[index][offset];
+                    for (id, expected) in top {
+                        let diff = (values[*id as usize] - expected).abs();
+                        worst = if diff.is_nan() {
+                            f32::INFINITY
+                        } else {
+                            worst.max(diff)
+                        };
+                    }
+                    if *margin >= WIDTH_NEAR_TIE {
+                        decisive += 1;
+                        assert_eq!(
+                            argmax(&values),
+                            *next,
+                            "{backend} width {width}: row {index} step {offset} left the solo \
+                             token (margin {margin:.3})"
+                        );
+                    }
+                    tokens[slot] = *next;
+                }
+            }
+        }
+        eprintln!(
+            "{name} {backend} width {width}: {decisive} decisive steps agree with width 1, \
+             worst top-16 logit delta {worst:.4}"
+        );
+        assert!(
+            worst <= max_logit_delta,
+            "{backend} width {width}: top-16 logit delta {worst} exceeds {max_logit_delta}"
+        );
+    }
+
+    // Throughput, interleaved across widths.
+    let widths = [1usize, 2, 4, 8];
+    let mut groups: Vec<_> = widths
+        .iter()
+        .map(|&width| {
+            let rows: Vec<usize> = (0..width).collect();
+            let (states, caches, tokens) = start(&rows);
+            (rows, states, caches, tokens)
+        })
+        .collect();
+    let mut elapsed = [std::time::Duration::ZERO; 4];
+    for offset in 0..WIDTH_TIMED_STEPS + 8 {
+        for ((rows, states, caches, tokens), time) in groups.iter_mut().zip(&mut elapsed) {
+            let started = std::time::Instant::now();
+            let logits = step(rows, states, caches, tokens, &vec![offset; rows.len()]);
+            let next = logits
+                .squeeze(1)
+                .and_then(|rows| rows.narrow(1, 0, vocab))
+                .and_then(|rows| rows.argmax(D::Minus1))
+                .and_then(|ids| ids.to_dtype(DType::U32))
+                .and_then(|ids| ids.to_vec1::<u32>())
+                .expect("argmax readback");
+            if offset >= 8 {
+                *time += started.elapsed();
+            }
+            tokens.copy_from_slice(&next);
+        }
+    }
+    for (width, time) in widths.iter().zip(elapsed) {
+        let ms = time.as_secs_f64() * 1000.0 / WIDTH_TIMED_STEPS as f64;
+        eprintln!(
+            "{name} {backend} width {width}: {ms:.2} ms/step, {:.1} tok/s",
+            *width as f64 * 1000.0 / ms
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a local Qwen3.5 checkpoint"]
+fn qwen35_decode_width_parity_and_throughput_cpu() {
+    // Measured on aarch64 (0.8B): widths 2, 4 and 8 equal width 1 exactly.
+    width_leg(DeviceProfile::cpu(), 0.05);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs a local Qwen3.5 checkpoint"]
+fn qwen35_decode_width_parity_and_throughput_metal() {
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "qwen35_decode_width_parity_and_throughput_metal",
+    );
+    let device =
+        DeviceSelector::detect_for_preference(BackendPreference::Metal).expect("metal device");
+    if device.kind == crate::backends::DeviceKind::Cpu {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    // Measured on an M1 Pro (0.8B and 2B): widths 2, 4 and 8 equal width 1
+    // exactly.
+    width_leg(device, 0.05);
 }

@@ -25,7 +25,6 @@ use crate::{
     },
 };
 
-const DEFAULT_MEDIA_DECODE_LANES: usize = 2;
 const DEFAULT_MAX_AUDIO_DURATION_SECS: f32 = 60.0 * 60.0;
 const DEFAULT_MAX_DECODED_SAMPLES: usize = 57_600_000;
 const DEFAULT_MAX_SOURCE_CHANNELS: u16 = 8;
@@ -906,11 +905,7 @@ fn canonical_storage_metadata(route: &str, profile: CanonicalAudioProfile) -> Ho
 }
 
 fn resolve_media_decode_lane_capacity() -> usize {
-    std::env::var("IZWI_MEDIA_DECODE_LANES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MEDIA_DECODE_LANES)
+    crate::env_config::tuning().media_decode_lanes
 }
 
 fn value_matches_rules(value: &str, rules: &[String]) -> bool {

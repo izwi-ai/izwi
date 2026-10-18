@@ -426,7 +426,7 @@ impl ModelManager {
     /// Unload a model from memory
     pub async fn unload_model(&self, variant: ModelVariant) -> Result<()> {
         if self.residency.has_active_leases(variant) {
-            return Err(Error::InferenceError(format!(
+            return Err(Error::ModelBusy(format!(
                 "Cannot unload model {variant}: active inference leases are still held"
             )));
         }
@@ -873,6 +873,7 @@ mod tests {
             .await
             .expect_err("active lease should block unload");
         assert!(err.to_string().contains("active inference lease"));
+        assert_eq!(err.kind(), crate::error::ErrorKind::ModelBusy);
 
         drop(lease);
         manager

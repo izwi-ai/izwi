@@ -10,6 +10,8 @@ pub const MAX_CHAT_MESSAGES: usize = 256;
 pub const MAX_CHAT_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_STOP_SEQUENCES: usize = 16;
 pub const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
+/// The most function tools one chat request may declare.
+pub const MAX_CHAT_TOOLS: usize = 128;
 pub const MAX_CALLER_REGIONS: usize = 32;
 pub const MAX_REMAINING_TIME_MS: u64 = 86_400_000; // 24 hours
 
@@ -35,6 +37,30 @@ impl SchemaVersion {
     pub const fn shares_major_with(self, peer: Self) -> bool {
         self.major == peer.major
     }
+
+    /// The version two peers use: this major, at the lower of this minor and
+    /// the highest minor the peer lists for it. `None` when the peer lists
+    /// no version of this major.
+    pub fn negotiate(self, peer_supported: &[Self]) -> Option<Self> {
+        peer_supported
+            .iter()
+            .filter(|version| version.major == self.major)
+            .map(|version| version.minor)
+            .max()
+            .map(|minor| Self::new(self.major, minor.min(self.minor)))
+    }
+
+    /// Parses the `major.minor` form of [`PROTOCOL_VERSION_HEADER`](crate::PROTOCOL_VERSION_HEADER).
+    pub fn parse(value: &str) -> Option<Self> {
+        let (major, minor) = value.trim().split_once('.')?;
+        Some(Self::new(major.parse().ok()?, minor.parse().ok()?))
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
 }
 
 impl Default for SchemaVersion {
@@ -49,6 +75,9 @@ pub enum BackendKind {
     Cpu,
     Metal,
     Cuda,
+    /// A backend from a newer protocol minor; no backend policy allows it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Explicit process resource assignment. The supervisor, not a request, selects this value.
@@ -72,6 +101,10 @@ pub enum DeviceAssignment {
         device_memory_limit_bytes: u64,
         host_memory_limit_bytes: u64,
     },
+    /// An assignment from a newer protocol minor; its backend is
+    /// [`BackendKind::Unknown`].
+    #[serde(other)]
+    Unknown,
 }
 
 impl DeviceAssignment {
@@ -80,6 +113,7 @@ impl DeviceAssignment {
             Self::Cpu { .. } => BackendKind::Cpu,
             Self::Metal { .. } => BackendKind::Metal,
             Self::Cuda { .. } => BackendKind::Cuda,
+            Self::Unknown => BackendKind::Unknown,
         }
     }
 }
@@ -90,6 +124,9 @@ pub enum TaskKind {
     Chat,
     TextToSpeech,
     SpeechToText,
+    /// A task from a newer protocol minor; it matches no typed input.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -109,6 +146,9 @@ pub enum InputFormat {
     ArtifactReference,
     /// Bounded plain text input (realtime TTS-stream stage, protocol minor 2).
     Text,
+    /// A format from a newer protocol minor.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -118,6 +158,9 @@ pub enum OutputFormat {
     Json,
     PcmAudio,
     EncodedAudio,
+    /// A format from a newer protocol minor.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -126,6 +169,9 @@ pub enum CancellationBehavior {
     Cooperative,
     TeardownRequired,
     NotSupported,
+    /// A contract from a newer protocol minor; it satisfies no requirement.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +195,9 @@ pub enum ModelReadiness {
     Ready,
     Draining,
     Failed,
+    /// A state from a newer protocol minor; not ready.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One model deployment loaded on a worker.
@@ -204,6 +253,57 @@ pub enum WorkerFeature {
     /// Worker serves realtime sessions on `GET /internal/v1/realtime` via the
     /// `izwi-realtime-v1` WebSocket subprotocol (protocol minor 2).
     RealtimeSocket,
+    /// Minor 4: honours `ChatParameters::seed`.
+    ChatSeed,
+    /// Minor 4: ends chat generation at `ChatParameters::stop` strings.
+    ChatStopSequences,
+    /// Minor 4: honours `ChatParameters::top_k`.
+    ChatTopK,
+    /// Minor 4: honours `ChatParameters::repetition_penalty` and
+    /// `presence_penalty`.
+    ChatPenalties,
+    /// Minor 4: reports per-token logprobs for `ChatParameters::logprobs`.
+    ChatLogprobs,
+    /// Minor 4: constrains output to one JSON value for
+    /// `ChatParameters::response_format`.
+    ChatJsonObject,
+    /// Minor 4: applies `ChatParameters::context` (the caller's own output
+    /// budget and truncation choice) exactly as the local server does.
+    ChatContextPolicy,
+    /// Minor 4: renders `ChatParameters::tools` into the prompt with the
+    /// model family's tool-calling template.
+    ChatTools,
+    /// Minor 4 (additive): honours `ChatParameters::skip_special_tokens`.
+    ChatSkipSpecialTokens,
+    /// Minor 4 (additive): a TTS realtime session honours the text-stream
+    /// admission's `speaker`, `language` and `incremental` fields.
+    RealtimeTtsTextStream,
+    /// A feature from a newer protocol minor; it satisfies no requirement.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkerFeature {
+    /// The protocol minor that added this feature. A worker advertises a
+    /// feature only to peers of that minor or later, because older peers
+    /// reject variants they do not know.
+    pub const fn introduced_in_minor(self) -> u16 {
+        match self {
+            Self::Streaming | Self::Cancellation | Self::AttemptQuery => 0,
+            Self::RealtimeSocket => 2,
+            Self::ChatSeed
+            | Self::ChatStopSequences
+            | Self::ChatTopK
+            | Self::ChatPenalties
+            | Self::ChatLogprobs
+            | Self::ChatJsonObject
+            | Self::ChatContextPolicy
+            | Self::ChatTools
+            | Self::ChatSkipSpecialTokens
+            | Self::RealtimeTtsTextStream => 4,
+            Self::Unknown => u16::MAX,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +318,24 @@ pub struct WorkerDescriptor {
     pub features: BTreeSet<WorkerFeature>,
 }
 
+impl WorkerDescriptor {
+    /// This descriptor as a peer speaking `peer` can decode it: features
+    /// added after the peer's minor are left out.
+    pub fn for_peer(&self, peer: SchemaVersion) -> Self {
+        let mut descriptor = self.clone();
+        descriptor
+            .features
+            .retain(|feature| feature.introduced_in_minor() <= peer.minor);
+        descriptor
+    }
+
+    /// The protocol version to use with this worker; see
+    /// [`SchemaVersion::negotiate`].
+    pub fn negotiated_version(&self) -> Option<SchemaVersion> {
+        PROTOCOL_V1.negotiate(&self.supported_protocol_versions)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerProcessState {
@@ -226,6 +344,9 @@ pub enum WorkerProcessState {
     Draining,
     Stopped,
     Failed,
+    /// A state from a newer protocol minor; not running.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,13 +421,155 @@ pub struct ChatInput {
     pub messages: Vec<ChatMessage>,
 }
 
+/// Chat sampling and output controls.
+///
+/// An absent sampling value means the model's own default: its family's
+/// published profile, else the engine default, exactly as on the local
+/// server. A gateway sends a minor-4 field only to a worker advertising the
+/// field's [`WorkerFeature`] (see [`ChatParameters::required_features`]);
+/// absent minor-4 fields encode exactly as minor 3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChatParameters {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// `WorkerFeature::ChatSeed` (workers before minor 4 reject any
+    /// non-zero seed).
     pub seed: Option<u64>,
+    /// `WorkerFeature::ChatStopSequences`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
+    /// Minor 4, `WorkerFeature::ChatTopK`: top-k cutoff; 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Minor 4, `WorkerFeature::ChatPenalties`: 1.0 to 2.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// Minor 4, `WorkerFeature::ChatPenalties`: -2.0 to 2.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Minor 4, `WorkerFeature::ChatLogprobs`: report each sampled token's
+    /// logprob with this many most likely alternatives (0 to
+    /// [`MAX_TOP_LOGPROBS`]) on its `TextDelta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<u8>,
+    /// Minor 4, `WorkerFeature::ChatJsonObject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ChatResponseFormat>,
+    /// Minor 4, `WorkerFeature::ChatContextPolicy`. Absent keeps the minor-3
+    /// behaviour: `output_limits.max_tokens` is the budget, and a request
+    /// that does not fit drops its oldest turns and shortens the budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ChatContextPolicy>,
+    /// Minor 4, `WorkerFeature::ChatTools`: OpenAI function tool
+    /// definitions for the prompt (at most [`MAX_CHAT_TOOLS`] objects). The
+    /// worker streams the model's tool-call markup as text; the caller
+    /// parses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
+    /// Minor 4, `WorkerFeature::ChatSkipSpecialTokens`: `Some(false)` keeps
+    /// the tokenizer's special tokens in the reply text (vLLM's OpenAI
+    /// extension). Absent skips them, as every worker does by default, so
+    /// only `Some(false)` requires the feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_special_tokens: Option<bool>,
+}
+
+impl ChatParameters {
+    /// The features a worker must advertise to honour these parameters.
+    pub fn required_features(&self) -> BTreeSet<WorkerFeature> {
+        self.knobs()
+            .into_iter()
+            .filter_map(|(set, _, feature)| set.then_some(feature))
+            .collect()
+    }
+
+    /// The OpenAI name of the first parameter set here that a worker
+    /// advertising `features` cannot honour.
+    pub fn first_unsupported(&self, features: &BTreeSet<WorkerFeature>) -> Option<&'static str> {
+        self.knobs()
+            .into_iter()
+            .find(|(set, _, feature)| *set && !features.contains(feature))
+            .map(|(_, name, _)| name)
+    }
+
+    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 10] {
+        [
+            (self.seed.is_some(), "seed", WorkerFeature::ChatSeed),
+            (
+                !self.stop.is_empty(),
+                "stop",
+                WorkerFeature::ChatStopSequences,
+            ),
+            (self.top_k.is_some(), "top_k", WorkerFeature::ChatTopK),
+            (
+                self.repetition_penalty.is_some(),
+                "repetition_penalty",
+                WorkerFeature::ChatPenalties,
+            ),
+            (
+                self.presence_penalty.is_some(),
+                "presence_penalty",
+                WorkerFeature::ChatPenalties,
+            ),
+            (
+                self.logprobs.is_some(),
+                "logprobs",
+                WorkerFeature::ChatLogprobs,
+            ),
+            (
+                self.response_format.is_some(),
+                "response_format",
+                WorkerFeature::ChatJsonObject,
+            ),
+            (
+                self.context.is_some(),
+                "truncation",
+                WorkerFeature::ChatContextPolicy,
+            ),
+            (!self.tools.is_empty(), "tools", WorkerFeature::ChatTools),
+            (
+                self.skip_special_tokens == Some(false),
+                "skip_special_tokens",
+                WorkerFeature::ChatSkipSpecialTokens,
+            ),
+        ]
+    }
+}
+
+/// The most alternatives `ChatParameters::logprobs` may ask for (OpenAI's
+/// `top_logprobs` limit).
+pub const MAX_TOP_LOGPROBS: u8 = 20;
+
+/// Minor 4: a constrained chat output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatResponseFormat {
+    /// One valid JSON value (OpenAI `response_format: json_object`).
+    JsonObject,
+}
+
+/// Minor 4: how a worker fits a chat request into the model's context, the
+/// way the local server does (decision D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatContextPolicy {
+    /// The caller's own output budget, or absent when the caller set none
+    /// (the rest of the context). `output_limits.max_tokens`, the gateway's
+    /// ceiling, still caps generation in both cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    pub truncation: ChatTruncation,
+}
+
+/// Minor 4: what a chat request that does not fit the context does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTruncation {
+    /// Reject it (`RejectionCode::ContextLengthExceeded`) when the prompt,
+    /// or the prompt plus an explicit budget, does not fit.
+    #[default]
+    Disabled,
+    /// Drop the oldest complete turns and shorten the budget to fit.
+    Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,10 +633,18 @@ pub enum ContractValidationError {
     InvalidMessageCount,
     #[error("chat message {index} is empty or exceeds {MAX_CHAT_MESSAGE_BYTES} bytes")]
     InvalidMessageLength { index: usize },
-    #[error("chat parameters contain invalid temperature or top_p")]
+    #[error("chat parameters contain an invalid temperature, top_p or penalty")]
     InvalidSamplingParameter,
+    #[error("chat parameters ask for more than {MAX_TOP_LOGPROBS} top logprobs")]
+    InvalidLogprobs,
+    #[error("chat context policy has a zero output budget")]
+    InvalidContextPolicy,
     #[error("chat parameters contain too many or oversized stop sequences")]
     InvalidStopSequences,
+    #[error(
+        "chat parameters declare more than {MAX_CHAT_TOOLS} tools or a tool that is not an object"
+    )]
+    InvalidTools,
     #[error("output limits must be non-zero")]
     InvalidOutputLimits,
     #[error("remaining execution budget must be non-zero")]
@@ -417,14 +688,27 @@ impl InvocationRequest {
                         return Err(ContractValidationError::InvalidMessageLength { index });
                     }
                 }
-                if parameters
-                    .temperature
-                    .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
-                    || parameters
-                        .top_p
-                        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                let outside = |value: Option<f32>, range: std::ops::RangeInclusive<f32>| {
+                    value.is_some_and(|value| !value.is_finite() || !range.contains(&value))
+                };
+                if outside(parameters.temperature, 0.0..=2.0)
+                    || outside(parameters.top_p, 0.0..=1.0)
+                    || outside(parameters.repetition_penalty, 1.0..=2.0)
+                    || outside(parameters.presence_penalty, -2.0..=2.0)
                 {
                     return Err(ContractValidationError::InvalidSamplingParameter);
+                }
+                if parameters
+                    .logprobs
+                    .is_some_and(|count| count > MAX_TOP_LOGPROBS)
+                {
+                    return Err(ContractValidationError::InvalidLogprobs);
+                }
+                if parameters
+                    .context
+                    .is_some_and(|context| context.max_tokens == Some(0))
+                {
+                    return Err(ContractValidationError::InvalidContextPolicy);
                 }
                 if parameters.stop.len() > MAX_STOP_SEQUENCES
                     || parameters
@@ -433,6 +717,11 @@ impl InvocationRequest {
                         .any(|stop| stop.is_empty() || stop.len() > MAX_STOP_SEQUENCE_BYTES)
                 {
                     return Err(ContractValidationError::InvalidStopSequences);
+                }
+                if parameters.tools.len() > MAX_CHAT_TOOLS
+                    || parameters.tools.iter().any(|tool| !tool.is_object())
+                {
+                    return Err(ContractValidationError::InvalidTools);
                 }
             }
         }
@@ -457,6 +746,25 @@ pub enum RejectionCode {
     InvalidRequest,
     DuplicateAttemptConflict,
     PolicyDenied,
+    /// Minor 4: the prompt, or the prompt plus the requested output budget,
+    /// does not fit the model's context (OpenAI `context_length_exceeded`).
+    /// Sent only to gateways whose invocation declares minor 4 or later;
+    /// older gateways get `InvalidRequest`.
+    ContextLengthExceeded,
+    /// A code from a newer protocol minor: a rejection that is not retried.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RejectionCode {
+    /// This code as a peer speaking `peer` can decode it: a code added after
+    /// the peer's minor becomes the older code that covered it.
+    pub const fn for_peer(self, peer: SchemaVersion) -> Self {
+        match self {
+            Self::ContextLengthExceeded if peer.minor < 4 => Self::InvalidRequest,
+            code => code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +802,19 @@ impl InvocationRejection {
     }
 }
 
+/// Body of a `504` invocation response whose runtime admission did not finish
+/// within the request's queue budget. The worker may still own the attempt,
+/// so this is not a rejection: the caller must not retry it elsewhere and
+/// reconciles it by query or cancel. It reports a busy worker, not an
+/// unreachable one. Workers before this type sent a plain-text `504`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationAdmissionUnknown {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationErrorCode {
@@ -503,6 +824,9 @@ pub enum InvocationErrorCode {
     OutputLimitExceeded,
     WorkerUnavailable,
     Internal,
+    /// A code from a newer protocol minor: an internal failure.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -510,6 +834,9 @@ pub enum InvocationErrorCode {
 pub enum FinishReason {
     Stop,
     Length,
+    /// A reason from a newer protocol minor: a normal end of generation.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Bounded per-invocation token accounting.
@@ -576,6 +903,10 @@ pub enum InvocationEventKind {
     Cancelled {
         reason: Option<String>,
     },
+    /// An event type from a newer protocol minor. It is not terminal, so a
+    /// receiver skips it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl InvocationEventKind {
@@ -614,8 +945,10 @@ pub enum AttemptState {
     Completed,
     Failed,
     Cancelled,
-    Unknown,
     Expired,
+    /// Also every state from a newer protocol minor: it proves nothing.
+    #[serde(other)]
+    Unknown,
 }
 
 impl AttemptState {
@@ -671,8 +1004,11 @@ pub enum CancelDisposition {
     AlreadyRequested,
     Stopped,
     AlreadyTerminal,
-    Unknown,
     Expired,
+    /// Also every disposition from a newer protocol minor: it confirms
+    /// nothing.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CancelDisposition {
@@ -917,11 +1253,43 @@ mod tests {
         ));
     }
 
+    /// DP-F11: what a worker sends decodes even when a newer worker added a
+    /// variant, as `Unknown`, which no selection or retry treats as a known
+    /// value. What a gateway sends stays strict: a gateway only sends what
+    /// the worker negotiated, so an unknown value there is an error.
     #[test]
-    fn unknown_enum_variant_does_not_silently_downgrade() {
-        assert!(serde_json::from_value::<BackendKind>(json!("rocm")).is_err());
-        assert!(serde_json::from_value::<TaskKind>(json!("unknown_task")).is_err());
-        assert!(serde_json::from_value::<RejectionCode>(json!("try_cpu_instead")).is_err());
+    fn worker_sent_enums_tolerate_newer_variants_and_requests_stay_strict() {
+        assert_eq!(
+            serde_json::from_value::<BackendKind>(json!("rocm")).unwrap(),
+            BackendKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<TaskKind>(json!("unknown_task")).unwrap(),
+            TaskKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<RejectionCode>(json!("try_cpu_instead")).unwrap(),
+            RejectionCode::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<AttemptState>(json!("migrating")).unwrap(),
+            AttemptState::Unknown
+        );
+        assert!(!AttemptState::Unknown.proves_execution_stopped());
+        assert_eq!(
+            serde_json::from_value::<CancelDisposition>(json!("deferred")).unwrap(),
+            CancelDisposition::Unknown
+        );
+        assert!(!CancelDisposition::Unknown.confirms_execution_stopped());
+        let assignment: DeviceAssignment =
+            serde_json::from_value(json!({"backend": "rocm", "device": "gfx1100"})).unwrap();
+        assert_eq!(assignment.backend(), BackendKind::Unknown);
+
+        assert!(serde_json::from_value::<ChatRole>(json!("developer")).is_err());
+        assert!(serde_json::from_value::<ServiceClass>(json!("background")).is_err());
+        assert!(serde_json::from_value::<PermittedAction>(json!("invoke_any")).is_err());
+        assert!(serde_json::from_value::<ChatTruncation>(json!("middle")).is_err());
+        assert!(serde_json::from_value::<ChatResponseFormat>(json!("json_schema")).is_err());
     }
 
     #[test]

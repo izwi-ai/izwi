@@ -39,6 +39,7 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::models::architectures::qwen38::cache::{
     CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
 };
+use crate::models::architectures::qwen38::fast_path::counters_lock;
 use crate::models::architectures::qwen38::mtp::tests::{write_fp8_geometry_checkpoint, TestDir};
 use crate::models::architectures::qwen38::native::Qwen38NativeCheckpoint;
 use crate::models::architectures::qwen38::residency::force_cpu_native_fp8_for_tests;
@@ -422,7 +423,9 @@ fn assert_attach_matches_fresh(
     page: usize,
     exact: bool,
 ) {
-    // Other tests change process-wide switches; hold them fixed.
+    // The CPU leg's fused paths count in the process-wide fast-path
+    // counters, and other tests change process-wide switches; hold both.
+    let _counters = counters_lock();
     let _env = env_lock();
     // CUDA samples on the device; the CPU leg runs the device sampler's
     // portable references so its graph quanta pipeline too.
@@ -599,8 +602,9 @@ fn attached_history_matches_the_fresh_run_on_cpu_graph_decode() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_attached_history_matches_the_fresh_run() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
-        eprintln!("metal device unavailable; qwen38 history attach leg not run");
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("metal_attached_history_matches_the_fresh_run")
+    else {
         return;
     };
     assert_attach_matches_fresh(device, Qwen38KvStorageProvider::MetalF16, 8, true);

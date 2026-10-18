@@ -1879,6 +1879,16 @@ mod tests {
         FishS2DacDecoder::load(config, vb).unwrap()
     }
 
+    /// TPIPE-22: the catalog announces Fish's realtime rate before the codec
+    /// loads; it must be the codec's real output rate.
+    #[test]
+    fn catalog_sample_rate_hint_is_the_codec_rate() {
+        assert_eq!(
+            crate::catalog::ModelVariant::FishAudioS2Pro.tts_output_sample_rate_hint(),
+            Some(FishS2DacConfig::current().sample_rate)
+        );
+    }
+
     #[test]
     fn incremental_codec_matches_full_decode_and_rolls_back_cancelled_push() {
         check_incremental_codec_partitions(&Device::Cpu);
@@ -1888,9 +1898,11 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_incremental_codec_matches_full_decode_and_rollback() {
-        check_incremental_codec_partitions(
-            &crate::backends::metal_device_if_available(0).expect("Metal device"),
-        );
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_incremental_codec_matches_full_decode_and_rollback",
+        )
+        .expect("Metal device");
+        check_incremental_codec_partitions(&device);
     }
 
     #[cfg(feature = "cuda")]
@@ -1980,7 +1992,11 @@ mod tests {
     #[test]
     #[ignore = "requires Metal; no CPU fallback"]
     fn metal_batched_codec_matches_scalar_for_mixed_ages_and_rollback() {
-        check_batched_codec(&crate::backends::metal_device_if_available(0).expect("Metal device"));
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_batched_codec_matches_scalar_for_mixed_ages_and_rollback",
+        )
+        .expect("Metal device");
+        check_batched_codec(&device);
     }
 
     fn check_batched_codec(device: &Device) {
@@ -2418,9 +2434,11 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_codec_attention_matches_dense_oracle() {
-        check_blocked_attention(
-            &crate::backends::metal_device_if_available(0).expect("Metal device"),
-        );
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_codec_attention_matches_dense_oracle",
+        )
+        .expect("Metal device");
+        check_blocked_attention(&device);
     }
 
     #[cfg(feature = "cuda")]

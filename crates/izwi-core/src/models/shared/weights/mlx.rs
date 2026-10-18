@@ -652,11 +652,15 @@ mod tests {
         use candle_core::{Device, Module};
 
         let cpu = Device::Cpu;
-        let mut devices = vec![("cpu", cpu.clone())];
-        match crate::backends::metal_device_if_available(0) {
-            Some(metal) => devices.push(("metal", metal)),
-            None => eprintln!("mlx_conv2d_ohwi_kernel_matches_cpu: no Metal device, CPU only"),
-        }
+        // The Metal leg holds the shared device's test lease throughout.
+        #[cfg(feature = "metal")]
+        let metal =
+            crate::backends::metal_test_device_or_skip("mlx_conv2d_ohwi_kernel_matches_cpu");
+        #[cfg(not(feature = "metal"))]
+        let metal: Option<(Device, ())> = None;
+        let devices = std::iter::once(("cpu", cpu.clone()))
+            .chain(metal.as_ref().map(|(metal, _)| ("metal", metal.clone())))
+            .collect::<Vec<_>>();
 
         let conv2d_weights = mlx_conv_weights(480, &[3, 3], 480);
         let conv2d_input = xorshift_tensor(&[2, 480, 32, 25], 7, 1.0, &cpu).unwrap();

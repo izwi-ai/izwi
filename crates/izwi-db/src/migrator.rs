@@ -1,0 +1,1876 @@
+use crate::voice_defaults::{
+    DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
+};
+use crate::{current_timestamp_millis, raw, write_transaction_options};
+use anyhow::Context;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use std::collections::BTreeSet;
+
+pub struct Migrator;
+
+/// A database's schema: the application's, or the fleet coordination
+/// store's claims table. Each has its own numbered migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Schema {
+    App,
+    Fleet,
+}
+
+impl Schema {
+    fn component(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Fleet => "fleet",
+        }
+    }
+
+    /// Every migration, in the order it applies. A schema change is a new
+    /// entry here; an applied migration's statements never change.
+    fn migrations(self) -> &'static [(i64, &'static str)] {
+        match self {
+            // Version 1 is the schema every earlier unversioned release
+            // created. Its statements are idempotent, so a database those
+            // releases left behind upgrades by running it once.
+            Self::App => &[
+                (1, "baseline"),
+                (2, "stage claim columns"),
+                (3, "artifact cleanup quota"),
+                (4, "media reference indexes"),
+                (5, "diarization alignment and node ownership"),
+                (6, "byte-ordered artifact publication keys"),
+            ],
+            Self::Fleet => &[
+                (1, "fleet coordination"),
+                (2, "drop the write-only worker observations"),
+            ],
+        }
+    }
+}
+
+/// Which migrations have been applied, per schema component.
+const SCHEMA_MIGRATIONS_DDL: &str = r#"
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        component TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL,
+        PRIMARY KEY(component, version)
+    );
+"#;
+
+impl Migrator {
+    /// Bring the application schema up to date.
+    pub async fn up(db: &DatabaseConnection) -> anyhow::Result<()> {
+        Self::up_schema(db, Schema::App).await
+    }
+
+    /// Apply `schema`'s pending migrations in one transaction. PostgreSQL
+    /// migrators on several nodes serialize on an advisory lock held to
+    /// commit, and SQLite's immediate transaction holds the writer lock, so
+    /// concurrent boots apply each migration exactly once.
+    pub async fn up_schema(db: &DatabaseConnection, schema: Schema) -> anyhow::Result<()> {
+        let backend = db.get_database_backend();
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start the migration transaction")?;
+        if backend == DbBackend::Postgres {
+            tx.execute_unprepared(
+                "SELECT pg_advisory_xact_lock(hashtextextended('izwi.schema_migrations', 0))",
+            )
+            .await
+            .context("Failed to take the migration lock")?;
+        }
+        tx.execute_unprepared(&dialect_ddl(backend, SCHEMA_MIGRATIONS_DDL))
+            .await?;
+        let applied = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                "SELECT version FROM schema_migrations WHERE component = ?1",
+                vec![schema.component().into()],
+            )?)
+            .await?
+            .iter()
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for &(version, name) in schema.migrations() {
+            if applied.contains(&version) {
+                continue;
+            }
+            apply_migration(&tx, schema, version)
+                .await
+                .with_context(|| {
+                    format!("{} migration {version} ({name}) failed", schema.component())
+                })?;
+            tx.execute_raw(raw::statement(
+                &tx,
+                "INSERT INTO schema_migrations (component, version, name, applied_at) VALUES (?1, ?2, ?3, ?4)",
+                vec![
+                    schema.component().into(),
+                    version.into(),
+                    name.into(),
+                    current_timestamp_millis().into(),
+                ],
+            )?)
+            .await?;
+        }
+        if schema == Schema::App {
+            ensure_default_voice_profile(&tx).await?;
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit the migration transaction")?;
+        Ok(())
+    }
+}
+
+async fn apply_migration<C: ConnectionTrait>(
+    db: &C,
+    schema: Schema,
+    version: i64,
+) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
+    match (schema, version) {
+        (Schema::App, 1) => {
+            let quota_usage_existed = table_has_column(db, "runtime_quota_usage", "used").await?;
+            for statement in BASELINE_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+            for column in COMPATIBILITY_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+            for statement in POST_COMPATIBILITY_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+            if !quota_usage_existed {
+                backfill_quota_usage(db).await?;
+            }
+        }
+        (Schema::App, 2) => {
+            for column in STAGE_CLAIM_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+            for statement in STAGE_CLAIM_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+        }
+        (Schema::App, 3) => {
+            for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
+                db.execute_unprepared(statement).await?;
+            }
+        }
+        (Schema::App, 4) => {
+            for statement in MEDIA_REFERENCE_INDEXES {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+        }
+        (Schema::App, 5) => {
+            for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+        }
+        // SQLite already compares TEXT byte by byte (BINARY).
+        (Schema::App, 6) => {
+            if backend == DbBackend::Postgres {
+                db.execute_unprepared(PUBLICATION_KEY_BYTE_ORDER).await?;
+            }
+        }
+        (Schema::Fleet, 1) => {
+            for statement in FLEET_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+        }
+        // Gateways wrote every polled status here and nothing ever read it.
+        (Schema::Fleet, 2) => {
+            db.execute_unprepared("DROP TABLE IF EXISTS fleet_worker_observations")
+                .await?;
+        }
+        _ => anyhow::bail!("Unknown {} migration {version}", schema.component()),
+    }
+    Ok(())
+}
+
+/// Translate the shared SQLite-flavored DDL into the target backend's
+/// dialect. The schema is deliberately portable (TEXT/INTEGER/REAL, no
+/// stored procedures); only three constructs need translation:
+///
+/// - `INTEGER` holds epoch-milli timestamps and counters, which overflow a
+///   4-byte server INTEGER: promote to BIGINT.
+/// - `REAL` maps to a 4-byte float on PostgreSQL: promote to DOUBLE
+///   PRECISION so f64 values round-trip exactly.
+/// - `COLLATE NOCASE` is a SQLite-only collation. The case-insensitive
+///   uniqueness contract on `saved_voices.name` becomes a LOWER(name)
+///   functional unique index on PostgreSQL; remaining occurrences are
+///   dropped (server default collations are case-sensitive on PostgreSQL).
+pub fn dialect_ddl(backend: DbBackend, sql: &str) -> String {
+    match backend {
+        DbBackend::Sqlite => sql.to_string(),
+        DbBackend::Postgres => {
+            let sql = sql.replace(
+                "ON saved_voices(name COLLATE NOCASE)",
+                "ON saved_voices(LOWER(name))",
+            );
+            let sql = replace_word(&sql, "COLLATE NOCASE", "");
+            let sql = replace_word(&sql, "INTEGER", "BIGINT");
+            replace_word(&sql, "REAL", "DOUBLE PRECISION")
+        }
+        _ => sql.to_string(),
+    }
+}
+
+/// Replace whole-word occurrences of `word` with `replacement`, leaving
+/// identifier substrings (for example `max_words`) and single-quoted SQL
+/// string literals untouched.
+fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
+    let boundary = |byte: Option<&u8>| {
+        byte.is_none_or(|candidate| !candidate.is_ascii_alphanumeric() && *candidate != b'_')
+    };
+    let bytes = haystack.as_bytes();
+    let mut result = String::with_capacity(haystack.len());
+    let mut segment_start = 0;
+    let mut cursor = 0;
+    let mut in_single_quote = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\'' {
+            let is_escaped_quote = in_single_quote && bytes.get(cursor + 1) == Some(&b'\'');
+            in_single_quote = if is_escaped_quote {
+                in_single_quote
+            } else {
+                !in_single_quote
+            };
+            cursor += if is_escaped_quote { 2 } else { 1 };
+            continue;
+        }
+        if in_single_quote || bytes[cursor] >= 0x80 {
+            cursor += 1;
+            continue;
+        }
+        if haystack[cursor..].starts_with(word) {
+            let end = cursor + word.len();
+            let before = if cursor == 0 {
+                None
+            } else {
+                Some(&bytes[cursor - 1])
+            };
+            let after = bytes.get(end);
+            if boundary(before) && boundary(after) {
+                result.push_str(&haystack[segment_start..cursor]);
+                result.push_str(replacement);
+                segment_start = end;
+            }
+            cursor = end;
+            continue;
+        }
+        cursor += 1;
+    }
+    result.push_str(&haystack[segment_start..]);
+    result
+}
+
+struct CompatibilityColumn {
+    table: &'static str,
+    column: &'static str,
+    definition: &'static str,
+}
+
+const BASELINE_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS runtime_admission_locks (id TEXT PRIMARY KEY, lock_value INTEGER NOT NULL DEFAULT 1);",
+    r#"
+    CREATE TABLE IF NOT EXISTS chat_threads (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        model_id TEXT NULL,
+        system_prompt TEXT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
+        content TEXT NOT NULL,
+        content_parts TEXT NULL,
+        created_at INTEGER NOT NULL,
+        tokens_generated INTEGER NULL,
+        generation_time_ms REAL NULL,
+        FOREIGN KEY(thread_id) REFERENCES chat_threads(id) ON DELETE CASCADE
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_chat_threads_updated_at ON chat_threads(updated_at DESC, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created_at ON chat_messages(thread_id, created_at, id);",
+    r#"
+    CREATE TABLE IF NOT EXISTS voice_profiles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        system_prompt TEXT NOT NULL,
+        observational_memory_enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS voice_sessions (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('modular', 'unified')),
+        system_prompt TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        ended_at INTEGER NULL,
+        FOREIGN KEY(profile_id) REFERENCES voice_profiles(id) ON DELETE CASCADE
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS voice_turns (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        utterance_id TEXT NOT NULL,
+        utterance_seq INTEGER NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('modular', 'unified')),
+        status TEXT NOT NULL CHECK(status IN ('processing', 'ok', 'error', 'timeout', 'interrupted', 'no_input')),
+        status_reason TEXT NULL,
+        vad_end_reason TEXT NULL,
+        user_text TEXT NULL,
+        assistant_text TEXT NULL,
+        assistant_raw_text TEXT NULL,
+        language TEXT NULL,
+        audio_duration_secs REAL NULL,
+        asr_model_id TEXT NULL,
+        text_model_id TEXT NULL,
+        tts_model_id TEXT NULL,
+        s2s_model_id TEXT NULL,
+        speaker TEXT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES voice_sessions(id) ON DELETE CASCADE
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_voice_sessions_updated_at ON voice_sessions(updated_at DESC, created_at DESC);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_turns_session_utterance ON voice_turns(session_id, utterance_seq);",
+    "CREATE INDEX IF NOT EXISTS idx_voice_turns_session_created_at ON voice_turns(session_id, created_at ASC, id ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS voice_observations (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        canonical_summary TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source_turn_id TEXT NULL,
+        source_user_text TEXT NULL,
+        source_assistant_text TEXT NULL,
+        times_seen INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        forgotten_at INTEGER NULL,
+        FOREIGN KEY(profile_id) REFERENCES voice_profiles(id) ON DELETE CASCADE
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_voice_observations_profile_updated_at ON voice_observations(profile_id, updated_at DESC, created_at DESC);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_observations_profile_canonical_active ON voice_observations(profile_id, canonical_summary) WHERE forgotten_at IS NULL;",
+    r#"
+    CREATE TABLE IF NOT EXISTS onboarding_state (
+        id TEXT PRIMARY KEY,
+        completed_at INTEGER NULL,
+        analytics_opt_in INTEGER NOT NULL DEFAULT 0
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS transcription_records (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        transcription_mode TEXT NOT NULL DEFAULT 'transcription',
+        model_id TEXT NULL,
+        aligner_model_id TEXT NULL,
+        language TEXT NULL,
+        processing_status TEXT NOT NULL DEFAULT 'ready',
+        processing_error TEXT NULL,
+        processing_progress_json TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
+        duration_secs REAL NULL,
+        processing_time_ms REAL NOT NULL,
+        rtf REAL NULL,
+        audio_mime_type TEXT NOT NULL,
+        audio_filename TEXT NULL,
+        audio_storage_path TEXT NOT NULL,
+        transcription TEXT NOT NULL,
+        segments_json TEXT NOT NULL DEFAULT '[]',
+        words_json TEXT NOT NULL DEFAULT '[]',
+        speaker_attributed_text TEXT NULL,
+        speaker_turns_json TEXT NOT NULL DEFAULT '[]',
+        saa_status TEXT NOT NULL DEFAULT 'not_requested',
+        saa_warnings_json TEXT NOT NULL DEFAULT '[]',
+        summary_status TEXT NOT NULL DEFAULT 'not_requested',
+        summary_model_id TEXT NULL,
+        summary_text TEXT NULL,
+        summary_error TEXT NULL,
+        summary_updated_at INTEGER NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_transcription_records_created_at ON transcription_records(created_at DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS diarization_records (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        model_id TEXT NULL,
+        asr_model_id TEXT NULL,
+        aligner_model_id TEXT NULL,
+        llm_model_id TEXT NULL,
+        processing_status TEXT NOT NULL DEFAULT 'ready',
+        processing_error TEXT NULL,
+        min_speakers INTEGER NULL,
+        max_speakers INTEGER NULL,
+        min_speech_duration_ms REAL NULL,
+        min_silence_duration_ms REAL NULL,
+        enable_llm_refinement INTEGER NOT NULL,
+        processing_time_ms REAL NOT NULL,
+        duration_secs REAL NULL,
+        rtf REAL NULL,
+        speaker_count INTEGER NOT NULL,
+        alignment_coverage REAL NULL,
+        unattributed_words INTEGER NOT NULL,
+        llm_refined INTEGER NOT NULL,
+        asr_text TEXT NOT NULL,
+        raw_transcript TEXT NOT NULL,
+        transcript TEXT NOT NULL,
+        summary_status TEXT NOT NULL DEFAULT 'not_requested',
+        summary_model_id TEXT NULL,
+        summary_text TEXT NULL,
+        summary_error TEXT NULL,
+        summary_updated_at INTEGER NULL,
+        segments_json TEXT NOT NULL,
+        words_json TEXT NOT NULL,
+        utterances_json TEXT NOT NULL,
+        speaker_name_overrides_json TEXT NOT NULL DEFAULT '{}',
+        audio_mime_type TEXT NOT NULL,
+        audio_filename TEXT NULL,
+        audio_storage_path TEXT NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_diarization_records_created_at ON diarization_records(created_at DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS speech_history_records (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        route_kind TEXT NOT NULL,
+        processing_status TEXT NOT NULL DEFAULT 'ready',
+        processing_error TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
+        model_id TEXT NULL,
+        speaker TEXT NULL,
+        language TEXT NULL,
+        saved_voice_id TEXT NULL,
+        speed REAL NULL,
+        input_text TEXT NOT NULL,
+        voice_description TEXT NULL,
+        reference_text TEXT NULL,
+        generation_time_ms REAL NOT NULL,
+        audio_duration_secs REAL NULL,
+        rtf REAL NULL,
+        tokens_generated INTEGER NULL,
+        audio_mime_type TEXT NOT NULL,
+        audio_filename TEXT NULL,
+        audio_storage_path TEXT NOT NULL,
+        audio_media_asset_id TEXT NULL,
+        audio_artifact_tenant TEXT NULL,
+        stop_reason TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_speech_history_route_created_at ON speech_history_records(route_kind, created_at DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS saved_voices (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL COLLATE NOCASE,
+        reference_text TEXT NOT NULL,
+        audio_mime_type TEXT NOT NULL,
+        audio_filename TEXT NULL,
+        audio_storage_path TEXT NOT NULL,
+        source_route_kind TEXT NULL,
+        source_record_id TEXT NULL,
+        permission_scope TEXT NOT NULL DEFAULT 'legacy_local',
+        consent_status TEXT NOT NULL DEFAULT 'granted',
+        allowed_uses_json TEXT NOT NULL DEFAULT '["local_tts","voice_clone_reference"]',
+        permission_provenance TEXT NULL,
+        permission_revoked_at INTEGER NULL
+    );
+    "#,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE);",
+    "CREATE INDEX IF NOT EXISTS idx_saved_voices_updated_at ON saved_voices(updated_at DESC, created_at DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_projects (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        source_filename TEXT NULL,
+        source_text TEXT NOT NULL,
+        model_id TEXT NULL,
+        voice_mode TEXT NOT NULL,
+        speaker TEXT NULL,
+        saved_voice_id TEXT NULL,
+        speed REAL NULL
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_segments (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        model_id TEXT NULL,
+        voice_mode TEXT NULL,
+        speaker TEXT NULL,
+        saved_voice_id TEXT NULL,
+        speech_record_id TEXT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES studio_projects(id) ON DELETE CASCADE
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_folders (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        parent_id TEXT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_meta (
+        project_id TEXT PRIMARY KEY,
+        folder_id TEXT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        default_export_format TEXT NOT NULL DEFAULT 'wav',
+        last_render_job_id TEXT NULL,
+        last_rendered_at INTEGER NULL,
+        FOREIGN KEY(project_id) REFERENCES studio_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(folder_id) REFERENCES studio_project_folders(id) ON DELETE SET NULL
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_pronunciations (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source_text TEXT NOT NULL,
+        replacement_text TEXT NOT NULL,
+        locale TEXT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES studio_projects(id) ON DELETE CASCADE
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_snapshots (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        label TEXT NULL,
+        project_json TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES studio_projects(id) ON DELETE CASCADE
+    );
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS studio_project_render_jobs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT NULL,
+        queued_segment_ids_json TEXT NOT NULL DEFAULT '[]',
+        FOREIGN KEY(project_id) REFERENCES studio_projects(id) ON DELETE CASCADE
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_studio_projects_updated_at ON studio_projects(updated_at DESC, id DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_studio_project_segments_project_position ON studio_project_segments(project_id, position ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_studio_project_folders_parent ON studio_project_folders(parent_id, sort_order ASC, updated_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_studio_project_pronunciations_project ON studio_project_pronunciations(project_id, updated_at DESC, id DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_studio_project_snapshots_project ON studio_project_snapshots(project_id, created_at DESC, id DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_studio_project_render_jobs_project ON studio_project_render_jobs(project_id, created_at DESC, id DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS media_assets (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        asset_kind TEXT NOT NULL,
+        storage_namespace TEXT NOT NULL,
+        storage_key TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        filename TEXT NULL,
+        size_bytes INTEGER NOT NULL,
+        sha256 TEXT NULL,
+        duration_secs REAL NULL,
+        sample_rate_hz INTEGER NULL,
+        channel_count INTEGER NULL,
+        peak_amplitude REAL NULL,
+        rms_amplitude REAL NULL,
+        source_asset_id TEXT NULL,
+        canonical_profile_version TEXT NULL,
+        scan_status TEXT NOT NULL DEFAULT 'not_scanned',
+        retention_policy TEXT NOT NULL DEFAULT 'default',
+        deleted_at INTEGER NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(source_asset_id) REFERENCES media_assets(id) ON DELETE RESTRICT
+    );
+    "#,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON media_assets(storage_key);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_created_at ON media_assets(created_at DESC, id DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS artifact_cleanup_intents (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        storage_key TEXT NOT NULL UNIQUE,
+        tenant_scope TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason = 'artifact_deleted'),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_artifact_cleanup_due ON artifact_cleanup_intents(available_at ASC, created_at ASC, id ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS provider_write_reservations (
+        write_id TEXT PRIMARY KEY,
+        reservation_token TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'stored', 'cleanup_pending', 'cleanup_claimed')),
+        tenant_scope TEXT NOT NULL,
+        storage_namespace TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        filename TEXT NULL,
+        expected_size_bytes INTEGER NOT NULL,
+        expected_sha256 TEXT NOT NULL,
+        provider_request_json TEXT NULL,
+        storage_key TEXT NULL,
+        cleanup_claim_token TEXT NULL,
+        cleanup_claim_expires_at INTEGER NULL,
+        cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_provider_write_cleanup_due ON provider_write_reservations(state, available_at ASC, expires_at ASC, created_at ASC, write_id ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS text_assets (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        raw_text TEXT NOT NULL,
+        normalized_text TEXT NOT NULL,
+        language_hint TEXT NULL,
+        character_count INTEGER NOT NULL,
+        sha256 TEXT NULL,
+        safety_status TEXT NOT NULL DEFAULT 'unchecked',
+        retention_policy TEXT NOT NULL DEFAULT 'default',
+        structure_json TEXT NOT NULL DEFAULT '{}'
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_text_assets_created_at ON text_assets(created_at DESC, id DESC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_jobs (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        queued_at INTEGER NULL,
+        started_at INTEGER NULL,
+        finished_at INTEGER NULL,
+        job_kind TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing', 'completed', 'failed', 'cancelled', 'expired')),
+        priority INTEGER NOT NULL DEFAULT 0,
+        model_id TEXT NULL,
+        capability TEXT NULL,
+        route_record_kind TEXT NULL,
+        route_record_id TEXT NULL,
+        input_media_asset_id TEXT NULL,
+        input_text_asset_id TEXT NULL,
+        request_json TEXT NOT NULL DEFAULT '{}',
+        model_snapshot_json TEXT NOT NULL DEFAULT '{}',
+        progress_json TEXT NULL,
+        error_code TEXT NULL,
+        error_message TEXT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 1,
+        retry_policy_json TEXT NOT NULL DEFAULT '{}',
+        idempotency_key TEXT NULL,
+        correlation_id TEXT NULL,
+        cancellation_reason TEXT NULL,
+        cancellation_state TEXT NULL,
+        FOREIGN KEY(input_media_asset_id) REFERENCES media_assets(id) ON DELETE SET NULL,
+        FOREIGN KEY(input_text_asset_id) REFERENCES text_assets(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status_priority ON runtime_jobs(status, priority DESC, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_route_record ON runtime_jobs(route_record_kind, route_record_id);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_idempotency_key ON runtime_jobs(idempotency_key);",
+    r#"
+    CREATE TABLE IF NOT EXISTS job_stages (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        stage_kind TEXT NOT NULL,
+        queue_class TEXT NOT NULL DEFAULT 'batch',
+        resource_hints_json TEXT NOT NULL DEFAULT '{"version":1}',
+        resource_target TEXT NOT NULL DEFAULT 'any',
+        required_backend TEXT NULL,
+        required_device_class TEXT NULL,
+        min_resource_memory_bytes INTEGER NULL,
+        resource_concurrency_weight INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL CHECK(status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing', 'completed', 'failed', 'cancelled', 'expired', 'skipped')),
+        capability TEXT NULL,
+        model_id TEXT NULL,
+        worker_id TEXT NULL,
+        lease_expires_at INTEGER NULL,
+        available_at INTEGER NULL,
+        attempt_token TEXT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 1,
+        input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+        output_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+        progress_json TEXT NULL,
+        started_at INTEGER NULL,
+        finished_at INTEGER NULL,
+        error_code TEXT NULL,
+        error_message TEXT NULL,
+        cancellation_state TEXT NULL,
+        FOREIGN KEY(job_id) REFERENCES runtime_jobs(id) ON DELETE CASCADE
+    );
+    "#,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_stages_job_sequence ON job_stages(job_id, sequence);",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_status_lease ON job_stages(status, lease_expires_at, sequence);",
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_artifacts (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        stage_id TEXT NULL,
+        producer_attempt_count INTEGER NULL,
+        producer_attempt_token TEXT NULL,
+        publication_key TEXT NULL,
+        created_at INTEGER NOT NULL,
+        artifact_kind TEXT NOT NULL,
+        artifact_role TEXT NOT NULL,
+        media_asset_id TEXT NULL,
+        text_asset_id TEXT NULL,
+        storage_key TEXT NULL,
+        content_type TEXT NULL,
+        filename TEXT NULL,
+        size_bytes INTEGER NULL,
+        sha256 TEXT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        retention_policy TEXT NOT NULL DEFAULT 'default',
+        FOREIGN KEY(job_id) REFERENCES runtime_jobs(id) ON DELETE CASCADE,
+        FOREIGN KEY(stage_id) REFERENCES job_stages(id) ON DELETE SET NULL,
+        FOREIGN KEY(media_asset_id) REFERENCES media_assets(id) ON DELETE SET NULL,
+        FOREIGN KEY(text_asset_id) REFERENCES text_assets(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_job_role ON runtime_artifacts(job_id, artifact_role, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_stage ON runtime_artifacts(stage_id);",
+    r#"
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+        operation TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NULL,
+        request_hash TEXT NOT NULL,
+        response_json TEXT NULL,
+        runtime_job_id TEXT NULL,
+        conflict_message TEXT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY(operation, idempotency_key),
+        FOREIGN KEY(runtime_job_id) REFERENCES runtime_jobs(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_runtime_job ON idempotency_keys(runtime_job_id);",
+    // Version two deliberately uses a new table instead of rewriting the legacy
+    // primary key in place. Existing installations retain their local-only
+    // records while new callers get tenant-scoped reservation semantics.
+    r#"
+    CREATE TABLE IF NOT EXISTS durable_idempotency_keys_v2 (
+        tenant_scope TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        digest_version INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'committed')),
+        reservation_token TEXT NOT NULL,
+        runtime_job_id TEXT NULL,
+        response_json TEXT NULL,
+        PRIMARY KEY(tenant_scope, operation, idempotency_key),
+        FOREIGN KEY(runtime_job_id) REFERENCES runtime_jobs(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_expiry ON durable_idempotency_keys_v2(expires_at ASC, created_at ASC, tenant_scope ASC, operation ASC, idempotency_key ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_runtime_job ON durable_idempotency_keys_v2(runtime_job_id);",
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_worker_heartbeats (
+        worker_id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        last_heartbeat_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        queue_names_json TEXT NOT NULL DEFAULT '[]',
+        instance_id TEXT NOT NULL DEFAULT '',
+        registration_version INTEGER NOT NULL DEFAULT 1,
+        registration_json TEXT NOT NULL DEFAULT '{}',
+        heartbeat_version INTEGER NOT NULL DEFAULT 1,
+        available_slots INTEGER NOT NULL DEFAULT 0,
+        heartbeat_details_json TEXT NOT NULL DEFAULT '{}',
+        current_job_id TEXT NULL,
+        current_stage_id TEXT NULL,
+        diagnostic_json TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(current_job_id) REFERENCES runtime_jobs(id) ON DELETE SET NULL,
+        FOREIGN KEY(current_stage_id) REFERENCES job_stages(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_runtime_worker_heartbeats_last ON runtime_worker_heartbeats(last_heartbeat_at DESC);",
+    // DS0.5 scoped credentials: only salted HMAC digests of gateway API keys
+    // are persisted here; key material lives exclusively in env:/file: refs.
+    r#"
+    CREATE TABLE IF NOT EXISTS gateway_principal_keys (
+        principal_id TEXT PRIMARY KEY,
+        roles_json TEXT NOT NULL,
+        tenant_id TEXT NULL,
+        key_salt TEXT NOT NULL,
+        key_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
+];
+
+const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_claim_ready ON job_stages(status, available_at, lease_expires_at, sequence);",
+    "UPDATE job_stages SET queue_class = CASE WHEN stage_kind IN ('asr_transcribe', 'asr_infer') THEN 'batch_asr' WHEN stage_kind IN ('tts_synthesize', 'tts_generate') THEN 'batch_tts' WHEN stage_kind IN ('diarization', 'diarization_segment') THEN 'diarization' WHEN stage_kind IN ('export', 'encode', 'notify') THEN 'export' WHEN stage_kind IN ('evaluation', 'evaluate') THEN 'evaluation' ELSE queue_class END WHERE queue_class = 'batch';",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_claim_ready ON job_stages(queue_class, status, available_at, lease_expires_at, sequence);",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_speech_history_audio_media_asset ON speech_history_records(audio_media_asset_id);",
+    // Per-tenant and global (`scope = ''`) record counts for bounded tables,
+    // kept by the transactions that insert and delete those records.
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_quota_usage (
+        quota_kind TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(quota_kind, scope)
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_tenant_expiry ON durable_idempotency_keys_v2(tenant_scope, expires_at ASC);",
+    // Bounded scans for retention, replay GC and reconciliation.
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status_updated ON runtime_jobs(status, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_replay_sweep ON runtime_jobs(replay_swept_at, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_job_publication ON runtime_artifacts(job_id, publication_key);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_media_asset ON runtime_artifacts(media_asset_id);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_retention ON media_assets(retention_policy, deleted_at, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_deleted ON media_assets(deleted_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created ON idempotency_keys(created_at ASC);",
+];
+
+/// The fleet coordination store as migration 1 created it: worker
+/// observations (dropped by migration 2) and capacity claims shared by the
+/// gateways of one fleet. Releases before versioned migrations created
+/// these tables in every application database too.
+const FLEET_SCHEMA: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_worker_observations (
+        worker_id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        status_sequence INTEGER NOT NULL,
+        process_state TEXT NOT NULL,
+        available_admission_credits INTEGER NOT NULL,
+        active_invocations INTEGER NOT NULL,
+        deployments_json TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        observer_gateway_id TEXT NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_worker_observations_observed ON fleet_worker_observations(observed_at ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_capacity_claims (
+        claim_id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        gateway_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
+];
+
+/// App migration 2: the claim filters on the stage's resource-hints version
+/// in SQL (every stage written before it is version 1), and a partial index
+/// keeps the claim scan to claimable stages rather than the history.
+const STAGE_CLAIM_COLUMNS: &[CompatibilityColumn] = &[CompatibilityColumn {
+    table: "job_stages",
+    column: "resource_hints_version",
+    definition: "INTEGER NOT NULL DEFAULT 1",
+}];
+
+const STAGE_CLAIM_SCHEMA: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_claimable ON job_stages(queue_class, available_at) WHERE status IN ('queued', 'retrying');",
+];
+
+/// Seed quota usage from the records that exist when the usage table is
+/// first created. Later changes are counted in the record transactions.
+const QUOTA_USAGE_BACKFILL: &[&str] = &[
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'durable_idempotency', tenant_scope, COUNT(*) FROM durable_idempotency_keys_v2 WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'durable_idempotency', '', COUNT(*) FROM durable_idempotency_keys_v2 WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', tenant_scope, COUNT(*) FROM provider_write_reservations WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', '', COUNT(*) FROM provider_write_reservations WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+];
+
+/// Migration 3: pending artifact cleanup intents are counted in
+/// `runtime_quota_usage` from now on; seed the counts from the intents that
+/// exist when it runs.
+const ARTIFACT_CLEANUP_QUOTA_BACKFILL: &[&str] = &[
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', tenant_scope, COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', '', COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+];
+
+/// Migration 4: the lookups that decide whether `default`-labelled input
+/// media is still used, which the retention sweeper runs for every
+/// candidate.
+const MEDIA_REFERENCE_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_input_media ON runtime_jobs(input_media_asset_id);",
+    "CREATE INDEX IF NOT EXISTS idx_transcription_records_audio_path ON transcription_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_diarization_records_audio_path ON diarization_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_speech_history_audio_path ON speech_history_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_saved_voices_audio_path ON saved_voices(audio_storage_path);",
+];
+
+/// Migration 5: forced-alignment warnings on transcriptions; the warnings,
+/// ASR language and VAD gate of a diarization job; and the node that runs a
+/// record's in-process task, so a restart fails only its own interrupted
+/// records on a shared database. Existing rows keep no owner.
+const ALIGNMENT_AND_OWNERSHIP_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "alignment_warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "language",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "vad_gate",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+];
+
+/// Migration 6 (PostgreSQL): publication keys are machine identifiers that
+/// the speech replay and PCM entry-limit queries select by byte range
+/// (`>= 'speech-pcm/' AND < 'speech-pcm0'`). Under a database's default
+/// linguistic collation (`en_US.utf8` in the official image) glibc ignores
+/// punctuation, so `speech-pcm/…01` sorts after `speech-pcm0` and the range
+/// matched nothing. The `"C"` collation keeps the range and its index exact.
+pub(crate) const PUBLICATION_KEY_BYTE_ORDER: &str =
+    r#"ALTER TABLE runtime_artifacts ALTER COLUMN publication_key TYPE TEXT COLLATE "C""#;
+
+async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    for statement in QUOTA_USAGE_BACKFILL {
+        db.execute_unprepared(statement).await?;
+    }
+    Ok(())
+}
+
+const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "provider_write_reservations",
+        column: "provider_request_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "admission_tenant",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "replay_swept_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "chat_threads",
+        column: "system_prompt",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "source_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "canonical_profile_version",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "queue_class",
+        definition: "TEXT NOT NULL DEFAULT 'batch'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_hints_json",
+        definition: "TEXT NOT NULL DEFAULT '{\"version\":1}'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_target",
+        definition: "TEXT NOT NULL DEFAULT 'any'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_backend",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_device_class",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "min_resource_memory_bytes",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_concurrency_weight",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "instance_id",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "available_slots",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_details_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "available_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_count",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "publication_key",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "chat_messages",
+        column: "content_parts",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "onboarding_state",
+        column: "analytics_opt_in",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "transcription_mode",
+        definition: "TEXT NOT NULL DEFAULT 'transcription'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "aligner_model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "processing_status",
+        definition: "TEXT NOT NULL DEFAULT 'ready'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "processing_progress_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "segments_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "words_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "speaker_attributed_text",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "speaker_turns_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "saa_status",
+        definition: "TEXT NOT NULL DEFAULT 'not_requested'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "saa_warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "summary_status",
+        definition: "TEXT NOT NULL DEFAULT 'not_requested'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "summary_model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "summary_text",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "summary_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "summary_updated_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "saved_voice_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "speed",
+        definition: "REAL NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "processing_status",
+        definition: "TEXT NOT NULL DEFAULT 'ready'",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_media_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_artifact_tenant",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "stop_reason",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_scope",
+        definition: "TEXT NOT NULL DEFAULT 'legacy_local'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "consent_status",
+        definition: "TEXT NOT NULL DEFAULT 'granted'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "allowed_uses_json",
+        definition: "TEXT NOT NULL DEFAULT '[\"local_tts\",\"voice_clone_reference\"]'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_provenance",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_revoked_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "speaker_name_overrides_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "processing_status",
+        definition: "TEXT NOT NULL DEFAULT 'ready'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "summary_status",
+        definition: "TEXT NOT NULL DEFAULT 'not_requested'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "summary_model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "summary_text",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "summary_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "summary_updated_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "voice_mode",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "speaker",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "saved_voice_id",
+        definition: "TEXT NULL",
+    },
+];
+
+async fn ensure_column<C: ConnectionTrait>(
+    db: &C,
+    column: &CompatibilityColumn,
+) -> anyhow::Result<()> {
+    if table_has_column(db, column.table, column.column).await? {
+        return Ok(());
+    }
+    let definition = dialect_ddl(db.get_database_backend(), column.definition);
+    db.execute_unprepared(&format!(
+        "ALTER TABLE {} ADD COLUMN {} {}",
+        column.table, column.column, definition
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn table_has_column<C: ConnectionTrait>(
+    db: &C,
+    table: &str,
+    target: &str,
+) -> anyhow::Result<bool> {
+    match db.get_database_backend() {
+        DbBackend::Sqlite => {
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("PRAGMA table_info({table})"),
+                ))
+                .await?;
+            for row in rows {
+                let name: String = row.try_get_by_index(1)?;
+                if name == target {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        backend => {
+            let sql = match backend {
+                DbBackend::Postgres => {
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
+                }
+                other => anyhow::bail!("Unsupported migration backend: {other:?}"),
+            };
+            let statement = raw::statement(db, sql, vec![table.into(), target.into()])?;
+            Ok(db.query_one_raw(statement).await?.is_some())
+        }
+    }
+}
+
+async fn ensure_default_voice_profile<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
+    let exists = db
+        .query_one_raw(raw::statement(
+            db,
+            "SELECT 1 FROM voice_profiles WHERE id = ?1 LIMIT 1",
+            vec![DEFAULT_VOICE_PROFILE_ID.into()],
+        )?)
+        .await?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    let now = current_timestamp_millis();
+    db.execute_raw(raw::statement(
+        db,
+        r#"
+        INSERT INTO voice_profiles (
+            id,
+            name,
+            system_prompt,
+            observational_memory_enabled,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, 1, ?4, ?4)
+        "#,
+        vec![
+            DEFAULT_VOICE_PROFILE_ID.into(),
+            DEFAULT_VOICE_PROFILE_NAME.into(),
+            DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.into(),
+            now.into(),
+        ],
+    )?)
+    .await?;
+
+    Ok(())
+}
+
+/// The application schema as one PostgreSQL script, for operators who
+/// manage the schema themselves: every app migration's statements on an
+/// empty database, the versions they record, and the seed data. The shipped
+/// copy is docs/dev/postgres-schema.sql; a test keeps it equal to this.
+#[cfg(test)]
+pub(crate) fn postgres_schema_sql() -> String {
+    let mut sql = String::from(
+        "-- Izwi application schema for PostgreSQL (provider-managed migrations).\n\
+         -- Generated from crates/izwi-db/src/migrator.rs: do not edit. Regenerate with\n\
+         --   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-db --lib postgres_schema\n\
+         -- Apply it to an empty schema. It records the migrations it contains in\n\
+         -- schema_migrations, so Izwi applies nothing further when it starts.\n\n\
+         BEGIN;\n\n",
+    );
+    let mut push = |statement: &str| {
+        let statement = dialect_ddl(DbBackend::Postgres, statement);
+        let statement = statement.trim().trim_end_matches(';');
+        // The constants are indented for the Rust source; dedent their body.
+        let mut lines = statement.lines();
+        sql.push_str(lines.next().unwrap_or_default());
+        let body = lines.collect::<Vec<_>>();
+        let indent = body
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        for line in body {
+            sql.push('\n');
+            sql.push_str(line.get(indent..).unwrap_or_else(|| line.trim_start()));
+        }
+        sql.push_str(";\n\n");
+    };
+    let add_column = |column: &CompatibilityColumn| {
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
+            column.table, column.column, column.definition
+        )
+    };
+    // Migration 1, as `apply_migration` runs it on an empty database.
+    for statement in BASELINE_SCHEMA {
+        push(statement);
+    }
+    for column in COMPATIBILITY_COLUMNS {
+        push(&add_column(column));
+    }
+    for statement in POST_COMPATIBILITY_SCHEMA.iter().chain(QUOTA_USAGE_BACKFILL) {
+        push(statement);
+    }
+    // Migration 2.
+    for column in STAGE_CLAIM_COLUMNS {
+        push(&add_column(column));
+    }
+    for statement in STAGE_CLAIM_SCHEMA {
+        push(statement);
+    }
+    // Migration 3.
+    for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
+        push(statement);
+    }
+    // Migration 4.
+    for statement in MEDIA_REFERENCE_INDEXES {
+        push(statement);
+    }
+    // Migration 5.
+    for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
+        push(&add_column(column));
+    }
+    // Migration 6.
+    push(PUBLICATION_KEY_BYTE_ORDER);
+    push(SCHEMA_MIGRATIONS_DDL);
+    for (version, name) in Schema::App.migrations() {
+        push(&format!(
+            "INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', {version}, '{name}', 0) ON CONFLICT DO NOTHING"
+        ));
+    }
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    sql.push_str(&format!(
+        "INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ({}, {}, {}, 1, 0, 0) ON CONFLICT (id) DO NOTHING;\n\n",
+        quote(DEFAULT_VOICE_PROFILE_ID),
+        quote(DEFAULT_VOICE_PROFILE_NAME),
+        quote(DEFAULT_VOICE_AGENT_SYSTEM_PROMPT),
+    ));
+    sql.push_str("COMMIT;\n");
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_database::TestDatabase;
+
+    async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
+        db.query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+            .await
+            .expect("count query")
+            .expect("count row")
+            .try_get_by_index::<i64>(0)
+            .expect("count value")
+    }
+
+    async fn has_table(db: &DatabaseConnection, table: &str) -> bool {
+        db.query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT 1 FROM {table} LIMIT 1"),
+        ))
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn migrations_apply_once_per_schema_and_record_their_versions() {
+        let database = TestDatabase::new().await;
+        let app = database.database();
+        let db = app.connection().await.expect("app schema migrates");
+        Migrator::up(db).await.expect("a second run is a no-op");
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
+            Schema::App.migrations().len() as i64
+        );
+        assert!(has_table(db, "runtime_jobs").await);
+        assert!(
+            !has_table(db, "fleet_capacity_claims").await,
+            "the application schema no longer carries fleet tables"
+        );
+
+        let fleet_database = TestDatabase::new().await;
+        let fleet = fleet_database.database().for_fleet();
+        let db = fleet.connection().await.expect("fleet schema migrates");
+        assert!(has_table(db, "fleet_capacity_claims").await);
+        assert!(
+            !has_table(db, "fleet_worker_observations").await,
+            "migration 2 drops the write-only observation table"
+        );
+        assert!(!has_table(db, "runtime_jobs").await);
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'fleet'").await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_keys_compare_byte_by_byte_on_postgres() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("app schema migrates");
+        if db.get_database_backend() != DbBackend::Postgres {
+            return;
+        }
+        let row = db
+            .query_one_raw(raw::statement_without_values(
+                db,
+                "SELECT collation_name FROM information_schema.columns \
+                 WHERE table_schema = ANY (current_schemas(false)) \
+                 AND table_name = 'runtime_artifacts' AND column_name = 'publication_key'",
+            ))
+            .await
+            .unwrap()
+            .expect("publication_key exists");
+        assert_eq!(
+            row.try_get_by_index::<Option<String>>(0)
+                .unwrap()
+                .as_deref(),
+            Some("C")
+        );
+        crate::schema_contract::validate_provider_managed_schema(db)
+            .await
+            .expect("the migrated schema meets the provider contract");
+
+        // A provider-managed schema left on the database's linguistic
+        // collation would select no speech replay entries, so it is refused.
+        db.execute_unprepared(
+            r#"ALTER TABLE runtime_artifacts ALTER COLUMN publication_key TYPE TEXT COLLATE "default""#,
+        )
+        .await
+        .unwrap();
+        let error = crate::schema_contract::validate_provider_managed_schema(db)
+            .await
+            .expect_err("a linguistic publication-key collation is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_artifacts.publication_key"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unversioned_database_upgrades_in_place() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        // A database an unversioned release created: the schema without the
+        // version table, holding data, and missing a later index.
+        db.execute_unprepared("DROP TABLE schema_migrations")
+            .await
+            .expect("version table drops");
+        db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
+            .await
+            .expect("index drops");
+        db.execute_unprepared(
+            "INSERT INTO chat_threads (id, title, created_at, updated_at) VALUES ('kept', 'kept', 1, 1)",
+        )
+        .await
+        .expect("row inserts");
+
+        Migrator::up(db).await.expect("unversioned database upgrades");
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
+            Schema::App.migrations().len() as i64
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM chat_threads WHERE id = 'kept'").await,
+            1
+        );
+        db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
+            .await
+            .expect("the baseline recreated the index");
+    }
+
+    fn shipped_postgres_schema_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/dev/postgres-schema.sql")
+    }
+
+    #[test]
+    fn shipped_postgres_schema_is_generated_from_the_migrator() {
+        let generated = postgres_schema_sql();
+        let path = shipped_postgres_schema_path();
+        if std::env::var_os("IZWI_WRITE_POSTGRES_SCHEMA").is_some() {
+            std::fs::write(&path, &generated).expect("schema file is written");
+        }
+        let shipped = std::fs::read_to_string(&path).expect("schema file is readable");
+        assert!(
+            shipped == generated,
+            "docs/dev/postgres-schema.sql is stale; regenerate it with \
+             IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-db --lib postgres_schema"
+        );
+    }
+
+    async fn postgres_columns_and_indexes(db: &DatabaseConnection) -> Vec<String> {
+        let schema: String = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_schema()",
+            ))
+            .await
+            .expect("schema query")
+            .expect("schema row")
+            .try_get_by_index(0)
+            .expect("schema name");
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT table_name || '.' || column_name || ' ' || data_type || ' ' || is_nullable || ' ' || COALESCE(column_default, '') FROM information_schema.columns WHERE table_schema = current_schema()",
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()",
+        ] {
+            for row in db
+                .query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .expect("catalog query")
+            {
+                let line: String = row.try_get_by_index(0).expect("catalog value");
+                rows.push(line.replace(&format!("{schema}."), ""));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// The shipped script builds exactly the schema the migrator builds, and
+    /// the migrator then finds nothing to apply.
+    #[tokio::test]
+    async fn postgres_schema_script_builds_the_migrated_schema() {
+        let migrated = TestDatabase::new().await;
+        let migrated_store = migrated.database();
+        let migrated_db = migrated_store.connection().await.expect("migrator runs");
+        if migrated_db.get_database_backend() != DbBackend::Postgres {
+            return;
+        }
+        let scripted = TestDatabase::new().await;
+        let scripted_db = scripted.connect_unmigrated().await;
+        let script = std::fs::read_to_string(shipped_postgres_schema_path())
+            .expect("schema file is readable");
+        scripted_db
+            .execute_unprepared(&script)
+            .await
+            .expect("the shipped script applies to an empty schema");
+        Migrator::up(&scripted_db)
+            .await
+            .expect("the migrator accepts the scripted schema");
+        assert_eq!(
+            count(
+                &scripted_db,
+                "SELECT COUNT(*) FROM schema_migrations WHERE applied_at <> 0"
+            )
+            .await,
+            0,
+            "the migrator applied nothing beyond the script"
+        );
+        assert_eq!(
+            postgres_columns_and_indexes(&scripted_db).await,
+            postgres_columns_and_indexes(migrated_db).await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_migrators_apply_each_migration_once() {
+        let database = TestDatabase::new().await;
+        let mut connections = Vec::new();
+        for _ in 0..8 {
+            connections.push(database.connect_unmigrated().await);
+        }
+        let handles = connections
+            .iter()
+            .cloned()
+            .map(|db| tokio::spawn(async move { Migrator::up(&db).await }))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .await
+                .expect("migrator joins")
+                .expect("every concurrent migrator succeeds");
+        }
+        let db = &connections[0];
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations").await,
+            Schema::App.migrations().len() as i64
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM voice_profiles").await,
+            1,
+            "the default voice profile is seeded once"
+        );
+    }
+
+
+    #[test]
+    fn sqlite_ddl_passes_through_unchanged() {
+        let sql =
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NULL);";
+        assert_eq!(dialect_ddl(DbBackend::Sqlite, sql), sql);
+    }
+
+    #[test]
+    fn postgres_ddl_promotes_integer_and_real_and_drops_nocase() {
+        let sql = "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NOT NULL);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL);"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_does_not_rewrite_word_fragments() {
+        let sql = "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_respects_escaped_quotes_and_multibyte_literals() {
+        let sql = "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');"
+        );
+        let sql = "ALTER TABLE résumé ADD COLUMN count INTEGER NULL";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "ALTER TABLE résumé ADD COLUMN count BIGINT NULL"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_nocase_index_becomes_lower_functional_index() {
+        let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(LOWER(name));"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_column_drops_nocase_collation() {
+        let sql = "name TEXT NOT NULL COLLATE NOCASE,";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "name TEXT NOT NULL ,"
+        );
+    }
+
+    #[test]
+    fn compatibility_column_definitions_are_promoted_for_postgres() {
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "INTEGER NOT NULL DEFAULT 0"),
+            "BIGINT NOT NULL DEFAULT 0"
+        );
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "REAL NULL"),
+            "DOUBLE PRECISION NULL"
+        );
+    }
+}

@@ -13,14 +13,16 @@ environment variable must be replaced and validated against the target host.
   workers advertise the same deployment identity as independent replicas; a
   third worker demonstrates a distinct deployment on another device.
 - `docker-compose.serving.yml` (in `config/serving/`) demonstrates the
-  separated gateway-and-worker container topology under Docker Compose.
+  separated gateway and worker containers under Docker Compose, in the
+  single-node `standalone` topology (the gateway shares the worker's network
+  namespace and reaches it over loopback).
 
 The current node schema configures workers and exactly one task-specific
 deployment/capability contract per worker. It does not accept gateway settings,
 `profile`, `topology`, worker-pool declarations, remote endpoints, or
-artifact-provider configuration. The implemented private worker route is
-chat-only, so these examples must not be read as support for speech or other
-task types. A distinct deployment can be assigned to a separate worker, as
+artifact-provider configuration. These examples declare chat
+deployments; speech workers (`speech_to_text`, `text_to_speech`) use the same
+schema with their own task and capability. A distinct deployment can be assigned to a separate worker, as
 shown in the CUDA example, but multi-stage execution is not implied.
 
 All worker binds are loopback-only because this supervisor generation is for a
@@ -33,11 +35,12 @@ live process.
 Parsing proves only that an example matches the bounded schema. Successful
 validation and launch additionally require real directories, executable worker
 binaries, available CPU resources, and exact accelerator inventory matches.
-The `izwi-serving-supervisor` command can launch the CPU example only when given
-an explicit config path, CPU worker binary, trusted CPU-ID list, and allocatable
-host-memory ceiling. Its current command-line inventory rejects Metal and CUDA
-assignments without fallback; those lanes still require a future trusted device
-inventory integration. Nothing in these examples is hardware validation, a
+The `izwi-serving-supervisor` command launches an example only when given an
+explicit config path, the worker binary for each lane it uses, the trusted
+device inventory (`--cpu-ids`; `--metal-devices device_id@index`;
+`--cuda-devices uuid@host_index@total_memory_bytes`), and an allocatable
+host-memory ceiling. A device that is not declared fails validation without
+fallback. Nothing in these examples is hardware validation, a
 certified memory profile, or a performance claim.
 
 For the exact single-node startup, readiness, security, drain, rollback, and

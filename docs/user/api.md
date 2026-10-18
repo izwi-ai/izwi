@@ -48,41 +48,62 @@ curl -H "x-request-id: demo-123" http://localhost:8080/readyz
 
 ### Errors
 
-JSON errors use this envelope:
+JSON errors use OpenAI's envelope:
 
 ```json
 {
   "error": {
-    "message": "Unsupported transcription model: Example",
-    "type": "invalid_request_error",
-    "param": null,
-    "code": "400"
+    "message": "Model not found: Example",
+    "type": "not_found_error",
+    "param": "model",
+    "code": "model_not_found"
   }
 }
 ```
 
-Common status codes:
+`code` names what went wrong; it is never the HTTP status. `param` names the request field the error is about, when there is one. The local server and the gateway answer the same failure with the same status, type and code.
 
-| Status | Meaning |
-|--------|---------|
-| `400` | Invalid request shape, model id, unsupported field, or invalid option, including input the runtime rejects (for example audio over the duration limit). |
-| `403` | Authenticated request or local voice reuse is not permitted by policy metadata. |
-| `404` | Resource, model, media object, or process-local record was not found. |
-| `413` | Body exceeded an upload limit before the handler could parse it. |
-| `415` | Endpoint expected JSON or multipart content but received another content type. |
-| `500` | Runtime, model, storage, or server failure. |
-| `503` | Temporarily out of capacity: the requested model cannot be loaded while other resident models are busy, or the runtime is overloaded. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
+| Status | `type` | `code` | Meaning |
+|--------|--------|--------|---------|
+| `400` | `invalid_request_error` | `invalid_value` | Invalid request shape, field, option or model input (for example audio over the duration limit). A body that is not valid JSON, or JSON of the wrong shape, is this error too. |
+| `400` | `invalid_request_error` | `unsupported_parameter` | A valid parameter this deployment cannot honour. |
+| `400` | `invalid_request_error` | `context_length_exceeded` | The prompt, or the prompt plus the requested output, does not fit the model's context. |
+| `401` | `authentication_error` | `invalid_api_key` | The server is bound to a network address (or is the gateway) and the request lacks a valid API key. |
+| `403` | `permission_denied_error` | `permission_denied` | The request is not permitted by policy, or a browser request came from a disallowed `Origin` or `Host`. |
+| `404` | `not_found_error` | `model_not_found` | The requested model is not served here (`param` is `model`). |
+| `404` | `not_found_error` | `not_found` | Another resource, media object or record was not found. |
+| `408` | `server_error` | `timeout` | The request's deadline passed. |
+| `409` | `invalid_request_error` | `conflict` | The resource is in use, for example unloading a model that is serving requests. |
+| `413` | `invalid_request_error` | `payload_too_large` | The body or an input exceeded a size limit. |
+| `415` | `invalid_request_error` | `unsupported_media_type` | The endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
+| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached. |
+| `499` | `server_error` | `cancelled` | The request was cancelled. |
+| `500` | `server_error` | `server_error` | Runtime, model, storage or server failure. |
+| `502` | `server_error` | `bad_gateway` | Gateway only: a worker's answer could not be used. |
+| `503` | `service_unavailable_error` | `service_unavailable` | Temporarily out of capacity or not ready: the requested model cannot be loaded while other resident models are busy, the runtime is overloaded, a worker is draining, or a runtime dependency is missing. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
+
+The message of a `500` or `502` can name file paths, devices and internal state, so the server logs it with the request ID and, unless it is a loopback-bound local server, returns only a generic message that includes the request ID (also in the `x-request-id` response header). A loopback-bound local server (the default, and the desktop app) returns the full message, since its only client is this machine.
 
 Enterprise builds can inject authentication and policy hooks. Community builds use local anonymous defaults. If an enterprise hook rejects a request, the response can be `401`, `403`, or `500` before the route handler runs.
 
 ### Security And CORS
 
-Community builds do not require API keys by default. Treat the server as a local trusted process unless you deliberately expose it.
+The server binds `127.0.0.1:8080` by default, so only this machine can reach it and no API key is needed.
 
-- `izwi serve` defaults to port `8080`.
-- `--host 0.0.0.0` binds beyond loopback. Use it only on trusted networks or behind your own access controls.
-- `--cors` enables wildcard browser CORS responses.
-- Desktop origins such as `tauri://localhost` are allowed for the native app.
+To reach it from other devices, bind a network address and set an API key:
+
+```bash
+export IZWI_API_KEY="$(openssl rand -hex 32)"
+izwi serve --host 0.0.0.0
+```
+
+- With a non-loopback host (`0.0.0.0`, `::`, a LAN IP or hostname) the server refuses to start unless `IZWI_API_KEY` is set (16-4096 printable characters, no spaces). The key is read from the environment only, never from the command line.
+- Clients send the key as `Authorization: Bearer <key>` or `x-api-key: <key>`. `izwi` CLI commands send `IZWI_API_KEY` automatically, and the web UI asks for the key once and keeps it in a same-site cookie.
+- Every route under `/v1` and `/internal` needs the key. The probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/internal/live`, `/internal/ready`), the docs and the web UI's static files do not.
+- `--allow-unauthenticated-network` (or `IZWI_ALLOW_UNAUTHENTICATED_NETWORK=1`) starts a network bind without a key. Anyone who can reach the port can then download, load and delete models and read or delete history. Use it only behind your own access controls.
+- Browser protections apply to every bind: a loopback-bound server only answers `localhost`, `*.localhost`, `127.0.0.1` and `[::1]` `Host` names (this blocks DNS rebinding), and writes and WebSocket upgrades from another site's page are rejected by their `Origin`. Allowed origins are the server's own origin, loopback pages, the desktop app (`tauri://localhost`, `http://tauri.localhost`) and any configured CORS origins.
+- `--cors` enables wildcard browser CORS responses, which also lets any web page send requests. Prefer listing origins in `cors_origins`.
+- A reverse proxy in front of a loopback-bound server must forward a loopback `Host` header (nginx does by default with `proxy_pass http://127.0.0.1:8080`).
 
 ### Pagination
 
@@ -138,7 +159,9 @@ HTTP streaming routes use server-sent events (SSE):
 
 `GET /v1/models`
 
-Returns enabled model variants in OpenAI list format.
+Returns the models this server can run now (enabled, and downloaded or
+loaded) in OpenAI list format. `created` is when the model's files arrived on
+this host (`0` when unknown).
 
 ```json
 {
@@ -148,7 +171,7 @@ Returns enabled model variants in OpenAI list format.
       "id": "Qwen3.5-4B",
       "object": "model",
       "created": 1760000000,
-      "owned_by": "agentem"
+      "owned_by": "izwi"
     }
   ]
 }
@@ -156,7 +179,25 @@ Returns enabled model variants in OpenAI list format.
 
 `GET /v1/models/{model}`
 
-Returns one enabled model in the same object shape. Unknown or disabled variants return `404`.
+Returns one of those models in the same object shape. An unknown, disabled or
+not-downloaded model is a `404` with `code: model_not_found` and `param:
+model`.
+
+The gateway serves both routes for every chat model its worker approvals
+name (with `created: 0`), behind the same API key as chat completions. A chat
+request names its model in `model` and is routed to that model's workers; a
+model the gateway does not serve is a `404` with `code: model_not_found`.
+Models added to a shared approvals file after the gateway started are served
+after a restart.
+
+The gateway serves chat completions only: `/v1/audio/*` and `/v1/responses`
+answer `404` there, because the worker protocol has no unary speech or
+Responses invocation. Use a local-role server for those routes (realtime
+speech goes through the gateway's realtime socket).
+
+The gateway is the standalone `izwi-gateway` binary, which runs no model, or
+`izwi-server --role gateway`; both serve the same API. Its `/openapi.json`
+lists only the routes above, plus the probes and `/docs`.
 
 Use `/v1/admin/models` when you need download, load, unload, local path, status, or speech-capability details.
 
@@ -184,19 +225,53 @@ Supported request fields:
 |-------|-------|
 | `model` | Required model variant. Must resolve to a chat-capable model. |
 | `messages` | Required array. Roles: `system`, `user`, `assistant`, `tool`. |
-| `max_tokens`, `max_completion_tokens` | Optional output budgets. |
-| `stream` | `true` returns SSE chat chunks. |
-| `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
+| `max_tokens`, `max_completion_tokens` | Optional output budgets (`max_completion_tokens` wins). Unset, the reply may use the rest of the context. An explicit budget that does not fit beside the prompt is a `400` (as in vLLM) unless `truncation` is `auto`. |
+| `truncation` | Izwi extension, as in the Responses API. `disabled` (default): a prompt that does not fit the context is a `400` with `code: context_length_exceeded`, `param: messages` and the token counts. `auto`: the oldest complete turns are dropped (the system message and newest user message are kept) and an explicit budget is shortened to the remaining context. Through the gateway, workers on worker protocol minor 4 apply this exactly as the local server; older workers still truncate automatically. |
+| `stream` | `true` returns SSE chat chunks. The request is admitted before the stream starts, so a request that cannot run (for example `context_length_exceeded`) is a plain HTTP error, not a stream. |
+| `stream_options.include_usage` | Sends the usage in one more chunk after the finish chunk, with `choices: []`; every earlier chunk then carries `usage: null`, as in OpenAI. |
+| `logprobs`, `top_logprobs` | Per-token logprobs (`top_logprobs` 0–20 alternatives). Returned on `choices[].logprobs.content` in the completion and in each stream chunk. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
-| `frequency_penalty`, `stop` | Rejected in strict OpenAI compatibility mode when non-default. |
+| `seed` | Optional signed 64-bit sampling seed. The same seed and parameters sample the same tokens on the same backend; without one, each request samples independently. |
+| `stop` | A string or an array of up to 4 non-empty strings (each at most 1024 bytes). Generation ends before the first match, the stop text is not returned, and `finish_reason` is `stop`. Streams hold back text that could still begin a stop string until it is settled. Requests with `stop` decode one token per scheduler step. |
+| `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
-| `tools`, `tool_choice` | Accepted for tool-call prompting. Strict mode only allows `tool_choice` as `auto`, `none`, or `null`. |
+| Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8 and LFM2.5 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
 | `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 defaults to `true`. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
 | `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
+
+Through the gateway, a chat request runs on a worker exactly as on the local
+server: the same sampling profiles, `seed`, `stop`, `top_k`, penalties,
+`logprobs`/`top_logprobs`, `response_format: json_object`, output budget and
+`truncation`. Each of these controls needs a worker on worker protocol minor
+4 that advertises it; the gateway routes the request only to such workers, and
+when none is ready it returns a `400` with `code: unsupported_parameter` and
+`param` naming the control, never dropping it. `tools` need a worker that
+advertises tool support; the gateway parses the calls in the worker's text
+exactly as the local server does. The reasoning controls are not yet
+supported through the gateway (400).
+
+Gateway limits and headers:
+
+- Every gateway chat response carries OpenAI's rate-limit headers for the
+  caller's tenant: `x-ratelimit-limit-requests`,
+  `x-ratelimit-remaining-requests` and `x-ratelimit-reset-requests` (for
+  example `30s`), plus the `-tokens` set when the operator configured a
+  tokens-per-minute limit. A `429` or `503` carries `Retry-After` in seconds.
+- With a token limit, a request is admitted against an estimate (its output
+  budget plus about one token per four prompt bytes) and charged what the
+  worker reports it used. A request whose estimate exceeds the remaining
+  budget is a `429` with message `Gateway tenant token rate limit exceeded`.
+- A request body that does not arrive within the gateway's body-read deadline
+  (10 seconds by default) is a `408` with `code: timeout`.
+- During a gateway shutdown, a stream that has not finished by the end of the
+  drain receives a `503` error event (`code: service_unavailable`) and
+  `data: [DONE]`. Retry it; nothing was replayed.
 
 Compatibility profile:
 
@@ -205,24 +280,41 @@ IZWI_OPENAI_COMPAT_PROFILE=strict   # default
 IZWI_OPENAI_COMPAT_PROFILE=relaxed
 ```
 
-Streaming sequence:
+Completion ids are `chatcmpl-<hex>`, and every chunk of a stream shares one
+id. Streaming sequence (with `stream_options.include_usage`):
 
 ```text
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"Hel"}}]}
-data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}}
 data: [DONE]
 ```
 
+If generation fails after the stream started, the last event before
+`[DONE]` is the OpenAI error object, `{"error": {"message", "type", "param",
+"code"}}`, with the type the same failure has as an HTTP error (the OpenAI
+SDKs raise it as `APIError`). There is no finish chunk then.
+
 Tool behavior:
 
-- Assistant messages may include `tool_calls`.
-- Tool responses can be sent with role `tool`.
-- Model-emitted tool calls are returned with `finish_reason: "tool_calls"` when detected.
+- Assistant messages may include `tool_calls`; a `tool` message's
+  `tool_call_id`, when given, must match a call of the preceding assistant
+  message (`400` otherwise). The templates read tool results in order.
+- Calls are parsed only when the request offered tools. They are returned as
+  `message.tool_calls` (ids `call_<hex>`) with `finish_reason: "tool_calls"`,
+  and the call markup never appears in `content`.
+- Streamed, calls arrive as `delta.tool_calls`: the first fragment of each
+  carries its `index`, `id`, `type` and `function.name`, and the
+  `function.arguments` fragments concatenate to the JSON arguments. A Qwen call
+  is sent as soon as its name is known and its arguments one parameter at a
+  time; an LFM2.5 call list is sent when it closes. Text that might open a
+  call is held back until the next delta settles it, and a block that does
+  not parse is sent as text.
 - LFM2.5 models use their own format: tools are listed in the system turn,
   `tool` messages become native tool turns, and calls the model writes as
   `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>` are returned as
-  `tool_calls`. Other chat models use the Qwen XML tool format.
+  `tool_calls`. The Qwen3.5 family uses Qwen's XML tool format.
 - LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
   cards, on every backend.
 
@@ -465,11 +557,13 @@ Request fields:
 | `input` | Text, one input item, or an array of input items. |
 | `instructions` | Optional system instruction. Required if `input` is empty. |
 | `max_output_tokens` | Optional output limit. |
+| `truncation` | `disabled` (default) or `auto`; same behavior as chat completions. |
 | `stream` | `true` returns SSE events. |
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice`, `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. |
+| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself. As in chat completions, `tool_choice` `required` and named functions are refused. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
 
@@ -649,13 +743,16 @@ first-party ASR and non-streaming text-to-speech jobs:
 | `GET` | `/v1/jobs/{job_id}` | Fetch the runtime job, ordered stages, and artifacts. |
 | `GET` | `/v1/jobs/{job_id}/artifacts` | Fetch only artifact lineage for the job. |
 | `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a non-terminal job and update the linked route record when one exists. |
-| `POST` | `/v1/jobs/{job_id}/retry` | Requeue failed, cancelled, or expired jobs that have retryable stages. |
+| `POST` | `/v1/jobs/{job_id}/retry` | Requeue a failed or cancelled job that has retryable stages. |
 
-Runtime jobs use statuses such as `created`, `queued`, `running`, `paused`,
-`retrying`, `postprocessing`, `completed`, `failed`, `cancelled`, and
-`expired`. Stages and artifacts include IDs, capability/model metadata, attempt
-counts, timing/error fields, media/text asset references, and storage keys when
-available.
+Runtime jobs and their stages use the statuses `queued`, `running`, `retrying`,
+`completed`, `failed`, and `cancelled`. `completed`, `failed`, and `cancelled`
+are terminal for workers. A manual retry requeues the job while the job's own
+retry budget (`max_attempts`) is not used up and every failed or cancelled
+stage still has attempts left; a stage that used all of its attempts is not
+revived, so submit a new job instead. Stages and artifacts include IDs,
+capability/model metadata, attempt counts, timing/error fields, media/text
+asset references, and storage keys when available.
 
 ### Saved Voices
 
@@ -755,6 +852,7 @@ Send-message request fields:
 | `enable_thinking` | Izwi extension for thinking-capable models. |
 | `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Qwen3.8 reasoning controls; compatible kwargs must not conflict with direct fields. |
 | `top_k`, `repetition_penalty`, `presence_penalty` | Optional sampling controls. |
+| `truncation` | `disabled` (default) or `auto`. The chat UI sends `auto`, so a long thread drops its oldest turns instead of failing. |
 
 Streaming thread events:
 
@@ -885,6 +983,44 @@ Batch runtime metrics include `queued_stages`, `jobs_by_status`,
 `stages_by_status`, and a local worker snapshot. Prometheus output appends
 `izwi_batch_runtime_queued_stages`, `izwi_batch_runtime_jobs`,
 `izwi_batch_runtime_stages`, and `izwi_batch_runtime_worker_running`.
+
+Latencies are Prometheus histograms (cumulative `_bucket{le=...}`, `_sum`,
+`_count`) in seconds, so they aggregate across replicas and `histogram_quantile`
+works on them. The JSON snapshot keeps its windowed averages and percentiles
+for the UI. Labels are bounded: model names come from the model catalog,
+families keep at most 64 series (the rest share `other`), and no request or
+tenant IDs are used.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `outcome` | Server admission to the terminal output. |
+| `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
+| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
+| `izwi_request_prompt_tokens_total`, `izwi_request_generation_tokens_total` | `model`, `task` | Counters for completed requests (generation counts audio frames for speech models). |
+| `izwi_engine_inter_token_latency_seconds` | `model`, `task` | Gap between successive committed tokens of one request; a commit of k tokens after a gap g counts k gaps of g/k. |
+| `izwi_engine_step_host_seconds` | `phase` (`prepare`, `commit`, `deliver`) | Host time of engine step phases under the step gate. |
+| `izwi_engine_batch_rows`, `izwi_engine_batch_tokens` | none | Rows and work units (tokens, or frames for speech) per dispatched physical batch. |
+| `izwi_engine_model_calls_per_step` | none | Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch. |
+| `izwi_engine_mixed_rows`, `izwi_engine_mixed_tokens` | `phase` (`decode`, `prefill`) on rows | Rows of each phase and tokens per committed mixed prefill+decode batch (models certified for mixed steps). |
+| `izwi_engine_device_idle_seconds` | `device` (`cpu`, `metal`, `cuda:0`) | Time the device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps. |
+| `izwi_engine_device_queue_wait_seconds` | `device`, `class` (workload class) | Time a model dispatch waited on its device's queue before it started. Control work (KV page operations, loads, frees) runs first; dispatches of different models share the device by workload-class weight, between jobs. |
+| `izwi_engine_device_ops_off_thread_total` | none | Counter of device operations (model calls, KV page operations, state allocation and frees) that ran off their device's thread. Zero in a healthy process. |
+| `izwi_runtime_stage_duration_seconds` | `stage`, `workload_class` | Duration of runtime pipeline stages. |
+| `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
+| `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |
+| `izwi_voice_audio_egress_underruns_total`, `izwi_voice_audio_ingress_dropped_frames_total` | none | Assistant audio sent after playback had drained; input frames missing from the client's sequence. |
+
+The windowed `quantile="avg"|"p50"|"p95"` gauges (`izwi_latency_*`,
+`izwi_runtime_stage_duration_ms`, `izwi_runtime_workload_*`) were removed in
+favour of these histograms. The latency breakdown a request returns also
+reports `pre_engine_ms`, the time between runtime admission and engine
+insertion.
+
+Requests may carry a W3C `traceparent`; the server continues that trace and
+logs `trace_id`, `span_id` and `parent_span_id` on the request. See the
+production serving runbook for JSON logs and the optional OTLP span export
+(`IZWI_OTLP_TRACES_ENDPOINT`).
 
 ### Admin Model Management
 
@@ -1076,6 +1212,7 @@ Client JSON messages:
 | `input_stream_start` | Optional `mode`, model ids, speaker, ASR language, max tokens, VAD settings, and input sample rate. |
 | `input_stream_stop` | Stops listening and closes the current session. |
 | `interrupt` | Optional `reason`; interrupts active assistant turn. |
+| `conversation_item_truncate` | `utterance_seq` and `audio_end_ms`: the client played only that much of the reply's audio (also accepted as `conversation.item.truncate`, after OpenAI Realtime). The conversation remembers the reply only up to there. |
 | `ping` | Optional `timestamp_ms`. |
 
 `mode` values:
@@ -1093,12 +1230,14 @@ Client JSON messages:
 | `s2s_model_id` | Unified audio-chat model override. |
 | `speaker` | TTS speaker/voice. |
 | `asr_language` | Language hint. |
-| `max_output_tokens` | Text output budget. |
+| `max_output_tokens` | Reply token budget: default `384` in modular mode (a few spoken sentences), `1536` in unified mode. |
+| `output_audio_format` | `pcm_i16` (default: PCM16 at the model's rate), `g711_ulaw` or `g711_alaw` (8 kHz, one byte a sample). |
 | `vad_threshold` | Earshot speech score threshold, default `0.5`. Values are clamped to the valid score range. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
+| `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
 
 Client binary frame:
@@ -1119,12 +1258,12 @@ Assistant audio binary frame:
 |-------|-------|
 | `0..4` | ASCII magic `IVWS`. |
 | `4` | Version `1`. |
-| `5` | Kind `2` for assistant PCM16. |
+| `5` | Kind: `2` assistant PCM16, `3` G.711 μ-law, `4` G.711 A-law (the session's `output_audio_format`). |
 | `6..8` | Flags; bit `0` marks final chunk. |
 | `8..16` | Little-endian `utterance_seq` (`u64`). |
 | `16..20` | Little-endian chunk sequence (`u32`). |
-| `20..24` | Little-endian sample rate (`u32`). |
-| `24..` | Mono PCM16 little-endian audio bytes. |
+| `20..24` | Little-endian sample rate (`u32`): the model's rate for PCM16, `8000` for G.711. |
+| `24..` | Mono audio: PCM16 little-endian, or one G.711 byte a sample. |
 
 Server events:
 
@@ -1132,16 +1271,26 @@ Server events:
 |------|-------|
 | `connected` | Socket accepted and protocol version announced. |
 | `session_ready` | Voice session initialized. |
-| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration. |
+| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration, and the `output_audio_format`. |
+| `models_ready` | Sent once the stream's models have loaded in the background after `input_stream_start`: each model's `stage`, `model_id`, `ready`, and `error` when it could not load. |
 | `input_stream_stopped` | Input stream stopped. |
-| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. |
-| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. |
+| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. A client may duck assistant playback on `user_speech_start`; the server cancels the turn only after `barge_in_min_speech_ms` of speech. |
+| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. Ducked playback can resume. |
 | `turn_processing` | Turn started. |
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
-| `assistant_text_start`, `assistant_text_delta`, `assistant_text_final` | Assistant text events. |
-| `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks. |
+| `assistant_text_start`, `assistant_text_snapshot`, `assistant_text_final` | Assistant text events. A snapshot carries the whole reply so far; the final event also has `raw_text`. |
+| `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks; the start event names the `sample_rate` and `audio_format`. |
+| `conversation_item_truncated` | Acknowledges a truncate with the `text` the conversation now remembers for that reply. |
 | `turn_done` | Terminal turn status: `ok`, `error`, `timeout`, `interrupted`, or `no_input`. |
 | `pong` | Ping response. |
 | `error` | Error with optional utterance identifiers. |
+
+How a modular turn runs:
+
+- The models load at `input_stream_start` (`models_ready`), so the first turn does not pay the load.
+- The reply streams from the chat model with thinking disabled (any reasoning text is dropped). Complete sentences are spoken as they arrive: the first segment is the fewest sentences reaching about 40 characters, later ones pack the sentences that have arrived (up to 240 characters), and the next segment is synthesized while the current one plays. Segments are joined with a short pause and fades.
+- Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
+- Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
+- The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.

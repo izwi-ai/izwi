@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::StoreError;
 use crate::{
     db::{raw, StoreDatabase},
     entity::diarization_records,
@@ -23,7 +24,6 @@ use crate::{
     storage_layout,
 };
 
-const DEFAULT_LIST_LIMIT: usize = 200;
 /// The error of a record whose in-process job died with the server (P1V-1).
 pub const INTERRUPTED_BY_SHUTDOWN_ERROR: &str =
     "Interrupted by a server shutdown before it finished; rerun the job.";
@@ -472,7 +472,7 @@ impl DiarizationStore {
         let audio_filename = sanitize_optional_text(record.audio_filename.as_deref(), 260);
 
         if record.audio_bytes.is_empty() {
-            return Err(anyhow!("Audio payload cannot be empty"));
+            return Err(StoreError::invalid("Audio payload cannot be empty").into());
         }
 
         let audio_storage_path = persist_audio_object(
@@ -1454,7 +1454,9 @@ fn sanitize_speaker_name_overrides(
     for (raw_label, corrected_label) in overrides {
         let raw = sanitize_required_text(raw_label.as_str(), 80);
         if !known_labels.contains(&raw) {
-            return Err(anyhow!("Unknown diarization speaker label: {raw}"));
+            return Err(
+                StoreError::invalid(format!("Unknown diarization speaker label: {raw}")).into(),
+            );
         }
 
         let normalized = corrected_label
@@ -1509,11 +1511,6 @@ fn i64_to_usize(value: i64) -> Option<usize> {
     } else {
         usize::try_from(value).ok()
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

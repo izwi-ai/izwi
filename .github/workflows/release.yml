@@ -102,7 +102,21 @@ jobs:
           NODE
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned: a new stable release can add clippy lints that fail
+        # `-D warnings` with no repo change. Bump deliberately, together
+        # with the version the lanes are verified with locally. No
+        # rust-toolchain.toml: it would override the 1.88.0 (MSRV) CUDA
+        # compile lanes, which install that version as the rustup default.
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      # The workspace .cargo/config.toml sets an extensionless python
+      # rustc-wrapper that only matters to Apple's linker. Windows cannot
+      # execute it, and an empty RUSTC_WRAPPER overrides the configured one
+      # for every later cargo call, including `cargo tauri build`.
+      - name: Disable the macOS rustc wrapper (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -126,8 +140,10 @@ jobs:
         if: runner.os != 'macOS'
         run: |
           # izwi-desktop bundles izwi/izwi-server as resources, so build those first.
-          # Native Linux/Windows serving workers remain CPU-only.
-          cargo build --release --bin izwi --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker
+          # Native Linux/Windows serving workers remain CPU-only. izwi-server and
+          # the standalone izwi-gateway (no inference engine) ship with
+          # PostgreSQL support (IZWI_DATABASE_URL=postgres://...).
+          cargo build --release --bin izwi --bin izwi-server --bin izwi-gateway --bin izwi-serving-supervisor --bin izwi-serving-worker --features izwi-server/db-postgres,izwi-gateway/db-postgres
 
       - name: Build CLI, gateway, supervisor, and worker binaries (macOS 15+ Metal, macOS 12 deployment)
         if: runner.os == 'macOS'
@@ -135,7 +151,8 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: |
           cargo build --release -p izwi-cli --features metal
-          cargo build --release -p izwi-server --features metal
+          cargo build --release -p izwi-server --features metal,db-postgres
+          cargo build --release -p izwi-gateway --features db-postgres
           cargo build --release -p izwi-serving-supervisor
           cargo build --release -p izwi-serving-worker --features metal
 
@@ -148,7 +165,7 @@ jobs:
       - name: Verify macOS binary deployment floor
         if: runner.os == 'macOS'
         run: |
-          for binary in target/release/izwi target/release/izwi-server target/release/izwi-serving-supervisor target/release/izwi-serving-worker target/release/izwi-desktop; do
+          for binary in target/release/izwi target/release/izwi-server target/release/izwi-gateway target/release/izwi-serving-supervisor target/release/izwi-serving-worker target/release/izwi-desktop; do
             minos="$(otool -l "$binary" | awk '/LC_BUILD_VERSION/ { found=1; next } found && /minos/ { print $2; exit }')"
             if [[ "$minos" != "12.0" ]]; then
               echo "::error::$binary has deployment floor '$minos', expected 12.0."
@@ -162,7 +179,7 @@ jobs:
           mkdir -p release-assets
           tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
             -C "${{ github.workspace }}/target/release" \
-            izwi izwi-server izwi-serving-supervisor izwi-serving-worker izwi-desktop \
+            izwi izwi-server izwi-gateway izwi-serving-supervisor izwi-serving-worker izwi-desktop \
             -C "${{ github.workspace }}/config/serving" \
             izwi-serving-node.example.toml
 
@@ -174,6 +191,7 @@ jobs:
           Compress-Archive -Path `
             target/release/izwi.exe, `
             target/release/izwi-server.exe, `
+            target/release/izwi-gateway.exe, `
             target/release/izwi-serving-supervisor.exe, `
             target/release/izwi-serving-worker.exe, `
             config/serving/izwi-serving-node.example.toml, `
@@ -420,7 +438,7 @@ jobs:
 
           - macOS native artifacts use Metal on Apple Silicon with macOS 15 or later and fall back to CPU on macOS 12-14.
           - Linux and Windows native artifacts are CPU-only and intentionally do not bundle CUDA runtime libraries.
-          - Terminal archives include the gateway-capable `izwi-server`, the CPU-only `izwi-serving-supervisor`, one backend-appropriate `izwi-serving-worker`, and a bounded single-node configuration example.
+          - Terminal archives include `izwi-server`, the standalone `izwi-gateway` (the preferred gateway: it links no inference engine; `izwi-server --role gateway` still works), the CPU-only `izwi-serving-supervisor`, one backend-appropriate `izwi-serving-worker`, and a bounded single-node configuration example.
           - The packaged supervisor accepts explicit CPU inventory only. Metal/CUDA supervisor inventory and launch profiles remain fail-closed and are release blockers for those supervised lanes.
           - NVIDIA CUDA is supported through the Docker `production-cuda` target / `docker compose --profile cuda` and through source builds with `--features cuda`.
           - Native artifacts are checked for CUDA runtime payloads and per-file size before release publication.

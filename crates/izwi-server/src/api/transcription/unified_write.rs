@@ -1,13 +1,12 @@
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Deserialize;
 
 use crate::api::diarization::handlers as diarization_handlers;
 use crate::api::request_context::RequestContext;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use crate::transcription_store::TranscriptionRecordMode;
 
@@ -47,13 +46,13 @@ pub async fn update_job(
     state: State<AppState>,
     Path(record_id): Path<String>,
     Query(query): Query<UnifiedMutationQuery>,
-    Json(req): Json<diarization_handlers::UpdateDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<diarization_handlers::UpdateDiarizationRecordRequest>,
 ) -> Result<Response, ApiError> {
     let kind = parse_job_kind(query.job_kind.as_deref(), true)?;
     match resolve_diarization_only_kind(&state, record_id.as_str(), kind).await? {
         MutationJobKind::Diarization => {
             let response =
-                diarization_handlers::update_record(state, Path(record_id), Json(req)).await?;
+                diarization_handlers::update_record(state, Path(record_id), ApiJson(req)).await?;
             Ok(response.into_response())
         }
         MutationJobKind::All
@@ -69,12 +68,12 @@ pub async fn rerun_job(
     ctx: Extension<RequestContext>,
     Path(record_id): Path<String>,
     Query(query): Query<UnifiedMutationQuery>,
-    Json(req): Json<diarization_handlers::RerunDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<diarization_handlers::RerunDiarizationRecordRequest>,
 ) -> Result<Response, ApiError> {
     let kind = parse_job_kind(query.job_kind.as_deref(), true)?;
     match resolve_diarization_only_kind(&state, record_id.as_str(), kind).await? {
         MutationJobKind::Diarization => {
-            diarization_handlers::rerun_record(state, ctx, Path(record_id), Json(req)).await
+            diarization_handlers::rerun_record(state, ctx, Path(record_id), ApiJson(req)).await
         }
         MutationJobKind::All
         | MutationJobKind::Transcription
@@ -251,5 +250,5 @@ async fn resolve_diarization_only_kind(
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Storage error: {err}"))
+    crate::error::store_api_error(err, "Storage error")
 }

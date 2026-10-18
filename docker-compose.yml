@@ -2,9 +2,10 @@
 # Izwi Audio - Production Docker Compose
 # =============================================================================
 #
-# Usage:
-#   CPU:  docker compose up -d
-#   CUDA: docker compose --profile cuda up -d
+# Usage (set IZWI_API_KEY first, e.g. in .env; clients send it as
+# "Authorization: Bearer <key>"):
+#   CPU:  IZWI_API_KEY=... docker compose up -d
+#   CUDA: IZWI_API_KEY=... docker compose --profile cuda up -d
 #
 # =============================================================================
 
@@ -27,6 +28,8 @@ services:
       - izwi-models:/app/models
       - izwi-data:/app/data
     environment:
+      # Required: the container binds 0.0.0.0, so the server needs an API key.
+      - IZWI_API_KEY=${IZWI_API_KEY:-}
       - IZWI_CONFIG_PATH=/app/config.toml
       - IZWI_UI_DIR=/app/ui/dist
       - IZWI_MODELS_DIR=/app/models
@@ -67,6 +70,8 @@ services:
       - izwi-models:/app/models
       - izwi-data:/app/data
     environment:
+      # Required: the container binds 0.0.0.0, so the server needs an API key.
+      - IZWI_API_KEY=${IZWI_API_KEY:-}
       - IZWI_CONFIG_PATH=/app/config.toml
       - IZWI_UI_DIR=/app/ui/dist
       - IZWI_MODELS_DIR=/app/models

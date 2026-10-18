@@ -1,0 +1,63 @@
+# Izwi public API gateway on the same host as the supervisor's workers.
+#
+# The gateway reads its worker approvals from the shared approvals file the
+# supervisor's rollouts edit (/var/lib/izwi/shared-approvals; start it with
+# one standalone line per worker, for example
+#   http://127.0.0.1:9470|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cpu-v1|1
+# ), and its secrets from /etc/izwi/gateway.env, mode 0600:
+#
+#   IZWI_GATEWAY_API_KEY=...                 # public inference key
+#   IZWI_GATEWAY_WORKER_CREDENTIAL_ID=...    # the workers' credential_id
+#   IZWI_GATEWAY_WORKER_BEARER_TOKEN=...     # the workers' bearer token
+#   IZWI_GATEWAY_ADMIN_API_KEY=...           # admin routes (drain, approvals)
+#   IZWI_GATEWAY_ADMIN_API_KEY_REF=env:IZWI_GATEWAY_ADMIN_API_KEY
+#
+# A rollout plan's [gateway_ack] then names http://127.0.0.1:8080 and an
+# environment variable of the supervisor that holds the same admin key.
+#
+# It binds loopback; expose it only through a TLS-terminating proxy (then
+# bind 0.0.0.0 and set IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1). The gateway boots
+# without a reachable worker and adopts workers as they come up, so it does
+# not need to wait for the supervisor.
+
+[Unit]
+Description=Izwi public API gateway
+Documentation=file:///usr/share/doc/izwi/PRODUCTION_SERVING_SINGLE_NODE_RUNBOOK.md
+After=network-online.target izwi-serving-supervisor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=izwi
+Group=izwi
+EnvironmentFile=/etc/izwi/gateway.env
+Environment=IZWI_LOG_FORMAT=json
+Environment=IZWI_GATEWAY_SHARED_APPROVALS_PATH=/var/lib/izwi/shared-approvals
+Environment=IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS=5000
+# A loopback gateway has no load balancer to drain from: no pre-stop window.
+Environment=IZWI_GATEWAY_PRESTOP_SECS=0
+Environment=IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
+# izwi-gateway links no inference engine. `izwi-server --role gateway` with
+# the same flags still works.
+ExecStart=/usr/local/bin/izwi-gateway \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --public-model LFM2.5-1.2B-Instruct-GGUF
+# SIGTERM closes admission and lets accepted responses finish within
+# IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS; streams still open near its end get a
+# terminal "shutting down" event.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/var/lib/izwi
+# Add ReadWritePaths for a SQLite fleet database or the durable principal
+# key store if you enable either.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

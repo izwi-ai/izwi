@@ -49,7 +49,7 @@ use crate::models::architectures::qwen35::fast_path::{compare_values, Qwen35Fast
 use crate::models::architectures::qwen35::linear::forward_shared;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
-/// Opt-in switch (`1`, `on`, `true`).
+/// Opt-in switch (a boolean; off when unset).
 pub(super) const GRAPH_ENV: &str = "IZWI_QWEN35_CUDA_GRAPH";
 
 /// Step buffer layout (U32).
@@ -66,12 +66,7 @@ const WARM_CHECK_REL_L2: f64 = 0.05;
 const WARM_CHECK_MAX_FRACTION: f32 = 0.1;
 
 fn graph_requested() -> bool {
-    std::env::var(GRAPH_ENV).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true"
-        )
-    })
+    crate::env::flag_or(GRAPH_ENV, false)
 }
 
 /// The q/k norm + RoPE + KV write inputs one attention layer needs in the
@@ -1292,8 +1287,9 @@ mod tests {
             ("1", true),
             (" ON ", true),
             ("true", true),
+            (" yes ", true),
             ("0", false),
-            ("auto", false),
+            ("no", false),
         ] {
             std::env::set_var(GRAPH_ENV, value);
             assert_eq!(graph_requested(), expected, "{value}");

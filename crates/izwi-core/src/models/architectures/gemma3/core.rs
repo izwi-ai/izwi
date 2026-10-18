@@ -98,14 +98,7 @@ impl Module for GemmaRmsNorm {
 }
 
 fn gemma_cuda_rms_norm_enabled(device: &Device) -> bool {
-    let override_enabled =
-        std::env::var("IZWI_GEMMA3_CUDA_RMS_NORM")
-            .ok()
-            .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            });
+    let override_enabled = crate::env::flag("IZWI_GEMMA3_CUDA_RMS_NORM");
     gemma_cuda_rms_norm_policy(device.is_cuda(), override_enabled)
 }
 
@@ -672,6 +665,39 @@ impl Gemma3PhysicalModel {
         position: usize,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let (hidden, prepared) = self.prepare_physical_hidden(input_ids, position, cache)?;
+        let sequence = hidden.dim(1)?;
+        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
+        let logits = match self.config.final_logit_softcapping {
+            Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
+            None => logits,
+        };
+        let logits = logits.narrow(1, sequence - 1, 1)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
+    }
+
+    /// Commit a span's KV without projecting logits (a capacity replay).
+    pub(crate) fn prefill_physical(
+        &self,
+        input_ids: &Tensor,
+        position: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let (_hidden, prepared) = self.prepare_physical_hidden(input_ids, position, cache)?;
+        cache.commit_prepared(prepared)?;
+        Ok(())
+    }
+
+    fn prepare_physical_hidden(
+        &self,
+        input_ids: &Tensor,
+        position: usize,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<(
+        Tensor,
+        crate::models::shared::attention::physical::PreparedPhysicalPagedStep,
+    )> {
         let (batch, sequence) = input_ids.dims2()?;
         if batch != 1 || sequence == 0 {
             return Err(Error::InvalidInput(
@@ -698,14 +724,7 @@ impl Gemma3PhysicalModel {
             hidden =
                 layer.forward_physical(&hidden, position, cache, &mut prepared, layer_index)?;
         }
-        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
-        let logits = match self.config.final_logit_softcapping {
-            Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
-            None => logits,
-        };
-        let logits = logits.narrow(1, sequence - 1, 1)?;
-        cache.commit_prepared(prepared)?;
-        Ok(logits)
+        Ok((hidden, prepared))
     }
 
     pub(crate) fn forward_physical_decode_batch(
@@ -767,6 +786,25 @@ impl Gemma3PhysicalModel {
     }
 }
 
+/// The core tests' tiny two-layer Gemma 3 on `device`, with the vocabulary
+/// and position table sized by the caller.
+#[cfg(test)]
+pub(crate) fn tiny_gemma3_model_for_test(
+    device: &Device,
+    vocab_size: usize,
+    max_positions: usize,
+) -> Gemma3PhysicalModel {
+    let mut config = tests::tiny_config();
+    config.vocab_size = vocab_size;
+    config.max_position_embeddings = max_positions;
+    let weights = tests::tiny_weights(&config);
+    Gemma3PhysicalModel::load(
+        config,
+        VarBuilder::from_tensors(weights, DType::F32, device),
+    )
+    .expect("tiny Gemma 3 model")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,7 +815,7 @@ mod tests {
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 
-    fn tiny_config() -> Config {
+    pub(super) fn tiny_config() -> Config {
         Config {
             attention_bias: false,
             head_dim: 2,
@@ -891,7 +929,7 @@ mod tests {
         }
     }
 
-    fn tiny_weights(config: &Config) -> HashMap<String, Tensor> {
+    pub(super) fn tiny_weights(config: &Config) -> HashMap<String, Tensor> {
         let device = &Device::Cpu;
         let mut weights = HashMap::new();
         weights.insert(

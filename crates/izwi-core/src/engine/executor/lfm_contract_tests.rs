@@ -301,3 +301,127 @@ fn sustained_decode_quanta_are_honoured_on_every_backend() {
         assert!(!profile.effective_sustained_decode_quantum(), "{backend:?}");
     }
 }
+
+#[test]
+fn sealed_mixed_step_replaces_the_split_chat_stages() {
+    let variant = ModelVariant::Lfm2512BInstructGguf;
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Metal,
+    )
+    .unwrap();
+    draft.seal_chat_workspace(8192).unwrap();
+    draft.seal_chat_prefill_workspace(1_000, 256).unwrap();
+    // Unsealed, which is every family today: the split stages.
+    for split in draft.execution_contracts(CapabilityKind::Chat).unwrap() {
+        assert!(!split.execution_profile.mixed_step);
+        assert_eq!(split.stages.len(), 2);
+        assert!(split
+            .stages
+            .iter()
+            .all(|stage| stage.batch_mode != crate::engine::NativeBatchMode::Mixed));
+    }
+
+    draft.seal_chat_mixed_step(384).unwrap();
+    draft.seal_chat_mixed_step(384).unwrap();
+    assert!(draft.seal_chat_mixed_step(512).is_err());
+    for mixed in draft.execution_contracts(CapabilityKind::Chat).unwrap() {
+        assert!(mixed.execution_profile.mixed_step);
+        let [stage] = &*mixed.stages else {
+            panic!("a mixed contract publishes exactly one stage");
+        };
+        assert_eq!(stage.name, "chat.step.mixed");
+        assert_eq!(
+            stage.selector,
+            crate::engine::StageWorkSelector::SequenceStep
+        );
+        assert_eq!(stage.batch_mode, crate::engine::NativeBatchMode::Mixed);
+        assert_eq!(stage.shape_policy, crate::engine::StageShapePolicy::Ragged);
+        assert_eq!(stage.max_work_units, 384);
+        assert_eq!(stage.workspace_per_work_unit_bytes, 1_000);
+        let per_row = stage.workspace_per_row_bytes;
+        assert!(per_row > 0);
+        assert_eq!(
+            stage.max_workspace_bytes,
+            1_000 * 384 + per_row * stage.max_batch_size as u64
+        );
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: mixed.execution_group_id,
+            model_instance_id: mixed.model_instance_id,
+            adapter_instance_id: mixed.adapter_instance_id,
+            adapter_abi_revision: mixed.adapter_abi_revision,
+            model_variant: variant,
+            capability_id: "chat".into(),
+            stages: mixed.stages.clone(),
+        };
+        for phase in [SequencePhase::Prefill, SequencePhase::Decode] {
+            let work = WorkUnit::SequenceStep {
+                phase,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+                auxiliary_state: None,
+            };
+            assert_eq!(binding.stage_for_work(&work).unwrap().id, stage.id);
+        }
+    }
+}
+
+/// A request bound to a sealed mixed stage resolves to resumable prefill and
+/// continuous decode rows, the profile the mixed stage requires, so the core
+/// accepts the contract and records the mixed step.
+#[test]
+fn mixed_stage_requests_resolve_to_a_mixed_profile() {
+    let variant = ModelVariant::Lfm2512BInstructGguf;
+    let model = ChatModelLease::for_test(tiny_lfm_model(variant));
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    draft.seal_chat_workspace(8192).unwrap();
+    draft.seal_chat_prefill_workspace(1_000, 256).unwrap();
+    draft.seal_chat_mixed_step(384).unwrap();
+    for contract in draft.execution_contracts(CapabilityKind::Chat).unwrap() {
+        let mut request = EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::User,
+            content: "Hello".into(),
+        }]);
+        request.model_variant = Some(variant);
+        request
+            .install_chat_execution_preparation_with_model(
+                variant,
+                vec![1, 0],
+                None,
+                model.clone(),
+                32,
+            )
+            .unwrap();
+        request
+            .bind_execution_adapter(ExecutionAdapterBinding {
+                execution_group_id: contract.execution_group_id,
+                model_instance_id: contract.model_instance_id,
+                adapter_instance_id: contract.adapter_instance_id,
+                adapter_abi_revision: contract.adapter_abi_revision,
+                model_variant: variant,
+                capability_id: "chat".into(),
+                stages: contract.stages,
+            })
+            .unwrap();
+        // Chunked prefill stays off: the mixed stage alone makes prefill
+        // resumable.
+        let executor = NativeExecutor::new(WorkerConfig::default());
+        let profile = executor.execution_profile(&request).unwrap();
+        assert_eq!(profile.prefill, crate::engine::PrefillMode::Incremental);
+        assert_eq!(profile.decode_batch, NativeBatchMode::Continuous);
+        let profile =
+            crate::engine::core::EngineCore::apply_adapter_execution_contract(&request, profile)
+                .unwrap();
+        assert!(profile.mixed_step);
+    }
+}

@@ -143,6 +143,12 @@ export interface ChatThreadSendMessageRequest {
   top_k?: number;
   repetition_penalty?: number;
   presence_penalty?: number;
+  /**
+   * `"auto"` lets the server drop the thread's oldest turns once it outgrows
+   * the model's context; `"disabled"` (the server default) rejects the
+   * message instead.
+   */
+  truncation?: "auto" | "disabled";
 }
 
 export interface ChatThreadSendMessageResponse {
@@ -445,6 +451,7 @@ export class ChatApiClient {
           top_k: request.top_k,
           repetition_penalty: request.repetition_penalty,
           presence_penalty: request.presence_penalty,
+          truncation: request.truncation,
         }),
       },
     );
@@ -484,6 +491,7 @@ export class ChatApiClient {
               top_k: request.top_k,
               repetition_penalty: request.repetition_penalty,
               presence_penalty: request.presence_penalty,
+              truncation: request.truncation,
             }),
             signal: abortController.signal,
           },

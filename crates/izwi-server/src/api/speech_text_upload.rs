@@ -68,6 +68,7 @@ pub(crate) fn multipart_upload_api_error(
                 "Failed reading multipart '{}' field: {}. {} uploads are limited to {} MiB; upload the original compressed file when possible.",
                 field_name, raw, route_label, limit_mb
             ),
+            detail: None,
         };
     }
 
@@ -82,12 +83,14 @@ This is commonly caused by oversized uploads or malformed multipart boundaries. 
 Ensure `Content-Type` includes a valid boundary (let your HTTP client set it automatically for FormData) and keep payload under {} MiB.",
                 field_name, raw, limit_mb
             ),
+            detail: None,
         };
     }
 
     ApiError {
         status,
         message: format!("Failed reading multipart '{}' field: {}", field_name, raw),
+        detail: None,
     }
 }
 

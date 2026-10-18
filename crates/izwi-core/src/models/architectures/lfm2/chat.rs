@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{Tensor, D};
 use serde::Deserialize;
 use tracing::info;
 
@@ -18,9 +18,12 @@ use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
+use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::sampling::ChatSampler;
+use crate::models::shared::chat::{
+    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRole,
+};
+use crate::models::shared::sampling::{sample_chat_rows_guarded, ChatSampler};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -37,7 +40,6 @@ pub struct ChatDecodeState {
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    greedy: bool,
     decoder: IncrementalDecoder,
     stop_reason: Option<&'static str>,
     assembled: String,
@@ -45,9 +47,35 @@ pub struct ChatDecodeState {
     finished: bool,
     position: usize,
     prefill_progress: usize,
+    /// Cache length a capacity replay is rebuilding; the state decodes again
+    /// once its cache and ShortConv state reach it.
+    replay_end: Option<usize>,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+}
+
+/// CPU continuation record of a session released for capacity: the
+/// generated-token journal (the prompt is the request's own) and the sampler
+/// and text state at a quantum boundary. It owns no tensors; the released KV
+/// pages and ShortConv state are rebuilt by replaying the prompt and every
+/// generated token but the pending one.
+#[derive(Clone)]
+pub(crate) struct Lfm2ChatReplayCheckpoint {
+    replay_tokens: usize,
+    pending_token: u32,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    decoder: IncrementalDecoder,
+    assembled: String,
+    max_new_tokens: usize,
+}
+
+impl Lfm2ChatReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.replay_tokens
+    }
 }
 
 pub(crate) struct Lfm2ChatDecodeCheckpoint {
@@ -57,13 +85,21 @@ pub(crate) struct Lfm2ChatDecodeCheckpoint {
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    greedy: bool,
     decoder: IncrementalDecoder,
     stop_reason: Option<&'static str>,
     assembled: String,
     finished: bool,
     position: usize,
     prefill_progress: usize,
+}
+
+/// One prefill row of a mixed step: the prompt span `[span_start,
+/// span_end)` that continues `state`'s resumable prefill.
+pub(crate) struct MixedPrefillRow<'s, 'p> {
+    pub(crate) state: &'s mut ChatDecodeState,
+    pub(crate) prompt: &'p [u32],
+    pub(crate) span_start: usize,
+    pub(crate) span_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +120,37 @@ impl ChatDecodeState {
         self.prefill_progress
     }
 
+    /// The replay a capacity suspension still has to rebuild, if any.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay_end
+    }
+
+    /// Capture the CPU continuation record at a quantum boundary, before the
+    /// caller releases the KV pages and ShortConv state.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Lfm2ChatReplayCheckpoint> {
+        let replay_tokens = self.replay_end.unwrap_or(self.position);
+        let pending_token = self.pending_token.filter(|_| {
+            !self.finished
+                && self.unconsumed_output.is_none()
+                && replay_tokens + 1 == self.prefill_progress + self.generated_ids.len()
+        });
+        let Some(pending_token) = pending_token else {
+            return Err(Error::InvalidInput(
+                "an LFM2 session suspends only between decode quanta".into(),
+            ));
+        };
+        Ok(Lfm2ChatReplayCheckpoint {
+            replay_tokens,
+            pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            decoder: self.decoder.clone(),
+            assembled: self.assembled.clone(),
+            max_new_tokens: self.max_new_tokens,
+        })
+    }
+
     pub(crate) fn begin_managed_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -102,7 +169,6 @@ impl ChatDecodeState {
             pending_token: self.pending_token,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
-            greedy: self.greedy,
             decoder: self.decoder.clone(),
             stop_reason: self.stop_reason,
             assembled: self.assembled.clone(),
@@ -134,7 +200,6 @@ impl ChatDecodeState {
         self.pending_token = checkpoint.pending_token;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
-        self.greedy = checkpoint.greedy;
         self.decoder = checkpoint.decoder;
         self.stop_reason = checkpoint.stop_reason;
         self.assembled = checkpoint.assembled;
@@ -518,16 +583,92 @@ impl Lfm2ChatModel {
             ),
             // A JSON-constrained row must sample through the grammar, so it
             // never takes the batched argmax shortcut.
-            greedy: is_plain_greedy(config) && !config.constrain_json_object,
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             stop_reason: None,
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             position: 0,
             prefill_progress: 0,
+            replay_end: None,
             pending_logprobs: Vec::new(),
         })
+    }
+
+    /// Start rebuilding a suspended session in an empty reservation and a
+    /// fresh ShortConv state. The state decodes again after
+    /// [`Self::continue_replay`] reaches the end of the checkpoint's replay.
+    pub(crate) fn begin_replay_managed(
+        &self,
+        saved: &Lfm2ChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0 || saved.replay_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 replay requires an empty reservation and a non-empty journal".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            shortconv: self.text_model.new_shortconv_state(),
+            physical_kv: cache,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: Some(saved.pending_token),
+            generated_ids: saved.generated_ids.clone(),
+            sampler: saved.sampler.clone(),
+            decoder: saved.decoder.clone(),
+            stop_reason: None,
+            assembled: saved.assembled.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            position: 0,
+            prefill_progress: saved.prefill_progress,
+            replay_end: Some(saved.replay_tokens),
+            pending_logprobs: Vec::new(),
+        })
+    }
+
+    /// Write `[span_start, span_end)` of the replay journal (the prompt, then
+    /// the generated tokens) into the KV pages and ShortConv state without
+    /// sampling or emitting. Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let replay_end = state
+            .replay_end
+            .ok_or_else(|| Error::InvalidInput("LFM2 state has no pending replay".into()))?;
+        if span_start != state.position
+            || span_start != state.physical_kv.context_len()
+            || state.shortconv.cursor() != span_start as u64
+            || span_start >= span_end
+            || span_end > replay_end
+            || prompt_ids.len() != state.prefill_progress
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2 replay span [{span_start},{span_end}) does not continue cursor {} of {replay_end}",
+                state.position
+            )));
+        }
+        record_prefill_sequence_span(span_end - span_start);
+        let ids = replay_journal_span(prompt_ids, &state.generated_ids, span_start, span_end)?;
+        let input = Tensor::from_vec(ids, (1, span_end - span_start), &self.device.device)?;
+        self.text_model.forward_tokens_retained(
+            &input,
+            span_start,
+            &mut state.physical_kv,
+            &mut state.shortconv,
+            false,
+        )?;
+        state.position = span_end;
+        let complete = span_end == replay_end;
+        if complete {
+            state.replay_end = None;
+        }
+        Ok(complete)
     }
 
     pub(crate) fn continue_resumable_prefill_managed(
@@ -575,6 +716,11 @@ impl Lfm2ChatModel {
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.replay_end.is_some() {
+            return Err(Error::InferenceError(
+                "LFM2 decode cannot run before its replay completes".into(),
+            ));
+        }
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
             let reason = *state.stop_reason.get_or_insert("length");
@@ -749,6 +895,7 @@ impl Lfm2ChatModel {
                 || state.generated_ids.len() >= state.max_new_tokens
                 || state.unconsumed_output.is_some()
                 || state.pending_token.is_none()
+                || state.replay_end.is_some()
                 || state.physical_kv.context_len() != state.position
                 || state.shortconv.cursor() != state.position as u64
             {
@@ -801,11 +948,178 @@ impl Lfm2ChatModel {
         Ok(steps)
     }
 
-    /// Next token per row from finite, width-checked logits. Plain greedy
-    /// rows read their argmax and the finite flag back in one transfer;
-    /// sampled rows sample first and then read the flag from an idle device,
-    /// so either way the step synchronizes once. No token is accepted from
-    /// non-finite logits.
+    /// One mixed step: `decode` rows take one token each and every
+    /// `prefill` row continues its resumable prefill over `[span_start,
+    /// span_end)`, in one model forward and one sampling readback. Returns
+    /// each decode row's step, and for each prefill row its bootstrap token
+    /// when the span ends the prompt. A step of only decode rows, or of one
+    /// prefill row, is exactly the split path's call.
+    pub(crate) fn step_mixed(
+        &self,
+        decode: &mut [&mut ChatDecodeState],
+        prefill: &mut [MixedPrefillRow<'_, '_>],
+    ) -> Result<(Vec<ChatDecodeStep>, Vec<Option<ChatDecodeStep>>)> {
+        match (decode.is_empty(), &mut *prefill) {
+            (_, []) => return Ok((self.decode_step_batch(decode)?, Vec::new())),
+            (true, [row]) => {
+                let complete = self.continue_resumable_prefill_managed(
+                    &mut *row.state,
+                    row.prompt,
+                    row.span_start,
+                    row.span_end,
+                )?;
+                let bootstrap = complete
+                    .then(|| self.decode_step(&mut *row.state))
+                    .transpose()?;
+                return Ok((Vec::new(), vec![bootstrap]));
+            }
+            _ => {}
+        }
+        for state in decode.iter() {
+            if state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.replay_end.is_some()
+                || state.physical_kv.context_len() != state.position
+                || state.shortconv.cursor() != state.position as u64
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2 mixed step contains a non-decodable decode row".into(),
+                ));
+            }
+        }
+        for row in prefill.iter() {
+            let state = &*row.state;
+            if state.prefill_progress != row.span_start
+                || row.span_start >= row.span_end
+                || row.span_end > row.prompt.len()
+                || state.physical_kv.context_len() != row.span_start
+                || state.shortconv.cursor() != row.span_start as u64
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_some()
+                || state.finished
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2 mixed prefill span does not match its retained state".into(),
+                ));
+            }
+        }
+        let mut spans = Vec::with_capacity(decode.len() + prefill.len());
+        let mut tokens = Vec::with_capacity(decode.len());
+        for state in decode.iter_mut() {
+            spans.push(MixedRowSpan {
+                start_pos: state.position,
+                q_len: 1,
+            });
+            tokens.push(state.pending_token.take().expect("pending token checked"));
+        }
+        for row in prefill.iter() {
+            record_prefill_sequence_span(row.span_end - row.span_start);
+            spans.push(MixedRowSpan {
+                start_pos: row.span_start,
+                q_len: row.span_end - row.span_start,
+            });
+            tokens.extend_from_slice(&row.prompt[row.span_start..row.span_end]);
+        }
+        let completes = prefill
+            .iter()
+            .map(|row| row.span_end == row.prompt.len())
+            .collect::<Vec<_>>();
+        let sample_rows = (0..decode.len())
+            .chain(
+                completes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, complete)| **complete)
+                    .map(|(row, _)| decode.len() + row),
+            )
+            .collect::<Vec<_>>();
+        let layout = MixedRowLayout::new(spans, decode.len())?;
+        // As in a decode step, the KV writes and ShortConv states commit only
+        // after the sampled tokens are read back: one synchronization.
+        let (logits, pending) = {
+            let shortconv = decode
+                .iter()
+                .map(|state| &state.shortconv)
+                .chain(prefill.iter().map(|row| &row.state.shortconv))
+                .collect::<Vec<_>>();
+            let caches = decode
+                .iter()
+                .map(|state| &state.physical_kv)
+                .chain(prefill.iter().map(|row| &row.state.physical_kv))
+                .collect::<Vec<_>>();
+            self.text_model.forward_token_ids_mixed_deferred(
+                &tokens,
+                layout,
+                &shortconv,
+                &caches,
+                &sample_rows,
+            )?
+        };
+        let next_tokens = match logits {
+            Some(logits) => {
+                let mut sampled = decode
+                    .iter_mut()
+                    .map(|state| &mut **state)
+                    .chain(
+                        prefill
+                            .iter_mut()
+                            .zip(&completes)
+                            .filter(|(_, complete)| **complete)
+                            .map(|(row, _)| &mut *row.state),
+                    )
+                    .collect::<Vec<_>>();
+                match self.select_batch_tokens(&mut sampled, &logits) {
+                    Ok(next_tokens) => next_tokens,
+                    Err(error) => return Err(pending.abort_with(error)),
+                }
+            }
+            None => Vec::new(),
+        };
+        {
+            let mut shortconv = Vec::with_capacity(decode.len() + prefill.len());
+            let mut caches = Vec::with_capacity(decode.len() + prefill.len());
+            for state in decode
+                .iter_mut()
+                .map(|state| &mut **state)
+                .chain(prefill.iter_mut().map(|row| &mut *row.state))
+            {
+                shortconv.push(&mut state.shortconv);
+                caches.push(&mut state.physical_kv);
+            }
+            pending.commit(&mut shortconv, &mut caches)?;
+        }
+        for state in decode.iter_mut() {
+            state.position += 1;
+        }
+        for row in prefill.iter_mut() {
+            row.state.prefill_progress = row.span_end;
+            row.state.position = row.span_end;
+        }
+        let mut next_tokens = next_tokens.into_iter();
+        let mut accept = |state: &mut ChatDecodeState, committed| {
+            let (next, entry) = next_tokens
+                .next()
+                .ok_or_else(|| Error::InferenceError("LFM2 mixed step lost a row".into()))?;
+            self.accept_token(state, next, committed, entry)
+        };
+        let decode_steps = decode
+            .iter_mut()
+            .map(|state| accept(state, 1))
+            .collect::<Result<Vec<_>>>()?;
+        let prefill_steps = prefill
+            .iter_mut()
+            .zip(completes)
+            .map(|(row, complete)| complete.then(|| accept(&mut *row.state, 0)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((decode_steps, prefill_steps))
+    }
+
+    /// Next token per row from finite, width-checked logits. Every row
+    /// samples from one readback that also carries the finite flag, so the
+    /// step synchronizes once, and no token is accepted (and no sampler
+    /// advances) from non-finite logits.
     fn select_batch_tokens(
         &self,
         states: &mut [&mut ChatDecodeState],
@@ -814,28 +1128,36 @@ impl Lfm2ChatModel {
         self.tokenizer.validate_logits_width(logits)?;
         let finite = diagnostics::finite_flag(logits)?;
         let masked = self.mask_non_generatable(logits)?;
-        // DS9.3: rows collecting logprobs must sample through the resolving
-        // path, which forfeits the batched argmax for the whole envelope.
-        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
-        if states.iter().all(|state| state.greedy) && !wants_logprobs {
-            let (ids, all_finite) = packed_greedy_selection(
-                &masked.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?,
-                &finite,
-            )?;
-            if !all_finite {
-                return Err(diagnostics::non_finite_error(logits, logits_stage()));
-            }
-            return Ok(ids.into_iter().map(|id| (id, None)).collect());
-        }
-        let mut sampled = Vec::with_capacity(states.len());
-        for (row, state) in states.iter_mut().enumerate() {
-            let row_logits = masked.i(row)?;
-            sampled.push(self.sample_token(state, &row_logits)?);
-        }
-        if finite.to_vec1::<f32>()?[0] == 0.0 {
+        let mut samplers = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_logprobs.clear();
+                &mut state.sampler
+            })
+            .collect::<Vec<_>>();
+        let Some(sampled) = sample_chat_rows_guarded(
+            &mut samplers,
+            &masked,
+            self.tokenizer.vocab_size,
+            Some(&finite),
+        )?
+        else {
             return Err(diagnostics::non_finite_error(logits, logits_stage()));
-        }
-        Ok(sampled)
+        };
+        sampled
+            .into_iter()
+            .map(|(token, raw)| {
+                let entry = raw
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
+                Ok((token, entry))
+            })
+            .collect()
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -976,14 +1298,6 @@ fn validate_generation_config(config: &ChatGenerationConfig) -> Result<()> {
     Ok(())
 }
 
-fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
-    config.temperature <= 1e-5
-        && config.top_k == 0
-        && config.top_p >= 1.0
-        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        && config.presence_penalty.abs() <= f32::EPSILON
-}
-
 /// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
 /// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
 /// kept. Object keys follow `serde_json`'s map order.
@@ -1099,21 +1413,6 @@ fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<
 /// Per-row argmax of `[B, V]` logits read back with a device-side `[1]`
 /// finite flag in one transfer: `(tokens, all_finite)`. Ties pick the first
 /// maximum. Token ids are below 2^24, so the F32 round trip is exact.
-fn packed_greedy_selection(logits: &Tensor, finite: &Tensor) -> Result<(Vec<u32>, bool)> {
-    let (rows, _) = logits.dims2()?;
-    let ids = logits.argmax(D::Minus1)?.to_dtype(DType::F32)?;
-    let packed = Tensor::cat(&[&ids, finite], 0)?.to_vec1::<f32>()?;
-    if packed.len() != rows + 1 {
-        return Err(Error::InferenceError(
-            "LFM2 packed greedy readback has the wrong length".into(),
-        ));
-    }
-    Ok((
-        packed[..rows].iter().map(|id| *id as u32).collect(),
-        packed[rows] != 0.0,
-    ))
-}
-
 /// The template's `content.split("</think>")[-1] | trim` for past assistant
 /// turns; content without `</think>` is kept verbatim.
 fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
@@ -1155,29 +1454,6 @@ mod tests {
     use super::{
         has_token_repetition_loop, should_check_repetition_loop, strip_past_assistant_thinking,
     };
-
-    #[test]
-    fn lfm2_packed_greedy_tokens_pick_the_first_maximum_per_row() {
-        use candle_core::{Device, Tensor};
-        let logits = Tensor::from_vec(
-            vec![1f32, 4., 2., 4., -3., -2., -1., -4., 9., 2., 1., 0.],
-            (3, 4),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let finite = super::diagnostics::finite_flag(&logits).unwrap();
-        assert_eq!(
-            super::packed_greedy_selection(&logits, &finite).unwrap(),
-            (vec![1, 2, 0], true)
-        );
-        assert_eq!(
-            super::packed_greedy_selection(&logits.narrow(0, 1, 1).unwrap(), &finite).unwrap(),
-            (vec![2], true)
-        );
-        let bad = Tensor::from_vec(vec![1f32, f32::NAN], (1, 2), &Device::Cpu).unwrap();
-        let bad_finite = super::diagnostics::finite_flag(&bad).unwrap();
-        assert!(!super::packed_greedy_selection(&bad, &bad_finite).unwrap().1);
-    }
 
     #[test]
     fn tool_json_uses_python_json_dumps_spacing() {
@@ -1253,6 +1529,12 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_integrity_tests.rs"]
 mod integrity_tests;
+
+/// A tiny LFM2 chat model with xorshift weights from `seed`.
+#[cfg(test)]
+pub(crate) fn tiny_lfm_model_for_test(seed: u64) -> Lfm2ChatModel {
+    integrity_tests::random_tiny_lfm_model(seed)
+}
 
 #[cfg(test)]
 #[path = "chat_reference_tests.rs"]

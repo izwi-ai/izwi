@@ -11,8 +11,7 @@ use serde::Serialize;
 use crate::batch_runtime::store::{current_timestamp_millis, RuntimeQueueHealthSnapshot};
 use crate::media_ingest::MediaIngestLaneSnapshot;
 use crate::state::{AppState, RealtimeSessionAdmissionSnapshot, RequestAdmissionSnapshot};
-
-const DEFAULT_BATCH_HEARTBEAT_STALE_SECS: u64 = 5;
+use izwi_core::RuntimeHealth;
 
 #[derive(Debug, Serialize)]
 pub struct ProbeCheck {
@@ -27,11 +26,17 @@ pub struct LiveResponse {
     pub status: &'static str,
     pub version: &'static str,
     pub uptime_secs: u64,
-    /// The inference runtime's resource authority is poisoned: new physical
-    /// work is rejected until the backend is recreated or fully drains.
-    /// Omitted while healthy so existing pollers see the old shape.
+    /// The inference runtime rejects new physical work: it is poisoned until
+    /// the backend is recreated or, for a resource-authority poison alone,
+    /// fully drains. Omitted while healthy so existing pollers see the old
+    /// shape.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub runtime_poisoned: bool,
+    /// Why the runtime failed permanently (a panic after native entry or a
+    /// latched fatal device fault). Only process recreation recovers, so
+    /// liveness answers 503 while this is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_failure: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,19 +56,37 @@ pub struct ReadyResponse {
     pub startup_warnings: Vec<String>,
 }
 
-pub async fn live_check(State(state): State<AppState>) -> Json<LiveResponse> {
+pub async fn live_check(State(state): State<AppState>) -> Response {
     let lifecycle = state.lifecycle.snapshot();
     // Liveness is polled aggressively (the desktop app every 200ms during
     // startup, the poison monitor every 10s), so it must stay off the heavy
-    // telemetry path: the poison flag is a cheap coordinator snapshot read,
-    // not a full `telemetry_snapshot()` that walks every model registry.
-    let runtime_poisoned = state.runtime.coordinator_snapshot().poisoned;
-    Json(LiveResponse {
-        status: "alive",
+    // telemetry path: runtime health is a cheap coordinator read, not a full
+    // `telemetry_snapshot()` that walks every model registry.
+    let health = state.runtime.health();
+    // Only a permanent failure fails liveness: a resource-authority poison
+    // alone clears once the backend drains, so restarting for it would only
+    // throw away resident models. Saturation never affects liveness.
+    let runtime_failure = match &health {
+        RuntimeHealth::Failed { reason } => Some(reason.clone()),
+        RuntimeHealth::Healthy | RuntimeHealth::Degraded { .. } => None,
+    };
+    let status = if runtime_failure.is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    let response = LiveResponse {
+        status: if runtime_failure.is_some() {
+            "failed"
+        } else {
+            "alive"
+        },
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: now_saturating_sub(lifecycle.started_at),
-        runtime_poisoned,
-    })
+        runtime_poisoned: !health.is_healthy(),
+        runtime_failure,
+    };
+    (status, Json(response)).into_response()
 }
 
 pub async fn ready_check(State(state): State<AppState>) -> Response {
@@ -81,7 +104,11 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
     let backend_context = state.runtime.backend_context();
     let telemetry = state.runtime.telemetry_snapshot().await;
     let startup_warnings = lifecycle.startup_warnings.clone();
-    let preload_complete = startup_warnings.is_empty();
+    // Startup maintenance warnings are reported, not gating: the live store
+    // checks below decide readiness. A configured model that failed to
+    // preload or warm up still keeps the server unready.
+    let preload_complete = lifecycle.preload_failures.is_empty();
+    let health = state.runtime.health();
     let request_admission = state.request_admission_snapshot();
     let realtime_session_admission = state.realtime_session_admission_snapshot();
     let media_ingest = state.media_ingest.lane_snapshot();
@@ -106,23 +133,24 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         },
         ProbeCheck {
             name: "runtime_accepting_work",
-            ok: !telemetry.coordinator.draining && !telemetry.coordinator.poisoned,
-            message: if telemetry.coordinator.poisoned {
-                Some(
-                    "runtime inference backend is poisoned; new work is rejected until it is recreated or fully drains"
-                        .to_string(),
-                )
-            } else {
-                telemetry
+            ok: !telemetry.coordinator.draining && health.is_healthy(),
+            message: match &health {
+                RuntimeHealth::Failed { reason } => Some(format!(
+                    "runtime inference backend failed permanently and must be recreated: {reason}"
+                )),
+                RuntimeHealth::Degraded { reason } => Some(format!(
+                    "runtime inference backend is poisoned; new work is rejected until it fully drains: {reason}"
+                )),
+                RuntimeHealth::Healthy => telemetry
                     .coordinator
                     .draining
-                    .then(|| "runtime inference coordinator is draining".to_string())
+                    .then(|| "runtime inference coordinator is draining".to_string()),
             },
         },
         ProbeCheck {
             name: "preload_complete",
             ok: preload_complete,
-            message: (!preload_complete).then(|| startup_warnings.join("; ")),
+            message: (!preload_complete).then(|| lifecycle.preload_failures.join("; ")),
         },
         ProbeCheck {
             name: "backend_available",
@@ -140,13 +168,10 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
             ok: true,
             message: None,
         },
-        ProbeCheck {
-            name: "request_capacity",
-            ok: request_admission.global.available > 0,
-            message: (request_admission.global.available == 0)
-                .then(|| "all request permits are currently in use".to_string()),
-        },
     ];
+    // Every request permit in use is backpressure, not unreadiness: failing
+    // readiness at saturation would pull every busy replica out of the load
+    // balancer at once. Saturation stays visible in `request_admission`.
 
     let worker_healthy = telemetry.worker_panics <= telemetry.worker_restarts;
     checks.push(ProbeCheck {
@@ -253,12 +278,7 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
 }
 
 pub(super) fn resolve_batch_heartbeat_stale_after_ms() -> u64 {
-    std::env::var("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_BATCH_HEARTBEAT_STALE_SECS)
-        .saturating_mul(1_000)
+    crate::env_config::tuning().batch_worker_heartbeat_stale_ms
 }
 
 fn now_saturating_sub(started_at: u64) -> u64 {
@@ -325,39 +345,96 @@ mod tests {
             .any(|check| check.name == "runtime_accepting_work" && !check.ok));
     }
 
+    async fn live_body(state: &AppState) -> (StatusCode, serde_json::Value) {
+        let response = live_check(State(state.clone())).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     #[tokio::test]
     async fn liveness_reports_runtime_poison_only_when_poisoned() {
         let (_guard, state) = test_state("liveness_runtime_poison");
         state.lifecycle.mark_ready();
 
-        assert!(!state.runtime.coordinator_snapshot().poisoned);
+        let (status, body) = live_body(&state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "alive");
+        assert!(body.get("runtime_poisoned").is_none());
+        assert!(body.get("runtime_failure").is_none());
 
         // The poisoned shape is exercised at the serde boundary: the flag is
         // omitted while healthy and present while poisoned.
-        let healthy = serde_json::to_string(&LiveResponse {
-            status: "alive",
-            version: "0.0.0-test",
-            uptime_secs: 1,
-            runtime_poisoned: false,
-        })
-        .unwrap();
-        assert!(!healthy.contains("runtime_poisoned"));
         let poisoned = serde_json::to_string(&LiveResponse {
             status: "alive",
             version: "0.0.0-test",
             uptime_secs: 1,
             runtime_poisoned: true,
+            runtime_failure: None,
         })
         .unwrap();
         assert!(poisoned.contains("\"runtime_poisoned\":true"));
+        assert!(!poisoned.contains("runtime_failure"));
     }
 
     #[tokio::test]
-    async fn readiness_reports_unready_when_startup_warnings_exist() {
-        let (_guard, state) = test_state("readiness_startup_warnings");
+    async fn latched_device_fault_fails_liveness_and_readiness() {
+        let (_guard, state) = test_state("probes_device_fault");
+        state.lifecycle.mark_ready();
+        assert!(readiness_response(&state).await.ready);
+
+        let fault = izwi_core::Error::InferenceError(
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"
+                .into(),
+        );
+        assert!(state.runtime.latch_device_fault_for_test(&fault));
+
+        let (status, body) = live_body(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["runtime_poisoned"], true);
+        assert!(body["runtime_failure"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("CUDA_ERROR_ILLEGAL_ADDRESS")));
+
+        let response = readiness_response(&state).await;
+        assert!(!response.ready);
+        assert!(response.checks.iter().any(|check| {
+            check.name == "runtime_accepting_work"
+                && !check.ok
+                && check
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("failed permanently"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn readiness_stays_ready_when_every_request_permit_is_in_use() {
+        let (_guard, state) = test_state("readiness_permits_full");
+        state.lifecycle.mark_ready();
+        let capacity = state.request_semaphore.available_permits();
+        let _all = state
+            .request_semaphore
+            .clone()
+            .try_acquire_many_owned(capacity as u32)
+            .expect("every request permit");
+
+        let response = readiness_response(&state).await;
+
+        assert_eq!(response.request_admission.global.available, 0);
+        assert!(response.ready);
+        assert!(response.checks.iter().all(|check| check.ok));
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_unready_when_a_configured_model_failed_to_preload() {
+        let (_guard, state) = test_state("readiness_preload_failure");
         state
             .lifecycle
-            .record_startup_warnings(vec!["failed to preload model test".to_string()]);
+            .record_preload_failures(vec!["failed to preload model test".to_string()]);
         state.lifecycle.mark_ready();
 
         let response = readiness_response(&state).await;
@@ -372,6 +449,21 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "preload_complete" && !check.ok));
+    }
+
+    #[tokio::test]
+    async fn startup_maintenance_warnings_are_reported_without_failing_readiness() {
+        let (_guard, state) = test_state("readiness_startup_warnings");
+        state.lifecycle.record_startup_warnings(vec![
+            "Failed to reconcile speech history records during startup: busy".to_string(),
+        ]);
+        state.lifecycle.mark_ready();
+
+        let response = readiness_response(&state).await;
+
+        assert!(response.ready);
+        assert_eq!(response.startup_warnings.len(), 1);
+        assert!(response.checks.iter().all(|check| check.ok));
     }
 
     #[tokio::test]

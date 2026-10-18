@@ -1293,7 +1293,15 @@ fn validate_pipeline_sample_count(samples: usize) -> Result<()> {
     Ok(())
 }
 
+/// The long-form chunk plan, with its `IZWI_ASR_CHUNK_*` overrides read once
+/// per process.
 fn pipeline_chunk_config() -> AsrLongFormConfig {
+    static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
+        crate::env::ReadOnce::new(pipeline_chunk_config_from_env);
+    CONFIG.get()
+}
+
+fn pipeline_chunk_config_from_env() -> AsrLongFormConfig {
     let mut cfg = AsrLongFormConfig::default();
     if let Some(v) = env_positive_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
         cfg.target_chunk_secs = v;
@@ -1312,13 +1320,16 @@ fn pipeline_chunk_config() -> AsrLongFormConfig {
 const DEFAULT_PIPELINE_CAPACITY_WAIT: Duration = Duration::from_secs(120);
 
 /// [`DEFAULT_PIPELINE_CAPACITY_WAIT`], or `IZWI_DIARIZATION_CAPACITY_WAIT_SECS`
-/// (0 fails at once).
+/// (0 fails at once), read once per process.
 fn pipeline_capacity_wait() -> Duration {
-    std::env::var("IZWI_DIARIZATION_CAPACITY_WAIT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-        .unwrap_or(DEFAULT_PIPELINE_CAPACITY_WAIT)
+    static WAIT: crate::env::ReadOnce<Duration> = crate::env::ReadOnce::new(|| {
+        std::env::var("IZWI_DIARIZATION_CAPACITY_WAIT_SECS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+            .unwrap_or(DEFAULT_PIPELINE_CAPACITY_WAIT)
+    });
+    WAIT.get()
 }
 
 fn env_positive_f32(key: &str) -> Option<f32> {

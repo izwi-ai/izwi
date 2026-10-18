@@ -229,46 +229,34 @@ pub struct RuntimeWorkerHeartbeatDetails {
 #[derive(Default)]
 pub enum RuntimeJobStatus {
     #[default]
-    Created,
     Queued,
     Running,
-    Paused,
     Retrying,
-    Postprocessing,
     Completed,
     Failed,
     Cancelled,
-    Expired,
 }
 
 impl RuntimeJobStatus {
     pub const fn as_db_value(self) -> &'static str {
         match self {
-            Self::Created => "created",
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::Paused => "paused",
             Self::Retrying => "retrying",
-            Self::Postprocessing => "postprocessing",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
         }
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
-            "created" => Some(Self::Created),
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
             "retrying" => Some(Self::Retrying),
-            "postprocessing" => Some(Self::Postprocessing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
-            "expired" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -279,49 +267,34 @@ impl RuntimeJobStatus {
 #[derive(Default)]
 pub enum RuntimeStageStatus {
     #[default]
-    Created,
     Queued,
     Running,
-    Paused,
     Retrying,
-    Postprocessing,
     Completed,
     Failed,
     Cancelled,
-    Expired,
-    Skipped,
 }
 
 impl RuntimeStageStatus {
     pub const fn as_db_value(self) -> &'static str {
         match self {
-            Self::Created => "created",
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::Paused => "paused",
             Self::Retrying => "retrying",
-            Self::Postprocessing => "postprocessing",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
-            Self::Skipped => "skipped",
         }
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
-            "created" => Some(Self::Created),
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
             "retrying" => Some(Self::Retrying),
-            "postprocessing" => Some(Self::Postprocessing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
-            "expired" => Some(Self::Expired),
-            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -569,19 +542,6 @@ pub struct RuntimeArtifact {
     pub sha256: Option<String>,
     pub metadata_json: serde_json::Value,
     pub retention_policy: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IdempotencyRecord {
-    pub operation: String,
-    pub idempotency_key: String,
-    pub created_at: u64,
-    pub expires_at: Option<u64>,
-    pub request_hash: String,
-    pub response_json: Option<serde_json::Value>,
-    pub runtime_job_id: Option<String>,
-    pub conflict_message: Option<String>,
-    pub metadata_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

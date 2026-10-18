@@ -4607,8 +4607,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_voxtral_numeric_probe_in_f16_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_voxtral_numeric_probe_in_f16_tracks_cpu_f32",
+        ) else {
             return;
         };
         assert_voxtral_probe_tracks_f32(&device, DType::F16);

@@ -1904,6 +1904,7 @@ impl Lfm25AudioModel {
         cache: &mut PhysicalPagedKvCache,
         shortconv: &mut InvocationTensorLease,
         depthformer_cache: &mut PhysicalPagedKvCache,
+        should_stop: &mut dyn FnMut() -> bool,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<Lfm25AudioGenerationOutput> {
@@ -1948,6 +1949,13 @@ impl Lfm25AudioModel {
                 let max_new_tokens = max_new_tokens.max(1);
 
                 while tokens_generated < max_new_tokens {
+                    // A barge-in or disconnect stops the reply at the next
+                    // token instead of running it to its end (SPK-F5).
+                    if should_stop() {
+                        return Err(Error::Cancelled(
+                            "LFM2.5 Audio interleaved generation cancelled".to_string(),
+                        ));
+                    }
                     modality_left = modality_left.saturating_sub(1);
                     if !in_audio {
                         let next = sample_from_logits(
@@ -2399,7 +2407,12 @@ pub(super) fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> b
 }
 
 fn lfm25_asr_stop_check_interval() -> usize {
-    lfm25_asr_stop_check_interval_from_env(std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL").ok())
+    static INTERVAL: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        lfm25_asr_stop_check_interval_from_env(
+            std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL").ok(),
+        )
+    });
+    INTERVAL.get()
 }
 
 fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
@@ -2410,9 +2423,12 @@ fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
 }
 
 fn lfm25_tts_audio_stop_check_interval() -> usize {
-    lfm25_tts_audio_stop_check_interval_from_env(
-        std::env::var("IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL").ok(),
-    )
+    static INTERVAL: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        lfm25_tts_audio_stop_check_interval_from_env(
+            std::env::var("IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL").ok(),
+        )
+    });
+    INTERVAL.get()
 }
 
 fn lfm25_tts_audio_stop_check_interval_from_env(value: Option<String>) -> usize {

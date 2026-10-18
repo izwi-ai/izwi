@@ -1,0 +1,188 @@
+# Izwi public API gateways on Kubernetes (fleet-one-gateway topology).
+#
+# Gateways are stateless: a Deployment behind a Service, scaled like any web
+# tier. They reach the workers of worker.yaml over mutual TLS and route to
+# the approved worker endpoints. The fleet-one-gateway topology requires at
+# least one --gateway-worker-approval on the command line (izwi-worker-0
+# here); the izwi-approvals ConfigMap approves the remaining ordinals up to
+# the worker autoscaler's maxReplicaCount, and a rollout edits it (each
+# gateway re-reads the mounted file every IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS
+# and adopts changes at runtime; the kubelet refreshes the mounted file
+# within about a minute).
+#
+# With more than one gateway, IZWI_GATEWAY_FLEET_DB_PATH (a PostgreSQL URL)
+# lets them share in-transit capacity claims so they steer away from
+# workers another gateway just filled. It is optional: without it each
+# gateway relies on the workers' own admission, which stays authoritative
+# either way. Each gateway takes its fleet identity from its pod name.
+#
+# Before applying:
+#   - a Secret izwi-gateway-credentials with api-key (public inference key)
+#     and admin-api-key (admin routes, including the approvals report a
+#     rollout polls);
+#   - the Secret izwi-worker-credentials from worker.yaml;
+#   - a Secret izwi-gateway-client-tls with tls.crt and tls.key (a client
+#     certificate the workers' CA signed) and ca.crt (the CA that signed the
+#     workers' serving certificates);
+#   - TLS termination at your Ingress or load balancer in front of the
+#     Service (IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1 asserts it).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: izwi-approvals
+  namespace: izwi
+data:
+  # One v1 line per worker ordinal beyond izwi-worker-0:
+  # v1|ENDPOINT|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|GENERATION
+  shared-approvals: |
+    v1|https://izwi-worker-1.izwi-worker.izwi.svc:9470|izwi-worker|izwi-worker-1|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cuda-v1|1
+    v1|https://izwi-worker-2.izwi-worker.izwi.svc:9470|izwi-worker|izwi-worker-2|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cuda-v1|1
+    v1|https://izwi-worker-3.izwi-worker.izwi.svc:9470|izwi-worker|izwi-worker-3|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cuda-v1|1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: izwi-gateway
+  namespace: izwi
+  labels:
+    app.kubernetes.io/name: izwi-gateway
+spec:
+  selector:
+    app.kubernetes.io/name: izwi-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: izwi-gateway
+  namespace: izwi
+  labels:
+    app.kubernetes.io/name: izwi-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: izwi-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: izwi-gateway
+    spec:
+      # On SIGTERM /readyz turns 503 at once while requests are still served
+      # for IZWI_GATEWAY_PRESTOP_SECS (endpoint removal propagates); then
+      # admission closes and accepted responses finish, all within
+      # IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS, below this grace period.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: gateway
+          # The slim image (Dockerfile target production-gateway): the
+          # gateway links no inference engine.
+          image: izwi:gateway
+          args:
+            - izwi-gateway
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --public-model
+            - LFM2.5-1.2B-Instruct-GGUF
+            - --gateway-topology
+            - fleet-one-gateway
+            - --gateway-worker-approval
+            - v1|https://izwi-worker-0.izwi-worker.izwi.svc:9470|izwi-worker|izwi-worker-0|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cuda-v1|1
+            - --gateway-max-in-flight
+            - "64"
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: IZWI_GATEWAY_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: IZWI_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-gateway-credentials
+                  key: api-key
+            - name: IZWI_GATEWAY_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-gateway-credentials
+                  key: admin-api-key
+            - name: IZWI_GATEWAY_ADMIN_API_KEY_REF
+              value: env:IZWI_GATEWAY_ADMIN_API_KEY
+            - name: IZWI_GATEWAY_WORKER_CREDENTIAL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-worker-credentials
+                  key: credential-id
+            - name: IZWI_GATEWAY_WORKER_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-worker-credentials
+                  key: bearer-token
+            - name: IZWI_GATEWAY_WORKER_TLS_CA_REFS
+              value: file:/etc/izwi/client/ca.crt
+            - name: IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF
+              value: file:/etc/izwi/client/tls.crt
+            - name: IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF
+              value: file:/etc/izwi/client/tls.key
+            - name: IZWI_GATEWAY_SHARED_APPROVALS_PATH
+              value: /etc/izwi/approvals/shared-approvals
+            - name: IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS
+              value: "10000"
+            - name: IZWI_GATEWAY_TRUSTED_INGRESS_TLS
+              value: "1"
+            - name: IZWI_GATEWAY_PRESTOP_SECS
+              value: "5"
+            - name: IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS
+              value: "35"
+            - name: IZWI_LOG_FORMAT
+              value: json
+            # Optional shared capacity claims across gateways:
+            # - name: IZWI_GATEWAY_FLEET_DB_PATH
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: izwi-fleet-database
+            #       key: url
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: client-tls
+              mountPath: /etc/izwi/client
+              readOnly: true
+            - name: approvals
+              mountPath: /etc/izwi/approvals
+              readOnly: true
+      volumes:
+        - name: client-tls
+          secret:
+            secretName: izwi-gateway-client-tls
+        - name: approvals
+          configMap:
+            name: izwi-approvals

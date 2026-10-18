@@ -17,7 +17,49 @@ where
     T::try_from(value).unwrap()
 }
 
+/// The strict Metal assignment lane requires the operator-provided device
+/// identity (`metal:<registryID>`). Tests discover it from the host's default
+/// GPU; when that is impossible the leg is recorded as not-run, never passed.
+#[cfg(feature = "metal")]
+fn host_metal_device_id() -> Option<String> {
+    let output = std::process::Command::new("swift")
+        .args(["-e", "import Metal; if let d = MTLCreateSystemDefaultDevice() { print(\"metal:\" + String(d.registryID)) }"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let id = stdout.trim().to_string();
+    (output.status.success() && id.starts_with("metal:")).then_some(id)
+}
+
+/// The host Metal device for one Metal leg, or `None` when the leg is not
+/// run. The skip goes to the real stderr, because libtest hides captured
+/// `println!`/`eprintln!` output of a passing test and a skipped leg would
+/// read as a pass. A lane that requires Metal (`IZWI_REQUIRE_METAL_PARITY=1`)
+/// fails instead.
+#[cfg(feature = "metal")]
+#[allow(dead_code)]
+pub fn metal_leg_device(leg: &str) -> Option<String> {
+    let device_id = host_metal_device_id();
+    if device_id.is_none() {
+        assert!(
+            std::env::var("IZWI_REQUIRE_METAL_PARITY").as_deref() != Ok("1"),
+            "{leg}: IZWI_REQUIRE_METAL_PARITY=1 but the host default GPU registryID is unavailable"
+        );
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP {leg}: host default GPU registryID unavailable (not run, not passed)"
+        );
+    }
+    device_id
+}
+
 pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
+    write_tiny_lfm_fixture_with_context(models_dir, 32)
+}
+
+/// The tiny LFM2 fixture with a chosen native context length.
+pub fn write_tiny_lfm_fixture_with_context(models_dir: &Path, context_tokens: u32) -> PathBuf {
     let model_dir = models_dir.join("LFM2.5-1.2B-Instruct-GGUF");
     std::fs::create_dir_all(&model_dir).unwrap();
     let tokenizer = tokenizers::Tokenizer::new(
@@ -60,7 +102,7 @@ pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
     let metadata = [
         ("general.architecture", Value::String("lfm2".into())),
         ("lfm2.block_count", Value::U32(2)),
-        ("lfm2.context_length", Value::U32(32)),
+        ("lfm2.context_length", Value::U32(context_tokens)),
         ("lfm2.embedding_length", Value::U32(4)),
         ("lfm2.attention.head_count", Value::U32(1)),
         (
@@ -1188,4 +1230,44 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     )
     .unwrap();
     model_dir
+}
+
+/// The gateway's view of one worker: a registry holding only the worker
+/// `client` reaches, approved as it describes itself, behind a dispatcher for
+/// `config`. The status TTL covers a whole test, so nothing needs to poll.
+#[allow(dead_code)]
+pub async fn single_worker_dispatcher(
+    client: izwi_serving_client::WorkerClient,
+    config: izwi_server::RemoteChatDispatchConfig,
+) -> izwi_server::RemoteChatDispatcher {
+    use izwi_server::worker_registry::{
+        ApprovedDeployment, ApprovedWorker, WorkerRegistry, WorkerRegistryConfig,
+    };
+
+    let descriptor = client.descriptor().await.expect("worker descriptor");
+    let status = client.status().await.expect("worker status");
+    let deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == config.deployment_id)
+        .expect("worker serves the configured deployment");
+    let registry = WorkerRegistry::new(WorkerRegistryConfig {
+        status_ttl: std::time::Duration::from_secs(60 * 60),
+        ..WorkerRegistryConfig::default()
+    })
+    .expect("registry config");
+    registry
+        .approve(ApprovedWorker {
+            approved_deployments: std::collections::BTreeMap::from([(
+                deployment.deployment_id.clone(),
+                ApprovedDeployment::from_loaded(deployment),
+            )]),
+            validated_capacity: status.capacity.max_active_invocations
+                + status.capacity.max_queued_invocations,
+            descriptor,
+            client,
+        })
+        .expect("worker approval");
+    registry.observe_status(status).expect("worker status");
+    izwi_server::RemoteChatDispatcher::new(registry, config).expect("dispatcher config")
 }

@@ -27,7 +27,11 @@ const OPENAI_MOD_SRC: &str = include_str!("mod.rs");
 const OPENAI_AUDIO_MOD_SRC: &str = include_str!("audio/mod.rs");
 const OPENAI_CHAT_MOD_SRC: &str = include_str!("chat/mod.rs");
 const OPENAI_RESPONSES_MOD_SRC: &str = include_str!("responses/mod.rs");
-const OPENAI_CHAT_COMPLETIONS_SRC: &str = include_str!("chat/completions.rs");
+// The chat stream renderer is izwi-gateway's, shared by both roles.
+const OPENAI_CHAT_STREAM_SRC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../izwi-gateway/src/api/openai/chat/stream.rs"
+));
 const OPENAI_RESPONSES_HANDLERS_SRC: &str = include_str!("responses/handlers.rs");
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +239,7 @@ fn chat_stream_contract_markers_exist_in_source() {
         .required_sequence
     {
         assert!(
-            marker_matches_source(marker, OPENAI_CHAT_COMPLETIONS_SRC),
+            marker_matches_source(marker, OPENAI_CHAT_STREAM_SRC),
             "missing chat stream marker in source: {}",
             marker
         );

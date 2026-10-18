@@ -15,7 +15,7 @@
 //! the caller keeps the provider on any failure.
 use candle_core::{DType, Device, Result, Tensor};
 
-/// Kill switch (`0`, `false` or `off`), read once per KV arena.
+/// Kill switch (any false boolean, e.g. `0` or `off`), read once per KV arena.
 pub const SPLIT_DECODE_ENV: &str = "IZWI_CUDA_SPLIT_DECODE";
 
 const MAX_GROUP: usize = 8;
@@ -29,16 +29,7 @@ const TARGET_BLOCKS: usize = 512;
 
 /// Whether the switch leaves the kernel on (the default).
 pub fn enabled() -> bool {
-    enabled_by(std::env::var(SPLIT_DECODE_ENV).ok().as_deref())
-}
-
-fn enabled_by(value: Option<&str>) -> bool {
-    !value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        )
-    })
+    crate::env::flag_or(SPLIT_DECODE_ENV, true)
 }
 
 /// Whether the kernel covers this geometry: F16/BF16 queries and KV, equal key
@@ -547,16 +538,6 @@ mod cuda_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_switch_defaults_on_and_turns_off_explicitly() {
-        assert!(enabled_by(None));
-        assert!(enabled_by(Some("1")));
-        assert!(enabled_by(Some("on")));
-        assert!(!enabled_by(Some("0")));
-        assert!(!enabled_by(Some(" OFF ")));
-        assert!(!enabled_by(Some("false")));
-    }
 
     #[test]
     fn supported_geometries_cover_grouped_f16_and_bf16_heads_of_128_and_256() {

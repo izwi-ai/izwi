@@ -140,8 +140,9 @@ pub(super) fn resource_plan(
     variant: ModelVariant,
     model_path: &Path,
     device: &DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<Option<ModelResourcePlan>> {
-    let Some(plan) = residency_plan(variant, model_path, device)? else {
+    let Some(plan) = residency_plan(variant, model_path, device, granite)? else {
         return Ok(None);
     };
     tracing::info!(
@@ -193,10 +194,13 @@ pub(super) fn weights_on_backend_device(variant: ModelVariant, backend: BackendK
         || sortformer_uses_selected_model_device(backend)
 }
 
+/// `granite` is the engine's resolved Granite overrides (the dtype override
+/// changes what a Granite load allocates).
 pub(super) fn residency_plan(
     variant: ModelVariant,
     model_path: &Path,
     device: &DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<Option<AsrResidencyPlan>> {
     let backend = BackendKind::from(device.kind);
     match variant {
@@ -211,7 +215,7 @@ pub(super) fn residency_plan(
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
         _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
-            granite_plan(model_path, device, backend)
+            granite_plan(model_path, device, backend, granite.speech_dtype.as_deref())
         }
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
@@ -333,9 +337,6 @@ pub(super) struct Ledger {
     backend: BackendKind,
     logical: u64,
     resident: u64,
-    /// Buffers kept alive across steps ([`Self::hold`]), and their maximum.
-    live: u64,
-    max_live: u64,
     /// Metal: high-water mark of reusable private-pool intermediates.
     scratch: u64,
     /// Metal: bytes held until a synchronization by steps that do not
@@ -380,8 +381,6 @@ impl Ledger {
             backend,
             logical: 0,
             resident: 0,
-            live: 0,
-            max_live: 0,
             scratch: 0,
             held_unsynced: 0,
             held_max: 0,
@@ -459,24 +458,6 @@ impl Ledger {
                 self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
                 self.held_step_max = self.held_step_max.max(step.held_until_sync);
             }
-        }
-        Ok(())
-    }
-
-    /// Keep `bytes` alive, not resident, until [`Self::release`].
-    fn hold(&mut self, bytes: u64) -> Result<()> {
-        self.live = sum(&[self.live, bytes])?;
-        self.max_live = self.max_live.max(self.live);
-        Ok(())
-    }
-
-    fn release(&mut self, bytes: u64) -> Result<()> {
-        self.live = self.live.checked_sub(bytes).ok_or_else(overflow)?;
-        if self.metal() {
-            // Held like a synchronizing step's buffers: the next
-            // synchronization drops it.
-            self.held_max = self.held_max.max(bytes);
-            self.at_sync_max = self.at_sync_max.max(sum(&[bytes, self.before_sync_max])?);
         }
         Ok(())
     }
@@ -1060,7 +1041,7 @@ impl Ledger {
     }
 
     fn finish(mut self) -> Result<Self> {
-        let base = sum(&[self.resident, self.max_live])?;
+        let base = self.resident;
         self.peak = if self.metal() {
             let base = sum(&[base, self.scratch])?;
             if self.held_unsynced > 0 {
@@ -1893,6 +1874,7 @@ fn granite_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    speech_dtype: Option<&str>,
 ) -> Result<Option<AsrResidencyPlan>> {
     let Ok(shards) = ensure_granite_speech_artifacts(model_path) else {
         return Ok(None);
@@ -1901,9 +1883,9 @@ fn granite_plan(
         return Ok(None);
     };
     let config = GraniteSpeechConfig::load(model_path)?;
-    let dtype = select_granite_speech_dtype(device, config.target_dtype_hint())?;
+    let dtype = select_granite_speech_dtype(device, config.target_dtype_hint(), speech_dtype)?;
     let f16_encoder_projections =
-        resolve_granite_encoder_projection_precision(device).dtype == DType::F16;
+        resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
     let load = GraniteLoad {
         dtype,
         audio_dtype: if f16_encoder_projections {
@@ -1912,7 +1894,7 @@ fn granite_plan(
             dtype
         },
         f16_encoder_projections,
-        representation: granite_load_representation(&device.device, dtype),
+        representation: granite_load_representation(&device.device, dtype, speech_dtype),
         residual_multiplier: config.text_config.residual_multiplier,
         tied_lm_head: config.tie_word_embeddings(),
         encoder_attention_dists: (
@@ -2584,7 +2566,7 @@ pub(super) mod tests {
     }
 
     fn granite_load(backend: BackendKind) -> GraniteLoad {
-        let dtype = select_granite_speech_dtype(&profile(backend), Some("bfloat16")).unwrap();
+        let dtype = select_granite_speech_dtype(&profile(backend), Some("bfloat16"), None).unwrap();
         // Metal loads the encoder projections as weight-only F16.
         let f16_encoder_projections = backend == BackendKind::Metal;
         GraniteLoad {
@@ -3382,7 +3364,7 @@ pub(super) mod tests {
     fn granite_cpu_representation_matches_the_loader() {
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&candle_core::Device::Cpu, DType::F32),
+            granite_load_representation(&candle_core::Device::Cpu, DType::F32, None),
             granite_representation(BackendKind::Cpu)
         );
     }
@@ -3390,12 +3372,14 @@ pub(super) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn granite_metal_representation_matches_the_loader() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "granite_metal_representation_matches_the_loader",
+        ) else {
             return;
         };
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&device, DType::F32),
+            granite_load_representation(&device, DType::F32, None),
             granite_representation(BackendKind::Metal)
         );
     }
@@ -3440,15 +3424,20 @@ pub(super) mod tests {
         let performance = crate::performance::PerformanceConfig::default();
         for backend in BACKENDS {
             let device = profile(backend);
-            let plan = resource_plan(ModelVariant::VibeVoiceAsr, &dir, &device)
-                .unwrap()
-                .expect("VibeVoice has a residency plan");
+            let plan = resource_plan(
+                ModelVariant::VibeVoiceAsr,
+                &dir,
+                &device,
+                &Default::default(),
+            )
+            .unwrap()
+            .expect("VibeVoice has a residency plan");
             let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
             let retry = super::super::retry_load_peak_bytes(
                 ModelVariant::VibeVoiceAsr,
                 backend,
                 &performance,
-                Some((&dir, &device)),
+                Some((&dir, &device, &Default::default())),
             );
             assert_eq!(admitted, ResourceAmount::Known(retry), "{backend:?}");
             let catalog = super::super::model_memory_estimate(ModelVariant::VibeVoiceAsr);
@@ -3531,15 +3520,20 @@ pub(super) mod tests {
             write_aligner_checkpoint(&dir, quantized);
             for backend in BACKENDS {
                 let device = profile(backend);
-                let plan = super::super::checkpoint_resource_plan(variant, &dir, &device)
-                    .unwrap()
-                    .expect("the aligner has a residency plan");
+                let plan = super::super::checkpoint_resource_plan(
+                    variant,
+                    &dir,
+                    &device,
+                    &Default::default(),
+                )
+                .unwrap()
+                .expect("the aligner has a residency plan");
                 let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
                 let retry = super::super::retry_load_peak_bytes(
                     variant,
                     backend,
                     &performance,
-                    Some((&dir, &device)),
+                    Some((&dir, &device, &Default::default())),
                 );
                 assert_eq!(
                     admitted,
@@ -3801,23 +3795,28 @@ pub(super) mod tests {
         write_nemo(b"revision: 1\n");
         let payload = std::fs::metadata(&nemo_path).unwrap().len();
         let plan = |backend| {
-            residency_plan(variant, &dir, &profile(backend))
+            residency_plan(variant, &dir, &profile(backend), &Default::default())
                 .unwrap()
                 .expect("the diarizer has a residency plan")
         };
         let check_retry = || {
             for backend in BACKENDS {
                 let device = profile(backend);
-                let admitted = super::super::checkpoint_resource_plan(variant, &dir, &device)
-                    .unwrap()
-                    .unwrap();
+                let admitted = super::super::checkpoint_resource_plan(
+                    variant,
+                    &dir,
+                    &device,
+                    &Default::default(),
+                )
+                .unwrap()
+                .unwrap();
                 assert_eq!(
                     super::super::load_domain_bytes(admitted.load_authorization, backend),
                     ResourceAmount::Known(super::super::retry_load_peak_bytes(
                         variant,
                         backend,
                         &performance,
-                        Some((&dir, &device)),
+                        Some((&dir, &device, &Default::default())),
                     )),
                     "{backend:?}"
                 );
@@ -3866,7 +3865,9 @@ pub(super) mod tests {
         let dir = temp_dir("fallback");
         let device = profile(BackendKind::Cuda);
         for variant in [ModelVariant::Kokoro82M, ModelVariant::Qwen306B] {
-            assert!(residency_plan(variant, &dir, &device).unwrap().is_none());
+            assert!(residency_plan(variant, &dir, &device, &Default::default())
+                .unwrap()
+                .is_none());
         }
         for variant in [
             ModelVariant::VibeVoiceAsr,
@@ -3883,7 +3884,9 @@ pub(super) mod tests {
             ModelVariant::Nemotron3Diarization,
         ] {
             assert!(
-                residency_plan(variant, &dir, &device).unwrap().is_none(),
+                residency_plan(variant, &dir, &device, &Default::default())
+                    .unwrap()
+                    .is_none(),
                 "{variant}"
             );
         }
@@ -3893,7 +3896,7 @@ pub(super) mod tests {
                 ModelVariant::Kokoro82M,
                 BackendKind::Metal,
                 &performance,
-                Some((&dir, &device)),
+                Some((&dir, &device, &Default::default())),
             ),
             super::super::model_memory_estimate(ModelVariant::Kokoro82M).load_peak_bytes
         );
@@ -3927,9 +3930,14 @@ pub(super) mod tests {
             .context()
             .device
             .clone();
-        let plan = resource_plan(ModelVariant::VibeVoiceAsr, &checkpoint, &device)
-            .unwrap()
-            .unwrap();
+        let plan = resource_plan(
+            ModelVariant::VibeVoiceAsr,
+            &checkpoint,
+            &device,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(admitted, plan);
         // F32 on the CPU: twice the BF16 checkpoint, not its stored bytes.
         let inventory = super::super::portable_model_memory_estimate(
@@ -4045,6 +4053,9 @@ mod metal_residency_tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner checkpoints and a Metal device"]
     fn forced_aligner_metal_load_stays_within_its_plan() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_metal_load_stays_within_its_plan",
+        );
         const DEVICE_STATE_BYTES: u64 = 8 << 20;
         let models = std::env::var("IZWI_MODELS_DIR")
             .ok()

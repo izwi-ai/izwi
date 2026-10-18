@@ -4,15 +4,22 @@ members = [
     "crates/izwi-asr-toolkit",
     "crates/izwi-agent",
     "crates/izwi-core",
+    "crates/izwi-db",
+    "crates/izwi-env",
+    "crates/izwi-model-catalog",
+    "crates/izwi-prometheus",
     "crates/izwi-hooks",
     "crates/izwi-vad",
     "crates/izwi-server",
+    "crates/izwi-gateway",
     "crates/izwi-cli",
     "crates/izwi-desktop",
     "crates/izwi-serving-protocol",
     "crates/izwi-serving-client",
+    "crates/izwi-serving-fence",
     "crates/izwi-serving-supervisor",
     "crates/izwi-serving-worker",
+    "crates/izwi-test-process",
 ]
 
 [workspace.package]

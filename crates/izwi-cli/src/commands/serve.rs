@@ -12,6 +12,7 @@ pub struct ServeArgs {
     pub config_path: Option<PathBuf>,
     pub mode: ServeMode,
     pub runtime: ServeRuntimeConfig,
+    pub allow_unauthenticated_network: bool,
     pub log_level: String,
     pub log_format: LogFormat,
     pub dev: bool,
@@ -34,6 +35,7 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
         "  Host:           {}:{}",
         args.runtime.host, args.runtime.port
     );
+    println!("  Auth:           {}", auth_label(&args));
     println!("  Models dir:     {}", args.runtime.models_dir.display());
     println!("  Tensor batch:   {}", args.runtime.max_batch_size);
     let physical_capacity = args
@@ -171,6 +173,17 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+fn auth_label(args: &ServeArgs) -> &'static str {
+    let has_key = std::env::var(crate::http::API_KEY_ENV).is_ok_and(|key| !key.is_empty());
+    if has_key {
+        "API key (IZWI_API_KEY)"
+    } else if args.allow_unauthenticated_network {
+        "NONE (--allow-unauthenticated-network)"
+    } else {
+        "none (loopback only)"
+    }
+}
+
 fn serve_mode_label(mode: &ServeMode) -> &'static str {
     match mode {
         ServeMode::Server => "server",
@@ -187,6 +200,12 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
     cmd.env("IZWI_LOG_FORMAT", args.log_format.as_str());
     cmd.env("IZWI_HOST", &args.runtime.host);
     cmd.env("IZWI_PORT", args.runtime.port.to_string());
+    // IZWI_API_KEY is inherited unchanged; only the opt-out is resolved here.
+    if args.allow_unauthenticated_network {
+        cmd.env("IZWI_ALLOW_UNAUTHENTICATED_NETWORK", "true");
+    } else {
+        cmd.env_remove("IZWI_ALLOW_UNAUTHENTICATED_NETWORK");
+    }
     cmd.env(
         "IZWI_MODELS_DIR",
         args.runtime.models_dir.to_string_lossy().to_string(),
@@ -276,6 +295,10 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
     cmd.env(
         "IZWI_CHUNKED_PREFILL_THRESHOLD",
         args.runtime.chunked_prefill_threshold.to_string(),
+    );
+    cmd.env(
+        "IZWI_MAX_TOKENS_PER_STEP",
+        args.runtime.max_tokens_per_step.to_string(),
     );
     if let Some(salt) = &args.runtime.managed_prefix_cache_salt {
         cmd.env("IZWI_MANAGED_PREFIX_CACHE_SALT", salt);
@@ -690,10 +713,12 @@ mod tests {
                 max_prefix_cache_pages: None,
                 enable_chunked_prefill: false,
                 chunked_prefill_threshold: 192,
+                max_tokens_per_step: 0,
                 max_retained_sequences: 8,
                 max_staged_transactions: 8,
                 max_queued_requests: 128,
                 max_sequence_length: izwi_core::ContextLengthPreference::Auto,
+                asr_realtime: Default::default(),
                 backend: BackendPreference::Auto,
                 num_threads: 4,
                 max_concurrent_requests: 100,
@@ -703,6 +728,7 @@ mod tests {
                 ui_enabled: false,
                 ui_dir: PathBuf::from("/tmp/ui"),
             },
+            allow_unauthenticated_network: true,
             log_level: "info".to_string(),
             log_format: LogFormat::Text,
             dev: false,
@@ -717,6 +743,10 @@ mod tests {
 
         assert_eq!(command_env(&cmd, "IZWI_CORS").as_deref(), Some("1"));
         assert_eq!(command_env(&cmd, "IZWI_NO_UI").as_deref(), Some("1"));
+        assert_eq!(
+            command_env(&cmd, "IZWI_ALLOW_UNAUTHENTICATED_NETWORK").as_deref(),
+            Some("true")
+        );
         assert_eq!(
             command_env(&cmd, "IZWI_LOG_FORMAT").as_deref(),
             Some("text")

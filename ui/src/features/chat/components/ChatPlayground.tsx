@@ -950,6 +950,9 @@ export function ChatPlayground({
           system_prompt: systemPrompt,
           enable_thinking: enableThinking,
           reasoning_effort: selectedReasoningEffort,
+          // Long threads keep working: the server drops the oldest turns
+          // once the history outgrows the model's context.
+          truncation: "auto",
         },
         {
           onStart: ({ userMessage }) => {

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::StoreError;
 use crate::{
     db::{raw, StoreDatabase},
     entity::{transcription_records, RuntimeProjectionAttempt},
@@ -22,8 +23,6 @@ use crate::{
     },
     storage_layout,
 };
-
-const DEFAULT_LIST_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -516,7 +515,7 @@ impl TranscriptionStore {
             });
 
         if record.audio_bytes.is_empty() {
-            return Err(anyhow!("Audio payload cannot be empty"));
+            return Err(StoreError::invalid("Audio payload cannot be empty").into());
         }
 
         let audio_storage_path = persist_audio_object(
@@ -711,7 +710,7 @@ impl TranscriptionStore {
                       FROM runtime_jobs j
                       WHERE j.job_kind = 'asr_transcription'
                         AND j.route_record_id = transcription_records.id
-                        AND j.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                        AND j.status IN ('queued', 'running', 'retrying')
                   )
                   AND (
                       owner_node_id = ?2
@@ -1670,11 +1669,11 @@ fn active_transcription_attempt_condition(
             INNER JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
               AND j.route_record_id = transcription_records.id
               AND j.route_record_kind IN ('transcription', 'speaker_attributed_asr')
@@ -1702,11 +1701,6 @@ fn i64_to_u64(value: i64) -> u64 {
     } else {
         value as u64
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

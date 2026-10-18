@@ -134,10 +134,22 @@ impl GrammarRuntime {
         history: PenaltyHistory<'_>,
         rng: &mut R,
     ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        let values = read_f32_values_to_host(&chat_logits_row(logits)?)?;
+        self.sample_host_values(values, vocab_size, config, history, rng)
+    }
+
+    /// [`Self::sample_token_with_history`] on a logits row already read to
+    /// the host.
+    fn sample_host_values<R: GrammarRng>(
+        &mut self,
+        mut values: Vec<f32>,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: PenaltyHistory<'_>,
+        rng: &mut R,
+    ) -> Result<(u32, Option<RawTokenLogprobs>)> {
         let surfaces = self.surfaces(vocab_size)?;
         let mask = self.masks.mask_for(&self.machine, surfaces);
-        let row = chat_logits_row(logits)?;
-        let mut values = read_f32_values_to_host(&row)?;
         values.truncate(vocab_size.min(values.len()));
         if values.is_empty() {
             return Err(Error::InvalidInput(
@@ -147,7 +159,7 @@ impl GrammarRuntime {
         // Raw stats (for logprobs) come from the unmasked row.
         let raw_logprobs = if config.logprobs {
             let (logsumexp, top) = raw_logprobs_stats(&values, config.top_logprobs)?;
-            Some((logsumexp, top))
+            Some((logsumexp, top, values.clone()))
         } else {
             None
         };
@@ -173,8 +185,13 @@ impl GrammarRuntime {
             })?;
         }
         let logprobs = match raw_logprobs {
-            Some((logsumexp, top)) => {
-                let chosen_raw = read_chosen_raw(&row, vocab_size, token)?;
+            Some((logsumexp, top, raw)) => {
+                let chosen_raw = raw[token as usize];
+                if !chosen_raw.is_finite() {
+                    return Err(Error::InferenceError(
+                        "sampled token has a non-finite raw logit".into(),
+                    ));
+                }
                 Some(RawTokenLogprobs {
                     token,
                     logprob: chosen_raw - logsumexp,
@@ -184,21 +201,6 @@ impl GrammarRuntime {
             None => None,
         };
         Ok((token, logprobs))
-    }
-}
-
-fn read_chosen_raw(row: &Tensor, vocab_size: usize, token: u32) -> Result<f32> {
-    let value = row
-        .i(token as usize)?
-        .to_dtype(DType::F32)?
-        .to_scalar::<f32>()?;
-    let _ = vocab_size;
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(Error::InferenceError(
-            "sampled token has a non-finite raw logit".into(),
-        ))
     }
 }
 
@@ -295,6 +297,232 @@ impl ChatSampler {
     fn history(&self) -> &[u32] {
         &self.history
     }
+
+    /// How [`sample_chat_rows`] reads row `row` of `logits` (already cut to
+    /// the vocabulary): the route [`Self::sample_with_logprobs`] would take.
+    fn row_sampling(&self, logits: &Tensor, row: usize, vocab_size: usize) -> Result<RowSampling> {
+        if self.grammar.is_some() || self.config.logprobs {
+            return Ok(RowSampling::Host);
+        }
+        if is_deterministic_greedy(&self.config) {
+            return Ok(RowSampling::Greedy);
+        }
+        if !(logits.device().is_cuda() || logits.device().is_metal()) {
+            return Ok(RowSampling::Host);
+        }
+        Ok(pending_sampling_candidates(
+            &logits.i(row)?,
+            vocab_size,
+            self.config.top_k,
+            self.config.temperature,
+            PenaltyHistory::uniform(&self.history),
+            self.config.repetition_penalty,
+            self.config.presence_penalty,
+            None,
+        )?
+        .map_or(RowSampling::Host, RowSampling::Candidates))
+    }
+
+    /// The draw of a row whose logits are already on the host.
+    fn sample_host_row(&mut self, values: Vec<f32>, vocab_size: usize) -> Result<SampledToken> {
+        if let Some(grammar) = self.grammar.as_mut() {
+            return grammar.sample_host_values(
+                values,
+                vocab_size,
+                &self.config,
+                PenaltyHistory::uniform(&self.history),
+                &mut self.rng,
+            );
+        }
+        if self.config.logprobs {
+            return sample_host_logprobs(
+                values,
+                vocab_size,
+                &self.config,
+                &self.history,
+                &mut self.rng,
+            );
+        }
+        let token = sample_candidates_or_host(
+            None,
+            || Ok(values),
+            vocab_size,
+            &self.config,
+            &self.history,
+            &mut self.rng,
+        )?;
+        Ok((token, None))
+    }
+
+    fn record(&mut self, token: u32) {
+        if self.track_history {
+            self.history.push(token);
+        }
+    }
+}
+
+/// A row's next token and, when its request asked for them, the token's raw
+/// logprobs.
+pub type SampledToken = (u32, Option<RawTokenLogprobs>);
+
+/// How one row of a batched decode step is read back.
+enum RowSampling {
+    /// Deterministic greedy: the row's argmax and its logit.
+    Greedy,
+    /// Bounded accelerator candidates.
+    Candidates(PendingCandidates),
+    /// The whole in-vocabulary row: grammar, logprobs and host sampling.
+    Host,
+}
+
+/// The next token of every row of one decode step's `[B, V]` logits, each
+/// drawn by that row's own [`ChatSampler`] exactly as
+/// [`ChatSampler::sample_with_logprobs`] draws it (same arithmetic, same RNG
+/// draws), with one device-to-host readback for the whole batch instead of
+/// one or two per row. Greedy rows read their argmax and its logit,
+/// accelerator rows their bounded candidates, and every other row (grammar,
+/// logprobs, CPU sampling) its in-vocabulary logits. A row reads again only
+/// where the single-row sampler falls back too: a non-finite greedy pick, or
+/// candidates that miss the top-p nucleus.
+///
+/// Only generic tensor ops run on the device, so the path is the same on
+/// CPU, Metal and CUDA.
+pub fn sample_chat_rows(
+    samplers: &mut [&mut ChatSampler],
+    logits: &Tensor,
+    vocab_size: usize,
+) -> Result<Vec<SampledToken>> {
+    sample_chat_rows_guarded(samplers, logits, vocab_size, None)?.ok_or_else(|| {
+        Error::InferenceError("unguarded chat sampling reported a tripped guard".into())
+    })
+}
+
+/// [`sample_chat_rows`] that reads `guard`, one F32 flag, in the same
+/// transfer and samples nothing (`None`) when it is zero, so a caller can
+/// refuse non-finite logits without another synchronization.
+pub(crate) fn sample_chat_rows_guarded(
+    samplers: &mut [&mut ChatSampler],
+    logits: &Tensor,
+    vocab_size: usize,
+    guard: Option<&Tensor>,
+) -> Result<Option<Vec<SampledToken>>> {
+    let (rows, width) = logits.dims2()?;
+    if rows == 0 || rows != samplers.len() {
+        return Err(Error::InvalidInput(format!(
+            "batched chat sampling received {rows} logits rows for {} samplers",
+            samplers.len()
+        )));
+    }
+    if vocab_size == 0 {
+        return Err(Error::InvalidInput(
+            "chat sampler received vocab_size=0".to_string(),
+        ));
+    }
+    let vocab = width.min(vocab_size);
+    if vocab == 0 {
+        return Err(Error::InvalidInput(
+            "chat sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    let full_logits = logits;
+    let logits = logits.narrow(1, 0, vocab)?;
+    if vocab > MAX_EXACT_F32_INTEGER {
+        // Token ids would not survive the F32 transfer: sample row by row.
+        if let Some(guard) = guard {
+            if read_f32_values_to_host(&guard.flatten_all()?)?[0] == 0.0 {
+                return Ok(None);
+            }
+        }
+        return samplers
+            .iter_mut()
+            .enumerate()
+            .map(|(row, sampler)| sampler.sample_with_logprobs(&logits.i(row)?, vocab_size))
+            .collect::<Result<Vec<_>>>()
+            .map(Some);
+    }
+    let plans = samplers
+        .iter()
+        .enumerate()
+        .map(|(row, sampler)| sampler.row_sampling(&logits, row, vocab))
+        .collect::<Result<Vec<_>>>()?;
+    let mut parts = Vec::with_capacity(rows + 3);
+    if let Some(guard) = guard {
+        parts.push(guard.to_dtype(DType::F32)?.flatten_all()?);
+    }
+    let any_greedy = plans.iter().any(|plan| matches!(plan, RowSampling::Greedy));
+    if any_greedy {
+        let ids = logits.argmax_keepdim(D::Minus1)?;
+        // Gather reads contiguous rows; every id is inside the vocabulary.
+        let picked = full_logits.contiguous()?.gather(&ids, D::Minus1)?;
+        parts.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+        parts.push(picked.to_dtype(DType::F32)?.flatten_all()?);
+    }
+    for (row, plan) in plans.iter().enumerate() {
+        match plan {
+            RowSampling::Greedy => {}
+            RowSampling::Candidates(pending) => parts.push(pending.packed.clone()),
+            RowSampling::Host => parts.push(logits.i(row)?.to_dtype(DType::F32)?),
+        }
+    }
+    let packed = read_f32_values_to_host(&Tensor::cat(&parts, 0)?)?;
+    let mut cursor = 0usize;
+    if guard.is_some() {
+        cursor = 1;
+        if packed.first().copied() == Some(0.0) {
+            return Ok(None);
+        }
+    }
+    let greedy_at = cursor;
+    if any_greedy {
+        cursor += rows * 2;
+    }
+    let mut sampled = Vec::with_capacity(rows);
+    for (row, (sampler, plan)) in samplers.iter_mut().zip(plans).enumerate() {
+        let token = match plan {
+            RowSampling::Greedy => {
+                let picked = packed[greedy_at + rows + row];
+                let token = if picked.is_finite() {
+                    packed[greedy_at + row] as u32
+                } else {
+                    finite_argmax(&read_f32_values_to_host(&logits.i(row)?)?)?
+                };
+                (token, None)
+            }
+            RowSampling::Candidates(pending) => {
+                let candidates = pending.unpack(take(&packed, &mut cursor, pending.len())?)?;
+                let row_logits = logits.i(row)?;
+                let token = sample_candidates_or_host(
+                    candidates,
+                    || read_f32_values_to_host(&row_logits),
+                    vocab_size,
+                    &sampler.config,
+                    &sampler.history,
+                    &mut sampler.rng,
+                )?;
+                (token, None)
+            }
+            RowSampling::Host => {
+                sampler.sample_host_row(take(&packed, &mut cursor, vocab)?.to_vec(), vocab_size)?
+            }
+        };
+        sampler.record(token.0);
+        sampled.push(token);
+    }
+    if cursor != packed.len() {
+        return Err(Error::InferenceError(
+            "batched sampling readback has the wrong length".into(),
+        ));
+    }
+    Ok(Some(sampled))
+}
+
+/// The next `len` values of a packed readback.
+fn take<'a>(packed: &'a [f32], cursor: &mut usize, len: usize) -> Result<&'a [f32]> {
+    let slice = packed
+        .get(*cursor..*cursor + len)
+        .ok_or_else(|| Error::InferenceError("batched sampling readback is too short".into()))?;
+    *cursor += len;
+    Ok(slice)
 }
 
 #[derive(Clone)]
@@ -394,52 +622,25 @@ fn sample_chat_token_and_logprobs(
         ));
     }
     let row = chat_logits_row(logits)?;
-    let collect_logprobs = config.logprobs;
 
     // DS9.3: logprobs need the full raw row on host (logsumexp + top-k over
     // the raw distribution), so requests that ask for them route through the
     // host sampler instead of the device fast paths.
-    if collect_logprobs {
-        let values = read_f32_values_to_host(&row)?;
-        let mut sampled = values.clone();
-        sampled.truncate(vocab_size.min(sampled.len()));
-        if sampled.is_empty() {
-            return Err(Error::InvalidInput(
-                "chat sampler received no in-vocabulary logits".to_string(),
-            ));
-        }
-        let (logsumexp, top) = raw_logprobs_stats(&sampled, config.top_logprobs)?;
-        let token =
-            sample_from_host_values(sampled, config, PenaltyHistory::uniform(history), rng)?;
-        let chosen_raw = values
-            .get(token as usize)
-            .copied()
-            .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
-        if !chosen_raw.is_finite() {
-            return Err(Error::InferenceError(
-                "sampled token has a non-finite raw logit".into(),
-            ));
-        }
-        return Ok((
-            token,
-            Some(RawTokenLogprobs {
-                token,
-                logprob: chosen_raw - logsumexp,
-                top,
-            }),
-        ));
+    if config.logprobs {
+        return sample_host_logprobs(
+            read_f32_values_to_host(&row)?,
+            vocab_size,
+            config,
+            history,
+            rng,
+        );
     }
 
-    let deterministic_greedy = config.temperature <= 1e-5
-        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        && config.presence_penalty.abs() <= f32::EPSILON
-        && config.top_k == 0
-        && config.top_p >= 1.0;
-    if deterministic_greedy {
+    if is_deterministic_greedy(config) {
         return chat_argmax_clamped(&row, vocab_size).map(|token| (token, None));
     }
 
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    let candidates = bounded_device_sampling_candidates(
         &row,
         vocab_size,
         config.top_k,
@@ -448,25 +649,91 @@ fn sample_chat_token_and_logprobs(
         config.repetition_penalty,
         config.presence_penalty,
         None,
-    )? {
+    )?;
+    let token = sample_candidates_or_host(
+        candidates,
+        || read_f32_values_to_host(&row),
+        vocab_size,
+        config,
+        history,
+        rng,
+    )?;
+    Ok((token, None))
+}
+
+/// Greedy decoding that needs no host-side policy: argmax of the raw row.
+fn is_deterministic_greedy(config: &ChatGenerationConfig) -> bool {
+    config.temperature <= 1e-5
+        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+        && config.presence_penalty.abs() <= f32::EPSILON
+        && config.top_k == 0
+        && config.top_p >= 1.0
+}
+
+/// The logprobs route on a row already read to the host: sample with the
+/// host pipeline and report the raw-distribution logprobs of the token.
+fn sample_host_logprobs(
+    values: Vec<f32>,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<(u32, Option<RawTokenLogprobs>)> {
+    let mut sampled = values.clone();
+    sampled.truncate(vocab_size.min(sampled.len()));
+    if sampled.is_empty() {
+        return Err(Error::InvalidInput(
+            "chat sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    let (logsumexp, top) = raw_logprobs_stats(&sampled, config.top_logprobs)?;
+    let token = sample_from_host_values(sampled, config, PenaltyHistory::uniform(history), rng)?;
+    let chosen_raw = values
+        .get(token as usize)
+        .copied()
+        .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
+    if !chosen_raw.is_finite() {
+        return Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ));
+    }
+    Ok((
+        token,
+        Some(RawTokenLogprobs {
+            token,
+            logprob: chosen_raw - logsumexp,
+            top,
+        }),
+    ))
+}
+
+/// Draw from bounded device candidates when they hold the whole top-p
+/// nucleus, else from the full row on the host (`host_values` reads it).
+fn sample_candidates_or_host(
+    candidates: Option<DeviceSamplingCandidates>,
+    host_values: impl FnOnce() -> Result<Vec<f32>>,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    if let Some(candidates) = candidates {
         if device_candidates_cover_top_p(&candidates, config.top_p) {
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
-                return Ok((sampled, None));
+                return Ok(sampled);
             }
         }
     }
-
-    let mut values = read_f32_values_to_host(&row)?;
+    let mut values = host_values()?;
     values.truncate(vocab_size.min(values.len()));
     if values.is_empty() {
         return Err(Error::InvalidInput(
             "chat sampler received no in-vocabulary logits".to_string(),
         ));
     }
-    let token = sample_from_host_values(values, config, PenaltyHistory::uniform(history), rng)?;
-    Ok((token, None))
+    sample_from_host_values(values, config, PenaltyHistory::uniform(history), rng)
 }
 
 /// DS9.3: raw-distribution log_softmax statistics over the full row:
@@ -1035,6 +1302,33 @@ fn bounded_sampling_candidates(
     presence_penalty: f32,
     allowed_mask: Option<&[bool]>,
 ) -> Result<Option<DeviceSamplingCandidates>> {
+    let Some(pending) = pending_sampling_candidates(
+        logits,
+        vocab_limit,
+        top_k,
+        temperature,
+        history,
+        repetition_penalty,
+        presence_penalty,
+        allowed_mask,
+    )?
+    else {
+        return Ok(None);
+    };
+    pending.unpack(&read_f32_values_to_host(&pending.packed)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pending_sampling_candidates(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    history: PenaltyHistory<'_>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    allowed_mask: Option<&[bool]>,
+) -> Result<Option<PendingCandidates>> {
     if temperature <= 1e-5 {
         return Ok(None);
     }
@@ -1084,18 +1378,41 @@ fn bounded_sampling_candidates(
     if let Some(logsumexp) = &logsumexp {
         packed_parts.push(logsumexp);
     }
-    let packed = read_f32_values_to_host(&Tensor::cat(&packed_parts, 0)?)?;
-    let candidate_count = values.dim(0)?;
-    let (values, indices, logsumexp) =
-        unpack_sampling_readback(&packed, candidate_count, logsumexp.is_some())?;
-    if values.iter().any(|value| !value.is_finite()) {
-        return Ok(None);
-    }
-    Ok(Some(DeviceSamplingCandidates {
-        values,
-        indices,
-        logsumexp,
+    Ok(Some(PendingCandidates {
+        packed: Tensor::cat(&packed_parts, 0)?,
+        count: values.dim(0)?,
+        has_logsumexp: logsumexp.is_some(),
     }))
+}
+
+/// One row's bounded candidates, still on the device as one packed F32
+/// tensor (values, indices, then the normalizer when present), so a caller
+/// can read many rows back in a single transfer.
+struct PendingCandidates {
+    packed: Tensor,
+    count: usize,
+    has_logsumexp: bool,
+}
+
+impl PendingCandidates {
+    fn len(&self) -> usize {
+        self.count * 2 + usize::from(self.has_logsumexp)
+    }
+
+    /// `None` when a candidate is non-finite: the caller keeps the exact
+    /// host fallback.
+    fn unpack(&self, packed: &[f32]) -> Result<Option<DeviceSamplingCandidates>> {
+        let (values, indices, logsumexp) =
+            unpack_sampling_readback(packed, self.count, self.has_logsumexp)?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Ok(None);
+        }
+        Ok(Some(DeviceSamplingCandidates {
+            values,
+            indices,
+            logsumexp,
+        }))
+    }
 }
 
 fn unpack_sampling_readback(
@@ -1366,6 +1683,197 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 mod tests {
     use super::*;
 
+    /// Unstructured logits: xorshift values in [-4, 4).
+    fn xorshift_logits(state: &mut u64, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                (*state >> 40) as f32 / (1u64 << 24) as f32 * 8.0 - 4.0
+            })
+            .collect()
+    }
+
+    fn sampled(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> ChatGenerationConfig {
+        ChatGenerationConfig {
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            ..ChatGenerationConfig::default()
+        }
+    }
+
+    /// Steps `samplers` through `steps` batches of `[rows, width]` logits on
+    /// `device`, sampling every batch once with [`sample_chat_rows`] and
+    /// once row by row with clones through [`ChatSampler::sample_with_logprobs`]
+    /// (the single-row path), and asserts both draw the same tokens and
+    /// logprobs. Returns the host reads of each batched step.
+    fn assert_batched_rows_match_single_rows(
+        device: &Device,
+        mut samplers: Vec<ChatSampler>,
+        width: usize,
+        vocab_size: usize,
+        steps: usize,
+    ) -> Vec<u64> {
+        let mut single = samplers.clone();
+        let rows = samplers.len();
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut reads = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let logits = Tensor::from_vec(
+                xorshift_logits(&mut state, rows * width),
+                (rows, width),
+                device,
+            )
+            .unwrap();
+            let mut batch = samplers.iter_mut().collect::<Vec<_>>();
+            let before = crate::models::shared::telemetry::thread_host_reads();
+            let batched = sample_chat_rows(&mut batch, &logits, vocab_size).unwrap();
+            reads.push(crate::models::shared::telemetry::thread_host_reads() - before);
+            let expected = single
+                .iter_mut()
+                .enumerate()
+                .map(|(row, sampler)| {
+                    sampler
+                        .sample_with_logprobs(&logits.i(row).unwrap(), vocab_size)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(batched, expected, "step {step}");
+        }
+        for (batched, single) in samplers.iter().zip(&single) {
+            assert_eq!(batched.history, single.history);
+        }
+        reads
+    }
+
+    /// Greedy, top-k, top-p, penalised, greedy-with-penalty and logprob
+    /// rows over a vocabulary narrower than the logits and wider than one
+    /// device sort chunk.
+    fn mixed_samplers(include_nucleus_only: bool) -> Vec<ChatSampler> {
+        let history = [3, 17, 17, 905];
+        let mut configs = vec![
+            ChatGenerationConfig::default(),
+            sampled(0.9, 40, 1.0, 3),
+            sampled(0.7, 64, 0.8, 4),
+            ChatGenerationConfig {
+                repetition_penalty: 1.3,
+                presence_penalty: 0.5,
+                ..sampled(0.7, 32, 1.0, 5)
+            },
+            ChatGenerationConfig {
+                repetition_penalty: 1.2,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 3,
+                ..sampled(0.8, 0, 1.0, 6)
+            },
+            ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 2,
+                ..ChatGenerationConfig::default()
+            },
+        ];
+        if include_nucleus_only {
+            configs.push(sampled(1.1, 0, 0.9, 7));
+        }
+        configs
+            .into_iter()
+            .map(|config| ChatSampler::new(config, &history))
+            .collect()
+    }
+
+    fn json_samplers() -> Vec<ChatSampler> {
+        let tokenizer = crate::tokenizer::Tokenizer::from_hf_json_bytes(
+            br#"{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{
+                "{":0,"\"":1,"a":2,":":3,"1":4,"}":5,",":6,"[":7,"]":8," ":9,"b":10,
+                "<eos>":11,"<unk>":12},
+                "unk_token":"<unk>"}
+        }"#,
+        )
+        .unwrap();
+        let tokenizer = std::sync::Arc::new(tokenizer);
+        let json = |config: ChatGenerationConfig| {
+            ChatSampler::new(
+                ChatGenerationConfig {
+                    constrain_json_object: true,
+                    ..config
+                },
+                &[],
+            )
+            .with_json_object_constraint(tokenizer.clone(), vec![11])
+        };
+        vec![
+            json(sampled(1.0, 0, 1.0, 8)),
+            json(ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 2,
+                ..sampled(0.9, 4, 1.0, 9)
+            }),
+            ChatSampler::new(ChatGenerationConfig::default(), &[]),
+            ChatSampler::new(sampled(1.0, 3, 1.0, 10), &[]),
+        ]
+    }
+
+    fn assert_batched_sampling_parity(device: &Device) {
+        assert_batched_rows_match_single_rows(device, mixed_samplers(true), 1_500, 1_400, 24);
+        assert_batched_rows_match_single_rows(device, json_samplers(), 16, 13, 24);
+        let reads =
+            assert_batched_rows_match_single_rows(device, mixed_samplers(false), 1_500, 1_400, 24);
+        assert!(
+            reads.iter().all(|&reads| reads == 1),
+            "reads per step {reads:?}"
+        );
+    }
+
+    #[test]
+    fn batched_rows_match_single_row_sampling_with_one_readback_on_cpu() {
+        assert_batched_sampling_parity(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn batched_rows_match_single_row_sampling_with_one_readback_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "batched_rows_match_single_row_sampling_with_one_readback_on_metal",
+        ) else {
+            return;
+        };
+        assert_batched_sampling_parity(&device);
+    }
+
+    #[test]
+    fn batched_rows_fall_back_like_single_rows_on_non_finite_greedy_picks() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![f32::NAN, 1.0, 2.0, 0.5, f32::INFINITY, -1.0],
+            (2, 3),
+            &device,
+        )
+        .unwrap();
+        let mut samplers = vec![ChatSampler::new(ChatGenerationConfig::default(), &[]); 2];
+        let mut single = samplers.clone();
+        let mut batch = samplers.iter_mut().collect::<Vec<_>>();
+        let batched = sample_chat_rows(&mut batch, &logits, 3).unwrap();
+        let expected = single
+            .iter_mut()
+            .enumerate()
+            .map(|(row, sampler)| {
+                sampler
+                    .sample_with_logprobs(&logits.i(row).unwrap(), 3)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batched, expected);
+    }
+
     #[test]
     fn distinct_in_vocab_is_sorted_deduplicated_and_bounded() {
         let mut state = 0x2545_f491_u32;
@@ -1464,8 +1972,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_device_resident_top_k_sample_matches_cpu_gumbel_max() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_device_resident_top_k_sample_matches_cpu_gumbel_max",
+        ) else {
             return;
         };
         let values = crate::kernels::numeric_check::xorshift_values(2049, 31, 4.0);
@@ -1821,7 +2330,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_bounded_candidates_match_cpu_semantics_if_available() {
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+        let Some((metal, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_bounded_candidates_match_cpu_semantics_if_available",
+        ) else {
             return;
         };
         let width = 257;

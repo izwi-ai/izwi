@@ -113,7 +113,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn linear_forward_last_dim_handles_voxtral_mlp_shape_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "linear_forward_last_dim_handles_voxtral_mlp_shape_on_metal",
+        ) else {
             return;
         };
         let linear = Linear::new(

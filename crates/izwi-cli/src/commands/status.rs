@@ -8,7 +8,6 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
 struct StatusHealthResponse {
-    status: Option<String>,
     version: Option<String>,
     runtime: Option<RuntimeBackendStatus>,
 }

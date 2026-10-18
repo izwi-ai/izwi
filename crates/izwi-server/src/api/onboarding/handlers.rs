@@ -42,5 +42,5 @@ pub async fn complete_onboarding(
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Onboarding storage error: {err}"))
+    crate::error::store_api_error(err, "Onboarding storage error")
 }

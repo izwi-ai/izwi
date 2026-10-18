@@ -5,10 +5,9 @@ use crate::catalog::ModelFamily;
 use crate::engine::InvocationPagedKvLease;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
-    PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, SpeakerReference,
-    TalkerPhysicalCache, TtsGenerationParams, TtsStreamingConfig,
+    PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, TalkerPhysicalCache,
+    TtsGenerationParams, TtsStreamingConfig,
 };
-use crate::runtime::audio_io::decode_reference_audio_base64;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
@@ -21,6 +20,11 @@ use super::state::{
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
+
+#[cfg(test)]
+use crate::models::architectures::qwen3::tts::SpeakerReference;
+#[cfg(test)]
+use crate::runtime::audio_io::decode_reference_audio_base64;
 
 // If any later row rejects staging, roll back every candidate already handed
 // to the coordinator before this physical invocation reports collective failure.
@@ -856,6 +860,7 @@ impl NativeExecutor {
         request.qwen_tts_generation_params()
     }
 
+    #[cfg(test)]
     pub(super) fn reference_from_request(
         request: &EngineCoreRequest,
     ) -> Result<Option<SpeakerReference>> {

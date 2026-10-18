@@ -30,6 +30,9 @@ fn fish_s2_real_artifact_metadata_contracts() -> Result<()> {
 fn fish_s2_real_artifacts_load_native_modules() -> Result<()> {
     let model_dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;
     let backend = env_backend()?;
+    #[cfg(feature = "metal")]
+    let _lease =
+        crate::backends::metal_test_device_or_skip("fish_s2_real_artifacts_load_native_modules");
     let device = DeviceSelector::detect_for_preference(backend)?;
     let model = FishS2TtsModel::load(&model_dir, ModelVariant::FishAudioS2Pro, device)?;
 

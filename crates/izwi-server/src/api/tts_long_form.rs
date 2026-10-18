@@ -24,17 +24,36 @@ fn seconds_to_samples(secs: f32, sample_rate: u32) -> usize {
     (secs * sample_rate as f32).round().max(1.0) as usize
 }
 
+/// Samples in the fade on each side of a segment join.
+pub(crate) fn segment_fade_samples(sample_rate: u32) -> usize {
+    seconds_to_samples(SEGMENT_FADE_SECS, sample_rate)
+}
+
+/// Samples of silence between two segments.
+pub(crate) fn segment_pause_samples(sample_rate: u32) -> usize {
+    seconds_to_samples(SEGMENT_PAUSE_SECS, sample_rate)
+}
+
 /// Fade the first samples of a segment in from silence.
 pub(crate) fn fade_in_segment(samples: &mut [f32], sample_rate: u32) {
-    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(samples.len());
+    let fade = segment_fade_samples(sample_rate).min(samples.len());
     for (index, sample) in samples.iter_mut().take(fade).enumerate() {
         *sample *= (index + 1) as f32 / (fade + 1) as f32;
     }
 }
 
+/// Fade the last samples of a segment out to silence.
+pub(crate) fn fade_out_segment(samples: &mut [f32], sample_rate: u32) {
+    let fade = segment_fade_samples(sample_rate).min(samples.len());
+    let tail = samples.len() - fade;
+    for (index, sample) in samples[tail..].iter_mut().enumerate() {
+        *sample *= (fade - index) as f32 / (fade + 1) as f32;
+    }
+}
+
 /// The pause before a later segment, followed by that segment faded in.
 pub(crate) fn pause_then_segment(segment: &[f32], sample_rate: u32) -> Vec<f32> {
-    let pause = seconds_to_samples(SEGMENT_PAUSE_SECS, sample_rate);
+    let pause = segment_pause_samples(sample_rate);
     let mut out = Vec::with_capacity(pause + segment.len());
     out.resize(pause, 0.0);
     out.extend_from_slice(segment);
@@ -49,11 +68,7 @@ pub(crate) fn append_segment(joined: &mut Vec<f32>, segment: &[f32], sample_rate
         joined.extend_from_slice(segment);
         return;
     }
-    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(joined.len());
-    let tail = joined.len() - fade;
-    for (index, sample) in joined[tail..].iter_mut().enumerate() {
-        *sample *= (fade - index) as f32 / (fade + 1) as f32;
-    }
+    fade_out_segment(joined, sample_rate);
     joined.extend(pause_then_segment(segment, sample_rate));
 }
 
@@ -62,9 +77,8 @@ fn chunk_max_chars() -> usize {
 }
 
 fn configured_chunk_max_chars() -> Option<usize> {
-    std::env::var("IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    crate::env_config::tuning()
+        .tts_long_form_chunk_max_chars
         .map(|value| value.clamp(CHUNK_MAX_CHARS_MIN, CHUNK_MAX_CHARS_MAX))
 }
 
@@ -153,16 +167,7 @@ impl SpeechTextPlan {
         // Blank layout alone is not an inference segment. Byte ranges still
         // identify original content for durable progress and recovery.
         segments.retain(|range| !text[range.clone()].trim().is_empty());
-        let long_form_enabled = match std::env::var("IZWI_FISH_LONG_FORM_ENABLED").as_deref() {
-            Ok("false" | "0") => false,
-            Ok("true" | "1") | Err(std::env::VarError::NotPresent) => true,
-            _ => {
-                return Err(izwi_core::Error::InvalidInput(
-                    "Invalid IZWI_FISH_LONG_FORM_ENABLED configuration".into(),
-                ))
-            }
-        };
-        if segments.len() > 1 && !long_form_enabled {
+        if segments.len() > 1 && !crate::env_config::tuning().fish_long_form_enabled {
             return Err(izwi_core::Error::InvalidInput(
                 "Fish long-form generation is disabled by this deployment".into(),
             ));
@@ -185,10 +190,8 @@ impl SpeechTextPlan {
         } else {
             estimated_frames
         };
-        let max_pcm_bytes = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        let max_pcm_bytes = crate::env_config::tuning()
+            .tts_stream_max_pcm_bytes
             .unwrap_or(u32::MAX as usize - 44)
             .min(u32::MAX as usize - 44);
         if estimated_frames
@@ -335,6 +338,14 @@ pub async fn generate_long_form_tts(
 
     let started = std::time::Instant::now();
     let split_request_count = planned_requests.len();
+    let outputs = generate_segments(
+        planned_requests,
+        long_form_segment_concurrency(runtime),
+        retry_runaways,
+        &request.id,
+        |segment| runtime.generate(segment),
+    )
+    .await?;
     let mut constituent_diagnostics = Vec::with_capacity(split_request_count);
     let mut merged_samples: Vec<f32> = Vec::new();
     let mut sample_rate: Option<u32> = None;
@@ -344,22 +355,9 @@ pub async fn generate_long_form_tts(
     let mut retried_segments = Vec::new();
     let mut budget_segments = Vec::new();
 
-    for (index, chunk_request) in planned_requests.into_iter().enumerate() {
-        let retry = retry_runaways.then(|| chunk_request.clone());
-        let mut output = runtime.generate(chunk_request).await?;
-        if let Some(retry) = retry.filter(|_| ran_to_budget(&output)) {
-            // A sampled segment that ran to its budget without ending
-            // speech babbled (TPIPE-27); one fresh sample usually ends.
-            tracing::warn!(
-                request_id = %request.id,
-                segment = index + 1,
-                "Long-form segment ran to its budget without end of speech; sampling it again"
-            );
+    for (index, (output, retried)) in outputs.into_iter().enumerate() {
+        if retried {
             retried_segments.push(index + 1);
-            let again = runtime.generate(retry).await?;
-            if !ran_to_budget(&again) {
-                output = again;
-            }
         }
         if ran_to_budget(&output) {
             tracing::warn!(
@@ -408,6 +406,55 @@ pub async fn generate_long_form_tts(
         })),
         stop_reason: TtsStopReason::combine(stop_reasons),
     })
+}
+
+/// Long-form segments in flight at once: the rows the engine batches TTS at
+/// (`RuntimeService::tts_row_width`), so segments synthesize side by side
+/// instead of one after another (SPK-F12). More would only queue.
+fn long_form_segment_concurrency(runtime: &RuntimeService) -> usize {
+    runtime.tts_row_width()
+}
+
+/// Generate the segments with up to `concurrency` in flight, returning each
+/// output (and whether it was sampled again) in segment order. A sampled
+/// Qwen3-TTS segment that ran to its budget without ending speech babbled
+/// (TPIPE-27); when `retry_runaways`, it is sampled once more and the second
+/// draw kept if it ended.
+async fn generate_segments<F, Fut>(
+    segments: Vec<GenerationRequest>,
+    concurrency: usize,
+    retry_runaways: bool,
+    request_id: &str,
+    generate: F,
+) -> Result<Vec<(GenerationResult, bool)>, izwi_core::Error>
+where
+    F: Fn(GenerationRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<GenerationResult, izwi_core::Error>>,
+{
+    use futures::{StreamExt, TryStreamExt};
+    let generate = &generate;
+    futures::stream::iter(
+        segments
+            .into_iter()
+            .enumerate()
+            .map(|(index, segment)| async move {
+                let retry = retry_runaways.then(|| segment.clone());
+                let output = generate(segment).await?;
+                let Some(retry) = retry.filter(|_| ran_to_budget(&output)) else {
+                    return Ok((output, false));
+                };
+                tracing::warn!(
+                    request_id = %request_id,
+                    segment = index + 1,
+                    "Long-form segment ran to its budget without end of speech; sampling it again"
+                );
+                let again = generate(retry).await?;
+                Ok((if ran_to_budget(&again) { output } else { again }, true))
+            }),
+    )
+    .buffered(concurrency.max(1))
+    .try_collect()
+    .await
 }
 
 /// Whether long form samples a Qwen3-TTS segment again when it runs to its
@@ -550,24 +597,39 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let _abort = AbortSpeechTask(task.abort_handle());
         // A progress deadline, not a wall clock: a segment fails only when
         // it publishes nothing for this long (TPIPE-6).
-        let stall_timeout = std::time::Duration::from_secs(
-            std::env::var("IZWI_TTS_SEGMENT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(1800),
-        );
+        let stall_timeout = crate::env_config::tuning().tts_segment_timeout;
         let mut deadline = tokio::time::Instant::now() + stall_timeout;
         let mut segment_duration = 0.0;
         let mut emitted = false;
         let mut segment_tokens = 0;
         let mut segment_ms = 0.0;
         let mut segment_stop = None;
-        while let Some(mut chunk) = tokio::select! {
-            chunk = receiver.recv() => chunk,
-            _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::Timeout("Speech segment made no progress".into())),
-            _ = output.closed() => return Err(izwi_core::Error::InferenceError("Speech consumer disconnected".into())),
-        } {
+        loop {
+            // Buffered durable audio is published by its deadline even when
+            // the model is between chunks.
+            let flush_at = progress.as_deref().and_then(|p| p.flush_deadline());
+            let flush_due = async {
+                match flush_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let mut chunk = tokio::select! {
+                chunk = receiver.recv() => match chunk {
+                    Some(chunk) => chunk,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::Timeout("Speech segment made no progress".into())),
+                _ = output.closed() => return Err(izwi_core::Error::InferenceError("Speech consumer disconnected".into())),
+                _ = flush_due => {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        if let Some(published) = progress.flush().await.map_err(progress_error)? {
+                            send_published(&output, &mut sequence, published).await?;
+                        }
+                    }
+                    continue;
+                }
+            };
             deadline = tokio::time::Instant::now() + stall_timeout;
             if let Some(stats) = &chunk.stats {
                 if chunk.is_final {
@@ -594,25 +656,25 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             rate = Some(actual);
             segment_duration += chunk.samples.len() as f32 / actual as f32;
             chunk.request_id = base.id.clone();
-            chunk.sequence = sequence;
             chunk.is_final = false;
             chunk.stats = None;
-            if let Some(progress) = progress.as_deref_mut() {
-                progress
-                    .publish_chunk(&chunk)
-                    .await
-                    .map_err(progress_error)?;
-            }
-            if output.send(chunk).await.is_err() {
-                drop(receiver);
-                task.abort();
-                let _ = task.await;
-                return Err(izwi_core::Error::InferenceError(
-                    "Speech consumer disconnected".into(),
-                ));
-            }
             emitted = true;
-            sequence += 1;
+            // Durable audio reaches listeners only once it is published.
+            let ready = match progress.as_deref_mut() {
+                Some(progress) => progress
+                    .publish_chunk(chunk)
+                    .await
+                    .map_err(progress_error)?,
+                None => vec![chunk],
+            };
+            for chunk in ready {
+                if let Err(error) = send_published(&output, &mut sequence, chunk).await {
+                    drop(receiver);
+                    task.abort();
+                    let _ = task.await;
+                    return Err(error);
+                }
+            }
         }
         let result = task
             .await
@@ -621,12 +683,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         if let Err(error) = result {
             // Exact tokenized reference+text fit is checked inside admitted model
             // preparation. Replan only before this segment has published audio.
-            if !emitted
-                && (error
-                    .to_string()
-                    .contains("Fish S2 segment does not fit effective context")
-                    || error.to_string().contains("leaves no output room"))
-            {
+            if !emitted && error.kind() == izwi_core::ErrorKind::ContextLengthExceeded {
                 let text = &base.text[range.clone()];
                 let count = text.chars().count();
                 if count > 1 {
@@ -644,6 +701,9 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             ));
         }
         if let Some(progress) = progress.as_deref_mut() {
+            if let Some(published) = progress.flush().await.map_err(progress_error)? {
+                send_published(&output, &mut sequence, published).await?;
+            }
             progress
                 .complete_segment(range.end, segment_tokens, segment_ms, segment_duration)
                 .await
@@ -674,6 +734,21 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))
 }
 
+/// Send one published chunk under the next output sequence.
+async fn send_published(
+    output: &tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
+    sequence: &mut usize,
+    mut chunk: izwi_core::AudioChunk,
+) -> Result<(), izwi_core::Error> {
+    chunk.sequence = *sequence;
+    output
+        .send(chunk)
+        .await
+        .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))?;
+    *sequence += 1;
+    Ok(())
+}
+
 /// Dropping a timed-out/cancelled job also cancels its current inference future.
 struct AbortSpeechTask(tokio::task::AbortHandle);
 impl Drop for AbortSpeechTask {
@@ -685,6 +760,85 @@ impl Drop for AbortSpeechTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPK-F12: segments run `concurrency` at a time, and their outputs come
+    /// back in segment order however long each takes.
+    #[tokio::test]
+    async fn long_form_segments_run_concurrently_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let segments: Vec<GenerationRequest> = (0..6)
+            .map(|index| GenerationRequest::new(format!("segment {index}")))
+            .collect();
+        let outputs = generate_segments(segments, 3, false, "request", |segment| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(now, Ordering::AcqRel);
+                let index: u64 = segment.text["segment ".len()..].parse().unwrap();
+                // Later segments finish first.
+                tokio::time::sleep(std::time::Duration::from_millis(60 - 10 * index)).await;
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                Ok(GenerationResult {
+                    request_id: segment.text.clone(),
+                    samples: vec![index as f32],
+                    sample_rate: 24_000,
+                    total_tokens: 1,
+                    total_time_ms: 1.0,
+                    diagnostics: None,
+                    stop_reason: Some(TtsStopReason::EndOfSpeech),
+                })
+            }
+        })
+        .await
+        .expect("segments");
+        let order: Vec<f32> = outputs
+            .iter()
+            .map(|(output, _)| output.samples[0])
+            .collect();
+        assert_eq!(order, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(peak.load(Ordering::Acquire), 3, "three segments in flight");
+    }
+
+    /// A segment that ran to its budget is sampled again, and the retry is
+    /// kept only if it ended speech.
+    #[tokio::test]
+    async fn runaway_segments_are_sampled_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let outputs = generate_segments(
+            vec![GenerationRequest::new("a"), GenerationRequest::new("b")],
+            2,
+            true,
+            "request",
+            |segment| {
+                let call = calls.fetch_add(1, Ordering::AcqRel);
+                async move {
+                    // "a" runs away on its first draw only.
+                    let runaway = segment.text == "a" && call == 0;
+                    Ok(GenerationResult {
+                        request_id: segment.text,
+                        samples: vec![call as f32],
+                        sample_rate: 24_000,
+                        total_tokens: 1,
+                        total_time_ms: 1.0,
+                        diagnostics: None,
+                        stop_reason: Some(if runaway {
+                            TtsStopReason::OutputBudget
+                        } else {
+                            TtsStopReason::EndOfSpeech
+                        }),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("segments");
+        assert!(outputs[0].1, "the runaway segment was retried");
+        assert!(!ran_to_budget(&outputs[0].0));
+        assert!(!outputs[1].1);
+    }
 
     #[test]
     fn fish_plan_preserves_utf8_text_and_short_fast_path() {

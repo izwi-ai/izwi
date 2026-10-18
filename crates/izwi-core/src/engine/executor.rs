@@ -22,14 +22,18 @@ mod handler_audio_chat;
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
+#[path = "executor/long_form.rs"]
+mod long_form;
 #[path = "executor/state.rs"]
 mod state;
+#[path = "executor/stop_sequences.rs"]
+mod stop_sequences;
 #[path = "executor/streaming.rs"]
 mod streaming;
 
 pub(crate) use streaming::{
-    deliver_committed_streams, CommittedStreamDelivery, IncrementalStreamDeliveryWorkers,
-    StreamDeliveryFailure, StreamDeliveryFailureKind,
+    deliver_committed_streams, CommittedStreamDelivery, ImmediateDelivery, IncrementalDeliveryTask,
+    IncrementalStreamDeliveryWorkers, StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
 pub(crate) fn decode_request_audio_with_rate(
@@ -72,21 +76,20 @@ use super::execution::{
     ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
     HealthImpact, ManagedSessionGeneration, NativeBatchMode, OutcomeProvenance, PhysicalBatch,
     PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum, RealtimeStageOutcome,
-    RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind, StageWorkSelector,
-    WorkUnit, YieldReason,
+    RetryDisposition, SequencePhase, SessionKey, StageId, StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
     begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
     EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
 };
 use super::output::StreamingOutput;
-use super::request::EngineCoreRequest;
+use super::request::{EngineCoreRequest, WorkloadClass};
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, TaskType};
 use crate::backends::{
-    can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
-    BackendSelectionSource,
+    can_parallelize_requests, BackendContext, BackendKind, BackendRouter, BackendSelectionSource,
+    DeviceJobTag, DeviceThread,
 };
 use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
@@ -99,9 +102,8 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode,
-    ActiveLfm25TtsDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
-    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
-    PendingNemotronRealtimeQuantum, PendingVoxtralRealtimeQuantum, PreparedNemotronRealtimeQuantum,
+    ActiveLfm25TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
+    ActiveVoxtralRealtime, ActiveVoxtralTtsDecode, PendingVoxtralRealtimeQuantum,
     PreparedVoxtralRealtimeQuantum,
 };
 
@@ -128,6 +130,10 @@ const PHYSICAL_ADMISSION_CANCELLATION_POLL: Duration = Duration::from_millis(25)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeBatchRoute {
     ChatContinuousDecode {
+        stage_id: StageId,
+    },
+    /// Decode rows and prefill spans of a mixed-step chat model in one call.
+    ChatMixedStep {
         stage_id: StageId,
     },
     Audio {
@@ -219,6 +225,19 @@ impl NativeBatchRoute {
             })?;
         let task = first_request.task_type;
         let role = Self::audio_stage(&first_scheduled.work);
+        // A mixed batch holds sequence rows of both phases; any other batch
+        // runs one stage role.
+        let mixed = execution.batch.mode == NativeBatchMode::Mixed;
+        let row_role_matches = |row_role: NativeAudioStage| {
+            if mixed {
+                matches!(
+                    row_role,
+                    NativeAudioStage::SequencePrefill | NativeAudioStage::SequenceDecode
+                )
+            } else {
+                row_role == role
+            }
+        };
 
         for scheduled in execution.scheduled {
             let request = execution
@@ -232,7 +251,7 @@ impl NativeBatchRoute {
                         scheduled.request_id
                     ))
                 })?;
-            if request.task_type != task || Self::audio_stage(&scheduled.work) != role {
+            if request.task_type != task || !row_role_matches(Self::audio_stage(&scheduled.work)) {
                 return Err(Error::InvalidInput(
                     "native physical batch mixed task or stage roles".to_string(),
                 ));
@@ -275,12 +294,17 @@ impl NativeBatchRoute {
                     stage_id: execution.batch.lane.stage_id,
                 })
             }
-            (TaskType::ASR | TaskType::TTS, stage, mode) => Ok(Self::Audio {
-                task,
-                stage,
-                mode,
+            (TaskType::Chat, _, NativeBatchMode::Mixed) => Ok(Self::ChatMixedStep {
                 stage_id: execution.batch.lane.stage_id,
             }),
+            (TaskType::ASR | TaskType::TTS, stage, mode) if mode != NativeBatchMode::Mixed => {
+                Ok(Self::Audio {
+                    task,
+                    stage,
+                    mode,
+                    stage_id: execution.batch.lane.stage_id,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "loaded stage has no compatible native executor route".to_string(),
             )),
@@ -852,7 +876,7 @@ fn validate_atomic_scalar_invocation_stage(
             "scalar invocation workspace requires an atomic scheduled row".to_string(),
         ));
     }
-    if stage.progress != StageProgressKind::Atomic || stage.batch_mode != NativeBatchMode::None {
+    if !stage.runs_independent_invocations() || stage.batch_mode != NativeBatchMode::None {
         return Err(Error::InvalidInput(
             "atomic invocation workspace requires a scalar atomic execution stage".to_string(),
         ));
@@ -983,7 +1007,7 @@ impl std::fmt::Debug for WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         let backend_context = BackendRouter::resolve_context(
-            BackendPreference::Auto,
+            BackendRouter::unset_preference(),
             BackendSelectionSource::Default,
         );
         let backend_kind = backend_context.backend_kind;
@@ -1066,13 +1090,11 @@ impl WorkerConfig {
         }
     }
 
+    /// The hard tensor width ceiling: the widest certified family on CPU and
+    /// Metal, the kernel and metadata limit on CUDA (whose runtime default
+    /// stays VRAM-tiered and resource-admitted).
     fn tensor_batch_cap(backend: BackendKind) -> usize {
-        match backend {
-            BackendKind::Cpu | BackendKind::Metal => 2,
-            // Runtime CUDA defaults remain VRAM-tiered and resource-admitted;
-            // this is only the hard kernel/metadata width ceiling.
-            BackendKind::Cuda => 32,
-        }
+        crate::catalog::max_certified_decode_width(backend)
     }
 
     fn request_parallelism_override() -> Option<usize> {
@@ -1095,27 +1117,23 @@ impl WorkerConfig {
         available_cpu_capacity: usize,
         override_value: Option<usize>,
     ) -> usize {
-        // Candle's Metal path is intentionally serialized in dispatch. Do not
-        // let an environment override inflate coordinator capacity beyond what
-        // the executor can actually run concurrently.
-        if backend == BackendKind::Metal {
+        // Accelerator rows are serialized in dispatch. Candle's Metal path
+        // shares one command queue, and CUDA rows share one device stream
+        // whose opt-in graph capture is thread-local, so another thread's
+        // launches would be captured into the graph (EXE-F11). Do not let an
+        // environment override inflate coordinator capacity beyond what the
+        // executor can actually run concurrently.
+        if backend != BackendKind::Cpu {
             return 1;
         }
 
-        if backend == BackendKind::Cpu {
-            let cpu_capacity = available_cpu_capacity.max(1);
-            let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
-            let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
-            // Preserve the operator override as the selected value, then keep
-            // both automatic and explicit widths within the process-visible
-            // CPU allocation and the executor's conservative worker ceiling.
-            return override_value.unwrap_or(automatic).clamp(1, hard_cap);
-        }
-
-        // CUDA does not gain automatic scalar concurrency here. Preserve the
-        // existing explicit override contract without coupling it to host CPU
-        // capacity; accelerator launch policy is sealed independently.
-        override_value.unwrap_or(1).max(1)
+        let cpu_capacity = available_cpu_capacity.max(1);
+        let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
+        let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
+        // Preserve the operator override as the selected value, then keep
+        // both automatic and explicit widths within the process-visible
+        // CPU allocation and the executor's conservative worker ceiling.
+        override_value.unwrap_or(automatic).clamp(1, hard_cap)
     }
 
     fn request_parallelism_for(backend: BackendKind, configured_intra_op_threads: usize) -> usize {
@@ -1521,6 +1539,90 @@ pub struct PhysicalBatchExecution<'a> {
     pub scheduled: &'a [ScheduledRequest],
 }
 
+/// A dispatch's place in device arbitration: its execution lane is the flow,
+/// weighted by the most latency-sensitive workload class among its rows.
+fn device_job_tag(execution: &PhysicalBatchExecution<'_>) -> (DeviceJobTag, WorkloadClass) {
+    let class = execution
+        .requests
+        .iter()
+        .map(|request| request.workload_class)
+        .max_by_key(|class| class.service_weight())
+        .unwrap_or_default();
+    let tag = DeviceJobTag {
+        flow: execution.batch.lane.model_instance.get(),
+        weight: class.service_weight(),
+    };
+    (tag, class)
+}
+
+/// When the device last finished a model step while the engine stayed busy.
+/// The next step's start records the gap as device idle time
+/// (`izwi_engine_device_idle_seconds`); an engine going idle clears it.
+#[derive(Default)]
+struct DeviceIdleClock {
+    last_step_end: Mutex<Option<std::time::Instant>>,
+}
+
+/// Marks the end of a device step when dropped.
+struct DeviceStep<'a>(&'a DeviceIdleClock);
+
+impl DeviceIdleClock {
+    fn begin_step(&self, device: &str) -> DeviceStep<'_> {
+        let last = self
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(ended) = last {
+            super::metrics::record_engine_device_idle(device, ended.elapsed());
+        }
+        DeviceStep(self)
+    }
+
+    fn end_busy_period(&self) {
+        *self
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+impl Drop for DeviceStep<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(std::time::Instant::now());
+    }
+}
+
+/// Owned inputs of one physical batch: they move to the device thread for
+/// the batch's execution and come back with its result.
+pub(super) trait PhysicalExecutionInputs: Send + 'static {
+    fn with_execution<R>(&self, run: impl FnOnce(PhysicalBatchExecution<'_>) -> R) -> R;
+}
+
+/// Copied inputs for the compatibility entry point.
+#[cfg(test)]
+struct OwnedPhysicalExecution {
+    batch: PhysicalBatch,
+    requests: Vec<EngineCoreRequest>,
+    scheduled: Vec<ScheduledRequest>,
+}
+
+#[cfg(test)]
+impl PhysicalExecutionInputs for OwnedPhysicalExecution {
+    fn with_execution<R>(&self, run: impl FnOnce(PhysicalBatchExecution<'_>) -> R) -> R {
+        let requests = self.requests.iter().collect::<Vec<_>>();
+        run(PhysicalBatchExecution {
+            batch: &self.batch,
+            requests: &requests,
+            scheduled: &self.scheduled,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PhysicalDispatchError {
     pub error: Error,
@@ -1601,14 +1703,20 @@ impl PhysicalBatchExecution<'_> {
             ));
         }
 
-        let is_prefill = self.scheduled[0].is_prefill;
-        if self
-            .scheduled
-            .iter()
-            .any(|scheduled| scheduled.is_prefill != is_prefill)
-        {
+        // Only a mixed batch holds rows of both phases, decode rows first.
+        let ordered = if self.batch.mode == NativeBatchMode::Mixed {
+            self.scheduled
+                .windows(2)
+                .all(|pair| !pair[0].is_prefill || pair[1].is_prefill)
+        } else {
+            let is_prefill = self.scheduled[0].is_prefill;
+            self.scheduled
+                .iter()
+                .all(|scheduled| scheduled.is_prefill == is_prefill)
+        };
+        if !ordered {
             return Err(Error::InferenceError(
-                "one physical batch cannot mix prefill and decode dispatch".to_string(),
+                "a physical batch mixes prefill and decode rows outside a mixed batch".to_string(),
             ));
         }
         Ok(())
@@ -1648,6 +1756,13 @@ pub trait ModelExecutor: Send + Sync {
         execution.validate().map_err(|error| {
             PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
         })?;
+        if execution.batch.mode == NativeBatchMode::Mixed {
+            return Err(PhysicalDispatchError::not_started(
+                Error::InvalidInput("this executor has no mixed prefill and decode route".into()),
+                width,
+                FailureOrigin::ExecutorValidation,
+            ));
+        }
         let dispatch = execution.expected_dispatch();
         let result = if execution.is_prefill() {
             self.execute_prefill(execution.requests, execution.scheduled)
@@ -1887,10 +2002,6 @@ impl<'a, T> ExecutorStateLease<'a, T> {
 
     fn state(&self) -> Option<&T> {
         self.state.as_ref()
-    }
-
-    fn state_mut(&mut self) -> Option<&mut T> {
-        self.state.as_mut()
     }
 
     fn require_state_mut(&mut self) -> Result<&mut T> {
@@ -2376,251 +2487,17 @@ impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
     }
 }
 
-struct NemotronRealtimeStateCoordinator {
-    states: ExecutorStateStore<ActiveNemotronRealtime>,
-    pending: Mutex<HashMap<PlanId, PendingNemotronRealtimeQuantum>>,
-    prepared: Mutex<HashMap<PlanId, PreparedNemotronRealtimeQuantum>>,
-}
-
-impl NemotronRealtimeStateCoordinator {
-    fn new() -> Self {
-        Self {
-            states: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
-            prepared: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // Returning the pending quantum preserves ownership when registration fails.
-    #[allow(clippy::result_large_err)]
-    fn register(
-        &self,
-        plan_id: PlanId,
-        pending: PendingNemotronRealtimeQuantum,
-    ) -> std::result::Result<(), (Error, PendingNemotronRealtimeQuantum)> {
-        let mut rows = match self.pending.lock() {
-            Ok(rows) => rows,
-            Err(_) => {
-                return Err((
-                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
-                    pending,
-                ))
-            }
-        };
-        if rows.contains_key(&plan_id) {
-            return Err((
-                Error::InferenceError(format!(
-                    "Nemotron pending quantum already exists for plan {plan_id}"
-                )),
-                pending,
-            ));
-        }
-        rows.insert(plan_id, pending);
-        Ok(())
-    }
-
-    fn register_batch(
-        &self,
-        rows: Vec<(PlanId, PendingNemotronRealtimeQuantum)>,
-    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingNemotronRealtimeQuantum)>)> {
-        let mut pending = match self.pending.lock() {
-            Ok(pending) => pending,
-            Err(_) => {
-                return Err((
-                    Error::InferenceError("Nemotron pending state mutex poisoned".into()),
-                    rows,
-                ))
-            }
-        };
-        let mut ids = HashSet::with_capacity(rows.len());
-        if rows
-            .iter()
-            .any(|(id, _)| !ids.insert(*id) || pending.contains_key(id))
-        {
-            return Err((
-                Error::InferenceError("Nemotron cohort contains duplicate pending plans".into()),
-                rows,
-            ));
-        }
-        pending.extend(rows);
-        Ok(())
-    }
-
-    fn replace_in_flight(
-        &self,
-        session: &SessionKey,
-        replacement: Option<ActiveNemotronRealtime>,
-    ) -> Result<()> {
-        let mut states = self
-            .states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let variant = match states.get(session) {
-            Some(ExecutorStateSlot::InFlight { variant }) => *variant,
-            _ => {
-                return Err(Error::InferenceError(
-                    "Nemotron pending state lost its ownership marker".into(),
-                ))
-            }
-        };
-        match replacement {
-            Some(active) if active.variant == variant => {
-                states.insert(
-                    session.clone(),
-                    ExecutorStateSlot::Ready {
-                        variant,
-                        state: active,
-                    },
-                );
-            }
-            Some(_) => {
-                states.insert(session.clone(), ExecutorStateSlot::Poisoned { variant });
-                return Err(Error::InferenceError(
-                    "Nemotron pending state crossed model variants".into(),
-                ));
-            }
-            None => {
-                states.remove(session);
-            }
-        }
-        Ok(())
-    }
-
-    fn abort_matching(
-        &self,
-        predicate: impl Fn(&PendingNemotronRealtimeQuantum) -> bool,
-    ) -> Result<usize> {
-        let rows = {
-            let mut pending = self.pending.lock().map_err(|_| {
-                Error::InferenceError("Nemotron pending state mutex poisoned".into())
-            })?;
-            let ids = pending
-                .iter()
-                .filter_map(|(id, row)| predicate(row).then_some(*id))
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| pending.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        let count = rows.len();
-        for row in rows {
-            self.replace_in_flight(&row.session, Some(row.checkpoint))?;
-        }
-        Ok(count)
-    }
-
-    fn has_prepared(&self) -> bool {
-        !self
-            .prepared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
-    }
-}
-
-impl PendingQuantumFinalizer for NemotronRealtimeStateCoordinator {
-    fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
-        self.pending
-            .lock()
-            .ok()
-            .and_then(|rows| rows.get(&plan_id).map(|row| &row.session == session))
-            .unwrap_or(false)
-    }
-
-    fn prepare(
-        &self,
-        plan_id: PlanId,
-        session: &SessionKey,
-        decision: PendingQuantumDecision,
-    ) -> Result<PendingQuantumFinalizeStatus> {
-        let row = {
-            let mut rows = self.pending.lock().map_err(|_| {
-                Error::InferenceError("Nemotron pending state mutex poisoned".into())
-            })?;
-            let Some(row) = rows.get(&plan_id) else {
-                return Ok(PendingQuantumFinalizeStatus::NotFound);
-            };
-            if &row.session != session {
-                return Err(Error::InferenceError(
-                    "Nemotron pending plan crossed sessions".into(),
-                ));
-            }
-            rows.remove(&plan_id).expect("pending row present")
-        };
-        let replacement = if decision == PendingQuantumDecision::Commit {
-            (!row.finished).then_some(row.active)
-        } else {
-            Some(row.checkpoint)
-        };
-        let prepared = PreparedNemotronRealtimeQuantum {
-            session: row.session,
-            replacement,
-        };
-        if self
-            .prepared
-            .lock()
-            .map_err(|_| Error::InferenceError("Nemotron prepared state mutex poisoned".into()))?
-            .insert(plan_id, prepared)
-            .is_some()
-        {
-            return Err(Error::InferenceError(
-                "duplicate Nemotron prepared quantum".into(),
-            ));
-        }
-        Ok(PendingQuantumFinalizeStatus::Finalized)
-    }
-
-    fn publish(
-        &self,
-        plan_id: PlanId,
-        session: &SessionKey,
-    ) -> Result<PendingQuantumFinalizeStatus> {
-        let Some(prepared) = self
-            .prepared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&plan_id)
-        else {
-            return Ok(PendingQuantumFinalizeStatus::NotFound);
-        };
-        if &prepared.session != session {
-            return Err(Error::InferenceError(
-                "Nemotron prepared plan crossed sessions".into(),
-            ));
-        }
-        self.replace_in_flight(session, prepared.replacement)?;
-        Ok(PendingQuantumFinalizeStatus::Finalized)
-    }
-
-    fn discard(&self, plan_id: PlanId, session: &SessionKey) {
-        let row = self
-            .prepared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&plan_id);
-        let mut states = self
-            .states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let target = row.as_ref().map_or(session, |row| &row.session);
-        if let Some(ExecutorStateSlot::InFlight { variant }) = states.get(target) {
-            let variant = *variant;
-            states.insert(target.clone(), ExecutorStateSlot::Poisoned { variant });
-        }
-    }
-}
-
 struct RealtimePendingQuantumFinalizer {
     fish: Arc<FishStateCoordinator>,
     voxtral: Arc<VoxtralRealtimeStateCoordinator>,
-    nemotron: Arc<NemotronRealtimeStateCoordinator>,
+    long_form: Arc<long_form::LongFormAsrRuns>,
 }
 
 impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.fish.contains(plan_id, session)
             || self.voxtral.contains(plan_id, session)
-            || self.nemotron.contains(plan_id, session)
+            || self.long_form.contains(plan_id, session)
     }
     fn prepare(
         &self,
@@ -2630,8 +2507,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.contains(plan_id, session) {
             self.fish.prepare(plan_id, session, decision)
-        } else if self.nemotron.contains(plan_id, session) {
-            self.nemotron.prepare(plan_id, session, decision)
+        } else if self.long_form.contains(plan_id, session) {
+            self.long_form.prepare(plan_id, session, decision)
         } else {
             self.voxtral.prepare(plan_id, session, decision)
         }
@@ -2643,14 +2520,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.has_prepared(plan_id) {
             self.fish.publish(plan_id, session)
-        } else if self
-            .nemotron
-            .prepared
-            .lock()
-            .ok()
-            .is_some_and(|rows| rows.contains_key(&plan_id))
-        {
-            self.nemotron.publish(plan_id, session)
+        } else if self.long_form.has_prepared(plan_id) {
+            self.long_form.publish(plan_id, session)
         } else {
             self.voxtral.publish(plan_id, session)
         }
@@ -2658,14 +2529,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn discard(&self, plan_id: PlanId, session: &SessionKey) {
         if self.fish.has_prepared(plan_id) {
             self.fish.discard(plan_id, session);
-        } else if self
-            .nemotron
-            .prepared
-            .lock()
-            .ok()
-            .is_some_and(|rows| rows.contains_key(&plan_id))
-        {
-            self.nemotron.discard(plan_id, session)
+        } else if self.long_form.has_prepared(plan_id) {
+            self.long_form.discard(plan_id, session)
         } else {
             self.voxtral.discard(plan_id, session)
         }
@@ -2746,8 +2611,8 @@ pub struct NativeExecutor {
     fish_s2_pending: Arc<FishStateCoordinator>,
     voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
-    nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
+    long_form_asr: Arc<long_form::LongFormAsrRuns>,
 }
 
 impl NativeExecutor {
@@ -2794,81 +2659,27 @@ impl NativeExecutor {
             requests,
             scheduled,
             outputs,
-            match mode {
-                NativeBatchMode::Static => {
-                    BatchDispatch::new(super::BatchDispatchKind::TensorStatic, scheduled.len())
-                }
-                NativeBatchMode::Continuous => {
-                    BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
-                }
-                NativeBatchMode::None => BatchDispatch::serial(),
-            },
-            Some(rows),
-        )
-    }
-
-    fn execute_nemotron_realtime_batch_with_rows(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-        rows: &[ReadyQuantum],
-        mode: NativeBatchMode,
-    ) -> Result<Vec<ExecutorStepResult>> {
-        let ordered = scheduled
-            .iter()
-            .map(|row| {
-                requests
-                    .iter()
-                    .copied()
-                    .find(|request| request.id == row.request_id)
-                    .ok_or_else(|| {
-                        Error::InferenceError("Nemotron batch lost request snapshot".into())
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let managed = scheduled
-            .iter()
-            .zip(&ordered)
-            .map(|(scheduled, request)| {
-                let reservation = rows
-                    .iter()
-                    .find(|row| row.plan_id == scheduled.plan_id)
-                    .and_then(|row| row.managed_cache.as_ref())
-                    .ok_or_else(|| {
-                        Error::InferenceError("Nemotron batch lost retained reservation".into())
-                    })?;
-                retained_row_managed_state_for_row(request, scheduled, reservation)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let outputs = self.nemotron_realtime_batch_with_managed(&ordered, scheduled, managed)?;
-        self.finish_scheduled_execution(
-            requests,
-            scheduled,
-            outputs,
-            if mode == NativeBatchMode::Continuous {
-                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
-            } else {
-                BatchDispatch::serial()
-            },
+            BatchDispatch::for_batch(mode, scheduled.len()),
             Some(rows),
         )
     }
 
     /// Create a new native executor.
+    #[cfg(test)]
     pub fn new(config: WorkerConfig) -> Self {
         Self::with_realtime_coordinators(
             config,
             Arc::new(VoxtralRealtimeStateCoordinator::new()),
-            Arc::new(NemotronRealtimeStateCoordinator::new()),
             Arc::new(FishStateCoordinator::new()),
+            Arc::default(),
         )
     }
 
     fn with_realtime_coordinators(
         config: WorkerConfig,
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
-        nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
         fish_s2_pending: Arc<FishStateCoordinator>,
+        long_form_asr: Arc<long_form::LongFormAsrRuns>,
     ) -> Self {
         Self {
             config,
@@ -2885,8 +2696,8 @@ impl NativeExecutor {
             fish_s2_pending,
             voxtral_tts_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
-            nemotron_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
+            long_form_asr,
         }
     }
 
@@ -2936,28 +2747,44 @@ impl NativeExecutor {
         f(registry)
     }
 
+    /// Run one model call, logging a panic before it unwinds to the physical
+    /// boundary. Model calls run on the device thread (the unified executor
+    /// sends every physical batch there), so this no longer moves work off a
+    /// tokio worker.
     fn run_blocking<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let run_catching_panic = || {
-            let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            match unwind_result {
-                Ok(result) => result,
-                Err(payload) => {
-                    let message = panic_payload_to_string(payload.as_ref());
-                    error!("Model execution panicked: {message}");
-                    std::panic::resume_unwind(payload)
-                }
+        crate::backends::probe_device_op("model.run_blocking");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_payload_to_string(payload.as_ref());
+                error!("Model execution panicked: {message}");
+                std::panic::resume_unwind(payload)
             }
-        };
-
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                // Long-running CPU inference should not monopolize Tokio workers; this allows
-                // async tasks (including SSE stream forwarding) to continue making progress.
-                tokio::task::block_in_place(run_catching_panic)
-            }
-            _ => run_catching_panic(),
         }
     }
+}
+
+/// Whether the request's loaded adapter runs it in a mixed prefill+decode
+/// stage, whose prefill spans are resumable whatever the engine's chunked
+/// prefill switch says.
+fn binds_mixed_step(request: &EngineCoreRequest) -> bool {
+    request.execution_adapter_binding().is_some_and(|binding| {
+        binding
+            .stages
+            .iter()
+            .any(|stage| stage.batch_mode == NativeBatchMode::Mixed)
+    })
+}
+
+/// `IZWI_MIXED_FORCE_SPLIT=1` runs mixed physical batches through the split
+/// prefill and decode handlers: the parity oracle for a family's mixed
+/// forward, and a production kill switch.
+const MIXED_FORCE_SPLIT_ENV: &str = "IZWI_MIXED_FORCE_SPLIT";
+
+fn mixed_force_split() -> bool {
+    static FORCE_SPLIT: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MIXED_FORCE_SPLIT_ENV, false));
+    FORCE_SPLIT.get()
 }
 
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
@@ -3091,11 +2918,16 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         max_output_steps: 1,
         auxiliary_state: None,
     };
+    // A mixed stage serves decode rows as continuous rows beside its spans.
     let decode = decode_supported
         && binding.stage_for_work(&decode_work).is_ok_and(|stage| {
-            stage.selector == StageWorkSelector::SequenceDecode
-                && stage.batch_mode == NativeBatchMode::Continuous
-                && stage.concurrency == ConcurrencyClass::Batchable
+            matches!(
+                (stage.selector, stage.batch_mode),
+                (
+                    StageWorkSelector::SequenceDecode,
+                    NativeBatchMode::Continuous
+                ) | (StageWorkSelector::SequenceStep, NativeBatchMode::Mixed)
+            ) && stage.concurrency == ConcurrencyClass::Batchable
         });
     let prefill_work = WorkUnit::SequenceStep {
         phase: SequencePhase::Prefill,
@@ -3310,12 +3142,18 @@ impl ModelExecutor for NativeExecutor {
             // incremental decode: the exact loaded family must publish a
             // resumable prefill safe point. Unsupported families remain full.
             profile.prefill = resolved_resumable_prefill_mode(
-                self.config.enable_chunked_prefill,
+                self.config.enable_chunked_prefill || binds_mixed_step(request),
                 resumable_prefill_proof,
             );
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
+            if request.task_type == super::types::TaskType::Chat {
+                profile.replay = request
+                    .prepared_chat_model_for_executor()
+                    .map(|model| model.replay_capability())
+                    .unwrap_or_default();
+            }
         }
         if matches!(request.task_type, super::types::TaskType::ASR) && !implementation_incremental {
             // Long audio can switch to a full chunk-plan operation after media
@@ -3386,11 +3224,31 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
+            // The chat handler checks stop strings after every token of a
+            // quantum, so stop strings keep a family's multi-token quantum.
+            // A speculative quantum or envelope verifies several tokens per
+            // forward and cannot stop between them, so stop strings keep
+            // those rows at one token per quantum.
+            let stops = request
+                .params
+                .stop_sequences
+                .iter()
+                .any(|stop| !stop.is_empty());
             let (preferred_decode_tokens, sustained_decode_quantum, speculative_decode_batch) =
                 request
                     .prepared_chat_model_for_executor()
                     .ok()
-                    .map(|model| model.as_ref().speculative_decode_profile())
+                    .map(|model| {
+                        let model = model.as_ref();
+                        let (tokens, sustained, speculative) = model.speculative_decode_profile();
+                        if !stops {
+                            (tokens, sustained, speculative)
+                        } else if handler_chat::decodes_speculative_quanta(model) {
+                            (1, false, false)
+                        } else {
+                            (tokens, sustained, false)
+                        }
+                    })
                     .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
@@ -3413,6 +3271,7 @@ impl ModelExecutor for NativeExecutor {
         &self,
         execution: PhysicalBatchExecution<'_>,
     ) -> PhysicalDispatchResult {
+        crate::backends::probe_device_op("model.execute_physical_batch");
         let width = execution.scheduled.len().max(1);
         let expected_dispatch = execution.expected_dispatch();
         execution.validate().map_err(|error| {
@@ -3496,6 +3355,31 @@ impl ModelExecutor for NativeExecutor {
                         execution.scheduled,
                         Some(&execution.batch.rows),
                     ),
+                NativeBatchRoute::ChatMixedStep { .. } => {
+                    let force_split = mixed_force_split();
+                    if !force_split
+                        && !execution.requests.iter().all(|request| {
+                            request
+                                .prepared_chat_model_for_executor()
+                                .is_ok_and(|model| model.supports_mixed_step())
+                        })
+                    {
+                        return Err(PhysicalDispatchError::not_started(
+                            Error::InvalidInput(
+                                "loaded chat model does not run mixed prefill and decode steps"
+                                    .into(),
+                            ),
+                            width,
+                            FailureOrigin::ExecutorValidation,
+                        ));
+                    }
+                    self.execute_mixed_chat_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        force_split,
+                    )
+                }
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::RealtimePreparation,
@@ -3512,24 +3396,6 @@ impl ModelExecutor for NativeExecutor {
                         execution.scheduled,
                         &execution.batch.rows,
                         NativeBatchMode::Static,
-                    )
-                }
-                NativeBatchRoute::Audio {
-                    task: TaskType::ASR,
-                    stage: NativeAudioStage::RealtimeDecodeContinuation,
-                    mode: NativeBatchMode::Continuous,
-                    ..
-                } if execution.requests.iter().all(|request| {
-                    request.model_variant.is_some_and(|variant| {
-                        variant.family() == crate::catalog::ModelFamily::NemotronAsr
-                    })
-                }) =>
-                {
-                    self.execute_nemotron_realtime_batch_with_rows(
-                        execution.requests,
-                        execution.scheduled,
-                        &execution.batch.rows,
-                        NativeBatchMode::Continuous,
                     )
                 }
                 NativeBatchRoute::Audio {
@@ -3855,20 +3721,9 @@ impl ModelExecutor for NativeExecutor {
                 "cannot shut down with a prepared Voxtral realtime quantum".to_string(),
             ));
         }
-        if self.nemotron_realtime.abort_matching(|_| true).is_err()
-            || self.nemotron_realtime.has_prepared()
-        {
-            return Err(Error::InferenceError(
-                "cannot shut down with unresolved Nemotron realtime state".into(),
-            ));
-        }
         let mut voxtral = self.voxtral_realtime.states.lock().map_err(|_| {
             Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
         })?;
-        let mut nemotron =
-            self.nemotron_realtime.states.lock().map_err(|_| {
-                Error::InferenceError("Nemotron realtime state mutex poisoned".into())
-            })?;
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
         })?;
@@ -3881,7 +3736,6 @@ impl ModelExecutor for NativeExecutor {
         fish_s2_tts.clear();
         voxtral_tts.clear();
         voxtral.clear();
-        nemotron.clear();
         tts.clear();
         drop((
             chat,
@@ -3893,7 +3747,6 @@ impl ModelExecutor for NativeExecutor {
             fish_s2_tts,
             voxtral_tts,
             voxtral,
-            nemotron,
             tts,
         ));
         self.initialized = false;
@@ -3902,6 +3755,7 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
+        self.long_form_asr.release(request_id);
         if self
             .fish_s2_pending
             .abort_matching(|session| session.request_id == request_id)
@@ -3921,13 +3775,6 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        if self
-            .nemotron_realtime
-            .abort_matching(|pending| pending.session.request_id == request_id)
-            .is_err()
-        {
-            return CacheReleaseReport::unconfirmed();
-        }
         let (
             Ok(mut chat),
             Ok(mut asr),
@@ -3938,7 +3785,6 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut fish_s2_tts),
             Ok(mut voxtral_tts),
             Ok(mut voxtral),
-            Ok(mut nemotron),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -3950,7 +3796,6 @@ impl ModelExecutor for NativeExecutor {
             self.fish_s2_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
-            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -3966,7 +3811,6 @@ impl ModelExecutor for NativeExecutor {
         let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
         let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
-        let nemotron = cleanup_request_states_locked(&mut nemotron, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
         cleanup_report(
             chat.combine(asr)
@@ -3977,7 +3821,6 @@ impl ModelExecutor for NativeExecutor {
                 .combine(fish_s2_tts)
                 .combine(voxtral_tts)
                 .combine(voxtral)
-                .combine(nemotron)
                 .combine(tts),
         )
     }
@@ -3987,6 +3830,7 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+        self.long_form_asr.release_session(session);
         if self
             .fish_s2_pending
             .abort_matching(|pending| pending == session)
@@ -3996,13 +3840,6 @@ impl ModelExecutor for NativeExecutor {
         }
         if self
             .voxtral_realtime
-            .abort_matching(|pending| &pending.session == session)
-            .is_err()
-        {
-            return CacheReleaseReport::unconfirmed();
-        }
-        if self
-            .nemotron_realtime
             .abort_matching(|pending| &pending.session == session)
             .is_err()
         {
@@ -4018,7 +3855,6 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut fish_s2_tts),
             Ok(mut voxtral_tts),
             Ok(mut voxtral),
-            Ok(mut nemotron),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -4030,7 +3866,6 @@ impl ModelExecutor for NativeExecutor {
             self.fish_s2_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
-            self.nemotron_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -4050,7 +3885,6 @@ impl ModelExecutor for NativeExecutor {
         let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
         let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
-        let nemotron = cleanup_session_state_locked(&mut nemotron, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
         cleanup_report(
             chat.combine(asr)
@@ -4061,7 +3895,6 @@ impl ModelExecutor for NativeExecutor {
                 .combine(fish_s2_tts)
                 .combine(voxtral_tts)
                 .combine(voxtral)
-                .combine(nemotron)
                 .combine(tts),
         )
     }
@@ -4079,32 +3912,16 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        if self
-            .nemotron_realtime
-            .abort_matching(|pending| pending.active.variant == variant)
-            .is_err()
-        {
-            return CacheReleaseReport::unconfirmed();
-        }
-        let (Ok(mut states), Ok(mut nemotron), Ok(mut voxtral_tts)) = (
+        let (Ok(mut states), Ok(mut voxtral_tts)) = (
             self.voxtral_realtime.states.lock(),
-            self.nemotron_realtime.states.lock(),
             self.voxtral_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
         cleanup_report(
-            cleanup_model_states_locked(&mut states, variant, |active| active.variant)
-                .combine(cleanup_model_states_locked(
-                    &mut nemotron,
-                    variant,
-                    |active| active.variant,
-                ))
-                .combine(cleanup_model_states_locked(
-                    &mut voxtral_tts,
-                    variant,
-                    |active| active.variant,
-                )),
+            cleanup_model_states_locked(&mut states, variant, |active| active.variant).combine(
+                cleanup_model_states_locked(&mut voxtral_tts, variant, |active| active.variant),
+            ),
         )
     }
 }
@@ -4119,6 +3936,10 @@ struct BatchWorkspaceContext {
 #[derive(Clone)]
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
+    /// Runs every model call and executor-state drop; `None` only for
+    /// device-less test executors, which run inline.
+    device: Option<Arc<DeviceThread>>,
+    device_idle: Arc<DeviceIdleClock>,
     batch_workspace: Option<BatchWorkspaceContext>,
     physical_execution_admission: Option<PhysicalExecutionAdmission>,
     pending_quantum_finalizer: Option<Arc<dyn PendingQuantumFinalizer>>,
@@ -4151,15 +3972,24 @@ impl UnifiedExecutor {
                     authority: authority.clone(),
                 });
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
-        let nemotron_realtime = Arc::new(NemotronRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
+        let long_form_asr = Arc::new(long_form::LongFormAsrRuns::default());
+        let device = match DeviceThread::for_device(&config.backend_context.device.device) {
+            Ok(device) => Some(device),
+            Err(error) => {
+                error!("Model execution runs on the calling thread: {error}");
+                None
+            }
+        };
         Self {
+            device,
+            device_idle: Arc::default(),
             inner: Arc::new(RwLock::new(Box::new(
                 NativeExecutor::with_realtime_coordinators(
                     config,
                     voxtral_realtime.clone(),
-                    nemotron_realtime.clone(),
                     fish_s2_pending.clone(),
+                    long_form_asr.clone(),
                 ),
             ))),
             batch_workspace,
@@ -4167,7 +3997,7 @@ impl UnifiedExecutor {
             pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
                 fish: fish_s2_pending,
                 voxtral: voxtral_realtime,
-                nemotron: nemotron_realtime,
+                long_form: long_form_asr,
             })),
         }
     }
@@ -4176,10 +4006,29 @@ impl UnifiedExecutor {
     pub(crate) fn new_for_test(executor: Box<dyn ModelExecutor>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            device: None,
+            device_idle: Arc::default(),
             batch_workspace: None,
             physical_execution_admission: None,
             pending_quantum_finalizer: None,
         }
+    }
+
+    /// The engine has no more work: the device's next step does not follow
+    /// this one, so the wait until it is not device idle time.
+    pub(crate) fn end_device_busy_period(&self) {
+        self.device_idle.end_busy_period();
+    }
+
+    /// The thread that runs this executor's device work, if it has a device.
+    pub(crate) fn device_thread(&self) -> Option<&Arc<DeviceThread>> {
+        self.device.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_device_for_test(mut self, device: Arc<DeviceThread>) -> Self {
+        self.device = Some(device);
+        self
     }
 
     #[cfg(test)]
@@ -4200,6 +4049,8 @@ impl UnifiedExecutor {
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            device: None,
+            device_idle: Arc::default(),
             batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
             physical_execution_admission: Some(admission),
             pending_quantum_finalizer: None,
@@ -4311,6 +4162,36 @@ impl UnifiedExecutor {
         }
     }
 
+    /// A sticky device error (CUDA illegal address, launch failure, ECC; a
+    /// Metal command-buffer fault) leaves the device unusable for this
+    /// process, so it poisons physical admission like a post-entry panic:
+    /// later requests fail fast and health reports `Failed` instead of every
+    /// request failing on device entry.
+    fn latch_fatal_device_fault(
+        &self,
+        batch: &PhysicalBatch,
+        result: &std::result::Result<Vec<ExecutorStepResult>, PhysicalDispatchError>,
+    ) {
+        let fault = match result {
+            Err(failure) => crate::runtime::fatal_device_fault(&failure.error),
+            Ok(rows) => rows.iter().find_map(|row| {
+                row.output
+                    .error
+                    .as_deref()
+                    .and_then(crate::runtime::fatal_device_fault_message)
+            }),
+        };
+        if let Some(fault) = fault {
+            error!(
+                batch_id = batch.batch_id.get(),
+                fault, "Fatal device fault during physical model execution"
+            );
+            self.poison_physical_runtime(format!(
+                "fatal device fault ({fault}) during physical model execution"
+            ));
+        }
+    }
+
     /// Acquire physical execution capacity for one validated batch envelope.
     /// Workspace and stream state must not be acquired until this returns.
     pub(super) async fn acquire_physical_execution(
@@ -4384,38 +4265,42 @@ impl UnifiedExecutor {
         ))
     }
 
-    /// Execute a batch whose exact physical capacity has already been admitted.
-    pub(super) async fn execute_admitted_physical_batch(
+    /// The admission token, deadline, cancellation and health checks that
+    /// gate device entry; `Some` is the result when the batch must not enter.
+    fn device_entry_refusal(
         &self,
-        admitted: AdmittedPhysicalExecution,
-        batch: &PhysicalBatch,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> PhysicalDispatchResult {
+        admitted: &AdmittedPhysicalExecution,
+        execution: &PhysicalBatchExecution<'_>,
+    ) -> Option<PhysicalDispatchResult> {
+        let PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        } = execution;
         if admitted.batch_id != batch.batch_id
             || admitted.lane != batch.lane
             || admitted.width != batch.rows.len().max(1)
         {
-            return Err(PhysicalDispatchError::not_started(
+            return Some(Err(PhysicalDispatchError::not_started(
                 Error::InvalidInput(
                     "physical execution admission does not match its batch envelope".to_string(),
                 ),
                 batch.rows.len().max(1),
                 FailureOrigin::ExecutorValidation,
-            ));
+            )));
         }
         if let Some(deadline) = requests.iter().filter_map(|request| request.deadline).min() {
             if deadline <= std::time::Instant::now() {
-                return Err(PhysicalDispatchError::not_started(
+                return Some(Err(PhysicalDispatchError::not_started(
                     Error::Timeout("physical batch device entry".to_string()),
                     admitted.width,
                     FailureOrigin::DispatchCoordination,
-                ));
+                )));
             }
         }
         if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
             let dispatch = BatchDispatch::not_dispatched(admitted.width);
-            return Ok(scheduled
+            return Some(Ok(scheduled
                 .iter()
                 .map(|scheduled| {
                     ExecutorStepResult::from_session(
@@ -4426,55 +4311,136 @@ impl UnifiedExecutor {
                     )
                     .with_dispatch(dispatch)
                 })
-                .collect());
+                .collect()));
         }
         if let Some(admission) = &self.physical_execution_admission {
             if let Err(error) = admission.ensure_healthy() {
-                return Err(PhysicalDispatchError::not_started(
+                return Some(Err(PhysicalDispatchError::not_started(
                     error,
                     admitted.width,
                     FailureOrigin::DispatchCoordination,
-                ));
+                )));
             }
         }
-        let _physical_dispatch = begin_engine_physical_dispatch();
-        let executor = self.inner.read().await;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            executor.execute_physical_batch(PhysicalBatchExecution {
-                batch,
-                requests,
-                scheduled,
-            })
-        }));
-        match result {
-            Ok(result) => {
-                drop(executor);
-                drop(admitted);
+        None
+    }
+
+    /// Execute a batch whose exact physical capacity has already been
+    /// admitted, on the device thread. The inputs move to the device thread
+    /// and come back with the result. `retained` (and the admission) stay
+    /// alive until the device work ends, even if this future is dropped.
+    pub(super) async fn execute_admitted_physical_batch<D: PhysicalExecutionInputs>(
+        &self,
+        admitted: AdmittedPhysicalExecution,
+        inputs: D,
+        retained: impl Send + 'static,
+    ) -> (D, PhysicalDispatchResult) {
+        if let Some(refusal) =
+            inputs.with_execution(|execution| self.device_entry_refusal(&admitted, &execution))
+        {
+            return (inputs, refusal);
+        }
+        let (batch_id, expected_dispatch, tag, class) = inputs.with_execution(|execution| {
+            let (tag, class) = device_job_tag(&execution);
+            (
+                execution.batch.batch_id,
+                execution.batch.expected_dispatch(),
+                tag,
+                class,
+            )
+        });
+        let slot = Arc::new(Mutex::new(Some(inputs)));
+        let job_slot = slot.clone();
+        let idle = self
+            .device
+            .as_ref()
+            .map(|device| (self.device_idle.clone(), device.key().label()));
+        let queued_at = std::time::Instant::now();
+        let run = move |executor: &dyn ModelExecutor| {
+            if let Some((_, label)) = idle.as_ref() {
+                super::metrics::record_engine_device_queue_wait(
+                    label,
+                    class.as_str(),
+                    queued_at.elapsed(),
+                );
+            }
+            let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
+            let _physical_dispatch = begin_engine_physical_dispatch();
+            let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
+            let result = inputs
+                .as_ref()
+                .expect("physical batch inputs stay in place until the device job ends")
+                .with_execution(|execution| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        executor.execute_physical_batch(execution)
+                    }))
+                });
+            drop(inputs);
+            drop(admitted);
+            drop(retained);
+            result
+        };
+        let outcome = match &self.device {
+            Some(device) => {
+                let executor = self.inner.clone();
+                device
+                    .submit_tagged(tag, move || run(executor.blocking_read().as_ref()))
+                    .await
+            }
+            None => Ok(run(self.inner.read().await.as_ref())),
+        };
+        let inputs = slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .expect("the device job hands its inputs back");
+        let result = match outcome {
+            Ok(Ok(result)) => {
+                inputs.with_execution(|execution| {
+                    self.latch_fatal_device_fault(execution.batch, &result)
+                });
                 result
             }
-            Err(payload) => {
+            Ok(Err(payload)) => {
                 let message = panic_payload_to_string(payload.as_ref());
                 error!(
-                    batch_id = batch.batch_id.get(),
+                    batch_id = batch_id.get(),
                     "Physical model execution panicked after entry: {message}"
                 );
-                record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
-                self.poison_physical_runtime("physical model execution panicked after entry");
-                drop(executor);
-                drop(admitted);
+                self.fail_after_entry("physical model execution panicked after entry");
                 Err(PhysicalDispatchError::started(
                     Error::InferenceError(
                         "physical model execution panicked; runtime must be recreated".to_string(),
                     ),
-                    batch.expected_dispatch(),
+                    expected_dispatch,
                     FailureOrigin::Panic,
                 ))
             }
-        }
+            Err(error) => {
+                // The device job may have run partway: state is unknown.
+                error!(
+                    batch_id = batch_id.get(),
+                    "Physical model execution lost its device job: {error}"
+                );
+                self.fail_after_entry("physical model execution lost its device job");
+                Err(PhysicalDispatchError::started(
+                    error,
+                    expected_dispatch,
+                    FailureOrigin::Panic,
+                ))
+            }
+        };
+        (inputs, result)
+    }
+
+    fn fail_after_entry(&self, reason: &str) {
+        record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
+        self.poison_physical_runtime(reason);
     }
 
     /// Compatibility boundary for callers that do not need to interpose
     /// workspace admission between physical admission and device entry.
+    #[cfg(test)]
     pub async fn execute_physical_batch(
         &self,
         batch: &PhysicalBatch,
@@ -4486,8 +4452,14 @@ impl UnifiedExecutor {
             .await?;
         match admitted {
             PhysicalExecutionAdmissionOutcome::Admitted(admitted) => {
-                self.execute_admitted_physical_batch(admitted, batch, requests, scheduled)
+                let inputs = OwnedPhysicalExecution {
+                    batch: batch.clone(),
+                    requests: requests.iter().map(|request| (*request).clone()).collect(),
+                    scheduled: scheduled.to_vec(),
+                };
+                self.execute_admitted_physical_batch(admitted, inputs, ())
                     .await
+                    .1
             }
             PhysicalExecutionAdmissionOutcome::Cancelled => {
                 let dispatch = BatchDispatch::not_dispatched(batch.rows.len().max(1));
@@ -4564,6 +4536,7 @@ impl UnifiedExecutor {
     }
 
     /// Check if ready.
+    #[cfg(test)]
     pub async fn is_ready(&self) -> bool {
         if self
             .physical_execution_admission
@@ -4588,30 +4561,44 @@ impl UnifiedExecutor {
         executor.shutdown()
     }
 
-    /// Cleanup transient backend state for a completed/aborted request.
-    pub async fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.cleanup_request(request_id)
+    /// Run `work` against the executor on the device thread: executor state
+    /// holds device tensors, so releasing or suspending it frees device
+    /// memory. Device-less test executors run it inline.
+    async fn on_device<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn ModelExecutor) -> T + Send + 'static,
+    ) -> Result<T> {
+        match &self.device {
+            Some(device) => {
+                let executor = self.inner.clone();
+                device
+                    .submit(move || work(executor.blocking_read().as_ref()))
+                    .await
+            }
+            None => Ok(work(self.inner.read().await.as_ref())),
+        }
     }
 
     pub(crate) async fn suspend_session_for_capacity(
         &self,
         session: &SessionKey,
     ) -> Result<Option<usize>> {
-        self.inner
-            .read()
-            .await
-            .suspend_session_for_capacity(session)
+        let session = session.clone();
+        self.on_device(move |executor| executor.suspend_session_for_capacity(&session))
+            .await?
     }
 
     pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.cleanup_session(session)
+        let session = session.clone();
+        self.on_device(move |executor| executor.cleanup_session(&session))
+            .await
+            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.purge_model_cache(variant)
+        self.on_device(move |executor| executor.purge_model_cache(variant))
+            .await
+            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 }
 
@@ -4733,12 +4720,7 @@ fn cleanup_session_state_locked<T>(
     }
 }
 
-/// Decode base64-encoded audio to samples.
-pub fn decode_audio_base64(audio_b64: &str, _sample_rate: u32) -> Result<Vec<f32>> {
-    let (samples, _) = decode_audio_base64_with_rate(audio_b64)?;
-    Ok(samples)
-}
-
+#[cfg(test)]
 fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
     audio::decode_audio_base64_with_rate(audio_b64)
 }
@@ -5518,6 +5500,165 @@ mod tests {
         .is_err());
     }
 
+    /// A two-row chat batch in `mode` under one stage: a decode row and a
+    /// prefill row of another request, in `order`.
+    fn two_phase_chat_batch(
+        selector: StageWorkSelector,
+        mode: NativeBatchMode,
+        decode_first: bool,
+    ) -> (Vec<EngineCoreRequest>, Vec<ScheduledRequest>, PhysicalBatch) {
+        let fixture = |phase| {
+            native_route_fixture(
+                TaskType::Chat,
+                "chat",
+                ModelVariant::Qwen306B,
+                selector,
+                "chat.step.mixed",
+                mode,
+                phase,
+            )
+        };
+        let (decode_request, decode, mut batch) = fixture(SequencePhase::Decode);
+        let (mut prefill_request, mut prefill, _) = fixture(SequencePhase::Prefill);
+        prefill_request.id = "native-route-prefill".to_string();
+        prefill.request_id = prefill_request.id.clone();
+        prefill.plan_id = 12;
+        let mut row = batch.rows[0].clone();
+        row.plan_id = prefill.plan_id;
+        row.session = prefill.session_key();
+        row.work = prefill.work.clone();
+        let (requests, scheduled) = if decode_first {
+            batch.rows.push(row);
+            (vec![decode_request, prefill_request], vec![decode, prefill])
+        } else {
+            batch.rows.insert(0, row);
+            (vec![prefill_request, decode_request], vec![prefill, decode])
+        };
+        batch.materialized_tensor_elements = 2;
+        batch.validate().unwrap();
+        (requests, scheduled, batch)
+    }
+
+    #[test]
+    fn native_route_runs_both_phases_only_in_a_mixed_chat_batch() {
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::ChatMixedStep {
+                stage_id: StageId::new(7)
+            }
+        );
+        assert_eq!(
+            execution.expected_dispatch().kind,
+            super::super::BatchDispatchKind::TensorMixed
+        );
+
+        // A prefill span before a decode row breaks the mixed layout.
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            false,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        assert!(PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        }
+        .validate()
+        .is_err());
+        assert!(dispatch::split_mixed_rows(&scheduled).is_err());
+
+        // A continuous batch runs one phase, even under a stage selecting both.
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Continuous,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        assert!(execution.validate().is_err());
+        assert!(NativeBatchRoute::resolve(&execution).is_err());
+    }
+
+    #[test]
+    fn mixed_rows_split_into_decode_rows_then_prefill_spans() {
+        let (_, scheduled, _) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let (decode, prefill) = dispatch::split_mixed_rows(&scheduled).unwrap();
+        assert_eq!(decode.len(), 1);
+        assert!(!decode[0].is_prefill);
+        assert_eq!(prefill.len(), 1);
+        assert!(prefill[0].is_prefill);
+        let (decode, prefill) = dispatch::split_mixed_rows(&scheduled[1..]).unwrap();
+        assert!(decode.is_empty());
+        assert_eq!(prefill.len(), 1);
+    }
+
+    /// The compatibility executor has no mixed route and refuses a mixed
+    /// batch before model entry.
+    #[test]
+    fn compatibility_executors_refuse_mixed_batches_before_model_entry() {
+        struct Compatibility;
+        impl ModelExecutor for Compatibility {
+            fn execute_prefill(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("refused before model entry")
+            }
+            fn execute_decode(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("refused before model entry")
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+            fn initialize(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let error = Compatibility
+            .execute_physical_batch(PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap_err();
+        assert_eq!(error.provenance.dispatch_state, DispatchState::NotStarted);
+    }
+
     fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
         ManagedCacheReservation {
             txn_id: 1,
@@ -5656,6 +5797,16 @@ mod tests {
             kind: "test".to_string(),
         };
         validate_atomic_scalar_invocation_stage(&scalar, &atomic).unwrap();
+        // Long-form run one chunk per dispatch leases a whole workspace for
+        // each dispatch, like any atomic row.
+        let mut chunked = scalar.clone();
+        chunked.selector = super::super::StageWorkSelector::Atomic;
+        chunked.progress = super::super::StageProgressKind::Iterative;
+        validate_atomic_scalar_invocation_stage(&chunked, &atomic).unwrap();
+        let mut iterative = scalar.clone();
+        iterative.selector = super::super::StageWorkSelector::SequencePrefill;
+        iterative.progress = super::super::StageProgressKind::Iterative;
+        assert!(validate_atomic_scalar_invocation_stage(&iterative, &atomic).is_err());
 
         let sequence = WorkUnit::SequenceStep {
             phase: super::super::SequencePhase::Decode,
@@ -5795,14 +5946,20 @@ mod tests {
             WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, None),
             1
         );
+        // EXE-F11: CUDA rows share one stream with thread-local graph
+        // capture, so an override cannot widen it either.
         assert_eq!(
             WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, Some(4)),
-            4
+            1
         );
     }
 
     #[test]
     fn automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows",
+        );
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let engine = EngineCoreConfig {
                 backend,
@@ -5828,9 +5985,9 @@ mod tests {
     }
 
     #[test]
-    fn tensor_batch_caps_are_backend_conservative() {
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 2);
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 2);
+    fn tensor_batch_caps_are_the_widest_certified_width() {
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 8);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 8);
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 32);
     }
 
@@ -5983,29 +6140,15 @@ mod tests {
         assert!(panic_payload_to_string(payload.as_ref()).contains("executor panic sentinel"));
     }
 
-    #[tokio::test]
-    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
-        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-            capacity: ResourceVector {
-                host_bytes: ResourceAmount::Known(64),
-                ..ResourceVector::zero()
-            },
-        })));
-        let admission = PhysicalExecutionAdmission::standalone(1);
-        let executor = UnifiedExecutor::new_for_test_with_physical_context(
-            Box::new(PanickingPhysicalExecutor),
-            BackendKind::Cpu,
-            authority.clone(),
-            admission.clone(),
-        );
-        let mut request = EngineCoreRequest::tts("panic containment");
-        request.id = "panic-containment".to_string();
+    fn single_row_physical_batch(
+        request: &EngineCoreRequest,
+    ) -> (PhysicalBatch, ScheduledRequest, super::super::BatchLaneKey) {
         let lane = super::super::BatchLaneKey {
             execution_group: super::super::ExecutionGroupId::new(27),
             model_instance: super::super::ModelInstanceId::new(28),
             adapter_instance: super::super::AdapterInstanceId::new(29),
             adapter_abi: super::super::AdapterAbiRevision::new(1),
-            capability_id: "panic-test".to_string(),
+            capability_id: "physical-test".to_string(),
             stage_id: super::super::StageId::new(1),
             backend: BackendKind::Cpu,
             device_ordinal: None,
@@ -6019,7 +6162,7 @@ mod tests {
             shape_bucket: "exact.1".to_string(),
         };
         let work = super::super::WorkUnit::AtomicJob {
-            kind: "panic-test".to_string(),
+            kind: "physical-test".to_string(),
         };
         let batch = PhysicalBatch {
             batch_id: super::super::BatchId::new(30),
@@ -6046,6 +6189,38 @@ mod tests {
             num_computed_tokens: 0,
             work,
         };
+        (batch, scheduled, lane)
+    }
+
+    #[tokio::test]
+    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
+        let device = crate::backends::DeviceThread::for_location(candle_core::DeviceLocation::Cpu)
+            .expect("device thread");
+        for device in [None, Some(device)] {
+            post_entry_panic_poisons_physical_runtime(device).await;
+        }
+    }
+
+    async fn post_entry_panic_poisons_physical_runtime(device: Option<Arc<DeviceThread>>) {
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
+            },
+        })));
+        let admission = PhysicalExecutionAdmission::standalone(1);
+        let mut executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(PanickingPhysicalExecutor),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission.clone(),
+        );
+        if let Some(device) = device {
+            executor = executor.with_device_for_test(device);
+        }
+        let mut request = EngineCoreRequest::tts("panic containment");
+        request.id = "panic-containment".to_string();
+        let (batch, scheduled, lane) = single_row_physical_batch(&request);
 
         let failure = executor
             .execute_physical_batch(&batch, &[&request], &[scheduled])
@@ -6079,6 +6254,205 @@ mod tests {
                 .await,
             Err(Error::Overloaded(message)) if message.contains("poisoned")
         ));
+    }
+
+    /// Records the thread each physical batch ran on.
+    #[derive(Default)]
+    struct ThreadRecordingExecutor {
+        threads: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl ModelExecutor for ThreadRecordingExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            crate::backends::probe_device_op("test.model_call");
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().map(str::to_string));
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::error(scheduled.request_id.clone(), "recorded"),
+                    )
+                    .with_dispatch(execution.expected_dispatch())
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical batches use execute_physical_batch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical batches use execute_physical_batch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The idle histogram counts the gap between back-to-back device steps,
+    /// not the wait after the engine ran out of work.
+    #[test]
+    fn device_idle_clock_records_gaps_only_inside_a_busy_period() {
+        let clock = DeviceIdleClock::default();
+        let label = "test-device-idle-clock";
+        drop(clock.begin_step(label));
+        std::thread::sleep(Duration::from_millis(2));
+        drop(clock.begin_step(label));
+        clock.end_busy_period();
+        std::thread::sleep(Duration::from_millis(2));
+        drop(clock.begin_step(label));
+
+        let (count, idle) = super::super::metrics::engine_device_idle_totals(label);
+        assert_eq!(count, 1);
+        assert!(idle >= 0.002, "{idle}");
+    }
+
+    /// B2: model calls run on the device thread, never on the tokio thread
+    /// that awaits them.
+    #[tokio::test]
+    async fn physical_batches_run_on_the_device_thread() {
+        let watch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::backends::device_thread::watch_off_thread_ops(Some(watch.clone()));
+        let recorder = ThreadRecordingExecutor::default();
+        let threads = recorder.threads.clone();
+        let device = crate::backends::DeviceThread::for_location(candle_core::DeviceLocation::Cpu)
+            .expect("device thread");
+        let executor = UnifiedExecutor::new_for_test(Box::new(recorder)).with_device_for_test(device);
+        let mut request = EngineCoreRequest::tts("device thread");
+        request.id = "device-thread".to_string();
+        let (batch, scheduled, _) = single_row_physical_batch(&request);
+
+        let results = executor
+            .execute_physical_batch(&batch, &[&request], &[scheduled])
+            .await
+            .expect("recorded batch");
+
+        crate::backends::device_thread::watch_off_thread_ops(None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            threads.lock().unwrap().as_slice(),
+            [Some("izwi-device-cpu-0".to_string())]
+        );
+        assert_eq!(watch.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    struct FailingPhysicalExecutor {
+        message: &'static str,
+    }
+
+    impl ModelExecutor for FailingPhysicalExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Err(Error::InferenceError(self.message.to_string()))
+        }
+
+        fn execute_decode(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute_prefill(requests, scheduled)
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_device_errors_latch_physical_runtime_and_ordinary_errors_do_not() {
+        for (message, fatal) in [
+            (
+                "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")",
+                true,
+            ),
+            (
+                "Metal error Command buffer had following error: Caused GPU Address Fault Error (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)",
+                true,
+            ),
+            ("shape mismatch in matmul", false),
+        ] {
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity: ResourceVector {
+                    host_bytes: ResourceAmount::Known(64),
+                    ..ResourceVector::zero()
+                },
+            })));
+            let admission = PhysicalExecutionAdmission::standalone(1);
+            let executor = UnifiedExecutor::new_for_test_with_physical_context(
+                Box::new(FailingPhysicalExecutor { message }),
+                BackendKind::Cpu,
+                authority.clone(),
+                admission.clone(),
+            );
+            let mut request = EngineCoreRequest::tts("device fault");
+            request.id = "device-fault".to_string();
+            let (batch, scheduled, lane) = single_row_physical_batch(&request);
+
+            let failure = executor
+                .execute_physical_batch(&batch, &[&request], &[scheduled])
+                .await
+                .expect_err("a model error must fail the dispatch");
+            assert_eq!(failure.provenance.failure_origin, Some(FailureOrigin::Model));
+            assert_eq!(admission.active(), 0);
+            assert_eq!(admission.poison_reason().is_some(), fatal, "{message}");
+            assert_eq!(authority.poison_reason().is_some(), fatal, "{message}");
+            assert_eq!(executor.is_ready().await, !fatal, "{message}");
+            if fatal {
+                assert!(admission
+                    .poison_reason()
+                    .is_some_and(|reason| reason.contains("fatal device fault")));
+                assert!(matches!(
+                    admission
+                        .acquire_dispatch(
+                            lane.execution_group,
+                            lane.model_instance,
+                            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                            NativeBatchMode::None,
+                            1,
+                            None,
+                        )
+                        .await,
+                    Err(Error::Overloaded(message)) if message.contains("poisoned")
+                ));
+            }
+        }
     }
 
     #[test]
@@ -6351,7 +6725,7 @@ mod tests {
             assert_eq!(profile.prefill, PrefillMode::Full);
             assert!(!profile.capabilities().native_batch);
             assert_eq!(profile.decode_batch, NativeBatchMode::None);
-            let expected_parallelism = if backend == BackendKind::Metal { 1 } else { 4 };
+            let expected_parallelism = if backend == BackendKind::Cpu { 4 } else { 1 };
             assert_eq!(profile.max_batch_size, expected_parallelism);
             assert_eq!(
                 profile.concurrency,

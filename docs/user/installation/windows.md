@@ -240,9 +240,14 @@ izwi serve --port 8888
 
 If you can't access Izwi from other devices:
 
-1. Open **Windows Defender Firewall**
-2. Click **Allow an app through firewall**
-3. Add `izwi-server.exe`
+1. Izwi listens on `127.0.0.1` by default. Set an API key and bind a network address:
+   ```powershell
+   $env:IZWI_API_KEY = "<a long random key>"
+   izwi serve --host 0.0.0.0
+   ```
+2. Open **Windows Defender Firewall**
+3. Click **Allow an app through firewall**
+4. Add `izwi-server.exe`
 
 ---
 

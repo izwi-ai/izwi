@@ -10,7 +10,7 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
 };
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::saved_voice_store::{
     NewSavedVoice, SavedVoice, SavedVoiceListCursor, SavedVoiceSourceRouteKind, SavedVoiceSummary,
     StoredSavedVoiceAudio,
@@ -122,7 +122,7 @@ fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
 
 pub async fn create_saved_voice(
     State(state): State<AppState>,
-    Json(req): Json<CreateSavedVoiceRequest>,
+    ApiJson(req): ApiJson<CreateSavedVoiceRequest>,
 ) -> Result<Json<SavedVoice>, ApiError> {
     let name = required_trimmed(req.name.as_deref(), "name")?;
     let reference_text = required_trimmed(req.reference_text.as_deref(), "reference_text")?;
@@ -151,7 +151,7 @@ pub async fn create_saved_voice(
             source_record_id: req.source_record_id,
         })
         .await
-        .map_err(map_create_error)?;
+        .map_err(map_store_error)?;
 
     Ok(Json(voice))
 }
@@ -214,23 +214,8 @@ fn audio_response(audio: StoredSavedVoiceAudio, as_attachment: bool) -> Response
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-fn map_create_error(err: anyhow::Error) -> ApiError {
-    if is_duplicate_name_error(&err) {
-        return ApiError::bad_request(
-            "A saved voice with this name already exists. Choose a different name.",
-        );
-    }
-    map_store_error(err)
-}
-
-fn is_duplicate_name_error(err: &anyhow::Error) -> bool {
-    let details = format!("{err:#}");
-    details.contains("UNIQUE constraint failed: saved_voices.name")
-        || details.contains("idx_saved_voices_name_nocase")
-}
-
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Saved voice storage error: {err}"))
+    crate::error::store_api_error(err, "Saved voice storage error")
 }
 
 #[cfg(test)]

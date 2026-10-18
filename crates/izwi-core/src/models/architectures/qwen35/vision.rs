@@ -975,8 +975,12 @@ fn fetch_file_media_bytes(source: &str) -> Result<Vec<u8>> {
     fetch_file_media_bytes_under_root(source, &root)
 }
 
+/// [`LOCAL_MEDIA_ROOT_ENV`] as set, read once; each request still validates it.
+static LOCAL_MEDIA_ROOT: crate::env::ReadOnce<Option<PathBuf>> =
+    crate::env::ReadOnce::new(|| env::var_os(LOCAL_MEDIA_ROOT_ENV).map(PathBuf::from));
+
 fn configured_local_media_root() -> Result<PathBuf> {
-    configured_local_media_root_from(env::var_os(LOCAL_MEDIA_ROOT_ENV).map(PathBuf::from))
+    configured_local_media_root_from(LOCAL_MEDIA_ROOT.get())
 }
 
 fn configured_local_media_root_from(root: Option<PathBuf>) -> Result<PathBuf> {

@@ -11,22 +11,10 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
-use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::types::{GenerationRequest, RuntimeRequestContext};
 use std::time::Instant;
 use uuid::Uuid;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum RequestPriority {
-    Background,
-    #[default]
-    Normal,
-    Interactive,
-    Critical,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RuntimeStreamPolicy {
     #[default]
@@ -34,7 +22,6 @@ pub(crate) enum RuntimeStreamPolicy {
     BlockWithDeadline {
         timeout_ms: u64,
     },
-    DropNewest,
 }
 
 impl From<RuntimeStreamPolicy> for EngineStreamPolicy {
@@ -44,19 +31,16 @@ impl From<RuntimeStreamPolicy> for EngineStreamPolicy {
             RuntimeStreamPolicy::BlockWithDeadline { timeout_ms } => {
                 Self::BlockWithDeadline { timeout_ms }
             }
-            RuntimeStreamPolicy::DropNewest => Self::DropNewest,
         }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct RequestEnvelope {
     pub(crate) request_id: String,
-    pub(crate) capability: CapabilityKind,
     pub(crate) model_variant: ModelVariant,
     pub(crate) correlation_id: Option<String>,
-    pub(crate) priority: RequestPriority,
+    pub(crate) priority: Priority,
     pub(crate) deadline: Option<Instant>,
     pub(crate) stream_policy: RuntimeStreamPolicy,
     pub(crate) workload_class: WorkloadClass,
@@ -65,13 +49,12 @@ pub(crate) struct RequestEnvelope {
 }
 
 impl RequestEnvelope {
-    pub(crate) fn new(capability: CapabilityKind, model_variant: ModelVariant) -> Self {
+    pub(crate) fn new(model_variant: ModelVariant) -> Self {
         Self {
             request_id: Uuid::new_v4().to_string(),
-            capability,
             model_variant,
             correlation_id: None,
-            priority: RequestPriority::default(),
+            priority: Priority::default(),
             deadline: None,
             stream_policy: RuntimeStreamPolicy::default(),
             workload_class: WorkloadClass::Online,
@@ -90,23 +73,8 @@ impl RequestEnvelope {
         self
     }
 
-    pub(crate) fn with_priority(mut self, priority: RequestPriority) -> Self {
-        self.priority = priority;
-        self
-    }
-
-    pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
-        self.deadline = deadline;
-        self
-    }
-
     pub(crate) fn with_stream_policy(mut self, stream_policy: RuntimeStreamPolicy) -> Self {
         self.stream_policy = stream_policy;
-        self
-    }
-
-    pub(crate) fn with_workload_class(mut self, workload_class: WorkloadClass) -> Self {
-        self.workload_class = workload_class;
         self
     }
 
@@ -114,12 +82,7 @@ impl RequestEnvelope {
         self.workload_class = context.workload_class;
         self.admission_ms = context.admission_ms;
         self.tenant_key = context.tenant_key;
-        self.priority = match context.priority {
-            Priority::Low => RequestPriority::Background,
-            Priority::Normal => RequestPriority::Normal,
-            Priority::High => RequestPriority::Interactive,
-            Priority::Critical => RequestPriority::Critical,
-        };
+        self.priority = context.priority;
         self.deadline = context.deadline;
         self
     }
@@ -128,12 +91,7 @@ impl RequestEnvelope {
         request.id = self.request_id;
         request.model_variant = Some(self.model_variant);
         request.correlation_id = self.correlation_id;
-        request.priority = match self.priority {
-            RequestPriority::Background => Priority::Low,
-            RequestPriority::Normal => Priority::Normal,
-            RequestPriority::Interactive => Priority::High,
-            RequestPriority::Critical => Priority::Critical,
-        };
+        request.priority = self.priority;
         request.deadline = self.deadline;
         request.stream_policy = self.stream_policy.into();
         request.workload_class = self.workload_class;
@@ -142,7 +100,6 @@ impl RequestEnvelope {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeAudioInput {
     Base64(String),
@@ -178,6 +135,14 @@ pub(crate) struct TtsRuntimeRequest {
 /// rather than failed when the engine's small queue fills (TPIPE-13).
 const TTS_STREAM_SEND_DEADLINE_MS: u64 = 30_000;
 
+/// Speech-to-speech audio waits for its reader like TTS (SPK-F5): a voice
+/// session's audio queue grants credit as the client plays it back, so a
+/// reply generated faster than real time is held back, not failed.
+const SPEECH_TO_SPEECH_STREAM_POLICY: RuntimeStreamPolicy =
+    RuntimeStreamPolicy::BlockWithDeadline {
+        timeout_ms: TTS_STREAM_SEND_DEADLINE_MS,
+    };
+
 impl TtsRuntimeRequest {
     pub(crate) fn from_generation(
         request: GenerationRequest,
@@ -188,7 +153,7 @@ impl TtsRuntimeRequest {
         }
 
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::Tts, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_request_id(request.id)
                 .with_correlation_id(request.correlation_id)
                 .with_runtime_context(request.runtime_context)
@@ -215,7 +180,6 @@ impl TtsRuntimeRequest {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct AsrRuntimeRequest {
     envelope: RequestEnvelope,
@@ -236,7 +200,7 @@ impl AsrRuntimeRequest {
         let audio = RuntimeAudioInput::Base64(audio_base64.into());
         audio.validate("ASR")?;
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::Asr, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
                 .with_runtime_context(runtime_context),
             audio,
@@ -256,7 +220,7 @@ impl AsrRuntimeRequest {
         let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
         audio.validate("ASR")?;
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::Asr, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
                 .with_runtime_context(runtime_context),
             audio,
@@ -299,7 +263,6 @@ impl AsrRuntimeRequest {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRuntimeRequest {
     envelope: RequestEnvelope,
@@ -326,7 +289,7 @@ impl ChatRuntimeRequest {
         }
 
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::Chat, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
                 .with_runtime_context(runtime_context),
             messages,
@@ -346,7 +309,6 @@ impl ChatRuntimeRequest {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct AudioChatRuntimeRequest {
     envelope: RequestEnvelope,
@@ -369,9 +331,10 @@ impl AudioChatRuntimeRequest {
         let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
         audio.validate("speech-to-speech")?;
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
-                .with_runtime_context(runtime_context),
+                .with_runtime_context(runtime_context)
+                .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
             params,
@@ -391,9 +354,10 @@ impl AudioChatRuntimeRequest {
         let audio = RuntimeAudioInput::Base64(audio_base64.into());
         audio.validate("speech-to-speech")?;
         Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
+            envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
-                .with_runtime_context(runtime_context),
+                .with_runtime_context(runtime_context)
+                .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
             params,
@@ -418,80 +382,6 @@ impl AudioChatRuntimeRequest {
             .filter(|value| !value.is_empty());
         request.params = self.params;
         request
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct AlignmentRuntimeRequest {
-    pub(crate) envelope: RequestEnvelope,
-    pub(crate) audio: RuntimeAudioInput,
-    pub(crate) transcript: String,
-    pub(crate) language: Option<String>,
-}
-
-impl AlignmentRuntimeRequest {
-    pub(crate) fn from_bytes(
-        model_variant: ModelVariant,
-        audio_bytes: impl Into<Vec<u8>>,
-        transcript: impl Into<String>,
-        language: Option<String>,
-    ) -> Result<Self> {
-        let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
-        audio.validate("forced alignment")?;
-        let transcript = transcript.into();
-        if transcript.trim().is_empty() {
-            return Err(Error::InvalidInput(
-                "Forced alignment request missing transcript".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            envelope: RequestEnvelope::new(CapabilityKind::ForcedAlignment, model_variant),
-            audio,
-            transcript,
-            language,
-        })
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct VadRuntimeRequest {
-    pub(crate) envelope: RequestEnvelope,
-    pub(crate) audio: RuntimeAudioInput,
-    pub(crate) sample_rate: u32,
-    pub(crate) endpointing: bool,
-}
-
-impl VadRuntimeRequest {
-    pub(crate) fn from_pcm_bytes(
-        model_variant: ModelVariant,
-        audio_bytes: impl Into<Vec<u8>>,
-        sample_rate: u32,
-        endpointing: bool,
-    ) -> Result<Self> {
-        let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
-        audio.validate("VAD")?;
-        if sample_rate == 0 {
-            return Err(Error::InvalidInput(
-                "VAD request missing sample rate".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            envelope: RequestEnvelope::new(
-                if endpointing {
-                    CapabilityKind::Endpointing
-                } else {
-                    CapabilityKind::Vad
-                },
-                model_variant,
-            ),
-            audio,
-            sample_rate,
-            endpointing,
-        })
     }
 }
 
@@ -553,27 +443,6 @@ mod tests {
         .expect_err("empty text should be rejected");
 
         assert!(matches!(err, Error::InvalidInput(_)));
-    }
-
-    #[test]
-    fn request_envelope_carries_capability_model_and_routing_controls() {
-        let deadline = Instant::now();
-        let envelope = RequestEnvelope::new(CapabilityKind::Chat, ModelVariant::Qwen359BGguf)
-            .with_request_id("req-1")
-            .with_correlation_id(Some("corr-1".to_string()))
-            .with_priority(RequestPriority::Interactive)
-            .with_deadline(Some(deadline))
-            .with_stream_policy(RuntimeStreamPolicy::DropNewest)
-            .with_workload_class(WorkloadClass::Streaming);
-
-        assert_eq!(envelope.request_id, "req-1");
-        assert_eq!(envelope.capability, CapabilityKind::Chat);
-        assert_eq!(envelope.model_variant, ModelVariant::Qwen359BGguf);
-        assert_eq!(envelope.correlation_id.as_deref(), Some("corr-1"));
-        assert_eq!(envelope.priority, RequestPriority::Interactive);
-        assert_eq!(envelope.deadline, Some(deadline));
-        assert_eq!(envelope.stream_policy, RuntimeStreamPolicy::DropNewest);
-        assert_eq!(envelope.workload_class, WorkloadClass::Streaming);
     }
 
     #[test]
@@ -731,33 +600,12 @@ mod tests {
         assert_eq!(core_request.system_prompt.as_deref(), Some("helpful voice"));
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-audio"));
         assert_eq!(core_request.chat_messages.as_ref().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn alignment_runtime_request_requires_transcript() {
-        let err = AlignmentRuntimeRequest::from_bytes(
-            ModelVariant::Qwen3ForcedAligner06B,
-            vec![1],
-            "  ",
-            Some("en".to_string()),
-        )
-        .expect_err("empty transcript should be rejected");
-
-        assert!(matches!(err, Error::InvalidInput(_)));
-    }
-
-    #[test]
-    fn vad_runtime_request_marks_endpointing_capability() {
-        let request = VadRuntimeRequest::from_pcm_bytes(
-            ModelVariant::VoxtralMini4BRealtime2602,
-            vec![1],
-            16_000,
-            true,
-        )
-        .expect("valid endpointing request");
-
-        assert_eq!(request.envelope.capability, CapabilityKind::Endpointing);
-        assert_eq!(request.sample_rate, 16_000);
-        assert!(request.endpointing);
+        // SPK-F5: a slow reader holds the reply back instead of failing it.
+        assert_eq!(
+            core_request.stream_policy,
+            EngineStreamPolicy::BlockWithDeadline {
+                timeout_ms: TTS_STREAM_SEND_DEADLINE_MS
+            }
+        );
     }
 }

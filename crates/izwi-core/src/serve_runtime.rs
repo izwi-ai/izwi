@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::backends::BackendPreference;
 use crate::config::{
     BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionMode,
-    PhysicalInFlightLimit,
+    PhysicalInFlightLimit, RealtimeAsrSessionConfig,
 };
 use crate::Result;
 
@@ -29,6 +29,7 @@ pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT"
 pub const ENV_MAX_PREFIX_CACHE_PAGES: &str = "IZWI_MAX_PREFIX_CACHE_PAGES";
 pub const ENV_ENABLE_CHUNKED_PREFILL: &str = "IZWI_ENABLE_CHUNKED_PREFILL";
 pub const ENV_CHUNKED_PREFILL_THRESHOLD: &str = "IZWI_CHUNKED_PREFILL_THRESHOLD";
+pub const ENV_MAX_TOKENS_PER_STEP: &str = "IZWI_MAX_TOKENS_PER_STEP";
 /// Host KV pool budget for hierarchical offload (DS4). Positive values opt a
 /// worker into demoting committed prefix pages to a bounded host tier.
 pub const ENV_KV_HOST_POOL_BUDGET_BYTES: &str = "IZWI_KV_HOST_POOL_BUDGET_BYTES";
@@ -42,6 +43,10 @@ pub const ENV_MAX_RETAINED_SEQUENCES: &str = "IZWI_MAX_RETAINED_SEQUENCES";
 pub const ENV_MAX_STAGED_TRANSACTIONS: &str = "IZWI_MAX_STAGED_TRANSACTIONS";
 pub const ENV_MAX_QUEUED_REQUESTS: &str = "IZWI_MAX_QUEUED_REQUESTS";
 pub const ENV_MAX_SEQUENCE_LENGTH: &str = "IZWI_MAX_SEQUENCE_LENGTH";
+/// Realtime ASR session limits ([`RealtimeAsrSessionConfig`]).
+pub const ENV_ASR_REALTIME_MAX_SESSIONS: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
+pub const ENV_ASR_REALTIME_MAX_LIFETIME_SECS: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
+pub const ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
 pub const ENV_NUM_THREADS: &str = "IZWI_NUM_THREADS";
 pub const ENV_MAX_CONCURRENT: &str = "IZWI_MAX_CONCURRENT";
 pub const ENV_TIMEOUT: &str = "IZWI_TIMEOUT";
@@ -77,11 +82,18 @@ pub struct ServeRuntimeConfig {
     /// [`EngineConfig::max_prefix_cache_pages`]).
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: bool,
+    /// Zero takes the backend's automatic chunk.
     pub chunked_prefill_threshold: usize,
+    /// Scheduler step token budget; zero takes the backend's automatic budget.
+    #[serde(default)]
+    pub max_tokens_per_step: usize,
     pub max_retained_sequences: usize,
     pub max_staged_transactions: usize,
     pub max_queued_requests: usize,
     pub max_sequence_length: ContextLengthPreference,
+    /// Unset limits take the engine's per-backend defaults.
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
     pub num_threads: usize,
     pub max_concurrent_requests: usize,
     pub request_timeout_secs: u64,
@@ -118,10 +130,12 @@ impl Default for ServeRuntimeConfig {
             max_prefix_cache_pages: None,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            max_tokens_per_step: 0,
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
+            asr_realtime: RealtimeAsrSessionConfig::default(),
             num_threads: default_num_threads(),
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout_secs: default_request_timeout_secs(),
@@ -200,6 +214,9 @@ impl ServeRuntimeConfig {
         if let Some(chunked_prefill_threshold) = overrides.chunked_prefill_threshold {
             self.chunked_prefill_threshold = chunked_prefill_threshold;
         }
+        if let Some(max_tokens_per_step) = overrides.max_tokens_per_step {
+            self.max_tokens_per_step = max_tokens_per_step;
+        }
         if let Some(max_retained_sequences) = overrides.max_retained_sequences {
             self.max_retained_sequences = max_retained_sequences;
         }
@@ -211,6 +228,16 @@ impl ServeRuntimeConfig {
         }
         if let Some(max_sequence_length) = overrides.max_sequence_length {
             self.max_sequence_length = max_sequence_length;
+        }
+        let asr_realtime = &overrides.asr_realtime;
+        if let Some(max_sessions) = asr_realtime.max_sessions {
+            self.asr_realtime.max_sessions = Some(max_sessions);
+        }
+        if let Some(max_lifetime_secs) = asr_realtime.max_lifetime_secs {
+            self.asr_realtime.max_lifetime_secs = Some(max_lifetime_secs);
+        }
+        if let Some(idle_timeout_secs) = asr_realtime.idle_timeout_secs {
+            self.asr_realtime.idle_timeout_secs = Some(idle_timeout_secs);
         }
         if let Some(num_threads) = overrides.num_threads {
             self.num_threads = num_threads;
@@ -252,11 +279,13 @@ impl ServeRuntimeConfig {
             managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.max_prefix_cache_pages,
             enable_chunked_prefill: self.enable_chunked_prefill,
-            chunked_prefill_threshold: self.chunked_prefill_threshold.max(1),
+            chunked_prefill_threshold: self.chunked_prefill_threshold,
+            max_tokens_per_step: self.max_tokens_per_step,
             max_retained_sequences: self.max_retained_sequences,
             max_staged_transactions: self.max_staged_transactions,
             max_queued_requests: self.max_queued_requests.max(1),
             max_sequence_length: self.max_sequence_length,
+            asr_realtime: self.asr_realtime,
             backend: self.backend,
             num_threads: self.num_threads.max(1),
             ..Default::default()
@@ -287,10 +316,14 @@ pub struct ServeRuntimeConfigOverrides {
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: Option<bool>,
     pub chunked_prefill_threshold: Option<usize>,
+    #[serde(default)]
+    pub max_tokens_per_step: Option<usize>,
     pub max_retained_sequences: Option<usize>,
     pub max_staged_transactions: Option<usize>,
     pub max_queued_requests: Option<usize>,
     pub max_sequence_length: Option<ContextLengthPreference>,
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
     pub num_threads: Option<usize>,
     pub max_concurrent_requests: Option<usize>,
     pub request_timeout_secs: Option<u64>,
@@ -354,29 +387,38 @@ impl ServeRuntimeConfigOverrides {
                 &[],
             ),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
-            enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
-            prefix_reuse_catalog_auto: read_env_bool(ENV_PREFIX_REUSE_AUTO, &[]),
+            enable_prefix_caching: crate::env::flag(ENV_ENABLE_PREFIX_CACHING),
+            prefix_reuse_catalog_auto: crate::env::flag(ENV_PREFIX_REUSE_AUTO),
             managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
             max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
-            enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
+            enable_chunked_prefill: crate::env::flag(ENV_ENABLE_CHUNKED_PREFILL),
             chunked_prefill_threshold: read_env_usize(ENV_CHUNKED_PREFILL_THRESHOLD, &[]),
+            max_tokens_per_step: read_env_usize(ENV_MAX_TOKENS_PER_STEP, &[]),
             max_retained_sequences: read_env_usize(ENV_MAX_RETAINED_SEQUENCES, &[]),
             max_staged_transactions: read_env_usize(ENV_MAX_STAGED_TRANSACTIONS, &[]),
             max_queued_requests: read_env_usize(ENV_MAX_QUEUED_REQUESTS, &[]),
             max_sequence_length: read_env_context(ENV_MAX_SEQUENCE_LENGTH, &[]),
+            asr_realtime: RealtimeAsrSessionConfig {
+                max_sessions: read_env_usize(ENV_ASR_REALTIME_MAX_SESSIONS, &[]),
+                max_lifetime_secs: read_env_u64(ENV_ASR_REALTIME_MAX_LIFETIME_SECS, &[]),
+                idle_timeout_secs: read_env_u64(ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, &[]),
+            },
             num_threads: read_env_usize(ENV_NUM_THREADS, &[]),
             max_concurrent_requests: read_env_usize(ENV_MAX_CONCURRENT, LEGACY_ENV_MAX_CONCURRENT),
             request_timeout_secs: read_env_u64(ENV_TIMEOUT, LEGACY_ENV_TIMEOUT),
-            cors_enabled: read_env_bool(ENV_CORS, &[]),
+            cors_enabled: crate::env::flag(ENV_CORS),
             cors_origins: read_env_csv(ENV_CORS_ORIGINS, &[]),
-            ui_enabled: read_env_bool(ENV_NO_UI, &[]).map(|no_ui| !no_ui),
+            ui_enabled: crate::env::flag(ENV_NO_UI).map(|no_ui| !no_ui),
             ui_dir: read_env_path(ENV_UI_DIR, &[]),
         }
     }
 }
 
+/// Loopback by default: the local role exposes model management and history,
+/// so network exposure is an explicit choice (the server then requires an API
+/// key).
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_port() -> u16 {
@@ -415,7 +457,7 @@ fn default_enable_chunked_prefill() -> bool {
 }
 
 fn default_chunked_prefill_threshold() -> usize {
-    192
+    0 // The backend's automatic chunk.
 }
 
 fn default_max_retained_sequences() -> usize {
@@ -559,16 +601,6 @@ fn read_env_context(primary: &str, aliases: &[&str]) -> Option<ContextLengthPref
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
 }
 
-fn read_env_bool(primary: &str, aliases: &[&str]) -> Option<bool> {
-    first_non_empty_env(primary, aliases).and_then(|value| {
-        match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
-}
-
 fn read_env_csv(primary: &str, aliases: &[&str]) -> Option<Vec<String>> {
     first_non_empty_env(primary, aliases).map(|value| {
         value
@@ -599,10 +631,14 @@ mod tests {
         ENV_MAX_PREFIX_CACHE_PAGES,
         ENV_ENABLE_CHUNKED_PREFILL,
         ENV_CHUNKED_PREFILL_THRESHOLD,
+        ENV_MAX_TOKENS_PER_STEP,
         ENV_MAX_RETAINED_SEQUENCES,
         ENV_MAX_STAGED_TRANSACTIONS,
         ENV_MAX_QUEUED_REQUESTS,
         ENV_MAX_SEQUENCE_LENGTH,
+        ENV_ASR_REALTIME_MAX_SESSIONS,
+        ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+        ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS,
         ENV_NUM_THREADS,
         ENV_MAX_CONCURRENT,
         ENV_TIMEOUT,
@@ -814,6 +850,42 @@ workers = 5
         clear_env();
     }
 
+    /// SPK-F9: the local role reads the realtime ASR limits once into its
+    /// typed config, and a later source overrides each limit on its own.
+    #[test]
+    fn realtime_asr_limits_come_from_the_environment_and_later_sources() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        std::env::set_var(ENV_ASR_REALTIME_MAX_SESSIONS, "8");
+        std::env::set_var(ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, "300");
+        let cli = ServeRuntimeConfigOverrides {
+            asr_realtime: RealtimeAsrSessionConfig {
+                idle_timeout_secs: Some(600),
+                ..RealtimeAsrSessionConfig::default()
+            },
+            ..ServeRuntimeConfigOverrides::default()
+        };
+
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &cli,
+        );
+        clear_env();
+
+        let expected = RealtimeAsrSessionConfig {
+            max_sessions: Some(8),
+            max_lifetime_secs: None,
+            idle_timeout_secs: Some(600),
+        };
+        assert_eq!(resolved.asr_realtime, expected);
+        assert_eq!(resolved.engine_config().asr_realtime, expected);
+        assert_eq!(
+            ServeRuntimeConfig::default().engine_config().asr_realtime,
+            RealtimeAsrSessionConfig::default()
+        );
+    }
+
     #[test]
     fn env_exposes_prefix_cache_and_chunked_prefill_knobs() {
         let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
@@ -823,6 +895,7 @@ workers = 5
         std::env::set_var(ENV_MAX_PREFIX_CACHE_PAGES, "64");
         std::env::set_var(ENV_ENABLE_CHUNKED_PREFILL, "1");
         std::env::set_var(ENV_CHUNKED_PREFILL_THRESHOLD, "512");
+        std::env::set_var(ENV_MAX_TOKENS_PER_STEP, "1024");
 
         let resolved = ServeRuntimeConfig::from_sources(
             &ServeRuntimeConfigOverrides::default(),
@@ -847,7 +920,14 @@ workers = 5
         assert_eq!(engine.max_prefix_cache_pages, Some(64));
         assert!(engine.enable_chunked_prefill);
         assert_eq!(engine.chunked_prefill_threshold, 512);
+        assert_eq!(resolved.max_tokens_per_step, 1024);
+        assert_eq!(engine.max_tokens_per_step, 1024);
         clear_env();
+
+        // Unset, both stay automatic (zero) for the backend to size.
+        let engine = ServeRuntimeConfig::default().engine_config();
+        assert_eq!(engine.chunked_prefill_threshold, 0);
+        assert_eq!(engine.max_tokens_per_step, 0);
     }
 
     /// An unset prefix page budget reaches the engine unset (automatic, sized

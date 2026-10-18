@@ -22,12 +22,12 @@ use crate::diarization_store::{
     DiarizationStore, DiarizationSummaryStatus, DiarizationUtteranceRecord, DiarizationWordRecord,
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
-    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole,
+    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
     DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
     JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
@@ -218,7 +218,7 @@ pub async fn delete_record(
 pub async fn update_record(
     State(state): State<AppState>,
     Path(record_id): Path<String>,
-    Json(req): Json<UpdateDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<UpdateDiarizationRecordRequest>,
 ) -> Result<Json<DiarizationRecord>, ApiError> {
     let updated = state
         .diarization_store
@@ -234,7 +234,7 @@ pub async fn rerun_record(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     Path(record_id): Path<String>,
-    Json(req): Json<RerunDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<RerunDiarizationRecordRequest>,
 ) -> Result<Response, ApiError> {
     let source_record = state
         .diarization_store
@@ -706,32 +706,30 @@ async fn generate_diarization_artifacts(
     // Keep diarization processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
     let output = match audio {
-        JobAudio::Samples(samples) => {
-            runtime
-                .diarize_with_transcript_samples(
-                    samples,
-                    model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                    &config,
-                    &options,
-                )
-                .await?
-        }
-        JobAudio::Encoded(bytes) => {
-            runtime
-                .diarize_with_transcript_bytes(
-                    &bytes,
-                    model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                    &config,
-                    &options,
-                )
-                .await?
-        }
+        JobAudio::Samples(samples) => runtime
+            .diarize_with_transcript_samples(
+                samples,
+                model_id,
+                asr_model_id,
+                aligner_model_id,
+                llm_model_id,
+                &config,
+                &options,
+            )
+            .await
+            .map_err(core_api_error)?,
+        JobAudio::Encoded(bytes) => runtime
+            .diarize_with_transcript_bytes(
+                &bytes,
+                model_id,
+                asr_model_id,
+                aligner_model_id,
+                llm_model_id,
+                &config,
+                &options,
+            )
+            .await
+            .map_err(core_api_error)?,
     };
 
     Ok(diarization_artifacts(
@@ -1021,7 +1019,12 @@ async fn generate_diarization_summary(
                 },
             ],
             params,
-            ChatRequestConfig::default(),
+            // Long transcripts keep fitting the summary model by trimming the
+            // output budget, as before D8.
+            ChatRequestConfig {
+                truncation: ChatTruncation::Auto,
+                ..ChatRequestConfig::default()
+            },
             correlation_id,
             runtime_context,
         )
@@ -1371,6 +1374,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 
@@ -1429,7 +1433,7 @@ fn audio_response(audio: StoredDiarizationAudio) -> Response {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Diarization storage error: {err}"))
+    crate::error::store_api_error(err, "Diarization storage error")
 }
 
 #[cfg(test)]

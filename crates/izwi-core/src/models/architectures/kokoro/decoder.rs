@@ -91,11 +91,15 @@ kernel void kokoro_conv_transpose1d_stride_f32(
 "#;
 
 fn kokoro_profile_enabled() -> bool {
-    std::env::var_os("IZWI_KOKORO_PROFILE").is_some()
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_PROFILE", false));
+    ENABLED.get()
 }
 
 fn kokoro_profile_sync_enabled() -> bool {
-    std::env::var_os("IZWI_KOKORO_PROFILE_SYNC").is_some()
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_PROFILE_SYNC", false));
+    ENABLED.get()
 }
 
 fn sync_kokoro_profile_tensor(tensor: &Tensor) {
@@ -114,33 +118,22 @@ fn log_kokoro_profile(stage: &str, dur: Duration) {
 }
 
 fn kokoro_cpu_resblocks_parallel_enabled() -> bool {
-    match std::env::var("IZWI_KOKORO_CPU_RESBLOCKS") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "serial" | "sequential"
-        ),
-        Err(_) => true,
-    }
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_CPU_RESBLOCKS", true));
+    ENABLED.get()
 }
 
 fn kokoro_cpu_stage_branches_parallel_enabled() -> bool {
-    match std::env::var("IZWI_KOKORO_CPU_STAGE_BRANCHES") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "serial" | "sequential"
-        ),
-        Err(_) => true,
-    }
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_KOKORO_CPU_STAGE_BRANCHES", true));
+    ENABLED.get()
 }
 
 fn kokoro_metal_harmonic_overlap_enabled() -> bool {
-    match std::env::var("IZWI_KOKORO_METAL_HARMONIC_OVERLAP") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "serial" | "sequential"
-        ),
-        Err(_) => true,
-    }
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_KOKORO_METAL_HARMONIC_OVERLAP", true)
+    });
+    ENABLED.get()
 }
 
 /// The im2col bound of every generator conv1d (KOK-9): a conv whose

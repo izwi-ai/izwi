@@ -1,18 +1,14 @@
 //! Realtime transcription websocket endpoint for `/transcription`.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
-use izwi_core::{
-    audio::{AudioEncoder, AudioFormat},
-    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass,
-};
-use serde::{Deserialize, Serialize};
+use futures::StreamExt;
+use izwi_core::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass};
+use serde::Serialize;
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::app::realtime_protocol::{
@@ -20,15 +16,17 @@ use crate::app::realtime_protocol::{
     RealtimeDeliveryClass, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol,
     RealtimeServerEnvelope, RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
 };
+#[cfg(test)]
+use crate::app::realtime_transport::MailboxOutput;
+use crate::app::realtime_transport::{
+    now_unix_millis, pcm16_bytes_to_i16, pcm16_i16_to_f32, spawn_writer, wav_bytes_from_pcm16_mono,
+    OutboundClass, OutboundEnqueueError, OutboundItem, OutboundLimits, OutboundMailbox,
+};
 use crate::state::AppState;
-
-pub(crate) const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
-pub(crate) const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
-
-pub(crate) const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
-pub(crate) const WS_BIN_VERSION: u8 = 1;
-pub(crate) const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
-pub(crate) const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
+pub(crate) use izwi_gateway::app::realtime_wire::{
+    negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
+    TranscriptionWireProtocol, LEGACY_REALTIME_PROTOCOL,
+};
 
 const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
@@ -37,7 +35,6 @@ const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
-const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 // LocalAgreement-2 style stabilization (as used in whisper_streaming):
 // commit only the common prefix between the previous and current hypothesis.
 // Text-only approximation of whisper_streaming's timestamp boundary filtering:
@@ -70,7 +67,7 @@ impl OutboundTx {
 
     fn with_capacity(runtime: Arc<RuntimeService>, label: &'static str, capacity: usize) -> Self {
         Self {
-            mailbox: Arc::new(OutboundMailbox::new(capacity)),
+            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::items(capacity))),
             runtime,
             label,
         }
@@ -81,7 +78,7 @@ impl OutboundTx {
     }
 
     fn send_snapshot(&self, key: &'static str, message: Message) -> bool {
-        self.send_class(message, OutboundClass::Coalescible(key))
+        self.send_class(message, OutboundClass::Coalescible(key.to_string()))
     }
 
     fn send_diagnostic(&self, message: Message) -> bool {
@@ -89,7 +86,11 @@ impl OutboundTx {
     }
 
     fn send_class(&self, message: Message, class: OutboundClass) -> bool {
-        match self.mailbox.enqueue(OutboundItem { message, class }) {
+        match self.mailbox.enqueue(OutboundItem {
+            message,
+            class,
+            turn_generation: None,
+        }) {
             Ok(()) => true,
             Err(OutboundEnqueueError::Closed) => false,
             Err(err) => {
@@ -104,6 +105,7 @@ impl OutboundTx {
         }
     }
 
+    #[cfg(test)]
     async fn next(&self) -> Option<MailboxOutput> {
         self.mailbox.next().await
     }
@@ -115,166 +117,6 @@ impl OutboundTx {
     fn fail(&self, reason: &'static str) {
         self.mailbox.fail(reason);
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundClass {
-    Critical,
-    Coalescible(&'static str),
-    Droppable,
-}
-
-struct OutboundItem {
-    message: Message,
-    class: OutboundClass,
-}
-
-struct OutboundMailbox {
-    capacity: usize,
-    state: Mutex<OutboundMailboxState>,
-    notify: Notify,
-}
-
-#[derive(Default)]
-struct OutboundMailboxState {
-    queue: VecDeque<OutboundItem>,
-    close_reason: Option<String>,
-    closed: bool,
-}
-
-enum MailboxOutput {
-    Message(Message),
-    Close(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundEnqueueError {
-    QueueSaturated,
-    DroppedDiagnostic,
-    Closed,
-}
-
-impl OutboundMailbox {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            state: Mutex::new(OutboundMailboxState::default()),
-            notify: Notify::new(),
-        }
-    }
-
-    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if state.closed {
-            return Err(OutboundEnqueueError::Closed);
-        }
-        if let OutboundClass::Coalescible(key) = item.class {
-            if let Some(existing) = state
-                .queue
-                .iter_mut()
-                .find(|queued| queued.class == OutboundClass::Coalescible(key))
-            {
-                existing.message = item.message;
-                return Ok(());
-            }
-        }
-        if state.queue.len() >= self.capacity {
-            return match item.class {
-                OutboundClass::Critical => {
-                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
-                    drop(state);
-                    self.notify.notify_one();
-                    Err(OutboundEnqueueError::QueueSaturated)
-                }
-                OutboundClass::Coalescible(_) => Err(OutboundEnqueueError::QueueSaturated),
-                OutboundClass::Droppable => Err(OutboundEnqueueError::DroppedDiagnostic),
-            };
-        }
-        state.queue.push_back(item);
-        drop(state);
-        self.notify.notify_one();
-        Ok(())
-    }
-
-    async fn next(&self) -> Option<MailboxOutput> {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if let Some(reason) = state.close_reason.take() {
-                    state.queue.clear();
-                    state.closed = true;
-                    return Some(MailboxOutput::Close(reason));
-                }
-                if let Some(item) = state.queue.pop_front() {
-                    return Some(MailboxOutput::Message(item.message));
-                }
-                if state.closed {
-                    return None;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
-        drop(state);
-        self.notify.notify_waiters();
-    }
-
-    fn fail(&self, reason: &'static str) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !state.closed {
-            state.close_reason = Some(reason.to_string());
-        }
-        drop(state);
-        self.notify.notify_one();
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ClientEvent {
-    SessionStart {
-        #[serde(default)]
-        model_id: Option<String>,
-        #[serde(default)]
-        language: Option<String>,
-        #[serde(default)]
-        protocol: Option<String>,
-        #[serde(default)]
-        version: Option<u16>,
-        #[serde(default)]
-        resume_from_event_id: Option<u64>,
-    },
-    SessionStop,
-    Ping {
-        #[serde(default)]
-        timestamp_ms: Option<u64>,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum BinaryMessageKind {
-    ClientPcm16Frame {
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: Vec<u8>,
-    },
 }
 
 #[derive(Debug)]
@@ -295,12 +137,6 @@ enum WorkerCommand {
     ProtocolError(String),
     SessionStop,
     Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptionWireProtocol {
-    LegacyV2,
-    TypedV3,
 }
 
 struct TypedTranscriptionSession {
@@ -547,30 +383,11 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         return;
     };
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, mut ws_rx) = socket.split();
     let out_tx = OutboundTx::new(state.runtime.clone(), "transcription realtime");
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_CAPACITY);
 
-    let writer_tx = out_tx.clone();
-    let writer = tokio::spawn(async move {
-        while let Some(output) = writer_tx.next().await {
-            let message = match output {
-                MailboxOutput::Message(message) => message,
-                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
-                    code: 1011,
-                    reason: reason.into(),
-                })),
-            };
-            let terminal = matches!(message, Message::Close(_));
-            if !matches!(
-                tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await,
-                Ok(Ok(()))
-            ) || terminal
-            {
-                break;
-            }
-        }
-    });
+    let writer = spawn_writer(ws_tx, out_tx.mailbox.clone(), 1011);
 
     let worker = tokio::spawn(run_worker(
         state.clone(),
@@ -726,31 +543,6 @@ fn handle_text_message(
         ClientEvent::Ping { timestamp_ms } => {
             let _ = send_worker_command(worker_tx, WorkerCommand::Ping { timestamp_ms });
             false
-        }
-    }
-}
-
-pub(crate) fn negotiate_transcription_protocol(
-    protocol: Option<&str>,
-    version: Option<u16>,
-    resume_from_event_id: Option<u64>,
-) -> Result<TranscriptionWireProtocol, String> {
-    match (protocol.map(str::trim), version) {
-        (None, None) => Ok(TranscriptionWireProtocol::LegacyV2),
-        (Some(TYPED_REALTIME_PROTOCOL), Some(TRANSCRIPTION_REALTIME_VERSION)) => {
-            if resume_from_event_id.is_some() {
-                return Err(
-                    "transcription_realtime v3 sessions are process-owned and non-resumable"
-                        .to_string(),
-                );
-            }
-            Ok(TranscriptionWireProtocol::TypedV3)
-        }
-        (Some(protocol), Some(version)) => Err(format!(
-            "Unsupported realtime protocol negotiation `{protocol}` version {version}"
-        )),
-        _ => {
-            Err("Realtime protocol negotiation requires both `protocol` and `version`".to_string())
         }
     }
 }
@@ -928,11 +720,16 @@ async fn handle_worker_command(
                         );
                     }
                 }
-                Err(err) => send_session_error_with_code(
+                Err(failure) if failure.terminal => {
+                    session.native_asr_stream = None;
+                    send_session_fatal_error(out_tx, session, failure.message);
+                    return true;
+                }
+                Err(failure) => send_session_error_with_code(
                     out_tx,
                     session,
                     RealtimeErrorCode::InferenceFailed,
-                    err,
+                    failure.message,
                 ),
             }
             false
@@ -1023,6 +820,45 @@ fn send_session_error_with_code(
             }
         }
     }
+}
+
+/// Ends the session after a failure the stream cannot recover from: one
+/// fatal error and a close frame, instead of an error for every later frame.
+fn send_session_fatal_error(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    message: String,
+) {
+    const REASON: &str = "realtime_stream_failed";
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            send_json(
+                out_tx,
+                json!({ "type": "error", "code": REASON, "message": message, "fatal": true }),
+            );
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            if let Some(typed) = session.typed_session.as_mut() {
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::FatalError {
+                        code: RealtimeErrorCode::InferenceFailed,
+                        message,
+                        close: RealtimeClose {
+                            code: RealtimeCloseCode::InternalError,
+                            reason: RealtimeCloseReason::InternalError,
+                            message: "transcription realtime stream failed".to_string(),
+                            retryable: false,
+                        },
+                    },
+                );
+            }
+        }
+    }
+    let _ = out_tx.send(Message::Close(Some(CloseFrame {
+        code: RealtimeCloseCode::InternalError.websocket_code(),
+        reason: REASON.into(),
+    })));
 }
 
 fn send_session_pong(
@@ -1315,13 +1151,29 @@ fn ingest_audio_frame(
     Ok(samples)
 }
 
+/// A native realtime stream failure. A `terminal` failure closed the runtime
+/// stream, so every later push would fail the same way.
+struct NativeStreamFailure {
+    message: String,
+    terminal: bool,
+}
+
+impl NativeStreamFailure {
+    fn recoverable(error: impl ToString) -> Self {
+        Self {
+            message: error.to_string(),
+            terminal: false,
+        }
+    }
+}
+
 async fn maybe_process_native_stream_frame(
     state: &AppState,
     out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
     frame_samples: &[i16],
     sample_rate: u32,
-) -> Result<bool, String> {
+) -> Result<bool, NativeStreamFailure> {
     if frame_samples.is_empty() {
         return Ok(session.native_asr_stream.is_some());
     }
@@ -1337,7 +1189,7 @@ async fn maybe_process_native_stream_frame(
                 None,
             )
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(NativeStreamFailure::recoverable)?;
     }
 
     let Some(stream) = session.native_asr_stream.as_mut() else {
@@ -1351,7 +1203,10 @@ async fn maybe_process_native_stream_frame(
         .runtime
         .push_asr_realtime_samples(stream, &samples, sample_rate)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| NativeStreamFailure {
+            message: err.to_string(),
+            terminal: stream.is_closed(),
+        })?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
     session.pending_recompute = false;
@@ -2026,56 +1881,6 @@ fn normalize_word(token: &str) -> String {
         .to_lowercase()
 }
 
-pub(crate) fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
-    if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
-        return Err("Unexpected binary message (missing transcription frame header)".to_string());
-    }
-
-    let version = data[4];
-    if version != WS_BIN_VERSION {
-        return Err(format!("Unsupported binary frame version {version}"));
-    }
-
-    let kind = data[5];
-    match kind {
-        WS_BIN_KIND_CLIENT_PCM16 => {
-            let sample_rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let frame_seq = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            Ok(BinaryMessageKind::ClientPcm16Frame {
-                frame_seq,
-                sample_rate,
-                payload: data[WS_BIN_CLIENT_HEADER_LEN..].to_vec(),
-            })
-        }
-        other => Err(format!("Unsupported binary frame kind {other}")),
-    }
-}
-
-fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.as_chunks::<2>().0 {
-        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    out
-}
-
-fn pcm16_i16_to_f32(samples_i16: &[i16]) -> Vec<f32> {
-    samples_i16
-        .iter()
-        .map(|sample| *sample as f32 / 32768.0)
-        .collect()
-}
-
-fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
-    if sample_rate == 0 {
-        return Err("Invalid sample rate 0".to_string());
-    }
-    let samples_f32 = pcm16_i16_to_f32(samples_i16);
-    AudioEncoder::new(sample_rate, 1)
-        .encode(&samples_f32, AudioFormat::Wav)
-        .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
-}
-
 fn send_json(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send(Message::Text(value.to_string().into()));
 }
@@ -2086,13 +1891,6 @@ fn send_json_snapshot(tx: &OutboundTx, key: &'static str, value: serde_json::Val
 
 fn send_json_diagnostic(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send_diagnostic(Message::Text(value.to_string().into()));
-}
-
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand) -> bool {
@@ -2112,9 +1910,9 @@ mod tests {
 
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
-        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_finished,
-        strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput, OutboundTx,
-        RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
+        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_fatal_error,
+        send_session_finished, strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput,
+        OutboundTx, RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
         TypedTranscriptionSession,
     };
     use crate::app::realtime_protocol::{
@@ -2225,6 +2023,56 @@ mod tests {
             events[2].event.finality(),
             RealtimeEventFinality::SessionFinal
         );
+    }
+
+    /// SPK-F1: a closed native stream ends the session with one fatal error
+    /// and a close frame, for both wire protocols.
+    #[tokio::test]
+    async fn terminal_native_stream_failure_sends_one_fatal_error_then_closes() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        for wire_protocol in [
+            TranscriptionWireProtocol::TypedV3,
+            TranscriptionWireProtocol::LegacyV2,
+        ] {
+            let outbound = OutboundTx::with_capacity(runtime.clone(), "transcription test", 8);
+            let mut session = RealtimeSessionState {
+                started: true,
+                wire_protocol,
+                typed_session: (wire_protocol == TranscriptionWireProtocol::TypedV3).then(|| {
+                    TypedTranscriptionSession::with_identity(
+                        "session-1".to_string(),
+                        "process-42".to_string(),
+                    )
+                }),
+                ..RealtimeSessionState::default()
+            };
+
+            send_session_fatal_error(&outbound, &mut session, "stream expired".to_string());
+
+            let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+                panic!("expected the fatal error event");
+            };
+            if wire_protocol == TranscriptionWireProtocol::TypedV3 {
+                let envelope = serde_json::from_str::<RealtimeServerEnvelope>(text.as_str())
+                    .expect("typed event envelope");
+                let RealtimeServerEvent::FatalError { message, close, .. } = &envelope.event else {
+                    panic!("expected a typed fatal error, got {:?}", envelope.event);
+                };
+                assert_eq!(message, "stream expired");
+                assert!(!close.retryable);
+                assert!(envelope.event.requires_connection_close());
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("legacy error");
+                assert_eq!(value["type"], "error");
+                assert_eq!(value["fatal"], true);
+            }
+            let Some(MailboxOutput::Message(Message::Close(Some(frame)))) = outbound.next().await
+            else {
+                panic!("expected a close frame after the fatal error");
+            };
+            assert_eq!(frame.code, 1011);
+        }
     }
 
     #[tokio::test]

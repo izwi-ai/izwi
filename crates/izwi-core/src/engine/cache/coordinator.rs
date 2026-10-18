@@ -87,6 +87,10 @@ pub struct KvPreparedReservation {
     pub expected: KvSnapshot,
     pub provisional_groups: Vec<GroupBlockTable>,
     pub writable_blocks: Vec<CacheBlockRef>,
+    /// Writable pages this transaction allocated (fresh tails and
+    /// copy-on-write destinations), as opposed to an exclusively owned
+    /// committed tail it extends in place.
+    pub fresh_blocks: Vec<CacheBlockRef>,
     pub page_copies: Vec<KvPageCopy>,
     pub target_committed_tokens: u32,
     pub target_window_start: u32,
@@ -115,18 +119,17 @@ pub enum KvTerminalState {
     Aborted,
 }
 
-/// Number of exact terminal dispositions retained for diagnostics.
+/// Number of exact terminal dispositions retained.
 ///
-/// Duplicate/stale transaction rejection does not depend on this window: the
-/// coordinator also keeps a constant-size high-water mark. The window only
-/// preserves the committed-versus-aborted detail for recently completed work.
+/// Stale transaction rejection is exact inside this window and, beyond it,
+/// falls back to a constant-size high-water mark over the evicted entries.
 const TERMINAL_TRANSACTION_HISTORY_LIMIT: usize = 4_096;
 
 #[derive(Debug)]
 struct TerminalTransactionHistory {
     states: HashMap<PlanId, KvTerminalState>,
     completion_order: VecDeque<PlanId>,
-    high_watermark: Option<PlanId>,
+    evicted_high_watermark: Option<PlanId>,
     limit: usize,
 }
 
@@ -138,25 +141,30 @@ impl TerminalTransactionHistory {
             // model arena; these grow only as that arena completes work.
             states: HashMap::new(),
             completion_order: VecDeque::new(),
-            high_watermark: None,
+            evicted_high_watermark: None,
             limit,
         }
     }
 
     fn contains(&self, txn_id: PlanId) -> bool {
-        // Scheduler PlanIds are globally monotonic on first admission. Active
-        // transactions may finish out of order, so exact recent states remain
-        // separate, but an ID at or below a completed high-water mark can only
-        // be a delayed report, a stale reservation, or a reused exhausted ID.
-        self.high_watermark.is_some_and(|high| txn_id <= high)
+        // Scheduler PlanIds are monotonic when allocated, but one engine step
+        // reserves its rows out of ID order (prefill before lower-numbered
+        // decode) and may abort a row before reserving the next. A recent
+        // terminal ID therefore says nothing about lower IDs that have not
+        // reserved yet; only an evicted ID is old enough that every ID below
+        // it was allocated by an earlier step.
+        self.states.contains_key(&txn_id)
+            || self
+                .evicted_high_watermark
+                .is_some_and(|high| txn_id <= high)
     }
 
+    #[cfg(test)]
     fn state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
         self.states.get(&txn_id).copied()
     }
 
     fn record(&mut self, txn_id: PlanId, state: KvTerminalState) {
-        self.high_watermark = Some(self.high_watermark.map_or(txn_id, |high| high.max(txn_id)));
         if self.states.insert(txn_id, state).is_none() {
             self.completion_order.push_back(txn_id);
         }
@@ -166,6 +174,7 @@ impl TerminalTransactionHistory {
                 .pop_front()
                 .expect("terminal history order matches retained states");
             self.states.remove(&expired);
+            self.evicted_high_watermark = self.evicted_high_watermark.max(Some(expired));
         }
     }
 }
@@ -304,12 +313,54 @@ struct Transaction {
 /// ownership, reference-count, and version check; applying it under the same
 /// engine state lock is infallible.
 pub(crate) struct KvCoordinatorCommitPlan {
-    txn: Transaction,
+    txn_id: PlanId,
     retain_prefix: Vec<CacheBlockRef>,
     release_prefix: Vec<CacheBlockRef>,
-    old_blocks: HashSet<CacheBlockRef>,
-    new_blocks: HashSet<CacheBlockRef>,
+    /// Pages the provisional table references and the committed one does not.
+    added_table_blocks: Vec<CacheBlockRef>,
+    /// Pages the committed table references and the provisional one does not.
+    removed_table_blocks: Vec<CacheBlockRef>,
     next_version: u64,
+}
+
+/// A reusable set of arena slot indices. Membership is one array read, so the
+/// per-step table checks cost no hashing of whole block tables. An index
+/// identifies a block only once that block has been validated against its
+/// slot (or is part of a committed table, which holds only current blocks).
+#[derive(Debug)]
+struct SlotMarks {
+    epoch: u32,
+    marks: Vec<u32>,
+}
+
+impl SlotMarks {
+    fn new(capacity_pages: usize) -> Self {
+        Self {
+            epoch: 0,
+            marks: vec![0; capacity_pages],
+        }
+    }
+
+    /// Empty the set in O(1); a wrapped epoch clears the stale marks once.
+    fn clear(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.marks.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Mark `index`; true when it was not yet in the set.
+    fn insert(&mut self, index: u32) -> bool {
+        let mark = &mut self.marks[index as usize];
+        let inserted = *mark != self.epoch;
+        *mark = self.epoch;
+        inserted
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        self.marks[index as usize] == self.epoch
+    }
 }
 
 /// Fully validated replacement of one committed table by an empty table in a
@@ -331,6 +382,10 @@ pub struct KvCacheCoordinator {
     tables: HashMap<TableKey, KvSnapshot>,
     transactions: HashMap<PlanId, Transaction>,
     terminal_transactions: TerminalTransactionHistory,
+    /// Two scratch sets for one call's table comparisons (expected vs
+    /// provisional pages, pages vs writable pages). They carry no state
+    /// between calls.
+    marks: [SlotMarks; 2],
 }
 
 impl KvCacheCoordinator {
@@ -346,11 +401,11 @@ impl KvCacheCoordinator {
             terminal_transactions: TerminalTransactionHistory::new(
                 TERMINAL_TRANSACTION_HISTORY_LIMIT,
             ),
+            marks: [
+                SlotMarks::new(capacity_pages),
+                SlotMarks::new(capacity_pages),
+            ],
         }
-    }
-
-    pub fn arena(&self) -> KvArenaId {
-        self.arena
     }
 
     pub fn register_table(
@@ -395,6 +450,7 @@ impl KvCacheCoordinator {
             .ok_or(KvCoordinatorError::MissingTable)
     }
 
+    #[cfg(test)]
     pub fn transaction_state(&self, txn_id: PlanId) -> Option<KvTransactionState> {
         self.transactions.get(&txn_id).map(|txn| txn.state)
     }
@@ -402,6 +458,7 @@ impl KvCacheCoordinator {
     /// Returns the exact disposition when `txn_id` remains in the bounded
     /// diagnostic window. `None` does not prove that the transaction was never
     /// completed; stale-ID rejection is retained independently.
+    #[cfg(test)]
     pub fn terminal_state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
         self.terminal_transactions.state(txn_id)
     }
@@ -515,23 +572,32 @@ impl KvCacheCoordinator {
         }
 
         let mut groups_seen = HashSet::new();
-        let mut blocks_seen = HashSet::new();
         let mut fresh_count = 0usize;
         let mut has_writable = false;
         let mut has_provisional_blocks = false;
+        let arena = self.arena;
+        let slots = &self.slots;
+        let [expected_blocks, blocks_seen] = &mut self.marks;
+        blocks_seen.clear();
 
         for group_request in &request.groups {
             if !groups_seen.insert(group_request.group) {
                 return Err(KvCoordinatorError::DuplicateGroup);
             }
-            // One set per group keeps membership checks O(1) per intent;
-            // scanning the snapshot per intent was O(pages^2) per step.
-            let expected_blocks: Option<HashSet<CacheBlockRef>> = request
+            // Marking the group's committed pages once keeps membership O(1)
+            // per intent. The expected snapshot equals the committed table,
+            // so every page in it is current.
+            expected_blocks.clear();
+            if let Some(group) = request
                 .expected
                 .groups
                 .iter()
                 .find(|group| group.group == group_request.group)
-                .map(|group| group.blocks.iter().copied().collect());
+            {
+                for block in &group.blocks {
+                    expected_blocks.insert(block.index);
+                }
+            }
             for intent in &group_request.blocks {
                 has_provisional_blocks = true;
                 match *intent {
@@ -540,17 +606,14 @@ impl KvCacheCoordinator {
                         has_writable = true;
                     }
                     KvBlockIntent::CopyOnWrite(block) => {
-                        self.validate_block(block, Some(group_request.group))?;
-                        if !blocks_seen.insert(block) {
+                        validate_slot_block(arena, slots, block, Some(group_request.group))?;
+                        if !blocks_seen.insert(block.index) {
                             return Err(KvCoordinatorError::DuplicateBlock);
                         }
-                        if !expected_blocks
-                            .as_ref()
-                            .is_some_and(|blocks| blocks.contains(&block))
-                        {
+                        if !expected_blocks.contains(block.index) {
                             return Err(KvCoordinatorError::BlockNotInSnapshot);
                         }
-                        let slot = &self.slots[block.index as usize];
+                        let slot = &slots[block.index as usize];
                         if slot.writer.is_some() {
                             return Err(KvCoordinatorError::WriteConflict);
                         }
@@ -560,21 +623,18 @@ impl KvCacheCoordinator {
                     KvBlockIntent::Existing(block)
                     | KvBlockIntent::Writable(block)
                     | KvBlockIntent::Shared(block) => {
-                        self.validate_block(block, Some(group_request.group))?;
-                        if !blocks_seen.insert(block) {
+                        validate_slot_block(arena, slots, block, Some(group_request.group))?;
+                        if !blocks_seen.insert(block.index) {
                             return Err(KvCoordinatorError::DuplicateBlock);
                         }
                         match *intent {
                             KvBlockIntent::Existing(_) | KvBlockIntent::Writable(_) => {
-                                if !expected_blocks
-                                    .as_ref()
-                                    .is_some_and(|blocks| blocks.contains(&block))
-                                {
+                                if !expected_blocks.contains(block.index) {
                                     return Err(KvCoordinatorError::BlockNotInSnapshot);
                                 }
                             }
                             KvBlockIntent::Shared(_) => {
-                                let slot = &self.slots[block.index as usize];
+                                let slot = &slots[block.index as usize];
                                 if slot.prefix_refs == 0 {
                                     return Err(KvCoordinatorError::UnpublishedPrefix);
                                 }
@@ -582,7 +642,7 @@ impl KvCacheCoordinator {
                             KvBlockIntent::Fresh | KvBlockIntent::CopyOnWrite(_) => unreachable!(),
                         }
                         if matches!(intent, KvBlockIntent::Writable(_)) {
-                            let slot = &self.slots[block.index as usize];
+                            let slot = &slots[block.index as usize];
                             if slot.writer.is_some()
                                 || slot.table_refs != 1
                                 || slot.prefix_refs != 0
@@ -702,20 +762,46 @@ impl KvCacheCoordinator {
                 actual: txn.state,
             });
         }
-        let pages = transaction_execution_blocks(txn);
-        let writable: HashSet<_> = txn.writable_blocks.iter().copied().collect();
-        for block in &pages {
-            self.validate_block(*block, None)?;
-            if self.slots[block.index as usize]
+        // Every provisional page plus every copy source, once each.
+        let arena = self.arena;
+        let slots = &self.slots;
+        let [writable, seen] = &mut self.marks;
+        writable.clear();
+        seen.clear();
+        for block in &txn.writable_blocks {
+            validate_slot_block(arena, slots, *block, None)?;
+            writable.insert(block.index);
+        }
+        let mut pages = Vec::new();
+        for block in txn
+            .provisional_groups
+            .iter()
+            .flat_map(|group| group.blocks.iter())
+            .chain(txn.page_copies.iter().map(|copy| &copy.source))
+        {
+            validate_slot_block(arena, slots, *block, None)?;
+            if !seen.insert(block.index) {
+                continue;
+            }
+            if slots[block.index as usize]
                 .writer
-                .is_some_and(|writer| writer != txn_id || !writable.contains(block))
+                .is_some_and(|writer| writer != txn_id || !writable.contains(block.index))
             {
                 return Err(KvCoordinatorError::WriteConflict);
             }
+            pages.push(*block);
         }
         for block in &pages {
             self.slots[block.index as usize].execution_pins += 1;
         }
+        // An extended committed tail is owned by the expected table; a page
+        // this transaction allocated has no table reference until commit.
+        let fresh_blocks = txn
+            .writable_blocks
+            .iter()
+            .copied()
+            .filter(|block| self.slots[block.index as usize].table_refs == 0)
+            .collect();
         let txn = self
             .transactions
             .get_mut(&txn_id)
@@ -727,6 +813,7 @@ impl KvCacheCoordinator {
             expected: txn.expected.clone(),
             provisional_groups: txn.provisional_groups.clone(),
             writable_blocks: txn.writable_blocks.clone(),
+            fresh_blocks,
             page_copies: txn.page_copies.clone(),
             target_committed_tokens: txn.target_committed_tokens,
             target_window_start: txn.target_window_start,
@@ -919,6 +1006,7 @@ impl KvCacheCoordinator {
     }
 
     /// CAS the expected table version and atomically publish optional full pages.
+    #[cfg(test)]
     pub fn commit(
         &mut self,
         txn_id: PlanId,
@@ -930,6 +1018,7 @@ impl KvCacheCoordinator {
     /// CAS the table and apply prefix-index ownership changes as one metadata
     /// transaction. Callers stage their index mutation first and make it
     /// visible only after this method succeeds.
+    #[cfg(test)]
     pub fn commit_with_prefix_updates(
         &mut self,
         txn_id: PlanId,
@@ -949,9 +1038,9 @@ impl KvCacheCoordinator {
     }
 
     /// Validate a written transaction without publishing any table or
-    /// reference-count mutation.
+    /// reference-count mutation. Only the scratch marks are written.
     pub(crate) fn stage_commit_with_prefix_updates(
-        &self,
+        &mut self,
         txn_id: PlanId,
         retain_prefix: &[CacheBlockRef],
         release_prefix: &[CacheBlockRef],
@@ -959,7 +1048,6 @@ impl KvCacheCoordinator {
         let txn = self
             .transactions
             .get(&txn_id)
-            .cloned()
             .ok_or(KvCoordinatorError::MissingTransaction(txn_id))?;
         if txn.state != KvTransactionState::Written {
             return Err(KvCoordinatorError::InvalidTransactionState {
@@ -976,39 +1064,66 @@ impl KvCacheCoordinator {
             return Err(KvCoordinatorError::VersionConflict);
         }
 
-        let writable: HashSet<_> = txn.writable_blocks.iter().copied().collect();
-        let mut published = HashSet::new();
+        let arena = self.arena;
+        let slots = &self.slots;
+        let [old_marks, new_marks] = &mut self.marks;
+        // Writable pages, then the pages published from them.
+        old_marks.clear();
+        new_marks.clear();
+        for block in &txn.writable_blocks {
+            validate_slot_block(arena, slots, *block, None)?;
+            old_marks.insert(block.index);
+        }
         for block in retain_prefix {
-            self.validate_block(*block, None)?;
-            if !writable.contains(block) || !published.insert(*block) {
+            validate_slot_block(arena, slots, *block, None)?;
+            if !old_marks.contains(block.index) || !new_marks.insert(block.index) {
                 return Err(KvCoordinatorError::InvalidWriteReceipt);
             }
         }
         let released = unique_blocks(release_prefix)?;
         for block in &released {
-            self.validate_block(*block, None)?;
-            let retained_here = usize::from(published.contains(block));
-            if self.slots[block.index as usize].prefix_refs + retained_here == 0 {
+            validate_slot_block(arena, slots, *block, None)?;
+            let retained_here = usize::from(new_marks.contains(block.index));
+            if slots[block.index as usize].prefix_refs + retained_here == 0 {
                 return Err(KvCoordinatorError::ReferenceUnderflow);
             }
         }
 
-        let old_blocks: HashSet<_> = unique_table_blocks(&txn.expected.groups)
-            .into_iter()
-            .collect();
-        let new_blocks: HashSet<_> = unique_table_blocks(&txn.provisional_groups)
-            .into_iter()
-            .collect();
-        for block in &new_blocks {
-            self.validate_block(*block, None)?;
+        // The committed table's pages, then the provisional table's. The
+        // expected snapshot equals the committed table, so its pages are
+        // current; provisional pages are validated before they are marked.
+        old_marks.clear();
+        new_marks.clear();
+        for block in txn.expected.groups.iter().flat_map(|group| &group.blocks) {
+            old_marks.insert(block.index);
         }
-        for block in old_blocks.difference(&new_blocks) {
-            if self.slots[block.index as usize].table_refs == 0 {
+        let mut added_table_blocks = Vec::new();
+        for block in txn
+            .provisional_groups
+            .iter()
+            .flat_map(|group| &group.blocks)
+        {
+            validate_slot_block(arena, slots, *block, None)?;
+            if new_marks.insert(block.index) && !old_marks.contains(block.index) {
+                added_table_blocks.push(*block);
+            }
+        }
+        // Marking each removed page in `new_marks` also deduplicates it.
+        let removed_table_blocks = txn
+            .expected
+            .groups
+            .iter()
+            .flat_map(|group| &group.blocks)
+            .copied()
+            .filter(|block| new_marks.insert(block.index))
+            .collect::<Vec<_>>();
+        for block in &removed_table_blocks {
+            if slots[block.index as usize].table_refs == 0 {
                 return Err(KvCoordinatorError::ReferenceUnderflow);
             }
         }
-        for block in new_blocks.difference(&old_blocks) {
-            self.slots[block.index as usize]
+        for block in &added_table_blocks {
+            slots[block.index as usize]
                 .table_refs
                 .checked_add(1)
                 .ok_or_else(|| {
@@ -1016,7 +1131,7 @@ impl KvCacheCoordinator {
                 })?;
         }
         for block in retain_prefix {
-            self.slots[block.index as usize]
+            slots[block.index as usize]
                 .prefix_refs
                 .checked_add(1)
                 .ok_or_else(|| {
@@ -1028,11 +1143,11 @@ impl KvCacheCoordinator {
         })?;
 
         Ok(KvCoordinatorCommitPlan {
-            txn,
+            txn_id,
             retain_prefix: retain_prefix.to_vec(),
             release_prefix: released,
-            old_blocks,
-            new_blocks,
+            added_table_blocks,
+            removed_table_blocks,
             next_version,
         })
     }
@@ -1041,15 +1156,19 @@ impl KvCacheCoordinator {
     /// The engine holds the coordinator state lock between staging and apply.
     pub(crate) fn apply_staged_commit(&mut self, plan: KvCoordinatorCommitPlan) -> KvSnapshot {
         let KvCoordinatorCommitPlan {
-            txn,
+            txn_id,
             retain_prefix,
             release_prefix,
-            old_blocks,
-            new_blocks,
+            added_table_blocks,
+            removed_table_blocks,
             next_version,
         } = plan;
+        let txn = self
+            .transactions
+            .remove(&txn_id)
+            .expect("staged transaction remains active under the manager lock");
         // Add new ownership before releasing reservations or removed table refs.
-        for block in new_blocks.difference(&old_blocks) {
+        for block in &added_table_blocks {
             self.slots[block.index as usize].table_refs += 1;
         }
         for block in &retain_prefix {
@@ -1061,7 +1180,7 @@ impl KvCacheCoordinator {
 
         self.release_transaction_pins(&txn);
         self.release_transaction_holds(&txn);
-        for block in old_blocks.difference(&new_blocks) {
+        for block in removed_table_blocks {
             let slot = &mut self.slots[block.index as usize];
             slot.table_refs -= 1;
             self.recycle_if_unowned(block.index);
@@ -1070,7 +1189,6 @@ impl KvCacheCoordinator {
             self.recycle_if_unowned(block.index);
         }
 
-        let txn_id = txn.id;
         let committed = KvSnapshot {
             arena: self.arena,
             session: txn.expected.session,
@@ -1081,7 +1199,6 @@ impl KvCacheCoordinator {
             groups: txn.provisional_groups,
         };
         self.tables.insert(txn.key, committed.clone());
-        self.transactions.remove(&txn_id);
         self.terminal_transactions
             .record(txn_id, KvTerminalState::Committed);
         committed
@@ -1198,20 +1315,7 @@ impl KvCacheCoordinator {
         Ok(())
     }
 
-    /// Add a durable prefix-index reference to a committed page.
-    pub fn retain_prefix(&mut self, block: CacheBlockRef) -> KvCoordinatorResult<()> {
-        self.validate_block(block, None)?;
-        let slot = &mut self.slots[block.index as usize];
-        if slot.table_refs == 0 && slot.prefix_refs == 0 {
-            return Err(KvCoordinatorError::UnpublishedPrefix);
-        }
-        if slot.prefix_refs == 0 && (slot.writer.is_some() || slot.reservations != 0) {
-            return Err(KvCoordinatorError::WriteConflict);
-        }
-        slot.prefix_refs += 1;
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn release_prefix(&mut self, block: CacheBlockRef) -> KvCoordinatorResult<()> {
         self.release_prefixes(&[block])
     }
@@ -1300,6 +1404,7 @@ impl KvCacheCoordinator {
     }
 
     /// Expensive internal consistency check intended for tests/shadow diagnostics.
+    #[cfg(test)]
     pub fn check_invariants(&self) -> KvCoordinatorResult<()> {
         let free = &self.free;
         if let Some(index) = free
@@ -1412,22 +1517,7 @@ impl KvCacheCoordinator {
         block: CacheBlockRef,
         expected_group: Option<KvGroupId>,
     ) -> KvCoordinatorResult<()> {
-        if block.arena != self.arena {
-            return Err(KvCoordinatorError::WrongArena);
-        }
-        let Some(slot) = self.slots.get(block.index as usize) else {
-            return Err(KvCoordinatorError::StaleBlock);
-        };
-        if !slot.allocated || slot.generation != block.slot_generation {
-            return Err(KvCoordinatorError::StaleBlock);
-        }
-        if slot.group != Some(block.group) {
-            return Err(KvCoordinatorError::WrongGroup);
-        }
-        if expected_group.is_some_and(|group| group != block.group) {
-            return Err(KvCoordinatorError::WrongGroup);
-        }
-        Ok(())
+        validate_slot_block(self.arena, &self.slots, block, expected_group)
     }
 
     fn abort_internal(&mut self, txn_id: PlanId) {
@@ -1532,6 +1622,32 @@ fn reconciled_prefix_groups(
     Ok(reconciled)
 }
 
+/// Free-function form of `KvCacheCoordinator::validate_block`, so callers can
+/// validate while holding the coordinator's scratch marks mutably.
+fn validate_slot_block(
+    arena: KvArenaId,
+    slots: &[BlockSlot],
+    block: CacheBlockRef,
+    expected_group: Option<KvGroupId>,
+) -> KvCoordinatorResult<()> {
+    if block.arena != arena {
+        return Err(KvCoordinatorError::WrongArena);
+    }
+    let Some(slot) = slots.get(block.index as usize) else {
+        return Err(KvCoordinatorError::StaleBlock);
+    };
+    if !slot.allocated || slot.generation != block.slot_generation {
+        return Err(KvCoordinatorError::StaleBlock);
+    }
+    if slot.group != Some(block.group) {
+        return Err(KvCoordinatorError::WrongGroup);
+    }
+    if expected_group.is_some_and(|group| group != block.group) {
+        return Err(KvCoordinatorError::WrongGroup);
+    }
+    Ok(())
+}
+
 fn unique_table_blocks(groups: &[GroupBlockTable]) -> Vec<CacheBlockRef> {
     let mut seen = HashSet::new();
     groups
@@ -1539,18 +1655,6 @@ fn unique_table_blocks(groups: &[GroupBlockTable]) -> Vec<CacheBlockRef> {
         .flat_map(|group| group.blocks.iter().copied())
         .filter(|block| seen.insert(*block))
         .collect()
-}
-
-fn transaction_execution_blocks(txn: &Transaction) -> Vec<CacheBlockRef> {
-    let mut blocks = unique_table_blocks(&txn.provisional_groups);
-    let mut seen = blocks.iter().copied().collect::<HashSet<_>>();
-    blocks.extend(
-        txn.page_copies
-            .iter()
-            .map(|copy| copy.source)
-            .filter(|block| seen.insert(*block)),
-    );
-    blocks
 }
 
 fn unique_blocks(blocks: &[CacheBlockRef]) -> KvCoordinatorResult<Vec<CacheBlockRef>> {
@@ -1568,7 +1672,6 @@ mod tests {
 
     use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig, KvWriteArgs};
     use crate::backends::BackendKind;
-    use crate::engine::cache::window::advance_window;
     use crate::engine::ModelInstanceId;
     use crate::kv::{KvLayerBinding, KvSlotRef};
 
@@ -1976,8 +2079,8 @@ mod tests {
             Some(KvTerminalState::Aborted)
         );
 
-        // Exact diagnostics may expire, but the high-water mark makes delayed
-        // aborts idempotent and permanently rejects a reused scheduler plan ID.
+        // Exact diagnostics may expire, but the evicted high-water mark makes
+        // delayed aborts idempotent and permanently rejects a reused plan ID.
         assert!(!coordinator.abort(10).unwrap());
         assert_eq!(
             coordinator.reserve(KvReserveRequest {
@@ -2005,16 +2108,43 @@ mod tests {
 
         assert!(coordinator.abort(21).unwrap());
         assert!(coordinator.abort(20).unwrap());
-        assert!(!coordinator.abort(19).unwrap());
-        assert_eq!(
-            coordinator.abort(22),
-            Err(KvCoordinatorError::MissingTransaction(22))
-        );
+        assert!(!coordinator.abort(21).unwrap());
+        for unseen in [19, 22] {
+            assert_eq!(
+                coordinator.abort(unseen),
+                Err(KvCoordinatorError::MissingTransaction(unseen))
+            );
+        }
         let current = coordinator
             .snapshot(&session("out-of-order-terminal", 1), CacheDomainId::new(0))
             .unwrap();
         reserve_fresh(&mut coordinator, 22, current, 1, 1);
         assert!(coordinator.abort(22).unwrap());
+        coordinator.check_invariants().unwrap();
+    }
+
+    /// One engine step allocates its plan IDs in order but reserves them out
+    /// of order: a prefill row can reserve, abort for tensor-state capacity,
+    /// and leave a lower-numbered decode row still to reserve. That fresh ID
+    /// is not stale and must reserve.
+    #[test]
+    fn a_lower_unseen_id_reserves_after_a_higher_id_aborts() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 2);
+        let initial = coordinator
+            .register_table(session("withheld-prefill", 1), CacheDomainId::new(0))
+            .unwrap();
+        let decode = coordinator
+            .register_table(session("decode-after-withheld", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 31, initial, 1, 1);
+        assert!(coordinator.abort(31).unwrap());
+
+        reserve_fresh(&mut coordinator, 30, decode, 1, 1);
+        assert_eq!(
+            coordinator.transaction_state(30),
+            Some(KvTransactionState::Reserved)
+        );
+        assert!(coordinator.abort(30).unwrap());
         coordinator.check_invariants().unwrap();
     }
 
@@ -2167,6 +2297,55 @@ mod tests {
         coordinator.reserve(append(72)).unwrap();
         coordinator.abort(72).unwrap();
         coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn prepared_fresh_blocks_exclude_an_extended_committed_tail() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 4);
+        let key = session("fresh", 1);
+        let initial = coordinator
+            .register_table(key, CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 80, initial, 1, 1);
+        let tail = prepare_and_complete(&mut coordinator, 80).writable_blocks[0];
+        let committed = coordinator.commit(80, &[]).unwrap();
+
+        coordinator
+            .reserve(KvReserveRequest {
+                txn_id: 81,
+                expected: committed,
+                target_committed_tokens: 20,
+                target_window_start: 0,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: vec![KvBlockIntent::Writable(tail), KvBlockIntent::Fresh],
+                }],
+            })
+            .unwrap();
+        let prepared = prepare_and_complete(&mut coordinator, 81);
+        assert_eq!(prepared.writable_blocks.len(), 2);
+        assert_eq!(prepared.writable_blocks[0], tail);
+        assert_eq!(prepared.fresh_blocks, vec![prepared.writable_blocks[1]]);
+        let committed = coordinator.commit(81, &[]).unwrap();
+        assert_eq!(committed.groups[0].blocks, prepared.writable_blocks);
+        assert_eq!(coordinator.stats().table_refs, 2);
+        coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn slot_marks_forget_marks_from_before_an_epoch_wrap() {
+        let mut marks = SlotMarks::new(2);
+        marks.clear();
+        assert!(marks.insert(0));
+        assert!(!marks.insert(0));
+        // Four billion clears later the epoch returns to the value index 0
+        // was marked with; the wrap must not resurrect that mark.
+        marks.epoch = u32::MAX;
+        marks.clear();
+        assert_eq!(marks.epoch, 1);
+        assert!(!marks.contains(0));
+        assert!(marks.insert(1));
+        assert!(marks.contains(1));
     }
 
     #[test]
@@ -2331,13 +2510,13 @@ mod tests {
         reserve_fresh(&mut coordinator, 110, initial, 3, 10);
         let initial_pages = prepare_and_complete(&mut coordinator, 110).writable_blocks;
         let committed = coordinator.commit(110, &[]).unwrap();
-        let advanced = advance_window(&initial_pages, 0, 5, 10, 4).unwrap();
+        // Start 5 of 10 tokens in 4-token pages hides only page 0.
         coordinator
             .reserve_window(KvWindowReserveRequest {
                 txn_id: 111,
                 expected: committed,
                 target_committed_tokens: 10,
-                target_window_start: advanced.window_start,
+                target_window_start: 5,
                 page_tokens: 4,
             })
             .unwrap();
@@ -2352,11 +2531,11 @@ mod tests {
             .unwrap();
         let trimmed = coordinator.commit(111, &[]).unwrap();
         assert_eq!(trimmed.window_start, 5);
-        assert_eq!(trimmed.groups[0].blocks, advanced.visible_blocks);
+        assert_eq!(trimmed.groups[0].blocks, initial_pages[1..]);
         assert_eq!(coordinator.stats().allocated_pages, 2);
         assert_eq!(coordinator.stats().table_refs, 2);
         assert_eq!(
-            coordinator.pin_transfer(&[advanced.released_blocks[0]]),
+            coordinator.pin_transfer(&[initial_pages[0]]),
             Err(KvCoordinatorError::StaleBlock)
         );
         coordinator.check_invariants().unwrap();

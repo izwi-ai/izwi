@@ -344,8 +344,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn page_round_trip_is_bit_preserving_through_metal_arenas() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping Metal page-transfer round trip: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "page_round_trip_is_bit_preserving_through_metal_arenas",
+        ) else {
             return Ok(());
         };
         for dtype in [DType::F32, DType::F16, DType::BF16] {

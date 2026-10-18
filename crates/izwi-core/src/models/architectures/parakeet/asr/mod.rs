@@ -3535,8 +3535,9 @@ mod tests {
     fn metal_weight_only_f16_encoder_engages_ggml_and_matches_cpu_f32() {
         use crate::kernels::f16_weight_linear::F16WeightLinearPath;
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_weight_only_f16_encoder_engages_ggml_and_matches_cpu_f32",
+        ) else {
             return;
         };
         let reference = encode_probe(&random_encoder(TINY, 36, &Device::Cpu), &Device::Cpu);

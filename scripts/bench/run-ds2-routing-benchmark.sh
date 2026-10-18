@@ -2,7 +2,7 @@
 #
 # DS2 routing benchmark: runs the multi_turn gateway chat workload across TWO
 # local workers + one local gateway on the requested backend lane, once with
-# routing (cache affinity + conversation pinning) off and once on, and writes
+# prefix-aware routing off and once on, and writes
 # per-leg manifests with per-worker managed-KV counter deltas under
 # benchmarks/manifests/.
 #
@@ -147,8 +147,8 @@ if [[ "$dry_run" == 1 ]]; then
     echo "fixture_model_dir=$fixture_model_dir"
     echo "output_dir=$output_dir worker_bin=$worker_bin gateway_bin=$gateway_bin"
     echo "per-leg gateway env:"
-    echo "  off: (defaults; IZWI_GATEWAY_ROUTER_CACHE_AFFINITY unset, IZWI_GATEWAY_SESSION_PIN unset)"
-    echo "  on:  IZWI_GATEWAY_ROUTER_CACHE_AFFINITY=on IZWI_GATEWAY_SESSION_PIN=on"
+    echo "  off: IZWI_GATEWAY_ROUTER_PREFIX_AFFINITY=off"
+    echo "  on:  IZWI_GATEWAY_ROUTER_PREFIX_AFFINITY=on (the default)"
     echo "gateway_cmd: $gateway_bin --role gateway ... --gateway-worker-approval http://127.0.0.1:<portA>|chat|$public_model|$deployment_id|1 --gateway-worker-approval http://127.0.0.1:<portB>|chat|$public_model|$deployment_id|1"
     echo "harness_vocab: a,b,c (the fixture tokenizer only knows a/b/c; other words collapse to unk)"
     exit 0
@@ -253,13 +253,12 @@ for leg in off on; do
     worker_ready_wait "$worker_b_pid" "$worker_b_port" "worker-b-$leg"
     log "workers ready"
 
-    routing_envs=()
-    if [[ "$leg" == "on" ]]; then
-        routing_envs+=(
-            "IZWI_GATEWAY_ROUTER_CACHE_AFFINITY=on"
-            "IZWI_GATEWAY_SESSION_PIN=on"
-        )
-    fi
+    # The fixture prompts are short single-letter words, so hash in small
+    # blocks to give each conversation's shared prefix several of them.
+    routing_envs=(
+        "IZWI_GATEWAY_ROUTER_PREFIX_AFFINITY=$leg"
+        "IZWI_GATEWAY_ROUTER_PREFIX_BLOCK_BYTES=32"
+    )
 
     log "starting gateway on 127.0.0.1:$gateway_port (routing=$leg)"
     env \

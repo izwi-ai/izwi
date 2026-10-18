@@ -2975,8 +2975,9 @@ mod tests {
     fn metal_f16_decoder_parity_gate() {
         use crate::kernels::numeric_check::{max_abs_diff, relative_l2};
 
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_f16_decoder_parity_gate")
+        else {
             return;
         };
         let dir = {

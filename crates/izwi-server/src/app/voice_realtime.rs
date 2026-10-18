@@ -12,23 +12,23 @@
 //! - interruption / barge-in cancellation
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
-    AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, MemoryMessage, MemoryMessageMeta,
-    MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest, NoopTool, TimeTool,
-    ToolRegistry, TurnInput,
+    strip_reasoning, AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, HistoryBudget,
+    MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput,
+    ModelRequest, NoopTool, ReasoningFilter, TimeTool, ToolRegistry, TurnInput,
 };
 use izwi_core::{
-    audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
+    resolve_asr_model_variant, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
     GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
-    VoiceSession, WorkloadClass,
+    SessionModelLeases, VoiceLatency, VoiceSession, VoiceSessionPhase, WorkloadClass,
 };
 use izwi_vad::{
     sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
@@ -40,40 +40,60 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
     RealtimeCloseReason, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeInterruptionReason,
     RealtimeProtocol, RealtimeServerEvent, RealtimeSpeechEndReason, RealtimeTurnStatus,
     VOICE_REALTIME_VERSION,
 };
+use crate::app::realtime_transport::{
+    now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, spawn_writer,
+    wav_bytes_from_pcm16_mono, ClientPcm16Frame, OutboundClass, OutboundEnqueueError, OutboundItem,
+    OutboundLimits, OutboundMailbox,
+};
+use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
-use crate::state::{AppState, StoredAgentSessionRecord};
+use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
 use crate::voice_memory::extract_observation_candidates;
 use crate::voice_store::CreateVoiceTurnRequest;
 const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
+/// A spoken reply's default token budget: a few sentences, not an essay
+/// (SPK-F2). Clients may raise it with `max_output_tokens`.
+const VOICE_DEFAULT_MAX_OUTPUT_TOKENS: usize = 384;
+/// The conversation history a voice turn's prompt carries (SPK-F13).
+const VOICE_HISTORY_BUDGET: HistoryBudget = HistoryBudget {
+    max_messages: 24,
+    max_tokens: 3_000,
+};
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
-const WS_BIN_VERSION: u8 = 1;
-const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
 const WS_BIN_KIND_ASSISTANT_PCM16: u8 = 2;
-const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
+const WS_BIN_KIND_ASSISTANT_G711_ULAW: u8 = 3;
+const WS_BIN_KIND_ASSISTANT_G711_ALAW: u8 = 4;
 const WS_BIN_ASSISTANT_HEADER_LEN: usize = 24;
 const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
 const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
 const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
 const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
 const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
-const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
-const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
-const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
-const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Voiced speech that confirms a barge-in. A speech start alone does not
+/// interrupt the assistant: a cough, a door or speaker echo also starts one.
+const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
+/// How long past the silence window frames may stop before the server
+/// assumes the client paused without `input_stream_stop`. Silence is measured
+/// in audio time, so this only has to cover network stalls and jitter.
+const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
 const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
+/// Assistant audio sent this long after the audio already sent had finished
+/// playing counts as a playback underrun.
+const PLAYBACK_UNDERRUN_TOLERANCE: Duration = Duration::from_millis(20);
 const LEGACY_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime_v1";
 const TYPED_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime";
 
@@ -180,7 +200,7 @@ struct OutboundTx {
 impl OutboundTx {
     fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
         Self {
-            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::from_env())),
+            mailbox: Arc::new(OutboundMailbox::new(voice_outbound_limits())),
             wire: Arc::new(Mutex::new(VoiceOutboundWireState::default())),
             runtime,
             label,
@@ -197,48 +217,59 @@ impl OutboundTx {
     }
 
     fn send_text_snapshot(&self, generation: u64, key: String, message: Message) -> bool {
-        self.enqueue(
-            message,
-            OutboundClass::CoalescibleText(key),
-            Some(generation),
-        )
-        .is_ok()
+        self.enqueue(message, OutboundClass::Coalescible(key), Some(generation))
+            .is_ok()
     }
 
-    fn send_audio(
+    /// Queue assistant audio once the client has taken enough of the audio
+    /// already queued (credit-based backpressure, SPK-F11).
+    async fn send_audio(
         &self,
         generation: u64,
         message: Message,
         bytes: usize,
         duration_ms: u64,
     ) -> Result<(), OutboundEnqueueError> {
-        if let Message::Binary(frame) = &message {
-            if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
-                && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
-                && frame.get(5).copied() == Some(WS_BIN_KIND_ASSISTANT_PCM16)
+        self.note_audio_chunk(&message);
+        let result = self
+            .mailbox
+            .enqueue_audio(OutboundItem {
+                message,
+                class: OutboundClass::Audio { bytes, duration_ms },
+                turn_generation: Some(generation),
+            })
+            .await;
+        self.report(result)
+    }
+
+    /// Remember the chunk sequence of an assistant audio frame for the typed
+    /// protocol's `assistant_audio_completed`.
+    fn note_audio_chunk(&self, message: &Message) {
+        let Message::Binary(frame) = message else {
+            return;
+        };
+        if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
+            && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
+            && frame.get(5).is_some_and(|kind| {
+                (WS_BIN_KIND_ASSISTANT_PCM16..=WS_BIN_KIND_ASSISTANT_G711_ALAW).contains(kind)
+            })
+        {
+            let chunk_sequence =
+                u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
+            if let Some(typed) = self
+                .wire
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .typed
+                .as_mut()
             {
-                let chunk_sequence =
-                    u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
-                if let Some(typed) = self
-                    .wire
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .typed
-                    .as_mut()
-                {
-                    typed.last_audio_chunk_sequence = chunk_sequence;
-                }
+                typed.last_audio_chunk_sequence = chunk_sequence;
             }
         }
-        self.enqueue(
-            message,
-            OutboundClass::Audio { bytes, duration_ms },
-            Some(generation),
-        )
     }
 
     fn send_diagnostic(&self, message: Message) -> bool {
-        self.enqueue(message, OutboundClass::Diagnostic, None)
+        self.enqueue(message, OutboundClass::Droppable, None)
             .is_ok()
     }
 
@@ -253,6 +284,10 @@ impl OutboundTx {
             class,
             turn_generation,
         });
+        self.report(result)
+    }
+
+    fn report(&self, result: Result<(), OutboundEnqueueError>) -> Result<(), OutboundEnqueueError> {
         if let Err(err) = &result {
             if !matches!(err, OutboundEnqueueError::Cutoff) {
                 self.runtime.record_voice_stream_backpressure();
@@ -326,235 +361,18 @@ impl OutboundTx {
         serde_json::to_string(&typed.envelope(event, utterance_id, turn_id)).map(Some)
     }
 
-    async fn next(&self) -> Option<MailboxOutput> {
-        self.mailbox.next().await
-    }
-
     fn close(&self) {
         self.mailbox.close();
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OutboundClass {
-    Critical,
-    CoalescibleText(String),
-    Audio { bytes: usize, duration_ms: u64 },
-    Diagnostic,
-}
-
-struct OutboundItem {
-    message: Message,
-    class: OutboundClass,
-    turn_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OutboundLimits {
-    max_items: usize,
-    max_audio_bytes: usize,
-    max_audio_ms: u64,
-}
-
-impl OutboundLimits {
-    fn from_env() -> Self {
-        Self {
-            max_items: env_usize("IZWI_VOICE_WS_OUTBOUND_ITEMS", WS_OUTBOUND_QUEUE_CAPACITY),
-            max_audio_bytes: env_usize(
-                "IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES",
-                WS_OUTBOUND_AUDIO_MAX_BYTES,
-            ),
-            max_audio_ms: env_u64("IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", WS_OUTBOUND_AUDIO_MAX_MS),
-        }
+fn voice_outbound_limits() -> OutboundLimits {
+    let tuning = crate::env_config::tuning();
+    OutboundLimits {
+        max_items: tuning.voice_ws_outbound_items,
+        max_audio_bytes: tuning.voice_ws_outbound_audio_bytes,
+        max_audio_ms: tuning.voice_ws_outbound_audio_ms,
     }
-}
-
-struct OutboundMailbox {
-    limits: OutboundLimits,
-    state: Mutex<OutboundMailboxState>,
-    notify: Notify,
-    minimum_turn_generation: AtomicU64,
-}
-
-#[derive(Default)]
-struct OutboundMailboxState {
-    queue: VecDeque<OutboundItem>,
-    audio_bytes: usize,
-    audio_ms: u64,
-    close_reason: Option<String>,
-    closed: bool,
-}
-
-enum MailboxOutput {
-    Message(Message),
-    Close(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundEnqueueError {
-    Cutoff,
-    AudioSaturated,
-    QueueSaturated,
-    Closed,
-    DroppedDiagnostic,
-}
-
-impl OutboundMailbox {
-    fn new(limits: OutboundLimits) -> Self {
-        Self {
-            limits,
-            state: Mutex::new(OutboundMailboxState::default()),
-            notify: Notify::new(),
-            minimum_turn_generation: AtomicU64::new(0),
-        }
-    }
-
-    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if item.turn_generation.is_some_and(|generation| {
-            generation < self.minimum_turn_generation.load(Ordering::Acquire)
-        }) {
-            return Err(OutboundEnqueueError::Cutoff);
-        }
-        if state.closed {
-            return Err(OutboundEnqueueError::Closed);
-        }
-
-        if let OutboundClass::CoalescibleText(key) = &item.class {
-            if let Some(existing) = state.queue.iter_mut().find(|queued| {
-                queued.turn_generation == item.turn_generation
-                    && matches!(&queued.class, OutboundClass::CoalescibleText(existing_key) if existing_key == key)
-            }) {
-                existing.message = item.message;
-                return Ok(());
-            }
-        }
-
-        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
-            if state.audio_bytes.saturating_add(*bytes) > self.limits.max_audio_bytes
-                || state.audio_ms.saturating_add(*duration_ms) > self.limits.max_audio_ms
-            {
-                state.close_reason = Some("outbound_audio_saturated".to_string());
-                self.notify.notify_one();
-                return Err(OutboundEnqueueError::AudioSaturated);
-            }
-        }
-
-        if state.queue.len() >= self.limits.max_items {
-            match &item.class {
-                OutboundClass::Critical => {
-                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
-                    self.notify.notify_one();
-                    return Err(OutboundEnqueueError::QueueSaturated);
-                }
-                OutboundClass::Audio { .. } => {
-                    state.close_reason = Some("outbound_audio_saturated".to_string());
-                    self.notify.notify_one();
-                    return Err(OutboundEnqueueError::AudioSaturated);
-                }
-                OutboundClass::Diagnostic => {
-                    return Err(OutboundEnqueueError::DroppedDiagnostic);
-                }
-                OutboundClass::CoalescibleText(_) => {
-                    return Err(OutboundEnqueueError::QueueSaturated);
-                }
-            }
-        }
-
-        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
-            state.audio_bytes = state.audio_bytes.saturating_add(*bytes);
-            state.audio_ms = state.audio_ms.saturating_add(*duration_ms);
-        }
-        state.queue.push_back(item);
-        drop(state);
-        self.notify.notify_one();
-        Ok(())
-    }
-
-    fn cutoff_turn(&self, generation: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        self.minimum_turn_generation
-            .fetch_max(generation.saturating_add(1), Ordering::AcqRel);
-        let mut retained = VecDeque::with_capacity(state.queue.len());
-        while let Some(item) = state.queue.pop_front() {
-            if item.turn_generation == Some(generation) {
-                subtract_audio_depth(&mut state, &item.class);
-            } else {
-                retained.push_back(item);
-            }
-        }
-        state.queue = retained;
-    }
-
-    fn accepts_turn_generation(&self, generation: u64) -> bool {
-        generation >= self.minimum_turn_generation.load(Ordering::Acquire)
-    }
-
-    async fn next(&self) -> Option<MailboxOutput> {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if let Some(reason) = state.close_reason.take() {
-                    state.queue.clear();
-                    state.audio_bytes = 0;
-                    state.audio_ms = 0;
-                    state.closed = true;
-                    return Some(MailboxOutput::Close(reason));
-                }
-                if let Some(item) = state.queue.pop_front() {
-                    subtract_audio_depth(&mut state, &item.class);
-                    return Some(MailboxOutput::Message(item.message));
-                }
-                if state.closed {
-                    return None;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
-        drop(state);
-        self.notify.notify_waiters();
-    }
-}
-
-fn subtract_audio_depth(state: &mut OutboundMailboxState, class: &OutboundClass) {
-    if let OutboundClass::Audio { bytes, duration_ms } = class {
-        state.audio_bytes = state.audio_bytes.saturating_sub(*bytes);
-        state.audio_ms = state.audio_ms.saturating_sub(*duration_ms);
-    }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,12 +416,25 @@ enum ClientEvent {
         #[serde(default)]
         pre_roll_ms: Option<u32>,
         #[serde(default)]
+        barge_in_min_speech_ms: Option<u32>,
+        #[serde(default)]
         input_sample_rate: Option<u32>,
+        /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
+        #[serde(default)]
+        output_audio_format: Option<String>,
     },
     InputStreamStop,
     Interrupt {
         #[serde(default)]
         reason: Option<String>,
+    },
+    /// The client played only `audio_end_ms` of a reply's audio (OpenAI
+    /// Realtime's `conversation.item.truncate`): the conversation remembers
+    /// the reply only up to there.
+    #[serde(alias = "conversation.item.truncate")]
+    ConversationItemTruncate {
+        utterance_seq: u64,
+        audio_end_ms: u64,
     },
     Ping {
         #[serde(default)]
@@ -636,6 +467,7 @@ struct ModularVoiceTurnConfig {
     speaker: Option<String>,
     asr_language: Option<String>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +475,7 @@ struct UnifiedVoiceTurnConfig {
     s2s_model_id: String,
     speaker: Option<String>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +489,12 @@ struct PendingAudioCommit {
     utterance_id: String,
     utterance_seq: u64,
     turn_config: VoiceTurnConfig,
+    /// When the endpoint decision ended the utterance; the turn's latencies
+    /// are measured from here.
+    endpointed_at: Instant,
+    /// Trailing silence waited for before the decision, when silence (or a
+    /// client pause) ended the utterance.
+    endpointing_delay: Option<Duration>,
 }
 
 struct ActiveTurn {
@@ -663,9 +502,69 @@ struct ActiveTurn {
     utterance_seq: u64,
     turn_record_id: String,
     state: AppState,
+    conversation: Arc<VoiceConversation>,
     task: tokio::task::JoinHandle<()>,
     control: TurnControl,
     output_generation: u64,
+}
+
+/// The connection's spoken conversation: the latest assistant replies,
+/// held until what the user heard of them is known, then stored in order
+/// (SPK-F13). Replies are stored when the next turn needs the history, or
+/// when the stream or socket ends; until then the client may truncate them.
+#[derive(Default)]
+struct VoiceConversation {
+    pending: Mutex<VecDeque<(u64, TurnControl)>>,
+}
+
+impl VoiceConversation {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<(u64, TurnControl)>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Hold `utterance_seq`'s reply until it is stored.
+    fn hold(&self, utterance_seq: u64, control: TurnControl) {
+        let mut pending = self.lock();
+        pending.retain(|(seq, _)| *seq != utterance_seq);
+        pending.push_back((utterance_seq, control));
+    }
+
+    /// The held replies, oldest first.
+    fn take(&self) -> Vec<TurnControl> {
+        self.lock().drain(..).map(|(_, control)| control).collect()
+    }
+
+    /// The held reply of `utterance_seq`.
+    fn reply_of(&self, utterance_seq: u64) -> Option<TurnControl> {
+        self.lock()
+            .iter()
+            .find(|(seq, _)| *seq == utterance_seq)
+            .map(|(_, control)| control.clone())
+    }
+
+    /// The user interrupted playback: the latest held reply was heard up to
+    /// where the client's playback had got.
+    fn interrupt_playback(&self) {
+        if let Some((_, control)) = self.lock().back() {
+            control.stop_playback();
+        }
+    }
+
+    /// Store the held replies in order.
+    async fn store(&self, state: &AppState) {
+        for control in self.take() {
+            store_reply(state, &control).await;
+        }
+    }
+
+    /// Store the held replies in the background.
+    fn store_in_background(self: &Arc<Self>, state: &AppState) {
+        let conversation = self.clone();
+        let state = state.clone();
+        tokio::spawn(async move { conversation.store(&state).await });
+    }
 }
 
 #[derive(Clone)]
@@ -677,16 +576,110 @@ struct TurnControlInner {
     cancelled: AtomicBool,
     reason: Mutex<Option<String>>,
     notify: Notify,
+    endpointed_at: Instant,
+    /// Set once the turn has sent assistant audio.
+    speaking: AtomicBool,
+    playback: Mutex<PlaybackClock>,
+    reply: Mutex<ReplyRecord>,
+}
+
+/// What the turn's assistant reply said, and how much of it was heard.
+#[derive(Default)]
+struct ReplyRecord {
+    /// The agent session (thread) the reply belongs to.
+    session: Option<AgentSession>,
+    turn_record_id: Option<String>,
+    /// The whole reply as generated, and without its reasoning.
+    raw_text: Option<String>,
+    text: Option<String>,
+    meta: MemoryMessageMeta,
+    ledger: SpokenLedger,
+    /// How much of the reply's audio the user heard, when not all of it.
+    heard_ms: Option<f64>,
+}
+
+impl ReplyRecord {
+    /// The text to remember: all of it, or what was heard.
+    fn remembered_text(&self) -> Option<String> {
+        match self.heard_ms {
+            Some(heard_ms) => Some(self.ledger.heard_text(heard_ms)),
+            None => self.text.clone(),
+        }
+    }
 }
 
 impl TurnControl {
-    fn new() -> Self {
+    fn new(endpointed_at: Instant) -> Self {
         Self {
             inner: Arc::new(TurnControlInner {
                 cancelled: AtomicBool::new(false),
                 reason: Mutex::new(None),
                 notify: Notify::new(),
+                endpointed_at,
+                speaking: AtomicBool::new(false),
+                playback: Mutex::new(PlaybackClock::default()),
+                reply: Mutex::new(ReplyRecord::default()),
             }),
+        }
+    }
+
+    fn reply(&self) -> std::sync::MutexGuard<'_, ReplyRecord> {
+        self.inner
+            .reply
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The client stopped playing the reply now: it was heard as far as its
+    /// playback had got, unless the client already said how far.
+    fn stop_playback(&self) {
+        let played = self
+            .inner
+            .playback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .played(Instant::now());
+        let mut reply = self.reply();
+        if reply.heard_ms.is_none() && played.as_secs_f64() * 1000.0 < reply.ledger.audio_ms() {
+            reply.heard_ms = Some(played.as_secs_f64() * 1000.0);
+        }
+    }
+
+    /// The client says it played `audio_end_ms` of the reply; returns the
+    /// text that covers.
+    fn truncate(&self, audio_end_ms: u64) -> String {
+        let mut reply = self.reply();
+        reply.heard_ms = Some(audio_end_ms as f64);
+        reply.ledger.heard_text(audio_end_ms as f64)
+    }
+
+    fn endpointed_at(&self) -> Instant {
+        self.inner.endpointed_at
+    }
+
+    fn is_speaking(&self) -> bool {
+        self.inner.speaking.load(Ordering::Acquire)
+    }
+
+    /// Account for `duration` of assistant audio just sent: the first audio
+    /// is the turn's response latency, and a chunk that found the client's
+    /// playback already drained is an underrun.
+    fn audio_sent(&self, runtime: &RuntimeService, duration: Duration) {
+        let now = Instant::now();
+        if !self.inner.speaking.swap(true, Ordering::AcqRel) {
+            runtime.record_voice_latency(
+                VoiceLatency::TurnFirstAudio,
+                now.saturating_duration_since(self.inner.endpointed_at),
+            );
+        }
+        let underrun = self
+            .inner
+            .playback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sent(now, duration);
+        if underrun {
+            runtime.record_voice_egress_underrun();
         }
     }
 
@@ -728,6 +721,57 @@ impl TurnControl {
     }
 }
 
+/// The server's view of the client's playback: the audio sent so far finishes
+/// playing at `playing_until`, assuming the client plays it as it arrives.
+#[derive(Debug, Default)]
+struct PlaybackClock {
+    playing_until: Option<Instant>,
+    sent: Duration,
+}
+
+impl PlaybackClock {
+    /// Account for `duration` of audio sent at `now`; returns whether the
+    /// audio sent before it had already finished playing (an underrun).
+    fn sent(&mut self, now: Instant, duration: Duration) -> bool {
+        let underrun = self
+            .playing_until
+            .is_some_and(|until| now > until + PLAYBACK_UNDERRUN_TOLERANCE);
+        let starts = self
+            .playing_until
+            .filter(|until| *until > now)
+            .unwrap_or(now);
+        self.playing_until = Some(starts + duration);
+        self.sent += duration;
+        underrun
+    }
+
+    /// How much of the audio sent has played by `now`.
+    fn played(&self, now: Instant) -> Duration {
+        let queued = self
+            .playing_until
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+        self.sent.saturating_sub(queued)
+    }
+}
+
+/// Move the session phase along with its active turn: Speaking once the turn
+/// has sent audio, Listening once it has ended. `turn` is the active turn's
+/// record id, whether it is still running and whether it has spoken.
+fn follow_turn_phase(session: &mut VoiceSession, turn: Option<(&str, bool, bool)>) {
+    let in_turn = matches!(
+        session.phase(),
+        VoiceSessionPhase::Processing | VoiceSessionPhase::Speaking
+    );
+    match turn {
+        Some((turn_id, true, true)) if session.phase() == VoiceSessionPhase::Processing => {
+            session.begin_speaking(turn_id)
+        }
+        Some((_, true, _)) => {}
+        Some((_, false, _)) | None if in_turn => session.begin_listening(),
+        _ => {}
+    }
+}
+
 struct AbortOnDropTask<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
 }
@@ -760,6 +804,7 @@ struct StreamingInputConfig {
     silence_duration_ms: u32,
     max_utterance_ms: u32,
     pre_roll_ms: u32,
+    barge_in_min_speech_ms: u32,
     input_sample_rate_hint: Option<u32>,
 }
 
@@ -783,7 +828,7 @@ struct StreamingActiveUtterance {
     voiced_ms: f32,
     total_ms: f32,
     silence_ms: f32,
-    started_at: Instant,
+    barge_in_confirmed: bool,
 }
 
 struct StreamingInputState {
@@ -796,15 +841,6 @@ struct StreamingInputState {
     pre_roll: VecDeque<i16>,
     active: Option<StreamingActiveUtterance>,
     last_frame_at: Option<Instant>,
-}
-
-#[derive(Debug)]
-enum BinaryMessageKind {
-    ClientPcm16Frame {
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: Vec<u8>,
-    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -851,6 +887,13 @@ impl VoiceTurnConfig {
         }
     }
 
+    fn output_format(&self) -> OutputAudioFormat {
+        match self {
+            Self::Modular(config) => config.output_format,
+            Self::Unified(config) => config.output_format,
+        }
+    }
+
     fn model_ids(&self) -> VoiceTurnModelIds {
         match self {
             Self::Modular(config) => VoiceTurnModelIds {
@@ -869,6 +912,73 @@ impl VoiceTurnConfig {
     }
 }
 
+/// The models a turn config runs, in pipeline order: (stage, model id,
+/// variant).
+fn turn_config_models(
+    config: &VoiceTurnConfig,
+) -> Result<Vec<(&'static str, String, izwi_core::ModelVariant)>, String> {
+    Ok(match config {
+        VoiceTurnConfig::Modular(config) => vec![
+            (
+                "asr",
+                config.asr_model_id.clone(),
+                resolve_asr_model_variant(Some(&config.asr_model_id)),
+            ),
+            (
+                "text",
+                config.text_model_id.clone(),
+                parse_chat_model_variant(Some(&config.text_model_id))
+                    .map_err(|err| format!("Invalid chat model: {err}"))?,
+            ),
+            (
+                "tts",
+                config.tts_model_id.clone(),
+                parse_tts_model_variant(&config.tts_model_id)
+                    .map_err(|err| format!("Unsupported TTS model: {err}"))?,
+            ),
+        ],
+        VoiceTurnConfig::Unified(config) => vec![(
+            "s2s",
+            config.s2s_model_id.clone(),
+            parse_model_variant(&config.s2s_model_id)
+                .map_err(|err| format!("Unsupported unified audio model: {err}"))?,
+        )],
+    })
+}
+
+/// Load and lease an input stream's models when the stream starts, so its
+/// first turn does not pay the cold load (SPK-F21), then report which are
+/// ready in a `models_ready` event. A model that fails to load is reported
+/// here; its turns fail with the same error.
+async fn warm_session_models(
+    runtime: Arc<RuntimeService>,
+    leases: SessionModelLeases,
+    models: Vec<(&'static str, String, izwi_core::ModelVariant)>,
+    out_tx: OutboundTx,
+) {
+    let started = Instant::now();
+    let mut statuses = Vec::with_capacity(models.len());
+    for (stage, model_id, variant) in models {
+        statuses.push(match leases.hold(&runtime, variant).await {
+            Ok(()) => json!({ "stage": stage, "model_id": model_id, "ready": true }),
+            Err(err) => json!({
+                "stage": stage,
+                "model_id": model_id,
+                "ready": false,
+                "error": err.to_string(),
+            }),
+        });
+    }
+    send_json(
+        &out_tx,
+        json!({
+            "type": "models_ready",
+            "models": statuses,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+}
+
 #[derive(Debug, Clone)]
 struct VoiceTurnModelIds {
     asr_model_id: Option<String>,
@@ -881,11 +991,20 @@ struct ConnectionState {
     system_prompt: String,
     voice_profile_id: Option<String>,
     voice_session_id: Option<String>,
-    agent_session_id: Option<String>,
-    agent_session_system_prompt: Option<String>,
+    agent_session: Arc<AgentSessionSlot>,
+    conversation: Arc<VoiceConversation>,
     streaming_input: Option<StreamingInputState>,
+    /// Keeps the input stream's models resident between turns without
+    /// pinning them; turns in flight hold their own clone.
+    model_leases: SessionModelLeases,
+    /// Loads the input stream's models at its start (SPK-F21).
+    model_warmup: Option<AbortOnDropTask<()>>,
     active_turn: Option<ActiveTurn>,
     voice_session: VoiceSession,
+    voice_session_started_at: Option<Instant>,
+    /// When the current utterance's speech started: a barge-in's latency
+    /// runs from here.
+    speech_started_at: Option<Instant>,
     started: bool,
     transport_session_id: String,
     owner_instance_id: String,
@@ -898,11 +1017,15 @@ impl Default for ConnectionState {
             system_prompt: DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.to_string(),
             voice_profile_id: None,
             voice_session_id: None,
-            agent_session_id: None,
-            agent_session_system_prompt: None,
+            agent_session: Arc::default(),
+            conversation: Arc::default(),
             streaming_input: None,
+            model_leases: SessionModelLeases::default(),
+            model_warmup: None,
             active_turn: None,
             voice_session: VoiceSession::default(),
+            voice_session_started_at: None,
+            speech_started_at: None,
             started: false,
             transport_session_id: uuid::Uuid::new_v4().to_string(),
             owner_instance_id: process_owner_instance_id().to_string(),
@@ -919,6 +1042,25 @@ fn process_owner_instance_id() -> &'static str {
 }
 
 impl ConnectionState {
+    fn sync_voice_phase(&mut self) {
+        let turn = self.active_turn.as_ref().map(|turn| {
+            (
+                turn.turn_record_id.as_str(),
+                !turn.task.is_finished(),
+                turn.control.is_speaking(),
+            )
+        });
+        follow_turn_phase(&mut self.voice_session, turn);
+    }
+
+    /// Record a closed session's duration, once.
+    fn record_session_closed(&mut self, runtime: &RuntimeService) {
+        runtime.record_voice_session_closed();
+        if let Some(started) = self.voice_session_started_at.take() {
+            runtime.record_voice_latency(VoiceLatency::SessionDuration, started.elapsed());
+        }
+    }
+
     fn clear_finished_turn(&mut self) {
         if self
             .active_turn
@@ -962,6 +1104,8 @@ struct SpeechStartEvent {
 struct StreamingFrameResult {
     sequence_gap: Option<(u32, u32)>,
     speech_start: Option<SpeechStartEvent>,
+    /// The active utterance has just confirmed a barge-in.
+    barge_in: bool,
     speech_rejected: Option<SpeechStartEvent>,
     finalized_utterance: Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>,
 }
@@ -1008,6 +1152,7 @@ impl StreamingInputState {
             return Ok(StreamingFrameResult {
                 sequence_gap,
                 speech_start: None,
+                barge_in: false,
                 speech_rejected: None,
                 finalized_utterance: None,
             });
@@ -1031,6 +1176,7 @@ impl StreamingInputState {
             return Ok(StreamingFrameResult {
                 sequence_gap,
                 speech_start: None,
+                barge_in: false,
                 speech_rejected: None,
                 finalized_utterance: None,
             });
@@ -1065,6 +1211,7 @@ impl StreamingInputState {
         let mut result = StreamingFrameResult {
             sequence_gap,
             speech_start: None,
+            barge_in: false,
             speech_rejected: None,
             finalized_utterance: None,
         };
@@ -1081,7 +1228,7 @@ impl StreamingInputState {
                 voiced_ms: 0.0,
                 total_ms: 0.0,
                 silence_ms: 0.0,
-                started_at: Instant::now(),
+                barge_in_confirmed: false,
             };
             if !self.pre_roll.is_empty() {
                 capture.samples_i16.extend(self.pre_roll.iter().copied());
@@ -1115,6 +1262,16 @@ impl StreamingInputState {
                 active.silence_ms = 0.0;
             } else {
                 active.silence_ms += frame_ms;
+            }
+            // An utterance that ends or is rejected in this frame never
+            // barges in; finalizing one preempts the turn on its own.
+            if !active.barge_in_confirmed
+                && end_reason.is_none()
+                && !noise_rejected
+                && active.voiced_ms >= self.config.barge_in_min_speech_ms as f32
+            {
+                active.barge_in_confirmed = true;
+                result.barge_in = true;
             }
         }
 
@@ -1154,18 +1311,19 @@ impl StreamingInputState {
         }
     }
 
+    /// Ends the active utterance when the client stops sending audio without
+    /// `input_stream_stop`. Silence and the utterance cap are measured in
+    /// audio time by the endpoint detector, so delayed but contiguous frames
+    /// (a network stall) cannot end an utterance early.
     fn on_tick(
         &mut self,
     ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
-        let Some(active) = self.active.as_ref() else {
+        if self.active.is_none() {
             return Ok(None);
-        };
-        if active.started_at.elapsed() >= Duration::from_millis(self.config.max_utterance_ms as u64)
-        {
-            return self.finalize_active_utterance(UtteranceEndReason::MaxDuration);
         }
-
-        let pause_limit = Duration::from_millis(self.config.silence_duration_ms.max(250) as u64);
+        let pause_limit = Duration::from_millis(
+            u64::from(self.config.silence_duration_ms) + CLIENT_PAUSE_STALL_ALLOWANCE_MS,
+        );
         if self
             .last_frame_at
             .is_some_and(|last_frame| last_frame.elapsed() >= pause_limit)
@@ -1201,10 +1359,24 @@ impl StreamingInputState {
             ));
         }
 
+        let trailing_silence =
+            Duration::from_micros((active.silence_ms.max(0.0) * 1000.0).round() as u64);
+        let endpointing_delay = match reason {
+            UtteranceEndReason::Silence => Some(trailing_silence),
+            UtteranceEndReason::ClientPause => Some(
+                trailing_silence
+                    + self
+                        .last_frame_at
+                        .map_or(Duration::ZERO, |last_frame| last_frame.elapsed()),
+            ),
+            UtteranceEndReason::MaxDuration | UtteranceEndReason::StreamStopped => None,
+        };
         let commit = PendingAudioCommit {
             utterance_id: active.utterance_id,
             utterance_seq: active.utterance_seq,
             turn_config: self.config.turn_config.clone(),
+            endpointed_at: Instant::now(),
+            endpointing_delay,
         };
 
         Ok(Some((commit, wav_bytes, reason)))
@@ -1225,7 +1397,10 @@ impl StreamingInputState {
     }
 }
 
-async fn finalize_stream_vad_utterance(
+/// Start the turn for a finished utterance. Nothing here waits on storage
+/// or on the turn it preempts (SPK-F19): the turn task creates its own
+/// record, and a preempted turn is reaped in the background.
+fn finalize_stream_vad_utterance(
     state: &AppState,
     correlation_id: &str,
     out_tx: &OutboundTx,
@@ -1234,65 +1409,57 @@ async fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
-    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn").await {
+    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
+    }
+    if let Some(delay) = commit.endpointing_delay {
+        state
+            .runtime
+            .record_voice_latency(VoiceLatency::Endpointing, delay);
     }
 
     let voice_session_id = conn
         .voice_session_id
         .clone()
         .ok_or_else(|| "Voice session not initialized".to_string())?;
-    let voice_profile_id = conn.voice_profile_id.clone();
     let model_ids = commit.turn_config.model_ids();
-    let turn_record = state
-        .voice_store
-        .create_turn(CreateVoiceTurnRequest {
-            session_id: voice_session_id.clone(),
-            utterance_id: commit.utterance_id.clone(),
-            utterance_seq: commit.utterance_seq,
-            mode: commit.turn_config.mode_str().to_string(),
-            vad_end_reason: Some(end_reason.as_str().to_string()),
-            asr_model_id: model_ids.asr_model_id,
-            text_model_id: model_ids.text_model_id,
-            tts_model_id: model_ids.tts_model_id,
-            s2s_model_id: model_ids.s2s_model_id,
-            speaker: commit.turn_config.speaker(),
-        })
-        .await
-        .map_err(|err| format!("Voice storage error: {err}"))?;
-
-    let agent_session_id = match &commit.turn_config {
-        VoiceTurnConfig::Modular(config) => Some(
-            ensure_agent_session(
-                state,
-                &mut conn.agent_session_id,
-                &mut conn.agent_session_system_prompt,
-                &conn.system_prompt,
-                &config.text_model_id,
-            )
-            .await?,
-        ),
-        VoiceTurnConfig::Unified(_) => None,
+    let turn_record_id = new_uuid();
+    let record = CreateVoiceTurnRequest {
+        turn_id: Some(turn_record_id.clone()),
+        session_id: voice_session_id.clone(),
+        utterance_id: commit.utterance_id.clone(),
+        utterance_seq: commit.utterance_seq,
+        mode: commit.turn_config.mode_str().to_string(),
+        vad_end_reason: Some(end_reason.as_str().to_string()),
+        asr_model_id: model_ids.asr_model_id,
+        text_model_id: model_ids.text_model_id,
+        tts_model_id: model_ids.tts_model_id,
+        s2s_model_id: model_ids.s2s_model_id,
+        speaker: commit.turn_config.speaker(),
     };
 
-    let turn_record_id = turn_record.id.clone();
     conn.next_turn_generation = conn.next_turn_generation.saturating_add(1);
     let output_generation = conn.next_turn_generation;
-    let control = TurnControl::new();
+    let control = TurnControl::new(commit.endpointed_at);
     let task = spawn_turn_task(
-        state.clone(),
-        correlation_id.to_string(),
-        out_tx.clone(),
-        commit.clone(),
+        TurnContext {
+            state: state.clone(),
+            correlation_id: correlation_id.to_string(),
+            out_tx: out_tx.clone(),
+            commit: commit.clone(),
+            turn_record_id: turn_record_id.clone(),
+            voice_session_id,
+            voice_profile_id: conn.voice_profile_id.clone(),
+            system_prompt: conn.system_prompt.clone(),
+            agent_session: conn.agent_session.clone(),
+            conversation: conn.conversation.clone(),
+            control: control.clone(),
+            output_generation,
+            model_leases: conn.model_leases.clone(),
+        },
+        record,
         wav_bytes,
-        agent_session_id,
-        voice_session_id,
-        voice_profile_id,
-        conn.system_prompt.clone(),
-        turn_record_id.clone(),
-        control.clone(),
-        output_generation,
     );
 
     conn.active_turn = Some(ActiveTurn {
@@ -1300,6 +1467,7 @@ async fn finalize_stream_vad_utterance(
         utterance_seq: commit.utterance_seq,
         turn_record_id: turn_record_id.clone(),
         state: state.clone(),
+        conversation: conn.conversation.clone(),
         task,
         control,
         output_generation,
@@ -1316,69 +1484,31 @@ fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
         .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
 }
 
-fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
-    if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
-        return Err("Unexpected binary message (missing voice realtime frame header)".to_string());
-    }
-
-    let version = data[4];
-    if version != WS_BIN_VERSION {
-        return Err(format!("Unsupported binary frame version {version}"));
-    }
-
-    let kind = data[5];
-    match kind {
-        WS_BIN_KIND_CLIENT_PCM16 => {
-            if data.len() < WS_BIN_CLIENT_HEADER_LEN {
-                return Err("Client PCM16 frame too short".to_string());
-            }
-            let sample_rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let frame_seq = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            Ok(BinaryMessageKind::ClientPcm16Frame {
-                frame_seq,
-                sample_rate,
-                payload: data[WS_BIN_CLIENT_HEADER_LEN..].to_vec(),
-            })
-        }
-        other => Err(format!("Unsupported binary frame kind {other}")),
-    }
-}
-
-fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.as_chunks::<2>().0 {
-        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    out
-}
-
-fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
-    if sample_rate == 0 {
-        return Err("Invalid sample rate 0".to_string());
-    }
-    let samples_f32: Vec<f32> = samples_i16.iter().map(|s| *s as f32 / 32768.0).collect();
-    AudioEncoder::new(sample_rate, 1)
-        .encode(&samples_f32, AudioFormat::Wav)
-        .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
-}
-
+/// An assistant audio frame: the 24-byte header (magic, version, kind,
+/// flags, utterance sequence, chunk sequence, sample rate) and the payload
+/// in the session's output format, which the kind names.
 fn encode_assistant_audio_binary_frame(
+    format: OutputAudioFormat,
     utterance_seq: u64,
     chunk_seq: u32,
     sample_rate: u32,
     is_final: bool,
-    payload_pcm16: &[u8],
+    payload: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(WS_BIN_ASSISTANT_HEADER_LEN + payload_pcm16.len());
+    let mut out = Vec::with_capacity(WS_BIN_ASSISTANT_HEADER_LEN + payload.len());
     out.extend_from_slice(WS_BIN_MAGIC);
-    out.push(WS_BIN_VERSION);
-    out.push(WS_BIN_KIND_ASSISTANT_PCM16);
+    out.push(crate::app::realtime_transport::WS_BIN_VERSION);
+    out.push(match format {
+        OutputAudioFormat::PcmI16 => WS_BIN_KIND_ASSISTANT_PCM16,
+        OutputAudioFormat::G711Ulaw => WS_BIN_KIND_ASSISTANT_G711_ULAW,
+        OutputAudioFormat::G711Alaw => WS_BIN_KIND_ASSISTANT_G711_ALAW,
+    });
     let flags: u16 = if is_final { 1 } else { 0 };
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&utterance_seq.to_le_bytes());
     out.extend_from_slice(&chunk_seq.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(payload_pcm16);
+    out.extend_from_slice(payload);
     out
 }
 
@@ -1405,28 +1535,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         return;
     };
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, mut ws_rx) = socket.split();
     let out_tx = OutboundTx::new(state.runtime.clone(), "voice realtime");
-    let writer_out_tx = out_tx.clone();
-
-    let writer = tokio::spawn(async move {
-        while let Some(output) = writer_out_tx.next().await {
-            let message = match output {
-                MailboxOutput::Message(message) => message,
-                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
-                    code: 1013,
-                    reason: reason.into(),
-                })),
-            };
-            match tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => break,
-            }
-            if ws_tx.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let writer = spawn_writer(ws_tx, out_tx.mailbox.clone(), 1013);
 
     let mut conn = ConnectionState::default();
     send_json(
@@ -1442,6 +1553,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
     actor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     actor_tick.tick().await;
     loop {
+        conn.sync_voice_phase();
         let result = tokio::select! {
             result = ws_rx.next() => result,
             _ = actor_tick.tick() => {
@@ -1468,9 +1580,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
                             commit,
                             wav_bytes,
                             end_reason,
-                        )
-                        .await
-                        {
+                        ) {
                             send_error(&out_tx, None, None, err);
                         }
                     }
@@ -1521,14 +1631,15 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         }
     }
 
-    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed").await {
+    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
         state.runtime.record_voice_interruption();
     }
+    conn.conversation.store_in_background(&state);
     if let Some(session_id) = conn.close_voice_session_now() {
         if let Err(err) = state.voice_store.end_session(session_id).await {
             warn!("failed to end voice session on socket close: {err}");
         } else {
-            state.runtime.record_voice_session_closed();
+            conn.record_session_closed(&state.runtime);
         }
     }
     out_tx.close();
@@ -1565,9 +1676,6 @@ async fn handle_text_message(
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
             {
-                if conn.agent_session_system_prompt.as_deref() != Some(prompt.as_str()) {
-                    conn.agent_session_id = None;
-                }
                 conn.system_prompt = prompt;
             } else {
                 conn.system_prompt = profile.system_prompt;
@@ -1610,7 +1718,9 @@ async fn handle_text_message(
             silence_duration_ms,
             max_utterance_ms,
             pre_roll_ms,
+            barge_in_min_speech_ms,
             input_sample_rate,
+            output_audio_format,
         } => {
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1631,6 +1741,7 @@ async fn handle_text_message(
             let normalized_speaker = speaker
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let output_format = OutputAudioFormat::parse(output_audio_format.as_deref())?;
             let normalized_asr_language = asr_language
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -1674,7 +1785,10 @@ async fn handle_text_message(
                         tts_model_id,
                         speaker: normalized_speaker.clone(),
                         asr_language: normalized_asr_language,
-                        max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+                        max_output_tokens: max_output_tokens
+                            .unwrap_or(VOICE_DEFAULT_MAX_OUTPUT_TOKENS)
+                            .clamp(1, 4096),
+                        output_format,
                     })
                 }
                 RealtimeVoiceMode::Unified => {
@@ -1696,6 +1810,7 @@ async fn handle_text_message(
                         s2s_model_id,
                         speaker: normalized_speaker,
                         max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+                        output_format,
                     })
                 }
             };
@@ -1715,9 +1830,12 @@ async fn handle_text_message(
                     .map_err(|err| format!("Voice storage error: {err}"))?;
                 conn.voice_session.start(session.id.clone());
                 conn.voice_session_id = Some(session.id);
+                conn.voice_session_started_at = Some(Instant::now());
                 state.runtime.record_voice_session_started();
             }
 
+            let warm_models = turn_config_models(&turn_config)?;
+            conn.model_leases = SessionModelLeases::default();
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
                 turn_config,
                 vad_threshold: normalize_stream_vad_threshold(vad_threshold),
@@ -1733,6 +1851,9 @@ async fn handle_text_message(
                 pre_roll_ms: pre_roll_ms
                     .unwrap_or(DEFAULT_STREAM_PRE_ROLL_MS)
                     .clamp(0, 2_000),
+                barge_in_min_speech_ms: barge_in_min_speech_ms
+                    .unwrap_or(DEFAULT_BARGE_IN_MIN_SPEECH_MS)
+                    .min(5_000),
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
             }));
@@ -1742,6 +1863,7 @@ async fn handle_text_message(
                 out_tx,
                 json!({
                     "type": "input_stream_ready",
+                    "output_audio_format": output_format.as_str(),
                     "vad": {
                         "backend": "earshot",
                         "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
@@ -1749,9 +1871,16 @@ async fn handle_text_message(
                         "score_frame_ms": VAD_FRAME_MS,
                         "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
                         "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
+                        "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
                     }
                 }),
             );
+            conn.model_warmup = Some(AbortOnDropTask::new(tokio::spawn(warm_session_models(
+                state.runtime.clone(),
+                conn.model_leases.clone(),
+                warm_models,
+                out_tx.clone(),
+            ))));
         }
         ClientEvent::InputStreamStop => {
             if let Some(mut streaming) = conn.streaming_input.take() {
@@ -1773,26 +1902,53 @@ async fn handle_text_message(
                         commit,
                         wav_bytes,
                         end_reason,
-                    )
-                    .await?;
+                    )?;
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
+            conn.conversation.store_in_background(state);
+            conn.model_warmup = None;
+            conn.model_leases = SessionModelLeases::default();
             if let Some(session_id) = conn.close_voice_session_if_idle() {
-                state
-                    .voice_store
-                    .end_session(session_id)
-                    .await
-                    .map_err(|err| format!("Voice storage error: {err}"))?;
-                state.runtime.record_voice_session_closed();
+                conn.record_session_closed(&state.runtime);
+                let store = state.voice_store.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = store.end_session(session_id).await {
+                        warn!("failed to end voice session: {err}");
+                    }
+                });
             }
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
-            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason).await {
+            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
             }
+        }
+        ClientEvent::ConversationItemTruncate {
+            utterance_seq,
+            audio_end_ms,
+        } => {
+            let control = conn
+                .active_turn
+                .as_ref()
+                .filter(|turn| turn.utterance_seq == utterance_seq)
+                .map(|turn| turn.control.clone())
+                .or_else(|| conn.conversation.reply_of(utterance_seq))
+                .ok_or_else(|| {
+                    format!("No assistant reply of utterance {utterance_seq} to truncate")
+                })?;
+            let text = control.truncate(audio_end_ms);
+            send_json(
+                out_tx,
+                json!({
+                    "type": "conversation_item_truncated",
+                    "utterance_seq": utterance_seq,
+                    "audio_end_ms": audio_end_ms,
+                    "text": text,
+                }),
+            );
         }
         ClientEvent::Ping { timestamp_ms } => {
             send_diagnostic_json(
@@ -1818,115 +1974,166 @@ async fn handle_binary_message(
     conn: &mut ConnectionState,
     audio_bytes: Vec<u8>,
 ) -> Result<(), String> {
-    match parse_binary_message(&audio_bytes)? {
-        BinaryMessageKind::ClientPcm16Frame {
-            frame_seq,
-            sample_rate,
-            payload,
-        } => {
-            if !conn.started {
-                return Err("Session not started. Send `session_start` first.".to_string());
-            }
-            let Some(streaming) = conn.streaming_input.as_mut() else {
-                return Err(
-                    "Received streaming audio frame before `input_stream_start`.".to_string(),
-                );
-            };
-
-            let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
-
-            if let Some((expected, received)) = frame_result.sequence_gap {
-                send_diagnostic_json(
-                    out_tx,
-                    json!({
-                        "type": "input_sequence_gap",
-                        "expected_frame_sequence": expected,
-                        "received_frame_sequence": received,
-                        "missing_frames": received.saturating_sub(expected),
-                        "action": "continue",
-                    }),
-                );
-            }
-
-            if let Some(evt) = frame_result.speech_start {
-                if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await {
-                    state.runtime.record_voice_interruption();
-                    state.runtime.record_voice_barge_in();
-                    conn.voice_session.interrupt("barge_in");
-                }
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_start",
-                        "utterance_id": evt.utterance_id,
-                        "utterance_seq": evt.utterance_seq,
-                    }),
-                );
-            }
-
-            if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_end",
-                        "utterance_id": commit.utterance_id,
-                        "utterance_seq": commit.utterance_seq,
-                        "reason": end_reason.as_str(),
-                    }),
-                );
-                finalize_stream_vad_utterance(
-                    state,
-                    correlation_id,
-                    out_tx,
-                    conn,
-                    commit,
-                    wav_bytes,
-                    end_reason,
-                )
-                .await?;
-            }
-
-            if let Some(evt) = frame_result.speech_rejected {
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_rejected",
-                        "utterance_id": evt.utterance_id,
-                        "utterance_seq": evt.utterance_seq,
-                    }),
-                );
-            }
-
-            Ok(())
-        }
+    let ClientPcm16Frame {
+        frame_seq,
+        sample_rate,
+        payload,
+    } = parse_client_pcm16_frame(&audio_bytes, WS_BIN_MAGIC, "voice realtime")?;
+    if !conn.started {
+        return Err("Session not started. Send `session_start` first.".to_string());
     }
+    let Some(streaming) = conn.streaming_input.as_mut() else {
+        return Err("Received streaming audio frame before `input_stream_start`.".to_string());
+    };
+
+    let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
+
+    if let Some((expected, received)) = frame_result.sequence_gap {
+        state
+            .runtime
+            .record_voice_ingress_dropped_frames(u64::from(received.saturating_sub(expected)));
+        send_diagnostic_json(
+            out_tx,
+            json!({
+                "type": "input_sequence_gap",
+                "expected_frame_sequence": expected,
+                "received_frame_sequence": received,
+                "missing_frames": received.saturating_sub(expected),
+                "action": "continue",
+            }),
+        );
+    }
+
+    // Clients may duck playback on `user_speech_start` and resume it
+    // on `user_speech_rejected`; the turn is cancelled only once the
+    // speech is sustained.
+    if let Some(evt) = frame_result.speech_start {
+        conn.speech_started_at = Some(Instant::now());
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_start",
+                "utterance_id": evt.utterance_id,
+                "utterance_seq": evt.utterance_seq,
+            }),
+        );
+    }
+
+    if frame_result.barge_in {
+        // A finished reply may still be playing on the client.
+        conn.conversation.interrupt_playback();
+    }
+    if frame_result.barge_in && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
+        state.runtime.record_voice_interruption();
+        state.runtime.record_voice_barge_in();
+        if let Some(started) = conn.speech_started_at {
+            state
+                .runtime
+                .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
+        }
+        conn.voice_session.interrupt("barge_in");
+    }
+
+    if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_end",
+                "utterance_id": commit.utterance_id,
+                "utterance_seq": commit.utterance_seq,
+                "reason": end_reason.as_str(),
+            }),
+        );
+        finalize_stream_vad_utterance(
+            state,
+            correlation_id,
+            out_tx,
+            conn,
+            commit,
+            wav_bytes,
+            end_reason,
+        )?;
+    }
+
+    if let Some(evt) = frame_result.speech_rejected {
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_rejected",
+                "utterance_id": evt.utterance_id,
+                "utterance_seq": evt.utterance_seq,
+            }),
+        );
+    }
+
+    Ok(())
 }
 
-fn spawn_turn_task(
+/// What one turn task works with.
+struct TurnContext {
     state: AppState,
     correlation_id: String,
     out_tx: OutboundTx,
     commit: PendingAudioCommit,
-    audio_bytes: Vec<u8>,
-    agent_session_id: Option<String>,
+    turn_record_id: String,
     voice_session_id: String,
     voice_profile_id: Option<String>,
     system_prompt: String,
-    turn_record_id: String,
+    agent_session: Arc<AgentSessionSlot>,
+    conversation: Arc<VoiceConversation>,
     control: TurnControl,
     output_generation: u64,
+    model_leases: SessionModelLeases,
+}
+
+fn spawn_turn_task(
+    context: TurnContext,
+    record: CreateVoiceTurnRequest,
+    audio_bytes: Vec<u8>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let TurnContext {
+            state,
+            correlation_id,
+            out_tx,
+            commit,
+            turn_record_id,
+            voice_session_id,
+            voice_profile_id,
+            system_prompt,
+            agent_session,
+            conversation,
+            control,
+            output_generation,
+            model_leases,
+        } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
 
-        let turn_future = async {
-            let permit = state
-                .acquire_owned_workload_permit(WorkloadClass::Realtime)
-                .await
-                .map_err(|_| "Server is shutting down".to_string())?;
-            let runtime_context = permit.runtime_context();
+        // The record exists before anything can complete it: a cancelled
+        // turn is still recorded as interrupted.
+        if let Err(err) = state.voice_store.create_turn(record).await {
+            send_turn_error(
+                &out_tx,
+                output_generation,
+                Some(commit.utterance_id.clone()),
+                Some(commit.utterance_seq),
+                format!("Voice storage error: {err}"),
+            );
+            send_turn_json(
+                &out_tx,
+                output_generation,
+                json!({
+                    "type": "turn_done",
+                    "utterance_id": commit.utterance_id,
+                    "utterance_seq": commit.utterance_seq,
+                    "status": "error",
+                }),
+            );
+            return;
+        }
 
+        let turn_future = async {
             send_turn_json(
                 &out_tx,
                 output_generation,
@@ -1949,13 +2156,22 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let transcript = {
+                    let transcript = with_stage_permit(&state, async |runtime_context| {
+                        model_leases
+                            .hold(
+                                &state.runtime,
+                                resolve_asr_model_variant(Some(&config.asr_model_id)),
+                            )
+                            .await
+                            .map_err(|err| format!("Failed to load ASR model: {err}"))?;
                         let tx = out_tx.clone();
                         let utt_id = commit.utterance_id.clone();
                         let utt_seq = commit.utterance_seq;
                         let asr_model_id = config.asr_model_id.clone();
                         let asr_language = config.asr_language.clone();
                         let mut snapshot = String::new();
+                        let runtime = state.runtime.clone();
+                        let endpointed_at = control.endpointed_at();
                         state
                             .runtime
                             .asr_transcribe_streaming_bytes_with_runtime_context(
@@ -1969,6 +2185,12 @@ fn spawn_turn_task(
                                 move |delta| {
                                     if delta.is_empty() {
                                         return;
+                                    }
+                                    if snapshot.is_empty() {
+                                        runtime.record_voice_latency(
+                                            VoiceLatency::AsrFirstPartial,
+                                            endpointed_at.elapsed(),
+                                        );
                                     }
                                     snapshot.push_str(&delta);
                                     send_turn_text_snapshot(
@@ -1985,8 +2207,14 @@ fn spawn_turn_task(
                                 },
                             )
                             .await
-                            .map_err(|err| format!("ASR failed: {err}"))?
-                    };
+                            .map_err(|err| format!("ASR failed: {err}"))
+                    })
+                    .await?;
+                    let transcript_final_at = Instant::now();
+                    state.runtime.record_voice_latency(
+                        VoiceLatency::AsrFinal,
+                        transcript_final_at.saturating_duration_since(control.endpointed_at()),
+                    );
 
                     let user_text = transcript.text.trim().to_string();
                     send_turn_json(
@@ -2041,91 +2269,104 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let Some(agent_session_id) = agent_session_id.as_deref() else {
-                        return Err("Missing agent session for modular voice turn".to_string());
-                    };
-                    let assistant_raw = run_agent_turn(
-                        &state,
-                        agent_session_id,
-                        &user_text,
-                        &config.text_model_id,
-                        config.max_output_tokens,
-                        voice_profile_id.as_deref(),
-                        &correlation_id,
-                        runtime_context,
-                    )
-                    .await?;
-                    let assistant_text = strip_think_tags(&assistant_raw);
+                    let agent_session_id = agent_session
+                        .ensure(&state, &system_prompt, &config.text_model_id)
+                        .await?;
+                    let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
+                        .map_err(|err| format!("Invalid chat model: {err}"))?;
+                    // The earlier replies join the history now, as far as
+                    // they were heard.
+                    conversation.store(&state).await;
 
-                    send_turn_json(
-                        &out_tx,
-                        output_generation,
-                        json!({
-                            "type": "assistant_text_final",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "text": assistant_text.clone(),
-                            "raw_text": assistant_raw.clone(),
-                        }),
-                    );
-                    state
-                        .voice_store
-                        .update_turn_assistant(
-                            turn_record_id.clone(),
-                            Some(assistant_text.clone()),
-                            Some(assistant_raw.clone()),
-                        )
-                        .await
-                        .map_err(|err| format!("Voice storage error: {err}"))?;
-
-                    if assistant_text.is_empty() {
-                        state
-                            .voice_store
-                            .complete_turn(turn_record_id.clone(), "ok", None)
+                    // The reply streams into speech: its sentences are
+                    // synthesized while the text model is still writing.
+                    let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let reply = async {
+                        let raw_text = with_stage_permit(&state, async |runtime_context| {
+                            model_leases
+                                .hold(&state.runtime, text_variant)
+                                .await
+                                .map_err(|err| format!("Failed to load chat model: {err}"))?;
+                            run_agent_turn(
+                                &state,
+                                &agent_session_id,
+                                &user_text,
+                                &config.text_model_id,
+                                config.max_output_tokens,
+                                voice_profile_id.as_deref(),
+                                &correlation_id,
+                                runtime_context,
+                                &control,
+                                &turn_record_id,
+                                deltas,
+                            )
                             .await
-                            .map_err(|err| format!("Voice storage error: {err}"))?;
+                        })
+                        .await?;
+                        let assistant_text = strip_reasoning(&raw_text);
                         send_turn_json(
                             &out_tx,
                             output_generation,
                             json!({
-                                "type": "turn_done",
+                                "type": "assistant_text_final",
                                 "utterance_id": commit.utterance_id,
                                 "utterance_seq": commit.utterance_seq,
-                                "status": "ok",
+                                "text": assistant_text.clone(),
+                                "raw_text": raw_text.clone(),
                             }),
                         );
-                        return Ok(());
-                    }
-
-                    stream_tts_to_socket(
+                        state
+                            .voice_store
+                            .update_turn_assistant(
+                                turn_record_id.clone(),
+                                Some(assistant_text.clone()),
+                                Some(raw_text),
+                            )
+                            .await
+                            .map_err(|err| format!("Voice storage error: {err}"))?;
+                        Ok::<_, String>(assistant_text)
+                    };
+                    let tts_variant = parse_tts_model_variant(&config.tts_model_id)
+                        .map_err(|err| format!("Unsupported TTS model: {err}"))?;
+                    let speech = speak_reply(
                         &state,
                         &out_tx,
-                        &correlation_id,
-                        &commit.utterance_id,
-                        commit.utterance_seq,
-                        &config.tts_model_id,
-                        config.speaker.clone(),
-                        assistant_text.as_str(),
-                        runtime_context,
+                        &commit,
                         &control,
                         output_generation,
-                    )
-                    .await?;
+                        delta_rx,
+                        transcript_final_at,
+                        |text| {
+                            SegmentSynthesis::start(
+                                &state,
+                                &correlation_id,
+                                tts_variant,
+                                config.speaker.clone(),
+                                &model_leases,
+                                text,
+                            )
+                        },
+                    );
+                    let (assistant_text, ()) = tokio::try_join!(reply, speech)?;
+                    conversation.hold(commit.utterance_seq, control.clone());
+
                     state
                         .voice_store
                         .complete_turn(turn_record_id.clone(), "ok", None)
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
-                    maybe_spawn_observation_extraction(
-                        state.clone(),
-                        voice_profile_id.clone(),
-                        voice_session_id.clone(),
-                        turn_record_id.clone(),
-                        config.text_model_id.clone(),
-                        correlation_id.clone(),
-                        user_text.clone(),
-                        assistant_text.clone(),
-                    );
+                    if !assistant_text.is_empty() {
+                        maybe_spawn_observation_extraction(
+                            state.clone(),
+                            voice_profile_id.clone(),
+                            voice_session_id.clone(),
+                            turn_record_id.clone(),
+                            config.text_model_id.clone(),
+                            correlation_id.clone(),
+                            user_text.clone(),
+                            assistant_text,
+                        );
+                    }
 
                     send_turn_json(
                         &out_tx,
@@ -2162,22 +2403,27 @@ fn spawn_turn_task(
 
                     let history_messages =
                         build_unified_history(&state, &voice_session_id, &turn_record_id).await?;
-                    let generation = stream_unified_s2s_to_socket(
-                        &state,
-                        &out_tx,
-                        &correlation_id,
-                        &commit.utterance_id,
-                        commit.utterance_seq,
-                        &config.s2s_model_id,
-                        config.speaker.clone(),
-                        &system_prompt,
-                        history_messages,
-                        config.max_output_tokens,
-                        audio_bytes.as_slice(),
-                        runtime_context,
-                        &control,
-                        output_generation,
-                    )
+                    let generation = with_stage_permit(&state, async |runtime_context| {
+                        stream_unified_s2s_to_socket(
+                            &state,
+                            &out_tx,
+                            &correlation_id,
+                            &commit.utterance_id,
+                            commit.utterance_seq,
+                            &config.s2s_model_id,
+                            config.speaker.clone(),
+                            &system_prompt,
+                            history_messages,
+                            config.max_output_tokens,
+                            config.output_format,
+                            audio_bytes.as_slice(),
+                            runtime_context,
+                            &control,
+                            output_generation,
+                            &model_leases,
+                        )
+                        .await
+                    })
                     .await?;
 
                     let user_text = generation
@@ -2208,7 +2454,7 @@ fn spawn_turn_task(
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
 
-                    let assistant_text = strip_think_tags(generation.text.trim());
+                    let assistant_text = strip_reasoning(generation.text.trim());
                     send_turn_json(
                         &out_tx,
                         output_generation,
@@ -2269,7 +2515,10 @@ fn spawn_turn_task(
             }
         };
 
+        // A cancelled turn reports its interruption even when the cutoff
+        // also failed the work it was doing.
         let turn_result = tokio::select! {
+            biased;
             _ = control.cancelled() => {
                 let reason = control.reason().unwrap_or_else(|| "cancelled".to_string());
                 if matches!(
@@ -2367,180 +2616,322 @@ fn spawn_turn_task(
     })
 }
 
-async fn stream_tts_to_socket(
-    state: &AppState,
-    out_tx: &OutboundTx,
-    correlation_id: &str,
-    utterance_id: &str,
-    utterance_seq: u64,
-    tts_model_id: &str,
-    speaker: Option<String>,
-    text: &str,
-    runtime_context: RuntimeRequestContext,
-    control: &TurnControl,
-    output_generation: u64,
-) -> Result<(), String> {
-    if control.is_cancelled() {
-        return Err("Turn cancelled".to_string());
-    }
-    let tts_variant = parse_tts_model_variant(tts_model_id)
-        .map_err(|err| format!("Unsupported TTS model: {err}"))?;
+/// A realtime admission permit for one stage of a turn. A turn takes one per
+/// stage (ASR, the reply, each TTS segment) instead of one for its whole
+/// life, so the time it spends waiting between stages, or on the client,
+/// does not hold a slot other traffic could use (SPK-F22).
+async fn acquire_stage_permit(state: &AppState) -> Result<OwnedAdmissionPermit, String> {
     state
-        .runtime
-        .load_model(tts_variant)
+        .acquire_owned_workload_permit(WorkloadClass::Realtime)
         .await
-        .map_err(|err| format!("Failed to load TTS model: {err}"))?;
+        .map_err(|_| "Server is shutting down".to_string())
+}
 
-    // The audio is announced at the model's own rate, read from its first
-    // chunk, not the codec default (TPIPE-22: a 44.1 kHz model played at
-    // 0.54x when labelled 24 kHz).
-    let fallback_sample_rate = state.runtime.sample_rate().await;
-    let mut announced_rate: Option<u32> = None;
-    let announce = |sample_rate: u32| {
-        send_turn_json(
-            out_tx,
-            output_generation,
-            json!({
-                "type": "assistant_audio_start",
-                "utterance_id": utterance_id,
-                "utterance_seq": utterance_seq,
-                "sample_rate": sample_rate,
-                "audio_format": "pcm_i16",
-            }),
-        );
-    };
+/// Run one turn stage under its own admission permit, released when the
+/// stage ends.
+async fn with_stage_permit<T>(
+    state: &AppState,
+    stage: impl AsyncFnOnce(RuntimeRequestContext) -> Result<T, String>,
+) -> Result<T, String> {
+    let permit = acquire_stage_permit(state).await?;
+    stage(permit.runtime_context()).await
+}
 
-    // The reply is spoken a segment at a time, its first sentence first, so
-    // the first audio follows the first sentence's synthesis, not the whole
-    // reply's (TPIPE-21).
-    let segments = realtime_speech_segments(text);
-    let segment_count = segments.len();
-    let mut chunk_seq = 0u32;
-    for (segment_index, segment) in segments.into_iter().enumerate() {
-        let last_segment = segment_index + 1 == segment_count;
-        let gen_config = GenerationConfig {
-            streaming: true,
-            options: GenerationParams {
-                max_tokens: 0,
-                speaker: speaker.clone(),
-                voice: speaker.clone(),
-                ..Default::default()
-            },
-        };
+/// One reply segment being synthesized: its audio arrives on `chunks` while
+/// the synthesis task, holding its own admission permit, runs ahead.
+struct SegmentSynthesis {
+    text: String,
+    chunks: tokio::sync::mpsc::Receiver<izwi_core::AudioChunk>,
+    task: AbortOnDropTask<Result<(), String>>,
+}
 
-        let gen_request = GenerationRequest {
+impl SegmentSynthesis {
+    fn start(
+        state: &AppState,
+        correlation_id: &str,
+        variant: izwi_core::ModelVariant,
+        speaker: Option<String>,
+        model_leases: &SessionModelLeases,
+        text: String,
+    ) -> Self {
+        let mut request = GenerationRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            model_variant: Some(tts_variant),
+            model_variant: Some(variant),
             correlation_id: Some(correlation_id.to_string()),
-            runtime_context,
-            text: segment,
-            config: gen_config,
+            runtime_context: RuntimeRequestContext::default(),
+            text: text.clone(),
+            config: GenerationConfig {
+                streaming: true,
+                options: GenerationParams {
+                    max_tokens: 0,
+                    speaker: speaker.clone(),
+                    voice: speaker,
+                    ..Default::default()
+                },
+            },
             language: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
         };
-
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<izwi_core::AudioChunk>(32);
-        let runtime = state.runtime.clone();
-        let generation_task = AbortOnDropTask::new(tokio::spawn(async move {
-            runtime.generate_streaming(gen_request, chunk_tx).await
+        let (chunk_tx, chunks) = tokio::sync::mpsc::channel(32);
+        let state = state.clone();
+        let model_leases = model_leases.clone();
+        let task = AbortOnDropTask::new(tokio::spawn(async move {
+            model_leases
+                .hold(&state.runtime, variant)
+                .await
+                .map_err(|err| format!("Failed to load TTS model: {err}"))?;
+            let permit = acquire_stage_permit(&state).await?;
+            request.runtime_context = permit.runtime_context();
+            state
+                .runtime
+                .generate_streaming(request, chunk_tx)
+                .await
+                .map_err(|err| format!("TTS failed: {err}"))
         }));
+        Self { text, chunks, task }
+    }
 
-        loop {
-            let chunk = tokio::select! {
-                _ = control.cancelled() => return Err("Turn cancelled".to_string()),
-                chunk = chunk_rx.recv() => chunk,
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            if chunk.samples.is_empty() && !(chunk.is_final && last_segment) {
+    async fn finish(self) -> Result<(), String> {
+        drop(self.chunks);
+        self.task
+            .join()
+            .await
+            .map_err(|err| format!("TTS streaming task failed: {err}"))?
+    }
+}
+
+/// The next audio chunk of the segment playing, if one is.
+async fn next_chunk(segment: Option<&mut SegmentSynthesis>) -> Option<izwi_core::AudioChunk> {
+    match segment {
+        Some(segment) => segment.chunks.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Assistant audio of one turn as it goes out: the rate it is announced
+/// at, its frame sequence, and the turn's latency accounting.
+struct ReplyAudio<'a> {
+    state: &'a AppState,
+    out_tx: &'a OutboundTx,
+    control: &'a TurnControl,
+    utterance_id: &'a str,
+    utterance_seq: u64,
+    output_generation: u64,
+    format: OutputAudioFormat,
+    encoder: Option<AudioOutputEncoder>,
+    announced_rate: Option<u32>,
+    chunk_seq: u32,
+    first_text_at: Option<Instant>,
+}
+
+impl ReplyAudio<'_> {
+    /// The rate `chunk_rate` audio goes out at, announcing the first.
+    fn rate(&mut self, chunk_rate: u32) -> Result<u32, String> {
+        let (sample_rate, first) = realtime_chunk_rate(&mut self.announced_rate, chunk_rate)?;
+        if first {
+            self.encoder = Some(AudioOutputEncoder::new(self.format, sample_rate)?);
+            send_turn_json(
+                self.out_tx,
+                self.output_generation,
+                json!({
+                    "type": "assistant_audio_start",
+                    "utterance_id": self.utterance_id,
+                    "utterance_seq": self.utterance_seq,
+                    "sample_rate": self.format.wire_rate(sample_rate),
+                    "audio_format": self.format.as_str(),
+                }),
+            );
+        }
+        Ok(sample_rate)
+    }
+
+    async fn send(&mut self, samples: &[f32], is_final: bool) -> Result<(), String> {
+        let Some(sample_rate) = self.announced_rate else {
+            return Ok(());
+        };
+        if samples.is_empty() && !is_final {
+            return Ok(());
+        }
+        let Some(encoder) = self.encoder.as_mut() else {
+            return Ok(());
+        };
+        let mut encoded = encoder.encode(samples)?;
+        if is_final {
+            encoded.extend(encoder.finish()?);
+        } else if encoded.is_empty() {
+            // The resampler holds this audio for the next chunk.
+            return Ok(());
+        }
+        let frame = encode_assistant_audio_binary_frame(
+            self.format,
+            self.utterance_seq,
+            self.chunk_seq,
+            self.format.wire_rate(sample_rate),
+            is_final,
+            &encoded,
+        );
+        self.chunk_seq = self.chunk_seq.saturating_add(1);
+        let duration = Duration::from_secs_f64(samples.len() as f64 / sample_rate.max(1) as f64);
+        self.out_tx
+            .send_audio(
+                self.output_generation,
+                Message::Binary(frame.into()),
+                encoded.len(),
+                duration.as_millis() as u64,
+            )
+            .await
+            .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
+        if !samples.is_empty() {
+            if let Some(first_text_at) = self.first_text_at.take() {
+                self.state
+                    .runtime
+                    .record_voice_latency(VoiceLatency::TtsFirstAudio, first_text_at.elapsed());
+            }
+            self.control
+                .reply()
+                .ledger
+                .audio_sent(duration.as_secs_f64() * 1000.0);
+            self.control.audio_sent(&self.state.runtime, duration);
+        }
+        Ok(())
+    }
+}
+
+/// Speak a reply while the text model writes it (SPK-F2): its text, minus
+/// any reasoning, is cut into segments as sentences complete, and the next
+/// segment is synthesized while the one before it plays. Segments are
+/// joined with the long-form pause and fades (SPK-F20), and each spoken
+/// segment is entered in the turn's ledger, so an interruption knows what
+/// was heard (SPK-F13).
+#[allow(clippy::too_many_arguments)]
+async fn speak_reply(
+    state: &AppState,
+    out_tx: &OutboundTx,
+    commit: &PendingAudioCommit,
+    control: &TurnControl,
+    output_generation: u64,
+    mut deltas: tokio::sync::mpsc::UnboundedReceiver<String>,
+    text_requested_at: Instant,
+    synthesize: impl Fn(String) -> SegmentSynthesis,
+) -> Result<(), String> {
+    let fallback_sample_rate = state.runtime.sample_rate().await;
+    let mut reasoning = ReasoningFilter::default();
+    let mut segmenter = SpeechSegmenter::default();
+    let mut joiner = SegmentJoiner::default();
+    let mut visible = String::new();
+    let mut text_done = false;
+    let mut spoke = false;
+    let mut playing: Option<SegmentSynthesis> = None;
+    let mut lookahead: Option<SegmentSynthesis> = None;
+    let mut audio = ReplyAudio {
+        state,
+        out_tx,
+        control,
+        utterance_id: &commit.utterance_id,
+        utterance_seq: commit.utterance_seq,
+        output_generation,
+        format: commit.turn_config.output_format(),
+        encoder: None,
+        announced_rate: None,
+        chunk_seq: 0,
+        first_text_at: None,
+    };
+
+    loop {
+        if lookahead.is_none() {
+            if let Some(text) = segmenter.next_segment(text_done) {
+                if !spoke {
+                    spoke = true;
+                    state.runtime.record_voice_latency(
+                        VoiceLatency::LlmFirstToken,
+                        text_requested_at.elapsed(),
+                    );
+                    audio.first_text_at = Some(Instant::now());
+                }
+                lookahead = Some(synthesize(text));
+            }
+        }
+        if playing.is_none() {
+            if let Some(next) = lookahead.take() {
+                joiner.begin_segment();
+                control.reply().ledger.begin_segment(&next.text);
+                playing = Some(next);
                 continue;
             }
-            let (sample_rate, first) = realtime_chunk_rate(
-                &mut announced_rate,
-                chunk.sample_rate_or(fallback_sample_rate),
-            )?;
-            if first {
-                announce(sample_rate);
+            if text_done {
+                break;
             }
-            let encoder = AudioEncoder::new(sample_rate, 1);
-
-            let encoded = encoder
-                .encode(&chunk.samples, AudioFormat::RawI16)
-                .map_err(|err| format!("Failed to encode streamed TTS chunk: {err}"))?;
-
-            let frame = encode_assistant_audio_binary_frame(
-                utterance_seq,
-                chunk_seq,
-                sample_rate,
-                chunk.is_final && last_segment,
-                &encoded,
-            );
-            chunk_seq = chunk_seq.saturating_add(1);
-            let sample_count = encoded.len() / std::mem::size_of::<i16>();
-            let duration_ms = (sample_count as u64)
-                .saturating_mul(1_000)
-                .checked_div(sample_rate.max(1) as u64)
-                .unwrap_or(0);
-            out_tx
-                .send_audio(
-                    output_generation,
-                    Message::Binary(frame.into()),
-                    encoded.len(),
-                    duration_ms,
-                )
-                .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
         }
 
-        match generation_task.join().await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(format!("TTS failed: {err}")),
-            Err(err) => return Err(format!("TTS streaming task failed: {err}")),
+        tokio::select! {
+            biased;
+            _ = control.cancelled() => return Err("Turn cancelled".to_string()),
+            chunk = next_chunk(playing.as_mut()) => match chunk {
+                Some(chunk) => {
+                    if chunk.samples.is_empty() {
+                        continue;
+                    }
+                    let sample_rate = audio.rate(chunk.sample_rate_or(fallback_sample_rate))?;
+                    let samples = joiner.push(&chunk.samples, sample_rate);
+                    audio.send(&samples, false).await?;
+                }
+                None => {
+                    if let Some(finished) = playing.take() {
+                        finished.finish().await?;
+                    }
+                    if let Some(sample_rate) = audio.announced_rate {
+                        let tail = joiner.end_segment(sample_rate);
+                        audio.send(&tail, false).await?;
+                    }
+                }
+            },
+            delta = deltas.recv(), if !text_done => {
+                let text = match delta {
+                    Some(delta) => reasoning.push(&delta),
+                    None => {
+                        text_done = true;
+                        reasoning.finish()
+                    }
+                };
+                if !text.is_empty() {
+                    visible.push_str(&text);
+                    segmenter.push(&text);
+                    send_turn_text_snapshot(
+                        out_tx,
+                        output_generation,
+                        format!("assistant-text-{}", commit.utterance_seq),
+                        json!({
+                            "type": "assistant_text_snapshot",
+                            "utterance_id": commit.utterance_id,
+                            "utterance_seq": commit.utterance_seq,
+                            "text": visible.trim_start(),
+                        }),
+                    );
+                }
+            }
         }
     }
 
-    if announced_rate.is_none() {
-        announce(fallback_sample_rate);
+    if audio.announced_rate.is_none() {
+        if !spoke {
+            // Nothing to say.
+            return Ok(());
+        }
+        audio.rate(fallback_sample_rate)?;
     }
+    audio.send(&[], true).await?;
     send_turn_json(
         out_tx,
         output_generation,
         json!({
             "type": "assistant_audio_done",
-            "utterance_id": utterance_id,
-            "utterance_seq": utterance_seq,
+            "utterance_id": commit.utterance_id,
+            "utterance_seq": commit.utterance_seq,
         }),
     );
     Ok(())
-}
-
-/// Characters one realtime TTS segment carries after the first sentence.
-const REALTIME_SEGMENT_CHARS: usize = 240;
-
-/// The reply as realtime TTS segments: its first sentence alone (the first
-/// audio waits only for it), then whole sentences packed up to
-/// [`REALTIME_SEGMENT_CHARS`].
-fn realtime_speech_segments(text: &str) -> Vec<String> {
-    let spans = crate::api::sentence_split::sentence_spans(text);
-    let Some(first) = spans.first() else {
-        return vec![text.trim().to_string()];
-    };
-    let mut segments = crate::api::sentence_split::pack_sentences(
-        &text[first.clone()],
-        REALTIME_SEGMENT_CHARS,
-        &|_| true,
-    );
-    let rest = text[first.end..].trim();
-    if !rest.is_empty() {
-        segments.extend(crate::api::sentence_split::pack_sentences(
-            rest,
-            REALTIME_SEGMENT_CHARS,
-            &|_| true,
-        ));
-    }
-    segments
 }
 
 /// Realtime voice speaks with a built-in voice and streams its audio: a
@@ -2596,30 +2987,35 @@ async fn build_unified_history(
         .map_err(|err| format!("Voice storage error: {err}"))?
         .ok_or_else(|| "Voice session not found".to_string())?;
 
-    let mut messages = Vec::new();
+    let mut history = Vec::new();
     for turn in session.turns {
         if turn.id == current_turn_id {
             continue;
         }
-        if let Some(user_text) = turn.user_text.as_deref().map(str::trim) {
-            if !user_text.is_empty() {
-                messages.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: user_text.to_string(),
-                });
-            }
-        }
-        if let Some(assistant_text) = turn.assistant_text.as_deref().map(str::trim) {
-            if !assistant_text.is_empty() {
-                messages.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: assistant_text.to_string(),
-                });
+        for (role, text) in [
+            (MemoryMessageRole::User, turn.user_text),
+            (MemoryMessageRole::Assistant, turn.assistant_text),
+        ] {
+            if let Some(content) = text.map(|text| text.trim().to_string()) {
+                if !content.is_empty() {
+                    history.push(MemoryMessage { role, content });
+                }
             }
         }
     }
 
-    Ok(messages)
+    Ok(VOICE_HISTORY_BUDGET
+        .apply(history)
+        .into_iter()
+        .map(|message| ChatMessage {
+            role: match message.role {
+                MemoryMessageRole::System => ChatRole::System,
+                MemoryMessageRole::User => ChatRole::User,
+                MemoryMessageRole::Assistant => ChatRole::Assistant,
+            },
+            content: message.content,
+        })
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2634,10 +3030,12 @@ async fn stream_unified_s2s_to_socket(
     system_prompt: &str,
     history_messages: Vec<ChatMessage>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
     audio_bytes: &[u8],
     runtime_context: RuntimeRequestContext,
     control: &TurnControl,
     output_generation: u64,
+    model_leases: &SessionModelLeases,
 ) -> Result<izwi_core::SpeechToSpeechGeneration, String> {
     if control.is_cancelled() {
         return Err("Turn cancelled".to_string());
@@ -2650,9 +3048,8 @@ async fn stream_unified_s2s_to_socket(
         ));
     }
 
-    state
-        .runtime
-        .load_model(variant)
+    model_leases
+        .hold(&state.runtime, variant)
         .await
         .map_err(|err| format!("Failed to load unified audio model: {err}"))?;
 
@@ -2663,12 +3060,12 @@ async fn stream_unified_s2s_to_socket(
             "type": "assistant_audio_start",
             "utterance_id": utterance_id,
             "utterance_seq": utterance_seq,
-            "sample_rate": 24_000,
-            "audio_format": "pcm_i16",
+            "sample_rate": output_format.wire_rate(24_000),
+            "audio_format": output_format.as_str(),
         }),
     );
 
-    let encoder = AudioEncoder::new(24_000, 1);
+    let mut encoder: Option<AudioOutputEncoder> = None;
     let delivery_error = Arc::new(Mutex::new(None::<String>));
     let params = GenerationParams {
         max_tokens: max_output_tokens.clamp(1, 4096),
@@ -2693,9 +3090,14 @@ async fn stream_unified_s2s_to_socket(
                 let control = control.clone();
                 let delivery_error = delivery_error.clone();
                 let mut text_snapshot = String::new();
+                let runtime = state.runtime.clone();
                 move |chunk| {
+                    // A cancelled turn stops the reply at its next token
+                    // instead of letting it run to its end (SPK-F5).
+                    let cancelled =
+                        || izwi_core::Error::Cancelled("unified voice turn cancelled".to_string());
                     if control.is_cancelled() {
-                        return;
+                        return futures::future::Either::Left(std::future::ready(Err(cancelled())));
                     }
                     if let Some(delta) = chunk.text.as_deref() {
                         if !delta.is_empty() {
@@ -2714,34 +3116,37 @@ async fn stream_unified_s2s_to_socket(
                         }
                     }
 
+                    let mut frame = None;
                     if !chunk.samples.is_empty() {
-                        match encoder.encode(&chunk.samples, AudioFormat::RawI16) {
+                        let encoded = match encoder.as_mut() {
+                            Some(encoder) => encoder.encode(&chunk.samples),
+                            None => {
+                                AudioOutputEncoder::new(output_format, chunk.sample_rate.max(1))
+                                    .and_then(|created| {
+                                        encoder.insert(created).encode(&chunk.samples)
+                                    })
+                            }
+                        };
+                        match encoded {
                             Ok(encoded) => {
                                 let chunk_seq = u32::try_from(chunk.sequence).unwrap_or(u32::MAX);
-                                let frame = encode_assistant_audio_binary_frame(
-                                    utterance_seq,
-                                    chunk_seq,
-                                    chunk.sample_rate.max(1),
-                                    chunk.is_final,
-                                    &encoded,
-                                );
-                                let sample_count = encoded.len() / std::mem::size_of::<i16>();
-                                let duration_ms = (sample_count as u64)
+                                let model_rate = chunk.sample_rate.max(1);
+                                let duration_ms = (chunk.samples.len() as u64)
                                     .saturating_mul(1_000)
-                                    .checked_div(chunk.sample_rate.max(1) as u64)
+                                    .checked_div(u64::from(model_rate))
                                     .unwrap_or(0);
-                                if let Err(err) = out_tx.send_audio(
-                                    output_generation,
-                                    Message::Binary(frame.into()),
+                                frame = Some((
+                                    encode_assistant_audio_binary_frame(
+                                        output_format,
+                                        utterance_seq,
+                                        chunk_seq,
+                                        output_format.wire_rate(model_rate),
+                                        chunk.is_final,
+                                        &encoded,
+                                    ),
                                     encoded.len(),
                                     duration_ms,
-                                ) {
-                                    *delivery_error
-                                        .lock()
-                                        .unwrap_or_else(|poison| poison.into_inner()) =
-                                        Some(format!("Outbound audio delivery failed: {err:?}"));
-                                    control.cancel("outbound_audio_saturated");
-                                }
+                                ));
                             }
                             Err(err) => {
                                 send_turn_error(
@@ -2754,6 +3159,40 @@ async fn stream_unified_s2s_to_socket(
                             }
                         }
                     }
+                    let Some((frame, bytes, duration_ms)) = frame else {
+                        return futures::future::Either::Left(std::future::ready(Ok(())));
+                    };
+                    // Audio waits for the client's playback credit, as the
+                    // cascaded pipeline's does (SPK-F11): a reply generated
+                    // faster than real time is held back, not dropped.
+                    let out_tx = out_tx.clone();
+                    let control = control.clone();
+                    let delivery_error = delivery_error.clone();
+                    let runtime = runtime.clone();
+                    futures::future::Either::Right(async move {
+                        match out_tx
+                            .send_audio(
+                                output_generation,
+                                Message::Binary(frame.into()),
+                                bytes,
+                                duration_ms,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                control.audio_sent(&runtime, Duration::from_millis(duration_ms));
+                                Ok(())
+                            }
+                            Err(err) => {
+                                *delivery_error
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) =
+                                    Some(format!("Outbound audio delivery failed: {err:?}"));
+                                control.cancel("socket_closed");
+                                Err(cancelled())
+                            }
+                        }
+                    })
                 }
             },
         )
@@ -2781,102 +3220,128 @@ async fn stream_unified_s2s_to_socket(
     Ok(generation)
 }
 
-async fn interrupt_active_turn(
+/// Interrupt the active turn without waiting for it (SPK-F19): its output
+/// is cut off and the interruption announced at once, and a background
+/// reaper gives the task [`TURN_CANCELLATION_TIMEOUT`] to stop on its own,
+/// aborts it otherwise, and records the turn as interrupted. Returns
+/// whether a running turn was interrupted.
+fn interrupt_active_turn(
     out_tx: &OutboundTx,
     active_turn: &mut Option<ActiveTurn>,
     reason: &str,
 ) -> bool {
-    if let Some(mut turn) = active_turn.take() {
-        out_tx.cutoff_turn(turn.output_generation);
-        let was_running = !turn.task.is_finished();
-        if !was_running {
-            let _ = turn.task.await;
-            return false;
-        }
-
-        turn.control.cancel(reason);
-        if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
-            .await
-            .is_err()
-        {
-            turn.task.abort();
-            let _ = turn.task.await;
-        }
-
-        let _ = tokio::time::timeout(
-            TURN_CANCELLATION_TIMEOUT,
-            turn.state.voice_store.complete_turn(
-                turn.turn_record_id.clone(),
-                "interrupted",
-                Some(reason.to_string()),
-            ),
-        )
-        .await;
-        out_tx.advance_typed_output_epoch();
-        send_json(
-            out_tx,
-            json!({
-                "type": "turn_interrupted",
-                "utterance_id": turn.utterance_id,
-                "utterance_seq": turn.utterance_seq,
-                "reason": reason,
-            }),
-        );
-        send_json(
-            out_tx,
-            json!({
-                "type": "turn_done",
-                "utterance_id": turn.utterance_id,
-                "utterance_seq": turn.utterance_seq,
-                "status": "interrupted",
-                "reason": reason,
-            }),
-        );
-        return true;
-    }
-    false
-}
-
-async fn ensure_agent_session(
-    state: &AppState,
-    agent_session_id: &mut Option<String>,
-    agent_session_system_prompt: &mut Option<String>,
-    system_prompt: &str,
-    text_model_id: &str,
-) -> Result<String, String> {
-    if let Some(existing_id) = agent_session_id.as_ref() {
-        if agent_session_system_prompt.as_deref() == Some(system_prompt) {
-            return Ok(existing_id.clone());
-        }
-    }
-
-    let model_id = resolve_chat_model_id(Some(text_model_id))?;
-    let thread = state
-        .chat_store
-        .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
-        .await
-        .map_err(|err| format!("Chat storage error: {err:#}"))?;
-
-    let now = now_unix_millis();
-    let session_id = new_uuid();
-    let record = StoredAgentSessionRecord {
-        id: session_id.clone(),
-        agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
-        thread_id: thread.id,
-        model_id,
-        system_prompt: system_prompt.to_string(),
-        planning_mode: PlanningMode::Auto,
-        created_at: now,
-        updated_at: now,
+    let Some(turn) = active_turn.take() else {
+        return false;
     };
+    out_tx.cutoff_turn(turn.output_generation);
+    if turn.task.is_finished() {
+        return false;
+    }
 
-    state.store_agent_session_record(record).await;
-
-    *agent_session_id = Some(session_id.clone());
-    *agent_session_system_prompt = Some(system_prompt.to_string());
-    Ok(session_id)
+    turn.control.cancel(reason);
+    // The reply was heard up to where playback had got; it is stored with
+    // the next turn's history.
+    turn.control.stop_playback();
+    turn.conversation
+        .hold(turn.utterance_seq, turn.control.clone());
+    out_tx.advance_typed_output_epoch();
+    send_json(
+        out_tx,
+        json!({
+            "type": "turn_interrupted",
+            "utterance_id": turn.utterance_id,
+            "utterance_seq": turn.utterance_seq,
+            "reason": reason,
+        }),
+    );
+    send_json(
+        out_tx,
+        json!({
+            "type": "turn_done",
+            "utterance_id": turn.utterance_id,
+            "utterance_seq": turn.utterance_seq,
+            "status": "interrupted",
+            "reason": reason,
+        }),
+    );
+    tokio::spawn(reap_interrupted_turn(turn, reason.to_string()));
+    true
 }
 
+async fn reap_interrupted_turn(mut turn: ActiveTurn, reason: String) {
+    if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
+        .await
+        .is_err()
+    {
+        turn.task.abort();
+        let _ = turn.task.await;
+    }
+    // A turn that stopped on its own has already recorded this; the record
+    // only moves out of `processing` once.
+    if let Err(err) = turn
+        .state
+        .voice_store
+        .complete_turn(turn.turn_record_id, "interrupted", Some(reason))
+        .await
+    {
+        warn!("failed to record an interrupted voice turn: {err}");
+    }
+}
+
+/// The connection's agent session, created by the first modular turn that
+/// needs it (off the receive loop) and replaced when the system prompt
+/// changes.
+#[derive(Default)]
+struct AgentSessionSlot {
+    /// The session's id and the system prompt it was created with.
+    binding: tokio::sync::Mutex<Option<(String, String)>>,
+}
+
+impl AgentSessionSlot {
+    async fn ensure(
+        &self,
+        state: &AppState,
+        system_prompt: &str,
+        text_model_id: &str,
+    ) -> Result<String, String> {
+        let mut binding = self.binding.lock().await;
+        if let Some((session_id, prompt)) = binding.as_ref() {
+            if prompt == system_prompt {
+                return Ok(session_id.clone());
+            }
+        }
+
+        let model_id = resolve_chat_model_id(Some(text_model_id))?;
+        let thread = state
+            .chat_store
+            .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
+            .await
+            .map_err(|err| format!("Chat storage error: {err:#}"))?;
+
+        let now = now_unix_millis();
+        let session_id = new_uuid();
+        state
+            .store_agent_session_record(StoredAgentSessionRecord {
+                id: session_id.clone(),
+                agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
+                thread_id: thread.id,
+                model_id,
+                system_prompt: system_prompt.to_string(),
+                planning_mode: PlanningMode::Auto,
+                created_at: now,
+                updated_at: now,
+            })
+            .await;
+
+        *binding = Some((session_id.clone(), system_prompt.to_string()));
+        Ok(session_id)
+    }
+}
+
+/// Run the agent's reply to `input`, streaming its text into `deltas`. The
+/// reply is not stored here: the turn's record holds it until what the user
+/// heard of it is known (SPK-F13). Returns the raw reply.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     state: &AppState,
     session_id: &str,
@@ -2886,6 +3351,9 @@ async fn run_agent_turn(
     voice_profile_id: Option<&str>,
     correlation_id: &str,
     runtime_context: RuntimeRequestContext,
+    control: &TurnControl,
+    turn_record_id: &str,
+    deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
     let session_record = {
         let store = state.agent_session_store.read().await;
@@ -2912,6 +3380,11 @@ async fn run_agent_turn(
         created_at: session_record.created_at,
         updated_at: session_record.updated_at,
     };
+    {
+        let mut reply = control.reply();
+        reply.session = Some(session.clone());
+        reply.turn_record_id = Some(turn_record_id.to_string());
+    }
 
     let memory_context = if let Some(profile_id) = voice_profile_id {
         match state
@@ -2936,6 +3409,8 @@ async fn run_agent_turn(
         runtime: state.runtime.clone(),
         correlation_id: correlation_id.to_string(),
         runtime_context,
+        deltas,
+        usage: Mutex::new(None),
     };
     let planner = SimplePlanner;
     let mut tools = ToolRegistry::new();
@@ -2957,6 +3432,8 @@ async fn run_agent_turn(
             AgentTurnOptions {
                 max_output_tokens: max_output_tokens.clamp(1, 4096),
                 max_tool_calls: 1,
+                history: VOICE_HISTORY_BUDGET,
+                persist_assistant_reply: false,
             },
         )
         .await
@@ -2965,11 +3442,56 @@ async fn run_agent_turn(
             other => other.to_string(),
         })?;
 
+    {
+        let mut reply = control.reply();
+        reply.text = Some(strip_reasoning(&result.assistant_text));
+        reply.raw_text = Some(result.assistant_text.clone());
+        reply.meta = MemoryMessageMeta {
+            model_id: Some(resolved_model_id.clone()),
+            ..backend.usage()
+        };
+    }
     state
         .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
         .await;
 
     Ok(result.assistant_text)
+}
+
+/// Store a turn's reply in its conversation thread: what the user heard of
+/// it, without reasoning. A reply cut short also records the heard text on
+/// its voice turn.
+async fn store_reply(state: &AppState, control: &TurnControl) {
+    let (session, text, meta, truncated, turn_record_id, raw_text) = {
+        let reply = control.reply();
+        let (Some(session), Some(text)) = (reply.session.clone(), reply.remembered_text()) else {
+            return;
+        };
+        (
+            session,
+            text,
+            reply.meta.clone(),
+            reply.heard_ms.is_some(),
+            reply.turn_record_id.clone(),
+            reply.raw_text.clone(),
+        )
+    };
+    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), None);
+    if let Err(err) = AgentEngine
+        .commit_assistant_reply(&memory, &session, &text, meta)
+        .await
+    {
+        warn!("failed to store a voice reply: {err}");
+    }
+    if let (true, Some(turn_record_id)) = (truncated, turn_record_id) {
+        if let Err(err) = state
+            .voice_store
+            .update_turn_assistant(turn_record_id, Some(text), raw_text)
+            .await
+        {
+            warn!("failed to record a truncated voice reply: {err}");
+        }
+    }
 }
 
 fn maybe_spawn_observation_extraction(
@@ -3154,6 +3676,8 @@ fn map_typed_voice_event(
                 .and_then(serde_json::Value::as_str)
             {
                 Some("pcm_f32") => RealtimeAudioFormat::PcmF32,
+                Some("g711_ulaw") => RealtimeAudioFormat::G711Ulaw,
+                Some("g711_alaw") => RealtimeAudioFormat::G711Alaw,
                 _ => RealtimeAudioFormat::PcmI16,
             },
         },
@@ -3239,6 +3763,8 @@ fn map_typed_voice_event(
         // These legacy-only state markers either have no typed equivalent or would encode
         // append-only deltas. Typed clients reconstruct state from full snapshots/finals.
         "input_stream_stopped"
+        | "models_ready"
+        | "conversation_item_truncated"
         | "turn_processing"
         | "user_transcript_start"
         | "user_transcript_delta"
@@ -3349,34 +3875,6 @@ fn send_turn_error(
     );
 }
 
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn strip_think_tags(input: &str) -> String {
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-    let mut out = input.to_string();
-
-    while let Some(start) = out.find(open_tag) {
-        if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
-            let end = start + open_tag.len() + end_rel;
-            let mut next = String::with_capacity(out.len());
-            next.push_str(&out[..start]);
-            next.push_str(&out[end + close_tag.len()..]);
-            out = next;
-        } else {
-            out.truncate(start);
-            break;
-        }
-    }
-
-    out.trim().to_string()
-}
-
 struct VoiceContextMemoryStore {
     chat_store: Arc<ChatStore>,
     memory_context: Option<String>,
@@ -3455,10 +3953,29 @@ struct IzwiRuntimeBackend {
     runtime: Arc<izwi_core::RuntimeService>,
     correlation_id: String,
     runtime_context: RuntimeRequestContext,
+    /// Receives the reply's text as it is generated.
+    deltas: tokio::sync::mpsc::UnboundedSender<String>,
+    usage: Mutex<Option<(usize, f64)>>,
+}
+
+impl IzwiRuntimeBackend {
+    fn usage(&self) -> MemoryMessageMeta {
+        let usage = *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        MemoryMessageMeta {
+            model_id: None,
+            tokens_generated: usage.map(|(tokens, _)| tokens),
+            generation_time_ms: usage.map(|(_, ms)| ms),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl ModelBackend for IzwiRuntimeBackend {
+    /// A streamed reply without reasoning: voice cannot speak thinking, and
+    /// waiting for it would hold back the first audio (SPK-F2).
     async fn generate(&self, request: ModelRequest) -> izwi_agent::Result<ModelOutput> {
         let variant = parse_chat_model_variant(Some(&request.model_id))
             .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
@@ -3476,18 +3993,35 @@ impl ModelBackend for IzwiRuntimeBackend {
             });
         }
 
+        let deltas = self.deltas.clone();
         let generation = self
             .runtime
-            .chat_generate_with_correlation_and_runtime_context(
+            .chat_generate_streaming_with_runtime_context(
                 variant,
                 runtime_messages,
-                request.max_output_tokens.clamp(1, 4096),
+                GenerationParams {
+                    max_tokens: request.max_output_tokens.clamp(1, 4096),
+                    ..Default::default()
+                },
+                ChatRequestConfig {
+                    enable_thinking: Some(false),
+                    truncation: ChatTruncation::Auto,
+                    ..ChatRequestConfig::default()
+                },
                 Some(&self.correlation_id),
                 self.runtime_context,
+                move |delta| {
+                    let _ = deltas.send(delta);
+                },
             )
             .await
             .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
 
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some((generation.tokens_generated, generation.generation_time_ms));
         Ok(ModelOutput {
             text: generation.text,
             tokens_generated: generation.tokens_generated,
@@ -3498,9 +4032,528 @@ impl ModelBackend for IzwiRuntimeBackend {
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::ws::Message;
-
     use super::*;
+
+    /// An app state on a temporary database with `realtime` realtime
+    /// admission permits.
+    fn test_app_state(realtime: usize) -> (tempfile::TempDir, AppState) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let models_dir = temp_dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let _env = crate::test_support::env_lock();
+        std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+        std::env::set_var("IZWI_MAX_REALTIME_REQUESTS", realtime.to_string());
+        let serve_config = izwi_core::ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            models_dir,
+            ..izwi_core::ServeRuntimeConfig::default()
+        };
+        let runtime = RuntimeService::new(serve_config.engine_config()).expect("runtime");
+        let state = AppState::new(runtime, &serve_config).expect("state");
+        for key in [
+            "IZWI_DB_PATH",
+            "IZWI_MEDIA_DIR",
+            "IZWI_MAX_REALTIME_REQUESTS",
+        ] {
+            std::env::remove_var(key);
+        }
+        (temp_dir, state)
+    }
+
+    fn realtime_permits_available(state: &AppState) -> usize {
+        state.request_admission_snapshot().realtime.available
+    }
+
+    /// SPK-F22: a turn stage holds a realtime permit only while it runs, so
+    /// a turn idle between stages holds none, and a stage waiting for one
+    /// starts as soon as another stage ends.
+    #[tokio::test]
+    async fn turn_stages_hold_a_permit_only_while_they_run() {
+        let (_dir, state) = test_app_state(1);
+        assert_eq!(realtime_permits_available(&state), 1);
+        let inside = with_stage_permit(&state, async |_| Ok(realtime_permits_available(&state)))
+            .await
+            .expect("stage");
+        assert_eq!(inside, 0, "the stage holds the permit");
+        assert_eq!(
+            realtime_permits_available(&state),
+            1,
+            "the turn holds no permit between stages"
+        );
+
+        // With one permit, a second stage waits for the first to end.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first = with_stage_permit(&state, async |_| {
+            released.await.ok();
+            Ok(())
+        });
+        let second = async {
+            tokio::task::yield_now().await;
+            with_stage_permit(&state, async |_| Ok(())).await
+        };
+        let second_waits = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release.send(()).ok();
+        };
+        let (first, second, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second, second_waits)
+        })
+        .await
+        .expect("the second stage runs once the first ends");
+        first.expect("first stage");
+        second.expect("second stage");
+        assert_eq!(realtime_permits_available(&state), 1);
+    }
+
+    /// A stored voice session with one processing turn, `turn_id`.
+    async fn stored_turn(state: &AppState, turn_id: &str) -> String {
+        let profile = state
+            .voice_store
+            .get_default_profile()
+            .await
+            .expect("profile");
+        let session = state
+            .voice_store
+            .create_session(crate::voice_store::CreateVoiceSessionRequest {
+                profile_id: profile.id,
+                mode: "modular".to_string(),
+                system_prompt: profile.system_prompt,
+            })
+            .await
+            .expect("session");
+        state
+            .voice_store
+            .create_turn(CreateVoiceTurnRequest {
+                turn_id: Some(turn_id.to_string()),
+                session_id: session.id.clone(),
+                utterance_id: "utt-1".to_string(),
+                utterance_seq: 1,
+                mode: "modular".to_string(),
+                vad_end_reason: None,
+                asr_model_id: None,
+                text_model_id: None,
+                tts_model_id: None,
+                s2s_model_id: None,
+                speaker: None,
+            })
+            .await
+            .expect("turn");
+        session.id
+    }
+
+    async fn turn_status(state: &AppState, session_id: &str) -> String {
+        let session = state
+            .voice_store
+            .get_session(session_id.to_string())
+            .await
+            .expect("session")
+            .expect("stored session");
+        session.turns[0].status.clone()
+    }
+
+    async fn drain_text(out_tx: &OutboundTx) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        out_tx.close();
+        while let Some(output) = out_tx.mailbox.next().await {
+            if let crate::app::realtime_transport::MailboxOutput::Message(Message::Text(text)) =
+                output
+            {
+                events.push(serde_json::from_str(text.as_str()).expect("json"));
+            }
+        }
+        events
+    }
+
+    /// SPK-F19: interrupting a turn that does not stop on its own returns at
+    /// once with the interruption announced; a background reaper aborts the
+    /// turn and records it as interrupted.
+    #[tokio::test]
+    async fn interrupting_a_turn_does_not_wait_for_it() {
+        let (_dir, state) = test_app_state(1);
+        let session_id = stored_turn(&state, "turn-1").await;
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let stubborn = tokio::spawn(tokio::time::sleep(Duration::from_secs(30)));
+        let mut active = Some(ActiveTurn {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_record_id: "turn-1".to_string(),
+            state: state.clone(),
+            conversation: Arc::default(),
+            task: stubborn,
+            control: TurnControl::new(Instant::now()),
+            output_generation: 1,
+        });
+
+        let started = Instant::now();
+        assert!(interrupt_active_turn(&out_tx, &mut active, "barge_in"));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the receive loop is not held for the turn ({:?})",
+            started.elapsed()
+        );
+        assert!(active.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while turn_status(&state, &session_id).await != "interrupted" {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper records the interruption"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let types: Vec<String> = drain_text(&out_tx)
+            .await
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(types, ["turn_interrupted", "turn_done"]);
+    }
+
+    /// SPK-F21: starting an input stream loads and leases its models in the
+    /// background and reports their readiness, before any turn.
+    #[tokio::test]
+    async fn input_stream_start_warms_the_session_models() {
+        let (_dir, state) = test_app_state(1);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let mut conn = ConnectionState::default();
+        for message in [
+            json!({ "type": "session_start" }),
+            json!({
+                "type": "input_stream_start",
+                "asr_model_id": "Parakeet-TDT-0.6B-v3",
+                "text_model_id": "LFM2.5-1.2B-Instruct-GGUF",
+                "tts_model_id": "Kokoro-82M",
+            }),
+        ] {
+            handle_text_message(&state, "corr", &out_tx, &mut conn, &message.to_string())
+                .await
+                .expect("message");
+        }
+        conn.model_warmup
+            .take()
+            .expect("the stream warms its models")
+            .join()
+            .await
+            .expect("warm-up");
+        let events = drain_text(&out_tx).await;
+        let ready = events
+            .iter()
+            .find(|event| event["type"] == "models_ready")
+            .expect("readiness is reported");
+        let stages: Vec<&str> = ready["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .map(|model| model["stage"].as_str().expect("stage"))
+            .collect();
+        assert_eq!(stages, ["asr", "text", "tts"]);
+        // The test models directory is empty, so none can load; each says why.
+        assert!(ready["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .all(|model| model["ready"] == false && model["error"].is_string()));
+    }
+
+    /// A turn control whose reply spoke "One two." over its first second of
+    /// audio and "Three four five six." over the next two, in `thread_id`.
+    fn spoken_reply(thread_id: &str) -> TurnControl {
+        let control = TurnControl::new(Instant::now());
+        let mut reply = control.reply();
+        reply.session = Some(AgentSession {
+            id: "agent-session".to_string(),
+            agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
+            thread_id: thread_id.to_string(),
+            created_at: 0,
+            updated_at: 0,
+        });
+        reply.text = Some("One two. Three four five six.".to_string());
+        reply.ledger.begin_segment("One two.");
+        reply.ledger.audio_sent(1_000.0);
+        reply.ledger.begin_segment("Three four five six.");
+        reply.ledger.audio_sent(2_000.0);
+        drop(reply);
+        control
+    }
+
+    async fn thread_text(state: &AppState, thread_id: &str) -> Vec<String> {
+        state
+            .chat_store
+            .list_messages(thread_id.to_string())
+            .await
+            .expect("messages")
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    /// SPK-F13: a client's truncate makes the conversation remember the
+    /// reply only up to what was played, and is acknowledged with that text.
+    #[tokio::test]
+    async fn a_truncated_reply_is_remembered_up_to_what_was_played() {
+        let (_dir, state) = test_app_state(1);
+        let thread = state
+            .chat_store
+            .create_thread(Some("Voice Session".to_string()), None)
+            .await
+            .expect("thread");
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let mut conn = ConnectionState::default();
+        conn.conversation.hold(4, spoken_reply(&thread.id));
+
+        let truncate = json!({
+            "type": "conversation.item.truncate",
+            "utterance_seq": 4,
+            "audio_end_ms": 2_000,
+        });
+        handle_text_message(&state, "corr", &out_tx, &mut conn, &truncate.to_string())
+            .await
+            .expect("truncate");
+        assert!(handle_text_message(
+            &state,
+            "corr",
+            &out_tx,
+            &mut conn,
+            &json!({"type": "conversation_item_truncate", "utterance_seq": 9, "audio_end_ms": 1})
+                .to_string(),
+        )
+        .await
+        .expect_err("no such reply")
+        .contains("utterance 9"));
+        conn.conversation.store(&state).await;
+
+        assert_eq!(
+            thread_text(&state, &thread.id).await,
+            ["One two. Three four"]
+        );
+        let events = drain_text(&out_tx).await;
+        assert_eq!(events[0]["type"], "conversation_item_truncated");
+        assert_eq!(events[0]["text"], "One two. Three four");
+    }
+
+    /// SPK-F13: a reply that played out is remembered whole; one interrupted
+    /// while playing is remembered up to where the client's playback had got.
+    #[tokio::test]
+    async fn an_interrupted_reply_is_remembered_up_to_its_playback() {
+        let (_dir, state) = test_app_state(1);
+        let thread = state
+            .chat_store
+            .create_thread(Some("Voice Session".to_string()), None)
+            .await
+            .expect("thread");
+        let conversation = Arc::new(VoiceConversation::default());
+
+        conversation.hold(1, spoken_reply(&thread.id));
+        conversation.store(&state).await;
+
+        let interrupted = spoken_reply(&thread.id);
+        *interrupted.inner.playback.lock().expect("playback") = PlaybackClock {
+            playing_until: Some(Instant::now() + Duration::from_millis(1_000)),
+            sent: Duration::from_millis(3_000),
+        };
+        conversation.hold(2, interrupted);
+        conversation.interrupt_playback();
+        conversation.store(&state).await;
+
+        assert_eq!(
+            thread_text(&state, &thread.id).await,
+            ["One two. Three four five six.", "One two. Three four"]
+        );
+    }
+
+    /// A fake TTS for `speak_reply`: segment `n` (from 1) is 3 chunks of 100
+    /// samples of value `n / 10` at 1 kHz; the first segment is slow (30 ms
+    /// between chunks), later ones instant. Records each segment's start and
+    /// the moment its synthesis ends.
+    fn fake_synthesis(
+        log: Arc<Mutex<Vec<(String, Instant, Option<Instant>)>>>,
+    ) -> impl Fn(String) -> SegmentSynthesis {
+        move |text| {
+            let index = {
+                let mut log = log.lock().expect("log");
+                log.push((text.clone(), Instant::now(), None));
+                log.len()
+            };
+            let (tx, chunks) = tokio::sync::mpsc::channel(32);
+            let log = log.clone();
+            let task = AbortOnDropTask::new(tokio::spawn(async move {
+                for sequence in 0..3 {
+                    if index == 1 {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    let chunk = izwi_core::AudioChunk::new(
+                        format!("segment-{index}"),
+                        sequence,
+                        vec![index as f32 / 10.0; 100],
+                    )
+                    .with_sample_rate(1_000);
+                    tx.send(chunk).await.map_err(|err| err.to_string())?;
+                }
+                log.lock().expect("log")[index - 1].2 = Some(Instant::now());
+                Ok(())
+            }));
+            SegmentSynthesis { text, chunks, task }
+        }
+    }
+
+    /// The PCM16 samples of the assistant audio frames queued on `out_tx`.
+    async fn assistant_samples(out_tx: &OutboundTx) -> Vec<i16> {
+        out_tx.close();
+        let mut samples = Vec::new();
+        while let Some(output) = out_tx.mailbox.next().await {
+            if let crate::app::realtime_transport::MailboxOutput::Message(Message::Binary(frame)) =
+                output
+            {
+                samples.extend(pcm16_bytes_to_i16(&frame[WS_BIN_ASSISTANT_HEADER_LEN..]));
+            }
+        }
+        samples
+    }
+
+    /// SPK-F2/F20: speech starts from the first sentence while the text is
+    /// still arriving, the next segment synthesizes while the first plays,
+    /// and the audio goes out in segment order with a pause between
+    /// segments, even when a later segment synthesizes faster.
+    #[tokio::test]
+    async fn the_reply_is_spoken_while_written_with_one_segment_ahead() {
+        const REPLY: &str = "Hello there, it is lovely to hear from you today. The second \
+            sentence is a little longer than the first one. Third and last.";
+        let (_dir, state) = test_app_state(4);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let control = TurnControl::new(Instant::now());
+        let commit = PendingAudioCommit {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_config: test_streaming_input().config.turn_config,
+            endpointed_at: Instant::now(),
+            endpointing_delay: None,
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = async {
+            for delta in [
+                "<think>plan</think>Hello there, it is lovely to hear from you today.",
+                " The second sentence",
+                " is a little longer than the first one.",
+            ] {
+                deltas.send(delta.to_string()).expect("delta");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            deltas.send(" Third and last.".to_string()).expect("delta");
+            drop(deltas);
+        };
+        let speech = speak_reply(
+            &state,
+            &out_tx,
+            &commit,
+            &control,
+            1,
+            delta_rx,
+            Instant::now(),
+            fake_synthesis(log.clone()),
+        );
+        let ((), spoken) = tokio::join!(writer, speech);
+        spoken.expect("spoken");
+
+        let log = log.lock().expect("log").clone();
+        let texts: Vec<&str> = log.iter().map(|(text, _, _)| text.as_str()).collect();
+        assert_eq!(
+            texts[0], "Hello there, it is lovely to hear from you today.",
+            "the first sentence is spoken alone"
+        );
+        assert_eq!(texts.join(" "), REPLY);
+        let first_done = log[0].2.expect("first segment finished");
+        assert!(
+            log[1].1 < first_done,
+            "the second segment starts while the first is still synthesizing"
+        );
+
+        let samples = assistant_samples(&out_tx).await;
+        let pause = crate::api::tts_long_form::segment_pause_samples(1_000);
+        let segments = texts.len();
+        assert_eq!(samples.len(), 300 * segments + pause * (segments - 1));
+        // Each segment's audio, in segment order, with the pause between.
+        for segment in 0..segments {
+            let start = segment * (300 + pause);
+            let block = &samples[start..start + 300];
+            let level = (32_767.0 * (segment + 1) as f32 / 10.0) as i16;
+            assert_eq!(block.iter().max(), Some(&level), "segment {segment}");
+            if segment + 1 < segments {
+                assert!(samples[start + 300..start + 300 + pause]
+                    .iter()
+                    .all(|sample| *sample == 0));
+            }
+        }
+        assert_eq!(control.reply().ledger.spoken_text(), REPLY);
+    }
+
+    /// SPK-F11: a session that asked for G.711 gets μ-law frames at 8 kHz,
+    /// announced as such, one byte a sample.
+    #[tokio::test]
+    async fn the_reply_goes_out_in_the_session_codec() {
+        let (_dir, state) = test_app_state(4);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let control = TurnControl::new(Instant::now());
+        let commit = PendingAudioCommit {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_config: VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
+                asr_model_id: "Parakeet-TDT-0.6B-v3".to_string(),
+                text_model_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+                tts_model_id: "Kokoro-82M".to_string(),
+                speaker: None,
+                asr_language: None,
+                max_output_tokens: 64,
+                output_format: OutputAudioFormat::G711Ulaw,
+            }),
+            endpointed_at: Instant::now(),
+            endpointing_delay: None,
+        };
+        let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        deltas.send("Hello there.".to_string()).expect("delta");
+        drop(deltas);
+        speak_reply(
+            &state,
+            &out_tx,
+            &commit,
+            &control,
+            1,
+            delta_rx,
+            Instant::now(),
+            fake_synthesis(Arc::default()),
+        )
+        .await
+        .expect("spoken");
+
+        out_tx.close();
+        let (mut start, mut payload, mut kinds) = (None, 0, Vec::new());
+        while let Some(output) = out_tx.mailbox.next().await {
+            match output {
+                crate::app::realtime_transport::MailboxOutput::Message(Message::Text(text)) => {
+                    let event: serde_json::Value =
+                        serde_json::from_str(text.as_str()).expect("json");
+                    if event["type"] == "assistant_audio_start" {
+                        start = Some(event);
+                    }
+                }
+                crate::app::realtime_transport::MailboxOutput::Message(Message::Binary(frame)) => {
+                    kinds.push(frame[5]);
+                    assert_eq!(&frame[20..24], &8_000_u32.to_le_bytes());
+                    payload += frame.len() - WS_BIN_ASSISTANT_HEADER_LEN;
+                }
+                _ => {}
+            }
+        }
+        let start = start.expect("audio start");
+        assert_eq!(start["audio_format"], "g711_ulaw");
+        assert_eq!(start["sample_rate"], 8_000);
+        assert!(kinds
+            .iter()
+            .all(|kind| *kind == WS_BIN_KIND_ASSISTANT_G711_ULAW));
+        // 300 samples at 1 kHz is 2 400 at 8 kHz, one byte each.
+        assert!((payload as i64 - 2_400).abs() <= 16, "{payload} bytes");
+    }
 
     fn test_streaming_input() -> StreamingInputState {
         StreamingInputState::new(StreamingInputConfig {
@@ -3508,29 +4561,16 @@ mod tests {
                 s2s_model_id: "LFM2.5-Audio-1.5B".to_string(),
                 speaker: None,
                 max_output_tokens: 32,
+                output_format: OutputAudioFormat::PcmI16,
             }),
             vad_threshold: DEFAULT_STREAM_VAD_THRESHOLD,
             min_speech_ms: 50,
             silence_duration_ms: 200,
             max_utterance_ms: 10_000,
             pre_roll_ms: 100,
+            barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
             input_sample_rate_hint: Some(16_000),
         })
-    }
-
-    /// TPIPE-21: the reply's first sentence is spoken alone, the rest in
-    /// packed sentence segments; decimals and titles do not split.
-    #[test]
-    fn realtime_replies_are_spoken_first_sentence_first() {
-        let reply = "Sure, Dr. Lee. The total is 3.14 units. It ships today, and arrives \
-            tomorrow. Anything else?";
-        let segments = realtime_speech_segments(reply);
-        assert_eq!(segments[0], "Sure, Dr. Lee.");
-        assert_eq!(
-            segments[1..].join(" "),
-            "The total is 3.14 units. It ships today, and arrives tomorrow. Anything else?"
-        );
-        assert_eq!(realtime_speech_segments("Hello"), vec!["Hello"]);
     }
 
     /// Realtime voice refuses a reference-only TTS model at session
@@ -3657,135 +4697,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_mailbox_coalesces_text_snapshots() {
-        let mailbox = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 100,
-            max_audio_ms: 100,
-        });
-
-        for text in ["first", "latest"] {
-            mailbox
-                .enqueue(OutboundItem {
-                    message: Message::Text(text.into()),
-                    class: OutboundClass::CoalescibleText("transcript-1".to_string()),
-                    turn_generation: Some(1),
-                })
-                .expect("snapshot should enqueue");
-        }
-
-        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
-            panic!("latest text snapshot should be delivered");
-        };
-        assert_eq!(text.as_str(), "latest");
-    }
-
-    #[tokio::test]
-    async fn outbound_mailbox_preserves_audio_order_and_closes_on_saturation() {
-        let ordered = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 8,
-            max_audio_ms: 100,
-        });
-        for byte in [1_u8, 2_u8] {
-            ordered
-                .enqueue(OutboundItem {
-                    message: Message::Binary(vec![byte].into()),
-                    class: OutboundClass::Audio {
-                        bytes: 1,
-                        duration_ms: 10,
-                    },
-                    turn_generation: Some(1),
-                })
-                .expect("audio should enqueue");
-        }
-        for expected in [1_u8, 2_u8] {
-            let Some(MailboxOutput::Message(Message::Binary(bytes))) = ordered.next().await else {
-                panic!("audio should be delivered in order");
-            };
-            assert_eq!(bytes.as_ref(), &[expected]);
-        }
-
-        let saturated = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 1,
-            max_audio_ms: 10,
-        });
-        saturated
-            .enqueue(OutboundItem {
-                message: Message::Binary(vec![1].into()),
-                class: OutboundClass::Audio {
-                    bytes: 1,
-                    duration_ms: 10,
-                },
-                turn_generation: Some(1),
-            })
-            .expect("first audio should enqueue");
-        assert_eq!(
-            saturated.enqueue(OutboundItem {
-                message: Message::Binary(vec![2].into()),
-                class: OutboundClass::Audio {
-                    bytes: 1,
-                    duration_ms: 1,
-                },
-                turn_generation: Some(1),
-            }),
-            Err(OutboundEnqueueError::AudioSaturated)
-        );
-        assert!(matches!(
-            saturated.next().await,
-            Some(MailboxOutput::Close(reason)) if reason == "outbound_audio_saturated"
-        ));
-    }
-
-    #[tokio::test]
-    async fn outbound_mailbox_drops_diagnostics_and_cuts_off_cancelled_turns() {
-        let mailbox = OutboundMailbox::new(OutboundLimits {
-            max_items: 2,
-            max_audio_bytes: 100,
-            max_audio_ms: 100,
-        });
-        mailbox
-            .enqueue(OutboundItem {
-                message: Message::Text("cancelled".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(7),
-            })
-            .expect("cancelled turn event should initially enqueue");
-        mailbox
-            .enqueue(OutboundItem {
-                message: Message::Text("next".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(8),
-            })
-            .expect("next turn event should enqueue");
-        assert_eq!(
-            mailbox.enqueue(OutboundItem {
-                message: Message::Text("diagnostic".into()),
-                class: OutboundClass::Diagnostic,
-                turn_generation: None,
-            }),
-            Err(OutboundEnqueueError::DroppedDiagnostic)
-        );
-
-        mailbox.cutoff_turn(7);
-        assert_eq!(
-            mailbox.enqueue(OutboundItem {
-                message: Message::Text("late".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(7),
-            }),
-            Err(OutboundEnqueueError::Cutoff)
-        );
-        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
-            panic!("next turn output should remain queued");
-        };
-        assert_eq!(text.as_str(), "next");
-    }
-
-    #[tokio::test]
     async fn turn_control_wakes_cooperative_cleanup() {
-        let control = TurnControl::new();
+        let control = TurnControl::new(Instant::now());
         let waiting_control = control.clone();
         let waiter = tokio::spawn(async move {
             waiting_control.cancelled().await;
@@ -3828,6 +4741,226 @@ mod tests {
             .handle_pcm16_frame(3, 16_000, &silence)
             .expect_err("duplicate frame must fail")
             .contains("Stale or duplicate"));
+    }
+
+    fn pcm16_frame(samples: &[i16]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    /// SPK-F3: a speech start alone does not barge in. Sustained speech
+    /// confirms exactly one barge-in once it reaches the configured voiced
+    /// duration.
+    #[test]
+    fn barge_in_waits_for_sustained_speech() {
+        let mut input = test_streaming_input();
+        // Every Earshot score clears the minimum threshold, so each frame is
+        // voiced and the utterance is pure sustained speech.
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+
+        let mut barge_ins = Vec::new();
+        let mut voiced_before = 0.0_f32;
+        for frame_seq in 1..=40_u32 {
+            let result = input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+            if frame_seq == 1 {
+                assert!(result.speech_start.is_some());
+            }
+            let voiced = input.active.as_ref().expect("active utterance").voiced_ms;
+            if result.barge_in {
+                barge_ins.push(frame_seq);
+                assert!(voiced >= DEFAULT_BARGE_IN_MIN_SPEECH_MS as f32);
+                assert!(voiced_before < DEFAULT_BARGE_IN_MIN_SPEECH_MS as f32);
+            }
+            voiced_before = voiced;
+        }
+        assert_eq!(barge_ins.len(), 1, "one barge-in per utterance");
+        assert!(barge_ins[0] > 1, "the first speech frame must not barge in");
+    }
+
+    /// SPK-F3: a short noise burst (a cough or a door) starts speech and is
+    /// rejected, but never barges in.
+    #[test]
+    fn short_noise_burst_never_barges_in() {
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            vad_threshold: 0.3,
+            min_speech_ms: DEFAULT_STREAM_MIN_SPEECH_MS,
+            ..test_streaming_input().config
+        });
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        let burst: Vec<i16> = (0..8_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 20_000.0) as i16
+            })
+            .collect();
+        let silence = vec![0_i16; 320];
+        let frames = std::iter::repeat_n(&silence[..], 15)
+            .chain(burst.chunks(320))
+            .chain(std::iter::repeat_n(&silence[..], 30));
+
+        let (mut starts, mut rejections) = (0, 0);
+        for (index, frame) in frames.enumerate() {
+            let result = input
+                .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(frame))
+                .expect("frame");
+            starts += usize::from(result.speech_start.is_some());
+            rejections += usize::from(result.speech_rejected.is_some());
+            assert!(!result.barge_in, "a short burst must not barge in");
+            assert!(result.finalized_utterance.is_none());
+        }
+        assert!(starts >= 1, "the burst must start speech");
+        assert_eq!(rejections, starts, "every start is rejected as noise");
+    }
+
+    /// SPK-F4: a network stall longer than the silence window, followed by
+    /// the delayed but contiguous frames, continues the same utterance. Only
+    /// a client that stops sending for the stall allowance is paused.
+    #[test]
+    fn network_stall_does_not_end_an_utterance() {
+        let mut input = test_streaming_input();
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+        for frame_seq in 1..=10_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        let utterance_id = input.active.as_ref().expect("speech").utterance_id.clone();
+        let silence_ms = u64::from(input.config.silence_duration_ms);
+
+        input.last_frame_at = Some(Instant::now() - Duration::from_millis(silence_ms + 900));
+        assert!(input.on_tick().expect("tick").is_none());
+        for frame_seq in 11..=20_u32 {
+            let result = input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("late frame");
+            assert!(result.speech_start.is_none());
+            assert!(result.finalized_utterance.is_none());
+        }
+        assert_eq!(
+            input.active.as_ref().expect("same utterance").utterance_id,
+            utterance_id
+        );
+
+        input.last_frame_at = Some(
+            Instant::now() - Duration::from_millis(silence_ms + CLIENT_PAUSE_STALL_ALLOWANCE_MS),
+        );
+        let (commit, _, reason) = input
+            .on_tick()
+            .expect("tick")
+            .expect("a client that stopped sending is paused");
+        assert_eq!(commit.utterance_id, utterance_id);
+        assert!(matches!(reason, UtteranceEndReason::ClientPause));
+        // SPK-F6: the endpointing delay a pause reports covers the stall.
+        assert!(
+            commit.endpointing_delay.expect("a pause endpoints")
+                >= Duration::from_millis(silence_ms + CLIENT_PAUSE_STALL_ALLOWANCE_MS)
+        );
+    }
+
+    /// SPK-F6: an utterance ended by silence reports the trailing silence the
+    /// detector waited for; a forced end reports none.
+    #[test]
+    fn silence_endpointing_reports_the_trailing_silence() {
+        let mut input = test_streaming_input();
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+        for frame_seq in 1..=10_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        input.active.as_mut().expect("speech").silence_ms = 240.0;
+        let (commit, _, _) = input
+            .finalize_active_utterance(UtteranceEndReason::Silence)
+            .expect("finalize")
+            .expect("voiced utterance");
+        assert_eq!(commit.endpointing_delay, Some(Duration::from_millis(240)));
+
+        for frame_seq in 11..=20_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        let (commit, _, _) = input
+            .finalize_active_utterance(UtteranceEndReason::MaxDuration)
+            .expect("finalize")
+            .expect("voiced utterance");
+        assert_eq!(commit.endpointing_delay, None);
+    }
+
+    /// SPK-F6: audio sent after the client finished playing what it had is
+    /// an underrun; audio sent while playback still has queued audio is not.
+    #[test]
+    fn playback_clock_counts_drained_playback_as_an_underrun() {
+        let start = Instant::now();
+        let mut clock = PlaybackClock::default();
+        let chunk = Duration::from_millis(200);
+        assert!(!clock.sent(start, chunk), "the first chunk starts playback");
+        assert!(!clock.sent(start + Duration::from_millis(150), chunk));
+        // Queued until 400 ms; arriving within the tolerance is in time.
+        assert!(!clock.sent(start + Duration::from_millis(410), chunk));
+        // Queued until 610 ms; arriving at 700 ms found playback drained.
+        assert!(clock.sent(start + Duration::from_millis(700), chunk));
+        // Playback restarted at 700 ms, so 850 ms is in time again.
+        assert!(!clock.sent(start + Duration::from_millis(850), chunk));
+    }
+
+    /// SPK-F6: the session reaches Speaking once its turn sends audio and
+    /// returns to Listening when the turn ends.
+    #[test]
+    fn session_phase_follows_the_turn_through_speaking() {
+        let mut session = VoiceSession::default();
+        session.start("session");
+        session.begin_listening();
+        session.begin_processing("turn-1");
+
+        follow_turn_phase(&mut session, Some(("turn-1", true, false)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Processing);
+        follow_turn_phase(&mut session, Some(("turn-1", true, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Speaking);
+        assert_eq!(session.active_turn_id(), Some("turn-1"));
+        follow_turn_phase(&mut session, Some(("turn-1", false, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Listening);
+        follow_turn_phase(&mut session, None);
+        assert_eq!(session.phase(), VoiceSessionPhase::Listening);
+
+        // An interrupted or closed session is not moved by its turn.
+        session.begin_processing("turn-2");
+        session.interrupt("barge_in");
+        follow_turn_phase(&mut session, Some(("turn-2", true, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Interrupted);
+        session.close();
+        follow_turn_phase(&mut session, None);
+        assert_eq!(session.phase(), VoiceSessionPhase::Closed);
+    }
+
+    /// SPK-F6: a turn records its response latency at its first audio only,
+    /// and an underrun when it falls behind playback.
+    #[tokio::test]
+    async fn turn_audio_records_first_audio_once_and_underruns() {
+        let runtime = RuntimeService::new(izwi_core::EngineConfig::default()).expect("runtime");
+        let control = TurnControl::new(Instant::now() - Duration::from_millis(300));
+        assert!(!control.is_speaking());
+        control.audio_sent(&runtime, Duration::from_millis(10));
+        assert!(control.is_speaking());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        control.audio_sent(&runtime, Duration::from_millis(10));
+
+        let payload = runtime.telemetry_prometheus().await;
+        let counts = izwi_core::runtime::prometheus::check_histograms(&payload).unwrap();
+        assert_eq!(counts["izwi_voice_turn_first_audio_seconds"], 1);
+        assert!(payload.contains("izwi_voice_audio_egress_underruns_total 1"));
     }
 
     #[test]

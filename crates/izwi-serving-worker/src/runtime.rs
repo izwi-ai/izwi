@@ -1,20 +1,23 @@
 use super::{
     AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
     ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
-    RealtimeTtsStageStream,
+    RealtimeTtsOptions, RealtimeTtsStageStream,
 };
 use async_trait::async_trait;
 use izwi_core::{
     engine::{OutputFinishReason, WorkloadClass},
-    AudioChunk, ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError,
-    GenerationConfig, GenerationParams, GenerationRequest, ModelVariant, RuntimeAsrRealtimeEvent,
-    RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
-    RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition, RuntimeRequestContext,
-    RuntimeService, RuntimeTelemetrySnapshot,
+    resolve_chat_sampling, AudioChunk, ChatGenerationControls, ChatMessage as CoreChatMessage,
+    ChatRequestConfig, ChatRole as CoreChatRole, ChatSamplingRequest, ChatTruncation,
+    Error as CoreError, ErrorKind, GenerationConfig, GenerationParams, GenerationRequest,
+    ModelVariant, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
+    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition,
+    RuntimeHealth, RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
+    CHAT_MAX_TOKENS_UNSET,
 };
 use izwi_serving_protocol::{
-    ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest,
-    RealtimeAudioCodec, RealtimeAudioSpec, RejectionCode, ServiceClass, TaskKind,
+    ChatParameters, ChatResponseFormat, ChatRole, ChatTruncation as WireChatTruncation,
+    FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest, RealtimeAudioCodec,
+    RealtimeAudioSpec, RejectionCode, ServiceClass, TaskKind,
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -55,6 +58,7 @@ pub async fn warm_up_chat_runtime(
             correlation_id: Some("worker-startup-warmup".into()),
             runtime_context,
             streaming: false,
+            max_tokens_ceiling: None,
         })
         .await?;
     let deadline = tokio::time::sleep(timeout);
@@ -149,17 +153,15 @@ impl InvocationExecutor for RuntimeChatExecutor {
         Some(self.runtime.telemetry_snapshot().await)
     }
 
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
+    }
+
     async fn admit(
         &self,
         request: &InvocationRequest,
     ) -> Result<AdmittedInvocation, AdmissionFailure> {
         let InvocationInput::Chat { input, parameters } = &request.input;
-        if parameters.seed.is_some_and(|seed| seed != 0) {
-            return Err(AdmissionFailure::new(
-                RejectionCode::InvalidRequest,
-                "the selected runtime does not expose per-request sampling seeds",
-            ));
-        }
         let messages = input
             .messages
             .iter()
@@ -177,15 +179,9 @@ impl InvocationExecutor for RuntimeChatExecutor {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut params = GenerationParams {
-            max_tokens: request.output_limits.max_tokens as usize,
-            temperature: parameters.temperature.unwrap_or(0.0),
-            top_p: parameters.top_p.unwrap_or(1.0),
-            stop_sequences: parameters.stop.clone(),
-            ..GenerationParams::default()
-        };
-        // Chat defaults are deterministic and do not need audio-generation penalties.
-        params.repetition_penalty = 1.0;
+        let ceiling = request.output_limits.max_tokens as usize;
+        let (params, chat_config, max_tokens_ceiling) =
+            chat_request(self.variant, parameters, ceiling);
         let workload_class = match request.service_class {
             ServiceClass::Realtime => WorkloadClass::Realtime,
             ServiceClass::Interactive if self.streaming => WorkloadClass::Streaming,
@@ -205,10 +201,11 @@ impl InvocationExecutor for RuntimeChatExecutor {
                 variant: self.variant,
                 messages,
                 params,
-                chat_config: Default::default(),
+                chat_config,
                 correlation_id: Some(request.request_id.as_str().to_owned()),
                 runtime_context,
                 streaming: self.streaming,
+                max_tokens_ceiling,
             })
             .await
             .map_err(map_admission_error)?;
@@ -220,6 +217,63 @@ impl InvocationExecutor for RuntimeChatExecutor {
             },
         )))
     }
+}
+
+/// The engine request for one invocation's chat parameters, built the way
+/// the local server builds it: an absent sampling value takes the model
+/// family's profile, else the engine default (`resolve_chat_sampling`).
+/// `ceiling` is the invocation's output limit.
+fn chat_request(
+    variant: ModelVariant,
+    parameters: &ChatParameters,
+    ceiling: usize,
+) -> (GenerationParams, ChatRequestConfig, Option<usize>) {
+    let sampling = resolve_chat_sampling(
+        variant,
+        None,
+        ChatSamplingRequest {
+            temperature: parameters.temperature,
+            top_p: parameters.top_p,
+            top_k: parameters.top_k.map(|top_k| top_k as usize),
+            repetition_penalty: parameters.repetition_penalty,
+            presence_penalty: parameters.presence_penalty,
+        },
+    );
+    // D8 as on the local server: the caller's own budget, or the rest of the
+    // context when it set none, capped at the gateway's ceiling. A gateway
+    // before minor 4 sends no policy; its ceiling is the budget and the
+    // request truncates to fit, as it always did.
+    let (max_tokens, truncation, max_tokens_ceiling) = match parameters.context {
+        Some(context) => (
+            context
+                .max_tokens
+                .map_or(CHAT_MAX_TOKENS_UNSET, |max_tokens| max_tokens as usize),
+            match context.truncation {
+                WireChatTruncation::Disabled => ChatTruncation::Disabled,
+                WireChatTruncation::Auto => ChatTruncation::Auto,
+            },
+            Some(ceiling),
+        ),
+        None => (ceiling, ChatTruncation::Auto, None),
+    };
+    let params = GenerationParams::for_chat(
+        sampling,
+        max_tokens,
+        ChatGenerationControls {
+            seed: parameters.seed,
+            stop: parameters.stop.clone(),
+            logprobs: parameters.logprobs.map(usize::from),
+            constrain_json_object: parameters.response_format
+                == Some(ChatResponseFormat::JsonObject),
+            keep_special_tokens: parameters.skip_special_tokens == Some(false),
+        },
+    );
+    let chat_config = ChatRequestConfig {
+        truncation,
+        tools: parameters.tools.clone(),
+        ..ChatRequestConfig::default()
+    };
+    (params, chat_config, max_tokens_ceiling)
 }
 
 struct RuntimeAdmittedExecution {
@@ -294,30 +348,66 @@ fn map_finish_reason(reason: Option<OutputFinishReason>) -> FinishReason {
     }
 }
 
+/// The rejection a worker sends for a core error kind before it accepts an
+/// invocation. The gateway maps the code through the same error classes as
+/// the local role maps the kind, except where the worker's view differs: a
+/// model the gateway routed here that this worker cannot serve right now
+/// (not found, busy, an internal fault, a missing dependency) is "not
+/// ready", so the gateway tries another worker; a queue timeout is a queue
+/// wait; and a cancellation the client did not ask for means the worker is
+/// draining.
+pub fn admission_rejection_code(kind: ErrorKind) -> RejectionCode {
+    match kind {
+        ErrorKind::InvalidInput => RejectionCode::InvalidRequest,
+        ErrorKind::ContextLengthExceeded => RejectionCode::ContextLengthExceeded,
+        ErrorKind::CapacityExhausted => RejectionCode::CapacityExhausted,
+        ErrorKind::Timeout => RejectionCode::QueueWaitExceeded,
+        ErrorKind::Cancelled => RejectionCode::WorkerDraining,
+        ErrorKind::ModelNotFound
+        | ErrorKind::ModelBusy
+        | ErrorKind::Unavailable
+        | ErrorKind::Internal => RejectionCode::ModelNotReady,
+    }
+}
+
+/// The terminal error code a worker sends for a core error kind after it
+/// accepted an invocation.
+pub fn execution_error_code(kind: ErrorKind) -> InvocationErrorCode {
+    match kind {
+        ErrorKind::InvalidInput | ErrorKind::ContextLengthExceeded => {
+            InvocationErrorCode::InvalidInput
+        }
+        ErrorKind::Timeout => InvocationErrorCode::DeadlineExceeded,
+        ErrorKind::CapacityExhausted | ErrorKind::Unavailable => {
+            InvocationErrorCode::WorkerUnavailable
+        }
+        ErrorKind::ModelNotFound
+        | ErrorKind::ModelBusy
+        | ErrorKind::Cancelled
+        | ErrorKind::Internal => InvocationErrorCode::ExecutionFailed,
+    }
+}
+
+/// The message a gateway shows for `error`: an overflow is OpenAI's bare
+/// explanation, as on the local role; anything else is the error's text.
+fn client_message(error: CoreError) -> String {
+    match error {
+        CoreError::ContextLengthExceeded(message) => message,
+        error => error.to_string(),
+    }
+}
+
 fn map_admission_error(error: CoreError) -> AdmissionFailure {
-    let code = match error {
-        CoreError::Overloaded(_) => RejectionCode::CapacityExhausted,
-        CoreError::Timeout(_) => RejectionCode::QueueWaitExceeded,
-        CoreError::ModelNotFound(_) | CoreError::ModelLoadError(_) => RejectionCode::ModelNotReady,
-        CoreError::Cancelled(_) => RejectionCode::WorkerDraining,
-        CoreError::InvalidInput(_) | CoreError::ConfigError(_) => RejectionCode::InvalidRequest,
-        _ => RejectionCode::ModelNotReady,
-    };
-    AdmissionFailure::new(code, error.to_string())
+    AdmissionFailure::new(
+        admission_rejection_code(error.kind()),
+        client_message(error),
+    )
 }
 
 pub(crate) fn map_execution_error(error: CoreError) -> ExecutionFailure {
-    let code = match error {
-        CoreError::Timeout(_) => InvocationErrorCode::DeadlineExceeded,
-        CoreError::InvalidInput(_) => InvocationErrorCode::InvalidInput,
-        CoreError::Overloaded(_) | CoreError::Backpressure(_) => {
-            InvocationErrorCode::WorkerUnavailable
-        }
-        _ => InvocationErrorCode::ExecutionFailed,
-    };
     ExecutionFailure {
-        code,
-        message: error.to_string(),
+        code: execution_error_code(error.kind()),
+        message: client_message(error),
     }
 }
 
@@ -394,6 +484,10 @@ impl RuntimeRealtimeAsrExecutor {
 impl InvocationExecutor for RuntimeRealtimeAsrExecutor {
     async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
         Some(self.runtime.telemetry_snapshot().await)
+    }
+
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
     }
 
     async fn admit(
@@ -599,6 +693,10 @@ impl InvocationExecutor for RuntimeRealtimeTtsExecutor {
         Some(self.runtime.telemetry_snapshot().await)
     }
 
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
+    }
+
     async fn admit(
         &self,
         _request: &InvocationRequest,
@@ -647,22 +745,26 @@ impl RealtimeStageRunner for RuntimeRealtimeTtsRunner {
     async fn start_tts_stream(
         &self,
         text: String,
+        options: &RealtimeTtsOptions,
         deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, CoreError> {
         let runtime_context =
             RuntimeRequestContext::new(WorkloadClass::Realtime).with_deadline(deadline);
-        let request = GenerationRequest::new(text)
+        let mut request = GenerationRequest::new(text)
             .with_config(GenerationConfig {
                 streaming: true,
                 // Zero mirrors the single-node realtime voice route: audio
                 // token generation is bounded by the model, not a text ceiling.
                 options: GenerationParams {
                     max_tokens: 0,
+                    speaker: options.speaker.clone(),
+                    voice: options.speaker.clone(),
                     ..GenerationParams::default()
                 },
             })
             .with_model_variant(self.variant)
             .with_runtime_context(runtime_context);
+        request.language = options.language.clone();
         // A dropped receiver is the natural cancellation signal: the
         // generation task observes the closed channel and unwinds. The abort
         // handle only backstops a task wedged outside a send.
@@ -718,5 +820,135 @@ impl RealtimeTtsStageStream for RuntimeTtsStageStream {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use izwi_serving_protocol::ChatContextPolicy;
+
+    const VARIANT: ModelVariant = ModelVariant::Lfm2512BInstructGguf;
+
+    /// DP-F2: every minor-4 control reaches the engine request, through the
+    /// same core resolver the local server uses.
+    #[test]
+    fn every_chat_control_reaches_the_engine_request() {
+        let parameters = ChatParameters {
+            temperature: Some(0.5),
+            top_p: Some(0.75),
+            seed: Some(7),
+            stop: vec!["END".into()],
+            top_k: Some(9),
+            repetition_penalty: Some(1.25),
+            presence_penalty: Some(-0.5),
+            logprobs: Some(3),
+            response_format: Some(ChatResponseFormat::JsonObject),
+            context: Some(ChatContextPolicy {
+                max_tokens: Some(16),
+                truncation: WireChatTruncation::Disabled,
+            }),
+            tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
+            skip_special_tokens: Some(false),
+        };
+        let (params, chat_config, ceiling) = chat_request(VARIANT, &parameters, 64);
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (0.5, 0.75, 9)
+        );
+        assert_eq!(
+            (params.repetition_penalty, params.presence_penalty),
+            (1.25, -0.5)
+        );
+        assert_eq!(params.seed, Some(7));
+        assert_eq!(params.stop_sequences, vec!["END".to_string()]);
+        assert!(params.logprobs);
+        assert_eq!(params.top_logprobs, 3);
+        assert!(params.constrain_json_object);
+        assert!(!params.skip_special_tokens);
+        assert_eq!(params.max_tokens, 16);
+        assert_eq!(chat_config.truncation, ChatTruncation::Disabled);
+        assert_eq!(chat_config.tools, parameters.tools);
+        assert_eq!(ceiling, Some(64));
+
+        let expected = GenerationParams::for_chat(
+            resolve_chat_sampling(
+                VARIANT,
+                None,
+                ChatSamplingRequest {
+                    temperature: Some(0.5),
+                    top_p: Some(0.75),
+                    top_k: Some(9),
+                    repetition_penalty: Some(1.25),
+                    presence_penalty: Some(-0.5),
+                },
+            ),
+            16,
+            ChatGenerationControls {
+                seed: Some(7),
+                stop: vec!["END".into()],
+                logprobs: Some(3),
+                constrain_json_object: true,
+                keep_special_tokens: true,
+            },
+        );
+        assert_eq!(format!("{params:?}"), format!("{expected:?}"));
+    }
+
+    /// An absent sampling value takes the model family's profile, as on the
+    /// local server, not greedy decoding; an unset budget under the D8
+    /// policy takes the rest of the context, capped at the ceiling.
+    #[test]
+    fn absent_controls_take_the_local_defaults() {
+        let parameters = ChatParameters {
+            context: Some(ChatContextPolicy {
+                max_tokens: None,
+                truncation: WireChatTruncation::Auto,
+            }),
+            ..ChatParameters::default()
+        };
+        let (params, chat_config, ceiling) = chat_request(VARIANT, &parameters, 64);
+        let profile = resolve_chat_sampling(VARIANT, None, ChatSamplingRequest::default());
+        assert_eq!(
+            (
+                params.temperature,
+                params.top_p,
+                params.top_k,
+                params.repetition_penalty,
+                params.presence_penalty
+            ),
+            (
+                profile.temperature,
+                profile.top_p,
+                profile.top_k,
+                profile.repetition_penalty,
+                profile.presence_penalty
+            )
+        );
+        assert_eq!((params.temperature, params.top_k), (0.1, 50));
+        assert_eq!(params.seed, None);
+        assert!(!params.logprobs && !params.constrain_json_object);
+        assert!(params.skip_special_tokens);
+        assert_eq!(params.max_tokens, CHAT_MAX_TOKENS_UNSET);
+        assert_eq!(chat_config.truncation, ChatTruncation::Auto);
+        assert_eq!(ceiling, Some(64));
+    }
+
+    /// A gateway before minor 4 sends no context policy: its ceiling is the
+    /// budget and the request truncates to fit, as before.
+    #[test]
+    fn a_minor3_gateway_keeps_its_ceiling_budget_and_truncation() {
+        let (params, chat_config, ceiling) = chat_request(VARIANT, &ChatParameters::default(), 64);
+        assert_eq!(params.max_tokens, 64);
+        assert_eq!(chat_config.truncation, ChatTruncation::Auto);
+        assert_eq!(ceiling, None);
+    }
+
+    #[test]
+    fn context_overflow_is_its_own_rejection_code() {
+        let failure = map_admission_error(CoreError::ContextLengthExceeded("too long".into()));
+        assert_eq!(failure.code, RejectionCode::ContextLengthExceeded);
+        // The bare explanation, as the local role reports it.
+        assert_eq!(failure.message, "too long");
     }
 }

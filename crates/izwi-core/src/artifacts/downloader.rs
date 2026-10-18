@@ -27,7 +27,6 @@ use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_compl
 use crate::models::shared::weights::nemo::ensure_free_disk;
 
 const HF_BASE_URL: &str = "https://huggingface.co";
-const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
 pub const ARTIFACT_MANIFEST_FILE: &str = "izwi-artifact.json";
 /// On-disk cache of resolved expected download sizes, so cold starts do not
 /// need a Hugging Face round-trip per catalog variant to render the model
@@ -2367,16 +2366,6 @@ impl ModelDownloader {
         } else {
             10_000_000
         }
-    }
-
-    /// Get estimated file sizes for a model variant (in bytes)
-    /// These are approximate sizes based on model architecture
-    fn get_file_sizes(&self, variant: ModelVariant) -> Vec<u64> {
-        let files = self.get_model_file_specs(variant);
-        files
-            .iter()
-            .map(|file| self.get_single_file_size_estimate(variant, &file.local_file))
-            .collect()
     }
 
     /// Get the on-disk size of a downloaded model, computing it off the async

@@ -1,10 +1,14 @@
 //! Process-level supervisor recovery: a worker that crashes on every start
 //! must be restarted with bounded backoff and then quarantined, never
-//! restarted without bound.
+//! restarted without bound. The run also checks the supervisor's operator
+//! surface: JSON logs, worker output annotated with its worker id, and the
+//! metrics textfile.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use izwi_test_process::ProcessGuard;
 
 #[cfg(unix)]
 #[test]
@@ -20,7 +24,12 @@ fn repeatedly_crashing_worker_is_quarantined() {
     std::fs::create_dir_all(&models).unwrap();
 
     let fake_worker = root.path().join("fake-worker");
-    std::fs::write(&fake_worker, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::write(
+        &fake_worker,
+        "#!/bin/sh\necho 'fake worker stderr line' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let metrics_textfile = root.path().join("supervisor.prom");
     std::fs::set_permissions(&fake_worker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let config = root.path().join("node.toml");
@@ -97,24 +106,27 @@ max_output_tokens = 32
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cpu-worker-binary")
-        .arg(&fake_worker)
-        .arg("--cpu-ids")
-        .arg("0")
-        .arg("--allocatable-host-memory-bytes")
-        .arg("8589934592")
-        .env(
-            "IZWI_SUPERVISOR_RECOVERY_TEST_TOKEN",
-            "recovery-test-secret-1234567890",
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("supervisor should spawn");
+    let mut child = ProcessGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
+            .arg("--config")
+            .arg(&config)
+            .arg("--cpu-worker-binary")
+            .arg(&fake_worker)
+            .arg("--cpu-ids")
+            .arg("0")
+            .arg("--allocatable-host-memory-bytes")
+            .arg("8589934592")
+            .env(
+                "IZWI_SUPERVISOR_RECOVERY_TEST_TOKEN",
+                "recovery-test-secret-1234567890",
+            )
+            .env("IZWI_LOG_FORMAT", "json")
+            .env("IZWI_SUPERVISOR_METRICS_TEXTFILE", &metrics_textfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .expect("supervisor should spawn");
 
     let stderr = child.stderr.take().expect("stderr should be piped");
     let (line_tx, line_rx) = std::sync::mpsc::channel();
@@ -126,14 +138,24 @@ max_output_tokens = 32
 
     let deadline = Instant::now() + Duration::from_secs(25);
     let mut quarantined = false;
+    let mut worker_lines = 0;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match line_rx.recv_timeout(remaining.min(Duration::from_secs(1))) {
-            Ok(line) if line.contains("quarantined") => {
-                quarantined = true;
-                break;
+            Ok(line) if line.starts_with("recovery-test-worker | ") => {
+                assert_eq!(line, "recovery-test-worker | fake worker stderr line");
+                worker_lines += 1;
             }
-            Ok(_) => {}
+            Ok(line) => {
+                let entry: serde_json::Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| panic!("supervisor log line is not JSON: {line}"));
+                let message = entry["message"].as_str().unwrap_or_default();
+                if message.contains("quarantined") {
+                    assert_eq!(entry["level"], "WARN");
+                    quarantined = true;
+                    break;
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Ok(Some(_)) = child.try_wait() {
                     break;
@@ -142,10 +164,33 @@ max_output_tokens = 32
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    // The textfile follows the quarantine within a supervision poll.
+    let metrics_deadline = Instant::now() + Duration::from_secs(5);
+    let metrics = loop {
+        let metrics = std::fs::read_to_string(&metrics_textfile).unwrap_or_default();
+        if metrics.contains("izwi_supervisor_quarantines_total 1")
+            || Instant::now() >= metrics_deadline
+        {
+            break metrics;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let _ = child.kill();
-    let _ = child.wait();
     assert!(
         quarantined,
         "a worker that crashes on every start must be quarantined instead of restarted without bound"
     );
+    assert!(
+        worker_lines >= 1,
+        "worker stderr is relayed with its worker id"
+    );
+    assert!(
+        metrics.contains("izwi_supervisor_quarantines_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("izwi_supervisor_workers_quarantined 1"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("# TYPE izwi_supervisor_launch_attempts_total counter"));
 }

@@ -17,16 +17,81 @@ use super::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use super::config::EngineCoreConfig;
 use super::execution::{
     CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
-    RealtimeStageOutcome, RealtimeSubphase,
+    RealtimeStageOutcome, RealtimeSubphase, ReplayCapability,
 };
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{Priority, RequestId, SequenceId, TaskType};
-use super::{InputRange, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit};
+use super::{
+    InputRange, ModelInstanceId, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit,
+};
 use crate::model::ModelVariant;
 
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL: usize = 8;
 pub(super) const MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE: usize = 8;
+/// Least common multiple of the workload weights: one class service unit is
+/// worth `CLASS_VIRTUAL_TIME_UNITS / weight` units of weighted virtual time.
+const CLASS_VIRTUAL_TIME_UNITS: u64 = 120;
+/// Lost prefix cursors after which a request stops re-probing the managed
+/// prefix index and prefills from zero, so pages evicted between every probe
+/// and its prepare cannot replan the same request forever.
+const MAX_MANAGED_PREFIX_CURSOR_LOSSES: u8 = 2;
+
+/// Capacity replays after which a request is no longer chosen as a replay
+/// victim, so one request cannot be suspended over and over; once no
+/// replayable victim is left the claim-deadlock breaker decides.
+const MAX_CAPACITY_REPLAYS: u8 = 3;
+
+/// Schedule-time managed prefix probe for one exact session: the cursor its
+/// first prefill span may start at, or `None` for a zero-start prefill.
+pub(crate) type ManagedPrefixProbe<'a> = dyn FnMut(&SessionKey) -> Option<u32> + 'a;
+
+/// The execution lane of a request: the loaded model instance it is bound
+/// to. Rows with no bound instance share the unbound lane (`None`).
+pub(crate) type ExecutionLane = Option<ModelInstanceId>;
+
+/// What one step driver serves: `None` is the whole engine (the single
+/// step driver), `Some(lane)` one lane's step driver.
+pub(crate) type LaneScope = Option<ExecutionLane>;
+
+/// The lanes one schedule may serve. A lane with a dispatch in flight is
+/// busy: none of its rows is scheduled until that dispatch commits or rolls
+/// back, so its decode rows cannot be planned twice. Other lanes schedule
+/// as usual.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaneSelection {
+    only: Option<ExecutionLane>,
+    busy: HashSet<ExecutionLane>,
+}
+
+impl LaneSelection {
+    /// Every lane.
+    pub(crate) fn all() -> Self {
+        Self::default()
+    }
+
+    /// The lanes `scope` serves.
+    pub(crate) fn scoped(scope: LaneScope) -> Self {
+        Self {
+            only: scope,
+            busy: HashSet::new(),
+        }
+    }
+
+    /// This selection without `busy` lanes.
+    pub(crate) fn excluding(mut self, busy: impl IntoIterator<Item = ExecutionLane>) -> Self {
+        self.busy.extend(busy);
+        self
+    }
+
+    pub(crate) fn admits(&self, lane: ExecutionLane) -> bool {
+        self.only.is_none_or(|only| only == lane) && !self.busy.contains(&lane)
+    }
+
+    fn is_unrestricted(&self) -> bool {
+        self.only.is_none() && self.busy.is_empty()
+    }
+}
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -55,8 +120,6 @@ pub struct SchedulerConfig {
     pub chunked_prefill_threshold: usize,
     /// Defer lower-priority decode while a higher-priority request is waiting.
     pub enable_preemption: bool,
-    /// Enable VAD-triggered preemption (for audio interruption handling)
-    pub enable_vad_preemption: bool,
     /// Enable adaptive, latency-aware batching heuristics.
     pub enable_adaptive_batching: bool,
     /// Minimum token budget for adaptive scheduling.
@@ -87,17 +150,12 @@ pub struct SchedulerConfig {
     pub enable_decode_quanta: bool,
     /// Maximum decode tokens per request in one scheduler step.
     pub max_decode_tokens_per_request: usize,
-}
-
-/// VAD preemption event - signals that user started speaking.
-#[derive(Debug, Clone)]
-pub struct VadPreemptionEvent {
-    /// Timestamp of the VAD detection
-    pub timestamp: Instant,
-    /// Speech probability from VAD
-    pub speech_probability: f32,
-    /// Request IDs that should be preempted (currently generating requests)
-    pub requests_to_preempt: Vec<RequestId>,
+    /// Physical dispatches the core launches per step (its candidate
+    /// dispatch limit). Decode selection never needs more.
+    pub physical_dispatch_limit: usize,
+    /// Rows one dispatch of an unbatched decode stage holds: the physical
+    /// launch limit, which is one unless launches run concurrently.
+    pub unbatched_dispatch_rows: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -109,7 +167,6 @@ impl Default for SchedulerConfig {
             enable_chunked_prefill: false,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
-            enable_vad_preemption: true,
             enable_adaptive_batching: false,
             min_tokens_per_step: 96,
             target_ttft_ms: 250.0,
@@ -125,12 +182,15 @@ impl Default for SchedulerConfig {
             power_save_mode: false,
             enable_decode_quanta: false,
             max_decode_tokens_per_request: 2,
+            physical_dispatch_limit: 1,
+            unbatched_dispatch_rows: 1,
         }
     }
 }
 
 impl From<&EngineCoreConfig> for SchedulerConfig {
     fn from(config: &EngineCoreConfig) -> Self {
+        let capacity = config.resolved_physical_execution_capacity();
         Self {
             max_batch_size: config.max_batch_size,
             max_tokens_per_step: config.max_tokens_per_step,
@@ -138,7 +198,6 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             enable_chunked_prefill: config.effective_chunked_prefill(),
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
-            enable_vad_preemption: true, // Default to enabled for audio apps
             enable_adaptive_batching: config.enable_adaptive_batching,
             min_tokens_per_step: config.min_tokens_per_step,
             target_ttft_ms: config.target_ttft_ms,
@@ -154,6 +213,8 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             power_save_mode: config.power_save_mode,
             enable_decode_quanta: config.enable_decode_quanta,
             max_decode_tokens_per_request: config.max_decode_tokens_per_request,
+            physical_dispatch_limit: capacity.candidate_dispatch_limit.get(),
+            unbatched_dispatch_rows: capacity.physical_launch_limit.get(),
         }
     }
 }
@@ -318,8 +379,6 @@ pub struct SchedulerTelemetry {
     pub dynamic_tokens_per_step: usize,
     /// Current adaptive prefill chunk threshold.
     pub dynamic_prefill_chunk_threshold: usize,
-    /// Exponential moving average of prefill chunk backoff pressure.
-    pub prefill_backoff_ewma: f64,
 }
 
 impl SchedulerTelemetry {
@@ -331,7 +390,6 @@ impl SchedulerTelemetry {
             avg_queue_age_ms: 0.0,
             dynamic_tokens_per_step: default_budget.max(1),
             dynamic_prefill_chunk_threshold: default_chunk,
-            prefill_backoff_ewma: 0.0,
         }
     }
 
@@ -387,8 +445,24 @@ pub struct Scheduler {
     telemetry: SchedulerTelemetry,
     /// Completed scheduling quanta by workload class for weighted service.
     class_service: HashMap<WorkloadClass, u64>,
+    /// Classes that held waiting or running work at the last schedule.
+    active_service_classes: HashSet<WorkloadClass>,
+    /// Weighted virtual time reached by every active class; never decreases.
+    class_virtual_floor: u64,
     tenant_service: HashMap<TenantServiceKey, TenantService>,
     tenant_service_floor: HashMap<WorkloadClass, u64>,
+    /// Starvation debts of the whole engine, read by the single step driver.
+    debts: StarvationDebts,
+    /// Starvation debts of each lane, read by that lane's step driver. Both
+    /// are kept on every commit; a lane is absent while it owes nothing.
+    lane_debts: HashMap<ExecutionLane, StarvationDebts>,
+    /// Committed non-realtime quanta, stamped on each row they served.
+    service_clock: u64,
+}
+
+/// Bounded-starvation guards, counted over committed transactions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StarvationDebts {
     /// Decode-only transactions observed while an indivisible full prefill was
     /// waiting. This bounds starvation without pretending that a Full adapter
     /// can safely resume a scheduler-authored chunk.
@@ -397,10 +471,12 @@ pub struct Scheduler {
     /// scheduler slot. Unlike a full prefill, one incremental span can share
     /// the transaction once this bounded wait expires.
     decode_only_steps_with_waiting_incremental_prefill: usize,
-    /// Transactions in which realtime rows consumed every decode slot while an
-    /// ordinary decode row was ready. One ordinary slot is reserved once this
-    /// bounded debt is reached.
+    /// Committed decode transactions that served only realtime rows while an
+    /// ordinary decode row was ready. Once this bounded debt is reached the
+    /// next decode transaction is left to ordinary rows.
     realtime_only_steps_with_ready_decode: usize,
+    /// Committed decode transactions that served only codec or finalization
+    /// rows while an AR decode row was ready; bounded the same way.
     audio_only_steps_with_ready_decode: usize,
 }
 
@@ -525,6 +601,7 @@ struct RequestMetadata {
     sequence_id: SequenceId,
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
+    lane: ExecutionLane,
     priority: Priority,
     workload_class: WorkloadClass,
     tenant_key: Option<[u8; 32]>,
@@ -537,6 +614,9 @@ struct RequestMetadata {
     retry_not_before: Option<Instant>,
     replay_prompt_tokens: Option<usize>,
     capacity_blocked_on: Option<SessionKey>,
+    /// Capacity replays this request has been through; at
+    /// `MAX_CAPACITY_REPLAYS` it is no longer chosen as a replay victim.
+    capacity_replays: u8,
     /// Retained per-session bound after a pre-execution workspace rejection.
     workspace_prefill_token_cap: Option<usize>,
     /// DS1.2b: declared `CommittedSnapshots` interval of the loaded contract.
@@ -551,11 +631,14 @@ struct RequestMetadata {
     /// The prompt's first-turn (system prompt) boundary, clipped like the
     /// history boundary so requests sharing only a system prompt can attach.
     managed_preamble_boundary: Option<u32>,
-    /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
-    /// are already resident (shared pages plus a forked tensor snapshot), so
-    /// the first prefill span starts here instead of zero. `None` means a
-    /// conventional zero-start prefill.
+    /// DS1.5: managed prefix cursor, probed at admission and again when a
+    /// resumable prefill is selected before any progress (SCH-F7). Tokens
+    /// below this cursor are already resident (shared pages plus a forked
+    /// tensor snapshot), so the first prefill span starts here instead of
+    /// zero. `None` means a conventional zero-start prefill.
     managed_prefix_cursor: Option<u32>,
+    /// Probed cursors this request lost before prepare could attach them.
+    managed_prefix_cursor_losses: u8,
 }
 
 impl RequestMetadata {
@@ -572,6 +655,8 @@ struct RequestCachePolicy {
     decode_batch: NativeBatchMode,
     recompute_safe: bool,
     cache_release_safe: bool,
+    /// The loaded family rebuilds a released session by replaying its tokens.
+    token_replay: bool,
     preferred_decode_tokens: usize,
     sustained_decode_quantum: bool,
     /// DS9.4: the loaded model can run shared speculative envelopes, so
@@ -580,6 +665,12 @@ struct RequestCachePolicy {
     speculative_decode_batch: bool,
     /// Model-preferred prefill span for an isolated request (0: none).
     preferred_prefill_tokens: usize,
+    /// Decode rows one physical dispatch of this model holds; `None` until
+    /// the loaded profile is installed, which leaves selection unclamped.
+    decode_dispatch_rows: Option<usize>,
+    /// Phase 3a: prefill spans run in the same mixed dispatch as decode rows
+    /// (always resumable), sharing its rows and one token budget.
+    mixed_step: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -592,20 +683,29 @@ impl Default for RequestCachePolicy {
             decode_batch: NativeBatchMode::None,
             recompute_safe: false,
             cache_release_safe: false,
+            token_replay: false,
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
             preferred_prefill_tokens: 0,
+            decode_dispatch_rows: None,
+            mixed_step: false,
         }
     }
 }
 
-impl RequestCachePolicy {}
+/// Decode rows that can share one physical dispatch: the same loaded model,
+/// task and native decode batching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeDispatchKey {
+    model_variant: Option<ModelVariant>,
+    task_type: TaskType,
+    decode_batch: NativeBatchMode,
+}
 
 /// State for a running request.
 #[derive(Debug, Clone)]
 struct RunningRequest {
-    request_id: RequestId,
     sequence_id: SequenceId,
     /// Number of tokens processed so far (prompt + generated)
     num_tokens_processed: usize,
@@ -627,12 +727,19 @@ struct RunningRequest {
     incremental_prefill_quanta_committed: usize,
     /// Priority of this request
     priority: Priority,
-    /// Coarse latency/throughput class for this request.
-    workload_class: WorkloadClass,
     /// Whether this request has produced its first output token.
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
     paused: bool,
+    /// Service clock of this request's last committed quantum or
+    /// capacity-withheld turn; decode rotates through equal-priority rows by
+    /// it (0: never served).
+    last_service: u64,
+    /// A resumable atomic prefill (a long-form ASR job) just committed one
+    /// operation: its next operation waits until another ready prompt has
+    /// taken a prefill slot, so a long job does not hold new requests until
+    /// it ends.
+    yield_prefill_to_waiting: bool,
 }
 
 impl Scheduler {
@@ -654,12 +761,13 @@ impl Scheduler {
             next_realtime_service_clock: 1,
             telemetry,
             class_service: HashMap::new(),
+            active_service_classes: HashSet::new(),
+            class_virtual_floor: 0,
             tenant_service: HashMap::new(),
             tenant_service_floor: HashMap::new(),
-            decode_only_steps_with_waiting_full_prefill: 0,
-            decode_only_steps_with_waiting_incremental_prefill: 0,
-            realtime_only_steps_with_ready_decode: 0,
-            audio_only_steps_with_ready_decode: 0,
+            debts: StarvationDebts::default(),
+            lane_debts: HashMap::new(),
+            service_clock: 0,
         }
     }
 
@@ -720,6 +828,7 @@ impl Scheduler {
             sequence_id,
             task_type: request.task_type,
             model_variant: request.model_variant,
+            lane: request.model_instance_id(),
             priority: request.priority,
             workload_class: request.workload_class,
             tenant_key: request.tenant_key,
@@ -736,22 +845,15 @@ impl Scheduler {
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
-            workspace_prefill_token_cap: request.execution_adapter_binding().and_then(|binding| {
-                binding
-                    .stages
-                    .iter()
-                    .filter(|stage| {
-                        stage.selector == crate::engine::StageWorkSelector::SequencePrefill
-                    })
-                    .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
-                    .min()
-            }),
+            capacity_replays: 0,
+            workspace_prefill_token_cap: loaded_prefill_token_cap(request),
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
             managed_snapshot_boundary: request.managed_snapshot_boundary(),
             managed_preamble_boundary: request.managed_preamble_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
+            managed_prefix_cursor_losses: 0,
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -787,6 +889,7 @@ impl Scheduler {
                 sequence_id,
                 task_type: request.task_type,
                 model_variant: request.model_variant,
+                lane: request.model_instance_id(),
                 priority: request.priority,
                 workload_class: request.workload_class,
                 tenant_key: request.tenant_key,
@@ -799,32 +902,20 @@ impl Scheduler {
                 retry_not_before: None,
                 replay_prompt_tokens: None,
                 capacity_blocked_on: None,
-                workspace_prefill_token_cap: request.execution_adapter_binding().and_then(
-                    |binding| {
-                        binding
-                            .stages
-                            .iter()
-                            .filter(|stage| {
-                                stage.selector == crate::engine::StageWorkSelector::SequencePrefill
-                            })
-                            .map(|stage| {
-                                usize::try_from(stage.max_work_units).unwrap_or(usize::MAX)
-                            })
-                            .min()
-                    },
-                ),
+                capacity_replays: 0,
+                workspace_prefill_token_cap: loaded_prefill_token_cap(request),
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
                 managed_snapshot_boundary: request.managed_snapshot_boundary(),
                 managed_preamble_boundary: request.managed_preamble_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
+                managed_prefix_cursor_losses: 0,
             },
         );
         self.running.insert(
             request.id.clone(),
             RunningRequest {
-                request_id: request.id.clone(),
                 sequence_id,
                 num_tokens_processed: 0,
                 num_tokens_generated: 0,
@@ -837,9 +928,10 @@ impl Scheduler {
                 finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: request.priority,
-                workload_class: request.workload_class,
                 first_token_emitted: false,
                 paused: false,
+                last_service: 0,
+                yield_prefill_to_waiting: false,
             },
         );
         let initial_service_clock = self.next_realtime_service_clock.saturating_sub(1);
@@ -958,6 +1050,11 @@ impl Scheduler {
         if metadata.sequence_id != session.epoch {
             return false;
         }
+        let decode_dispatch_rows = if profile.decode_batch == NativeBatchMode::None {
+            self.config.unbatched_dispatch_rows
+        } else {
+            profile.max_batch_size
+        };
         metadata.cache_policy = RequestCachePolicy {
             mode: Some(profile.cache_mode),
             // Only an explicit incremental contract is scheduler-resumable.
@@ -971,10 +1068,13 @@ impl Scheduler {
             decode_batch: profile.decode_batch,
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
+            token_replay: profile.replay == ReplayCapability::TokenReplay,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
             speculative_decode_batch: profile.speculative_decode_batch,
             preferred_prefill_tokens: profile.preferred_prefill_tokens,
+            decode_dispatch_rows: Some(decode_dispatch_rows.max(1)),
+            mixed_step: profile.mixed_step && profile.prefill == PrefillMode::Incremental,
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -1039,30 +1139,78 @@ impl Scheduler {
 
     /// Schedule requests for the next step.
     pub fn schedule(&mut self) -> ScheduleResult {
+        self.schedule_inner(None, &LaneSelection::all())
+    }
+
+    /// [`Self::schedule`] for the rows of `lanes` only, re-probing the
+    /// managed prefix index for every resumable prefill selected before it
+    /// has made progress (SCH-F7).
+    pub(crate) fn schedule_with_prefix_probe(
+        &mut self,
+        probe: &mut ManagedPrefixProbe<'_>,
+        lanes: &LaneSelection,
+    ) -> ScheduleResult {
+        self.schedule_inner(Some(probe), lanes)
+    }
+
+    /// Whether `lanes` admits the request's lane.
+    fn lane_admits(&self, lanes: &LaneSelection, request_id: &RequestId) -> bool {
+        lanes.is_unrestricted()
+            || self
+                .requests
+                .get(request_id)
+                .is_some_and(|metadata| lanes.admits(metadata.lane))
+    }
+
+    /// Waiting requests in `lanes`.
+    fn waiting_in(&self, lanes: &LaneSelection) -> usize {
+        if lanes.is_unrestricted() {
+            return self.waiting_count();
+        }
+        self.waiting_members
+            .iter()
+            .filter(|request_id| self.lane_admits(lanes, request_id))
+            .count()
+    }
+
+    fn schedule_inner(
+        &mut self,
+        mut prefix_probe: Option<&mut ManagedPrefixProbe<'_>>,
+        lanes: &LaneSelection,
+    ) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
         self.refresh_tenant_service();
+        self.refresh_class_service();
         let scheduling_now = Instant::now();
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
 
         let total_budget = self.current_token_budget();
-        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now);
+        let debts = self.debts(lanes.only);
+        let waiting_in_lanes = self.waiting_in(lanes);
+        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now, lanes);
         let force_full_prefill_service = waiting_full_prefill
-            && self.decode_only_steps_with_waiting_full_prefill
+            && debts.decode_only_steps_with_waiting_full_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL;
-        let waiting_incremental_prefill = self.has_eligible_incremental_prefill(scheduling_now);
+        let waiting_incremental_prefill =
+            self.has_eligible_incremental_prefill(scheduling_now, lanes);
         let force_incremental_prefill_service = !force_full_prefill_service
             && waiting_incremental_prefill
-            && self.decode_only_steps_with_waiting_incremental_prefill
+            && debts.decode_only_steps_with_waiting_incremental_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL;
-        let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
+        let latency_sensitive_waiting = self.has_latency_sensitive_waiting(lanes);
         let throughput_waiting_only =
-            !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
+            !latency_sensitive_waiting && self.has_throughput_or_background_waiting(lanes);
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
-        if self.config.enable_adaptive_batching && total_budget > 0 {
+        // When every live request runs mixed steps, prefill spans share the
+        // decode dispatch: decode rows take their tokens first and prefill
+        // spans the rest of one budget, so no slice is reserved for a slot
+        // the phases no longer contend for.
+        let unified_budget = self.all_requests_mixed(lanes);
+        if !unified_budget && self.config.enable_adaptive_batching && total_budget > 0 {
             let target_ttft_ms = self.config.target_ttft_ms;
             let mut prefill_share: f64 = if self.telemetry.avg_ttft_ms > target_ttft_ms {
                 0.55
@@ -1083,8 +1231,9 @@ impl Scheduler {
             reserved_prefill_budget = ((total_budget as f64) * prefill_share) as usize;
             reserved_prefill_budget = reserved_prefill_budget.clamp(1, total_budget);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
-        } else if self.config.policy == SchedulingPolicy::WeightedFair
-            && !self.waiting_members.is_empty()
+        } else if !unified_budget
+            && self.config.policy == SchedulingPolicy::WeightedFair
+            && waiting_in_lanes > 0
             && total_budget > 0
         {
             reserved_prefill_budget = total_budget.clamp(1, 32);
@@ -1113,20 +1262,12 @@ impl Scheduler {
         }
         let mut remaining_decode_budget = decode_budget;
 
-        let ordinary_decode_ready = self.running.iter().any(|(request_id, running)| {
-            if !running.prefill_complete || self.realtime_sessions.contains_key(request_id) {
-                return false;
-            }
-            self.requests.get(request_id).is_some_and(|metadata| {
-                metadata
-                    .retry_not_before
-                    .is_none_or(|not_before| not_before <= scheduling_now)
-                    && metadata.max_tokens > running.num_tokens_generated
-            })
-        });
-        let reserve_ordinary_decode = ordinary_decode_ready
-            && self.realtime_only_steps_with_ready_decode
-                >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+        // Realtime and ordinary rows never share a physical batch, and the
+        // core launches the first-formed lane. Once committed realtime-only
+        // transactions reach the bound, yield this transaction entirely.
+        let reserve_ordinary_decode = debts.realtime_only_steps_with_ready_decode
+            >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE
+            && self.ordinary_decode_ready(scheduling_now, false, lanes);
 
         // Realtime operations are already admitted, session-fenced quanta.
         // Schedule at most one FIFO head per session and keep their source
@@ -1136,7 +1277,10 @@ impl Scheduler {
             .realtime_sessions
             .iter()
             .filter_map(|(request_id, state)| {
-                (state.in_flight.is_none() && !state.pending.is_empty()).then_some((
+                (state.in_flight.is_none()
+                    && !state.pending.is_empty()
+                    && self.lane_admits(lanes, request_id))
+                .then_some((
                     state.last_service_clock,
                     state.sequence_id,
                     request_id.clone(),
@@ -1148,7 +1292,7 @@ impl Scheduler {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
-            if reserve_ordinary_decode && (remaining_batch <= 1 || remaining_decode_budget <= 1) {
+            if reserve_ordinary_decode {
                 break;
             }
             let Some(state) = self.realtime_sessions.get_mut(&request_id) else {
@@ -1188,23 +1332,11 @@ impl Scheduler {
         // Finalization is a distinct, cache-free model stage. Schedule it
         // ahead of ordinary decode so a completed acoustic row cannot consume
         // another decoder quantum or be stranded by its output-token ceiling.
-        let ready_ordinary_decode = self.running.iter().any(|(id, running)| {
-            running.prefill_complete
-                && !running.finalize_pending
-                && running.audio_decode_pending.is_none()
-                && !self.realtime_sessions.contains_key(id)
-                && self.requests.get(id).is_some_and(|metadata| {
-                    running.num_tokens_generated < metadata.max_tokens
-                        && !self.capacity_waiting(metadata)
-                        && metadata
-                            .retry_not_before
-                            .is_none_or(|until| until <= scheduling_now)
-                })
-        });
-        // At width one a sustained supply of codec work must still leave a
-        // bounded opportunity for AR to refill other streams' audio buffers.
-        let reserve_ordinary_decode =
-            ready_ordinary_decode && self.audio_only_steps_with_ready_decode >= 4;
+        // A sustained supply of codec work must still leave a bounded
+        // opportunity for AR to refill other streams' audio buffers. Codec and
+        // AR rows form separate lanes, so the reserved transaction is AR-only.
+        let reserve_ordinary_decode = debts.audio_only_steps_with_ready_decode >= 4
+            && self.ordinary_decode_ready(scheduling_now, true, lanes);
         let mut finalize_candidates = self
             .running
             .iter()
@@ -1213,6 +1345,7 @@ impl Scheduler {
                     && !running.finalize_in_flight
                     && !running.audio_decode_in_flight
                     && !self.realtime_sessions.contains_key(*id)
+                    && self.lane_admits(lanes, id)
             })
             .filter_map(|(id, running)| {
                 let metadata = self.requests.get(id)?;
@@ -1254,8 +1387,8 @@ impl Scheduler {
                 finalize_candidates.remove(0);
             if remaining_batch == 0
                 || remaining_decode_budget == 0
-                || (remaining_batch <= 1
-                    && (force_incremental_prefill_service || reserve_ordinary_decode))
+                || reserve_ordinary_decode
+                || (remaining_batch <= 1 && force_incremental_prefill_service)
             {
                 break;
             }
@@ -1297,7 +1430,9 @@ impl Scheduler {
             .filter(|(_, r)| {
                 r.prefill_complete && !r.finalize_pending && r.audio_decode_pending.is_none()
             })
-            .filter(|(id, _)| !self.realtime_sessions.contains_key(*id))
+            .filter(|(id, _)| {
+                !self.realtime_sessions.contains_key(*id) && self.lane_admits(lanes, id)
+            })
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
                 if self.capacity_waiting(metadata) {
@@ -1329,6 +1464,7 @@ impl Scheduler {
                     metadata.cache_policy.preferred_decode_tokens,
                     metadata.cache_policy.sustained_decode_quantum,
                     metadata.cache_policy.speculative_decode_batch,
+                    r.last_service,
                 ))
             })
             .collect();
@@ -1336,10 +1472,13 @@ impl Scheduler {
         if self.config.enable_adaptive_batching
             && self.config.policy != SchedulingPolicy::WeightedFair
         {
-            // Favor overdue requests first, then requests close to completion.
+            // Favor overdue requests first, rotating among them by last
+            // service, then requests close to completion.
             decode_candidates.sort_by(|a, b| {
-                b.8.partial_cmp(&a.8)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                (b.8 > 0.0)
+                    .cmp(&(a.8 > 0.0))
+                    .then_with(|| a.13.cmp(&b.13))
+                    .then_with(|| b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| b.6.cmp(&a.6))
                     .then_with(|| {
                         b.7.adaptive_score_boost()
@@ -1351,46 +1490,76 @@ impl Scheduler {
                     .then_with(|| a.5.cmp(&b.5))
             });
         } else if self.config.policy == SchedulingPolicy::WeightedFair {
-            let mut simulated_service = self.class_service.clone();
-            let mut simulated_tenants = self.tenant_service.clone();
-            let mut fair_order = Vec::with_capacity(decode_candidates.len());
-            while !decode_candidates.is_empty() {
-                let next_index = (0..decode_candidates.len())
-                    .min_by(|left, right| {
-                        let a = &decode_candidates[*left];
-                        let b = &decode_candidates[*right];
-                        Self::compare_class_service_with(&simulated_service, a.7, b.7)
-                            .then_with(|| {
-                                self.compare_tenant_service_with(&simulated_tenants, &a.0, &b.0)
-                            })
-                            .then_with(|| b.2.cmp(&a.2))
-                            .then_with(|| {
-                                b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .then_with(|| a.1.cmp(&b.1))
-                    })
-                    .unwrap_or(0);
-                let candidate = decode_candidates.remove(next_index);
-                let next_service = simulated_service
-                    .get(&candidate.7)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(1);
-                simulated_service.insert(candidate.7, next_service);
-                if let Some(metadata) = self.requests.get(&candidate.0) {
-                    let service = simulated_tenants
-                        .entry((metadata.workload_class, metadata.tenant_key))
-                        .or_default();
-                    service.units = service.units.saturating_add(1);
-                    service.last_selected = self.next_plan_id;
-                }
-                fair_order.push(candidate);
+            // Repeatedly take the row whose workload class, then tenant, has
+            // the least simulated service, and charge that group one unit.
+            // Rows of one (class, tenant) group always compare by their own
+            // keys, so the rows are sorted once and only each group's head
+            // competes: O(R log R + R*G) for R rows in G groups, instead of
+            // a selection sort over every row (SCH-F9).
+            decode_candidates.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| a.13.cmp(&b.13))
+                    .then_with(|| b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let mut groups: Vec<(TenantServiceKey, TenantService, VecDeque<usize>)> = Vec::new();
+            let mut group_of = HashMap::<TenantServiceKey, usize>::new();
+            for (row, candidate) in decode_candidates.iter().enumerate() {
+                let key = self
+                    .requests
+                    .get(&candidate.0)
+                    .map_or((candidate.7, None), |metadata| {
+                        (metadata.workload_class, metadata.tenant_key)
+                    });
+                let group = *group_of.entry(key).or_insert_with(|| {
+                    groups.push((
+                        key,
+                        self.tenant_service.get(&key).copied().unwrap_or_default(),
+                        VecDeque::new(),
+                    ));
+                    groups.len() - 1
+                });
+                groups[group].2.push_back(row);
             }
-            decode_candidates = fair_order;
+            let mut simulated_service = groups
+                .iter()
+                .map(|(key, _, _)| {
+                    (
+                        key.0,
+                        self.class_service.get(&key.0).copied().unwrap_or_default(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut fair_order = Vec::with_capacity(decode_candidates.len());
+            while let Some(next) = (0..groups.len())
+                .filter(|group| !groups[*group].2.is_empty())
+                .min_by(|left, right| {
+                    let (a, b) = (&groups[*left], &groups[*right]);
+                    Self::compare_class_service_with(&simulated_service, a.0 .0, b.0 .0)
+                        .then_with(|| self.compare_tenant_entries(a.1, b.1))
+                        .then_with(|| a.2[0].cmp(&b.2[0]))
+                })
+            {
+                let (key, service, rows) = &mut groups[next];
+                fair_order.push(rows.pop_front().expect("only non-empty groups compete"));
+                let class_service = simulated_service.entry(key.0).or_default();
+                *class_service = class_service.saturating_add(1);
+                service.units = service.units.saturating_add(1);
+                service.last_selected = self.next_plan_id;
+            }
+            let mut rows = decode_candidates.into_iter().map(Some).collect::<Vec<_>>();
+            decode_candidates = fair_order
+                .into_iter()
+                .map(|row| rows[row].take().expect("each row is ordered once"))
+                .collect();
         } else {
             decode_candidates.sort_by(|a, b| match self.config.policy {
-                SchedulingPolicy::FCFS => a.1.cmp(&b.1),
-                SchedulingPolicy::Priority => b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)),
+                SchedulingPolicy::FCFS => a.13.cmp(&b.13).then_with(|| a.1.cmp(&b.1)),
+                SchedulingPolicy::Priority => {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.13.cmp(&b.13))
+                        .then_with(|| a.1.cmp(&b.1))
+                }
                 SchedulingPolicy::WeightedFair => Ordering::Equal,
             });
         }
@@ -1398,10 +1567,16 @@ impl Scheduler {
         let highest_waiting_priority = self
             .waiting_members
             .iter()
+            .filter(|request_id| self.lane_admits(lanes, request_id))
             .filter_map(|request_id| self.requests.get(request_id).map(|m| m.priority))
             .max();
-        let effective_prefill_chunk_threshold =
-            self.effective_prefill_chunk_threshold(has_decode_demand);
+        let effective_prefill_chunk_threshold = self.effective_prefill_chunk_threshold();
+        // The core launches at most `physical_dispatch_limit` dispatches per
+        // step, each holding one model's rows up to its dispatch width. A row
+        // that would need a further dispatch waits for a later step instead
+        // of beginning a plan the core can only roll back; the rotation by
+        // last service then reaches it (SCH-F2).
+        let mut decode_dispatches: Vec<(DecodeDispatchKey, usize, usize)> = Vec::new();
 
         for (
             request_id,
@@ -1417,6 +1592,7 @@ impl Scheduler {
             preferred_decode_tokens,
             sustained_decode_quantum,
             speculative_decode_batch,
+            _last_service,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1431,16 +1607,50 @@ impl Scheduler {
                 break;
             }
             if self.config.policy == SchedulingPolicy::WeightedFair
-                && !self.waiting_members.is_empty()
+                && waiting_in_lanes > 0
                 && remaining_batch <= 1
             {
                 break;
+            }
+            let dispatch = self.requests.get(&request_id).and_then(|metadata| {
+                let rows = metadata.cache_policy.decode_dispatch_rows?;
+                let key = DecodeDispatchKey {
+                    model_variant: metadata.model_variant,
+                    task_type: metadata.task_type,
+                    decode_batch: metadata.cache_policy.decode_batch,
+                };
+                Some((key, rows))
+            });
+            let dispatch_slot = match &dispatch {
+                Some((key, _)) => {
+                    let open = decode_dispatches
+                        .iter()
+                        .position(|(open, used, rows)| open == key && used < rows);
+                    match open {
+                        Some(index) => Some(index),
+                        None if decode_dispatches.len() < self.config.physical_dispatch_limit => {
+                            Some(decode_dispatches.len())
+                        }
+                        None => continue,
+                    }
+                }
+                None => None,
+            };
+            // A mixed dispatch keeps its last row for a waiting prefill span,
+            // as the weighted-fair split keeps one row of the step.
+            if unified_budget && waiting_incremental_prefill {
+                if let (Some((_, rows)), Some(index)) = (&dispatch, dispatch_slot) {
+                    let used = decode_dispatches.get(index).map_or(0, |open| open.1);
+                    if *rows > 1 && used + 1 >= *rows {
+                        continue;
+                    }
+                }
             }
 
             let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
                 remaining_decode_tokens,
-                self.waiting_count() > 0,
+                waiting_in_lanes > 0,
                 overdue_ms,
                 workload_class,
                 preferred_decode_tokens,
@@ -1451,12 +1661,18 @@ impl Scheduler {
             if num_tokens == 0 {
                 continue;
             }
+            if let (Some((key, rows)), Some(index)) = (dispatch, dispatch_slot) {
+                match decode_dispatches.get_mut(index) {
+                    Some((_, used, _)) => *used += 1,
+                    None => decode_dispatches.push((key, 1, rows)),
+                }
+            }
 
             let quantum_reason = if num_tokens > 1 {
                 "model_preference"
             } else if remaining_decode_budget <= 1 || remaining_decode_tokens <= 1 {
                 "token_budget"
-            } else if self.waiting_count() > 0 || self.running.len() > 1 {
+            } else if waiting_in_lanes > 0 || self.running.len() > 1 {
                 "peer_fairness"
             } else if overdue_ms > 0.0 && !sustained_decode_quantum {
                 "soft_deadline"
@@ -1504,33 +1720,6 @@ impl Scheduler {
             self.record_scheduled_service(&request_id, num_tokens);
         }
 
-        let served_realtime = result.decode_requests.iter().any(|row| {
-            matches!(
-                &row.work,
-                WorkUnit::RealtimePush { .. }
-                    | WorkUnit::RealtimeFinish { .. }
-                    | WorkUnit::RealtimePreparation { .. }
-                    | WorkUnit::RealtimePromptPrefill { .. }
-                    | WorkUnit::RealtimeDecodeContinuation { .. }
-                    | WorkUnit::RealtimeCompletion { .. }
-            )
-        });
-        let served_ordinary_decode = result.decode_requests.iter().any(|row| {
-            matches!(
-                &row.work,
-                WorkUnit::SequenceStep {
-                    phase: SequencePhase::Decode,
-                    ..
-                }
-            )
-        });
-        if !ordinary_decode_ready || served_ordinary_decode {
-            self.realtime_only_steps_with_ready_decode = 0;
-        } else if served_realtime {
-            self.realtime_only_steps_with_ready_decode =
-                self.realtime_only_steps_with_ready_decode.saturating_add(1);
-        }
-
         // Phase 2: schedule prefill requests.
         let mut remaining_prefill_budget =
             if force_full_prefill_service || force_incremental_prefill_service {
@@ -1542,17 +1731,47 @@ impl Scheduler {
             } else {
                 remaining_decode_budget
             };
-        let prefill_admission_cap = usize::MAX;
-        let mut prefill_admissions = 0usize;
         let mut scheduling_full_prefill_batch = false;
 
         // Phase 2a: continue incomplete prefills before admitting new waiting requests.
         // An in-flight quantum is excluded until update_after_step commits its
         // progress, preventing duplicate plans when schedule is polled again.
+        // A resumable atomic prefill that just ran one operation steps aside
+        // until another prompt of its lanes (waiting, or admitted and not yet
+        // run) has taken a prefill slot.
+        let yielding = self
+            .running
+            .iter()
+            .filter(|(id, running)| running.yield_prefill_to_waiting && self.lane_admits(lanes, id))
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let ready = |metadata: &RequestMetadata| {
+            lanes.admits(metadata.lane)
+                && !self.capacity_waiting(metadata)
+                && metadata
+                    .retry_not_before
+                    .is_none_or(|retry| retry <= scheduling_now)
+        };
+        let other_prompt_ready = !yielding.is_empty()
+            && (self
+                .waiting_members
+                .iter()
+                .any(|request_id| self.requests.get(request_id).is_some_and(ready))
+                || self.running.iter().any(|(request_id, running)| {
+                    !running.prefill_complete
+                        && !running.prefill_in_flight
+                        && !yielding.contains(request_id)
+                        && self.requests.get(request_id).is_some_and(ready)
+                }));
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
+            .filter(|(id, r)| {
+                !r.prefill_complete
+                    && !r.prefill_in_flight
+                    && self.lane_admits(lanes, id)
+                    && !(other_prompt_ready && yielding.contains(*id))
+            })
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
                 if self.capacity_waiting(metadata) {
@@ -1579,7 +1798,7 @@ impl Scheduler {
                     .then_with(|| a.3.cmp(&b.3))
             });
 
-            let (request_id, _priority, sequence_id, num_computed) =
+            let (request_id, _priority, sequence_id, mut num_computed) =
                 incomplete_prefill_candidates.remove(0);
             if remaining_batch == 0 || remaining_prefill_budget == 0 {
                 break;
@@ -1589,6 +1808,21 @@ impl Scheduler {
                 Some(m) => m.clone(),
                 None => continue,
             };
+
+            // A resumable prefill restarting from zero (after a recompute
+            // or a lost cursor) starts above the prefix resident now.
+            if num_computed == 0 && metadata.cache_policy.prefill == PrefillMode::Incremental {
+                if let Some(probe) = prefix_probe.as_deref_mut() {
+                    num_computed = self
+                        .reprobe_managed_prefix_cursor(&request_id, probe)
+                        .map_or(0, |cursor| {
+                            (cursor as usize).min(metadata.prefill_tokens().saturating_sub(1))
+                        });
+                    if let Some(running) = self.running.get_mut(&request_id) {
+                        running.num_tokens_processed = num_computed;
+                    }
+                }
+            }
 
             let remaining_prompt = metadata.prefill_tokens().saturating_sub(num_computed);
             if remaining_prompt == 0 {
@@ -1615,13 +1849,25 @@ impl Scheduler {
                 &metadata,
                 effective_prefill_chunk_threshold,
                 has_decode_demand,
+                waiting_in_lanes,
                 remaining_prefill_budget,
             );
             if !full_prefill
-                && self.config.enable_chunked_prefill
+                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
+            }
+            // A mixed span takes a row of its model's dispatch.
+            let mixed_dispatch = metadata
+                .cache_policy
+                .mixed_step
+                .then(|| Self::mixed_prefill_dispatch(&metadata, &decode_dispatches))
+                .flatten();
+            if mixed_dispatch
+                .is_some_and(|(index, _, _)| index >= self.config.physical_dispatch_limit)
+            {
+                continue;
             }
             if full_prefill {
                 if !result.decode_requests.is_empty()
@@ -1643,13 +1889,14 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, num_computed, target_tokens);
-            let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
-            self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.prefill_in_flight = true;
                 running.paused = false;
+            }
+            if let Some(dispatch) = mixed_dispatch {
+                Self::claim_dispatch_row(&mut decode_dispatches, dispatch);
             }
 
             let plan_id = self.next_plan_id;
@@ -1688,7 +1935,6 @@ impl Scheduler {
 
         while remaining_batch > 0
             && remaining_prefill_budget > 0
-            && prefill_admissions < prefill_admission_cap
             && waiting_attempts < max_waiting_attempts
         {
             let request_id = match self.take_next_waiting_request() {
@@ -1697,13 +1943,17 @@ impl Scheduler {
             };
             waiting_attempts = waiting_attempts.saturating_add(1);
 
-            let metadata = match self.requests.get(&request_id) {
+            let mut metadata = match self.requests.get(&request_id) {
                 Some(m) => m.clone(),
                 None => continue,
             };
 
             // Check if already running (shouldn't happen, but safety check)
             if self.running.contains_key(&request_id) {
+                continue;
+            }
+            if !lanes.admits(metadata.lane) {
+                deferred_waiting.push(request_id);
                 continue;
             }
 
@@ -1725,6 +1975,14 @@ impl Scheduler {
             }
             // A full-prefill adapter always runs the whole prompt from position
             // 0, so a probed prefix cursor only applies to resumable prefill.
+            // Its first selection re-probes: a burst sharing a system prompt
+            // is admitted before the first request publishes it.
+            if !full_prefill {
+                if let Some(probe) = prefix_probe.as_deref_mut() {
+                    metadata.managed_prefix_cursor =
+                        self.reprobe_managed_prefix_cursor(&request_id, probe);
+                }
+            }
             let prefix_start = if full_prefill {
                 0
             } else {
@@ -1739,15 +1997,27 @@ impl Scheduler {
                 &metadata,
                 effective_prefill_chunk_threshold,
                 has_decode_demand,
+                waiting_in_lanes,
                 remaining_prefill_budget,
             );
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
-                && self.config.enable_chunked_prefill
+                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
+            }
+            let mixed_dispatch = metadata
+                .cache_policy
+                .mixed_step
+                .then(|| Self::mixed_prefill_dispatch(&metadata, &decode_dispatches))
+                .flatten();
+            if mixed_dispatch
+                .is_some_and(|(index, _, _)| index >= self.config.physical_dispatch_limit)
+            {
+                deferred_waiting.push(request_id);
+                continue;
             }
 
             // Full-prefill executors cannot honor a scheduler chunk. Permit one
@@ -1773,16 +2043,13 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, prefix_start, target_tokens);
-            let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             let span_end = prefix_start.saturating_add(num_tokens);
-            self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             // Create running state. A jumped request counts its shared
             // prefix as already-committed progress so prefill completion
             // still lands at the full prompt length.
             let running = RunningRequest {
-                request_id: request_id.clone(),
                 sequence_id: metadata.sequence_id,
                 num_tokens_processed: prefix_start,
                 num_tokens_generated: 0,
@@ -1798,9 +2065,10 @@ impl Scheduler {
                 finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: metadata.priority,
-                workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
+                last_service: 0,
+                yield_prefill_to_waiting: false,
             };
 
             let plan_id = self.next_plan_id;
@@ -1824,6 +2092,9 @@ impl Scheduler {
             });
 
             self.running.insert(request_id.clone(), running);
+            if let Some(dispatch) = mixed_dispatch {
+                Self::claim_dispatch_row(&mut decode_dispatches, dispatch);
+            }
 
             if full_prefill {
                 remaining_batch -= 1;
@@ -1831,7 +2102,6 @@ impl Scheduler {
                 remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
                 remaining_batch -= 1;
             }
-            prefill_admissions = prefill_admissions.saturating_add(1);
             result.total_tokens += num_tokens;
             self.record_scheduled_service(&request_id, num_tokens);
         }
@@ -1839,25 +2109,96 @@ impl Scheduler {
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
         }
-        if ready_ordinary_decode
-            && !result
-                .decode_requests
+        // The step aside ends once another prompt was scheduled, none is
+        // ready, or the slot went unused (the prompts cannot run now).
+        if !other_prompt_ready
+            || result
+                .prefill_requests
                 .iter()
-                .any(|row| matches!(row.work, WorkUnit::SequenceStep { .. }))
-            && result.decode_requests.iter().any(|row| {
-                matches!(
-                    row.work,
-                    WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
-                )
-            })
+                .any(|row| !yielding.contains(&row.request_id))
+            || (result.decode_requests.is_empty() && result.prefill_requests.is_empty())
         {
-            self.audio_only_steps_with_ready_decode =
-                self.audio_only_steps_with_ready_decode.saturating_add(1);
-        } else {
-            self.audio_only_steps_with_ready_decode = 0;
+            for request_id in &yielding {
+                if let Some(running) = self.running.get_mut(request_id) {
+                    running.yield_prefill_to_waiting = false;
+                }
+            }
         }
 
         result
+    }
+
+    /// Whether a non-realtime row can take a token decode step now.
+    /// `token_rows_only` excludes rows whose next quantum is codec or
+    /// finalization work.
+    fn ordinary_decode_ready(
+        &self,
+        now: Instant,
+        token_rows_only: bool,
+        lanes: &LaneSelection,
+    ) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            running.prefill_complete
+                && !(token_rows_only
+                    && (running.finalize_pending || running.audio_decode_pending.is_some()))
+                && !self.realtime_sessions.contains_key(request_id)
+                && self.lane_admits(lanes, request_id)
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    running.num_tokens_generated < metadata.max_tokens
+                        && !self.capacity_waiting(metadata)
+                        && metadata.retry_not_before.is_none_or(|until| until <= now)
+                })
+        })
+    }
+
+    /// Whether every live non-realtime request runs mixed steps, so decode
+    /// rows and prefill spans share one token budget.
+    fn all_requests_mixed(&self, lanes: &LaneSelection) -> bool {
+        let mut live = self
+            .running
+            .keys()
+            .chain(self.waiting_members.iter())
+            .filter(|request_id| {
+                !self.realtime_sessions.contains_key(*request_id)
+                    && self.lane_admits(lanes, request_id)
+            })
+            .peekable();
+        live.peek().is_some()
+            && live.all(|request_id| {
+                self.requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.mixed_step)
+            })
+    }
+
+    /// The dispatch a mixed prefill span would join, as `(index, key,
+    /// rows)`: its model's open dispatch with a free row, else the next one.
+    /// `None` until the model's dispatch width is installed.
+    fn mixed_prefill_dispatch(
+        metadata: &RequestMetadata,
+        dispatches: &[(DecodeDispatchKey, usize, usize)],
+    ) -> Option<(usize, DecodeDispatchKey, usize)> {
+        let rows = metadata.cache_policy.decode_dispatch_rows?;
+        let key = DecodeDispatchKey {
+            model_variant: metadata.model_variant,
+            task_type: metadata.task_type,
+            decode_batch: metadata.cache_policy.decode_batch,
+        };
+        let index = dispatches
+            .iter()
+            .position(|(open, used, rows)| *open == key && used < rows)
+            .unwrap_or(dispatches.len());
+        Some((index, key, rows))
+    }
+
+    fn claim_dispatch_row(
+        dispatches: &mut Vec<(DecodeDispatchKey, usize, usize)>,
+        (index, key, rows): (usize, DecodeDispatchKey, usize),
+    ) {
+        match dispatches.get_mut(index) {
+            Some((_, used, _)) => *used += 1,
+            None => dispatches.push((key, 1, rows)),
+        }
     }
 
     /// Update request state after a step.
@@ -1878,6 +2219,10 @@ impl Scheduler {
             .get(request_id)
             .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental);
         if let Some(running) = self.running.get_mut(request_id) {
+            if tokens_processed > 0 || tokens_generated > 0 {
+                self.service_clock = self.service_clock.saturating_add(1);
+                running.last_service = self.service_clock;
+            }
             if running.audio_decode_in_flight {
                 running.audio_decode_in_flight = false;
                 running.audio_decode_pending = None;
@@ -2211,6 +2556,7 @@ impl Scheduler {
         state.in_flight = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_realtime_stage_outcome(
         &mut self,
         session: &SessionKey,
@@ -2247,42 +2593,189 @@ impl Scheduler {
         true
     }
 
+    /// The starvation debts `scope`'s step driver reads.
+    fn debts(&self, scope: LaneScope) -> StarvationDebts {
+        match scope {
+            None => self.debts,
+            Some(lane) => self.lane_debts.get(&lane).copied().unwrap_or_default(),
+        }
+    }
+
+    /// Apply `update` to the engine's debts and to the debts of each lane
+    /// among `rows`, which sees only that lane's rows and requests.
+    fn update_debts<T>(
+        &mut self,
+        rows: &[(&RequestId, T)],
+        update: impl Fn(&Self, StarvationDebts, &[(&RequestId, T)], &LaneSelection) -> StarvationDebts,
+    ) where
+        T: Copy,
+    {
+        self.debts = update(self, self.debts, rows, &LaneSelection::all());
+        let mut lanes = rows
+            .iter()
+            .map(|(request_id, _)| self.requests.get(*request_id).and_then(|m| m.lane))
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        for lane in lanes {
+            let lane_rows = rows
+                .iter()
+                .filter(|(request_id, _)| {
+                    self.requests.get(*request_id).and_then(|m| m.lane) == lane
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let debts = update(
+                self,
+                self.debts(Some(lane)),
+                &lane_rows,
+                &LaneSelection::scoped(Some(lane)),
+            );
+            if debts == StarvationDebts::default() {
+                self.lane_debts.remove(&lane);
+            } else {
+                self.lane_debts.insert(lane, debts);
+            }
+        }
+    }
+
     /// Advance starvation debt once per successfully committed physical
     /// transaction. Scheduler polling, retry deferral, and rolled-back model
     /// work must not mutate this service clock.
+    /// Keyed on the phase each committed row ran: a mixed transaction that
+    /// served a prefill row is prefill service, and one with only decode rows
+    /// is decode-only.
     pub(crate) fn record_committed_batch_service(
         &mut self,
-        committed_requests: &[RequestId],
-        decode_transaction: bool,
+        committed_rows: &[(RequestId, SequencePhase)],
     ) {
-        if committed_requests.is_empty() {
+        if committed_rows.is_empty() {
             return;
         }
-        let served_full_prefill = !decode_transaction
-            && committed_requests.iter().any(|request_id| {
-                self.requests
-                    .get(request_id)
-                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
-            });
-        let served_incremental_prefill = !decode_transaction
-            && committed_requests.iter().any(|request_id| {
-                self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Incremental
+        let rows = committed_rows
+            .iter()
+            .map(|(request_id, phase)| (request_id, *phase))
+            .collect::<Vec<_>>();
+        self.update_debts(&rows, |scheduler, mut debts, rows, lanes| {
+            let decode_transaction = rows
+                .iter()
+                .all(|(_, phase)| *phase == SequencePhase::Decode);
+            let served_prefill = |mode: PrefillMode| {
+                rows.iter().any(|(request_id, phase)| {
+                    *phase == SequencePhase::Prefill
+                        && scheduler
+                            .requests
+                            .get(*request_id)
+                            .is_some_and(|metadata| metadata.cache_policy.prefill == mode)
                 })
-            });
-        if served_full_prefill || !self.has_pending_full_prefill() {
-            self.decode_only_steps_with_waiting_full_prefill = 0;
-        } else if decode_transaction {
-            self.decode_only_steps_with_waiting_full_prefill = self
-                .decode_only_steps_with_waiting_full_prefill
-                .saturating_add(1);
+            };
+            if served_prefill(PrefillMode::Full) || !scheduler.has_pending_full_prefill(lanes) {
+                debts.decode_only_steps_with_waiting_full_prefill = 0;
+            } else if decode_transaction {
+                debts.decode_only_steps_with_waiting_full_prefill += 1;
+            }
+            if served_prefill(PrefillMode::Incremental)
+                || !scheduler.has_pending_incremental_prefill(lanes)
+            {
+                debts.decode_only_steps_with_waiting_incremental_prefill = 0;
+            } else if decode_transaction {
+                debts.decode_only_steps_with_waiting_incremental_prefill += 1;
+            }
+            debts
+        });
+    }
+
+    /// Rows withheld for managed capacity wait on state that running
+    /// sequences hold until they finish, so only decode can free it. Clear
+    /// the starvation debt of each withheld prefill's mode: the bound then
+    /// returns the next transactions to decode instead of forcing the same
+    /// prefill again with no decode budget, which no commit would ever
+    /// resolve. Each withheld row also takes its rotation turn, so the clamped
+    /// decode selection reaches the other rows rather than retrying it first.
+    pub(crate) fn yield_capacity_blocked(&mut self, deferred: &[ScheduledRequest]) {
+        for scheduled in deferred {
+            if let Some(running) = self.running.get_mut(&scheduled.request_id) {
+                if running.sequence_id == scheduled.sequence_id {
+                    self.service_clock = self.service_clock.saturating_add(1);
+                    running.last_service = self.service_clock;
+                }
+            }
+            if !scheduled.is_prefill {
+                continue;
+            }
+            let Some(metadata) = self.requests.get(&scheduled.request_id) else {
+                continue;
+            };
+            let (mode, lane) = (metadata.cache_policy.prefill, metadata.lane);
+            for debts in [Some(&mut self.debts), self.lane_debts.get_mut(&lane)]
+                .into_iter()
+                .flatten()
+            {
+                match mode {
+                    PrefillMode::Full => debts.decode_only_steps_with_waiting_full_prefill = 0,
+                    PrefillMode::Incremental => {
+                        debts.decode_only_steps_with_waiting_incremental_prefill = 0;
+                    }
+                    _ => {}
+                }
+            }
         }
-        if served_incremental_prefill || !self.has_pending_incremental_prefill() {
-            self.decode_only_steps_with_waiting_incremental_prefill = 0;
-        } else if decode_transaction {
-            self.decode_only_steps_with_waiting_incremental_prefill = self
-                .decode_only_steps_with_waiting_incremental_prefill
-                .saturating_add(1);
+    }
+
+    /// Advance the realtime and codec starvation debts once per committed
+    /// decode transaction, keyed on the rows that committed. The core defers
+    /// scheduled rows whose lane does not own the physical slot, so a row
+    /// that was merely scheduled is not service.
+    pub(crate) fn record_committed_decode_service(
+        &mut self,
+        committed: &[(&RequestId, &WorkUnit)],
+    ) {
+        if committed.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.update_debts(committed, |scheduler, mut debts, rows, lanes| {
+            let realtime = |work: &WorkUnit| {
+                matches!(
+                    work,
+                    WorkUnit::RealtimePush { .. }
+                        | WorkUnit::RealtimeFinish { .. }
+                        | WorkUnit::RealtimePreparation { .. }
+                        | WorkUnit::RealtimePromptPrefill { .. }
+                        | WorkUnit::RealtimeDecodeContinuation { .. }
+                        | WorkUnit::RealtimeCompletion { .. }
+                )
+            };
+            let served_ordinary = rows.iter().any(|(_, work)| !realtime(work));
+            if served_ordinary || !scheduler.ordinary_decode_ready(now, false, lanes) {
+                debts.realtime_only_steps_with_ready_decode = 0;
+            } else {
+                debts.realtime_only_steps_with_ready_decode += 1;
+            }
+            let served_token_decode = rows
+                .iter()
+                .any(|(_, work)| matches!(work, WorkUnit::SequenceStep { .. }));
+            let served_codec = rows.iter().any(|(_, work)| {
+                matches!(
+                    work,
+                    WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
+                )
+            });
+            if served_token_decode || !scheduler.ordinary_decode_ready(now, true, lanes) {
+                debts.audio_only_steps_with_ready_decode = 0;
+            } else if served_codec {
+                debts.audio_only_steps_with_ready_decode += 1;
+            }
+            debts
+        });
+    }
+
+    /// One operation of a resumable atomic prefill (a long-form ASR chunk)
+    /// committed without completing the prompt: offer the next prefill slot
+    /// to another ready prompt before the job's next operation.
+    pub(crate) fn yield_prefill_to_waiting(&mut self, request_id: &RequestId) {
+        if let Some(running) = self.running.get_mut(request_id) {
+            running.yield_prefill_to_waiting = true;
         }
     }
 
@@ -2308,6 +2801,23 @@ impl Scheduler {
         running.audio_decode_in_flight = false;
         running.prefill_complete = running.num_tokens_processed >= metadata.prefill_tokens();
         true
+    }
+
+    /// Release every scheduler fence held by a row that was rolled back before
+    /// execution. A realtime row also clears its session's in-flight marker
+    /// when it still names this exact plan; its FIFO head stays queued, so the
+    /// same operation is scheduled again.
+    pub(crate) fn release_unexecuted_quantum(&mut self, scheduled: &ScheduledRequest) -> bool {
+        if let Some(state) = self.realtime_sessions.get_mut(&scheduled.request_id) {
+            if state.sequence_id == scheduled.sequence_id
+                && state
+                    .in_flight
+                    .is_some_and(|in_flight| in_flight.plan_id == scheduled.plan_id)
+            {
+                state.in_flight = None;
+            }
+        }
+        self.release_execution_quantum_for_retry(&scheduled.session_key())
     }
 
     /// Remove service charged when a scheduled quantum never reached
@@ -2411,12 +2921,33 @@ impl Scheduler {
             return false;
         }
         metadata.managed_prefix_cursor = None;
+        metadata.managed_prefix_cursor_losses =
+            metadata.managed_prefix_cursor_losses.saturating_add(1);
         if let Some(running) = self.running.get_mut(request_id) {
             running.num_tokens_processed = 0;
             running.prefill_complete = false;
             running.prefill_in_flight = false;
         }
         true
+    }
+
+    /// SCH-F7: replace a not-yet-started resumable prefill's cursor with the
+    /// probe's answer for its exact session. A capacity replay keeps its
+    /// zero start (the executor restarts a suspended replay only at context
+    /// 0), and a request that lost too many cursors stops probing.
+    fn reprobe_managed_prefix_cursor(
+        &mut self,
+        request_id: &RequestId,
+        probe: &mut ManagedPrefixProbe<'_>,
+    ) -> Option<u32> {
+        let metadata = self.requests.get_mut(request_id)?;
+        if metadata.replay_prompt_tokens.is_none()
+            && metadata.managed_prefix_cursor_losses < MAX_MANAGED_PREFIX_CURSOR_LOSSES
+        {
+            let session = SessionKey::new(request_id.clone(), metadata.sequence_id);
+            metadata.managed_prefix_cursor = probe(&session);
+        }
+        metadata.managed_prefix_cursor
     }
 
     /// Defer the next execution quantum for an exact session. This clears an
@@ -2472,6 +3003,7 @@ impl Scheduler {
         // cursor must not survive into the replayed spans.
         metadata.managed_prefix_cursor = None;
         metadata.capacity_blocked_on = Some(survivor);
+        metadata.capacity_replays = metadata.capacity_replays.saturating_add(1);
         running.num_tokens_processed = 0;
         running.prefill_complete = false;
         running.prefill_in_flight = false;
@@ -2504,8 +3036,30 @@ impl Scheduler {
             })
     }
 
-    /// Protect the older equal-priority request. Victims remain suspended until
-    /// that exact survivor leaves, avoiding repeated eviction/replay oscillation.
+    /// Whether the loaded family of `request_id` rebuilds a released session
+    /// by replaying its tokens.
+    pub(crate) fn replays_tokens(&self, request_id: &RequestId) -> bool {
+        self.requests
+            .get(request_id)
+            .is_some_and(|metadata| metadata.cache_policy.token_replay)
+    }
+
+    /// Whether `session` has been replayed for capacity as often as one
+    /// request may be.
+    pub(crate) fn capacity_replays_exhausted(&self, session: &SessionKey) -> bool {
+        self.requests
+            .get(&session.request_id)
+            .is_some_and(|metadata| {
+                metadata.sequence_id == session.epoch
+                    && metadata.capacity_replays >= MAX_CAPACITY_REPLAYS
+            })
+    }
+
+    /// The lowest-priority, then youngest, candidate below the survivor in
+    /// the same priority/age order; the older equal-priority request is
+    /// protected. Victims remain suspended until that exact survivor leaves,
+    /// and a request replayed `MAX_CAPACITY_REPLAYS` times is not chosen
+    /// again, avoiding repeated eviction/replay oscillation.
     pub(crate) fn published_capacity_victim(
         &self,
         candidates: impl IntoIterator<Item = SessionKey>,
@@ -2527,10 +3081,16 @@ impl Scheduler {
                     && !running.finalize_in_flight
                     && !running.audio_decode_in_flight
                     && !self.capacity_waiting(meta)
+                    && meta.capacity_replays < MAX_CAPACITY_REPLAYS
                     && (meta.priority < owner.priority
                         || meta.priority == owner.priority && meta.sequence_id > owner.sequence_id)
             })
-            .max_by_key(|candidate| candidate.epoch)
+            .max_by_key(|candidate| {
+                (
+                    std::cmp::Reverse(self.requests[&candidate.request_id].priority),
+                    candidate.epoch,
+                )
+            })
     }
 
     /// Restart an exact running request incarnation from prefill after an
@@ -2777,6 +3337,25 @@ impl Scheduler {
         })
     }
 
+    /// The earliest future instant at which work becomes due without any
+    /// other event: a deferred row's retry time, a hard deadline, or a
+    /// cleanup retry. An idle step driver sleeps no longer than this, so a
+    /// deferred row runs at its retry time rather than after the idle
+    /// backoff (SCH-F11).
+    pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        let rows = self
+            .requests
+            .values()
+            .flat_map(|metadata| [metadata.retry_not_before, metadata.hard_deadline])
+            .flatten();
+        let cleanups = self
+            .pending_releases
+            .values()
+            .filter(|pending| pending.confirmation_required && !pending.cleanup_confirmed)
+            .map(|pending| pending.retry_at);
+        rows.chain(cleanups).filter(|at| *at > now).min()
+    }
+
     pub(crate) fn force_release_all_after_executor_shutdown(&mut self) {
         self.pending_releases.clear();
     }
@@ -2792,6 +3371,7 @@ impl Scheduler {
     }
 
     /// Compatibility helper retained for existing deadline tests.
+    #[cfg(test)]
     pub(crate) fn pending_expired_cleanup_sessions(&self) -> Vec<SessionKey> {
         let mut sessions: Vec<_> = self
             .pending_releases
@@ -2856,6 +3436,23 @@ impl Scheduler {
                 .realtime_sessions
                 .values()
                 .any(|state| state.in_flight.is_some() || !state.pending.is_empty())
+    }
+
+    /// Lanes that hold the work [`Self::has_pending_work`] counts.
+    pub(crate) fn lanes_with_work(&self) -> Vec<ExecutionLane> {
+        let mut lanes = self
+            .waiting_members
+            .iter()
+            .chain(self.running.keys().filter(|request_id| {
+                self.realtime_sessions
+                    .get(*request_id)
+                    .is_none_or(|state| state.in_flight.is_some() || !state.pending.is_empty())
+            }))
+            .filter_map(|request_id| self.requests.get(request_id).map(|metadata| metadata.lane))
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        lanes
     }
 
     /// Get running request info.
@@ -3068,15 +3665,56 @@ impl Scheduler {
             .then_with(|| Self::workload_order(a).cmp(&Self::workload_order(b)))
     }
 
-    fn workload_weight(workload_class: WorkloadClass) -> u64 {
-        match workload_class {
-            WorkloadClass::Realtime => 8,
-            WorkloadClass::Interactive => 6,
-            WorkloadClass::Streaming => 5,
-            WorkloadClass::Online => 4,
-            WorkloadClass::Batch => 2,
-            WorkloadClass::Background => 1,
+    fn class_virtual_time(&self, workload_class: WorkloadClass) -> u64 {
+        self.class_service
+            .get(&workload_class)
+            .copied()
+            .unwrap_or_default()
+            .saturating_mul(CLASS_VIRTUAL_TIME_UNITS / Self::workload_weight(workload_class))
+    }
+
+    /// Start-time fair queuing across workload classes. Class service only
+    /// grows, so a class returning from idle would otherwise win every
+    /// comparison until its total caught up with long-served classes. A class
+    /// that becomes active instead starts at the weighted virtual time the
+    /// active classes have already reached. An idle realtime session holds no
+    /// work and does not keep its class active. The floor is read before this
+    /// step charges any service, so refunding unexecuted quanta returns a
+    /// class to a total that is still at or above it.
+    fn refresh_class_service(&mut self) {
+        if self.config.policy != SchedulingPolicy::WeightedFair {
+            return;
         }
+        let active = self
+            .requests
+            .iter()
+            .filter(|(request_id, _)| {
+                self.realtime_sessions
+                    .get(*request_id)
+                    .is_none_or(|state| state.in_flight.is_some() || !state.pending.is_empty())
+            })
+            .map(|(_, metadata)| metadata.workload_class)
+            .collect::<HashSet<_>>();
+        for workload_class in &active {
+            if !self.active_service_classes.contains(workload_class) {
+                let floor = self.class_virtual_floor
+                    / (CLASS_VIRTUAL_TIME_UNITS / Self::workload_weight(*workload_class));
+                let service = self.class_service.entry(*workload_class).or_default();
+                *service = (*service).max(floor);
+            }
+        }
+        if let Some(reached) = active
+            .iter()
+            .map(|workload_class| self.class_virtual_time(*workload_class))
+            .min()
+        {
+            self.class_virtual_floor = self.class_virtual_floor.max(reached);
+        }
+        self.active_service_classes = active;
+    }
+
+    fn workload_weight(workload_class: WorkloadClass) -> u64 {
+        workload_class.service_weight()
     }
 
     fn workload_order(workload_class: WorkloadClass) -> u8 {
@@ -3133,8 +3771,15 @@ impl Scheduler {
         if key_a.0 != key_b.0 {
             return self.compare_class_service(key_a.0, key_b.0);
         }
-        let a = service.get(&key_a).copied().unwrap_or_default();
-        let b = service.get(&key_b).copied().unwrap_or_default();
+        self.compare_tenant_entries(
+            service.get(&key_a).copied().unwrap_or_default(),
+            service.get(&key_b).copied().unwrap_or_default(),
+        )
+    }
+
+    /// Order two tenants of one workload class: a tenant unselected for
+    /// eight plans first (oldest first), then the least served.
+    fn compare_tenant_entries(&self, a: TenantService, b: TenantService) -> Ordering {
         let aged_a = self.next_plan_id.saturating_sub(a.last_selected) >= 8;
         let aged_b = self.next_plan_id.saturating_sub(b.last_selected) >= 8;
         aged_b
@@ -3321,33 +3966,38 @@ impl Scheduler {
             + (prompt_bonus * 0.2)
     }
 
-    fn has_latency_sensitive_waiting(&self) -> bool {
+    fn has_latency_sensitive_waiting(&self, lanes: &LaneSelection) -> bool {
         self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .map(|metadata| metadata.workload_class.is_latency_sensitive())
-                .unwrap_or(false)
+            self.lane_admits(lanes, request_id)
+                && self
+                    .requests
+                    .get(request_id)
+                    .map(|metadata| metadata.workload_class.is_latency_sensitive())
+                    .unwrap_or(false)
         })
     }
 
-    fn has_throughput_or_background_waiting(&self) -> bool {
+    fn has_throughput_or_background_waiting(&self, lanes: &LaneSelection) -> bool {
         self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .map(|metadata| {
-                    matches!(
-                        metadata.workload_class,
-                        WorkloadClass::Batch | WorkloadClass::Background
-                    )
-                })
-                .unwrap_or(false)
+            self.lane_admits(lanes, request_id)
+                && self
+                    .requests
+                    .get(request_id)
+                    .map(|metadata| {
+                        matches!(
+                            metadata.workload_class,
+                            WorkloadClass::Batch | WorkloadClass::Background
+                        )
+                    })
+                    .unwrap_or(false)
         })
     }
 
-    fn has_eligible_full_prefill(&self, now: Instant) -> bool {
+    fn has_eligible_full_prefill(&self, now: Instant, lanes: &LaneSelection) -> bool {
         let running_full = self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
                 && !running.prefill_in_flight
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Full
                         && !self.capacity_waiting(metadata)
@@ -3357,31 +4007,34 @@ impl Scheduler {
         running_full
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Full
+                    lanes.admits(metadata.lane)
+                        && metadata.cache_policy.prefill == PrefillMode::Full
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
             })
     }
 
-    fn has_pending_full_prefill(&self) -> bool {
+    fn has_pending_full_prefill(&self, lanes: &LaneSelection) -> bool {
         self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
+                && self.lane_admits(lanes, request_id)
                 && self
                     .requests
                     .get(request_id)
                     .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
         }) || self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+            self.requests.get(request_id).is_some_and(|metadata| {
+                lanes.admits(metadata.lane) && metadata.cache_policy.prefill == PrefillMode::Full
+            })
         })
     }
 
-    fn has_eligible_incremental_prefill(&self, now: Instant) -> bool {
+    fn has_eligible_incremental_prefill(&self, now: Instant, lanes: &LaneSelection) -> bool {
         let running_incremental = self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
                 && !running.prefill_in_flight
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
                         && !self.capacity_waiting(metadata)
@@ -3391,23 +4044,26 @@ impl Scheduler {
         running_incremental
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                    lanes.admits(metadata.lane)
+                        && metadata.cache_policy.prefill == PrefillMode::Incremental
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
             })
     }
 
-    fn has_pending_incremental_prefill(&self) -> bool {
+    fn has_pending_incremental_prefill(&self, lanes: &LaneSelection) -> bool {
         self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
                 })
         }) || self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental)
+            self.requests.get(request_id).is_some_and(|metadata| {
+                lanes.admits(metadata.lane)
+                    && metadata.cache_policy.prefill == PrefillMode::Incremental
+            })
         })
     }
 
@@ -3460,10 +4116,11 @@ impl Scheduler {
         metadata: &RequestMetadata,
         threshold: usize,
         has_decode_demand: bool,
+        waiting: usize,
         remaining_budget: usize,
     ) -> (usize, usize) {
         let preferred = metadata.cache_policy.preferred_prefill_tokens;
-        let isolated = !has_decode_demand && self.running.len() <= 1 && self.waiting_count() <= 1;
+        let isolated = !has_decode_demand && self.running.len() <= 1 && waiting <= 1;
         if isolated && preferred > threshold {
             (preferred, remaining_budget.max(preferred))
         } else {
@@ -3471,23 +4128,15 @@ impl Scheduler {
         }
     }
 
-    fn effective_prefill_chunk_threshold(&self, has_decode_demand: bool) -> usize {
-        let base = if self.config.enable_adaptive_batching {
+    /// The prefill chunk this step. It does not shrink under decode load:
+    /// prefill and decode take whole steps in turn, so a smaller chunk only
+    /// multiplies a prompt's prefill steps (SCH-F3).
+    fn effective_prefill_chunk_threshold(&self) -> usize {
+        let mut threshold = if self.config.enable_adaptive_batching {
             self.telemetry.dynamic_prefill_chunk_threshold.max(32)
         } else {
             self.config.chunked_prefill_threshold.max(32)
         };
-        let mut threshold = base;
-
-        // If decode is already active, avoid over-investing in prefill this step.
-        if has_decode_demand {
-            threshold = threshold.min((base / 2).max(64));
-        }
-
-        // Favor throughput for single-request execution.
-        if self.waiting_count() <= 1 && self.running.len() <= 1 {
-            threshold = threshold.max(base).min(base.saturating_mul(2));
-        }
 
         if self.config.enable_power_adaptive {
             threshold = ((threshold as f64) * self.thermal_budget_scale()) as usize;
@@ -3540,18 +4189,6 @@ impl Scheduler {
         scale.clamp(0.40, 1.0)
     }
 
-    fn record_prefill_backoff(&mut self, original_tokens: usize, selected_tokens: usize) {
-        if original_tokens == 0 {
-            return;
-        }
-        let ratio = if selected_tokens >= original_tokens {
-            0.0
-        } else {
-            1.0 - (selected_tokens as f64 / original_tokens as f64)
-        };
-        SchedulerTelemetry::update_ewma(&mut self.telemetry.prefill_backoff_ewma, ratio, 0.25);
-    }
-
     fn update_dynamic_prefill_chunk_threshold(&mut self) {
         let base = self.config.chunked_prefill_threshold.max(32);
         let min_chunk = 32usize;
@@ -3562,11 +4199,9 @@ impl Scheduler {
             .clamp(min_chunk, max_chunk);
         let step = (base / 8).max(8);
 
-        if self.telemetry.prefill_backoff_ewma > 0.35 {
-            current = current.saturating_sub(step).max(min_chunk);
-        } else if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 1.10 {
+        if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 1.10 {
             current = current.saturating_add(step).min(max_chunk);
-        } else if self.telemetry.prefill_backoff_ewma < 0.08 {
+        } else {
             current = current.saturating_add((step / 2).max(4)).min(max_chunk);
         }
 
@@ -3576,6 +4211,26 @@ impl Scheduler {
 
         self.telemetry.dynamic_prefill_chunk_threshold = current.max(min_chunk);
     }
+}
+
+/// The most prompt tokens one prefill span of `request` may take: the work
+/// budget of its loaded prefill stage, or of the mixed stage whose spans share
+/// a step with decode rows.
+fn loaded_prefill_token_cap(request: &EngineCoreRequest) -> Option<usize> {
+    request.execution_adapter_binding().and_then(|binding| {
+        binding
+            .stages
+            .iter()
+            .filter(|stage| {
+                matches!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequencePrefill
+                        | crate::engine::StageWorkSelector::SequenceStep
+                )
+            })
+            .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
+            .min()
+    })
 }
 
 #[cfg(test)]
@@ -3593,6 +4248,7 @@ mod tests {
             sequence_id: 1,
             task_type: TaskType::Chat,
             model_variant: None,
+            lane: None,
             priority: Priority::Normal,
             workload_class: WorkloadClass::default(),
             tenant_key: None,
@@ -3607,19 +4263,24 @@ mod tests {
                 decode_batch: NativeBatchMode::None,
                 recompute_safe: false,
                 cache_release_safe: false,
+                token_replay: false,
                 preferred_decode_tokens: 1,
                 sustained_decode_quantum: false,
                 speculative_decode_batch: false,
                 preferred_prefill_tokens: 0,
+                decode_dispatch_rows: None,
+                mixed_step: false,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
+            capacity_replays: 0,
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
             managed_snapshot_boundary: None,
             managed_preamble_boundary: None,
             managed_prefix_cursor: None,
+            managed_prefix_cursor_losses: 0,
         }
     }
 
@@ -3785,6 +4446,67 @@ mod tests {
     }
 
     #[test]
+    fn resumable_prefill_reprobes_its_prefix_when_selected_from_zero() {
+        // SCH-F7: the cursor comes from a probe when the request is selected,
+        // and again when a lost cursor sends it back to zero; after
+        // MAX_MANAGED_PREFIX_CURSOR_LOSSES losses it prefills from zero.
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1024,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::Chat, "reprobed", Priority::Normal);
+        request.prompt_tokens = (0..100).collect();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler
+            .get_sequence_id(&request.id)
+            .expect("request epoch");
+        let session = SessionKey::new(request.id.clone(), epoch);
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        assert!(scheduler.update_execution_profile(&session, &profile));
+
+        let mut probes = 0;
+        for (offered, expected_start) in [(64, 64), (48, 48), (32, 0)] {
+            let scheduled = scheduler.schedule_with_prefix_probe(
+                &mut |probed| {
+                    assert_eq!(probed, &session);
+                    probes += 1;
+                    Some(offered)
+                },
+                &LaneSelection::all(),
+            );
+            let row = scheduled
+                .prefill_requests
+                .iter()
+                .find(|row| row.request_id == request.id)
+                .expect("prefill is scheduled");
+            assert_eq!(row.num_computed_tokens, expected_start, "offered {offered}");
+            assert_eq!(
+                row.work,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    input: InputRange {
+                        start: expected_start,
+                        end: 100,
+                    },
+                    max_output_steps: 100 - expected_start,
+                    auxiliary_state: None,
+                }
+            );
+            if expected_start > 0 {
+                // Prepare found the probed pages gone.
+                assert!(scheduler.reset_managed_prefix_cursor(&request.id));
+            }
+        }
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
     fn full_prefill_requests_ignore_a_probed_prefix_cursor() {
         // H10: a probed cursor makes the first span start above zero. Only a
         // resumable (incremental) adapter can run that span; a full-prefill
@@ -3872,6 +4594,76 @@ mod tests {
         assert_eq!(
             scheduler.published_capacity_victim([peer_session.clone()], &survivor),
             Some(peer_session)
+        );
+    }
+
+    /// D4: the replay victim is the lowest-priority claim holder, then the
+    /// youngest among equal priority (published or not), never the older
+    /// equal-priority survivor, and a request replayed
+    /// `MAX_CAPACITY_REPLAYS` times is no longer chosen.
+    #[test]
+    fn capacity_victim_is_lowest_priority_then_youngest_until_its_replay_cap() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 1024,
+            enable_adaptive_batching: false,
+            enable_chunked_prefill: false,
+            ..Default::default()
+        });
+        let survivor = build_request(TaskType::Chat, "survivor", Priority::Normal);
+        let older_low = build_request(TaskType::Chat, "older-low", Priority::Low);
+        let younger_low = build_request(TaskType::Chat, "younger-low", Priority::Low);
+        let youngest_normal = build_request(TaskType::Chat, "youngest-normal", Priority::Normal);
+        let requests = [&survivor, &older_low, &younger_low, &youngest_normal];
+        for request in requests {
+            assert!(scheduler.add_request(request));
+        }
+        scheduler.schedule();
+        for request in requests {
+            scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 1, 1.0);
+        }
+        let session = |request: &EngineCoreRequest| {
+            SessionKey::new(
+                request.id.clone(),
+                scheduler.get_sequence_id(&request.id).unwrap(),
+            )
+        };
+        let survivor = session(&survivor);
+        let older_low = session(&older_low);
+        let younger_low = session(&younger_low);
+        let youngest_normal = session(&youngest_normal);
+        let candidates = [
+            survivor.clone(),
+            older_low.clone(),
+            younger_low.clone(),
+            youngest_normal.clone(),
+        ];
+        assert_eq!(
+            scheduler.published_capacity_victim(candidates.clone(), &survivor),
+            Some(younger_low.clone())
+        );
+        assert_eq!(
+            scheduler
+                .published_capacity_victim([survivor.clone(), youngest_normal.clone()], &survivor),
+            Some(youngest_normal)
+        );
+        // The survivor is never its own victim.
+        assert_eq!(
+            scheduler.published_capacity_victim([survivor.clone()], &survivor),
+            None
+        );
+        for _ in 0..MAX_CAPACITY_REPLAYS {
+            assert!(!scheduler.capacity_replays_exhausted(&younger_low));
+            scheduler
+                .requests
+                .get_mut(&younger_low.request_id)
+                .unwrap()
+                .capacity_replays += 1;
+        }
+        assert!(scheduler.capacity_replays_exhausted(&younger_low));
+        assert_eq!(
+            scheduler.published_capacity_victim(candidates, &survivor),
+            Some(older_low)
         );
     }
 
@@ -4165,10 +4957,67 @@ mod tests {
     }
 
     #[test]
+    fn unexecuted_realtime_row_release_reschedules_the_same_operation() {
+        let mut scheduler = small_scheduler();
+        let mut realtime = build_request(TaskType::ASR, "deferred-realtime", Priority::High);
+        realtime
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        assert!(scheduler.add_realtime_session(&realtime));
+        scheduler.add_request(&build_request(
+            TaskType::Chat,
+            "waiting-chat",
+            Priority::Normal,
+        ));
+        allow_incremental_prefill(&mut scheduler, "waiting-chat");
+        let session = SessionKey::new(
+            realtime.id.clone(),
+            scheduler.get_sequence_id(&realtime.id).expect("epoch"),
+        );
+        let (operation, _) = scheduler
+            .enqueue_realtime_push(&session, 80, 1, 2)
+            .expect("realtime push");
+
+        // The core defers every row of a mixed schedule it cannot dispatch.
+        let first = scheduler.schedule();
+        assert_eq!(first.prefill_requests.len(), 1);
+        let deferred = first
+            .decode_requests
+            .iter()
+            .find(|row| row.request_id == realtime.id)
+            .cloned()
+            .expect("realtime row");
+        for row in first.decode_requests.iter().chain(&first.prefill_requests) {
+            assert!(scheduler.release_unexecuted_quantum(row));
+        }
+
+        let second = scheduler.schedule();
+        let retried = second
+            .decode_requests
+            .iter()
+            .find(|row| row.request_id == realtime.id)
+            .expect("released realtime session is scheduled again");
+        assert_ne!(retried.plan_id, deferred.plan_id);
+        assert!(matches!(
+            &retried.work,
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == operation
+        ));
+        assert_eq!(second.prefill_requests.len(), 1);
+
+        // A stale release must not free the newer plan's fence.
+        scheduler.release_unexecuted_quantum(&deferred);
+        assert!(scheduler
+            .schedule()
+            .decode_requests
+            .iter()
+            .all(|row| row.request_id != realtime.id));
+    }
+
+    #[test]
     fn ready_ordinary_decode_receives_bounded_service_amid_realtime_demand() {
         let mut scheduler = Scheduler::new(SchedulerConfig {
-            max_batch_size: 1,
-            max_tokens_per_step: 1,
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
             min_tokens_per_step: 1,
             policy: SchedulingPolicy::Priority,
             enable_adaptive_batching: false,
@@ -4189,22 +5038,65 @@ mod tests {
             realtime.id.clone(),
             scheduler.get_sequence_id(&realtime.id).expect("epoch"),
         );
-        scheduler
-            .enqueue_realtime_push(&session, 80, 1, 2)
-            .expect("realtime push");
-        scheduler.realtime_only_steps_with_ready_decode = MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+        for _ in 0..=MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE {
+            scheduler
+                .enqueue_realtime_push(&session, 80, 1, 2)
+                .expect("realtime push");
+        }
 
-        let scheduled = scheduler.schedule();
-        assert_eq!(scheduled.decode_requests.len(), 1);
-        assert_eq!(scheduled.decode_requests[0].request_id, ordinary.id);
+        // Both rows fit the width, but realtime forms its own lane first and
+        // the core defers the ordinary row. Only committed rows are service.
+        for _ in 0..MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE {
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 2);
+            let (realtime_rows, deferred): (Vec<_>, Vec<_>) = step
+                .decode_requests
+                .iter()
+                .partition(|row| row.request_id == realtime.id);
+            for row in deferred {
+                scheduler.release_unexecuted_quantum(row);
+            }
+            let WorkUnit::RealtimePreparation { operation_id, .. } = realtime_rows[0].work else {
+                panic!("realtime push starts with preparation");
+            };
+            scheduler
+                .commit_realtime_stage_outcome(
+                    &session,
+                    RealtimeStageOutcome {
+                        plan_id: realtime_rows[0].plan_id,
+                        operation_id,
+                        completed: RealtimeSubphase::Preparation,
+                        next: None,
+                        input_consumed: 80,
+                        output_steps: 0,
+                        cache_append: 0,
+                    },
+                )
+                .expect("realtime commit");
+            scheduler.record_committed_decode_service(&[(
+                &realtime_rows[0].request_id,
+                &realtime_rows[0].work,
+            )]);
+        }
+
+        let reserved = scheduler.schedule();
+        assert_eq!(reserved.decode_requests.len(), 1);
+        assert_eq!(reserved.decode_requests[0].request_id, ordinary.id);
         assert!(matches!(
-            scheduled.decode_requests[0].work,
+            reserved.decode_requests[0].work,
             WorkUnit::SequenceStep {
                 phase: SequencePhase::Decode,
                 ..
             }
         ));
-        assert_eq!(scheduler.realtime_only_steps_with_ready_decode, 0);
+        let row = &reserved.decode_requests[0];
+        scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
+        assert_eq!(scheduler.debts.realtime_only_steps_with_ready_decode, 0);
+        assert!(scheduler
+            .schedule()
+            .decode_requests
+            .iter()
+            .any(|row| row.request_id == realtime.id));
     }
 
     fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {
@@ -4216,6 +5108,329 @@ mod tests {
         profile.prefill = PrefillMode::Incremental;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
+    }
+
+    /// One physical dispatch of up to `max_batch_size` rows; chunked prefill
+    /// stays off, as on CPU and Metal.
+    fn mixed_scheduler(budget: usize, chunk: usize) -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            max_batch_size: 16,
+            max_tokens_per_step: budget,
+            chunked_prefill_threshold: chunk,
+            enable_chunked_prefill: false,
+            physical_dispatch_limit: 1,
+            ..Default::default()
+        })
+    }
+
+    /// Add a chat request with a `prompt`-token prompt whose loaded model
+    /// runs `width`-row dispatches, mixed or split.
+    fn add_chat(scheduler: &mut Scheduler, id: &str, prompt: usize, width: usize, mixed: bool) {
+        let mut request = build_request(TaskType::Chat, id, Priority::Normal);
+        request.prompt_tokens = (0..prompt as u32).collect();
+        request.params.max_tokens = 64;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler
+            .get_sequence_id(&request.id)
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = if mixed {
+            PrefillMode::Incremental
+        } else {
+            PrefillMode::Full
+        };
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = width;
+        profile.mixed_step = mixed;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+    }
+
+    /// Run `ids` through their one-span prefill so they decode next.
+    fn start_decoding(scheduler: &mut Scheduler, ids: &[&str]) {
+        let scheduled = scheduler.schedule();
+        for id in ids {
+            let row = scheduled
+                .prefill_requests
+                .iter()
+                .find(|row| row.request_id == *id)
+                .expect("prefill scheduled");
+            scheduler.update_after_step(&row.request_id, row.num_tokens, 1, 1.0);
+        }
+    }
+
+    /// After one operation of a resumable atomic prefill (a long-form ASR
+    /// chunk), a waiting prompt takes the next prefill slot; the job's next
+    /// operation follows.
+    #[test]
+    fn a_yielded_atomic_prefill_lets_other_prompts_go_first() {
+        let mut scheduler = small_scheduler();
+        let long = build_request(TaskType::ASR, "long-form", Priority::Normal);
+        assert!(scheduler.add_request(&long));
+        let first = scheduler.schedule();
+        assert_eq!(first.prefill_requests[0].request_id, "long-form");
+        // The chunk committed without completing the prompt.
+        scheduler.update_after_step(&long.id, 0, 0, 1.0);
+        scheduler.yield_prefill_to_waiting(&long.id);
+        let prompt = build_request(TaskType::Chat, "prompt", Priority::Normal);
+        assert!(scheduler.add_request(&prompt));
+
+        let next = scheduler.schedule();
+        let rows = next
+            .prefill_requests
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["prompt"]);
+        // The core withheld the prompt's quantum: admitted but not yet run,
+        // it still goes before the job's next operation.
+        scheduler.release_unexecuted_quantum(&next.prefill_requests[0]);
+        scheduler.yield_prefill_to_waiting(&long.id);
+        let retry = scheduler.schedule();
+        let rows = retry
+            .prefill_requests
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["prompt"]);
+        let after = scheduler.schedule();
+        assert_eq!(after.prefill_requests[0].request_id, "long-form");
+    }
+
+    /// With lane step drivers each lane's starvation guard counts its own
+    /// decode-only transactions: another lane's decode does not force this
+    /// lane's waiting full prefill into an isolated step.
+    #[test]
+    fn starvation_debts_are_kept_per_lane() {
+        let mut scheduler = small_scheduler();
+        let (lane_a, lane_b) = (Some(ModelInstanceId::new(1)), Some(ModelInstanceId::new(2)));
+        for (id, lane) in [("a-decode", lane_a), ("b-decode", lane_b)] {
+            let mut request = build_request(TaskType::Chat, id, Priority::Normal);
+            request.params.max_tokens = 1_000;
+            request.bind_model_instance(lane.unwrap()).unwrap();
+            assert!(scheduler.add_request(&request));
+        }
+        start_decoding(&mut scheduler, &["a-decode", "b-decode"]);
+        let mut waiting = build_request(TaskType::Chat, "a-prefill", Priority::Normal);
+        waiting.bind_model_instance(lane_a.unwrap()).unwrap();
+        assert!(scheduler.add_request(&waiting));
+
+        let schedule = |scheduler: &mut Scheduler, lane| {
+            scheduler.schedule_with_prefix_probe(&mut |_| None, &LaneSelection::scoped(Some(lane)))
+        };
+        let commit_decode = |scheduler: &mut Scheduler, lane| {
+            let scheduled = schedule(scheduler, lane);
+            let row = &scheduled.decode_requests[0];
+            scheduler.update_after_step(&row.request_id, 1, 1, 1.0);
+            scheduler
+                .record_committed_batch_service(&[(row.request_id.clone(), SequencePhase::Decode)]);
+        };
+        for _ in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            commit_decode(&mut scheduler, lane_b);
+        }
+        // The whole engine owes the prefill an isolated step; lane A does not.
+        assert_eq!(
+            scheduler.debts.decode_only_steps_with_waiting_full_prefill,
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL
+        );
+        assert_eq!(scheduler.debts(Some(lane_a)), StarvationDebts::default());
+        let lane_a_step = schedule(&mut scheduler, lane_a);
+        assert_eq!(lane_a_step.decode_requests[0].request_id, "a-decode");
+        assert!(lane_a_step.prefill_requests.is_empty());
+        scheduler.release_unexecuted_quantum(&lane_a_step.decode_requests[0]);
+
+        // Lane A's own decode-only steps do build its debt.
+        for _ in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            commit_decode(&mut scheduler, lane_a);
+        }
+        let forced = schedule(&mut scheduler, lane_a);
+        assert!(forced.decode_requests.is_empty());
+        assert_eq!(forced.prefill_requests[0].request_id, "a-prefill");
+    }
+
+    /// An isolated request may take its model's preferred prefill span, but
+    /// never more than its loaded mixed stage's work budget: a longer span
+    /// fails the physical batch's budget check every step.
+    #[test]
+    fn mixed_stage_budget_caps_an_isolated_preferred_span() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        let variant = ModelVariant::Lfm2512BInstructGguf;
+        let mut request =
+            build_request(TaskType::Chat, "isolated", Priority::Normal).with_model_variant(variant);
+        request.prompt_tokens = (0..400).collect();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        let mut stage = crate::engine::StageDescriptor::from_execution_profile(
+            crate::engine::StageId::new(3),
+            "chat.step.mixed",
+            &profile,
+            NativeBatchMode::Mixed,
+        );
+        stage.selector = crate::engine::StageWorkSelector::SequenceStep;
+        stage.max_work_units = 64;
+        request
+            .bind_execution_adapter(crate::engine::ExecutionAdapterBinding {
+                execution_group_id: crate::engine::ExecutionGroupId::new(1),
+                model_instance_id: crate::engine::ModelInstanceId::new(1),
+                adapter_instance_id: crate::engine::AdapterInstanceId::new(1),
+                adapter_abi_revision: crate::engine::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "chat".into(),
+                stages: std::sync::Arc::from([stage]),
+            })
+            .unwrap();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request.id).unwrap();
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = 4;
+        profile.mixed_step = true;
+        profile.preferred_prefill_tokens = 256;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+        let row = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!((row.num_computed_tokens, row.num_tokens), (0, 64));
+    }
+
+    #[test]
+    fn mixed_requests_share_one_budget_and_the_decode_dispatch() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b", "prompt-c"] {
+            add_chat(&mut scheduler, id, 40, 4, true);
+        }
+
+        let scheduled = scheduler.schedule();
+        // Decode rows first, one token each, then prefill spans fill the
+        // dispatch's remaining rows. Spans are chunked although the engine
+        // switch is off, and no slice of the budget was held back.
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert!(scheduled
+            .decode_requests
+            .iter()
+            .all(|row| row.num_tokens == 1));
+        let spans = scheduled
+            .prefill_requests
+            .iter()
+            .map(|row| row.num_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [32, 30], "two free rows of a four-row dispatch");
+        assert_eq!(scheduled.total_tokens, 64);
+
+        // A tight budget: decode takes its tokens first, prefill the rest.
+        let mut scheduler = mixed_scheduler(40, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b"] {
+            add_chat(&mut scheduler, id, 40, 4, true);
+        }
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        let spans = scheduled
+            .prefill_requests
+            .iter()
+            .map(|row| row.num_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [32, 6]);
+        assert_eq!(scheduled.total_tokens, 40);
+
+        // The weighted-fair split would hold the whole 8-token budget for
+        // the waiting prompt and decode nothing; one budget decodes first.
+        let mut scheduler = mixed_scheduler(8, 32);
+        let decoders = ["decode-a", "decode-b", "decode-c", "decode-d"];
+        for id in decoders {
+            add_chat(&mut scheduler, id, 1, 4, true);
+        }
+        start_decoding(&mut scheduler, &decoders);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, true);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 3);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests[0].num_tokens, 5);
+
+        // Rows, not the budget, bound short prompts: the dispatch has two
+        // free rows, so the third prompt waits.
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b", "prompt-c"] {
+            add_chat(&mut scheduler, id, 10, 4, true);
+        }
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert_eq!(scheduled.prefill_requests.len(), 2);
+        assert_eq!(scheduled.total_tokens, 2 + 20);
+    }
+
+    #[test]
+    fn split_requests_keep_prefill_out_of_decode_steps() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, false);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, false);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert!(scheduled.prefill_requests.is_empty());
+    }
+
+    #[test]
+    fn mixed_decode_leaves_a_dispatch_row_for_a_waiting_prompt() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 2, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2, "no prompt waits");
+        for row in &scheduled.decode_requests {
+            scheduler.update_after_step(&row.request_id, 1, 1, 1.0);
+        }
+
+        add_chat(&mut scheduler, "prompt-a", 40, 2, true);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests[0].num_tokens, 32);
+    }
+
+    #[test]
+    fn prefill_debt_keys_on_the_phase_each_committed_row_ran() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        add_chat(&mut scheduler, "decode-a", 4, 4, true);
+        start_decoding(&mut scheduler, &["decode-a"]);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, true);
+        let decode = ("decode-a".to_string(), SequencePhase::Decode);
+        let prefill = ("prompt-a".to_string(), SequencePhase::Prefill);
+
+        scheduler
+            .debts
+            .decode_only_steps_with_waiting_incremental_prefill = 5;
+        scheduler.record_committed_batch_service(std::slice::from_ref(&decode));
+        assert_eq!(
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
+            6,
+            "a batch of decode rows is decode-only"
+        );
+        scheduler.record_committed_batch_service(&[decode, prefill]);
+        assert_eq!(
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
+            0,
+            "a mixed batch that served a prefill row pays the prefill debt"
+        );
     }
 
     #[test]
@@ -4652,6 +5867,36 @@ mod tests {
         let first = scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(first.num_computed_tokens, 0);
         assert_eq!(first.num_tokens, 4);
+    }
+
+    /// A prefill chunk keeps its configured size while other rows decode
+    /// (SCH-F3): halving it under decode load only doubled a prompt's steps.
+    #[test]
+    fn prefill_chunk_keeps_its_size_while_rows_decode() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 2_048,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 512,
+            ..Default::default()
+        });
+        let mut decoding = build_request(TaskType::Chat, "decoding", Priority::Normal);
+        decoding.prompt_tokens = vec![7; 8];
+        assert!(scheduler.add_request(&decoding));
+        allow_incremental_prefill(&mut scheduler, &decoding.id);
+        let prefill = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(prefill.num_tokens, 8);
+        scheduler.update_after_step(&decoding.id, 8, 1, 1.0);
+
+        let mut long = build_request(TaskType::Chat, "long", Priority::Normal);
+        long.prompt_tokens = vec![7; 2_000];
+        assert!(scheduler.add_request(&long));
+        allow_incremental_prefill(&mut scheduler, &long.id);
+        let step = scheduler.schedule();
+        assert_eq!(step.decode_requests.len(), 1, "{step:?}");
+        assert_eq!(step.decode_requests[0].request_id, decoding.id);
+        assert_eq!(step.prefill_requests.len(), 1, "{step:?}");
+        assert_eq!(step.prefill_requests[0].num_tokens, 512);
     }
 
     #[test]
@@ -5182,7 +6427,7 @@ mod tests {
                 "decode unexpectedly absent at bounded-service step {step}: {scheduled:?}"
             );
             scheduler.update_after_step(&decode_id, 1, 1, 1.0);
-            scheduler.record_committed_batch_service(std::slice::from_ref(&decode_id), true);
+            scheduler.record_committed_batch_service(&[(decode_id.clone(), SequencePhase::Decode)]);
         }
         panic!("full prefill was starved beyond the bounded decode-only window");
     }
@@ -5226,10 +6471,15 @@ mod tests {
             .update_execution_profile(&SessionKey::new(incremental_id.clone(), epoch), &profile,));
 
         for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL {
-            let debt_before = scheduler.decode_only_steps_with_waiting_incremental_prefill;
+            let debt_before = scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill;
             let scheduled = scheduler.schedule();
             assert_eq!(
-                scheduler.decode_only_steps_with_waiting_incremental_prefill, debt_before,
+                scheduler
+                    .debts
+                    .decode_only_steps_with_waiting_incremental_prefill,
+                debt_before,
                 "scheduler polling changed committed-service debt"
             );
             if let Some(prefill) = scheduled.prefill_requests.first() {
@@ -5249,9 +6499,8 @@ mod tests {
             scheduler.record_committed_batch_service(
                 &decode_requests
                     .iter()
-                    .map(|request| request.id.clone())
+                    .map(|request| (request.id.clone(), SequencePhase::Decode))
                     .collect::<Vec<_>>(),
-                true,
             );
         }
         panic!("incremental prefill was starved beyond the bounded decode-only window");
@@ -5288,13 +6537,18 @@ mod tests {
             .get_mut(&request_id)
             .unwrap()
             .retry_not_before = Some(Instant::now() + Duration::from_secs(60));
-        scheduler.decode_only_steps_with_waiting_incremental_prefill =
+        scheduler
+            .debts
+            .decode_only_steps_with_waiting_incremental_prefill =
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL - 1;
-        scheduler.record_committed_batch_service(&["decode-row".to_string()], true);
+        scheduler
+            .record_committed_batch_service(&[("decode-row".to_string(), SequencePhase::Decode)]);
 
-        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now()));
+        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now(), &LaneSelection::all()));
         assert_eq!(
-            scheduler.decode_only_steps_with_waiting_incremental_prefill,
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
         );
     }
@@ -5780,6 +7034,7 @@ mod tests {
                 let mut profile =
                     ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
                 profile.decode_batch = NativeBatchMode::Continuous;
+                profile.max_batch_size = 2;
                 profile.preferred_decode_tokens = 4;
                 profile.speculative_decode_batch = speculative_decode_batch;
                 assert!(scheduler
@@ -5804,6 +7059,69 @@ mod tests {
         }
     }
 
+    /// SCH-F2: decode selection never exceeds what the physical dispatches
+    /// of one step hold (dispatch limit x width, not the eight scheduler
+    /// rows), and equal-priority streams rotate by last service so every
+    /// running stream advances.
+    #[test]
+    fn decode_selection_fills_the_physical_width_and_rotates_streams() {
+        for (dispatch_limit, per_step) in [(1usize, 2usize), (2, 4)] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 8,
+                physical_dispatch_limit: dispatch_limit,
+                ..Default::default()
+            });
+            let ids = ["rr-0", "rr-1", "rr-2", "rr-3", "rr-4", "rr-5", "rr-6"];
+            for id in ids {
+                let mut request = EngineCoreRequest::tts("hello");
+                request.id = id.to_string();
+                request.prompt_tokens = vec![1];
+                assert!(scheduler.add_request(&request));
+                let epoch = scheduler.get_sequence_id(&request.id).expect("epoch");
+                let mut profile =
+                    ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+                profile.prefill = PrefillMode::Incremental;
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.max_batch_size = 2;
+                assert!(scheduler
+                    .update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+            }
+            let prefill = scheduler.schedule();
+            assert_eq!(prefill.prefill_requests.len(), ids.len());
+            for id in ids {
+                scheduler.update_after_step(&id.to_string(), 1, 1, 1.0);
+            }
+
+            let mut served = HashMap::<RequestId, usize>::new();
+            let rounds = ids.len() * 4 / per_step;
+            for _ in 0..rounds {
+                let step = scheduler.schedule();
+                assert!(step.prefill_requests.is_empty());
+                assert_eq!(
+                    step.decode_requests.len(),
+                    per_step,
+                    "limit {dispatch_limit}"
+                );
+                for row in &step.decode_requests {
+                    *served.entry(row.request_id.clone()).or_default() += 1;
+                    scheduler.update_after_step(
+                        &row.request_id,
+                        row.num_tokens,
+                        row.num_tokens,
+                        1.0,
+                    );
+                }
+            }
+            for id in ids {
+                assert_eq!(
+                    served.get(id),
+                    Some(&4),
+                    "limit {dispatch_limit}: {served:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_decode_quanta_backs_off_when_multiple_decodes_are_active() {
         let config = SchedulerConfig {
@@ -5816,6 +7134,8 @@ mod tests {
             enable_adaptive_batching: false,
             enable_decode_quanta: true,
             max_decode_tokens_per_request: 4,
+            // Two unbatched decode rows run as two physical dispatches.
+            physical_dispatch_limit: 2,
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);
@@ -6015,6 +7335,49 @@ mod tests {
         }
 
         assert!(selected.iter().any(|id| id == "background"));
+    }
+
+    #[test]
+    fn newly_active_class_starts_at_the_served_classes_virtual_time() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            policy: SchedulingPolicy::WeightedFair,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut interactive = build_request(TaskType::Chat, "interactive", Priority::Normal);
+        interactive.workload_class = WorkloadClass::Interactive;
+        interactive.params.max_tokens = 1_000;
+        scheduler.add_request(&interactive);
+        assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+        scheduler.update_after_step(&interactive.id, 1, 0, 1.0);
+        // An hour of interactive traffic.
+        scheduler
+            .class_service
+            .insert(WorkloadClass::Interactive, 6_000_000);
+        assert_eq!(scheduler.schedule().decode_requests.len(), 1);
+
+        let mut background = build_request(TaskType::Chat, "background", Priority::Normal);
+        background.workload_class = WorkloadClass::Background;
+        background.params.max_tokens = 1_000;
+        scheduler.add_request(&background);
+        let admitted = scheduler.schedule();
+        assert_eq!(admitted.prefill_requests[0].request_id, background.id);
+        scheduler.update_after_step(&background.id, 1, 0, 1.0);
+
+        let mut served = HashMap::<RequestId, usize>::new();
+        for _ in 0..14 {
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 1);
+            *served
+                .entry(step.decode_requests[0].request_id.clone())
+                .or_default() += 1;
+        }
+        // Weights 6:1 share the slot; history accrued while background was
+        // idle buys it nothing.
+        assert!(served.get(&background.id).copied().unwrap_or(0) >= 1);
+        assert!(served.get(&interactive.id).copied().unwrap_or(0) >= 11);
     }
 
     #[test]
@@ -6249,7 +7612,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_rows_rotate_and_sustained_codec_work_preserves_ar_progress_at_width_one() {
+    fn audio_rows_rotate_and_sustained_codec_work_preserves_ar_progress() {
         let (mut scheduler, first, second) = two_ready_audio_requests();
         for request in [&first, &second] {
             scheduler
@@ -6266,19 +7629,36 @@ mod tests {
             served.request_id
         );
 
+        // Codec and AR rows fit the width together, but form separate lanes:
+        // the core launches the codec lane and defers AR. Only committed
+        // codec-only transactions build the debt that reserves AR service.
         let (mut scheduler, codec, ar) = two_ready_audio_requests();
+        scheduler.config.max_batch_size = 2;
         scheduler
             .request_sequence_audio_decode(&codec.id, 4)
             .unwrap();
         for _ in 0..4 {
-            let row = scheduler.schedule().decode_requests.remove(0);
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 2);
+            let row = &step.decode_requests[0];
             assert_eq!(row.request_id, codec.id);
+            assert!(matches!(row.work, WorkUnit::SequenceAudioDecode { .. }));
+            scheduler.release_unexecuted_quantum(&step.decode_requests[1]);
             scheduler.update_after_step(&codec.id, 0, 0, 1.0);
+            scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
             scheduler
                 .request_sequence_audio_decode(&codec.id, 4)
                 .unwrap();
         }
-        assert_eq!(scheduler.schedule().decode_requests[0].request_id, ar.id);
+        let reserved = scheduler.schedule();
+        assert!(reserved
+            .decode_requests
+            .iter()
+            .all(|row| matches!(row.work, WorkUnit::SequenceStep { .. })));
+        assert!(reserved
+            .decode_requests
+            .iter()
+            .any(|row| row.request_id == ar.id));
 
         let (mut scheduler, high, low) = two_ready_audio_requests();
         scheduler.running.get_mut(&high.id).unwrap().priority = Priority::High;

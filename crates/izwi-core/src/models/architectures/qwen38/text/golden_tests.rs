@@ -594,8 +594,9 @@ fn zero_centered_norm_gains_stay_f32_under_every_plan() {
 #[cfg(feature = "metal")]
 #[test]
 fn native_trunk_tracks_the_hf_reference_logits_on_metal() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
-        eprintln!("metal device unavailable; qwen38 golden metal leg not run");
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "native_trunk_tracks_the_hf_reference_logits_on_metal",
+    ) else {
         return;
     };
     let checkpoint = Qwen38NativeCheckpoint::open_synthetic(&fixture_dir()).unwrap();

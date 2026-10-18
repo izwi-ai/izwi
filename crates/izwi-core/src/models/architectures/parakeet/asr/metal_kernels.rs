@@ -630,44 +630,26 @@ fn depthwise_conv2d_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeli
 
 #[cfg(feature = "metal")]
 pub fn depthwise_conv1d_enabled_for_device(device: &candle_core::Device) -> bool {
-    device.is_metal()
-        && std::env::var("IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D", true)
+    });
+    device.is_metal() && ENABLED.get()
 }
 
 #[cfg(feature = "metal")]
 pub fn depthwise_conv2d_enabled_for_device(device: &candle_core::Device) -> bool {
-    device.is_metal()
-        && std::env::var("IZWI_PARAKEET_METAL_DEPTHWISE_CONV2D")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_PARAKEET_METAL_DEPTHWISE_CONV2D", true)
+    });
+    device.is_metal() && ENABLED.get()
 }
 
 #[cfg(feature = "metal")]
 pub fn depthwise_conv1d_bias_swish_enabled_for_device(device: &candle_core::Device) -> bool {
-    device.is_metal()
-        && std::env::var("IZWI_PARAKEET_METAL_CONV1D_BN_SWISH")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_PARAKEET_METAL_CONV1D_BN_SWISH", true)
+    });
+    device.is_metal() && ENABLED.get()
 }
 
 #[cfg(feature = "metal")]
@@ -930,7 +912,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv1d_metal_matches_candle_reference",
+        ) else {
             return Ok(());
         };
 
@@ -962,7 +946,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv2d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv2d_metal_matches_candle_reference",
+        ) else {
             return Ok(());
         };
 
@@ -990,7 +976,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_bias_swish_metal_matches_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv1d_bias_swish_metal_matches_reference",
+        ) else {
             return Ok(());
         };
 

@@ -187,6 +187,7 @@ pub(crate) struct TensorStateSnapshotIndex {
 }
 
 impl TensorStateSnapshotIndex {
+    #[cfg(test)]
     pub(crate) fn new(max_entries: usize, max_bytes: u64) -> Self {
         Self::with_telemetry(
             max_entries,
@@ -214,20 +215,13 @@ impl TensorStateSnapshotIndex {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
-    }
-
-    pub(crate) fn max_entries(&self) -> usize {
-        self.max_entries
-    }
-
-    pub(crate) fn max_bytes(&self) -> u64 {
-        self.max_bytes
     }
 
     /// Remove every entry (model unload), handing them to the caller.

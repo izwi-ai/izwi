@@ -768,7 +768,7 @@ mod tests {
             Ok(d) => d,
             Err(e) => {
                 assert!(
-                    std::env::var("IZWI_REQUIRE_CUDA_TEST_DEVICE").as_deref() != Ok("1"),
+                    !crate::env::flag_or("IZWI_REQUIRE_CUDA_TEST_DEVICE", false),
                     "required CUDA dense loader device unavailable: {e}"
                 );
                 eprintln!("Skipping CUDA dense loader probe: {e}");

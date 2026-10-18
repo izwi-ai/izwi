@@ -59,13 +59,7 @@ enum Qwen38GeometryPolicy {
 }
 
 fn geometry_policy_from_env() -> Qwen38GeometryPolicy {
-    let enabled = std::env::var(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY)
-        .map(|value| {
-            let trimmed = value.trim();
-            trimmed.eq_ignore_ascii_case("1") || trimmed.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false);
-    if enabled {
+    if crate::env::flag_or(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY, false) {
         Qwen38GeometryPolicy::Synthetic
     } else {
         Qwen38GeometryPolicy::Pinned27B
@@ -2063,8 +2057,6 @@ fn decode_e4m3fn(bits: u8) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use candle_core::Module;
     use safetensors::tensor::TensorView;
     use serde_json::json;
@@ -2075,13 +2067,9 @@ mod tests {
 
     impl TestDir {
         pub(super) fn new(label: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen38-native-{label}-{}-{nonce}",
-                std::process::id()
+                "izwi-qwen38-native-{label}-{}",
+                uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(&path).unwrap();
             Self(path)

@@ -1,0 +1,69 @@
+[package]
+name = "izwi-gateway"
+description = "Izwi public API gateway: OpenAI-compatible authentication, admission and routing to approved inference workers, with no inference engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "izwi-gateway"
+path = "src/main.rs"
+
+[features]
+default = []
+# The fleet coordination store and the principal-key store on PostgreSQL.
+db-postgres = [
+    "izwi-db/db-postgres",
+    "sea-orm/sqlx-postgres",
+    "sea-orm/runtime-tokio-rustls",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = { workspace = true }
+hmac = { workspace = true }
+http-body = "1"
+http-body-util = "0.1"
+izwi-db = { path = "../izwi-db" }
+izwi-env = { path = "../izwi-env" }
+izwi-hooks = { path = "../izwi-hooks" }
+izwi-model-catalog = { path = "../izwi-model-catalog" }
+izwi-prometheus = { path = "../izwi-prometheus" }
+izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+rand = { workspace = true }
+scalar_api_reference = { workspace = true }
+sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+    "macros",
+    "runtime-tokio",
+    "sqlx-sqlite",
+    "sqlite-use-returning-for-3_35",
+    "with-json",
+    "with-uuid",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+izwi-db = { path = "../izwi-db", features = ["test-support"] }
+izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-support"] }
+izwi-test-process = { path = "../izwi-test-process" }
+reqwest = { workspace = true }
+tempfile = "3.10"
+tokio = { workspace = true, features = ["test-util"] }

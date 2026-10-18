@@ -19,18 +19,11 @@ use izwi_core::ModelVariant;
 use izwi_serving_client::realtime::{connect, RealtimeClientConfig};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_test_process::ProcessGuard;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 #[tokio::test]
 #[ignore = "requires the real Kokoro TTS artifact (IZWI_REAL_TTS_MODELS_DIR)"]
@@ -89,7 +82,7 @@ async fn real_worker_streams_tts_through_the_realtime_subprotocol() {
         _ => BackendKind::Cpu,
     };
     let deployment_id = format!("kokoro-tts-{backend}-v1");
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
     command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_WORKER_TASK", "text_to_speech")
@@ -114,7 +107,7 @@ async fn real_worker_streams_tts_through_the_realtime_subprotocol() {
             command.env(name, inherited);
         }
     }
-    let child = ChildGuard(command.spawn().unwrap());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: CredentialId::new("real-tts-credential").unwrap(),
@@ -169,7 +162,7 @@ async fn real_worker_streams_tts_through_the_realtime_subprotocol() {
         task: TaskKind::TextToSpeech,
         service_class: ServiceClass::Realtime,
         remaining_time_ms: 300_000,
-        input: RealtimeStageInput::TextStream,
+        input: RealtimeStageInput::text_stream(),
     };
 
     let mut session = connect(

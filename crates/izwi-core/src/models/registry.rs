@@ -12,11 +12,12 @@ use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
-use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile, DeviceThread};
 use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
 use crate::engine::{
-    InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
-    RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
+    InvocationStaticAttentionLease, InvocationTensorLease, ReplayCapability,
+    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
 use crate::kernels::numeric_check::{with_precision_reload_gate, PrecisionReloadGate};
@@ -38,7 +39,8 @@ use crate::models::architectures::granite_speech::asr::{
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::{
-    ChatDecodeState as Lfm2ChatDecodeState, Lfm2ChatDecodeCheckpoint, Lfm2ChatModel,
+    ChatDecodeState as Lfm2ChatDecodeState, ChatDecodeStep as Lfm2ChatDecodeStep,
+    Lfm2ChatDecodeCheckpoint, Lfm2ChatModel, MixedPrefillRow as Lfm2MixedPrefillRow,
 };
 use crate::models::architectures::lfm25_audio::{
     asr_retained::{
@@ -81,7 +83,7 @@ use crate::models::architectures::qwen3::asr::{
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
-    ChatGenerationOutput, Qwen3ChatModel,
+    ChatGenerationOutput, MixedPrefillRow as Qwen3MixedPrefillRow, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
@@ -131,7 +133,14 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
-type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
+/// ASR loaders also take the engine's Granite overrides (only Granite reads
+/// them).
+type AsrLoaderFn = fn(
+    &Path,
+    ModelVariant,
+    DeviceProfile,
+    &crate::config::GraniteSpeechOptions,
+) -> Result<NativeAsrModel>;
 type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAudioChatModel>;
 type ChatLoaderFn = fn(
     &Path,
@@ -222,6 +231,7 @@ fn load_qwen_forced_aligner_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Qwen3(Qwen3AsrModel::load(
         model_dir, variant, device,
@@ -232,6 +242,7 @@ fn load_qwen_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Qwen3(Qwen3AsrModel::load(
         model_dir, variant, device,
@@ -242,6 +253,7 @@ fn load_parakeet_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Parakeet(ParakeetAsrModel::load(
         model_dir, variant, device,
@@ -252,6 +264,7 @@ fn load_nemotron_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Nemotron(NemotronAsrModel::load(
         model_dir, variant, device,
@@ -262,6 +275,7 @@ fn load_whisper_asr_model(
     model_dir: &Path,
     _variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::WhisperTurbo(WhisperTurboAsrModel::load(
         model_dir, device,
@@ -272,6 +286,7 @@ fn load_vibevoice_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::VibeVoice(VibeVoiceAsrModel::load(
         model_dir, variant, device,
@@ -282,9 +297,10 @@ fn load_granite_speech_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::GraniteSpeech(GraniteSpeechAsrModel::load(
-        model_dir, variant, device,
+        model_dir, variant, device, granite,
     )?))
 }
 
@@ -3037,6 +3053,12 @@ impl NativeAsrModel {
 }
 
 fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
+    static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
+        crate::env::ReadOnce::new(lfm25_audio_asr_long_form_config_from_env);
+    CONFIG.get()
+}
+
+fn lfm25_audio_asr_long_form_config_from_env() -> AsrLongFormConfig {
     let mut cfg = AsrLongFormConfig::default();
     if let Some(value) = env_positive_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
         cfg.target_chunk_secs = value;
@@ -3068,8 +3090,10 @@ fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
 }
 
 fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
+    static ENV_MAX_NEW_TOKENS: crate::env::ReadOnce<Option<usize>> =
+        crate::env::ReadOnce::new(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"));
     max_tokens
-        .or_else(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"))
+        .or_else(|| ENV_MAX_NEW_TOKENS.get())
         .unwrap_or(LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS)
         .max(1)
 }
@@ -3078,7 +3102,9 @@ fn lfm25_audio_asr_chunk_max_new_tokens(duration_secs: f32, max_tokens: Option<u
     if let Some(max_tokens) = max_tokens {
         return max_tokens.max(1);
     }
-    if let Some(max_tokens) = env_positive_usize("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS") {
+    static ENV_CHUNK_MAX_NEW_TOKENS: crate::env::ReadOnce<Option<usize>> =
+        crate::env::ReadOnce::new(|| env_positive_usize("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS"));
+    if let Some(max_tokens) = ENV_CHUNK_MAX_NEW_TOKENS.get() {
         return max_tokens;
     }
 
@@ -3503,6 +3529,7 @@ impl NativeAudioChatModel {
         stream_config: &Lfm25AudioStreamConfig,
         decode_partial_audio: bool,
         leases: &mut InvocationWorkspaceLeaseSetV2,
+        should_stop: &mut dyn FnMut() -> bool,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<NativeAudioChatGeneration> {
@@ -3525,6 +3552,7 @@ impl NativeAudioChatModel {
                     attention.paged_cache_mut()?,
                     shortconv.typed_mut::<InvocationTensorLease>()?,
                     depthformer.paged_cache_mut()?,
+                    should_stop,
                     on_text_delta,
                     on_audio_samples,
                 )?;
@@ -4555,6 +4583,32 @@ pub(crate) enum NativeChatDecodeCheckpoint {
     Lfm2(Lfm2ChatDecodeCheckpoint),
 }
 
+/// Family-typed CPU continuation record of a chat session suspended for
+/// capacity: everything needed to rebuild its released physical state by
+/// replaying tokens. It owns no tensors, cache views or device events.
+pub(crate) enum NativeChatReplayCheckpoint {
+    Qwen3(crate::models::architectures::qwen3::chat::ChatReplayCheckpoint),
+    Gemma3(crate::models::architectures::gemma3::chat::ChatReplayCheckpoint),
+    Lfm2(crate::models::architectures::lfm2::chat::Lfm2ChatReplayCheckpoint),
+    Qwen35(crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint),
+    Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
+    Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
+}
+
+impl NativeChatReplayCheckpoint {
+    /// Tokens the replay writes back: everything the released state held.
+    pub(crate) fn replay_tokens(&self) -> usize {
+        match self {
+            Self::Qwen3(checkpoint) => checkpoint.replay_tokens(),
+            Self::Gemma3(checkpoint) => checkpoint.replay_tokens(),
+            Self::Lfm2(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen35(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
@@ -4639,6 +4693,36 @@ impl NativeChatDecodeState {
             Self::Lfm2(state) => Some(state.prefill_progress()),
         }
     }
+
+    /// Capture the CPU continuation record of a session whose physical state
+    /// is about to be released for capacity; `None` when the family cannot
+    /// replay. The caller fences the last completed step first.
+    pub(crate) fn replay_checkpoint(&self) -> Result<NativeChatReplayCheckpoint> {
+        Ok(match self {
+            Self::Qwen3(state) => NativeChatReplayCheckpoint::Qwen3(state.replay_checkpoint()?),
+            Self::Gemma3(state) => NativeChatReplayCheckpoint::Gemma3(state.replay_checkpoint()?),
+            Self::Lfm2(state) => NativeChatReplayCheckpoint::Lfm2(state.replay_checkpoint()?),
+            Self::Qwen35(state) => NativeChatReplayCheckpoint::Qwen35(state.replay_checkpoint()?),
+            Self::Qwen38(state) => NativeChatReplayCheckpoint::Qwen38(state.replay_checkpoint()?),
+            Self::Qwen36Moe(state) => {
+                NativeChatReplayCheckpoint::Qwen36Moe(state.replay_checkpoint()?)
+            }
+        })
+    }
+
+    /// Length of the replay still being rebuilt, or `None` once the state
+    /// decodes normally.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => state.replay_tokens(),
+            Self::Gemma3(state) => state.replay_tokens(),
+            Self::Lfm2(state) => state.replay_tokens(),
+            Self::Qwen35(state) => state.replay_tokens(),
+            Self::Qwen38(state) => state.replay_tokens(),
+            Self::Qwen36Moe(state) => state.replay_tokens(),
+        }
+    }
+
     pub(crate) fn begin_continuous_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -4880,6 +4964,34 @@ pub struct NativeChatDecodeStep {
     pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
+/// What one row of a mixed step feeds the model.
+pub(crate) enum MixedInput<'a> {
+    /// One decode token: the row's pending sampled token.
+    Decode,
+    /// The prompt span `[span_start, span_end)` of a resumable prefill.
+    Prefill {
+        prompt: &'a [u32],
+        prepared: Option<&'a NativeChatPreparedPrompt>,
+        span_start: usize,
+        span_end: usize,
+    },
+}
+
+/// One row of a mixed step: decode rows come before prefill rows.
+pub(crate) struct MixedRow<'a> {
+    pub(crate) state: &'a mut NativeChatDecodeState,
+    pub(crate) input: MixedInput<'a>,
+}
+
+/// What one row of a mixed step produced.
+#[derive(Debug)]
+pub(crate) enum MixedRowStep {
+    /// A non-final prefill span committed `input_tokens` prompt tokens.
+    Progress { input_tokens: usize },
+    /// A decode row's token, or a final prefill span's bootstrap token.
+    Token(NativeChatDecodeStep),
+}
+
 impl NativeChatModel {
     /// Prepare the exact prompt consumed by execution. Hybrid Qwen families
     /// return their independently typed reusable artifacts.
@@ -5024,6 +5136,148 @@ impl NativeChatModel {
         }
     }
 
+    /// Whether this loaded model runs prefill spans and one-token decode rows
+    /// in one model call ([`Self::step_mixed`]). Each family joins in its own
+    /// trunk once its mixed forward matches the split path; whether a loaded
+    /// model publishes the mixed stage is `catalog::mixed_step`'s call.
+    pub fn supports_mixed_step(&self) -> bool {
+        matches!(self, Self::Qwen3(_) | Self::Lfm2(_))
+    }
+
+    /// Run `rows` (decode rows first, then prefill spans) in one forward and
+    /// one sampling readback.
+    pub(crate) fn step_mixed(&self, rows: &mut [MixedRow<'_>]) -> Result<Vec<MixedRowStep>> {
+        let decode_rows = rows
+            .iter()
+            .take_while(|row| matches!(row.input, MixedInput::Decode))
+            .count();
+        if rows[decode_rows..]
+            .iter()
+            .any(|row| matches!(row.input, MixedInput::Decode))
+        {
+            return Err(Error::InvalidInput(
+                "mixed chat rows must list decode rows before prefill spans".into(),
+            ));
+        }
+        let crossed = || {
+            Error::InvalidInput("mixed chat step crossed model family or prepared prompt".into())
+        };
+        match self {
+            Self::Qwen3(model) => {
+                let mut decode = Vec::with_capacity(decode_rows);
+                let mut prefill = Vec::with_capacity(rows.len() - decode_rows);
+                for row in rows.iter_mut() {
+                    match (&mut *row.state, &row.input) {
+                        (NativeChatDecodeState::Qwen3(state), MixedInput::Decode) => {
+                            decode.push(state)
+                        }
+                        (
+                            NativeChatDecodeState::Qwen3(state),
+                            MixedInput::Prefill {
+                                prompt,
+                                prepared: None,
+                                span_start,
+                                span_end,
+                            },
+                        ) => prefill.push(Qwen3MixedPrefillRow {
+                            state,
+                            prompt,
+                            span_start: *span_start,
+                            span_end: *span_end,
+                        }),
+                        _ => return Err(crossed()),
+                    }
+                }
+                let (decode_steps, prefill_steps) = model.step_mixed(&mut decode, &mut prefill)?;
+                let decoded = decode_steps.into_iter().zip(decode).map(|(step, state)| {
+                    MixedRowStep::Token(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs: std::mem::take(&mut state.pending_logprobs),
+                    })
+                });
+                let prefilled =
+                    prefill_steps
+                        .into_iter()
+                        .zip(prefill)
+                        .map(|(step, row)| match step {
+                            Some(step) => MixedRowStep::Token(NativeChatDecodeStep {
+                                delta: step.delta,
+                                text: step.text,
+                                tokens_generated: step.tokens_generated,
+                                input_tokens_committed: 1,
+                                finished: step.finished,
+                                logprobs: std::mem::take(&mut row.state.pending_logprobs),
+                            }),
+                            None => MixedRowStep::Progress {
+                                input_tokens: row.span_end - row.span_start,
+                            },
+                        });
+                Ok(decoded.chain(prefilled).collect())
+            }
+            Self::Lfm2(model) => {
+                let mut decode = Vec::with_capacity(decode_rows);
+                let mut prefill = Vec::with_capacity(rows.len() - decode_rows);
+                for row in rows.iter_mut() {
+                    match (&mut *row.state, &row.input) {
+                        (NativeChatDecodeState::Lfm2(state), MixedInput::Decode) => {
+                            decode.push(state)
+                        }
+                        (
+                            NativeChatDecodeState::Lfm2(state),
+                            MixedInput::Prefill {
+                                prompt,
+                                prepared: None,
+                                span_start,
+                                span_end,
+                            },
+                        ) => prefill.push(Lfm2MixedPrefillRow {
+                            state,
+                            prompt,
+                            span_start: *span_start,
+                            span_end: *span_end,
+                        }),
+                        _ => return Err(crossed()),
+                    }
+                }
+                let (decode_steps, prefill_steps) = model.step_mixed(&mut decode, &mut prefill)?;
+                let token = |step: Lfm2ChatDecodeStep, logprobs| {
+                    MixedRowStep::Token(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    })
+                };
+                let decoded = decode_steps
+                    .into_iter()
+                    .zip(decode)
+                    .map(|(step, state)| token(step, std::mem::take(&mut state.pending_logprobs)));
+                let prefilled =
+                    prefill_steps
+                        .into_iter()
+                        .zip(prefill)
+                        .map(|(step, row)| match step {
+                            Some(step) => {
+                                token(step, std::mem::take(&mut row.state.pending_logprobs))
+                            }
+                            None => MixedRowStep::Progress {
+                                input_tokens: row.span_end - row.span_start,
+                            },
+                        });
+                Ok(decoded.chain(prefilled).collect())
+            }
+            _ => Err(Error::InvalidInput(
+                "loaded chat model does not run mixed prefill and decode steps".into(),
+            )),
+        }
+    }
+
     pub fn supports_continuous_decode_batch(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
@@ -5048,6 +5302,122 @@ impl NativeChatModel {
             | Self::Gemma3(_)
             | Self::Lfm2(_)
         )
+    }
+
+    /// How this loaded model rebuilds a session released for capacity.
+    /// Qwen3.6-MoE keeps a replay checkpoint, but its replay waits for CUDA
+    /// validation, so it does not declare one.
+    pub fn replay_capability(&self) -> ReplayCapability {
+        match self {
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) | Self::Qwen38(_) => {
+                ReplayCapability::TokenReplay
+            }
+            Self::Qwen36Moe(_) => ReplayCapability::None,
+        }
+    }
+
+    /// Whether CUDA incremental admission (a claim of exactly the next
+    /// scheduled span, including projected speculative spans) is validated
+    /// for this family.
+    pub fn admits_incrementally_on_cuda(&self) -> bool {
+        matches!(self, Self::Qwen38(_))
+    }
+
+    /// Start rebuilding a suspended session in a fresh context-0 reservation.
+    /// The returned state replays before it decodes again.
+    pub(crate) fn begin_replay_state_managed(
+        &self,
+        checkpoint: &NativeChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        match (self, checkpoint) {
+            (Self::Qwen3(model), NativeChatReplayCheckpoint::Qwen3(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Qwen3(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
+            (Self::Gemma3(model), NativeChatReplayCheckpoint::Gemma3(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Gemma3(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
+            (Self::Lfm2(model), NativeChatReplayCheckpoint::Lfm2(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Lfm2(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
+            (Self::Qwen35(model), NativeChatReplayCheckpoint::Qwen35(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_replay_state_physical(checkpoint, cache)?,
+                ))
+            }
+            (Self::Qwen38(model), NativeChatReplayCheckpoint::Qwen38(checkpoint)) => {
+                Ok(NativeChatDecodeState::Qwen38(
+                    model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
+                ))
+            }
+            (Self::Qwen36Moe(model), NativeChatReplayCheckpoint::Qwen36Moe(checkpoint)) => {
+                Ok(NativeChatDecodeState::Qwen36Moe(
+                    model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
+                ))
+            }
+            _ => Err(Error::InferenceError(
+                "replay model does not match session".into(),
+            )),
+        }
+    }
+
+    /// Replay `[span_start, span_end)` of a suspended session's journal (its
+    /// prompt, then its generated tokens) into its state without sampling or
+    /// emitting output. Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut NativeChatDecodeState,
+        prompt_ids: &[u32],
+        prepared: Option<&NativeChatPreparedPrompt>,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .filter(|prepared| prepared.prompt_ids() == prompt_ids)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 replay requires its sealed prepared prompt".into(),
+                        )
+                    })?;
+                model.continue_replay(state, prepared, span_start, span_end)
+            }
+            (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
+            (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
+            (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
+                model.continue_replay_physical(state, span_start, span_end)
+            }
+            (Self::Qwen36Moe(model), NativeChatDecodeState::Qwen36Moe(state)) => {
+                model.continue_replay_physical(state, span_start, span_end)
+            }
+            _ => Err(Error::InferenceError(
+                "chat replay crossed model family".into(),
+            )),
+        }
     }
 
     /// Whether one continuous model call executes all live rows through a
@@ -5090,14 +5460,14 @@ impl NativeChatModel {
     /// cache until they publish an equivalent managed adapter.
     pub fn start_qwen3_decode_state_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
-                messages,
+                prompt_ids,
                 max_new_tokens,
                 config,
                 cache,
@@ -5449,14 +5819,14 @@ impl NativeChatModel {
 
     pub(crate) fn start_gemma3_decode_state_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Gemma3(model) => Ok(NativeChatDecodeState::Gemma3(model.start_decode_managed(
-                messages,
+                prompt_ids,
                 max_new_tokens,
                 config,
                 cache,
@@ -5896,6 +6266,7 @@ impl NativeChatModel {
 pub struct ModelRegistry {
     performance: crate::performance::PerformanceConfig,
     prefix_reuse: PrefixReuseMode,
+    granite_speech: crate::config::GraniteSpeechOptions,
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
@@ -6191,6 +6562,7 @@ impl ModelRegistry {
         Self {
             performance: performance.snapshot_env(),
             prefix_reuse: PrefixReuseMode::default(),
+            granite_speech: crate::config::GraniteSpeechOptions::default().with_env_fallback(),
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
@@ -6226,6 +6598,16 @@ impl ModelRegistry {
     /// The prefix-reuse decision mode this registry's loads apply.
     pub(crate) fn prefix_reuse_mode(&self) -> PrefixReuseMode {
         self.prefix_reuse
+    }
+
+    /// Pin the Granite speech overrides (already resolved against the
+    /// environment) for every Granite model this registry loads.
+    pub fn with_granite_speech(
+        mut self,
+        granite_speech: crate::config::GraniteSpeechOptions,
+    ) -> Self {
+        self.granite_speech = granite_speech;
+        self
     }
 
     /// Record the page size and storage dtype of every paged domain a loaded
@@ -6653,9 +7035,10 @@ impl ModelRegistry {
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
                 let loader = registration.loader;
+                let granite_speech = self.granite_speech.clone();
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
-                        let load = || loader(&model_dir, variant, device);
+                    DeviceThread::for_device(&device.device)?.submit(move || {
+                        let load = || loader(&model_dir, variant, device, &granite_speech);
                         let model = match reload_gate {
                             Some(gate) => with_precision_reload_gate(gate, load),
                             None => load(),
@@ -6719,7 +7102,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeAudioChatModel, Error>(model)
                     })
@@ -6783,7 +7166,7 @@ impl ModelRegistry {
                 let performance = self.performance.clone();
                 let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model =
                             loader(&model_dir, variant, device, &performance, prefix_reuse)?;
                         Ok::<NativeChatModel, Error>(model)
@@ -6842,7 +7225,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeDiarizationModel, Error>(model)
                     })
@@ -6892,7 +7275,7 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         loader(&model_dir, variant, device, prefix_reuse)
                     })
                     .await
@@ -6955,7 +7338,7 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 let kv_cache_dtype = kv_cache_dtype.to_string();
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         loader(
                             &model_dir,
                             variant,
@@ -7021,7 +7404,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7080,7 +7463,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7137,7 +7520,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7194,7 +7577,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7633,6 +8016,22 @@ impl ModelRegistry {
         entry.publish_ready()
     }
 
+    /// The thread that loads, runs and frees this registry's models.
+    pub(crate) fn device_thread(&self) -> Result<Arc<DeviceThread>> {
+        DeviceThread::for_device(&self.device.device)
+    }
+
+    /// Free a retired model's weights on the device thread. A lease that
+    /// outlives the unload frees them where it is dropped.
+    async fn drop_on_device<T: Send + 'static>(&self, retired: T) {
+        match self.device_thread() {
+            Ok(device) => {
+                let _ = device.submit(move || drop(retired)).await;
+            }
+            Err(_) => drop(retired),
+        }
+    }
+
     pub async fn unload_asr(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.asr_models.write().await;
@@ -7644,12 +8043,15 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
     pub async fn unload_diarization(&self, variant: ModelVariant) {
-        let mut guard = self.diarization_models.write().await;
-        guard.remove(&variant);
+        let entry = self.diarization_models.write().await.remove(&variant);
+        if let Some(entry) = entry {
+            self.drop_on_device(entry).await;
+        }
     }
 
     pub async fn unload_chat(&self, variant: ModelVariant) {
@@ -7659,6 +8061,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7673,6 +8076,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7684,6 +8088,7 @@ impl ModelRegistry {
         if let Some(entry) = entry {
             entry.reset_ready();
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7698,6 +8103,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7712,6 +8118,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7726,6 +8133,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7736,6 +8144,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7750,6 +8159,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 }

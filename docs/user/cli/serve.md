@@ -45,7 +45,8 @@ The resolved settings are passed through to the spawned `izwi-server` process, s
 | Option | Description | Built-in default |
 |--------|-------------|------------------|
 | `--mode <MODE>` | Startup mode: `server`, `desktop`, `web` | `server` |
-| `-H, --host <HOST>` | Host to bind to | `0.0.0.0` |
+| `-H, --host <HOST>` | Host to bind to. A non-loopback host requires `IZWI_API_KEY` | `127.0.0.1` |
+| `--allow-unauthenticated-network` | Start a non-loopback bind without an API key (unsafe) | Disabled |
 | `-p, --port <PORT>` | Port to listen on | `8080` |
 | `-m, --models-dir <PATH>` | Models directory | Platform default |
 | `--max-batch-size <N>` | Maximum batch size | `8` |
@@ -112,6 +113,22 @@ izwi serve \
   --threads 6
 ```
 
+### Access from other devices
+
+Binding a network address requires an API key. Clients send it as
+`Authorization: Bearer <key>` or `x-api-key: <key>`; the web UI asks for it
+once.
+
+```bash
+export IZWI_API_KEY="$(openssl rand -hex 32)"
+izwi serve --host 0.0.0.0
+```
+
+Without `IZWI_API_KEY` the server refuses to start on a non-loopback host.
+`--allow-unauthenticated-network` overrides that and exposes model
+management and history to anyone who can reach the port. See
+[Security And CORS](/api#security-and-cors).
+
 ### Development browser access
 
 ```bash
@@ -132,9 +149,13 @@ izwi serve --mode web --no-ui
 |----------|-------------------|
 | `IZWI_HOST` | `--host` |
 | `IZWI_PORT` | `--port` |
+| `IZWI_API_KEY` | API key required for non-loopback binds (environment only) |
+| `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` | `--allow-unauthenticated-network` |
 | `IZWI_MODELS_DIR` | `--models-dir` |
 | `IZWI_BACKEND` | `--backend` |
 | `IZWI_MAX_BATCH_SIZE` | `--max-batch-size` |
+| `IZWI_MAX_TOKENS_PER_STEP` | Environment only: scheduler token budget per step (default `0`, the backend's: 2048 on CUDA, 384 on CPU/Metal) |
+| `IZWI_CHUNKED_PREFILL_THRESHOLD` | Environment only: prefill chunk in tokens when chunked prefill is on (default `0`, the backend's: 512 on CUDA, 192 on CPU/Metal) |
 | `IZWI_NUM_THREADS` | `--threads` |
 | `IZWI_MAX_CONCURRENT` | `--max-concurrent` |
 | `IZWI_TIMEOUT` | `--timeout` |
@@ -144,6 +165,7 @@ izwi serve --mode web --no-ui
 | `IZWI_UI_DIR` | Config-only UI build directory |
 | `RUST_LOG` | `--log-level` |
 | `IZWI_LOG_FORMAT` | `--log-format` |
+| `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | Environment only: how long a streamed chat answer waits for a client that stopped reading before it fails (default `30000`). While the client lags, text is merged rather than dropped |
 | `IZWI_SERVE_MODE` | `--mode` |
 
 Legacy aliases still resolve for one release cycle:
@@ -159,7 +181,7 @@ Legacy aliases still resolve for one release cycle:
 
 ```toml
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8080
 cors = false
 cors_origins = ["http://localhost:3000"]

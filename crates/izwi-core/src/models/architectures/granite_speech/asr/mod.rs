@@ -562,7 +562,15 @@ pub(crate) struct GraniteSpeechPhysicalStateSpec {
 }
 
 impl GraniteSpeechAsrModel {
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    /// Loads a Granite Speech checkpoint. `granite` carries the engine's
+    /// resolved overrides (dtype, decode profile); this never reads the
+    /// environment for them.
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        granite: &crate::config::GraniteSpeechOptions,
+    ) -> Result<Self> {
         let expected_kind = GraniteSpeechCheckpointKind::for_variant(variant).ok_or_else(|| {
             Error::InvalidInput(format!(
                 "GraniteSpeechAsrModel cannot load non-Granite variant {variant}"
@@ -592,10 +600,17 @@ impl GraniteSpeechAsrModel {
         let prompt_tokenizer =
             GraniteSpeechPromptTokenizer::load(model_dir, &config, &processor, &tokenizer_config)?;
         let preprocessor = GraniteSpeechPreprocessor::new(processor.clone())?;
-        let dtype = select_granite_speech_dtype(&device, config.target_dtype_hint())?;
-        let encoder_precision = resolve_granite_encoder_projection_precision(&device);
-        let runtime =
-            GraniteSpeechRuntime::load(&shards, &config, &device, dtype, &encoder_precision)?;
+        let speech_dtype = granite.speech_dtype.as_deref();
+        let dtype = select_granite_speech_dtype(&device, config.target_dtype_hint(), speech_dtype)?;
+        let encoder_precision = resolve_granite_encoder_projection_precision(&device, speech_dtype);
+        let runtime = GraniteSpeechRuntime::load(
+            &shards,
+            &config,
+            &device,
+            dtype,
+            &encoder_precision,
+            granite,
+        )?;
 
         info!(
             "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files); encoder: {}",
@@ -2083,16 +2098,18 @@ const GRANITE_SPEECH_DTYPE_ENV: &str = "IZWI_GRANITE_SPEECH_DTYPE";
 
 /// Whether the conformer encoder's linear and pointwise-convolution weights
 /// load as weight-only F16 (F32 activations): on by default on Metal, as
-/// whisper.cpp stores conformer encoders; `IZWI_GRANITE_SPEECH_DTYPE=f32`
-/// or `IZWI_METAL_DTYPE=f32` keeps them F32. Admission prices the encoder
+/// whisper.cpp stores conformer encoders; a `speech_dtype` override of f32
+/// (`IZWI_GRANITE_SPEECH_DTYPE`, resolved into the engine config) or
+/// `IZWI_METAL_DTYPE=f32` keeps them F32. Admission prices the encoder
 /// accordingly (`runtime/lifecycle/asr_memory.rs`).
 pub(crate) fn resolve_granite_encoder_projection_precision(
     device: &DeviceProfile,
+    speech_dtype: Option<&str>,
 ) -> DTypeSelection {
-    let family = std::env::var(GRANITE_SPEECH_DTYPE_ENV).ok();
     device.resolve_metal_weight_only_f16(
-        family
-            .as_deref()
+        speech_dtype
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(|value| (GRANITE_SPEECH_DTYPE_ENV, value)),
     )
 }
@@ -2132,19 +2149,18 @@ pub(crate) fn granite_tensor_is_f16_encoder_projection(name: &str) -> bool {
 }
 
 /// The base weight dtype the Granite Speech loader selects on `device`,
-/// honouring `IZWI_GRANITE_SPEECH_DTYPE`; `config_hint` is the checkpoint
-/// config's dtype. Load admission prices the checkpoint at this dtype
-/// (`runtime/lifecycle/asr_memory.rs`).
+/// honouring the `speech_dtype` override (`IZWI_GRANITE_SPEECH_DTYPE` or
+/// `--granite-speech-dtype`, resolved into the engine config);
+/// `config_hint` is the checkpoint config's dtype. Load admission prices the
+/// checkpoint at this dtype (`runtime/lifecycle/asr_memory.rs`).
 pub(crate) fn select_granite_speech_dtype(
     device: &DeviceProfile,
     config_hint: Option<&str>,
+    speech_dtype: Option<&str>,
 ) -> Result<DType> {
-    let explicit = std::env::var(GRANITE_SPEECH_DTYPE_ENV)
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty());
+    let explicit = speech_dtype.map(str::trim).filter(|raw| !raw.is_empty());
 
-    if let Some(raw) = explicit.as_deref() {
+    if let Some(raw) = explicit {
         return resolve_explicit_granite_speech_dtype(device, raw);
     }
     if device.kind.is_metal()
@@ -2484,15 +2500,12 @@ fn duration_ms(duration: Duration) -> f64 {
 }
 
 fn granite_token_debug_enabled() -> bool {
-    std::env::var("IZWI_GRANITE_TOKEN_DEBUG")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_TOKEN_DIAGNOSTICS").ok())
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag("IZWI_GRANITE_TOKEN_DEBUG")
+            .or_else(|| crate::env::flag("IZWI_GRANITE_TOKEN_DIAGNOSTICS"))
+            .unwrap_or(false)
+    });
+    ENABLED.get()
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -3060,11 +3073,10 @@ mod tests {
     #[test]
     fn granite_speech_dtype_config_hint_keeps_existing_metal_f32_policy() {
         let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
         let metal = test_profile(DeviceKind::Metal, true);
 
         assert_eq!(
-            select_granite_speech_dtype(&metal, Some("torch.bfloat16")).unwrap(),
+            select_granite_speech_dtype(&metal, Some("torch.bfloat16"), None).unwrap(),
             DType::F32
         );
     }
@@ -3072,25 +3084,21 @@ mod tests {
     #[test]
     fn granite_speech_dtype_explicit_f16_can_opt_into_metal_half_precision() {
         let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", "f16");
         let metal = test_profile(DeviceKind::Metal, true);
 
         assert_eq!(
-            select_granite_speech_dtype(&metal, None).unwrap(),
+            select_granite_speech_dtype(&metal, None, Some("f16")).unwrap(),
             DType::F16
         );
-        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
     }
 
     #[test]
     fn granite_speech_dtype_rejects_bf16_on_metal() {
         let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", "bf16");
         let metal = test_profile(DeviceKind::Metal, true);
 
-        let err = select_granite_speech_dtype(&metal, None).unwrap_err();
+        let err = select_granite_speech_dtype(&metal, None, Some("bf16")).unwrap_err();
         assert!(err.to_string().contains("BF16 is not supported on Metal"));
-        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
     }
 
     #[test]
@@ -3099,21 +3107,21 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
-        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
         std::env::remove_var("IZWI_METAL_DTYPE");
         let metal = test_profile(DeviceKind::Metal, true);
-        let resolve = || resolve_granite_encoder_projection_precision(&metal).dtype;
+        let resolve = || resolve_granite_encoder_projection_precision(&metal, None).dtype;
         assert_eq!(resolve(), DType::F16);
         assert_eq!(
-            resolve_granite_encoder_projection_precision(&DeviceProfile::cpu()).dtype,
+            resolve_granite_encoder_projection_precision(&DeviceProfile::cpu(), None).dtype,
             DType::F32
         );
         std::env::set_var("IZWI_METAL_DTYPE", "f32");
         assert_eq!(resolve(), DType::F32);
         std::env::remove_var("IZWI_METAL_DTYPE");
-        std::env::set_var(GRANITE_SPEECH_DTYPE_ENV, "f32");
-        assert_eq!(resolve(), DType::F32);
-        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
+        assert_eq!(
+            resolve_granite_encoder_projection_precision(&metal, Some("f32")).dtype,
+            DType::F32
+        );
 
         for name in [
             "encoder.input_linear.weight",
@@ -3236,6 +3244,7 @@ mod tests {
                 &dir,
                 wrong_variant,
                 test_profile(DeviceKind::Cpu, false),
+                &Default::default(),
             )
             .err()
             .expect("mismatched checkpoint must not load")
@@ -3251,6 +3260,7 @@ mod tests {
             &fixtures.join("base"),
             ModelVariant::WhisperLargeV3Turbo,
             test_profile(DeviceKind::Cpu, false),
+            &Default::default(),
         )
         .is_err());
     }

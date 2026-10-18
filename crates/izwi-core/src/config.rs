@@ -156,10 +156,11 @@ impl BatchSizePreference {
         match self {
             Self::Fixed(rows) => rows.get(),
             Self::Auto => match backend {
-                // Both portable backends have complete width-two chat kernels;
-                // keep the conservative hard cap while enabling useful
-                // continuous tensor batching by default.
-                BackendKind::Cpu | BackendKind::Metal => 2,
+                // The widest certified family width; each loaded model then
+                // clamps to its own family's (`catalog::batch_width`).
+                BackendKind::Cpu | BackendKind::Metal => {
+                    crate::catalog::max_certified_decode_width(backend)
+                }
                 BackendKind::Cuda => 8,
             },
         }
@@ -632,6 +633,65 @@ pub(crate) fn resolve_prefix_engagement(
     }
 }
 
+/// Realtime ASR session limits (SPK-F9). An unset field takes its
+/// `IZWI_ASR_REALTIME_*` environment variable, then the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeAsrSessionConfig {
+    /// Concurrent realtime sessions, which is also the row count of the
+    /// realtime state arena a load reserves up front
+    /// (`IZWI_ASR_REALTIME_MAX_SESSIONS`; default 16 on CUDA, 4 on CPU and
+    /// Metal).
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+    /// Absolute lifetime of one session in seconds
+    /// (`IZWI_ASR_REALTIME_MAX_LIFETIME_SECS`; default 8 hours). Models with
+    /// a bounded stream roll over inside it, so it only bounds a session
+    /// that is never closed.
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u64>,
+    /// Seconds a session may receive no audio before it is reaped
+    /// (`IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS`; default 90).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// Granite speech ASR overrides. Each unset field falls back to its
+/// environment variable when the runtime is built
+/// ([`GraniteSpeechOptions::with_env_fallback`]); model loads and admission
+/// read the resolved value, never the environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraniteSpeechOptions {
+    /// Per-invocation decode-profile diagnostics
+    /// (`IZWI_GRANITE_DECODE_PROFILE`, alias `IZWI_GRANITE_DECODE_PROFILING`).
+    #[serde(default)]
+    pub decode_profile: bool,
+    /// Weight dtype override after backend selection: `f32`, `f16` or
+    /// `bf16` (`IZWI_GRANITE_SPEECH_DTYPE`).
+    #[serde(default)]
+    pub speech_dtype: Option<String>,
+}
+
+impl GraniteSpeechOptions {
+    /// These options, with the environment filling what is unset: a profile
+    /// asked for by either side is on, and an explicit dtype wins over the
+    /// variable.
+    pub fn with_env_fallback(&self) -> Self {
+        Self {
+            decode_profile: self.decode_profile
+                || crate::env::flag("IZWI_GRANITE_DECODE_PROFILE")
+                    .or_else(|| crate::env::flag("IZWI_GRANITE_DECODE_PROFILING"))
+                    .unwrap_or(false),
+            speech_dtype: self
+                .speech_dtype
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| crate::env::value("IZWI_GRANITE_SPEECH_DTYPE")),
+        }
+    }
+}
+
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -687,6 +747,15 @@ pub struct EngineConfig {
     /// Automatic or explicitly fixed maximum sequence length.
     #[serde(default)]
     pub max_sequence_length: ContextLengthPreference,
+
+    /// Realtime ASR session quota, lifetime and idle timeout.
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
+
+    /// Granite ASR diagnostics and dtype overrides (the server's
+    /// `--granite-decode-profile` and `--granite-speech-dtype`).
+    #[serde(default)]
+    pub granite_speech: GraniteSpeechOptions,
 
     /// Memory kept outside fitted model/state plans for allocator and backend
     /// command-buffer overhead.
@@ -744,9 +813,15 @@ pub struct EngineConfig {
     #[serde(default = "default_enable_chunked_prefill")]
     pub enable_chunked_prefill: bool,
 
-    /// Prompt length (tokens) above which chunked prefill applies.
+    /// Prompt length (tokens) above which chunked prefill applies; zero takes
+    /// the backend's automatic chunk (512 on CUDA).
     #[serde(default = "default_chunked_prefill_threshold")]
     pub chunked_prefill_threshold: usize,
+
+    /// Token budget of one scheduler step; zero takes the backend's automatic
+    /// budget (2,048 on CUDA).
+    #[serde(default)]
+    pub max_tokens_per_step: usize,
 
     /// Host KV pool budget in bytes for hierarchical offload (DS4). A positive
     /// budget opts this engine into demoting committed prefix pages to a host
@@ -788,6 +863,8 @@ impl Default for EngineConfig {
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
+            asr_realtime: RealtimeAsrSessionConfig::default(),
+            granite_speech: GraniteSpeechOptions::default(),
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
@@ -800,6 +877,7 @@ impl Default for EngineConfig {
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            max_tokens_per_step: 0,
             kv_host_pool_budget_bytes: 0,
             kv_offload_high_watermark: default_kv_offload_high_watermark(),
             kv_offload_low_watermark: default_kv_offload_low_watermark(),
@@ -826,7 +904,7 @@ fn default_enable_chunked_prefill() -> bool {
 }
 
 fn default_chunked_prefill_threshold() -> usize {
-    192
+    0 // The backend's automatic chunk.
 }
 
 fn default_kv_offload_high_watermark() -> f32 {
@@ -939,7 +1017,7 @@ impl EngineConfig {
 }
 
 fn default_backend_preference() -> BackendPreference {
-    BackendRouter::env_preference().unwrap_or(BackendPreference::Auto)
+    BackendRouter::unset_preference()
 }
 
 fn default_num_threads() -> usize {
@@ -1123,8 +1201,9 @@ mod managed_kv_default_tests {
     fn physical_batch_defaults_are_backend_aware() {
         let preference = EngineConfig::default().max_batch_size;
         assert_eq!(preference, BatchSizePreference::Auto);
-        assert_eq!(preference.resolve(BackendKind::Cpu), 2);
-        assert_eq!(preference.resolve(BackendKind::Metal), 2);
+        // The widest certified family; each model clamps to its own.
+        assert_eq!(preference.resolve(BackendKind::Cpu), 8);
+        assert_eq!(preference.resolve(BackendKind::Metal), 8);
         assert_eq!(preference.resolve(BackendKind::Cuda), 8);
     }
 
@@ -1150,7 +1229,7 @@ mod managed_kv_default_tests {
         assert_eq!(config.max_retained_sequences, 0);
         assert_eq!(config.max_staged_transactions, 0);
         assert_eq!(config.max_queued_requests, 128);
-        assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 2);
+        assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 8);
         assert_eq!(
             config.physical_execution_mode,
             PhysicalExecutionMode::Serial

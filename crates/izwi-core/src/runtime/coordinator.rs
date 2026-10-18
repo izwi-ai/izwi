@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use serde::Serialize;
 
-use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{BackendKind, DeviceKind, DeviceProfile, DeviceThread};
 use crate::engine::{
     AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
     ExecutionGroupId, ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider,
@@ -22,6 +23,7 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
+use crate::runtime::health::{fatal_device_fault, RuntimeHealth};
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIRECT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
@@ -635,6 +637,9 @@ pub struct InferenceCoordinator {
     host_model_stages_total: AtomicU64,
     execution: PhysicalExecutionAdmission,
     resources: Arc<ResourceAuthority>,
+    /// Runs direct inference stages; `None` only for device-less test
+    /// coordinators, whose stages run on the blocking pool.
+    device_thread: Option<Arc<DeviceThread>>,
     admission_gate: Mutex<()>,
     idle: Arc<Notify>,
     active_jobs: AtomicUsize,
@@ -671,6 +676,7 @@ impl InferenceCoordinator {
         max_queued_jobs: usize,
     ) -> Result<Self> {
         let location = validate_device_identity(backend, &device)?;
+        let device_thread = DeviceThread::for_device(&device.device)?;
         let failed_stage_fence =
             matches!(backend, BackendKind::Metal | BackendKind::Cuda).then(|| {
                 let device = device.device.clone();
@@ -684,6 +690,7 @@ impl InferenceCoordinator {
             max_queued_jobs,
             resources,
         );
+        coordinator.device_thread = Some(device_thread);
         coordinator.failed_stage_fence = failed_stage_fence;
         Ok(coordinator)
     }
@@ -717,6 +724,7 @@ impl InferenceCoordinator {
                 idle.clone(),
             ),
             resources,
+            device_thread: None,
             admission_gate: Mutex::new(()),
             idle,
             active_jobs: AtomicUsize::new(0),
@@ -728,6 +736,12 @@ impl InferenceCoordinator {
             draining: AtomicBool::new(false),
             failed_stage_fence: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_device_thread_for_test(mut self, device: Arc<DeviceThread>) -> Self {
+        self.device_thread = Some(device);
+        self
     }
 
     pub fn resource_authority(&self) -> Arc<ResourceAuthority> {
@@ -807,6 +821,32 @@ impl InferenceCoordinator {
         }
     }
 
+    /// Latch `error` as a fatal device fault when it is one, with the
+    /// classification device execution uses, on this runtime's execution
+    /// admission only: the resource authority is shared by every runtime in
+    /// the process, and an injected fault must not fail the others. Returns
+    /// whether the runtime is now poisoned.
+    pub(crate) fn latch_fatal_device_fault_for_test(&self, error: &Error) -> bool {
+        let Some(fault) = fatal_device_fault(error) else {
+            return false;
+        };
+        self.execution
+            .poison(format!("fatal device fault ({fault}) during inference"));
+        true
+    }
+
+    /// Execution admission poison is permanent for this process; a resource
+    /// authority poison alone clears once the backend fully drains.
+    pub fn health(&self) -> RuntimeHealth {
+        if let Some(reason) = self.execution.poison_reason() {
+            RuntimeHealth::Failed { reason }
+        } else if let Some(reason) = self.resources.poison_reason() {
+            RuntimeHealth::Degraded { reason }
+        } else {
+            RuntimeHealth::Healthy
+        }
+    }
+
     pub fn begin_drain(&self) {
         let _gate = self
             .admission_gate
@@ -870,6 +910,7 @@ impl InferenceCoordinator {
         })?;
         let JobLeaseInner {
             coordinator,
+            admitted_at,
             _permit,
             reservation,
             active,
@@ -885,6 +926,7 @@ impl InferenceCoordinator {
         drop(active);
         Ok(PreparationAdmissionBridge {
             coordinator,
+            admitted_at,
             preparation_spec: spec,
             reservation: Some(
                 reservation
@@ -980,6 +1022,7 @@ impl InferenceCoordinator {
         Ok(JobLease {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
+                admitted_at: bridge.admitted_at,
                 _permit: permit,
                 reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
@@ -1040,6 +1083,7 @@ impl InferenceCoordinator {
         Ok(JobLease {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
+                admitted_at: Instant::now(),
                 _permit: permit,
                 reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
@@ -1077,6 +1121,7 @@ impl InferenceCoordinator {
         })
     }
 
+    #[cfg(test)]
     async fn acquire_execution(
         self: &Arc<Self>,
         deadline: Option<Instant>,
@@ -1126,6 +1171,7 @@ impl InferenceCoordinator {
             .reserve_batch_workspace(execution_group, batch_id, resources)
     }
 
+    #[cfg(test)]
     async fn acquire_execution_units(
         self: &Arc<Self>,
         units: usize,
@@ -1921,6 +1967,7 @@ impl InferenceCoordinator {
         .await
     }
 
+    #[cfg(test)]
     async fn run_blocking_stage_inner<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
@@ -2011,7 +2058,7 @@ impl InferenceCoordinator {
         let blocking_request_id = request_id.clone();
         let poison_admission = self.execution.clone();
         let poison_resources = self.resources.clone();
-        let handle = tokio::task::spawn_blocking(move || {
+        let job = move || {
             let _guard = guard;
             let _job = retained_job;
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
@@ -2020,8 +2067,14 @@ impl InferenceCoordinator {
             let _physical_dispatch = (task_kind == "inference")
                 .then(crate::engine::metrics::begin_engine_physical_dispatch);
             if task_kind == "inference" {
+                crate::backends::probe_device_op("model.blocking_stage");
                 return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Err(error) = &result {
+                            latch_fatal_device_fault(error, &poison_admission, &poison_resources);
+                        }
+                        result
+                    }
                     Err(payload) => {
                         let reason = "blocking inference task panicked after entry";
                         poison_admission.poison(reason);
@@ -2031,7 +2084,22 @@ impl InferenceCoordinator {
                 };
             }
             operation()
-        });
+        };
+        // Device work runs on the device's own thread; host preparation and
+        // device-less test coordinators use the blocking pool. Either way a
+        // deadline detaches the job instead of cancelling it.
+        let handle: Pin<Box<dyn Future<Output = Result<Result<T>>> + Send>> =
+            match (&self.device_thread, task_kind) {
+                (Some(device), "inference") => Box::pin(device.submit(job)),
+                _ => {
+                    let handle = tokio::task::spawn_blocking(job);
+                    Box::pin(async move {
+                        handle
+                            .await
+                            .map_err(|error| Error::InferenceError(error.to_string()))
+                    })
+                }
+            };
         let joined = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), handle)
                 .await
@@ -2055,6 +2123,27 @@ impl InferenceCoordinator {
         }
         result
     }
+}
+
+/// A sticky device error poisons physical admission for the life of the
+/// process, like a panic after native entry: the device cannot run later work.
+fn latch_fatal_device_fault(
+    error: &Error,
+    execution: &PhysicalExecutionAdmission,
+    resources: &ResourceAuthority,
+) -> bool {
+    let Some(fault) = fatal_device_fault(error) else {
+        return false;
+    };
+    let reason = format!("fatal device fault ({fault}) during inference");
+    tracing::error!(
+        fault,
+        error = %error,
+        "{reason}; physical admission fails closed until the process is recreated"
+    );
+    execution.poison(reason.clone());
+    resources.poison(reason);
+    true
 }
 
 fn validate_device_identity(
@@ -2320,6 +2409,11 @@ pub struct JobLease {
 }
 
 impl JobLease {
+    /// When the coordinator admitted this request.
+    pub fn admitted_at(&self) -> Instant {
+        self._inner.admitted_at
+    }
+
     /// Stop this job's stages once `cancellation` fires.
     pub(crate) fn with_cancellation(mut self, cancellation: JobCancellation) -> Self {
         self.cancellation = Some(cancellation);
@@ -2442,6 +2536,9 @@ impl Drop for ModelLoadLease {
 #[derive(Debug)]
 struct JobLeaseInner {
     coordinator: Arc<InferenceCoordinator>,
+    /// When the coordinator first admitted this request; a preparation
+    /// handoff keeps the original admission.
+    admitted_at: Instant,
     _permit: OwnedSemaphorePermit,
     // Locked only to shrink the authorization; observations take it briefly.
     reservation: Mutex<ResourceLease>,
@@ -2464,6 +2561,7 @@ impl Drop for ActiveJobGuard {
 #[derive(Debug)]
 pub(crate) struct PreparationAdmissionBridge {
     coordinator: Arc<InferenceCoordinator>,
+    admitted_at: Instant,
     preparation_spec: JobSpec,
     reservation: Option<ResourceLease>,
 }
@@ -3243,6 +3341,8 @@ fn derive_default_metal_budget(_device: &DeviceProfile) -> Option<u64> {
     None
 }
 
+// Pure arithmetic, tested on every backend; only the Metal probe calls it.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 fn combine_metal_memory_snapshot(
     metal_total: u64,
     metal_allocated: u64,
@@ -4213,6 +4313,48 @@ Pages free: 10.\n";
         assert!(coordinator.snapshot().poisoned);
         coordinator.resources.clear_poison();
         assert!(!coordinator.snapshot().poisoned);
+    }
+
+    #[tokio::test]
+    async fn fatal_device_error_in_blocking_inference_latches_failed_health() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        assert_eq!(coordinator.health(), RuntimeHealth::Healthy);
+        coordinator.resources.poison("simulated authority poison");
+        assert!(matches!(
+            coordinator.health(),
+            RuntimeHealth::Degraded { .. }
+        ));
+        coordinator.resources.clear_poison();
+
+        let ordinary = coordinator.admit(job("ordinary-error")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage(&ordinary, || {
+                Err::<(), _>(Error::InferenceError("shape mismatch in matmul".into()))
+            })
+            .await;
+        assert!(matches!(result, Err(Error::InferenceError(_))));
+        drop(ordinary);
+        assert_eq!(coordinator.health(), RuntimeHealth::Healthy);
+
+        let faulting = coordinator.admit(job("device-fault")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage(&faulting, || {
+                Err::<(), _>(Error::InferenceError(
+                    "DriverError(CUDA_ERROR_LAUNCH_FAILED, \"unspecified launch failure\")".into(),
+                ))
+            })
+            .await;
+        assert!(matches!(result, Err(Error::InferenceError(_))));
+        drop(faulting);
+        assert!(matches!(
+            coordinator.health(),
+            RuntimeHealth::Failed { reason } if reason.contains("CUDA_ERROR_LAUNCH_FAILED")
+        ));
+        assert!(coordinator.snapshot().poisoned);
+        assert!(matches!(
+            coordinator.admit(job("after-fault")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[test]
@@ -5587,6 +5729,11 @@ Pages free: 10.\n";
     #[cfg(feature = "metal")]
     #[test]
     fn metal_coordinator_fences_its_own_device_after_a_failed_loaded_stage() {
+        let Some((_device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_coordinator_fences_its_own_device_after_a_failed_loaded_stage",
+        ) else {
+            return;
+        };
         let profile = crate::backends::DeviceSelector::detect_for_preference(
             crate::backends::BackendPreference::Metal,
         )
@@ -6209,6 +6356,36 @@ Pages free: 10.\n";
             assert_eq!(called.load(Ordering::Relaxed), 0);
             assert_eq!(coordinator.snapshot().expired_total, 1);
         });
+    }
+
+    /// B2: direct inference stages run on the device thread, and a panic
+    /// there still poisons the runtime.
+    #[tokio::test]
+    async fn blocking_inference_runs_on_the_device_thread() {
+        let device = DeviceThread::for_location(DeviceLocation::Cpu).expect("device thread");
+        let coordinator = Arc::new(
+            InferenceCoordinator::new(BackendKind::Cpu, 1, 4).with_device_thread_for_test(device),
+        );
+        let admitted = coordinator.admit(job("device-thread-stage")).await.unwrap();
+        let thread = coordinator
+            .run_blocking_stage(&admitted, || {
+                Ok(std::thread::current().name().map(str::to_string))
+            })
+            .await
+            .expect("stage");
+        assert_eq!(thread.as_deref(), Some("izwi-device-cpu-0"));
+        drop(admitted);
+
+        let panicking = coordinator.admit(job("device-thread-panic")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage::<(), _>(&panicking, || panic!("device stage panic"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::InferenceError(message))
+                if message.contains("blocking inference task failed")
+        ));
+        assert!(coordinator.snapshot().poisoned);
     }
 
     #[tokio::test]

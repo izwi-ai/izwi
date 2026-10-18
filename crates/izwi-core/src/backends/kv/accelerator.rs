@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
 
-use crate::backends::BackendKind;
+use crate::backends::{probe_device_op, BackendKind};
 use crate::error::Error;
 use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
 use crate::models::shared::memory::exact::exact_zeros;
@@ -2000,6 +2000,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn grow_resident_pages(&self, plan: KvArenaGrowthPlan) -> Result<()> {
+        probe_device_op("kv.grow_resident_pages");
         if self.backend != BackendKind::Cuda || plan.arena != self.config.id {
             return Err(Error::InvalidInput(
                 "KV growth plan targets a different or fixed arena".into(),
@@ -2065,6 +2066,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn lower_slots(&self, slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>> {
+        probe_device_op("kv.lower_slots");
         let mut flat_slots = Vec::with_capacity(slots.len());
         let mut unique = HashSet::with_capacity(slots.len());
         for slot in slots {
@@ -2096,6 +2098,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence> {
+        probe_device_op("kv.zero_pages");
         let page_indices = pages
             .iter()
             .copied()
@@ -2232,6 +2235,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence> {
+        probe_device_op("kv.copy_pages");
         let mut lowered = Vec::with_capacity(copies.len());
         let mut destinations = HashSet::with_capacity(copies.len());
         for copy in copies {
@@ -2285,6 +2289,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn capture_page(&self, page: CacheBlockRef, destination: &mut [u8]) -> Result<()> {
+        probe_device_op("kv.capture_page");
         let page = self.validate_block(page)?;
         let expected = arena_page_bytes(&self.config) as usize;
         if destination.len() != expected {
@@ -2323,6 +2328,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn restore_page(&self, page: CacheBlockRef, source: &[u8]) -> Result<()> {
+        probe_device_op("kv.restore_page");
         let page = self.validate_block(page)?;
         let expected = arena_page_bytes(&self.config) as usize;
         if source.len() != expected {
@@ -2366,6 +2372,7 @@ impl KvArena for CandleAcceleratorKvArena {
         binding: KvLayerBinding,
         args: KvWriteArgs<'_>,
     ) -> Result<KvWriteCompletion> {
+        probe_device_op("kv.write_slots");
         let slots = self.accelerator_slots(args.slots)?;
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
@@ -2476,6 +2483,7 @@ impl KvArena for CandleAcceleratorKvArena {
         decodes: u64,
         enqueue: &mut dyn FnMut(&GraphKvLayers) -> Result<()>,
     ) -> Result<Vec<KvWriteCompletion>> {
+        probe_device_op("kv.with_graph_writes");
         let lowered = self.accelerator_slots(slots)?;
         if self.storage_dtype != self.config.dtype {
             return Err(Error::InferenceError(
@@ -2540,6 +2548,7 @@ impl KvArena for CandleAcceleratorKvArena {
         binding: KvLayerBinding,
         args: PagedKvPrefillArgs<'_>,
     ) -> Result<Tensor> {
+        probe_device_op("kv.paged_prefill");
         let (_key_head_dim, _value_head_dim) = {
             let layers = self.layers.read().map_err(|_| {
                 Error::InferenceError("accelerator KV layer map was poisoned".into())
@@ -2626,6 +2635,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
+        probe_device_op("kv.paged_decode");
         if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
             return Err(Error::InferenceError(format!(
                 "direct paged attention is not compiled for {:?}",
@@ -2736,6 +2746,7 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn drain(&self) -> Result<()> {
+        probe_device_op("kv.drain");
         if self.backend == BackendKind::Metal {
             match &self.metal_completion {
                 // Drains even when every epoch is complete: paged attention
@@ -2801,6 +2812,7 @@ impl super::KvBackendRuntime for MetalKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CandleAcceleratorKvArena::new_mutation_only(
             config,
             self.device.clone(),
@@ -2827,6 +2839,7 @@ impl KvBackendRuntime for CudaKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CandleAcceleratorKvArena::new_mutation_only(
             config,
             self.device.clone(),
@@ -3644,9 +3657,13 @@ mod tests {
     fn batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics() -> Result<()> {
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "metal")]
-        if let Some(device) = crate::backends::metal_device_if_available(0) {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics",
+        )
+        .map(|(device, lease)| {
             devices.push(device);
-        }
+            lease
+        });
         #[cfg(feature = "cuda")]
         if let Ok(device) = Device::new_cuda(0) {
             devices.push(device);
@@ -3718,7 +3735,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn prefill_lowering_is_compact_and_cache_key_tracks_generations() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "prefill_lowering_is_compact_and_cache_key_tracks_generations",
+        ) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -3845,9 +3864,14 @@ mod tests {
     #[test]
     fn resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero() -> Result<()> {
         let mut devices = vec![Device::Cpu];
-        if let Some(metal) = crate::backends::metal_device_if_available(0) {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero",
+        )
+        .map(|(metal, lease)| {
             devices.push(metal);
-        }
+            lease
+        });
         for device in devices {
             for dtype in [DType::F32, DType::F16] {
                 // [pages, page_tokens, kv_heads, head_dim]
@@ -3871,7 +3895,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn failed_in_place_plan_update_never_serves_mixed_device_tables() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "failed_in_place_plan_update_never_serves_mixed_device_tables",
+        ) else {
             return Ok(());
         };
         let arena_id = KvArenaId {
@@ -3956,7 +3982,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn clean_page_tracking_elides_only_proven_redundant_zeroes() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "clean_page_tracking_elides_only_proven_redundant_zeroes",
+        ) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -4027,7 +4055,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn graph_writes_keep_the_write_bookkeeping() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("graph_writes_keep_the_write_bookkeeping")
+        else {
             return Ok(());
         };
         let bindings = [0u32, 1].map(|layer| KvLayerBinding {

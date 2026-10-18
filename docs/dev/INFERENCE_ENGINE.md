@@ -281,7 +281,7 @@ Key `SchedulerConfig` parameters (all tunable via `EngineCoreConfig`):
 | Parameter | Default | Description |
 |---|---|---|
 | `max_batch_size` | 8 | Maximum logical rows scheduled per step |
-| `max_tokens_per_step` | 384 | Token budget per scheduler step |
+| `max_tokens_per_step` | 2,048 on CUDA, 384 on CPU/Metal | Token budget per scheduler step (`IZWI_MAX_TOKENS_PER_STEP`; 0 or unset is the backend default) |
 | `max_seq_len` | model-dependent | Maximum sequence length |
 | `enable_chunked_prefill` | false | Split long chat prefills across scheduler steps (opt-in) |
 Physical managed-cache capacity is enforced during transactional batch
@@ -407,11 +407,14 @@ Each decode step:
 
 When `enable_chunked_prefill = true`, long prompts for chat models with an
 explicit span-resumable contract (Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma3)
-are split into chunks of at most `chunked_prefill_threshold` tokens (adaptive
-under decode demand). This
+are split into chunks of at most `chunked_prefill_threshold` tokens (512 on
+CUDA, 192 on CPU/Metal; the chunk does not shrink while other rows decode).
+CUDA always chunks; CPU and Metal run whole prompts unless chunking is
+enabled. This
 allows the scheduler to interleave prefill chunks with decode steps, reducing
 time-to-first-token for concurrent requests. The flag is exposed to operators
-via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`).
+via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`,
+`IZWI_MAX_TOKENS_PER_STEP`).
 
 ---
 
@@ -664,7 +667,8 @@ The following features are scaffolded or partially implemented but not yet activ
 
 ### Adding a New Model Family
 
-1. Add a variant to `ModelFamily` and `ModelTask` in `catalog/variant.rs`.
+1. Add a variant to `ModelFamily` and `ModelTask` in `catalog/variant.rs` (the
+   accelerator-free `izwi-model-catalog` crate, which izwi-core re-exports).
 2. Implement `family()`, `primary_task()`, and `backend_hint()` arms for the new variant.
 3. Create a loader in `families/<new_family>/`.
 4. Implement `ModelExecutor` for the new architecture in `models/architectures/`.

@@ -58,6 +58,20 @@ pub(super) struct PreparedPhysicalDispatch {
     launch_policy: PhysicalLaunchPolicy,
 }
 
+impl super::executor::PhysicalExecutionInputs for PreparedPhysicalDispatch {
+    fn with_execution<R>(
+        &self,
+        run: impl FnOnce(super::executor::PhysicalBatchExecution<'_>) -> R,
+    ) -> R {
+        let requests = self.requests.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        run(super::executor::PhysicalBatchExecution {
+            batch: &self.physical_batch,
+            requests: &requests,
+            scheduled: &self.scheduled,
+        })
+    }
+}
+
 impl PreparedPhysicalDispatch {
     pub(super) fn new(
         phase: ExecutionPhase,
@@ -91,7 +105,7 @@ impl PreparedPhysicalDispatch {
                         .to_string(),
                 ));
             }
-            if scheduled.is_prefill != (phase == ExecutionPhase::Prefill) {
+            if !phase.admits_row(scheduled.is_prefill) {
                 return Err(crate::error::Error::InvalidInput(
                     "physical dispatch ticket phase disagrees with its scheduled row".to_string(),
                 ));
@@ -306,6 +320,7 @@ impl Drop for PhysicalTaskDrainRegistration {
 }
 
 impl PreparedEngineStep {
+    #[cfg(test)]
     pub(super) fn new(
         executor: UnifiedExecutor,
         dispatches: Vec<PreparedPhysicalDispatch>,
@@ -439,6 +454,9 @@ impl ExecutedEngineStep {
 pub(super) enum ExecutionPhase {
     Decode,
     Prefill,
+    /// Decode and prefill rows in one mixed physical batch; per-row facts
+    /// come from each row's scheduled phase.
+    Mixed,
 }
 
 impl ExecutionPhase {
@@ -446,6 +464,16 @@ impl ExecutionPhase {
         match self {
             Self::Decode => "decode",
             Self::Prefill => "prefill",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// Whether a row scheduled as `prefill` may run in a batch of this phase.
+    pub(super) fn admits_row(self, prefill: bool) -> bool {
+        match self {
+            Self::Decode => !prefill,
+            Self::Prefill => prefill,
+            Self::Mixed => true,
         }
     }
 }
@@ -456,7 +484,6 @@ pub(super) struct ExecutedPhysicalBatch {
     pub(super) physical_batch: PhysicalBatch,
     pub(super) report: PhysicalBatchReport,
     pub(super) results: Vec<ExecutorStepResult>,
-    #[allow(dead_code)]
     pub(super) managed_cache_reservations: Vec<super::ManagedCacheReservation>,
 }
 
@@ -507,6 +534,7 @@ async fn execute_dispatches(
             dispatches,
             progress_tx,
             progress_budget,
+            task_drain,
             completion_tx,
             Some(cohort_ready_at),
         )
@@ -521,6 +549,7 @@ async fn execute_dispatches(
             dispatches,
             progress_tx,
             progress_budget,
+            task_drain,
             completion_tx,
             Some(cohort_ready_at),
         )
@@ -776,6 +805,7 @@ async fn execute_dispatches_concurrent(
             let task_executor = executor.clone();
             let task_progress_tx = progress_tx.clone();
             let task_progress_budget = progress_budget.clone();
+            let task_drain = task_drain.clone();
             let task = tokio::spawn(async move {
                 let _task_registration = task_registration;
                 let mut executed = execute_dispatches_serial(
@@ -783,6 +813,7 @@ async fn execute_dispatches_concurrent(
                     vec![dispatch],
                     &task_progress_tx,
                     &task_progress_budget,
+                    &task_drain,
                     None,
                     None,
                 )
@@ -849,6 +880,7 @@ async fn execute_dispatches_serial(
     dispatches: Vec<PreparedPhysicalDispatch>,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
+    task_drain: &PhysicalTaskDrainTracker,
     completion_tx: Option<&mpsc::UnboundedSender<ExecutedPhysicalBatch>>,
     cohort_ready_at: Option<Instant>,
 ) -> Vec<ExecutedPhysicalBatch> {
@@ -1024,13 +1056,11 @@ async fn execute_dispatches_serial(
             continue;
         }
         let observed_workspace = dispatch.physical_batch.workspace;
-        let result = executor
-            .execute_admitted_physical_batch(
-                admitted,
-                &dispatch.physical_batch,
-                &request_refs,
-                &dispatch.scheduled,
-            )
+        // The device job keeps the batch registered until it really ends, so
+        // recovery of an aborted runner waits for it before rolling back.
+        let device_registration = task_drain.register(&[dispatch.physical_batch.batch_id]);
+        let (dispatch, result) = executor
+            .execute_admitted_physical_batch(admitted, dispatch, device_registration)
             .await;
         let mut results = reconcile_executor_outputs(
             dispatch.phase.label(),

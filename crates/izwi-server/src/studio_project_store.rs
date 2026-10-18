@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::StoreError;
 use crate::{
     db::{raw, write_transaction_options, StoreDatabase},
     ids::new_uuid,
@@ -1231,13 +1232,19 @@ impl StudioProjectStore {
             return Ok(None);
         }
         if ordered_segment_ids.len() != existing_ids.len() {
-            anyhow::bail!("Reorder request must include every project segment exactly once.");
+            return Err(StoreError::invalid(
+                "Reorder request must include every project segment exactly once.",
+            )
+            .into());
         }
 
         let existing_set = existing_ids.iter().collect::<HashSet<_>>();
         let requested_set = ordered_segment_ids.iter().collect::<HashSet<_>>();
         if existing_set != requested_set {
-            anyhow::bail!("Reorder request contains unknown or missing segment ids.");
+            return Err(StoreError::invalid(
+                "Reorder request contains unknown or missing segment ids.",
+            )
+            .into());
         }
 
         let now = now_unix_millis_i64();
@@ -1316,7 +1323,7 @@ impl StudioProjectStore {
             .filter(|(id, _)| !remove_set.contains(id))
             .count();
         if remaining_count == 0 {
-            anyhow::bail!("A project must keep at least one segment.");
+            return Err(StoreError::invalid("A project must keep at least one segment.").into());
         }
 
         for (segment_id, _) in &existing {

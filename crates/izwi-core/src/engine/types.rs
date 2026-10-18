@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use super::execution::OutcomeProvenance;
 
+pub use izwi_model_catalog::chat::{FinishReason, LatencyBreakdown, TokenLogprob, TopTokenLogprob};
+
 /// Unique identifier for a request.
 pub type RequestId = String;
 
@@ -36,6 +38,11 @@ pub struct GenerationParams {
     /// Presence penalty applied once to previously generated tokens.
     #[serde(default)]
     pub presence_penalty: f32,
+
+    /// Chat sampling seed. The same seed and parameters on the same backend
+    /// sample the same tokens; `None` derives a seed from the request id.
+    #[serde(default)]
+    pub seed: Option<u64>,
 
     /// Maximum number of tokens to generate
     #[serde(default = "default_max_tokens")]
@@ -83,6 +90,12 @@ pub struct GenerationParams {
     /// (`response_format: json_object`).
     #[serde(default)]
     pub constrain_json_object: bool,
+
+    /// Leave special tokens out of generated chat text (vLLM's
+    /// `skip_special_tokens`, on by default). Markup the serving stack
+    /// parses (tool calls, reasoning) stays in either way.
+    #[serde(default = "default_skip_special_tokens")]
+    pub skip_special_tokens: bool,
 
     /// Speech sampling the request set explicitly (TTS only).
     #[serde(default)]
@@ -188,6 +201,10 @@ fn default_repetition_penalty() -> f32 {
 fn default_max_tokens() -> usize {
     2048
 }
+fn default_skip_special_tokens() -> bool {
+    true
+}
+
 fn default_speed() -> f32 {
     1.0
 }
@@ -200,6 +217,7 @@ impl Default for GenerationParams {
             top_k: 0,
             repetition_penalty: default_repetition_penalty(),
             presence_penalty: 0.0,
+            seed: None,
             max_tokens: default_max_tokens(),
             speaker: None,
             voice: None,
@@ -211,6 +229,7 @@ impl Default for GenerationParams {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: default_skip_special_tokens(),
             speech: SpeechSamplingOptions::default(),
         }
     }
@@ -330,21 +349,6 @@ impl EngineOutput {
     }
 }
 
-/// Reason for finishing generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FinishReason {
-    /// Reached maximum token limit
-    MaxTokens,
-    /// Generated stop token (EOS)
-    StopToken,
-    /// Generated stop sequence
-    StopSequence,
-    /// Request was aborted
-    Aborted,
-    /// Error during generation
-    Error,
-}
-
 /// Token generation statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenStats {
@@ -363,80 +367,6 @@ pub struct TokenStats {
     /// never probed a managed prefix (unavailable, not a zero measurement).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_prefix_tokens: Option<u32>,
-}
-
-/// DS9.3: one top alternative in a token's logprob entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TopTokenLogprob {
-    /// Decoded surface text of this token (single-token decode).
-    pub token: String,
-    /// log_softmax of the raw logit, before penalties and temperature.
-    pub logprob: f32,
-    /// UTF-8 bytes of `token`.
-    pub bytes: Vec<u8>,
-}
-
-/// DS9.3: per-token logprob entry for one sampled output token.
-///
-/// Logprobs are computed from the raw model distribution (log_softmax of the
-/// raw logits) so they stay independent of sampling parameters, matching the
-/// raw-logprob semantics of serving engines. Token strings use single-token
-/// decoding: byte-level pieces that split a multi-byte UTF-8 sequence decode
-/// lossily, and `bytes` carries those lossy bytes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TokenLogprob {
-    pub token: String,
-    pub logprob: f32,
-    pub bytes: Vec<u8>,
-    pub top_logprobs: Vec<TopTokenLogprob>,
-}
-
-/// Request latency phases captured by the scheduler/engine loop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LatencyBreakdown {
-    /// Time spent waiting in queue before first scheduling.
-    pub queue_wait_ms: f64,
-    /// Time spent decoding input media before model execution, when measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_decode_ms: Option<f64>,
-    /// Time spent normalizing/preparing inputs, when measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub normalization_ms: Option<f64>,
-    /// Total scheduler prefill phase wall-clock time attributed to this request.
-    pub prefill_ms: f64,
-    /// Sum of physical decode batch service durations attributed to this request.
-    /// Shared batches are attributed in full; this is not decode wall time.
-    pub decode_ms: f64,
-    /// Monotonic interval from registration of the first entered decode dispatch
-    /// through the last successful decode token commit. Includes dispatch waiting,
-    /// inter-quantum scheduling, retries and commit overhead; excludes initial
-    /// admission queue and prefill. Absent when no decode tokens were committed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decode_wall_ms: Option<f64>,
-    /// Tokens durably committed by decode quanta, never speculative proposals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decode_tokens: Option<usize>,
-    /// First committed token group through last committed token group. Groups may
-    /// contain multiple speculative tokens; this is not SSE inter-token latency.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post_first_token_ms: Option<f64>,
-    /// Time spent sampling model outputs, when measured separately.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling_ms: Option<f64>,
-    /// Time spent encoding or decoding codec/audio representations, when measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codec_ms: Option<f64>,
-    /// Time spent on final postprocessing and artifact preparation, when measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub postprocess_ms: Option<f64>,
-    /// Time to first user-visible output in milliseconds, when observed.
-    pub ttft_ms: Option<f64>,
-    /// End-to-end request time in milliseconds.
-    pub total_ms: f64,
-    /// Number of prefill steps.
-    pub prefill_steps: u32,
-    /// Number of decode steps.
-    pub decode_steps: u32,
 }
 
 impl TokenStats {
@@ -530,6 +460,18 @@ pub enum TaskType {
     Chat,
     /// Speech-to-speech generation.
     SpeechToSpeech,
+}
+
+impl TaskType {
+    /// Stable lowercase name for telemetry labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TTS => "tts",
+            Self::ASR => "asr",
+            Self::Chat => "chat",
+            Self::SpeechToSpeech => "speech_to_speech",
+        }
+    }
 }
 
 #[cfg(test)]

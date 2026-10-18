@@ -25,6 +25,20 @@ pub fn kv_dtype_bytes(requested_dtype: &str, is_metal: bool) -> usize {
     }
 }
 
+/// Only CPU rows run on parallel request threads. Metal shares one command
+/// queue; CUDA shares one device stream whose graph capture is thread-local.
 pub fn can_parallelize_requests(kind: BackendKind) -> bool {
-    !matches!(kind, BackendKind::Metal)
+    kind == BackendKind::Cpu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_cpu_rows_run_on_parallel_request_threads() {
+        assert!(can_parallelize_requests(BackendKind::Cpu));
+        assert!(!can_parallelize_requests(BackendKind::Metal));
+        assert!(!can_parallelize_requests(BackendKind::Cuda));
+    }
 }

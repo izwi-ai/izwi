@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::api::speech_history::{synthesize_record, CreateSpeechHistoryRecordRequest};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::speech_history_store::{SpeechRouteKind, StoredSpeechAudio};
 use crate::state::AppState;
 use crate::studio_project_store::{
@@ -232,7 +232,7 @@ pub async fn list_studio_project_folders(
 
 pub async fn create_studio_project_folder(
     State(state): State<AppState>,
-    Json(req): Json<CreateStudioProjectFolderRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectFolderRequest>,
 ) -> Result<Json<StudioProjectFolderRecord>, ApiError> {
     let name = required_trimmed(Some(req.name.as_str()), "name")?;
     let folder = state
@@ -271,7 +271,7 @@ pub async fn get_studio_project_meta(
 pub async fn upsert_studio_project_meta(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<UpsertStudioProjectMetaRequest>,
+    ApiJson(req): ApiJson<UpsertStudioProjectMetaRequest>,
 ) -> Result<Json<StudioProjectMetaRecord>, ApiError> {
     let folder_id_update = req.folder_id.map(|value| {
         let trimmed = value.trim().to_string();
@@ -331,7 +331,7 @@ pub async fn list_studio_project_pronunciations(
 pub async fn create_studio_project_pronunciation(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<CreateStudioProjectPronunciationRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectPronunciationRequest>,
 ) -> Result<Json<StudioProjectPronunciationRecord>, ApiError> {
     let source_text = required_trimmed(Some(req.source_text.as_str()), "source_text")?;
     let replacement_text =
@@ -387,7 +387,7 @@ pub async fn list_studio_project_snapshots(
 pub async fn create_studio_project_snapshot(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<CreateStudioProjectSnapshotRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectSnapshotRequest>,
 ) -> Result<Json<StudioProjectSnapshotRecord>, ApiError> {
     let snapshot = state
         .studio_store
@@ -431,7 +431,7 @@ pub async fn list_studio_project_render_jobs(
 pub async fn create_studio_project_render_job(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<CreateStudioProjectRenderJobRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectRenderJobRequest>,
 ) -> Result<Json<StudioProjectRenderJobRecord>, ApiError> {
     let job = state
         .studio_store
@@ -450,7 +450,7 @@ pub async fn create_studio_project_render_job(
 pub async fn update_studio_project_render_job(
     State(state): State<AppState>,
     Path((project_id, job_id)): Path<(String, String)>,
-    Json(req): Json<UpdateStudioProjectRenderJobRequest>,
+    ApiJson(req): ApiJson<UpdateStudioProjectRenderJobRequest>,
 ) -> Result<Json<StudioProjectRenderJobRecord>, ApiError> {
     let error_message_update = req.error_message.map(|value| {
         let trimmed = value.trim().to_string();
@@ -478,7 +478,7 @@ pub async fn update_studio_project_render_job(
 
 pub async fn create_studio_project(
     State(state): State<AppState>,
-    Json(req): Json<CreateStudioProjectRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     let req = normalize_create_request(req);
     let model_id = required_trimmed(Some(req.model_id.as_str()), "model_id")?;
@@ -579,7 +579,7 @@ pub async fn get_studio_project_segment(
 pub async fn update_studio_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<UpdateStudioProjectRequest>,
+    ApiJson(req): ApiJson<UpdateStudioProjectRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     let existing = state
         .studio_store
@@ -639,7 +639,7 @@ pub async fn update_studio_project(
 pub async fn update_studio_project_segment(
     State(state): State<AppState>,
     Path((project_id, segment_id)): Path<(String, String)>,
-    Json(req): Json<UpdateStudioProjectSegmentRequest>,
+    ApiJson(req): ApiJson<UpdateStudioProjectSegmentRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     let req = normalize_segment_update_request(req);
     let text_update = match req.text {
@@ -750,7 +750,7 @@ pub async fn update_studio_project_segment(
 pub async fn create_studio_project_segment(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<CreateStudioProjectSegmentRequest>,
+    ApiJson(req): ApiJson<CreateStudioProjectSegmentRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     let text = required_trimmed(Some(req.text.as_str()), "text")?;
     let after_segment_id = normalize_optional_trimmed(req.after_segment_id);
@@ -787,7 +787,7 @@ pub async fn create_studio_project_segment(
 pub async fn split_studio_project_segment(
     State(state): State<AppState>,
     Path((project_id, segment_id)): Path<(String, String)>,
-    Json(req): Json<SplitStudioProjectSegmentRequest>,
+    ApiJson(req): ApiJson<SplitStudioProjectSegmentRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     let before_text = required_trimmed(Some(req.before_text.as_str()), "before_text")?;
     let after_text = required_trimmed(Some(req.after_text.as_str()), "after_text")?;
@@ -819,7 +819,7 @@ pub async fn merge_studio_project_segment_with_next(
 pub async fn reorder_studio_project_segments(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<ReorderStudioProjectSegmentsRequest>,
+    ApiJson(req): ApiJson<ReorderStudioProjectSegmentsRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     if req.ordered_segment_ids.is_empty() {
         return Err(ApiError::bad_request(
@@ -838,7 +838,7 @@ pub async fn reorder_studio_project_segments(
 pub async fn bulk_delete_studio_project_segments(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(req): Json<BulkDeleteStudioProjectSegmentsRequest>,
+    ApiJson(req): ApiJson<BulkDeleteStudioProjectSegmentsRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
     if req.segment_ids.is_empty() {
         return Err(ApiError::bad_request(
@@ -1322,15 +1322,15 @@ fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Studio project storage error: {err}"))
+    crate::error::store_api_error(err, "Studio project storage error")
 }
 
 fn map_saved_voice_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Saved voice storage error: {err}"))
+    crate::error::store_api_error(err, "Saved voice storage error")
 }
 
 fn map_speech_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Speech history storage error: {err}"))
+    crate::error::store_api_error(err, "Speech history storage error")
 }
 
 async fn apply_project_pronunciations(

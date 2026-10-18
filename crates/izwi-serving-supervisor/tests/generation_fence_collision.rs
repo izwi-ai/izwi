@@ -12,6 +12,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use izwi_test_process::ProcessGuard;
+
 #[cfg(unix)]
 #[test]
 fn supervisor_generation_fence_blocks_a_second_supervisor_until_workers_exit() {
@@ -126,9 +128,8 @@ max_output_tokens = 32
         command
     };
 
-    let mut first = supervisor_command()
-        .spawn()
-        .expect("first supervisor spawns");
+    let mut first =
+        ProcessGuard::spawn(&mut supervisor_command()).expect("first supervisor spawns");
     if let Some(stderr) = first.stderr.take() {
         std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
     }
@@ -188,10 +189,8 @@ max_output_tokens = 32
     // The orphaned workers exit. The fence frees only once every shared
     // lease is gone; probe it the same way a replacement supervisor would,
     // at the exact fence path the launcher handed the worker.
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg(fake_worker.to_str().unwrap())
-        .output();
+    // They share the dead supervisor's process group.
+    let _ = first.kill();
     let worker_env = std::fs::read_to_string(&env_marker).expect("worker env snapshot");
     let fence_path = worker_env
         .lines()
@@ -218,9 +217,8 @@ max_output_tokens = 32
 
     // Recovery: with the fence free, a replacement supervisor starts and
     // launches its own workers.
-    let mut replacement = supervisor_command()
-        .spawn()
-        .expect("replacement supervisor spawns");
+    let mut replacement =
+        ProcessGuard::spawn(&mut supervisor_command()).expect("replacement supervisor spawns");
     if let Some(stderr) = replacement.stderr.take() {
         std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
     }
@@ -266,9 +264,4 @@ max_output_tokens = 32
         }
     }
     let _ = replacement.kill();
-    let _ = replacement.wait();
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg(fake_worker.to_str().unwrap())
-        .output();
 }

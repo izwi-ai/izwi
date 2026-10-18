@@ -1,5 +1,6 @@
 //! Runtime telemetry ownership.
 
+pub use izwi_prometheus as histogram;
 mod metrics;
 mod replay;
 mod tracing;
@@ -7,7 +8,8 @@ mod tracing;
 pub(crate) use metrics::{
     push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
     push_engine_metric_f64, push_engine_multi_labeled_metric,
-    push_engine_physical_execution_metrics, RuntimeTelemetryCollector,
+    push_engine_physical_execution_metrics, RuntimeTelemetryCollector, ENGINE_REQUEST_STAGE,
+    ENGINE_STREAMING_REQUEST_STAGE,
 };
 pub use metrics::{
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,

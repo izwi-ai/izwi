@@ -1,5 +1,14 @@
-use crate::{ConfigError, ValidatedNodeConfig};
-use izwi_serving_protocol::{DeviceAssignment, IncarnationId, ServiceBearerToken, WorkerId};
+use crate::env::INHERITED_ENV_ALLOWLIST;
+use crate::{ConfigError, ValidatedNodeConfig, WorkerConfig};
+use izwi_serving_fence::{
+    WorkerLockPaths, MANAGED_WORKER_ENV, WORKER_EXECUTION_REPRESENTATION_ENV,
+    WORKER_GENERATION_FENCE_ENV, WORKER_INCARNATION_ENV, WORKER_MAX_CONTEXT_TOKENS_ENV,
+    WORKER_MAX_OUTPUT_TOKENS_ENV, WORKER_MODEL_LOAD_LOCK_ENV, WORKER_MODEL_LOAD_SLOTS_ENV,
+    WORKER_OWNERSHIP_LOCK_ENV, WORKER_PRECISION_ENV, WORKER_TASK_ENV,
+};
+use izwi_serving_protocol::{
+    DeviceAssignment, IncarnationId, ServiceBearerToken, TaskKind, WorkerId,
+};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -7,25 +16,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-/// Environment variables that may be deliberately inherited by a worker.
-/// Everything else is removed before these and the assignment variables are set.
-pub const INHERITED_ENV_ALLOWLIST: &[&str] = &[
-    "PATH",
-    "RUST_LOG",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-    "SYSTEMROOT",
-];
-
-pub const MANAGED_WORKER_ENV: &str = "IZWI_WORKER_MANAGED";
-pub const WORKER_INCARNATION_ENV: &str = "IZWI_WORKER_INCARNATION_ID";
-pub const WORKER_OWNERSHIP_LOCK_ENV: &str = "IZWI_WORKER_OWNERSHIP_LOCK";
-pub const WORKER_GENERATION_FENCE_ENV: &str = "IZWI_WORKER_GENERATION_FENCE_LOCK";
-pub const WORKER_MODEL_LOAD_LOCK_ENV: &str = "IZWI_WORKER_MODEL_LOAD_LOCK";
-pub const WORKER_MODEL_LOAD_SLOTS_ENV: &str = "IZWI_WORKER_MODEL_LOAD_SLOTS";
 pub const MAX_INHERITED_ENV_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_INHERITED_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
@@ -40,57 +30,6 @@ impl std::fmt::Debug for ResolvedWorkerSecret {
             .debug_struct("ResolvedWorkerSecret")
             .field("bearer_token", &"[REDACTED]")
             .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerLockPaths {
-    ownership: PathBuf,
-    generation_fence: PathBuf,
-    model_load: PathBuf,
-}
-
-impl WorkerLockPaths {
-    pub fn for_worker(
-        namespace: &crate::LockNamespace,
-        worker_id: &WorkerId,
-        assignment: &DeviceAssignment,
-    ) -> Self {
-        let resource_identity = match assignment {
-            DeviceAssignment::Cpu { .. } => format!("cpu-worker:{worker_id}"),
-            DeviceAssignment::Metal { device_id, .. } => format!("metal:{device_id}"),
-            DeviceAssignment::Cuda { device_uuid, .. } => format!("cuda:{device_uuid}"),
-        };
-        Self {
-            ownership: namespace.resource_path(resource_identity.as_bytes()),
-            generation_fence: namespace.generation_fence_path(),
-            model_load: namespace.model_load_path(),
-        }
-    }
-
-    pub fn ownership(&self) -> &std::path::Path {
-        &self.ownership
-    }
-
-    pub fn generation_fence(&self) -> &std::path::Path {
-        &self.generation_fence
-    }
-
-    pub fn model_load(&self) -> &std::path::Path {
-        &self.model_load
-    }
-
-    pub fn try_acquire(
-        &self,
-        namespace: &crate::LockNamespace,
-        metadata: &[u8],
-    ) -> Result<crate::WorkerFenceLeases, crate::LockError> {
-        crate::try_acquire_worker_fences(
-            namespace,
-            &self.ownership,
-            &self.generation_fence,
-            metadata,
-        )
     }
 }
 
@@ -244,6 +183,11 @@ pub fn build_child_launch_spec(
         }
         environment.insert(key.clone(), value.clone());
     }
+    // The operator's validated table comes next, and the supervisor's own
+    // variables last, so an owned name can never be overridden.
+    for (name, value) in &worker.environment {
+        environment.insert(OsString::from(name), OsString::from(value));
+    }
     let mut set = |name: &str, value: OsString| {
         environment.insert(OsString::from(name), value);
     };
@@ -260,6 +204,30 @@ pub fn build_child_launch_spec(
         "IZWI_WORKER_MODEL",
         worker.deployment.public_model.as_str().into(),
     );
+    set(
+        WORKER_TASK_ENV,
+        match worker.deployment.task {
+            TaskKind::Chat => "chat",
+            TaskKind::SpeechToText => "speech_to_text",
+            TaskKind::TextToSpeech => "text_to_speech",
+            TaskKind::Unknown => return Err(unknown_protocol_value(worker, "deployment.task")),
+        }
+        .into(),
+    );
+    set(
+        WORKER_PRECISION_ENV,
+        worker.deployment.precision.as_str().into(),
+    );
+    set(
+        WORKER_EXECUTION_REPRESENTATION_ENV,
+        worker.deployment.execution_representation.as_str().into(),
+    );
+    if let Some(tokens) = worker.deployment.capability.max_context_tokens {
+        set(WORKER_MAX_CONTEXT_TOKENS_ENV, tokens.to_string().into());
+    }
+    if let Some(tokens) = worker.deployment.capability.max_output_tokens {
+        set(WORKER_MAX_OUTPUT_TOKENS_ENV, tokens.to_string().into());
+    }
     set(
         "IZWI_WORKER_ARTIFACT_REVISION",
         worker.deployment.artifact_revision.as_str().into(),
@@ -414,6 +382,9 @@ pub fn build_child_launch_spec(
                 host_memory_limit_bytes.to_string().into(),
             );
         }
+        DeviceAssignment::Unknown => {
+            return Err(unknown_protocol_value(worker, "assignment.backend"));
+        }
     }
 
     Ok(ChildLaunchSpec {
@@ -423,6 +394,14 @@ pub fn build_child_launch_spec(
         clear_environment: true,
         environment,
         pipe_stdin_for_ownership: true,
+    })
+}
+
+/// Validation rejects these, so a validated node never reaches them.
+fn unknown_protocol_value(worker: &WorkerConfig, field: &'static str) -> LaunchSpecError {
+    LaunchSpecError::InvalidConfig(ConfigError::UnknownProtocolValue {
+        worker: worker.worker_id.clone(),
+        field,
     })
 }
 
@@ -488,6 +467,7 @@ mod tests {
             BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
             BackendKind::Metal => WorkerBinaryFlavor::Metal,
             BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
+            BackendKind::Unknown => unreachable!("tests build known backends"),
         };
         NodeConfig {
             schema_version: NODE_CONFIG_SCHEMA_VERSION,
@@ -531,8 +511,10 @@ mod tests {
                 attempt_retention_secs: 30,
                 streaming: true,
                 host_kv_pool_budget_bytes: 0,
+                environment: Default::default(),
             }],
             readiness: ReadinessPolicy::default(),
+            liveness: Default::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             autoscaling: None,
@@ -573,13 +555,14 @@ mod tests {
                 host_device_index: 3,
                 total_memory_bytes: *device_memory_limit_bytes + 1,
             }),
-            DeviceAssignment::Cpu { .. } => {}
+            DeviceAssignment::Cpu { .. } | DeviceAssignment::Unknown => {}
         }
         let backend = assignment.backend();
         let flavor = match backend {
             BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
             BackendKind::Metal => WorkerBinaryFlavor::Metal,
             BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
+            BackendKind::Unknown => unreachable!("tests build known backends"),
         };
         let catalog = BinaryCatalog::new([(
             flavor,
@@ -656,6 +639,73 @@ mod tests {
             env_value(&with, "IZWI_KV_HOST_POOL_BUDGET_BYTES"),
             OsStr::new("512")
         );
+    }
+
+    #[test]
+    fn operator_environment_reaches_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let assignment = DeviceAssignment::Cuda {
+            device_uuid: id("GPU-1234"),
+            process_local_device_index: 0,
+            device_memory_limit_bytes: 2048,
+            host_memory_limit_bytes: 512,
+        };
+        let spec = build_with(directory.path(), assignment, |config| {
+            config.workers[0].environment = BTreeMap::from([
+                ("IZWI_KV_HOST_OFFLOAD".to_string(), "0".to_string()),
+                (
+                    "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS".to_string(),
+                    "60000".to_string(),
+                ),
+                (
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/usr/local/cuda/lib64".to_string(),
+                ),
+            ]);
+        });
+        assert_eq!(env_value(&spec, "IZWI_KV_HOST_OFFLOAD"), "0");
+        assert_eq!(
+            env_value(&spec, "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS"),
+            "60000"
+        );
+        assert_eq!(env_value(&spec, "LD_LIBRARY_PATH"), "/usr/local/cuda/lib64");
+    }
+
+    /// Every variable the launch sets is in the owned list, so the
+    /// environment table's validation can name exactly what it protects.
+    #[test]
+    fn every_supervisor_variable_is_declared_owned() {
+        let directory = tempfile::tempdir().unwrap();
+        for assignment in [
+            DeviceAssignment::Cpu {
+                thread_budget: 2,
+                affinity: vec![0, 1],
+                host_memory_limit_bytes: 1024,
+            },
+            DeviceAssignment::Metal {
+                device_id: id("metal-registry-1"),
+                process_local_device_index: 1,
+                shared_memory_limit_bytes: 2048,
+            },
+            DeviceAssignment::Cuda {
+                device_uuid: id("GPU-1234"),
+                process_local_device_index: 0,
+                device_memory_limit_bytes: 2048,
+                host_memory_limit_bytes: 512,
+            },
+        ] {
+            let spec = build_with(directory.path(), assignment, |config| {
+                config.workers[0].host_kv_pool_budget_bytes = 256;
+            });
+            for name in spec.environment.keys() {
+                let name = name.to_str().unwrap();
+                assert!(
+                    INHERITED_ENV_ALLOWLIST.contains(&name)
+                        || crate::env::SUPERVISOR_OWNED_ENVIRONMENT.contains(&name),
+                    "{name} is set by the supervisor but not declared owned"
+                );
+            }
+        }
     }
 
     #[test]

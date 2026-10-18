@@ -8,7 +8,6 @@ use crate::audio::AudioCodec;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::lifecycle::load::now_unix_millis;
 use crate::runtime::service::RuntimeService;
@@ -210,7 +209,7 @@ impl ModelLifecycleController {
             .into_iter()
             .any(|resident| resident != variant);
         if !has_other_authoritative_models && !has_other_manager_models {
-            MetalPoolManager::global().clear_all();
+            self.clear_metal_pools_on_device();
         }
 
         // Dropping the slot is the final step: it releases physical resource
@@ -243,7 +242,7 @@ impl ModelLifecycleController {
         }
         // The last unload flushed the pool only on the authoritative path;
         // flush again so recovery starts from a clean scratch slate.
-        MetalPoolManager::global().clear_all();
+        self.clear_metal_pools_on_device();
         authority.clear_poison();
     }
 

@@ -1,8 +1,9 @@
 //! Text tokenization for Qwen3-TTS
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use serde::Deserialize;
@@ -15,7 +16,7 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-use tokenizers::tokenizer::step_decode_stream;
+use tokenizers::tokenizer::{step_decode_stream, DecodeStreamError};
 use tokenizers::AddedToken;
 use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -36,7 +37,23 @@ pub struct SpecialTokens {
 pub struct Tokenizer {
     inner: HfTokenizer,
     special_tokens: SpecialTokens,
+    /// Special tokens an incremental decode that skips special tokens
+    /// leaves out of the text (see [`Self::skips_special_token`]).
+    skipped_special_ids: Arc<HashSet<u32>>,
 }
+
+/// Markup the serving stack parses out of generated text: tool calls
+/// (Qwen `<tool_call>` XML, LFM2 `<|tool_call_start|>` lists) and reasoning
+/// blocks. A tokenizer that flags one of these special still writes it into
+/// the text, so skipping special tokens never hides what a parser needs.
+const PARSED_OUTPUT_MARKUP: [&str; 6] = [
+    "<tool_call>",
+    "</tool_call>",
+    "<|tool_call_start|>",
+    "<|tool_call_end|>",
+    "<think>",
+    "</think>",
+];
 
 /// Owned state for incremental token decoding.
 ///
@@ -53,7 +70,10 @@ pub struct IncrementalDecoder {
     prefix: String,
     prefix_index: usize,
     all_ids: Vec<u32>,
+    /// The streamed text, or after a divergence the one-shot decode the
+    /// stream continued from. Equals the one-shot decode once finished.
     emitted: String,
+    divergences: u64,
     finished: bool,
 }
 
@@ -66,9 +86,32 @@ impl IncrementalDecoder {
             prefix_index: 0,
             all_ids: Vec::new(),
             emitted: String::new(),
+            divergences: 0,
             finished: false,
         }
     }
+
+    /// The one-shot decode of every token once
+    /// [`Tokenizer::finish_incremental_decode`] has run.
+    pub fn decoded_text(&self) -> &str {
+        &self.emitted
+    }
+
+    /// Steps at which a decoder that is not prefix-stable rewrote text the
+    /// stream had already emitted. Byte-level decoders never do.
+    pub fn divergences(&self) -> u64 {
+        self.divergences
+    }
+}
+
+/// `current` after the longest character prefix it shares with `previous`.
+fn text_after_shared_prefix(previous: &str, current: &str) -> String {
+    let shared = previous
+        .char_indices()
+        .zip(current.chars())
+        .find(|((_, emitted), next)| emitted != next)
+        .map_or(previous.len().min(current.len()), |((at, _), _)| at);
+    current.get(shared..).unwrap_or_default().to_owned()
 }
 
 /// The split regex transformers' `Qwen2Converter` gives `Qwen2TokenizerFast`
@@ -88,7 +131,7 @@ impl Tokenizer {
         let tokenizer_path = model_dir.join("tokenizer.json");
         if tokenizer_path.exists() {
             match Self::from_tokenizer_json(&tokenizer_path) {
-                Ok(tokenizer) => return Ok(tokenizer),
+                Ok(tokenizer) => return Ok(tokenizer.with_config_special_tokens(model_dir)),
                 Err(err) => {
                     warn!(
                         "Failed to parse tokenizer.json at {:?}: {}. Falling back to vocab.json + merges.txt",
@@ -124,14 +167,42 @@ impl Tokenizer {
     pub fn from_path_requiring_tokenizer_json(model_dir: &Path) -> Result<Self> {
         let tokenizer_path = model_dir.join("tokenizer.json");
         if tokenizer_path.exists() {
-            return Self::from_tokenizer_json(&tokenizer_path).map_err(|err| {
-                Error::TokenizationError(format!(
-                    "Failed to parse tokenizer.json at {}: {err}",
-                    tokenizer_path.display()
-                ))
-            });
+            return Self::from_tokenizer_json(&tokenizer_path)
+                .map(|tokenizer| tokenizer.with_config_special_tokens(model_dir))
+                .map_err(|err| {
+                    Error::TokenizationError(format!(
+                        "Failed to parse tokenizer.json at {}: {err}",
+                        tokenizer_path.display()
+                    ))
+                });
         }
         Self::from_path(model_dir)
+    }
+
+    /// Also skip the tokens `tokenizer_config.json` flags special. A
+    /// `tokenizer.json` need not flag them itself (a checkpoint can list its
+    /// control tokens only in the config), and a skipping decode then wrote
+    /// them into the reply (`<|image_pad|>`).
+    fn with_config_special_tokens(mut self, model_dir: &Path) -> Self {
+        let config = match load_tokenizer_config(model_dir) {
+            Ok(Some(config)) => config,
+            Ok(None) => return self,
+            Err(err) => {
+                warn!("Ignoring unreadable tokenizer_config.json in {model_dir:?}: {err}");
+                return self;
+            }
+        };
+        let flagged = config
+            .added_tokens_decoder
+            .iter()
+            .filter(|(_, entry)| entry.special)
+            .filter_map(|(id, entry)| {
+                let id = id.parse::<u32>().ok()?;
+                (self.inner.token_to_id(&entry.content) == Some(id)).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        self.skipped_special_ids = skipped_special_ids(&self.inner, flagged);
+        self
     }
 
     fn from_tokenizer_json(path: &Path) -> Result<Self> {
@@ -392,16 +463,28 @@ impl Tokenizer {
                 )));
             }
         }
+        let kept = self.skipped_special_ids.iter().copied().collect::<Vec<_>>();
+        self.skipped_special_ids = skipped_special_ids(&self.inner, kept);
         Ok(())
     }
 
     fn new_with_tokenizer(inner: HfTokenizer) -> Result<Self> {
         let special_tokens = SpecialTokens::default();
+        let skipped_special_ids = skipped_special_ids(&inner, []);
 
         Ok(Self {
             inner,
             special_tokens,
+            skipped_special_ids,
         })
+    }
+
+    /// Whether a decode that skips special tokens leaves `id` out of the
+    /// text: a special token of the vocabulary, the GGUF control types or
+    /// `tokenizer_config.json`, unless it is markup the serving stack parses
+    /// (`PARSED_OUTPUT_MARKUP`).
+    pub fn skips_special_token(&self, id: u32) -> bool {
+        self.skipped_special_ids.contains(&id)
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -439,17 +522,41 @@ impl Tokenizer {
                 "Cannot decode another token after incremental decoding was finished".to_string(),
             ));
         }
+        if decoder.skip_special_tokens && self.skips_special_token(token_id) {
+            return Ok(String::new());
+        }
+        // Skipped ids never enter the decoder, so every decode below keeps
+        // the rest, parsed markup included.
         decoder.all_ids.push(token_id);
-        let delta = step_decode_stream(
+        let delta = match step_decode_stream(
             &self.inner,
             vec![token_id],
-            decoder.skip_special_tokens,
+            false,
             &mut decoder.stream_ids,
             &mut decoder.prefix,
             &mut decoder.prefix_index,
-        )
-        .map_err(|e| Error::TokenizationError(e.to_string()))?
-        .unwrap_or_default();
+        ) {
+            Ok(delta) => delta.unwrap_or_default(),
+            // ByteFallback decodes a run of byte tokens as one sequence, so a
+            // stray byte turns a character the stream already emitted into
+            // U+FFFD. Emitted text cannot be retracted: continue after the
+            // longest prefix it shares with the one-shot decode, as
+            // whole-sequence re-decoding streamed, and restart the window.
+            Err(error) if error.downcast_ref::<DecodeStreamError>().is_some() => {
+                let decoded = self
+                    .inner
+                    .decode(&decoder.all_ids, false)
+                    .map_err(|e| Error::TokenizationError(e.to_string()))?;
+                let delta = text_after_shared_prefix(&decoder.emitted, &decoded);
+                decoder.emitted = decoded;
+                decoder.stream_ids.clear();
+                decoder.prefix.clear();
+                decoder.prefix_index = 0;
+                decoder.divergences += 1;
+                return Ok(delta);
+            }
+            Err(error) => return Err(Error::TokenizationError(error.to_string())),
+        };
         decoder.emitted.push_str(&delta);
         Ok(delta)
     }
@@ -459,22 +566,24 @@ impl Tokenizer {
     /// This is idempotent and deliberately compares against a one-shot decode,
     /// ensuring streamed deltas plus this suffix have exactly the same decoder
     /// semantics even when generation ends part-way through a byte sequence.
+    /// A decoder that is not prefix-stable can have rewritten emitted text;
+    /// the suffix then follows the longest shared prefix.
     pub fn finish_incremental_decode(&self, decoder: &mut IncrementalDecoder) -> Result<String> {
         if decoder.finished {
             return Ok(String::new());
         }
         let decoded = self
             .inner
-            .decode(&decoder.all_ids, decoder.skip_special_tokens)
+            .decode(&decoder.all_ids, false)
             .map_err(|e| Error::TokenizationError(e.to_string()))?;
-        let suffix = decoded.strip_prefix(&decoder.emitted).ok_or_else(|| {
-            Error::TokenizationError(format!(
-                "Incremental decode diverged from one-shot decode: emitted {:?}, decoded {:?}",
-                decoder.emitted, decoded
-            ))
-        })?;
-        let suffix = suffix.to_string();
-        decoder.emitted.push_str(&suffix);
+        let suffix = match decoded.strip_prefix(&decoder.emitted) {
+            Some(suffix) => suffix.to_string(),
+            None => {
+                decoder.divergences += 1;
+                text_after_shared_prefix(&decoder.emitted, &decoded)
+            }
+        };
+        decoder.emitted = decoded;
         decoder.finished = true;
         Ok(suffix)
     }
@@ -504,6 +613,24 @@ impl Tokenizer {
         let speaker_tag = speaker.unwrap_or("default");
         format!("[speaker:{}] {}", speaker_tag, text)
     }
+}
+
+/// The vocabulary's special tokens plus `extra`, less parsed markup.
+fn skipped_special_ids(
+    inner: &HfTokenizer,
+    extra: impl IntoIterator<Item = u32>,
+) -> Arc<HashSet<u32>> {
+    let parsed = |id: u32| {
+        inner
+            .id_to_token(id)
+            .is_some_and(|token| PARSED_OUTPUT_MARKUP.contains(&token.as_str()))
+    };
+    let special = inner
+        .get_added_tokens_decoder()
+        .into_iter()
+        .filter(|(_, token)| token.special)
+        .map(|(id, _)| id);
+    Arc::new(special.chain(extra).filter(|id| !parsed(*id)).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -746,6 +873,99 @@ mod tests {
         );
     }
 
+    /// Every id streamed through an incremental decode, concatenated with
+    /// its finish, and the decoder's one-shot text.
+    fn incremental_text(tokenizer: &Tokenizer, ids: &[u32], skip: bool) -> (String, String) {
+        let mut decoder = IncrementalDecoder::new(skip);
+        let mut text = String::new();
+        for &id in ids {
+            text.push_str(&tokenizer.decode_incrementally(&mut decoder, id).unwrap());
+        }
+        text.push_str(&tokenizer.finish_incremental_decode(&mut decoder).unwrap());
+        (text, decoder.decoded_text().to_string())
+    }
+
+    /// A tokenizer.json that lists its control tokens only as plain
+    /// vocabulary, with the special flags in tokenizer_config.json (the
+    /// serving fixture's Qwen3.8 checkpoint): a skipping decode wrote
+    /// `<|image_pad|>` into the reply. Markup a parser needs stays even when
+    /// flagged special (Gemma-style `<tool_call>`).
+    #[test]
+    fn skipping_decode_drops_config_special_tokens_and_keeps_parsed_markup() {
+        let dir = std::env::temp_dir().join(format!("izwi-tokenizer-special-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 4, "content": "<tool_call>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 5, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"hi": 0, "there": 1, "<unk>": 2,
+                "<|image_pad|>": 3, "<tool_call>": 4, "<|im_end|>": 5}, "unk_token": "<unk>"}
+        }"#;
+        fs::write(dir.join("tokenizer.json"), tokenizer_json).unwrap();
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {
+                "3": {"content": "<|image_pad|>", "special": true},
+                "4": {"content": "<tool_call>", "special": true}
+            }}"#,
+        )
+        .unwrap();
+        let ids = [0, 3, 4, 1, 5];
+        for tokenizer in [
+            Tokenizer::from_path(&dir).unwrap(),
+            Tokenizer::from_path_requiring_tokenizer_json(&dir).unwrap(),
+        ] {
+            assert!(tokenizer.skips_special_token(3));
+            assert!(tokenizer.skips_special_token(5));
+            assert!(
+                !tokenizer.skips_special_token(4),
+                "parsed markup is never skipped"
+            );
+            let (streamed, whole) = incremental_text(&tokenizer, &ids, true);
+            assert_eq!(streamed, "hi <tool_call> there");
+            assert_eq!(whole, streamed);
+            let (streamed, whole) = incremental_text(&tokenizer, &ids, false);
+            assert_eq!(streamed, "hi <|image_pad|> <tool_call> there <|im_end|>");
+            assert_eq!(whole, streamed);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GGUF control tokens are skipped and user-defined markup kept by the
+    /// incremental decode as by the one-shot one.
+    #[test]
+    fn skipping_decode_follows_gguf_token_types() {
+        let tokens = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "<|im_start|>".to_string(),
+            "<think>".to_string(),
+            "<tool_call>".to_string(),
+        ];
+        let mut tokenizer =
+            Tokenizer::from_gguf_bpe(&tokens, &[], Some("qwen35"), false).expect("tokenizer");
+        tokenizer
+            .register_gguf_token_types(&tokens, &[1, 1, 3, 4, 4])
+            .expect("register token types");
+        let ids = [0, 2, 3, 4, 1];
+        assert_eq!(
+            incremental_text(&tokenizer, &ids, true).0,
+            "a<think><tool_call>b"
+        );
+        assert_eq!(
+            incremental_text(&tokenizer, &ids, false).0,
+            "a<|im_start|><think><tool_call>b"
+        );
+    }
+
     #[test]
     fn gguf_bpe_rejects_duplicate_token_strings() {
         let tokens = vec!["a".to_string(), "a".to_string()];
@@ -815,6 +1035,44 @@ mod tests {
             tokenizer.decode_incrementally(&mut decoder, ids[0]),
             Err(Error::TokenizationError(message)) if message.contains("after incremental decoding was finished")
         ));
+    }
+
+    #[test]
+    fn incremental_decode_continues_when_byte_fallback_rewrites_emitted_text() {
+        // SentencePiece-style byte fallback decodes a run of byte tokens as
+        // one sequence: a stray continuation byte after "é" turns the whole
+        // run, including the emitted "é", into U+FFFD.
+        let tokenizer = Tokenizer::from_hf_json_bytes(
+            br#"{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"}]},
+            "model":{"type":"WordLevel","unk_token":"b",
+                "vocab":{"<0xC3>":0,"<0xA9>":1,"b":2}}
+        }"#,
+        )
+        .expect("tokenizer");
+        let ids = [0, 1, 1, 2, 0, 1];
+        let mut decoder = IncrementalDecoder::new(true);
+        let deltas = ids
+            .iter()
+            .map(|id| {
+                tokenizer
+                    .decode_incrementally(&mut decoder, *id)
+                    .expect("a rewrite is not an error")
+            })
+            .collect::<Vec<_>>();
+        let suffix = tokenizer
+            .finish_incremental_decode(&mut decoder)
+            .expect("finish after a rewrite");
+        let one_shot = tokenizer.decode(&ids).expect("one-shot decode");
+        assert_eq!(one_shot, "\u{FFFD}\u{FFFD}\u{FFFD}bé");
+        // The stream continues after the longest prefix it shares with the
+        // one-shot decode, as whole-sequence re-decoding streamed.
+        assert_eq!(deltas, ["", "é", "", "\u{FFFD}\u{FFFD}\u{FFFD}b", "", "é"]);
+        assert_eq!(suffix, "");
+        assert_eq!(decoder.decoded_text(), one_shot);
+        assert_eq!(decoder.divergences(), 1);
     }
 
     #[test]

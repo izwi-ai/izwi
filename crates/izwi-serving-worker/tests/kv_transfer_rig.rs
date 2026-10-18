@@ -11,7 +11,7 @@
 //!
 //! This is contract evidence for the framing, not a serving path: no engine
 //! code, scheduler state, or protocol types participate. The engine stays
-//! node-local per the serving-plan exclusion (ADR 0008).
+//! node-local per the serving-plan exclusion.
 
 use candle_core::{DType, Device, Tensor};
 use izwi_core::backends::kv::{capture_block, restore_block};

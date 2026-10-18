@@ -19,21 +19,28 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
+use crate::api::idempotency::{
+    begin_durable_idempotency, extract_idempotency_key, release_durable_idempotency,
+    replay_record_id, reservation_lost, DurableIdempotencyStart, DURABLE_IDEMPOTENCY_RETENTION_MS,
+};
 use crate::api::request_context::RequestContext;
 use crate::api::transcript_alignment::align_transcript;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
-        NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
+        canonical_request_digest, sha256_hex, BatchRuntimeStore, DurableIdempotencyRequest,
+        DurableIdempotencyReservation, DurableJobAcceptanceOutcome, NewDurableJobAcceptance,
+        NewDurableJobArtifact, NewDurableJobStage, NewRuntimeArtifact, NewRuntimeJob,
+        NewStageOutputArtifact, NewTextAsset, DURABLE_IDEMPOTENCY_DIGEST_VERSION,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
-        RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
+        RuntimeJobStatus, StageResourceHints,
     },
     worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
 use crate::entity::RuntimeProjectionAttempt;
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
+use crate::ids::new_uuid;
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
 };
@@ -48,8 +55,8 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
-    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeRequestContext,
-    RuntimeService, WindowedAlignment, WorkloadClass,
+    ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams, ModelVariant,
+    RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -66,6 +73,9 @@ const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
+const DURABLE_ASR_IDEMPOTENCY_OPERATION: &str = "transcription.create";
+/// The upload is ingested and canonicalized while the key is reserved.
+const DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 5 * 60 * 1_000;
 #[cfg(not(test))]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -297,11 +307,56 @@ async fn create_record_for_mode(
     req: Request,
     record_mode: TranscriptionRecordMode,
 ) -> Result<Response, ApiError> {
-    let idempotency_key = extract_idempotency_key(&req);
+    let idempotency_key = extract_idempotency_key(req.headers())?;
     let mut parsed = parse_create_request(req).await?;
     parsed.record_mode = record_mode;
     prepare_create_request(&mut parsed)?;
-    let placeholder = create_pending_record(&state, &mut parsed).await?;
+    let reservation = match idempotency_key {
+        Some(_) if parsed.stream => {
+            return Err(ApiError::bad_request(
+                "Idempotency-Key is not supported for streaming transcription requests",
+            ));
+        }
+        Some(idempotency_key) => {
+            match begin_durable_idempotency(
+                &state.batch_runtime_store,
+                DurableIdempotencyRequest {
+                    tenant_scope: ctx.tenant_scope(),
+                    operation: DURABLE_ASR_IDEMPOTENCY_OPERATION.to_string(),
+                    idempotency_key,
+                    digest_version: DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+                    request_digest: transcription_request_digest(&parsed)?,
+                    reservation_ttl_ms: DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS,
+                },
+                "transcription",
+            )
+            .await?
+            {
+                DurableIdempotencyStart::Reserved(reservation) => Some(reservation),
+                DurableIdempotencyStart::Replay(replay) => {
+                    let record = state
+                        .transcription_store
+                        .get_record(replay_record_id(&replay)?)
+                        .await
+                        .map_err(map_store_error)?
+                        .ok_or_else(|| {
+                            ApiError::internal(
+                                "Stored transcription idempotency record no longer exists",
+                            )
+                        })?;
+                    return Ok((StatusCode::ACCEPTED, Json(record)).into_response());
+                }
+            }
+        }
+        None => None,
+    };
+    let placeholder = match create_pending_record(&state, &mut parsed).await {
+        Ok(placeholder) => placeholder,
+        Err(err) => {
+            release_durable_idempotency(&state.batch_runtime_store, reservation.as_ref()).await;
+            return Err(err);
+        }
+    };
 
     if parsed.stream {
         return create_record_stream(state, parsed, placeholder, ctx.correlation_id).await;
@@ -312,10 +367,11 @@ async fn create_record_for_mode(
         &placeholder,
         &parsed,
         Some(ctx.correlation_id),
-        idempotency_key,
+        reservation.clone(),
     )
     .await
     {
+        release_durable_idempotency(&state.batch_runtime_store, reservation.as_ref()).await;
         let _ = state
             .transcription_store
             .update_processing_status(
@@ -421,14 +477,25 @@ async fn create_pending_record(
         .map_err(map_store_error)
 }
 
-fn extract_idempotency_key(req: &Request) -> Option<String> {
-    req.headers()
-        .get("idempotency-key")
-        .or_else(|| req.headers().get("x-idempotency-key"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+/// The keyed request's canonical digest: every field that changes the job,
+/// with the upload identified by its content hash.
+fn transcription_request_digest(
+    parsed: &ParsedTranscriptionCreateRequest,
+) -> Result<String, ApiError> {
+    let semantic_request = serde_json::json!({
+        "version": DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+        "operation": DURABLE_ASR_IDEMPOTENCY_OPERATION,
+        "request": BatchTranscriptionRequest::from_parsed(parsed),
+        "audio_sha256": sha256_hex(&parsed.audio_bytes),
+        "audio_bytes": parsed.audio_bytes.len(),
+        "audio_mime_type": parsed.audio_mime_type,
+        "audio_filename": parsed.audio_filename,
+    });
+    canonical_request_digest(&semantic_request).map_err(|err| {
+        ApiError::payload_too_large(format!(
+            "Transcription idempotency request cannot be canonicalized: {err}"
+        ))
+    })
 }
 
 async fn enqueue_batch_transcription_job(
@@ -436,7 +503,7 @@ async fn enqueue_batch_transcription_job(
     placeholder: &TranscriptionRecord,
     parsed: &ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
-    idempotency_key: Option<String>,
+    reservation: Option<DurableIdempotencyReservation>,
 ) -> Result<(), ApiError> {
     let audio = state
         .transcription_store
@@ -447,11 +514,6 @@ async fn enqueue_batch_transcription_job(
     let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
     let request_json = serde_json::to_value(&request_snapshot)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let request_hash = sha256_hex(
-        serde_json::to_string(&request_json)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
 
     let ingested = state
         .media_ingest
@@ -478,122 +540,95 @@ async fn enqueue_batch_transcription_job(
         .ok_or_else(|| ApiError::internal("Audio ingest did not create a canonical asset"))?;
     let duration_secs = source_asset.duration_secs.unwrap_or_default();
 
-    let job = state
+    let original_artifact_id = new_uuid();
+    let canonical_artifact_id = new_uuid();
+    let accepted = state
         .batch_runtime_store
-        .create_job(NewRuntimeJob {
-            job_kind: RuntimeJobKind::AsrTranscription,
-            status: RuntimeJobStatus::Queued,
-            priority: 0,
-            model_id: request_snapshot.model_id.clone(),
-            capability: Some("asr".to_string()),
-            route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
-            route_record_id: Some(placeholder.id.clone()),
-            input_media_asset_id: Some(source_asset.id.clone()),
-            input_text_asset_id: None,
-            request_json: request_json.clone(),
-            model_snapshot_json: serde_json::json!({}),
-            retry_policy_json: serde_json::json!({"max_attempts": 2}),
-            max_attempts: 2,
-            idempotency_key: idempotency_key.clone(),
-            correlation_id,
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    let original_artifact = state
-        .batch_runtime_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: job.id.clone(),
-            stage_id: None,
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputOriginal,
-            media_asset_id: Some(source_asset.id),
-            text_asset_id: None,
-            storage_key: Some(source_asset.storage_key),
-            content_type: Some(source_asset.content_type),
-            filename: source_asset.filename,
-            size_bytes: Some(source_asset.size_bytes),
-            sha256: source_asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "source_sample_rate_hz": source_asset.sample_rate_hz,
-                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
-            }),
-            retention_policy: "default".to_string(),
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    let canonical_artifact = state
-        .batch_runtime_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: job.id.clone(),
-            stage_id: None,
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputCanonical,
-            media_asset_id: Some(canonical.asset.id),
-            text_asset_id: None,
-            storage_key: Some(canonical.asset.storage_key),
-            content_type: Some(canonical.asset.content_type),
-            filename: canonical.asset.filename,
-            size_bytes: Some(canonical.asset.size_bytes),
-            sha256: canonical.asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "source_artifact_id": original_artifact.id,
-                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
-                "timebase": {
-                    "source_sample_rate_hz": source_asset.sample_rate_hz,
-                    "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
-                }
-            }),
-            retention_policy: "default".to_string(),
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    state
-        .batch_runtime_store
-        .create_stage_with_dispatch(NewJobStageDispatch {
-            stage: NewJobStage {
-                job_id: job.id.clone(),
+        .accept_durable_job(NewDurableJobAcceptance {
+            job: NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: request_snapshot.model_id.clone(),
+                capability: Some("asr".to_string()),
+                route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
+                route_record_id: Some(placeholder.id.clone()),
+                input_media_asset_id: Some(source_asset.id.clone()),
+                input_text_asset_id: None,
+                request_json: request_json.clone(),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 2}),
+                max_attempts: 2,
+                idempotency_key: None,
+                correlation_id,
+            },
+            text_input: None,
+            artifacts: vec![
+                NewDurableJobArtifact {
+                    id: original_artifact_id.clone(),
+                    artifact_kind: RuntimeArtifactKind::Media,
+                    artifact_role: RuntimeArtifactRole::InputOriginal,
+                    media_asset_id: Some(source_asset.id),
+                    text_asset_id: None,
+                    storage_key: Some(source_asset.storage_key),
+                    content_type: Some(source_asset.content_type),
+                    filename: source_asset.filename,
+                    size_bytes: Some(source_asset.size_bytes),
+                    sha256: source_asset.sha256,
+                    metadata_json: serde_json::json!({
+                        "route_record_id": placeholder.id,
+                        "source_sample_rate_hz": source_asset.sample_rate_hz,
+                        "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
+                    }),
+                    retention_policy: "default".to_string(),
+                },
+                NewDurableJobArtifact {
+                    id: canonical_artifact_id.clone(),
+                    artifact_kind: RuntimeArtifactKind::Media,
+                    artifact_role: RuntimeArtifactRole::InputCanonical,
+                    media_asset_id: Some(canonical.asset.id),
+                    text_asset_id: None,
+                    storage_key: Some(canonical.asset.storage_key),
+                    content_type: Some(canonical.asset.content_type),
+                    filename: canonical.asset.filename,
+                    size_bytes: Some(canonical.asset.size_bytes),
+                    sha256: canonical.asset.sha256,
+                    metadata_json: serde_json::json!({
+                        "route_record_id": placeholder.id,
+                        "source_artifact_id": original_artifact_id,
+                        "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+                        "timebase": {
+                            "source_sample_rate_hz": source_asset.sample_rate_hz,
+                            "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
+                        }
+                    }),
+                    retention_policy: "default".to_string(),
+                },
+            ],
+            stages: vec![NewDurableJobStage {
                 sequence: 0,
                 stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
-                status: RuntimeStageStatus::Queued,
                 capability: Some("asr".to_string()),
                 model_id: request_snapshot.model_id,
                 max_attempts: 2,
-                input_artifact_ids: vec![canonical_artifact.id],
-            },
-            queue_class: asr_queue_class(duration_secs),
-            resource_hints: StageResourceHints {
-                estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
-                ..StageResourceHints::default()
-            },
+                input_artifact_ids: vec![canonical_artifact_id],
+                queue_class: asr_queue_class(duration_secs),
+                resource_hints: StageResourceHints {
+                    estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
+                    ..StageResourceHints::default()
+                },
+            }],
+            reservation,
+            idempotency_response: serde_json::json!({"record_id": placeholder.id}),
+            idempotency_retention_ms: DURABLE_IDEMPOTENCY_RETENTION_MS,
         })
         .await
         .map_err(map_store_error)?;
+    if let DurableJobAcceptanceOutcome::ReservationLost = accepted {
+        return Err(reservation_lost("Transcription"));
+    }
 
     state.runtime.record_batch_asr_pipeline_job();
-
-    if let Some(idempotency_key) = idempotency_key {
-        state
-            .batch_runtime_store
-            .record_idempotency(NewIdempotencyRecord {
-                operation: "transcription.create".to_string(),
-                idempotency_key,
-                expires_at: None,
-                request_hash,
-                response_json: Some(
-                    serde_json::json!({"record_id": placeholder.id, "job_id": job.id}),
-                ),
-                runtime_job_id: Some(job.id),
-                conflict_message: None,
-                metadata_json: serde_json::json!({}),
-            })
-            .await
-            .map_err(map_store_error)?;
-    }
 
     Ok(())
 }
@@ -1302,7 +1337,8 @@ where
                 }
             },
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
 
     let resolved_language = output
         .language
@@ -1415,7 +1451,8 @@ where
             max_speakers,
             on_progress,
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
     let resolved_language = output
         .language
         .clone()
@@ -1661,6 +1698,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 
@@ -2036,8 +2074,11 @@ async fn generate_transcription_summary_attempt(
             variant,
             transcription_summary_messages(transcription),
             transcription_summary_params(),
+            // Long transcripts keep fitting the summary model by trimming the
+            // output budget, as before D8.
             ChatRequestConfig {
                 enable_thinking,
+                truncation: ChatTruncation::Auto,
                 ..Default::default()
             },
             correlation_id,
@@ -2135,7 +2176,7 @@ fn truncate_summary_error(raw: &str) -> String {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Transcription storage error: {err}"))
+    crate::error::store_api_error(err, "Transcription storage error")
 }
 
 fn map_media_ingest_error(err: MediaIngestError) -> ApiError {

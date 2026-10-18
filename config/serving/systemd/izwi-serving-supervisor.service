@@ -1,0 +1,72 @@
+# Izwi serving supervisor: validates the node config, then launches, fences,
+# probes and restarts the node's workers (one actor per worker).
+#
+# Install izwi-serving-supervisor and izwi-serving-worker under
+# /usr/local/bin, write /etc/izwi/node.toml from
+# config/serving/izwi-serving-node.example.toml (runtime_directory =
+# "/run/izwi", working_directory = "/var/lib/izwi"), and put each worker's
+# bearer token (the node config's bearer_token_env names) in
+# /etc/izwi/supervisor.env, mode 0600. Then:
+#
+#   systemctl daemon-reload && systemctl enable --now izwi-serving-supervisor
+#
+# Adjust the inventory flags (--cpu-ids, --allocatable-host-memory-bytes,
+# --metal-devices or --cuda-devices and the matching worker binary) to the
+# host. Stopping the unit drains every worker: TimeoutStopSec must exceed
+# shutdown.drain_grace_ms + cancellation_grace_ms + termination_grace_ms.
+#
+# Operator signals (journalctl shows the output):
+#   systemctl kill -s SIGUSR1 izwi-serving-supervisor   # one status snapshot
+#   systemctl kill -s SIGHUP  izwi-serving-supervisor   # clear every quarantine
+#
+# A rollout runs the supervisor with --rollout-plan; see "Rollouts under
+# systemd" in docs/dev/PRODUCTION_SERVING_SINGLE_NODE_RUNBOOK.md.
+
+[Unit]
+Description=Izwi serving supervisor
+Documentation=file:///usr/share/doc/izwi/PRODUCTION_SERVING_SINGLE_NODE_RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=izwi
+Group=izwi
+EnvironmentFile=/etc/izwi/supervisor.env
+Environment=IZWI_LOG_FORMAT=json
+# For node_exporter's textfile collector; remove if you do not run one.
+Environment=IZWI_SUPERVISOR_METRICS_TEXTFILE=/var/lib/izwi/metrics/izwi_supervisor.prom
+ExecStartPre=/usr/local/bin/izwi-serving-supervisor \
+    --config /etc/izwi/node.toml \
+    --cpu-worker-binary /usr/local/bin/izwi-serving-worker \
+    --cpu-ids 0,1,2,3 \
+    --allocatable-host-memory-bytes 8589934592 \
+    --validate-only
+ExecStart=/usr/local/bin/izwi-serving-supervisor \
+    --config /etc/izwi/node.toml \
+    --cpu-worker-binary /usr/local/bin/izwi-serving-worker \
+    --cpu-ids 0,1,2,3 \
+    --allocatable-host-memory-bytes 8589934592
+# SIGTERM goes to the supervisor alone, which drains its workers; anything
+# left after TimeoutStopSec is killed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# After a crash the workers drain themselves when their control pipe closes;
+# a restart that comes too early fails on the generation fence and retries.
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=izwi
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=izwi izwi/metrics
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/izwi /run/izwi
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

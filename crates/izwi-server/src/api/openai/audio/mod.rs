@@ -30,12 +30,9 @@ pub fn router() -> Router<AppState> {
 
 pub fn resolve_audio_upload_limit_bytes() -> usize {
     const MIB: usize = 1024 * 1024;
-    let default_mb = default_audio_upload_limit_mb(compatibility_profile());
-    std::env::var("IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|mb| *mb > 0)
-        .unwrap_or(default_mb)
+    crate::env_config::tuning()
+        .openai_audio_upload_limit_mb
+        .unwrap_or_else(|| default_audio_upload_limit_mb(compatibility_profile()))
         .saturating_mul(MIB)
 }
 

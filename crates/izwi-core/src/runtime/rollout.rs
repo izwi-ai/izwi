@@ -49,12 +49,14 @@ impl KvProviderRollout {
         self.optimized_provider_enabled
     }
 
+    // Read by the accelerator KV backend, which only Metal and CUDA builds compile.
+    #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
     pub(crate) const fn metal_eager_fences(self) -> bool {
         self.metal_eager_fences
     }
 }
 
-/// An unset switch is off; a set one must be an explicit boolean.
+/// An unset or empty switch is off; a set one must be an explicit boolean.
 fn strict_bool(name: &str, value: Option<&OsStr>) -> Result<bool> {
     let Some(value) = value else {
         return Ok(false);
@@ -62,13 +64,10 @@ fn strict_bool(name: &str, value: Option<&OsStr>) -> Result<bool> {
     let value = value
         .to_str()
         .ok_or_else(|| invalid(format!("{name} must contain UTF-8")))?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(invalid(format!(
-            "{name} must be one of 1/true/yes/on or 0/false/no/off, got `{value}`"
-        ))),
+    if value.trim().is_empty() {
+        return Ok(false);
     }
+    izwi_env::parse_bool(name, value).map_err(|error| invalid(error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +181,7 @@ mod tests {
         assert!(error
             .to_string()
             .contains(DISABLE_OPTIMIZED_KV_PROVIDER_ENV));
-        assert!(error.to_string().contains("1/true/yes/on"));
+        assert!(error.to_string().contains("yes, no, on or off"));
     }
 
     #[test]
@@ -203,7 +202,7 @@ mod tests {
 
         let error = KvProviderRollout::from_values(None, Some(OsStr::new("maybe"))).unwrap_err();
         assert!(error.to_string().contains(METAL_EAGER_KV_FENCES_ENV));
-        assert!(error.to_string().contains("1/true/yes/on"));
+        assert!(error.to_string().contains("yes, no, on or off"));
     }
 
     #[test]

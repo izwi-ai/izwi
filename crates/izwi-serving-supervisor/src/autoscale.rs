@@ -1,33 +1,31 @@
 //! DS7 signal-driven worker autoscaling primitives.
 //!
-//! Three process-free concerns live here, each unit-testable in isolation:
+//! Two process-free concerns live here, each unit-testable in isolation:
 //!
 //! 1. The per-deployment scale state machine: capacity signals → scale
-//!    decisions under the configured bounds and the shared hysteresis window.
+//!    decisions under the configured bounds and the per-direction
+//!    stabilization windows.
 //!    Decisions are pure observations; the supervision driver confirms the
 //!    lifecycle transitions it actually performed, so a failed launch or a
 //!    failed approvals write never desynchronizes the state machine.
-//! 2. The node resource ledger: reserved declared budgets of supervised
-//!    workers with a fail-closed candidate check, so a scale-up is rejected
-//!    with a diagnostic instead of launched into overcommit.
-//! 3. The shared approvals view editor: this node's autoscaled workers are
+//! 2. The shared approvals view editor: this node's autoscaled workers are
 //!    approved through v1 pinned lines that the supervisor alone adds and
-//!    removes, preserving every unrelated line verbatim.
+//!    removes, under the shared file lock and preserving every unrelated
+//!    line verbatim (see [`crate::approvals_file`]).
+//!
+//! Scale-ups need no resource check of their own: config validation proves
+//! that every declared worker, standbys included, fits the node at once.
 //!
 //! Scale state is intentionally in-memory: a supervisor restart relaunches
 //! the declared min set and reconciles the view to it, which is the fail-closed
 //! posture (a crashed supervisor never leaves phantom capacity behind).
 
-use crate::{DeploymentAutoscalingPolicy, HostInventory, ValidatedNodeConfig, WorkerConfig};
-use fs2::FileExt;
+use crate::approvals_file::{self, ApprovalsDocument, SharedApprovalsError};
+use crate::{DeploymentAutoscalingPolicy, ValidatedNodeConfig, WorkerConfig};
 use izwi_serving_protocol::{
-    ApprovalsFileError, DeploymentId, DeviceAssignment, DeviceId, GatewayWorkerApproval,
-    GatewayWorkerApprovalError, GatewayWorkerApprovalIdentity, NodeId, WorkerId,
-    MAX_APPROVALS_FILE_BYTES,
+    DeploymentId, GatewayWorkerApproval, GatewayWorkerApprovalIdentity, NodeId, WorkerId,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -45,6 +43,13 @@ impl WorkerSignals {
     /// reserved realtime sessions; scale-down waits for a fully quiet worker.
     pub fn is_busy(&self) -> bool {
         self.queued_invocations > 0 || self.active_invocations > 0 || self.reserved_sessions > 0
+    }
+
+    /// Invocations the worker holds: running plus queued. Workers do not
+    /// queue today, so this is their active count.
+    pub fn outstanding(&self) -> u64 {
+        self.queued_invocations
+            .saturating_add(u64::from(self.active_invocations))
     }
 }
 
@@ -90,6 +95,10 @@ pub struct DeploymentScaleState {
     worker_order: Vec<WorkerId>,
     active: BTreeSet<WorkerId>,
     draining: Option<WorkerId>,
+    /// Workers whose process went down without a scale decision (crashed,
+    /// restarting or quarantined). Scale-up never picks one as a standby:
+    /// the restart controller owns whether it comes back.
+    lost: BTreeSet<WorkerId>,
     sustained_up_polls: u32,
     last_scale_event_ms: Option<u64>,
     idle_since_ms: BTreeMap<WorkerId, u64>,
@@ -112,6 +121,7 @@ impl DeploymentScaleState {
             worker_order,
             active: BTreeSet::new(),
             draining: None,
+            lost: BTreeSet::new(),
             sustained_up_polls: 0,
             last_scale_event_ms: None,
             idle_since_ms: BTreeMap::new(),
@@ -157,12 +167,14 @@ impl DeploymentScaleState {
     /// Driver confirmation: a launch reached readiness as part of the
     /// startup min set. Records running capacity but is not a scale event.
     pub fn note_launched(&mut self, worker: &WorkerId) {
+        self.lost.remove(worker);
         self.active.insert(worker.clone());
     }
 
     /// Driver confirmation: a scale-up launch reached readiness. Records the
     /// scale event for hysteresis.
     pub fn note_scaled_up(&mut self, now_ms: u64, worker: &WorkerId) {
+        self.lost.remove(worker);
         self.active.insert(worker.clone());
         self.last_scale_event_ms = Some(now_ms);
     }
@@ -173,11 +185,13 @@ impl DeploymentScaleState {
     }
 
     /// Driver confirmation: a process exited unexpectedly (crash). The
-    /// restart controller owns whether it comes back; the autoscaler only
-    /// stops counting it toward the deployment's running capacity.
+    /// restart controller owns whether it comes back; the autoscaler stops
+    /// counting it toward the deployment's running capacity and never picks
+    /// it as a standby until a relaunch confirms it again.
     pub fn note_worker_lost(&mut self, worker: &WorkerId) {
         self.active.remove(worker);
         self.idle_since_ms.remove(worker);
+        self.lost.insert(worker.clone());
     }
 
     /// Driver confirmation: the approvals line was removed and admission
@@ -201,7 +215,11 @@ impl DeploymentScaleState {
     fn next_standby(&self) -> Option<WorkerId> {
         self.worker_order
             .iter()
-            .find(|worker| !self.active.contains(*worker) && !self.is_core(worker))
+            .find(|worker| {
+                !self.active.contains(*worker)
+                    && !self.lost.contains(*worker)
+                    && !self.is_core(worker)
+            })
             .cloned()
     }
 
@@ -233,23 +251,23 @@ impl DeploymentScaleState {
         self.idle_since_ms
             .retain(|worker, _| self.active.contains(worker));
 
-        let hysteresis_elapsed = self
+        let up_allowed = self
             .policy
-            .hysteresis_elapsed(now_ms, self.last_scale_event_ms);
-        let max_queued = observation
+            .scale_up_allowed(now_ms, self.last_scale_event_ms);
+        let max_outstanding = observation
             .signals
             .values()
-            .map(|signals| signals.queued_invocations)
+            .map(WorkerSignals::outstanding)
             .max()
             .unwrap_or(0);
-        let saturated = max_queued >= self.policy.scale_up_queue_depth;
-        if saturated && hysteresis_elapsed {
+        let saturated = max_outstanding >= self.policy.scale_up_queue_depth;
+        if saturated && up_allowed {
             self.sustained_up_polls = self.sustained_up_polls.saturating_add(1);
         } else {
             self.sustained_up_polls = 0;
         }
         if saturated
-            && hysteresis_elapsed
+            && up_allowed
             && self.sustained_up_polls >= self.policy.scale_up_sustained_polls
             && self.active.len() < self.policy.max_workers
         {
@@ -258,7 +276,10 @@ impl DeploymentScaleState {
             }
         }
 
-        if hysteresis_elapsed && self.active.len() > self.policy.min_workers {
+        let down_allowed = self
+            .policy
+            .scale_down_allowed(now_ms, self.last_scale_event_ms);
+        if down_allowed && self.active.len() > self.policy.min_workers {
             let window = self.policy.scale_down_stabilization_window_ms;
             let candidate = self
                 .worker_order
@@ -346,349 +367,16 @@ impl Autoscaler {
     }
 }
 
-/// Node resource ledger for scale decisions (DS7.3). It reserves the
-/// declared budgets of supervised workers — running *and* restart-pending
-/// slots alike, so a crash-looping worker's budget is never handed to a
-/// scale-up — and rejects candidates that would overcommit host memory,
-/// CPU threads, or an exclusive device, with actionable diagnostics.
-///
-/// Config validation already proves that the sum over *all* declared workers
-/// fits the node, so a rejected reservation indicates ledger misuse rather
-/// than reachable config state; the check exists to keep that guarantee
-/// structural as the runtime evolves.
-#[derive(Debug)]
-pub struct ResourceLedger {
-    host_memory_budget_bytes: u64,
-    effective_cpu_count: usize,
-    metal_devices: BTreeSet<DeviceId>,
-    cuda_devices: BTreeMap<DeviceId, u64>,
-    worker_config: BTreeMap<WorkerId, WorkerConfig>,
-    reserved_host_memory_bytes: u64,
-    reserved_threads: u64,
-    reserved_metal: BTreeSet<DeviceId>,
-    reserved_cuda_memory: BTreeMap<DeviceId, u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LedgerRejection {
-    pub worker: WorkerId,
-    pub reason: String,
-}
-
-impl std::fmt::Display for LedgerRejection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "scale-up of worker {} rejected by the node resource ledger: {}",
-            self.worker, self.reason
-        )
-    }
-}
-
-impl ResourceLedger {
-    pub fn new(inventory: &HostInventory, node: &ValidatedNodeConfig) -> Self {
-        Self {
-            host_memory_budget_bytes: node.config().host_memory_budget_bytes,
-            effective_cpu_count: inventory.effective_cpu_ids.len(),
-            metal_devices: inventory
-                .metal_devices
-                .iter()
-                .map(|device| device.device_id.clone())
-                .collect(),
-            cuda_devices: inventory
-                .cuda_devices
-                .iter()
-                .map(|device| (device.device_uuid.clone(), device.total_memory_bytes))
-                .collect(),
-            worker_config: node
-                .config()
-                .workers
-                .iter()
-                .map(|worker| (worker.worker_id.clone(), worker.clone()))
-                .collect(),
-            reserved_host_memory_bytes: 0,
-            reserved_threads: 0,
-            reserved_metal: BTreeSet::new(),
-            reserved_cuda_memory: BTreeMap::new(),
-        }
-    }
-
-    /// Reserves one worker's declared budgets, or explains the rejection.
-    pub fn reserve(&mut self, worker_id: &WorkerId) -> Result<(), LedgerRejection> {
-        let rejection = |reason: String| LedgerRejection {
-            worker: worker_id.clone(),
-            reason,
-        };
-        let worker = self
-            .worker_config
-            .get(worker_id)
-            .ok_or_else(|| rejection("worker is not declared on this node".to_string()))?;
-        match &worker.assignment {
-            DeviceAssignment::Cpu {
-                thread_budget,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*host_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        host_memory_limit_bytes
-                    )));
-                }
-                let threads = self
-                    .reserved_threads
-                    .saturating_add(u64::from(*thread_budget));
-                if threads > self.effective_cpu_count as u64 {
-                    return Err(rejection(format!(
-                        "CPU thread budget {} would be exceeded ({} reserved + {} requested)",
-                        self.effective_cpu_count, self.reserved_threads, thread_budget
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_threads = threads;
-            }
-            DeviceAssignment::Metal {
-                device_id,
-                shared_memory_limit_bytes,
-                ..
-            } => {
-                if self.reserved_metal.contains(device_id) {
-                    return Err(rejection(format!(
-                        "Metal device {device_id} is already reserved by another worker"
-                    )));
-                }
-                if !self.metal_devices.contains(device_id) {
-                    return Err(rejection(format!(
-                        "Metal device {device_id} is not in the host inventory"
-                    )));
-                }
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*shared_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        shared_memory_limit_bytes
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_metal.insert(device_id.clone());
-            }
-            DeviceAssignment::Cuda {
-                device_uuid,
-                device_memory_limit_bytes,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                let Some(device_total) = self.cuda_devices.get(device_uuid) else {
-                    return Err(rejection(format!(
-                        "CUDA device {device_uuid} is not in the host inventory"
-                    )));
-                };
-                let device_reserved = self
-                    .reserved_cuda_memory
-                    .get(device_uuid)
-                    .copied()
-                    .unwrap_or(0);
-                let device = device_reserved.saturating_add(*device_memory_limit_bytes);
-                if device > *device_total {
-                    return Err(rejection(format!(
-                        "CUDA device {device_uuid} memory {} bytes would be exceeded ({} reserved + {} requested)",
-                        device_total, device_reserved, device_memory_limit_bytes
-                    )));
-                }
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*host_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        host_memory_limit_bytes
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_cuda_memory
-                    .insert(device_uuid.clone(), device);
-            }
-        }
-        Ok(())
-    }
-
-    /// Releases one worker's reservation after a scale-down stop or a failed
-    /// launch (idempotent for never-reserved workers).
-    pub fn release(&mut self, worker_id: &WorkerId) {
-        let Some(worker) = self.worker_config.get(worker_id) else {
-            return;
-        };
-        match &worker.assignment {
-            DeviceAssignment::Cpu {
-                thread_budget,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*host_memory_limit_bytes);
-                self.reserved_threads = self
-                    .reserved_threads
-                    .saturating_sub(u64::from(*thread_budget));
-            }
-            DeviceAssignment::Metal {
-                device_id,
-                shared_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*shared_memory_limit_bytes);
-                self.reserved_metal.remove(device_id);
-            }
-            DeviceAssignment::Cuda {
-                device_uuid,
-                device_memory_limit_bytes,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*host_memory_limit_bytes);
-                if let Some(reserved) = self.reserved_cuda_memory.get_mut(device_uuid) {
-                    *reserved = reserved.saturating_sub(*device_memory_limit_bytes);
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AutoscaleError {
     #[error("shared approvals view is unusable: {0}")]
     View(String),
-    #[error("shared approvals view write failed: {0}")]
-    Io(#[source] std::io::Error),
+    #[error(transparent)]
+    File(#[from] SharedApprovalsError),
     #[error(
         "standalone approval line for {endpoint} collides with this node's autoscaled worker {worker}; the fleet profile requires v1 pinned lines"
     )]
     CollidingStandaloneLine { endpoint: String, worker: WorkerId },
-}
-
-impl From<ApprovalsFileError> for AutoscaleError {
-    fn from(error: ApprovalsFileError) -> Self {
-        AutoscaleError::View(error.to_string())
-    }
-}
-
-impl From<GatewayWorkerApprovalError> for AutoscaleError {
-    fn from(error: GatewayWorkerApprovalError) -> Self {
-        AutoscaleError::View(error.to_string())
-    }
-}
-
-fn worker_approval(node_id: &NodeId, worker: &WorkerConfig) -> GatewayWorkerApproval {
-    GatewayWorkerApproval {
-        endpoint: format!("http://{}", worker.bind),
-        identity: GatewayWorkerApprovalIdentity::V1 {
-            node_id: node_id.clone(),
-            worker_id: worker.worker_id.clone(),
-        },
-        task: worker.deployment.task,
-        public_model: worker.deployment.public_model.clone(),
-        deployment_id: worker.deployment.deployment_id.clone(),
-        model_generation: worker.deployment.model_generation,
-    }
-}
-
-/// One classified approvals entry: the raw entry line plus its parsed
-/// approval. Unrelated entries pass through `raw` verbatim.
-#[derive(Debug, Clone)]
-struct ClassifiedLine {
-    raw: String,
-    approval: GatewayWorkerApproval,
-}
-
-/// Reads the shared approvals view; a missing file is an empty view (first
-/// boot owns its creation). Any invalid entry fails the whole view.
-fn read_classified(path: &Path) -> Result<Vec<ClassifiedLine>, AutoscaleError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => {
-            if text.len() as u64 > MAX_APPROVALS_FILE_BYTES {
-                return Err(AutoscaleError::View(format!(
-                    "{} exceeds the {MAX_APPROVALS_FILE_BYTES} byte approvals size limit",
-                    path.display()
-                )));
-            }
-            text
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AutoscaleError::Io(error)),
-    };
-    let mut classified = Vec::new();
-    for line in text.lines() {
-        let entry = line.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
-        }
-        classified.push(ClassifiedLine {
-            raw: entry.to_string(),
-            approval: entry.parse::<GatewayWorkerApproval>()?,
-        });
-    }
-    Ok(classified)
-}
-
-/// Atomically rewrites the shared approvals view, serialized against
-/// concurrent supervisor-side writers by an exclusive sidecar lock (temp
-/// file in the target directory plus rename).
-fn write_view(path: &Path, text: &str) -> Result<(), AutoscaleError> {
-    let directory = path.parent().ok_or_else(|| {
-        AutoscaleError::View(format!("{} has no parent directory", path.display()))
-    })?;
-    std::fs::create_dir_all(directory).map_err(AutoscaleError::Io)?;
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "shared-approvals".to_string());
-    let lock_path = directory.join(format!(".{file_name}.autoscale-lock"));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(AutoscaleError::Io)?;
-    lock.lock_exclusive()
-        .map_err(|error| AutoscaleError::Io(std::io::Error::other(error.to_string())))?;
-    let temp_path = directory.join(format!(
-        ".{file_name}.autoscale-temp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)
-                .map_err(AutoscaleError::Io)?;
-            file.write_all(text.as_bytes())
-                .map_err(AutoscaleError::Io)?;
-            file.sync_all().map_err(AutoscaleError::Io)?;
-        }
-        std::fs::rename(&temp_path, path).map_err(AutoscaleError::Io)
-    })();
-    let _ = fs2::FileExt::unlock(&lock);
-    drop(lock);
-    let _ = std::fs::remove_file(&lock_path);
-    result
 }
 
 /// The autoscaled workers declared on this node, keyed for line ownership.
@@ -737,19 +425,19 @@ impl<'a> AutoscaledWorkers<'a> {
     /// pin, so the operator must migrate it to the v1 fleet form.
     fn reject_standalone_collisions(
         &self,
-        classified: &[ClassifiedLine],
+        document: &ApprovalsDocument,
     ) -> Result<(), AutoscaleError> {
-        for line in classified {
+        for approval in document.approvals() {
             if let GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint =
-                line.approval.identity
+                approval.identity
             {
                 if let Some(worker) = self
                     .workers
                     .iter()
-                    .find(|worker| line.approval.endpoint == format!("http://{}", worker.bind))
+                    .find(|worker| approval.endpoint == format!("http://{}", worker.bind))
                 {
                     return Err(AutoscaleError::CollidingStandaloneLine {
-                        endpoint: line.approval.endpoint.clone(),
+                        endpoint: approval.endpoint.clone(),
                         worker: worker.worker_id.clone(),
                     });
                 }
@@ -787,25 +475,19 @@ pub fn reconcile_min_set(
     desired: &[&WorkerConfig],
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    let desired_lines: Vec<GatewayWorkerApproval> = desired
+    let desired: Vec<GatewayWorkerApproval> = desired
         .iter()
-        .map(|worker| worker_approval(own.node_id, worker))
+        .map(|worker| approvals_file::pinned_approval(own.node_id, worker))
         .collect();
-    let mut text = String::new();
-    for line in &classified {
-        if own.is_own_line(&line.approval, None) {
-            continue;
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.retain(|approval| !own.is_own_line(approval, None) || desired.contains(approval));
+        for approval in &desired {
+            document.ensure(approval);
         }
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    for approval in desired_lines {
-        text.push_str(&approval.render_line());
-        text.push('\n');
-    }
-    write_view(path, &text)
+        Ok(())
+    })
+    .map(drop)
 }
 
 /// Scale-up: appends one worker's pinned line if it is not already present.
@@ -816,23 +498,13 @@ pub fn add_worker(
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
     let worker = own.worker(worker_id)?;
-    let line = worker_approval(own.node_id, worker);
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    if classified
-        .iter()
-        .any(|line| own.is_own_line(&line.approval, Some(&worker.worker_id)))
-    {
-        return Ok(());
-    }
-    let mut text = String::new();
-    for line in &classified {
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    text.push_str(&line.render_line());
-    text.push('\n');
-    write_view(path, &text)
+    let line = approvals_file::pinned_approval(own.node_id, worker);
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.ensure(&line);
+        Ok(())
+    })
+    .map(drop)
 }
 
 /// Scale-down: removes one worker's pinned line (idempotent).
@@ -843,28 +515,24 @@ pub fn remove_worker(
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
     own.worker(worker_id)?;
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    let mut text = String::new();
-    for line in &classified {
-        if own.is_own_line(&line.approval, Some(worker_id)) {
-            continue;
-        }
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    write_view(path, &text)
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.retain(|approval| !own.is_own_line(approval, Some(worker_id)));
+        Ok(())
+    })
+    .map(drop)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, NodeConfig,
-        WorkerBinaryFlavor,
+        BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, HostInventory,
+        NodeConfig, WorkerBinaryFlavor,
     };
     use izwi_serving_protocol::{
-        BackendKind, CancellationBehavior, InputFormat, ModelGeneration, OutputFormat, TaskKind,
+        BackendKind, CancellationBehavior, DeviceAssignment, InputFormat, ModelGeneration,
+        OutputFormat, TaskKind,
     };
     use std::collections::BTreeSet;
     use std::io::Write as IoWrite;
@@ -899,6 +567,7 @@ mod tests {
             max_workers,
             scale_up_queue_depth: 4,
             scale_up_sustained_polls: 3,
+            scale_up_stabilization_window_ms: 0,
             scale_down_stabilization_window_ms: 1_000,
         }
     }
@@ -976,6 +645,106 @@ mod tests {
                 worker: id("worker-b")
             }
         );
+    }
+
+    #[test]
+    fn active_invocations_count_toward_the_scale_up_threshold() {
+        let mut state = state(1, 2);
+        state.note_launched(&id("worker-a"));
+        // Workers do not queue: a full worker reports active work only.
+        let full = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(0, &full), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(1, &full), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(2, &full),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-b")
+            }
+        );
+    }
+
+    /// Scale out right after a scale-in: the scale-down window must not
+    /// hold back a burst (scale-up stabilization defaults to zero).
+    #[test]
+    fn a_burst_scales_up_right_after_a_scale_down() {
+        let mut state = state(1, 2);
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        let idle = observation(&[("worker-a", signals(0, 0)), ("worker-b", signals(0, 0))]);
+        assert_eq!(state.evaluate(0, &idle), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(1_000, &idle),
+            ScaleDecision::MarkDraining {
+                worker: id("worker-b")
+            }
+        );
+        state.note_draining(1_000, &id("worker-b"));
+        assert_eq!(
+            state.evaluate(1_001, &idle),
+            ScaleDecision::StopDrained {
+                worker: id("worker-b")
+            }
+        );
+        state.note_stopped();
+
+        let busy = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(1_002, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(1_003, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(1_004, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-b")
+            }
+        );
+    }
+
+    #[test]
+    fn the_scale_up_window_holds_scale_up_after_a_scale_event() {
+        let mut policy = policy(1, 3);
+        policy.scale_up_stabilization_window_ms = 500;
+        let mut state = DeploymentScaleState::new(
+            id("deployment-1"),
+            policy,
+            vec![id("worker-a"), id("worker-b"), id("worker-c")],
+        );
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        let busy = observation(&[("worker-a", signals(0, 4)), ("worker-b", signals(0, 4))]);
+        for now in [100, 200, 300, 499] {
+            assert_eq!(state.evaluate(now, &busy), ScaleDecision::NoAction);
+        }
+        assert_eq!(state.evaluate(500, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(501, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(502, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-c")
+            }
+        );
+    }
+
+    #[test]
+    fn a_crashed_worker_is_never_picked_as_a_standby() {
+        let mut state = state(1, 3);
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        // worker-b crashes: the restart controller owns it now.
+        state.note_worker_lost(&id("worker-b"));
+
+        let busy = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(1, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(2, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(3, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-c")
+            },
+            "scale-up must take the next free standby, not the crashed worker"
+        );
+
+        // Once its restart reaches readiness it counts as running again.
+        state.note_launched(&id("worker-b"));
+        assert!(state.active().contains(&id("worker-b")));
     }
 
     #[test]
@@ -1150,12 +919,13 @@ mod tests {
                 },
                 models_directory: directory.to_path_buf(),
             },
-            max_active_invocations: 1,
+            max_active_invocations: 4,
             max_request_bytes: 4096,
-            max_retained_attempts: 2,
+            max_retained_attempts: 4,
             attempt_retention_secs: 30,
             streaming: true,
             host_kv_pool_budget_bytes: 0,
+            environment: Default::default(),
         };
         let config = NodeConfig {
             schema_version: crate::NODE_CONFIG_SCHEMA_VERSION,
@@ -1165,6 +935,7 @@ mod tests {
             host_memory_budget_bytes: 2048,
             workers: vec![worker("cpu-1", 9471), worker("cpu-2", 9472)],
             readiness: Default::default(),
+            liveness: Default::default(),
             restart: Default::default(),
             shutdown: Default::default(),
             max_parallel_model_loads: crate::DEFAULT_MODEL_LOAD_SLOTS,
@@ -1199,6 +970,20 @@ mod tests {
 
         reconcile_min_set(&path, &node, &[core]).unwrap();
         assert_eq!(view(&path), first, "reconciliation is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_views_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let node = autoscaled_node(directory.path());
+        let path = directory.path().join("shared-approvals");
+        let core = node.worker(&id("cpu-1")).unwrap();
+
+        reconcile_min_set(&path, &node, &[core]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "approvals views are owner-only");
     }
 
     #[test]
@@ -1260,86 +1045,5 @@ mod tests {
             error,
             AutoscaleError::CollidingStandaloneLine { .. }
         ));
-    }
-
-    #[test]
-    fn ledger_overcommit_is_rejected_and_release_restores_capacity() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1, 2, 3],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-
-        // Simulate a ledger whose host budget cannot fit both workers; the
-        // second reservation must be rejected with an actionable diagnostic.
-        ledger.host_memory_budget_bytes = 1023;
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("host memory budget"),
-            "unexpected rejection: {rejection}"
-        );
-        ledger.release(&id("cpu-1"));
-        ledger.reserve(&id("cpu-2")).unwrap();
-    }
-
-    #[test]
-    fn ledger_rejects_cpu_thread_overcommit() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-        ledger.effective_cpu_count = 3;
-
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("CPU thread budget"),
-            "unexpected rejection: {rejection}"
-        );
-    }
-
-    #[test]
-    fn ledger_rejects_duplicate_exclusive_device_reservations() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1, 2, 3],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-
-        // Point both declared workers at one Metal device to exercise the
-        // exclusivity guard (config validation rejects this shape, so the
-        // fixture is edited post-construction).
-        let device: DeviceId = id("GPU-1");
-        for worker in ledger.worker_config.values_mut() {
-            worker.assignment = DeviceAssignment::Metal {
-                device_id: device.clone(),
-                process_local_device_index: 0,
-                shared_memory_limit_bytes: 512,
-            };
-        }
-        ledger.metal_devices.insert(device.clone());
-
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("already reserved"),
-            "unexpected rejection: {rejection}"
-        );
-        ledger.release(&id("cpu-1"));
-        ledger.reserve(&id("cpu-2")).unwrap();
     }
 }

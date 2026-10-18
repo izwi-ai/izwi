@@ -222,7 +222,6 @@ async fn provider_database_context(
     let actual_backend = actual_database_backend(&decision.connection)?;
     validate_declared_backend(&decision.backend, &actual_backend)?;
     validate_supported_database_backend(&actual_backend)?;
-    validate_migration_mode_for_backend(&actual_backend, &decision.migration_mode)?;
 
     if matches!(decision.migration_mode, DatabaseMigrationMode::IzwiManaged) {
         Migrator::up(&decision.connection)
@@ -272,26 +271,14 @@ fn validate_declared_backend(
 
 fn validate_supported_database_backend(backend: &DatabaseBackend) -> anyhow::Result<()> {
     match backend {
-        DatabaseBackend::Sqlite | DatabaseBackend::Postgres | DatabaseBackend::Mysql => Ok(()),
+        DatabaseBackend::Sqlite | DatabaseBackend::Postgres => Ok(()),
+        DatabaseBackend::Mysql => {
+            bail!("MySQL is not supported; use SQLite or PostgreSQL")
+        }
         DatabaseBackend::Other(name) => {
             bail!("Enterprise database backend {name:?} is not supported by this runtime")
         }
     }
-}
-
-fn validate_migration_mode_for_backend(
-    backend: &DatabaseBackend,
-    migration_mode: &DatabaseMigrationMode,
-) -> anyhow::Result<()> {
-    if matches!(migration_mode, DatabaseMigrationMode::IzwiManaged)
-        && !matches!(backend, DatabaseBackend::Sqlite)
-    {
-        bail!(
-            "Izwi-managed migrations currently require the local SQLite backend; enterprise database providers must use provider-managed or disabled migrations for {backend:?}"
-        );
-    }
-
-    Ok(())
 }
 
 struct ResolvedMediaStorage {
@@ -350,15 +337,23 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     ) -> HookResult<StoredMediaObject> {
         let content_length = bytes.len() as u64;
         let (group, namespace) = local_namespace(&request.namespace, &request.metadata);
-        let key = storage_layout::persist_audio_file(
-            &self.media_root,
-            group,
-            &namespace,
-            &request.record_id,
-            request.preferred_filename.as_deref(),
-            &request.content_type,
-            &bytes,
-        )
+        let media_root = self.media_root.clone();
+        let record_id = request.record_id.clone();
+        let preferred_filename = request.preferred_filename.clone();
+        let content_type = request.content_type.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            storage_layout::persist_audio_file(
+                &media_root,
+                group,
+                &namespace,
+                &record_id,
+                preferred_filename.as_deref(),
+                &content_type,
+                &bytes,
+            )
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
         .map_err(|err| HookError::Failed(err.to_string()))?;
 
         Ok(StoredMediaObject {
@@ -612,7 +607,14 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes> {
         let key = request.key.key;
         let metadata = request.metadata;
-        let bytes = storage_layout::read_media_file(&self.media_root, &key).map_err(|err| {
+        let media_root = self.media_root.clone();
+        let read_key = key.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            storage_layout::read_media_file(&media_root, &read_key)
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
+        .map_err(|err| {
             if is_not_found_error(&err) {
                 HookError::NotFound(key.clone())
             } else {
@@ -745,26 +747,35 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     }
 
     async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()> {
-        storage_layout::delete_media_file(&self.media_root, Some(&request.key.key))
-            .map_err(|err| HookError::Failed(err.to_string()))?;
-        if let Some(parent) = reserved_write_parent_for_key(&self.media_root, &request.key.key) {
-            match std::fs::remove_dir(parent) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(error) => return Err(HookError::Failed(error.to_string())),
+        let media_root = self.media_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = request.key.key;
+            storage_layout::delete_media_file(&media_root, Some(&key))
+                .map_err(|err| HookError::Failed(err.to_string()))?;
+            if let Some(parent) = reserved_write_parent_for_key(&media_root, &key) {
+                match std::fs::remove_dir(parent) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(error) => return Err(HookError::Failed(error.to_string())),
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
     }
 }
 
+/// The artifact store, the only caller, digests these exact bytes to build the
+/// request, so the digest is not computed a second time here; reads verify it
+/// while streaming.
 fn validate_reserved_write(request: &MediaReservedWriteRequest, bytes: &[u8]) -> HookResult<()> {
     validate_reserved_write_request(request)?;
-    if request.content_length != bytes.len() as u64 || sha256_hex_bytes(bytes) != request.sha256 {
+    if request.content_length != bytes.len() as u64 {
         return Err(HookError::Failed(
             "Invalid reserved media write identity".into(),
         ));
@@ -850,11 +861,6 @@ fn with_reserved_write_lock<T>(
     let unlock = lock.unlock();
     drop(lock);
     result.and_then(|value| unlock.map(|_| value).map_err(Into::into))
-}
-
-fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn reserved_write_fingerprint(
@@ -1217,6 +1223,11 @@ mod tests {
     use sea_orm::DbBackend;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    fn sha256_hex_bytes(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[test]
     fn reserved_file_copy_uses_a_fixed_buffer_and_checks_in_flight_expiry() {
@@ -1720,43 +1731,10 @@ mod tests {
     }
 
     #[test]
-    fn izwi_managed_migrations_are_restricted_to_sqlite() {
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Sqlite,
-            &DatabaseMigrationMode::IzwiManaged,
-        )
-        .is_ok());
-
-        let error = validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::IzwiManaged,
-        )
-        .expect_err("managed migrations should reject non-sqlite backends");
-
-        assert!(
-            error
-                .to_string()
-                .contains("Izwi-managed migrations currently require the local SQLite backend"),
-            "{error}"
-        );
-
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::ProviderManaged,
-        )
-        .is_ok());
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Mysql,
-            &DatabaseMigrationMode::Disabled,
-        )
-        .is_ok());
-    }
-
-    #[test]
     fn supported_database_backends_accept_portable_store_sql() {
         assert!(validate_supported_database_backend(&DatabaseBackend::Sqlite).is_ok());
         assert!(validate_supported_database_backend(&DatabaseBackend::Postgres).is_ok());
-        assert!(validate_supported_database_backend(&DatabaseBackend::Mysql).is_ok());
+        assert!(validate_supported_database_backend(&DatabaseBackend::Mysql).is_err());
 
         let error =
             validate_supported_database_backend(&DatabaseBackend::Other("unsupported".to_string()))

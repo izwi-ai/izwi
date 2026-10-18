@@ -431,6 +431,9 @@ pub enum NativeBatchMode {
     None,
     Static,
     Continuous,
+    /// Ragged rows of both sequence phases in one model call: one-token
+    /// decode rows first, then prefill spans, under one token budget.
+    Mixed,
 }
 
 /// Where one model stage is executed. Host stages remain part of the same
@@ -461,6 +464,9 @@ pub enum StageWorkSelector {
     PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    /// Both sequence phases: a stage that runs prefill and decode rows in
+    /// one mixed model call.
+    SequenceStep,
     SequenceFinalize,
     SequenceAudioDecode,
     RealtimePush,
@@ -478,7 +484,8 @@ impl StageWorkSelector {
         match (self, work) {
             (Self::Any, _) => true,
             (Self::PreSequencePreparation, WorkUnit::PreSequencePreparation { .. }) => true,
-            (
+            (Self::SequenceStep, WorkUnit::SequenceStep { .. })
+            | (
                 Self::SequencePrefill,
                 WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
@@ -581,6 +588,14 @@ pub struct StageDescriptor {
 }
 
 impl StageDescriptor {
+    /// Whether each dispatch of this stage is one complete invocation that
+    /// leaves no model state for a later dispatch: atomic progress, or
+    /// atomic work that yields between its operations (a long-form ASR job
+    /// run one chunk per dispatch carries only host state between them).
+    pub fn runs_independent_invocations(&self) -> bool {
+        self.progress == StageProgressKind::Atomic || self.selector == StageWorkSelector::Atomic
+    }
+
     /// Conservative bridge for existing executors. Callers choose the phase's
     /// declared batch mode explicitly because one legacy profile can describe
     /// different prefill and decode behavior.
@@ -612,7 +627,7 @@ impl StageDescriptor {
             (NativeBatchMode::None, ConcurrencyClass::Batchable) => StageShapePolicy::Independent,
             (NativeBatchMode::None, ConcurrencyClass::Exclusive) => StageShapePolicy::Exact,
             (NativeBatchMode::Static, _) => StageShapePolicy::Padded,
-            (NativeBatchMode::Continuous, _) => StageShapePolicy::Ragged,
+            (NativeBatchMode::Continuous | NativeBatchMode::Mixed, _) => StageShapePolicy::Ragged,
         };
         Self {
             id,
@@ -724,9 +739,11 @@ impl StageDescriptor {
                 "only padded execution stages may declare padding overhead".to_string(),
             ));
         }
-        if self.batch_mode == NativeBatchMode::Continuous
-            && (self.progress == StageProgressKind::Atomic
-                || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
+        if matches!(
+            self.batch_mode,
+            NativeBatchMode::Continuous | NativeBatchMode::Mixed
+        ) && (self.progress == StageProgressKind::Atomic
+            || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
         {
             return Err(Error::InvalidInput(
                 "continuous batching requires a repeatable membership safe point".to_string(),
@@ -1009,6 +1026,7 @@ pub enum BatchDispatchKind {
     RequestParallel,
     TensorStatic,
     TensorContinuous,
+    TensorMixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1034,6 +1052,18 @@ impl BatchDispatch {
             kind: BatchDispatchKind::NotDispatched,
             width,
         }
+    }
+
+    /// How a physical batch of `width` rows in `mode` dispatches.
+    pub const fn for_batch(mode: NativeBatchMode, width: usize) -> Self {
+        let kind = match mode {
+            NativeBatchMode::Static => BatchDispatchKind::TensorStatic,
+            NativeBatchMode::Continuous => BatchDispatchKind::TensorContinuous,
+            NativeBatchMode::Mixed => BatchDispatchKind::TensorMixed,
+            NativeBatchMode::None if width > 1 => BatchDispatchKind::RequestParallel,
+            NativeBatchMode::None => return Self::serial(),
+        };
+        Self::new(kind, width)
     }
 }
 
@@ -1204,6 +1234,20 @@ impl PhysicalLaunchPolicy {
     }
 }
 
+/// How a loaded model can rebuild a session whose physical state was released
+/// for capacity (recompute preemption).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayCapability {
+    /// The session cannot be rebuilt; releasing it loses the request.
+    #[default]
+    None,
+    /// The family keeps a CPU journal of the prompt and generated tokens (plus
+    /// sampler and text state) and recomputes the released state by
+    /// re-prefilling it, so the request resumes without re-emitting output.
+    TokenReplay,
+}
+
 /// Effective execution behavior for one model/request/backend combination.
 ///
 /// Profiles fail closed: advanced scheduling features stay disabled unless
@@ -1243,6 +1287,10 @@ pub struct ExecutionProfile {
     /// multi-token quanta inside continuous batches (not just solo rows).
     #[serde(default)]
     pub speculative_decode_batch: bool,
+    /// Phase 3a: the loaded adapter runs this request's prefill spans and
+    /// one-token decode rows in one mixed stage, under one token budget.
+    #[serde(default)]
+    pub mixed_step: bool,
     /// Model-preferred prefill span for an isolated request (nothing else
     /// decoding or waiting); 0 keeps the engine's chunk threshold. Kernels
     /// whose per-call cost amortizes over the span (expert weights read once
@@ -1260,6 +1308,9 @@ pub struct ExecutionProfile {
     /// for cross-request fork. `None` keeps scheduling unchanged.
     #[serde(default)]
     pub managed_snapshot_prefill_interval: Option<u32>,
+    /// Whether the loaded model can rebuild a session released for capacity.
+    #[serde(default)]
+    pub replay: ReplayCapability,
 }
 
 impl ExecutionProfile {
@@ -1294,12 +1345,14 @@ impl ExecutionProfile {
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
+            mixed_step: false,
             preferred_prefill_tokens: 0,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
             cache_namespace: None,
             managed_snapshot_prefill_interval: None,
+            replay: ReplayCapability::None,
         }
     }
 
@@ -1310,7 +1363,7 @@ impl ExecutionProfile {
             incremental_prefill: self.prefill == PrefillMode::Incremental,
             incremental_decode: self.incremental_decode,
             native_batch,
-            mixed_phase_batch: false,
+            mixed_phase_batch: self.mixed_step,
             cancellable_between_steps: !matches!(
                 self.cancellation,
                 CancellationGranularity::OperationBoundary
@@ -2179,20 +2232,42 @@ pub struct PhysicalBatch {
 
 impl PhysicalBatch {
     pub fn expected_dispatch(&self) -> BatchDispatch {
-        let width = self.rows.len().max(1);
-        match self.mode {
-            NativeBatchMode::Static => BatchDispatch::new(BatchDispatchKind::TensorStatic, width),
-            NativeBatchMode::Continuous => {
-                BatchDispatch::new(BatchDispatchKind::TensorContinuous, width)
-            }
-            NativeBatchMode::None if width > 1 => {
-                BatchDispatch::new(BatchDispatchKind::RequestParallel, width)
-            }
-            NativeBatchMode::None => BatchDispatch::serial(),
-        }
+        BatchDispatch::for_batch(self.mode, self.rows.len().max(1))
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_width()?;
+        let mut keys = HashSet::with_capacity(self.rows.len());
+        let mut cost = WorkCost::default();
+        for (row_count, row) in self.rows.iter().enumerate() {
+            cost = self.validate_row(row_count, row, cost, &mut keys)?;
+        }
+        self.validate_totals(cost)
+    }
+
+    /// Validate a batch whose rows before the last were validated by earlier
+    /// calls, which left their session plans in `keys` and their summed work
+    /// in `cost`. Checks only the new row and the batch totals, so assembling
+    /// a batch row by row is linear in its width. On success `keys` holds the
+    /// new row and the new summed work is returned; on failure `keys` is
+    /// unchanged.
+    pub(crate) fn validate_appended(
+        &self,
+        keys: &mut HashSet<(SessionKey, PlanId)>,
+        cost: WorkCost,
+    ) -> Result<WorkCost> {
+        self.validate_width()?;
+        let row_count = self.rows.len() - 1;
+        let row = &self.rows[row_count];
+        let cost = self.validate_row(row_count, row, cost, keys)?;
+        if let Err(error) = self.validate_totals(cost) {
+            keys.remove(&(row.session.clone(), row.plan_id));
+            return Err(error);
+        }
+        Ok(cost)
+    }
+
+    fn validate_width(&self) -> Result<()> {
         self.budget.validate()?;
         if self.rows.is_empty() {
             return Err(Error::InvalidInput(
@@ -2207,30 +2282,42 @@ impl PhysicalBatch {
                 "request-parallel physical dispatch exceeds its declared width".to_string(),
             ));
         }
+        Ok(())
+    }
 
-        let mut keys = HashSet::with_capacity(self.rows.len());
-        let mut cost = WorkCost::default();
-        for (row_count, row) in self.rows.iter().enumerate() {
-            if row.lane != self.lane {
-                return Err(Error::InvalidInput(
-                    "physical batch contains an incompatible lane".to_string(),
-                ));
-            }
-            if !keys.insert((row.session.clone(), row.plan_id)) {
-                return Err(Error::InvalidInput(
-                    "physical batch contains a duplicate session plan".to_string(),
-                ));
-            }
-            if !self.budget.admits(row_count, cost, row.cost) {
-                return Err(Error::InvalidInput(
-                    "physical batch exceeds its declared work budget".to_string(),
-                ));
-            }
-            cost = cost.checked_add(row.cost).ok_or_else(|| {
-                Error::InvalidInput("physical batch work accounting overflowed".to_string())
-            })?;
+    /// Validate row `row_count` after rows of summed work `cost`, recording
+    /// its session plan in `keys`. Returns the summed work including it.
+    fn validate_row(
+        &self,
+        row_count: usize,
+        row: &ReadyQuantum,
+        cost: WorkCost,
+        keys: &mut HashSet<(SessionKey, PlanId)>,
+    ) -> Result<WorkCost> {
+        if row.lane != self.lane {
+            return Err(Error::InvalidInput(
+                "physical batch contains an incompatible lane".to_string(),
+            ));
         }
+        let key = (row.session.clone(), row.plan_id);
+        if keys.contains(&key) {
+            return Err(Error::InvalidInput(
+                "physical batch contains a duplicate session plan".to_string(),
+            ));
+        }
+        if !self.budget.admits(row_count, cost, row.cost) {
+            return Err(Error::InvalidInput(
+                "physical batch exceeds its declared work budget".to_string(),
+            ));
+        }
+        let cost = cost.checked_add(row.cost).ok_or_else(|| {
+            Error::InvalidInput("physical batch work accounting overflowed".to_string())
+        })?;
+        keys.insert(key);
+        Ok(cost)
+    }
 
+    fn validate_totals(&self, cost: WorkCost) -> Result<()> {
         if self.materialized_tensor_elements < cost.tensor_elements {
             return Err(Error::InvalidInput(
                 "physical batch materialization is smaller than useful tensor work".to_string(),
@@ -2400,6 +2487,11 @@ impl PhysicalBatchReport {
             BatchDispatchKind::TensorContinuous if batch.mode != NativeBatchMode::Continuous => {
                 return Err(Error::InferenceError(
                     "physical batch reported undeclared continuous tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorMixed if batch.mode != NativeBatchMode::Mixed => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared mixed tensor execution".to_string(),
                 ));
             }
             BatchDispatchKind::RequestParallel
@@ -2778,6 +2870,11 @@ impl ExecutionReport {
                     "executor reported an undeclared continuous tensor batch".to_string(),
                 ));
             }
+            BatchDispatchKind::TensorMixed if plan.batch_mode != NativeBatchMode::Mixed => {
+                return Err(Error::InferenceError(
+                    "executor reported an undeclared mixed tensor batch".to_string(),
+                ));
+            }
             _ => {}
         }
         if self.dispatch.kind == BatchDispatchKind::NotDispatched
@@ -2940,10 +3037,23 @@ impl ExecutionReport {
                 }
             }
             WorkUnit::AtomicJob { .. } => {
+                // An atomic stage with iterative progress (long-form ASR run
+                // one chunk per dispatch) may yield between its operations;
+                // a yield commits no scheduler progress.
+                let resumable = plan
+                    .stage
+                    .as_ref()
+                    .is_some_and(|stage| stage.progress == StageProgressKind::Iterative);
+                let yielded = matches!(
+                    self.disposition,
+                    ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
+                ) && self.input_consumed == 0
+                    && self.output_produced == 0;
                 if !matches!(
                     self.disposition,
                     ExecutionDisposition::Finished(_) | ExecutionDisposition::Failed(_)
-                ) {
+                ) && !(resumable && yielded)
+                {
                     return Err(Error::InferenceError(
                         "atomic execution must finish or fail in one transaction".to_string(),
                     ));

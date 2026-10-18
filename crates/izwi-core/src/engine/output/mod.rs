@@ -1,12 +1,9 @@
 //! Output processing for the inference engine.
 //!
 //! Handles conversion of raw model outputs to user-facing results,
-//! including streaming chunked output and stop condition detection.
+//! including streaming chunk and progress types.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tracing::debug;
+use std::time::Duration;
 
 use super::execution::{
     ExecutionDisposition, ExecutionFailure, FinishReason as ExecutionFinishReason,
@@ -135,37 +132,12 @@ pub struct StreamingStats {
 pub struct OutputProcessor {
     /// Sample rate for audio output
     sample_rate: u32,
-    /// Chunk size for streaming (samples)
-    streaming_chunk_size: usize,
-    /// Active streaming sessions
-    streaming_sessions: HashMap<RequestId, StreamingSession>,
-}
-
-/// State for an active streaming session.
-struct StreamingSession {
-    request_id: RequestId,
-    sequence_id: SequenceId,
-    start_time: Instant,
-    samples_buffer: Vec<f32>,
-    chunks_sent: usize,
-    total_samples_sent: usize,
-    tx: mpsc::Sender<StreamingOutput>,
 }
 
 impl OutputProcessor {
     /// Create a new output processor.
     pub fn new(sample_rate: u32) -> Self {
-        Self {
-            sample_rate,
-            streaming_chunk_size: 4800, // 200ms at 24kHz
-            streaming_sessions: HashMap::new(),
-        }
-    }
-
-    /// Set streaming chunk size.
-    pub fn with_chunk_size(mut self, size: usize) -> Self {
-        self.streaming_chunk_size = size;
-        self
+        Self { sample_rate }
     }
 
     /// Process executor output into engine output.
@@ -247,7 +219,9 @@ impl OutputProcessor {
         let token_stats = TokenStats {
             prompt_tokens: executor_output.tokens_processed,
             generated_tokens: num_tokens,
-            prefill_time_ms: 0.0, // Not tracked at this level
+            // Stamped by the engine core from the request's phase timing; an
+            // output that never reached scheduling has no prefill.
+            prefill_time_ms: 0.0,
             decode_time_ms: generation_time.as_secs_f32() * 1000.0,
             tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
                 num_tokens as f32 / generation_time.as_secs_f32()
@@ -278,185 +252,6 @@ impl OutputProcessor {
             error: executor_output.error,
             provenance: super::OutcomeProvenance::produced_output(),
         }
-    }
-
-    /// Start a streaming session.
-    pub fn start_streaming(
-        &mut self,
-        request_id: RequestId,
-        sequence_id: SequenceId,
-        tx: mpsc::Sender<StreamingOutput>,
-    ) {
-        let session = StreamingSession {
-            request_id: request_id.clone(),
-            sequence_id,
-            start_time: Instant::now(),
-            samples_buffer: Vec::new(),
-            chunks_sent: 0,
-            total_samples_sent: 0,
-            tx,
-        };
-        self.streaming_sessions.insert(request_id, session);
-    }
-
-    /// Add samples to a streaming session.
-    pub async fn add_streaming_samples(
-        &mut self,
-        request_id: &RequestId,
-        samples: Vec<f32>,
-    ) -> bool {
-        let session = match self.streaming_sessions.get_mut(request_id) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        session.samples_buffer.extend(samples);
-
-        // Send chunks when buffer is large enough
-        while session.samples_buffer.len() >= self.streaming_chunk_size {
-            let chunk_samples: Vec<f32> = session
-                .samples_buffer
-                .drain(..self.streaming_chunk_size)
-                .collect();
-
-            let stats = StreamingStats {
-                total_samples: session.total_samples_sent + chunk_samples.len(),
-                total_duration_secs: (session.total_samples_sent + chunk_samples.len()) as f32
-                    / self.sample_rate as f32,
-                chunks_sent: session.chunks_sent + 1,
-                elapsed_secs: session.start_time.elapsed().as_secs_f32(),
-                rtf: session.start_time.elapsed().as_secs_f32()
-                    / ((session.total_samples_sent + chunk_samples.len()) as f32
-                        / self.sample_rate as f32),
-            };
-
-            let output = StreamingOutput {
-                request_id: session.request_id.clone(),
-                sequence: session.chunks_sent,
-                samples: chunk_samples.clone(),
-                sample_rate: self.sample_rate,
-                is_final: false,
-                text: None,
-                stats: Some(stats),
-                asr_progress: None,
-                logprobs: Vec::new(),
-            };
-
-            session.total_samples_sent += chunk_samples.len();
-            session.chunks_sent += 1;
-
-            if session.tx.send(output).await.is_err() {
-                debug!("Streaming channel closed for {}", request_id);
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Finish a streaming session.
-    pub async fn finish_streaming(
-        &mut self,
-        request_id: &RequestId,
-        text: Option<String>,
-    ) -> Option<StreamingStats> {
-        let session = self.streaming_sessions.remove(request_id)?;
-
-        // Send remaining samples as final chunk
-        let remaining_samples = session.samples_buffer;
-        let total_samples = session.total_samples_sent + remaining_samples.len();
-
-        let stats = StreamingStats {
-            total_samples,
-            total_duration_secs: total_samples as f32 / self.sample_rate as f32,
-            chunks_sent: session.chunks_sent + 1,
-            elapsed_secs: session.start_time.elapsed().as_secs_f32(),
-            rtf: if total_samples > 0 {
-                session.start_time.elapsed().as_secs_f32()
-                    / (total_samples as f32 / self.sample_rate as f32)
-            } else {
-                0.0
-            },
-        };
-
-        let output = StreamingOutput {
-            request_id: session.request_id,
-            sequence: session.chunks_sent,
-            samples: remaining_samples,
-            sample_rate: self.sample_rate,
-            is_final: true,
-            text,
-            stats: Some(stats.clone()),
-            asr_progress: None,
-            logprobs: Vec::new(),
-        };
-
-        let _ = session.tx.send(output).await;
-
-        Some(stats)
-    }
-
-    /// Cancel a streaming session.
-    pub fn cancel_streaming(&mut self, request_id: &RequestId) {
-        self.streaming_sessions.remove(request_id);
-    }
-
-    /// Check if a streaming session is active.
-    pub fn is_streaming(&self, request_id: &RequestId) -> bool {
-        self.streaming_sessions.contains_key(request_id)
-    }
-
-    /// Get number of active streaming sessions.
-    pub fn active_streams(&self) -> usize {
-        self.streaming_sessions.len()
-    }
-}
-
-/// Stop condition checker.
-pub struct StopChecker {
-    /// Stop token IDs
-    stop_token_ids: Vec<u32>,
-    /// Maximum tokens
-    max_tokens: usize,
-    /// Maximum sequence length
-    max_seq_len: usize,
-}
-
-impl StopChecker {
-    /// Create a new stop checker.
-    pub fn new(stop_token_ids: Vec<u32>, max_tokens: usize, max_seq_len: usize) -> Self {
-        Self {
-            stop_token_ids,
-            max_tokens,
-            max_seq_len,
-        }
-    }
-
-    /// Check if generation should stop.
-    pub fn should_stop(
-        &self,
-        generated_tokens: usize,
-        total_tokens: usize,
-        last_token: Option<u32>,
-    ) -> Option<FinishReason> {
-        // Check max tokens
-        if generated_tokens >= self.max_tokens {
-            return Some(FinishReason::MaxTokens);
-        }
-
-        // Check max sequence length
-        if total_tokens >= self.max_seq_len {
-            return Some(FinishReason::MaxTokens);
-        }
-
-        // Check stop tokens
-        if let Some(token) = last_token {
-            if self.stop_token_ids.contains(&token) {
-                return Some(FinishReason::StopToken);
-            }
-        }
-
-        None
     }
 }
 
@@ -536,26 +331,6 @@ mod tests {
         assert_eq!(output.finish_reason, Some(FinishReason::Aborted));
         assert_eq!(output.error.as_deref(), Some("request cancelled"));
         assert_eq!(output.num_tokens, 0);
-    }
-
-    #[test]
-    fn test_stop_checker() {
-        let checker = StopChecker::new(vec![151673], 100, 1000);
-
-        // Should not stop
-        assert!(checker.should_stop(50, 100, Some(12345)).is_none());
-
-        // Should stop - max tokens
-        assert_eq!(
-            checker.should_stop(100, 150, None),
-            Some(FinishReason::MaxTokens)
-        );
-
-        // Should stop - stop token
-        assert_eq!(
-            checker.should_stop(50, 100, Some(151673)),
-            Some(FinishReason::StopToken)
-        );
     }
 
     #[test]

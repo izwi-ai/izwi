@@ -28,6 +28,7 @@ use crate::models::shared::attention::flash::{
 use crate::models::shared::attention::gqa::{
     banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask,
 };
+use crate::models::shared::attention::mixed::{MixedRowLayout, PreparedPhysicalMixedStep};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -434,6 +435,44 @@ impl Lfm2PendingDecodeCommit {
             Err(drain) => Error::InferenceError(format!(
                 "LFM2 decode step failed: {error}; fence drain failed: {drain}"
             )),
+        }
+    }
+}
+
+/// One mixed step's KV writes and next ShortConv states, not yet committed:
+/// [`Self::commit`] or [`Self::abort_with`] consumes it.
+#[must_use = "a pending mixed step must be committed or aborted"]
+pub(crate) struct Lfm2PendingMixedCommit {
+    step: PreparedPhysicalMixedStep,
+    working: Vec<Lfm2ShortConvRuntimeState>,
+}
+
+impl Lfm2PendingMixedCommit {
+    /// Seal the step's writes, then advance every row's cache by its span
+    /// and install its ShortConv state.
+    pub(crate) fn commit(
+        self,
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<()> {
+        if states.len() != self.working.len() {
+            return Err(self.abort_with(Error::InvalidInput(
+                "LFM2 pending mixed commit rows do not match".into(),
+            )));
+        }
+        self.step.finish(caches, Ok(()))?;
+        for (state, working) in states.iter_mut().zip(self.working) {
+            **state = working;
+        }
+        Ok(())
+    }
+
+    /// Drain the step's writes without committing them, returning `error`
+    /// (annotated if the drain also fails).
+    pub(crate) fn abort_with(self, error: Error) -> Error {
+        match self.step.finish::<()>(&mut [], Err(error)) {
+            Err(error) => error,
+            Ok(()) => unreachable!("an aborted mixed step cannot finish"),
         }
     }
 }
@@ -1063,6 +1102,72 @@ impl AttentionLayer {
     }
 }
 
+impl AttentionLayer {
+    /// One mixed step: projections and norms on every token, RoPE per row
+    /// from its own position (as each split call rotates), then one K/V
+    /// write and paged attention over the step's rows.
+    fn forward_mixed(
+        &self,
+        hidden_states: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+    ) -> Result<Tensor> {
+        let (_, tokens, hidden_size) = hidden_states.dims3()?;
+        let query =
+            self.wq
+                .forward(hidden_states)?
+                .reshape((1, tokens, self.n_head, self.head_dim))?;
+        let key =
+            self.wk
+                .forward(hidden_states)?
+                .reshape((1, tokens, self.n_kv_head, self.head_dim))?;
+        let values =
+            self.wv
+                .forward(hidden_states)?
+                .reshape((tokens, self.n_kv_head, self.head_dim))?;
+        let query = self.q_norm.forward(&query.contiguous()?)?;
+        let key = self.k_norm.forward(&key.contiguous()?)?;
+        let layout = step.layout();
+        let mut queries = Vec::with_capacity(layout.rows().len());
+        let mut keys = Vec::with_capacity(layout.rows().len());
+        for (row, span) in layout.rows().iter().enumerate() {
+            let offset = layout.token_offset(row);
+            let q = query.narrow(1, offset, span.q_len)?;
+            let k = key.narrow(1, offset, span.q_len)?;
+            let (q, k) = match self.try_apply_rotary_emb_pair_bshd(&q, &k, span.start_pos)? {
+                Some(rotated) => rotated,
+                None => (
+                    self.apply_rotary_emb(&q.transpose(1, 2)?.contiguous()?, span.start_pos)?
+                        .transpose(1, 2)?,
+                    self.apply_rotary_emb(&k.transpose(1, 2)?.contiguous()?, span.start_pos)?
+                        .transpose(1, 2)?,
+                ),
+            };
+            queries.push(q.reshape((span.q_len, self.n_head, self.head_dim))?);
+            keys.push(k.reshape((span.q_len, self.n_kv_head, self.head_dim))?);
+        }
+        // The arena may store KV narrower than the F32 activations.
+        let kv_dtype = caches[0].arena().config().dtype;
+        let queries = Tensor::cat(&queries, 0)?.contiguous()?.to_dtype(kv_dtype)?;
+        let keys = Tensor::cat(&keys, 0)?.contiguous()?.to_dtype(kv_dtype)?;
+        let values = values.contiguous()?.to_dtype(kv_dtype)?;
+        let output = step.write_and_attend(
+            caches,
+            self.physical_layer,
+            &queries,
+            &keys,
+            &values,
+            (1.0f64 / (self.head_dim as f64).sqrt()) as f32,
+            None,
+            self.sliding_window,
+        )?;
+        let output = output
+            .to_dtype(hidden_states.dtype())?
+            .reshape((1, tokens, hidden_size))?;
+        self.wo.forward(&output).map_err(Error::from)
+    }
+}
+
 impl ShortConvLayer {
     fn forward_stateless(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
@@ -1168,14 +1273,62 @@ impl ShortConvLayer {
         hidden_size: usize,
         state: &mut Lfm2ShortConvRuntimeState,
     ) -> Result<Tensor> {
+        let conv_out = self.gated_conv_retained(projected, hidden_size, state)?;
+        self.out_proj.forward(&conv_out).map_err(Error::from)
+    }
+
+    /// The gated convolution `[1, steps, hidden]` of one sequence's
+    /// in-projection `[1, steps, 3 * hidden]`, continuing `state`.
+    fn gated_conv_retained(
+        &self,
+        projected: Tensor,
+        hidden_size: usize,
+        state: &mut Lfm2ShortConvRuntimeState,
+    ) -> Result<Tensor> {
         let projected = projected.transpose(1, 2)?;
         let b = projected.narrow(1, 0, hidden_size)?;
         let c = projected.narrow(1, hidden_size, hidden_size)?;
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
         let bx = (&b * &x)?.contiguous()?;
         let conv_out = state.apply(self.component, &bx, &self.conv)?;
-        let conv_out = (&c * &conv_out)?.transpose(1, 2)?.contiguous()?;
-        self.out_proj.forward(&conv_out).map_err(Error::from)
+        (&c * &conv_out)?
+            .transpose(1, 2)?
+            .contiguous()
+            .map_err(Error::from)
+    }
+
+    /// One mixed step: the in- and out-projections run on every token, and
+    /// each row's segment convolves with its own state the way its split
+    /// call does (a one-token row through the fused step, a span through
+    /// the chunk path).
+    fn forward_mixed(
+        &self,
+        hidden_states: &Tensor,
+        layout: &MixedRowLayout,
+        states: &mut [Lfm2ShortConvRuntimeState],
+    ) -> Result<Tensor> {
+        let (_, tokens, hidden_size) = hidden_states.dims3()?;
+        if tokens != layout.total_tokens() || states.len() != layout.rows().len() {
+            return Err(Error::InvalidInput(
+                "LFM2 ShortConv mixed rows do not match the step".into(),
+            ));
+        }
+        let projected = self.in_proj.forward(hidden_states)?;
+        let mut rows = Vec::with_capacity(states.len());
+        for (row, (span, state)) in layout.rows().iter().zip(states.iter_mut()).enumerate() {
+            let projected = projected.narrow(1, layout.token_offset(row), span.q_len)?;
+            let fused = if span.q_len == 1 {
+                state.apply_fused_step(self.component, &projected, &self.conv)?
+            } else {
+                None
+            };
+            rows.push(match fused {
+                Some(y) => y,
+                None => self.gated_conv_retained(projected, hidden_size, state)?,
+            });
+        }
+        let conv = Tensor::cat(&rows, 1)?;
+        self.out_proj.forward(&conv).map_err(Error::from)
     }
 
     fn forward_retained_decode_batch(
@@ -1828,6 +1981,125 @@ impl QuantizedLfm2Backbone {
         ))
     }
 
+    /// One forward over a mixed step: `token_ids` holds every row's new
+    /// tokens in `layout` order (one-token decode rows, then prefill spans);
+    /// `states[i]` and `caches[i]` are row `i`'s. See
+    /// [`Self::forward_embeds_mixed_deferred`].
+    pub(crate) fn forward_token_ids_mixed_deferred(
+        &self,
+        token_ids: &[u32],
+        layout: MixedRowLayout,
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        sample_rows: &[usize],
+    ) -> Result<(Option<Tensor>, Lfm2PendingMixedCommit)> {
+        let input = Tensor::from_slice(token_ids, (1, token_ids.len()), self.norm.weight.device())?;
+        let embeds = self.embed_tokens(&input)?;
+        self.forward_embeds_mixed_deferred(&embeds, layout, states, caches, sample_rows)
+    }
+
+    /// Every token of a mixed step (`[1, tokens, hidden]` in `layout` order)
+    /// through the projections, norms and MLP together; attention writes
+    /// and attends once per layer over all rows, and each row's ShortConv
+    /// segment continues its own state. Returns the `[sample_rows, vocab]`
+    /// logits of the last token of each row in `sample_rows` (`None` when no
+    /// row samples) with the step's pending commit: no cache or state
+    /// changes until [`Lfm2PendingMixedCommit::commit`].
+    pub(crate) fn forward_embeds_mixed_deferred(
+        &self,
+        input_embeds: &Tensor,
+        layout: MixedRowLayout,
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        sample_rows: &[usize],
+    ) -> Result<(Option<Tensor>, Lfm2PendingMixedCommit)> {
+        let (batch, tokens, hidden_size) = input_embeds.dims3()?;
+        if batch != 1
+            || tokens != layout.total_tokens()
+            || hidden_size != self.cfg.embedding_length
+            || states.len() != layout.rows().len()
+            || caches.len() != layout.rows().len()
+            || sample_rows.iter().any(|row| *row >= caches.len())
+        {
+            return Err(Error::InvalidInput(
+                "LFM2 mixed step inputs do not match its row layout".into(),
+            ));
+        }
+        let head_dim = self.cfg.embedding_length / self.cfg.attention_head_count;
+        let sparse_geometry = self
+            .state_layout
+            .attention_model_layers
+            .iter()
+            .map(|model_layer| {
+                (
+                    *model_layer,
+                    self.cfg.attention_head_count_kv[*model_layer as usize],
+                    head_dim,
+                    head_dim,
+                )
+            })
+            .collect::<Vec<_>>();
+        for ((cache, state), span) in caches.iter().zip(states).zip(layout.rows()) {
+            if cache.context_len() != span.start_pos || state.cursor() != span.start_pos as u64 {
+                return Err(Error::InvalidInput(
+                    "LFM2 mixed row cursors do not match their state".into(),
+                ));
+            }
+            cache.validate_sparse_model_layers(&sparse_geometry)?;
+        }
+        let sample_tokens = sample_rows
+            .iter()
+            .map(|row| u32::try_from(layout.last_token(*row)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("LFM2 mixed step exceeds u32 tokens".into()))?;
+        let mut step = PreparedPhysicalMixedStep::new(caches, layout)?;
+        let mut working = states
+            .iter()
+            .map(|state| (**state).clone())
+            .collect::<Vec<_>>();
+        let execution = (|| -> Result<Option<Tensor>> {
+            let layout = step.layout().clone();
+            let mut hidden_states = input_embeds.clone();
+            for layer in &self.layers {
+                let residual = hidden_states.clone();
+                let hidden = layer.operator_norm.forward(&hidden_states)?;
+                let hidden = match &layer.kind {
+                    LayerKind::Attention(attention) => {
+                        attention.forward_mixed(&hidden, caches, &mut step)?
+                    }
+                    LayerKind::ShortConv(shortconv) => {
+                        shortconv.forward_mixed(&hidden, &layout, &mut working)?
+                    }
+                };
+                hidden_states = (&hidden + &residual)?;
+                let residual = hidden_states.clone();
+                let hidden = layer.ffn_norm.forward(&hidden_states)?;
+                let mlp = layer.mlp.forward(&hidden)?;
+                hidden_states = (&mlp + &residual)?;
+            }
+            if sample_tokens.is_empty() {
+                return Ok(None);
+            }
+            let normalized = self.norm.forward(&hidden_states)?.squeeze(0)?;
+            let sample_tokens =
+                Tensor::from_vec(sample_tokens, sample_rows.len(), normalized.device())?;
+            self.output_head
+                .forward(&normalized.index_select(&sample_tokens, 0)?)
+                .map(Some)
+        })();
+        let advanced = execution.and_then(|logits| {
+            for (state, span) in working.iter_mut().zip(step.layout().rows()) {
+                state.advance(span.q_len)?;
+            }
+            Ok(logits)
+        });
+        let pending = Lfm2PendingMixedCommit { step, working };
+        match advanced {
+            Ok(logits) => Ok((logits, pending)),
+            Err(error) => Err(pending.abort_with(error)),
+        }
+    }
+
     pub(crate) fn forward_embeds_retained_batch(
         &self,
         input_embeds: &[Tensor],
@@ -2292,15 +2564,9 @@ fn should_try_lfm25_metal_prefill_sdpa(
 }
 
 fn lfm25_metal_prefill_sdpa_enabled() -> bool {
-    std::env::var("IZWI_LFM25_METAL_PREFILL_SDPA")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_LFM25_METAL_PREFILL_SDPA", true));
+    ENABLED.get()
 }
 
 fn normalize_shortconv_weight(
@@ -2573,7 +2839,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn rope_tables_match_f64_at_far_positions_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "rope_tables_match_f64_at_far_positions_on_metal",
+        ) else {
             return;
         };
         assert_rope_tables_exact(&device);
@@ -2701,6 +2969,15 @@ pub(crate) mod tests {
         sliding_window: Option<u32>,
         head_outputs: usize,
     ) -> super::QuantizedLfm2Backbone {
+        tiny_windowed_backbone_on(sliding_window, head_outputs, &Device::Cpu)
+    }
+
+    /// [`tiny_windowed_backbone_with_head`] loaded on `device`.
+    pub(crate) fn tiny_windowed_backbone_on(
+        sliding_window: Option<u32>,
+        head_outputs: usize,
+        device: &Device,
+    ) -> super::QuantizedLfm2Backbone {
         use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
         use gguf_file::Value;
 
@@ -2777,7 +3054,7 @@ pub(crate) mod tests {
         let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&path).unwrap();
         let config = super::super::config::parse_lfm2_backbone_config(&loader).unwrap();
         let backbone =
-            super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, &Device::Cpu).unwrap();
+            super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, device).unwrap();
         std::fs::remove_file(&path).unwrap();
         backbone
     }
@@ -3194,7 +3471,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn unfused_shortconv_ring_falls_back_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "unfused_shortconv_ring_falls_back_on_metal",
+        ) else {
             return;
         };
         assert_unfused_ring_matches_cpu(&device);
@@ -3282,6 +3561,10 @@ pub(crate) mod tests {
         assert_eq!(rows[1].cursor, 2);
     }
 }
+#[cfg(test)]
+#[path = "backbone_mixed_tests.rs"]
+mod mixed_tests;
+
 #[test]
 fn retained_ragged_launches_drop_shorter_rows_without_padding() {
     assert_eq!(

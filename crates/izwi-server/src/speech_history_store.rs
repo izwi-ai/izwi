@@ -12,15 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     artifact_store::{ArtifactId, ArtifactRetention, ArtifactStore, ArtifactTenant},
-    batch_runtime::store::BatchRuntimeStore,
     db::{raw, StoreDatabase},
     entity::{speech_history_records, RuntimeProjectionAttempt},
     ids::new_uuid,
     node_identity::{NodeIdentity, RecoveryScope},
-    persistence::{
-        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
-    },
-    storage_layout,
+    persistence::{delete_media_object, persist_audio_object, read_media_object},
 };
 
 /// Incremental mono PCM16 WAV spool. Drop removes partial output on any failure,
@@ -245,8 +241,6 @@ pub struct StoredSpeechAudioStream {
     pub audio_filename: Option<String>,
 }
 
-const DEFAULT_LIST_LIMIT: usize = 200;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechRouteKind {
@@ -451,8 +445,13 @@ pub struct SpeechHistoryStore {
 }
 
 impl SpeechHistoryStore {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn initialize() -> anyhow::Result<Self> {
+        use crate::{
+            batch_runtime::store::BatchRuntimeStore, persistence::LocalMediaStorageProvider,
+            storage_layout,
+        };
+
         let db_path = storage_layout::resolve_db_path();
         let media_root = storage_layout::resolve_media_root();
 
@@ -854,7 +853,7 @@ impl SpeechHistoryStore {
                       WHERE j.job_kind = 'tts_speech'
                         AND j.route_record_kind = speech_history_records.route_kind
                         AND j.route_record_id = speech_history_records.id
-                        AND j.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                        AND j.status IN ('queued', 'running', 'retrying')
                   )
                   AND (
                       owner_node_id = ?1
@@ -1555,11 +1554,11 @@ fn active_speech_attempt_condition(
             INNER JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
               AND j.route_record_id = speech_history_records.id
               AND j.route_record_kind = {route_placeholder}
@@ -1596,11 +1595,6 @@ fn i64_to_usize(value: i64) -> Option<usize> {
     } else {
         usize::try_from(value).ok()
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

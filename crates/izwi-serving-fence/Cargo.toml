@@ -1,0 +1,19 @@
+[package]
+name = "izwi-serving-fence"
+description = "Worker launch contract shared by the Izwi supervisor and worker: lock and fence primitives and the environment that hands them over"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs2 = "0.4.3"
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.10"

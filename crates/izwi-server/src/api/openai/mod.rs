@@ -3,8 +3,10 @@
 pub mod audio;
 pub mod chat;
 pub mod compat;
+pub use izwi_gateway::api::openai::convert;
 pub mod models;
 pub mod responses;
+pub(crate) use izwi_gateway::api::openai::tool_calls;
 
 use axum::Router;
 

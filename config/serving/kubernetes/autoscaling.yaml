@@ -1,0 +1,81 @@
+# Autoscaling Izwi workers on Kubernetes with KEDA, on the workers' own
+# Prometheus metrics. This replaces the supervisor's in-process autoscaler
+# for fleets.
+#
+# Scaling signal: izwi_worker_active_invocations, the invocations each
+# worker is running (workers do not queue; a full worker rejects and the
+# gateway tries another or sheds 503). KEDA keeps the StatefulSet at
+# ceil(total active / threshold) replicas, so set threshold a little below
+# IZWI_WORKER_MAX_ACTIVE to add a worker before the others fill. Keep
+# maxReplicaCount at most the number of ordinals the gateways approve
+# (gateway.yaml), or new replicas never get traffic.
+#
+# Prometheus must scrape the workers. Their metrics endpoint needs the
+# worker credential, so the scrape job sends the bearer token and the
+# credential id header (http_headers needs Prometheus 3):
+#
+#   - job_name: izwi-worker
+#     scheme: https
+#     metrics_path: /internal/v1/metrics/prometheus
+#     authorization:
+#       credentials_file: /etc/prometheus/izwi/bearer-token
+#     http_headers:
+#       x-izwi-service-credential-id:
+#         values: ["<the workers' credential id>"]
+#     tls_config:
+#       ca_file: /etc/prometheus/izwi/ca.crt
+#       cert_file: /etc/prometheus/izwi/tls.crt
+#       key_file: /etc/prometheus/izwi/tls.key
+#     kubernetes_sd_configs:
+#       - role: pod
+#         namespaces: { names: [izwi] }
+#     relabel_configs:
+#       - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+#         regex: izwi-worker
+#         action: keep
+#
+# Without KEDA, a HorizontalPodAutoscaler on the same series works through
+# prometheus-adapter (an External metric with the query below); give it the
+# same scale-up and scale-down behavior.
+#
+# Scale-down is gentle by design: a removed worker drains its accepted work
+# (terminationGracePeriodSeconds in worker.yaml) and the gateway stops
+# routing to it as soon as its status goes stale.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: izwi-worker
+  namespace: izwi
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: izwi-worker
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        # Scale out at once on a burst; scale in only after five quiet
+        # minutes, one worker at a time.
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: sum(izwi_worker_active_invocations{job="izwi-worker"})
+        threshold: "6"

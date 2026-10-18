@@ -17,10 +17,11 @@
 use crate::identity::*;
 use crate::types::{
     GatewayAttestedCallerContext, InvocationEvent, SchemaVersion, ServiceClass, TaskKind,
-    MAX_CALLER_REGIONS, MAX_REMAINING_TIME_MS,
+    WorkerFeature, MAX_CALLER_REGIONS, MAX_REMAINING_TIME_MS,
 };
 use crate::PROTOCOL_V1;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// The only realtime subprotocol implemented by this crate.
 pub const REALTIME_SUBPROTOCOL: &str = "izwi-realtime-v1";
@@ -37,6 +38,8 @@ pub const MAX_REALTIME_IN_FLIGHT_FRAMES: usize = 64;
 pub const MAX_REALTIME_SESSION_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 /// Bounded language tag length on an audio-stream admission.
 pub const MAX_REALTIME_LANGUAGE_BYTES: usize = 128;
+/// Bounded speaker (voice) name length on a text-stream admission.
+pub const MAX_REALTIME_SPEAKER_BYTES: usize = 128;
 
 /// Binary audio frame magic (`IZWI RealTime Audio`).
 pub const REALTIME_AUDIO_MAGIC: [u8; 4] = *b"IRTA";
@@ -53,6 +56,9 @@ pub const REALTIME_AUDIO_FLAG_FINAL: u8 = 0b0000_0001;
 pub enum RealtimeAudioCodec {
     /// Little-endian signed 16-bit PCM, interleaved if channels > 1.
     PcmI16Le,
+    /// A codec from a newer protocol minor; it fails validation.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Declared audio format for one direction of a realtime session.
@@ -122,14 +128,52 @@ pub enum RealtimeStageInput {
         language: Option<String>,
     },
     /// Client pushes bounded text into the worker (TTS-stream stage).
-    TextStream,
+    ///
+    /// The fields need [`WorkerFeature::RealtimeTtsTextStream`]; a worker
+    /// without it would ignore them, so a gateway routes an admit that sets
+    /// any of them only to workers advertising it
+    /// ([`Self::required_features`]).
+    TextStream {
+        /// The built-in voice to speak with; the model's default when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speaker: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        /// Synthesize each complete sentence as its `Input` arrives instead
+        /// of the whole text at `Finish`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incremental: bool,
+    },
 }
 
 impl RealtimeStageInput {
+    /// A text stream with the model's defaults, synthesized at `Finish`.
+    pub const fn text_stream() -> Self {
+        Self::TextStream {
+            speaker: None,
+            language: None,
+            incremental: false,
+        }
+    }
+
     pub const fn task(&self) -> TaskKind {
         match self {
             Self::AudioStream { .. } => TaskKind::SpeechToText,
-            Self::TextStream => TaskKind::TextToSpeech,
+            Self::TextStream { .. } => TaskKind::TextToSpeech,
+        }
+    }
+
+    /// The worker features a session with this input needs.
+    pub fn required_features(&self) -> BTreeSet<WorkerFeature> {
+        match self {
+            Self::TextStream {
+                speaker,
+                language,
+                incremental,
+            } if speaker.is_some() || language.is_some() || *incremental => {
+                BTreeSet::from([WorkerFeature::RealtimeTtsTextStream])
+            }
+            _ => BTreeSet::new(),
         }
     }
 }
@@ -178,6 +222,8 @@ pub enum RealtimeContractError {
     InvalidAudioSpec,
     #[error("language tag exceeds {MAX_REALTIME_LANGUAGE_BYTES} bytes")]
     InvalidLanguageTag,
+    #[error("speaker exceeds {MAX_REALTIME_SPEAKER_BYTES} bytes")]
+    InvalidSpeaker,
     #[error("input text exceeds {MAX_REALTIME_INPUT_TEXT_BYTES} bytes")]
     InvalidInputText,
     #[error("session bounds are outside the hard protocol caps")]
@@ -227,7 +273,22 @@ impl RealtimeSessionAdmit {
                     return Err(RealtimeContractError::InvalidLanguageTag);
                 }
             }
-            RealtimeStageInput::TextStream => {}
+            RealtimeStageInput::TextStream {
+                speaker, language, ..
+            } => {
+                if speaker
+                    .as_ref()
+                    .is_some_and(|speaker| speaker.len() > MAX_REALTIME_SPEAKER_BYTES)
+                {
+                    return Err(RealtimeContractError::InvalidSpeaker);
+                }
+                if language
+                    .as_ref()
+                    .is_some_and(|tag| tag.len() > MAX_REALTIME_LANGUAGE_BYTES)
+                {
+                    return Err(RealtimeContractError::InvalidLanguageTag);
+                }
+            }
         }
         Ok(())
     }
@@ -275,6 +336,9 @@ pub enum RealtimeServerFrame {
     Event {
         event: InvocationEvent,
     },
+    /// A frame type from a newer protocol minor, which a receiver skips.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Fixed-layout binary audio frame: 16-byte header followed by the codec
@@ -392,10 +456,63 @@ mod tests {
         admit.validate().expect("valid admit");
     }
 
+    /// SPK-F10: a text-stream admission without the new fields stays the
+    /// `{"kind":"text_stream"}` older peers send and accept; setting any
+    /// field round-trips and requires the TTS text-stream worker feature.
+    #[test]
+    fn text_stream_fields_are_additive_and_feature_gated() {
+        let plain = RealtimeStageInput::text_stream();
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({ "kind": "text_stream" })
+        );
+        assert_eq!(
+            serde_json::from_value::<RealtimeStageInput>(
+                serde_json::json!({ "kind": "text_stream" })
+            )
+            .unwrap(),
+            plain
+        );
+        assert!(plain.required_features().is_empty());
+
+        let voiced = RealtimeStageInput::TextStream {
+            speaker: Some("af_heart".into()),
+            language: None,
+            incremental: true,
+        };
+        let wire = serde_json::to_value(&voiced).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "text_stream", "speaker": "af_heart", "incremental": true })
+        );
+        assert_eq!(
+            serde_json::from_value::<RealtimeStageInput>(wire).unwrap(),
+            voiced
+        );
+        assert_eq!(
+            voiced.required_features(),
+            BTreeSet::from([WorkerFeature::RealtimeTtsTextStream])
+        );
+    }
+
+    #[test]
+    fn admit_rejects_an_oversized_speaker() {
+        let mut admit = admit(TaskKind::TextToSpeech);
+        admit.input = RealtimeStageInput::TextStream {
+            speaker: Some("x".repeat(MAX_REALTIME_SPEAKER_BYTES + 1)),
+            language: None,
+            incremental: false,
+        };
+        assert!(matches!(
+            admit.validate(),
+            Err(RealtimeContractError::InvalidSpeaker)
+        ));
+    }
+
     #[test]
     fn admit_rejects_chat_stage() {
         let mut admit = admit(TaskKind::Chat);
-        admit.input = RealtimeStageInput::TextStream;
+        admit.input = RealtimeStageInput::text_stream();
         assert!(matches!(
             admit.validate(),
             Err(RealtimeContractError::UnsupportedTask)

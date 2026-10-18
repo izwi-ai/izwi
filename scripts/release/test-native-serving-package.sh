@@ -16,6 +16,7 @@ mkdir -p "${stage}"
 touch \
     "${stage}/izwi" \
     "${stage}/izwi-server" \
+    "${stage}/izwi-gateway" \
     "${stage}/izwi-serving-supervisor" \
     "${stage}/izwi-serving-worker" \
     "${stage}/izwi-desktop"
@@ -24,6 +25,7 @@ cp "${example_config}" "${stage}/izwi-serving-node.example.toml"
 tar -czf "${archive}" -C "${stage}" \
     izwi \
     izwi-server \
+    izwi-gateway \
     izwi-serving-supervisor \
     izwi-serving-worker \
     izwi-serving-node.example.toml \
@@ -34,6 +36,7 @@ mkdir -p "${windows_stage}"
 touch \
     "${windows_stage}/izwi.exe" \
     "${windows_stage}/izwi-server.exe" \
+    "${windows_stage}/izwi-gateway.exe" \
     "${windows_stage}/izwi-serving-supervisor.exe" \
     "${windows_stage}/izwi-serving-worker.exe" \
     "${windows_stage}/izwi-desktop.exe"
@@ -43,6 +46,7 @@ cp "${example_config}" "${windows_stage}/izwi-serving-node.example.toml"
     zip -q "${windows_archive}" \
         izwi.exe \
         izwi-server.exe \
+        izwi-gateway.exe \
         izwi-serving-supervisor.exe \
         izwi-serving-worker.exe \
         izwi-serving-node.example.toml \
@@ -54,6 +58,7 @@ rm "${stage}/izwi-serving-worker"
 tar -czf "${archive}" -C "${stage}" \
     izwi \
     izwi-server \
+    izwi-gateway \
     izwi-serving-supervisor \
     izwi-serving-node.example.toml \
     izwi-desktop
@@ -67,6 +72,7 @@ touch "${stage}/izwi-serving-worker"
 tar -czf "${archive}" -C "${stage}" \
     izwi \
     izwi-server \
+    izwi-gateway \
     izwi-serving-supervisor \
     izwi-serving-worker \
     izwi-desktop
@@ -80,6 +86,7 @@ rm "${stage}/izwi-serving-supervisor"
 tar -czf "${archive}" -C "${stage}" \
     izwi \
     izwi-server \
+    izwi-gateway \
     izwi-serving-worker \
     izwi-serving-node.example.toml \
     izwi-desktop
@@ -89,6 +96,19 @@ if "${verifier}" --terminal-archive "${archive}" >/dev/null 2>&1; then
 fi
 
 cp "${example_config}" "${stage}/izwi-serving-node.example.toml"
+touch "${stage}/izwi-serving-supervisor"
+tar -czf "${archive}" -C "${stage}" \
+    izwi \
+    izwi-server \
+    izwi-serving-supervisor \
+    izwi-serving-worker \
+    izwi-serving-node.example.toml \
+    izwi-desktop
+if "${verifier}" --terminal-archive "${archive}" >/dev/null 2>&1; then
+    echo "error: verifier accepted a serving archive without its standalone gateway" >&2
+    exit 1
+fi
+
 python3 - "${stage}/izwi-serving-node.example.toml" << 'PYEOF'
 import sys
 import tomllib

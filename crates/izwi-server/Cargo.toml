@@ -18,8 +18,12 @@ cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda"]
 metal = ["izwi-core/metal"]
-db-mysql = ["sea-orm/sqlx-mysql"]
-db-postgres = ["sea-orm/sqlx-postgres"]
+db-postgres = [
+    "izwi-db/db-postgres",
+    "izwi-gateway/db-postgres",
+    "sea-orm/sqlx-postgres",
+    "sea-orm/runtime-tokio-rustls",
+]
 
 [dependencies]
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
@@ -32,6 +36,8 @@ async-stream = { workspace = true }
 
 axum = { workspace = true }
 axum-extra = { workspace = true }
+http-body = "1"
+http-body-util = "0.1"
 tower = { workspace = true }
 tower-http = { workspace = true }
 utoipa = { workspace = true }
@@ -57,6 +63,9 @@ async-trait = "0.1"
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
+rubato = { workspace = true }
+izwi-db = { path = "../izwi-db" }
+izwi-gateway = { path = "../izwi-gateway" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 
@@ -90,7 +99,9 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [dev-dependencies]
+izwi-db = { path = "../izwi-db", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
-izwi-serving-client = { path = "../izwi-serving-client", features = ["mock-worker"] }
+izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-support"] }
+izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

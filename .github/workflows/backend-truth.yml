@@ -63,7 +63,12 @@ jobs:
             ripgrep
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned: a new stable release can add clippy lints that fail
+        # `-D warnings` with no repo change. Bump deliberately, together
+        # with the version the lanes are verified with locally. No
+        # rust-toolchain.toml: it would override the 1.88.0 (MSRV) CUDA
+        # compile lanes, which install that version as the rustup default.
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
 
@@ -90,7 +95,8 @@ jobs:
             libssl-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -101,8 +107,72 @@ jobs:
       - name: Run CPU backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
+  cargo-serving:
+    name: Cargo Validation (Serving)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev
+
+      - name: Setup Rust toolchain
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run serving crate and gateway process tests
+        run: scripts/ci/check-backend-truth.sh cargo-serving
+
+  serving-windows:
+    name: Serving Compile (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      # release.yml ships the supervisor, worker and gateway for Windows.
+      # The workspace rustc-wrapper is a python script for the macOS linker
+      # that Windows cannot execute, so this check runs without it.
+      - name: Check serving crates for Windows
+        shell: bash
+        run: >-
+          cargo --config "build.rustc-wrapper=''" check --locked
+          -p izwi-serving-supervisor
+          -p izwi-serving-worker
+          -p izwi-serving-protocol
+          -p izwi-serving-client
+          -p izwi-gateway
+          -p izwi-model-catalog
+          -p izwi-prometheus
+          -p izwi-db
+
   fleet-stores:
-    name: Fleet Store Validation (PostgreSQL)
+    name: Store Validation (PostgreSQL)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -124,6 +194,7 @@ jobs:
     env:
       IZWI_TEST_FLEET_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_test
       IZWI_TEST_FLEET_RIG_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_rig
+      IZWI_TEST_STORE_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_store_test
 
     steps:
       - name: Checkout
@@ -137,7 +208,8 @@ jobs:
             libssl-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -145,9 +217,10 @@ jobs:
           workspaces: |
             . -> target
 
-      - name: Create the fleet rig database
+      - name: Create the fleet rig and store suite databases
         run: |
           PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_fleet_rig"
+          PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_store_test"
 
       - name: Run fleet store validation
         run: scripts/ci/check-backend-truth.sh cargo-fleet-stores
@@ -218,7 +291,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Run required native and FlashAttention device certification
         run: scripts/ci/check-backend-truth.sh cargo-cuda-device
@@ -254,7 +328,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned like the first Rust toolchain step in this file.
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2

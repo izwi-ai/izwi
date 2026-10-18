@@ -453,8 +453,9 @@ mod tests {
     fn metal_resident_filter_matches_cpu() {
         use crate::kernels::numeric_check::xorshift_values;
 
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_resident_filter_matches_cpu")
+        else {
             return;
         };
         let values = xorshift_values(4096, 0x5EED, 4.0);
@@ -589,9 +590,11 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_sampling_matches_cpu_policy_and_rejects_raw_nan() {
-        check_device_distribution(
-            &crate::backends::metal_device_if_available(0).expect("Metal device"),
-        );
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_sampling_matches_cpu_policy_and_rejects_raw_nan",
+        )
+        .expect("Metal device");
+        check_device_distribution(&device);
     }
 
     #[cfg(feature = "cuda")]
@@ -716,9 +719,10 @@ mod tests {
     #[cfg(feature = "metal")]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn fish_s2_sampling_metal_matches_host() {
-        assert_accelerator_matches_host(
-            crate::backends::metal_device_if_available(0).expect("Metal device required"),
-        );
+        let (device, _lease) =
+            crate::backends::metal_test_device_or_skip("fish_s2_sampling_metal_matches_host")
+                .expect("Metal device required");
+        assert_accelerator_matches_host(device);
     }
 
     #[test]

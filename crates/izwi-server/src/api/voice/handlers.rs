@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use crate::voice_defaults::DEFAULT_VOICE_AGENT_SYSTEM_PROMPT;
 use crate::voice_observation_store::VoiceObservation;
@@ -93,7 +93,7 @@ pub async fn get_voice_profile(
 
 pub async fn update_voice_profile(
     State(state): State<AppState>,
-    Json(req): Json<UpdateVoiceProfileRequest>,
+    ApiJson(req): ApiJson<UpdateVoiceProfileRequest>,
 ) -> Result<Json<VoiceProfileResponse>, ApiError> {
     let profile = state
         .voice_store
@@ -121,7 +121,7 @@ pub async fn list_voice_sessions(
 
 pub async fn create_voice_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateVoiceSessionApiRequest>,
+    ApiJson(req): ApiJson<CreateVoiceSessionApiRequest>,
 ) -> Result<Json<VoiceSessionDetail>, ApiError> {
     let profile = if let Some(profile_id) = req.profile_id {
         state
@@ -242,7 +242,7 @@ pub async fn list_voice_session_turns(
 pub async fn update_voice_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Json(req): Json<UpdateVoiceSessionRequest>,
+    ApiJson(req): ApiJson<UpdateVoiceSessionRequest>,
 ) -> Result<Json<VoiceSessionDetail>, ApiError> {
     if let Some(system_prompt) = req.system_prompt {
         if system_prompt.trim().is_empty() {
@@ -401,14 +401,9 @@ fn format_voice_session_transcript(detail: &VoiceSessionDetail) -> String {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    let message = err.to_string();
-    if message.contains("Invalid voice mode") || message.contains("Missing required") {
-        return ApiError::bad_request(message);
-    }
-
-    ApiError::internal(format!("Voice storage error: {err}"))
+    crate::error::store_api_error(err, "Voice storage error")
 }
 
 fn map_observation_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Voice memory storage error: {err}"))
+    crate::error::store_api_error(err, "Voice memory storage error")
 }

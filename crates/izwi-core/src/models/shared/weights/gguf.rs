@@ -560,7 +560,7 @@ mod tests {
     fn test_gguf_magic_detection() {
         // Create a temporary file with GGUF magic
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test.gguf");
+        let test_file = temp_dir.join(format!("izwi-gguf-magic-{}.gguf", uuid::Uuid::new_v4()));
 
         std::fs::write(&test_file, b"GGUF\x00\x00\x00\x00").unwrap();
         assert!(is_gguf_file(&test_file));
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn test_non_gguf_file() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test.txt");
+        let test_file = temp_dir.join(format!("izwi-not-gguf-{}.txt", uuid::Uuid::new_v4()));
 
         std::fs::write(&test_file, b"This is not a GGUF file").unwrap();
         assert!(!is_gguf_file(&test_file));

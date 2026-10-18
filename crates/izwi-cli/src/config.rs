@@ -251,10 +251,14 @@ impl Config {
             max_prefix_cache_pages: self.runtime.max_prefix_cache_pages,
             enable_chunked_prefill: self.runtime.enable_chunked_prefill,
             chunked_prefill_threshold: self.runtime.chunked_prefill_threshold,
+            // Environment only (IZWI_MAX_TOKENS_PER_STEP).
+            max_tokens_per_step: None,
             max_retained_sequences: self.runtime.max_retained_sequences,
             max_staged_transactions: self.runtime.max_staged_transactions,
             max_queued_requests: self.runtime.max_queued_requests,
             max_sequence_length: self.runtime.max_sequence_length,
+            // Environment only (IZWI_ASR_REALTIME_*).
+            asr_realtime: Default::default(),
             num_threads: self.runtime.threads,
             max_concurrent_requests: self.runtime.max_concurrent,
             request_timeout_secs: self.runtime.timeout,

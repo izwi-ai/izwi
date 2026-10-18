@@ -925,6 +925,10 @@ mod tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint (IZWI_ALIGNER_DEVICE=cpu|metal)"]
     fn forced_aligner_windows_cover_doubled_test_wav() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_windows_cover_doubled_test_wav",
+        );
         use crate::models::architectures::qwen3::asr::Qwen3AsrModel;
         use crate::{DeviceSelector, ModelVariant};
 
@@ -1045,6 +1049,10 @@ mod tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint (IZWI_ALIGNER_DEVICE=cpu|metal)"]
     fn forced_aligner_single_window_matches_30_s_windows() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_single_window_matches_30_s_windows",
+        );
         use crate::models::architectures::qwen3::asr::Qwen3AsrModel;
         use crate::{DeviceSelector, ModelVariant};
         use std::io::Write;

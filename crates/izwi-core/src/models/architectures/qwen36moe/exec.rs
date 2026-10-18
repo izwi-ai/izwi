@@ -51,13 +51,18 @@ fn qwen35_prefill_chunk_size() -> usize {
 /// The forward size a prefill span is split into: `IZWI_QWEN35_PREFILL_CHUNK_SIZE`
 /// when set, else `default` (bounded either way).
 fn qwen35_prefill_chunk_size_or(default: usize) -> usize {
-    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    PREFILL_CHUNK_SIZE
+        .get()
         .unwrap_or(default)
         .min(MAX_PREFILL_CHUNK_SIZE)
 }
+
+/// `IZWI_QWEN35_PREFILL_CHUNK_SIZE` when set to a positive integer, read once.
+static PREFILL_CHUNK_SIZE: crate::env::ReadOnce<Option<usize>> = crate::env::ReadOnce::new(|| {
+    crate::env::value("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+});
 
 fn next_prefill_segment_end(
     prompt_ids: &[u32],
@@ -294,6 +299,16 @@ impl ChatDecodeState {
 
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
+    }
+
+    /// The whole reply, which only a terminal step carries: streaming
+    /// consumers read the deltas.
+    fn terminal_text(&self) -> String {
+        if self.finished {
+            self.assembled.clone()
+        } else {
+            String::new()
+        }
     }
 
     /// Committed output tokens for the session so far.
@@ -1061,7 +1076,7 @@ impl Qwen36ChatExec {
                 max_new_tokens,
                 track_history,
             ),
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             tokens_generated: 0,
             track_history,
             assembled: String::new(),
@@ -1696,7 +1711,7 @@ impl Qwen36ChatExec {
         }
         Ok(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,
@@ -1737,7 +1752,7 @@ impl Qwen36ChatExec {
         state.pending_logprobs = logprobs;
         Ok(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,
@@ -1862,7 +1877,7 @@ impl Qwen36ChatExec {
         }
         Ok(Some(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,
@@ -3986,6 +4001,7 @@ mod tests {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: true,
         };
         let mut rng = SimpleRng::new(7);
         let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
@@ -4012,6 +4028,7 @@ mod tests {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: true,
         };
         let history = [1u32];
         let mut direct_rng = SimpleRng::new(17);
@@ -4045,6 +4062,7 @@ mod tests {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: true,
         };
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
@@ -4073,6 +4091,7 @@ mod tests {
                 logprobs: false,
                 top_logprobs: 0,
                 constrain_json_object: false,
+                skip_special_tokens: true,
             };
             let mut rng = SimpleRng::new(7);
             let error = sample_next_token(&logits, 3, &config, &[], &mut rng)

@@ -1,0 +1,195 @@
+# Izwi serving workers on Kubernetes (fleet-one-gateway topology).
+#
+# Kubernetes replaces the in-process supervisor here: it starts, restarts and
+# scales the workers, and the gateways (gateway.yaml) route to them over
+# mutual TLS. Workers run as a StatefulSet, not a Deployment, because the
+# gateway's v1 approvals pin each worker's endpoint and identity: a
+# StatefulSet gives every replica a stable DNS name
+# (izwi-worker-N.izwi-worker.izwi.svc) and a stable worker id (its pod
+# name). Approve every ordinal up to the autoscaler's maxReplicaCount; the
+# gateway adopts each one when it starts answering and skips it while it
+# is down.
+#
+# Before applying:
+#   - a Secret izwi-worker-credentials with credential-id and bearer-token
+#     (the gateway uses the same pair);
+#   - a Secret izwi-worker-tls (cert-manager or your CA) with tls.crt and
+#     tls.key for *.izwi-worker.izwi.svc and ca.crt, the CA that signs the
+#     gateways' client certificates; the probes reuse a client certificate
+#     from izwi-gateway-client-tls (see gateway.yaml);
+#   - the pinned model artifact in the izwi-models PersistentVolumeClaim
+#     (the worker verifies its artifact and never downloads at startup);
+#   - the NVIDIA device plugin, which exposes the assigned GPU's UUID in
+#     NVIDIA_VISIBLE_DEVICES (its default envvar strategy); the worker
+#     verifies that UUID before it loads the model.
+#
+# For CPU workers drop the GPU request, set IZWI_BACKEND=cpu with
+# IZWI_WORKER_CPU_THREADS, IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES and
+# IZWI_CPU_MEMORY_BUDGET_BYTES (equal), and run the CPU image.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: izwi-worker
+  namespace: izwi
+  labels:
+    app.kubernetes.io/name: izwi-worker
+spec:
+  # Headless: each worker is addressed by its own DNS name, never through a
+  # load-balanced virtual IP (the gateway pins identities per endpoint).
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: izwi-worker
+  ports:
+    - name: worker
+      port: 9470
+      targetPort: worker
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: izwi-worker
+  namespace: izwi
+  labels:
+    app.kubernetes.io/name: izwi-worker
+spec:
+  serviceName: izwi-worker
+  replicas: 1
+  # Workers are independent replicas: start and stop them in parallel.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: izwi-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: izwi-worker
+    spec:
+      # Longer than the worker's drain grace plus cancellation grace, so a
+      # scale-down finishes accepted work before the kubelet kills it.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: izwi:serving-cuda
+          command:
+            - sh
+            - -c
+            # The device plugin names the assigned GPU; the worker refuses
+            # to start on any other device.
+            - IZWI_WORKER_EXPECTED_DEVICE_UUID="$NVIDIA_VISIBLE_DEVICES" exec izwi-serving-worker
+          ports:
+            - name: worker
+              containerPort: 9470
+          env:
+            - name: IZWI_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: IZWI_WORKER_NODE_ID
+              value: izwi-worker
+            - name: IZWI_WORKER_BIND
+              value: 0.0.0.0:9470
+            - name: IZWI_WORKER_TLS_CERT_REF
+              value: file:/etc/izwi/tls/tls.crt
+            - name: IZWI_WORKER_TLS_KEY_REF
+              value: file:/etc/izwi/tls/tls.key
+            - name: IZWI_WORKER_TLS_CLIENT_CA_REF
+              value: file:/etc/izwi/tls/ca.crt
+            - name: IZWI_WORKER_CREDENTIAL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-worker-credentials
+                  key: credential-id
+            - name: IZWI_WORKER_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: izwi-worker-credentials
+                  key: bearer-token
+            - name: IZWI_WORKER_MODEL
+              value: LFM2.5-1.2B-Instruct-GGUF
+            - name: IZWI_WORKER_DEPLOYMENT_ID
+              value: lfm25-cuda-v1
+            - name: IZWI_WORKER_ARTIFACT_REVISION
+              value: REPLACE_WITH_PINNED_ARTIFACT_REVISION
+            - name: IZWI_WORKER_MODEL_GENERATION
+              value: "1"
+            - name: IZWI_MODELS_DIR
+              value: /models
+            - name: IZWI_BACKEND
+              value: cuda
+            - name: IZWI_CUDA_DEVICE_ORDINAL
+              value: "0"
+            - name: IZWI_WORKER_DEVICE_MEMORY_LIMIT_BYTES
+              value: "21474836480"
+            - name: IZWI_CUDA_MEMORY_BUDGET_BYTES
+              value: "21474836480"
+            - name: IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES
+              value: "8589934592"
+            - name: IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES
+              value: "8589934592"
+            - name: IZWI_WORKER_MAX_ACTIVE
+              value: "8"
+            - name: IZWI_WORKER_MAX_RETAINED_ATTEMPTS
+              value: "256"
+            - name: IZWI_WORKER_DRAIN_GRACE_MS
+              value: "30000"
+            - name: IZWI_WORKER_CANCELLATION_GRACE_MS
+              value: "10000"
+            # A permanently failed runtime exits the process (status 70), so
+            # the kubelet restarts the container.
+            - name: IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE
+              value: "true"
+            - name: IZWI_LOG_FORMAT
+              value: json
+          resources:
+            requests:
+              cpu: "4"
+              memory: 10Gi
+              nvidia.com/gpu: 1
+            limits:
+              memory: 12Gi
+              nvidia.com/gpu: 1
+          # Loading the model can take minutes; liveness starts afterwards.
+          startupProbe:
+            exec:
+              command: &status-probe
+                - sh
+                - -c
+                - >-
+                  curl -fsS -k --max-time 3
+                  --cert /etc/izwi/probe/tls.crt --key /etc/izwi/probe/tls.key
+                  -H "Authorization: Bearer $IZWI_WORKER_BEARER_TOKEN"
+                  -H "x-izwi-service-credential-id: $IZWI_WORKER_CREDENTIAL_ID"
+                  https://127.0.0.1:9470/internal/v1/status
+            periodSeconds: 10
+            failureThreshold: 60
+          # A worker whose runtime wedged stops answering its status; three
+          # missed probes restart it, like the supervisor's liveness probe.
+          livenessProbe:
+            exec:
+              command: *status-probe
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/izwi/tls
+              readOnly: true
+            - name: probe-client
+              mountPath: /etc/izwi/probe
+              readOnly: true
+            - name: models
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: izwi-worker-tls
+        - name: probe-client
+          secret:
+            secretName: izwi-gateway-client-tls
+        - name: models
+          persistentVolumeClaim:
+            claimName: izwi-models
+            readOnly: true

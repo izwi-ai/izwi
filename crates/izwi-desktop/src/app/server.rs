@@ -252,8 +252,8 @@ fn poll_livez_runtime_poisoned(server_url: &Url) -> Option<bool> {
         .get(live_url)
         .send()
         .ok()?
-        .error_for_status()
-        .ok()?
+        // A permanently failed runtime answers 503 with the same body, so the
+        // body is read whatever the status.
         .text()
         .ok()?;
     parse_livez_runtime_poisoned(&body)

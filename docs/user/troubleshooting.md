@@ -67,6 +67,14 @@ pkill -f izwi
 izwi serve
 ```
 
+**"refusing to bind ... without an API key":** a non-loopback host such as
+`0.0.0.0` requires `IZWI_API_KEY`. Set one, or bind `127.0.0.1` (the default):
+
+```bash
+export IZWI_API_KEY="$(openssl rand -hex 32)"
+izwi serve --host 0.0.0.0
+```
+
 ### Can't connect to server
 
 1. Verify server is running:
@@ -85,7 +93,16 @@ izwi serve
    http://localhost:8080
    ```
 
-4. Check firewall settings
+4. From another device: the server listens on `127.0.0.1` by default. Start
+   it with `--host 0.0.0.0` and an `IZWI_API_KEY` (see
+   [Security And CORS](/api#security-and-cors)).
+
+5. Check firewall settings
+
+6. A `403` saying the `Host` header is not allowed means the server is bound
+   to loopback and was reached through another name (a reverse proxy that
+   forwards the original `Host`, or DNS rebinding). Make the proxy send
+   `Host: 127.0.0.1:8080`, or bind a network address with an API key.
 
 ### Server crashes on startup
 
@@ -224,7 +241,7 @@ izwi serve --backend metal
 
 Linux (Docker CUDA):
 ```bash
-CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
+IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
 ```
 
 Linux/Windows source build (CUDA):
@@ -405,9 +422,18 @@ Ensure required models are loaded:
 
 ### 401 Unauthorized
 
-Izwi doesn't require authentication by default. If you're getting this error:
-- Check you're connecting to the right server
-- Verify no proxy is interfering
+A server bound to a network address requires its `IZWI_API_KEY`:
+- Send `Authorization: Bearer <key>` or `x-api-key: <key>`.
+- For `izwi` CLI commands, export `IZWI_API_KEY` in the shell that runs them.
+- In the web UI, reload the page and enter the key when asked.
+
+A loopback-bound server (the default) needs no key; if you still get `401`,
+check you're connecting to the right server and that no proxy is interfering.
+
+### 403 Cross-origin request rejected
+
+The server rejects writes from web pages on other sites. If your own web app
+calls the API, add its origin to `cors_origins` (or `IZWI_CORS_ORIGINS`).
 
 ### 404 Not Found
 

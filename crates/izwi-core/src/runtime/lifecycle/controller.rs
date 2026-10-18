@@ -14,6 +14,7 @@ use crate::config::EngineConfig;
 use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
+use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedModelBundle, LoadedModelBundleDraft, LoadedStatePublication,
     RuntimeAdapterRegistry,
@@ -331,6 +332,7 @@ impl ModelLifecycleController {
         self.mark_slot_ready_for_instance(variant, model_instance_id)
     }
 
+    #[cfg(test)]
     pub(super) fn bind_loaded_model_bundle(
         &self,
         variant: ModelVariant,
@@ -343,6 +345,7 @@ impl ModelLifecycleController {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn bind_loaded_model_bundle_with_state_publications(
         &self,
         variant: ModelVariant,
@@ -516,7 +519,7 @@ impl ModelLifecycleController {
         let mut state = self.state();
         let active_leases = self.model_manager.active_residency_leases(variant);
         if active_leases > 0 {
-            return Err(Error::InferenceError(format!(
+            return Err(Error::ModelBusy(format!(
                 "Cannot unload model {variant}: {active_leases} active inference lease(s) are still held"
             )));
         }
@@ -568,8 +571,26 @@ impl ModelLifecycleController {
             slot.bundle.take()
         };
         let retired = bundle.is_some();
-        drop(bundle);
+        // Publication-owned state (invocation pools, retained arenas) frees
+        // device memory: drop it on the device thread.
+        match self.model_registry.device_thread() {
+            Ok(device) => {
+                let _ = device.run_sync(move || drop(bundle));
+            }
+            Err(_) => drop(bundle),
+        }
         Ok(retired)
+    }
+
+    /// Release the pooled Metal scratch buffers on the device thread.
+    pub(super) fn clear_metal_pools_on_device(&self) {
+        let clear = || MetalPoolManager::global().clear_all();
+        match self.model_registry.device_thread() {
+            Ok(device) => {
+                let _ = device.run_sync(clear);
+            }
+            Err(_) => clear(),
+        }
     }
 
     pub(super) fn remove_resident_slot(&self, variant: ModelVariant) -> bool {

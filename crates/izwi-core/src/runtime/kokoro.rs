@@ -3,10 +3,13 @@
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::backends::BackendKind;
 use crate::engine::WorkUnit;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::kokoro::admission::kokoro_chunk_frame_bound;
+use crate::models::architectures::kokoro::admission::{
+    kokoro_chunk_frame_bound, kokoro_chunk_price,
+};
 use crate::models::architectures::kokoro::planning::{KokoroChunkPolicy, KokoroPlannedChunk};
 use crate::models::architectures::kokoro::{
     kokoro_output_budget, KokoroPreparedRequest, KokoroSynthesisResult, KokoroTtsModel,
@@ -18,15 +21,22 @@ use crate::runtime::tts::direct_tts_retained_input_bytes;
 use crate::runtime::types::{AudioChunk, GenerationRequest};
 
 pub(crate) const KOKORO_STREAM_TARGET_CHARS: usize = 180;
-const KOKORO_STREAM_MIN_CHARS: usize = 64;
 
-/// Planned frames of the largest chunk the stream planner can produce for
+/// Planned frames of the heaviest chunk the stream planner can produce for
 /// `text`: its chunks never exceed `KOKORO_STREAM_TARGET_CHARS`.
 pub(crate) fn kokoro_stream_chunk_frames(text: &str, speed: f32) -> usize {
-    kokoro_chunk_frame_bound(
-        text.trim().chars().count().min(KOKORO_STREAM_TARGET_CHARS),
-        speed,
-    )
+    kokoro_chunk_frame_bound(text, KOKORO_STREAM_TARGET_CHARS, speed)
+}
+
+/// The audio one streamed chunk of `text` may produce. Admission reserved
+/// one chunk of output at the planning pace for the largest chunk the
+/// planner can produce (KOK-8); each chunk's audio is handed on before the
+/// next is synthesized.
+fn kokoro_stream_chunk_sample_limit(text: &str, speed: f32, backend: BackendKind) -> Result<usize> {
+    let samples =
+        kokoro_chunk_price(kokoro_stream_chunk_frames(text, speed), backend)?.output_samples;
+    usize::try_from(samples)
+        .map_err(|_| Error::Overloaded("Kokoro chunk sample limit exceeds usize".into()))
 }
 
 fn kokoro_streaming_capability() -> CapabilityKind {
@@ -131,17 +141,11 @@ impl RuntimeService {
         let mut expected_sample_rate: Option<u32> = None;
         let mut emitted_samples = 0usize;
         let mut materialized_output_samples = 0usize;
-        // Admission reserved one chunk of output at the planning pace for
-        // the largest chunk the planner can produce (KOK-8); each chunk's
-        // audio is handed on before the next is synthesized.
-        let chunk_sample_limit =
-            crate::models::architectures::kokoro::admission::kokoro_chunk_price(
-                kokoro_stream_chunk_frames(&text_for_limit, speed),
-                self.backend_router.context().backend_kind,
-            )?
-            .output_samples;
-        let chunk_sample_limit = usize::try_from(chunk_sample_limit)
-            .map_err(|_| Error::Overloaded("Kokoro chunk sample limit exceeds usize".into()))?;
+        let chunk_sample_limit = kokoro_stream_chunk_sample_limit(
+            &text_for_limit,
+            speed,
+            self.backend_router.context().backend_kind,
+        )?;
 
         for (sequence, planned) in stream_chunks.into_iter().enumerate() {
             let model_for_task = model.clone();
@@ -383,7 +387,6 @@ fn record_kokoro_materialized_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::BackendKind;
     use crate::engine::{ExecutionGroupId, ModelInstanceId};
     use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
 
@@ -580,5 +583,49 @@ mod tests {
             contract.metadata.execution_target,
             ExecutionTargetKind::DirectModel
         );
+    }
+
+    /// Short replies ("Sure.", "Call 911.") and text the G2P expands
+    /// (numbers, currency) speak within the chunk audio a stream admits for
+    /// them, on the real checkpoint with its slowest measured voice. The
+    /// character-only price admitted a one-character text at 2,400 samples,
+    /// and the voice pipeline failed "Sure." (34,200 > 2,400).
+    #[test]
+    fn short_and_expanded_texts_fit_their_admitted_chunk_audio_if_env_set() {
+        use crate::backends::DeviceSelector;
+        use std::io::Write;
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            let _ = writeln!(std::io::stderr(), "IZWI_KOKORO_MODEL_DIR unset; not run");
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu")).expect("cpu device");
+        let model = KokoroTtsModel::load(std::path::Path::new(&model_dir), device)
+            .expect("load local Kokoro model");
+        let voice = Some("am_michael");
+        let mut failures = Vec::new();
+        for text in [
+            "A",
+            "1",
+            "OK.",
+            "Sure.",
+            "Wait, really?",
+            "Call 911.",
+            "That costs $1,234,567.89.",
+            "Dr. Lee, 221B Baker St.",
+        ] {
+            let limit = kokoro_stream_chunk_sample_limit(text, 1.0, BackendKind::Cpu).unwrap();
+            let policy = KokoroChunkPolicy::streaming(KOKORO_STREAM_TARGET_CHARS);
+            for chunk in model.plan(text, voice, None, policy).unwrap() {
+                let samples =
+                    synthesize_planned_kokoro(&model, &chunk, voice, None, 1.0, usize::MAX)
+                        .unwrap()
+                        .samples
+                        .len();
+                if samples > limit {
+                    failures.push(format!("{:?}: {samples} > {limit}", chunk.text));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

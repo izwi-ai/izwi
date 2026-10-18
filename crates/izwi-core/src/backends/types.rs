@@ -3,23 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::capabilities::BackendCapabilities;
 use super::device::DeviceProfile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-impl BackendKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Metal => "metal",
-            Self::Cuda => "cuda",
-        }
-    }
-}
+pub use izwi_model_catalog::BackendKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

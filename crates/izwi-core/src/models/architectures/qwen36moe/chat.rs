@@ -51,29 +51,18 @@ impl Qwen36MoeKvStorageProvider {
     fn select(
         backend: BackendKind,
         cuda_compute_capability: Option<(u32, u32)>,
-        cuda_bf16_override: Option<&str>,
+        bf16_kv: bool,
     ) -> Self {
-        fn bf16_kv_enabled(raw: Option<&str>) -> bool {
-            matches!(
-                raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-                None | Some("1" | "true" | "yes" | "on")
-            )
-        }
         fn cuda_supports_bf16(capability: Option<(u32, u32)>) -> bool {
             capability.is_some_and(crate::backends::device::cuda_compute_capability_supports_bf16)
         }
         match backend {
             BackendKind::Cpu => Self::CpuF32,
             BackendKind::Metal => Self::MetalF32,
-            BackendKind::Cuda
-                if bf16_kv_enabled(cuda_bf16_override)
-                    && cuda_supports_bf16(cuda_compute_capability) =>
-            {
+            BackendKind::Cuda if bf16_kv && cuda_supports_bf16(cuda_compute_capability) => {
                 Self::CudaBf16
             }
-            BackendKind::Cuda if bf16_kv_enabled(cuda_bf16_override) => {
-                Self::CudaF16CapabilityFallback
-            }
+            BackendKind::Cuda if bf16_kv => Self::CudaF16CapabilityFallback,
             BackendKind::Cuda => Self::CudaF16Fallback,
         }
     }
@@ -130,8 +119,13 @@ impl InferenceStateContractProvider for Qwen36MoeChatModel {
 pub const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN36_DECODE_QUANTUM";
 const DEFAULT_DECODE_QUANTUM: usize = 8;
 
+/// [`DECODE_QUANTUM_ENV`], read once.
+static DECODE_QUANTUM: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+    decode_quantum_from(crate::env::value(DECODE_QUANTUM_ENV).as_deref())
+});
+
 fn decode_quantum_tokens() -> usize {
-    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+    DECODE_QUANTUM.get()
 }
 
 fn decode_quantum_from(value: Option<&str>) -> usize {
@@ -172,7 +166,7 @@ impl Qwen36MoeChatModel {
         let kv_storage_provider = Qwen36MoeKvStorageProvider::select(
             device_kind,
             device.capabilities.cuda_compute_capability,
-            std::env::var(CUDA_BF16_KV_ENV).ok().as_deref(),
+            crate::env::flag_or(CUDA_BF16_KV_ENV, true),
         );
         tracing::info!(
             provider = kv_storage_provider.as_str(),
@@ -938,10 +932,11 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_attached_prefill_matches_the_fresh_run() {
-        if crate::backends::metal_device_if_available(0).is_none() {
-            eprintln!("metal device unavailable; attach leg not run");
+        let Some((_, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_attached_prefill_matches_the_fresh_run",
+        ) else {
             return;
-        }
+        };
         let profile = crate::backends::DeviceSelector::detect_for_preference(
             crate::backends::BackendPreference::Metal,
         )
@@ -1770,32 +1765,38 @@ pub(crate) mod tests {
     #[test]
     fn kv_storage_provider_keeps_portable_f32_and_gates_cuda_bf16() {
         let select = Qwen36MoeKvStorageProvider::select;
-        assert_eq!(select(BackendKind::Cpu, None, None), Qwen36MoeKvStorageProvider::CpuF32);
-        assert_eq!(select(BackendKind::Metal, None, None), Qwen36MoeKvStorageProvider::MetalF32);
+        for bf16_kv in [true, false] {
+            assert_eq!(
+                select(BackendKind::Cpu, None, bf16_kv),
+                Qwen36MoeKvStorageProvider::CpuF32
+            );
+            assert_eq!(
+                select(BackendKind::Metal, None, bf16_kv),
+                Qwen36MoeKvStorageProvider::MetalF32
+            );
+        }
         // Default CUDA policy: BF16 on capability 8.0+, F16 below.
         assert_eq!(
-            select(BackendKind::Cuda, Some((8, 0)), None),
+            select(BackendKind::Cuda, Some((8, 0)), true),
             Qwen36MoeKvStorageProvider::CudaBf16
         );
         assert_eq!(
-            select(BackendKind::Cuda, Some((9, 0)), Some("TRUE")),
+            select(BackendKind::Cuda, Some((9, 0)), true),
             Qwen36MoeKvStorageProvider::CudaBf16
         );
         assert_eq!(
-            select(BackendKind::Cuda, Some((7, 5)), None),
+            select(BackendKind::Cuda, Some((7, 5)), true),
             Qwen36MoeKvStorageProvider::CudaF16CapabilityFallback
         );
         assert_eq!(
-            select(BackendKind::Cuda, None, None),
+            select(BackendKind::Cuda, None, true),
             Qwen36MoeKvStorageProvider::CudaF16CapabilityFallback
         );
         // The kill switch forces F16 even on capable hardware.
-        for raw in ["0", "false", "OFF", "no"] {
-            assert_eq!(
-                select(BackendKind::Cuda, Some((8, 0)), Some(raw)),
-                Qwen36MoeKvStorageProvider::CudaF16Fallback
-            );
-        }
+        assert_eq!(
+            select(BackendKind::Cuda, Some((8, 0)), false),
+            Qwen36MoeKvStorageProvider::CudaF16Fallback
+        );
         // Dtypes: portable plans stay F32, CUDA plans are F16/BF16.
         assert_eq!(Qwen36MoeKvStorageProvider::CpuF32.dtype(), DType::F32);
         assert_eq!(Qwen36MoeKvStorageProvider::MetalF32.dtype(), DType::F32);
@@ -2124,8 +2125,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fixture_generation_matches_between_cpu_and_metal() {
-        let Some(_metal_device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; parity leg not run");
+        let Some((_metal_device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "fixture_generation_matches_between_cpu_and_metal",
+        ) else {
             return;
         };
         let run = |device: DeviceProfile| -> Vec<String> {

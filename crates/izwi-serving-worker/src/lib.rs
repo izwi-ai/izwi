@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use izwi_core::{ManagedKvRuntimeSnapshot, RuntimeTelemetrySnapshot};
+use izwi_core::{ManagedKvRuntimeSnapshot, RuntimeHealth, RuntimeTelemetrySnapshot};
 use izwi_serving_protocol::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -23,20 +23,24 @@ use std::{
     fmt::Write as _,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
     time::Duration,
 };
 use tokio::sync::{mpsc, watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 mod realtime;
 mod runtime;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use realtime::{RuntimeRealtimeSessionLimits, REALTIME_SESSION_DEFAULT_LIMITS};
 pub use runtime::{
-    warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
-    RuntimeRealtimeAsrExecutor, RuntimeRealtimeTtsExecutor,
+    admission_rejection_code, execution_error_code, warm_up_asr_runtime, warm_up_chat_runtime,
+    warm_up_tts_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
+    RuntimeRealtimeTtsExecutor,
 };
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -44,6 +48,7 @@ pub const DEFAULT_MAX_RETAINED_ATTEMPTS: usize = 1024;
 pub const DEFAULT_ATTEMPT_RETENTION: Duration = Duration::from_secs(300);
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 4;
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_SLOW_CONSUMER_TIMEOUT: Duration = izwi_core::DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT;
 pub const WORKER_METRICS_PATH: &str = "/internal/v1/metrics/prometheus";
 const EVENT_ENVELOPE_ALLOWANCE: usize = 1024;
 const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 8192;
@@ -60,6 +65,10 @@ pub struct WorkerConfig {
     pub attempt_retention: Duration,
     pub event_channel_capacity: usize,
     pub max_event_bytes: usize,
+    /// How long a streaming reader may leave text unaccepted before the
+    /// invocation is cancelled. Until then a lagging reader's deltas are
+    /// coalesced, never dropped.
+    pub slow_consumer_timeout: Duration,
     /// Per-realtime-session transport bounds; always within the protocol's
     /// hard caps. Ignored by deployments that do not serve realtime.
     pub realtime_session_limits: RuntimeRealtimeSessionLimits,
@@ -143,6 +152,7 @@ impl WorkerConfig {
                     return Err(WorkerConfigError::UnsupportedDeployment);
                 }
             }
+            TaskKind::Unknown => return Err(WorkerConfigError::UnsupportedDeployment),
         }
         if self.max_active_invocations == 0 {
             return Err(WorkerConfigError::ZeroActiveCapacity);
@@ -169,6 +179,9 @@ impl WorkerConfig {
         if self.max_event_bytes < EVENT_ENVELOPE_ALLOWANCE * 2 {
             return Err(WorkerConfigError::EventLimit);
         }
+        if self.slow_consumer_timeout.is_zero() {
+            return Err(WorkerConfigError::SlowConsumerTimeout);
+        }
         Ok(())
     }
 }
@@ -193,6 +206,8 @@ pub enum WorkerConfigError {
     AttemptRetentionWindow,
     #[error("event channel capacity must hold accepted, delta, and terminal events")]
     EventChannelCapacity,
+    #[error("slow_consumer_timeout must be non-zero")]
+    SlowConsumerTimeout,
     #[error("max_event_bytes must be at least 2048")]
     EventLimit,
     #[error("realtime session limits must be non-zero and within the protocol caps")]
@@ -305,6 +320,13 @@ pub trait InvocationExecutor: Send + Sync + 'static {
         None
     }
 
+    /// Physical execution health of the embedded runtime: admission poison
+    /// and latched fatal device faults. Status reports it instead of the
+    /// static startup readiness. Executors without an engine stay healthy.
+    fn runtime_health(&self) -> RuntimeHealth {
+        RuntimeHealth::Healthy
+    }
+
     /// Realtime stage runner when the executor embeds a runtime able to serve
     /// realtime WebSocket sessions (`izwi-realtime-v1`). Executors without
     /// realtime support return `None`, and the realtime socket route fails
@@ -344,6 +366,13 @@ pub trait RealtimeTtsStageStream: Send {
     async fn next_chunk(&mut self) -> Result<Option<izwi_core::AudioChunk>, izwi_core::Error>;
 }
 
+/// How a realtime TTS session speaks: the text-stream admission's voice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeTtsOptions {
+    pub speaker: Option<String>,
+    pub language: Option<String>,
+}
+
 /// Execution surface for one realtime stage on this worker's runtime.
 #[async_trait::async_trait]
 pub trait RealtimeStageRunner: Send + Sync + 'static {
@@ -362,15 +391,16 @@ pub trait RealtimeStageRunner: Send + Sync + 'static {
         None
     }
 
-    /// Starts realtime TTS synthesis of the committed utterance text.
-    /// Synthesis must stop by the given deadline; the session's own
-    /// cancellation ladder remains authoritative.
+    /// Starts realtime TTS synthesis of one piece of the session's text,
+    /// spoken with `options`. Synthesis must stop by the given deadline; the
+    /// session's own cancellation ladder remains authoritative.
     async fn start_tts_stream(
         &self,
         text: String,
+        options: &RealtimeTtsOptions,
         deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, izwi_core::Error> {
-        let _ = (text, deadline);
+        let _ = (text, options, deadline);
         Err(izwi_core::Error::ConfigError(
             "stage does not serve realtime TTS sessions".into(),
         ))
@@ -386,6 +416,14 @@ struct AttemptRecord {
     cancel_requested: bool,
     cancel: Option<watch::Sender<bool>>,
     evict_after: Option<Instant>,
+}
+
+/// Locks the attempt table or an admission slot. A panic while one was held
+/// must not turn every later request on this worker into a panic, so a
+/// poisoned lock is recovered with whatever state the interrupted section
+/// left, the policy the gateway registry and tenant limits follow too.
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Default)]
@@ -522,12 +560,7 @@ impl WorkerMetrics {
         engine_telemetry: Option<&RuntimeTelemetrySnapshot>,
     ) -> String {
         let active = state.config.max_active_invocations - state.capacity.available_permits();
-        let retained_attempts = state
-            .attempts
-            .lock()
-            .expect("worker attempt table poisoned")
-            .records
-            .len();
+        let retained_attempts = lock_recover(&state.attempts).records.len();
         let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
         macro_rules! metric {
             ($name:literal, $kind:literal, $help:literal, $value:expr) => {{
@@ -804,7 +837,7 @@ impl<E> WorkerState<E> {
     }
 
     fn reserve_attempt(&self, request: &InvocationRequest) -> ReserveAttempt {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::reserve_new_attempt(
             &mut table,
             AttemptIdentity::from(request),
@@ -817,7 +850,7 @@ impl<E> WorkerState<E> {
     /// fencing identity model, so `query_attempt`/`cancel_attempt` over HTTP
     /// behave identically for them.
     fn reserve_realtime_session(&self, admit: &RealtimeSessionAdmit) -> ReserveAttempt {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::reserve_new_attempt(
             &mut table,
             AttemptIdentity {
@@ -876,12 +909,12 @@ impl<E> WorkerState<E> {
     }
 
     fn remove_reservation(&self, attempt_id: &AttemptId) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::remove_record(&mut table, attempt_id);
     }
 
     fn install_admission(&self, attempt_id: &AttemptId, cancel: watch::Sender<bool>) -> bool {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         let record = table
             .records
             .get_mut(attempt_id)
@@ -893,7 +926,7 @@ impl<E> WorkerState<E> {
     }
 
     fn update_attempt(&self, attempt_id: &AttemptId, state: AttemptState, sequence: Option<u64>) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if let Some(record) = table.records.get_mut(attempt_id) {
             record.state = state;
             if let Some(sequence) = sequence {
@@ -907,7 +940,7 @@ impl<E> WorkerState<E> {
     }
 
     fn mark_cancellation_requested(&self, attempt_id: &AttemptId) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if let Some(record) = table.records.get_mut(attempt_id) {
             record.cancel_requested = true;
             record.state = AttemptState::CancellationRequested;
@@ -915,7 +948,7 @@ impl<E> WorkerState<E> {
     }
 
     fn insert_cancel_tombstone(&self, identity: AttemptIdentity) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if table.records.contains_key(&identity.attempt_id) {
             return;
         }
@@ -1014,6 +1047,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
                 Arc::clone(&self.state),
                 observe_worker_body_limit,
             ))
+            .layer(middleware::from_fn(continue_trace))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -1026,11 +1060,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
     /// Capacity remains held until each execution reports confirmed teardown.
     pub fn request_cancel_all(&self) -> usize {
         let cancellations = {
-            let mut table = self
-                .state
-                .attempts
-                .lock()
-                .expect("worker attempt table poisoned");
+            let mut table = lock_recover(&self.state.attempts);
             table
                 .records
                 .values_mut()
@@ -1053,6 +1083,10 @@ impl<E: InvocationExecutor> WorkerService<E> {
 
     pub fn active_invocations(&self) -> usize {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
+    }
+
+    pub fn runtime_health(&self) -> RuntimeHealth {
+        self.state.executor.runtime_health()
     }
 }
 
@@ -1085,7 +1119,18 @@ async fn descriptor<E: InvocationExecutor>(
             .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.config.descriptor.clone()).into_response()
+    let peer = peer_protocol_version(&headers);
+    Json(state.config.descriptor.for_peer(peer)).into_response()
+}
+
+/// The protocol version a gateway declared in [`PROTOCOL_VERSION_HEADER`],
+/// or [`UNDECLARED_PEER_VERSION`] for gateways from before the header.
+fn peer_protocol_version(headers: &HeaderMap) -> SchemaVersion {
+    headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(SchemaVersion::parse)
+        .unwrap_or(UNDECLARED_PEER_VERSION)
 }
 
 /// Map managed-KV engine counters onto the deployment's optional routing
@@ -1139,8 +1184,21 @@ async fn status<E: InvocationExecutor>(
     }
     let active = state.config.max_active_invocations - state.capacity.available_permits();
     let draining = state.draining.load(Ordering::Acquire);
+    let health = state.executor.runtime_health();
     let mut deployment = state.config.deployment.clone();
-    if draining {
+    // A poisoned runtime rejects every invocation, so it must never be
+    // advertised as ready: a permanent failure fails the whole process, and
+    // a drain-recoverable poison fails only the deployment's readiness.
+    let process_state = if health.is_failed() {
+        WorkerProcessState::Failed
+    } else if draining {
+        WorkerProcessState::Draining
+    } else {
+        WorkerProcessState::Running
+    };
+    if !health.is_healthy() {
+        deployment.readiness = ModelReadiness::Failed;
+    } else if draining {
         deployment.readiness = ModelReadiness::Draining;
     }
     // Optional routing signals: populated only while the executor embeds an
@@ -1160,11 +1218,7 @@ async fn status<E: InvocationExecutor>(
         node_id: state.config.descriptor.node_id.clone(),
         incarnation_id: state.config.descriptor.incarnation_id.clone(),
         status_sequence: state.status_sequence.fetch_add(1, Ordering::Relaxed) + 1,
-        process_state: if draining {
-            WorkerProcessState::Draining
-        } else {
-            WorkerProcessState::Running
-        },
+        process_state,
         deployments: vec![deployment],
         capacity: CapacitySnapshot {
             max_active_invocations: state.config.max_active_invocations as u32,
@@ -1205,6 +1259,63 @@ async fn metrics<E: InvocationExecutor>(
         .into_response()
 }
 
+/// The worker's JSON log line shape (`IZWI_LOG_FORMAT=json`), matching the
+/// server's: event fields at the top level plus the current span and the
+/// span list, so the W3C trace ids reach every line logged in a request.
+pub fn json_log_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_writer(writer)
+}
+
+/// Continue the caller's W3C trace. Every request runs in a span carrying
+/// the trace id, this worker's span id and the caller's span id, so the
+/// worker's logs join the gateway's under one trace id; a request without a
+/// valid `traceparent` starts a trace.
+async fn continue_trace(mut request: AxumRequest, next: Next) -> Response {
+    let incoming = request
+        .headers()
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let (trace, parent) = TraceContext::continue_from(incoming);
+    let span = tracing::info_span!(
+        "worker_request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        trace_id = %trace.trace_id(),
+        span_id = %trace.span_id(),
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some(parent) = parent {
+        span.record("parent_span_id", trace::hex(&parent));
+    }
+    // Status polls are frequent; only work-carrying requests log at info.
+    let work =
+        request.method() == axum::http::Method::POST || request.uri().path() == REALTIME_WS_PATH;
+    request.extensions_mut().insert(trace);
+    let started = Instant::now();
+    async move {
+        let response = next.run(request).await;
+        let status = response.status().as_u16();
+        let latency_ms = started.elapsed().as_millis() as u64;
+        if work {
+            tracing::info!(status, latency_ms, "worker request completed");
+        } else {
+            tracing::debug!(status, latency_ms, "worker request completed");
+        }
+        response
+    }
+    .instrument(span)
+    .await
+}
+
 async fn invoke<E: InvocationExecutor>(
     State(state): State<Arc<WorkerState<E>>>,
     headers: HeaderMap,
@@ -1243,6 +1354,18 @@ async fn invoke<E: InvocationExecutor>(
             StatusCode::BAD_REQUEST,
             RejectionCode::InvalidRequest,
             error.to_string(),
+            None,
+        );
+    }
+    // A control this worker did not advertise is refused, never ignored.
+    let InvocationInput::Chat { parameters, .. } = &request.input;
+    if let Some(parameter) = parameters.first_unsupported(&state.config.descriptor.features) {
+        return counted_rejection(
+            &state,
+            &request,
+            StatusCode::BAD_REQUEST,
+            RejectionCode::InvalidRequest,
+            format!("this worker does not support `{parameter}`"),
             None,
         );
     }
@@ -1442,50 +1565,49 @@ async fn invoke<E: InvocationExecutor>(
     let admission_request = request.clone();
     let slot_for_admission = Arc::clone(&admission_slot);
     let ready_for_admission = Arc::clone(&admission_ready);
-    tokio::spawn(async move {
-        let result = admission_state.executor.admit(&admission_request).await;
-        admission_state
-            .metrics
-            .record_queue_wait(received_at.elapsed());
-        if result.is_ok() {
+    tokio::spawn(
+        async move {
+            let result = admission_state.executor.admit(&admission_request).await;
             admission_state
                 .metrics
-                .inner
-                .admitted
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            admission_state
-                .metrics
-                .inner
-                .rejected
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let handoff = AdmissionHandoff {
-            result,
-            permit,
-            admission_guard,
-            execution_started_at: Instant::now(),
-        };
-        let abandoned_handoff = {
-            let mut slot = slot_for_admission
-                .lock()
-                .expect("worker admission slot poisoned");
-            if slot.abandoned {
-                Some(handoff)
+                .record_queue_wait(received_at.elapsed());
+            if result.is_ok() {
+                admission_state
+                    .metrics
+                    .inner
+                    .admitted
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
-                slot.handoff = Some(handoff);
-                None
+                admission_state
+                    .metrics
+                    .inner
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
             }
-        };
-        ready_for_admission.notify_one();
-        if let Some(handoff) = abandoned_handoff {
-            settle_abandoned_admission(admission_state, admission_request, handoff).await;
+            let handoff = AdmissionHandoff {
+                result,
+                permit,
+                admission_guard,
+                execution_started_at: Instant::now(),
+            };
+            let abandoned_handoff = {
+                let mut slot = lock_recover(&slot_for_admission);
+                if slot.abandoned {
+                    Some(handoff)
+                } else {
+                    slot.handoff = Some(handoff);
+                    None
+                }
+            };
+            ready_for_admission.notify_one();
+            if let Some(handoff) = abandoned_handoff {
+                settle_abandoned_admission(admission_state, admission_request, handoff).await;
+            }
         }
-    });
+        .in_current_span(),
+    );
     let handoff = match tokio::time::timeout(admission_budget, &mut admission_wait).await {
-        Ok(()) => admission_slot
-            .lock()
-            .expect("worker admission slot poisoned")
+        Ok(()) => lock_recover(&admission_slot)
             .handoff
             .take()
             .expect("admission notification carries ownership"),
@@ -1494,9 +1616,7 @@ async fn invoke<E: InvocationExecutor>(
             // admission already published ownership, it wins. Otherwise mark
             // the receiver abandoned before returning the uncertain response.
             let completed = {
-                let mut slot = admission_slot
-                    .lock()
-                    .expect("worker admission slot poisoned");
+                let mut slot = lock_recover(&admission_slot);
                 if let Some(handoff) = slot.handoff.take() {
                     Some(handoff)
                 } else {
@@ -1518,7 +1638,14 @@ async fn invoke<E: InvocationExecutor>(
                     .fetch_add(1, Ordering::Relaxed);
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
-                    "runtime admission outcome is unknown; query or cancel this attempt",
+                    Json(InvocationAdmissionUnknown {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request.request_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        message: "runtime admission outcome is unknown; query or cancel this \
+                                  attempt"
+                            .into(),
+                    }),
                 )
                     .into_response();
             }
@@ -1552,16 +1679,19 @@ async fn invoke<E: InvocationExecutor>(
     let (tx, mut rx) = mpsc::channel::<Bytes>(state.config.event_channel_capacity);
     let remaining_time =
         Duration::from_millis(request.remaining_time_ms).saturating_sub(received_at.elapsed());
-    tokio::spawn(run_invocation(
-        Arc::clone(&state),
-        request,
-        permit,
-        execution,
-        cancel_rx,
-        remaining_time,
-        execution_started_at,
-        tx,
-    ));
+    tokio::spawn(
+        run_invocation(
+            Arc::clone(&state),
+            request,
+            permit,
+            execution,
+            cancel_rx,
+            remaining_time,
+            execution_started_at,
+            tx,
+        )
+        .in_current_span(),
+    );
     drop(admission_guard);
     let output = stream! {
         while let Some(bytes) = rx.recv().await {
@@ -1615,6 +1745,8 @@ async fn run_invocation<E: InvocationExecutor>(
     let mut cancellation_requested = !accepted_delivered || *cancel.borrow();
     let mut cancellation_started_at = None;
     let mut terminal = None;
+    let mut outbox = TextOutbox::new(state.config.slow_consumer_timeout);
+    let mut consumer_stalled = false;
     if cancellation_requested {
         mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
         execution.request_cancel();
@@ -1622,7 +1754,10 @@ async fn run_invocation<E: InvocationExecutor>(
     }
 
     while terminal.is_none() && !cancellation_requested {
-        tokio::select! {
+        let stall_deadline = outbox.stall_deadline();
+        // Every arm yields the delivery result of any text it emitted; a
+        // failed delivery stops the invocation below.
+        let delivery = tokio::select! {
             biased;
             () = &mut deadline, if !timed_out => {
                 timed_out = true;
@@ -1634,6 +1769,7 @@ async fn run_invocation<E: InvocationExecutor>(
                     AttemptState::ExecutionStopping,
                     None,
                 );
+                EventSendResult::Sent
             }
             () = tx.closed(), if !cancellation_requested => {
                 cancellation_requested = true;
@@ -1644,6 +1780,7 @@ async fn run_invocation<E: InvocationExecutor>(
                     AttemptState::ExecutionStopping,
                     None,
                 );
+                EventSendResult::Sent
             }
             changed = cancel.changed(), if !cancellation_requested => {
                 if changed.is_ok() && *cancel.borrow() {
@@ -1656,6 +1793,19 @@ async fn run_invocation<E: InvocationExecutor>(
                         None,
                     );
                 }
+                EventSendResult::Sent
+            }
+            _ = async { tx.reserve().await.is_ok() }, if outbox.has_pending() => {
+                outbox.flush(&state, &request, &tx, &mut sequence)
+            }
+            () = async {
+                match stall_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if stall_deadline.is_some() => {
+                consumer_stalled = true;
+                EventSendResult::Unavailable
             }
             event = execution.next_event() => {
                 match event {
@@ -1678,42 +1828,9 @@ async fn run_invocation<E: InvocationExecutor>(
                             );
                             continue;
                         }
-                        let event = InvocationEvent {
-                            schema_version: PROTOCOL_V1,
-                            request_id: request.request_id.clone(),
-                            attempt_id: request.attempt_id.clone(),
-                            sequence,
-                            event: InvocationEventKind::TextDelta {
-                                text,
-                                logprobs: protocol_logprobs(&logprobs),
-                            },
-                        };
-                        match try_send_event(&state.config, &state.metrics, &tx, event) {
-                            EventSendResult::Sent => {
-                                state.update_attempt(
-                                    &request.attempt_id,
-                                    AttemptState::Running,
-                                    Some(sequence),
-                                );
-                                sequence = sequence.saturating_add(1);
-                            }
-                            EventSendResult::Oversized => {
-                                terminal = Some(TerminalEvent::Failed(ExecutionFailure {
-                                    code: InvocationErrorCode::OutputLimitExceeded,
-                                    message: "encoded output event exceeded the worker limit".into(),
-                                }));
-                                cancellation_requested = true;
-                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                execution.request_cancel();
-                            }
-                            EventSendResult::Unavailable => {
-                                cancellation_requested = true;
-                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                execution.request_cancel();
-                            }
-                        }
+                        outbox.offer(&state, &request, &tx, &mut sequence, text, logprobs)
                     }
-                    Some(ExecutionEvent::TextDelta { .. }) => {}
+                    Some(ExecutionEvent::TextDelta { .. }) => EventSendResult::Sent,
                     Some(ExecutionEvent::Completed {
                         text,
                         finish_reason,
@@ -1721,6 +1838,7 @@ async fn run_invocation<E: InvocationExecutor>(
                         output_tokens,
                         cached_input_tokens,
                     }) => {
+                        let mut delivery = EventSendResult::Sent;
                         if let Some(text) = text.filter(|text| !text.is_empty()) {
                             output_bytes = output_bytes.saturating_add(text.len());
                             if output_bytes as u64 > request.output_limits.max_bytes {
@@ -1732,60 +1850,51 @@ async fn run_invocation<E: InvocationExecutor>(
                                 execution.request_cancel();
                                 continue;
                             }
-                            let delta = InvocationEvent {
-                                schema_version: PROTOCOL_V1,
-                                request_id: request.request_id.clone(),
-                                attempt_id: request.attempt_id.clone(),
-                                sequence,
-                                event: InvocationEventKind::TextDelta {
-                                text,
-                                logprobs: None,
-                            },
-                            };
-                            match try_send_event(&state.config, &state.metrics, &tx, delta) {
-                                EventSendResult::Sent => {
-                                    state.update_attempt(
-                                        &request.attempt_id,
-                                        AttemptState::Running,
-                                        Some(sequence),
-                                    );
-                                    sequence = sequence.saturating_add(1);
-                                }
-                                EventSendResult::Oversized => {
-                                    terminal = Some(TerminalEvent::Failed(ExecutionFailure {
-                                        code: InvocationErrorCode::OutputLimitExceeded,
-                                        message: "encoded output event exceeded the worker limit".into(),
-                                    }));
-                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                    execution.request_cancel();
-                                    continue;
-                                }
-                                EventSendResult::Unavailable => {
-                                    cancellation_requested = true;
-                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                    execution.request_cancel();
-                                }
-                            }
+                            delivery =
+                                outbox.offer(&state, &request, &tx, &mut sequence, text, Vec::new());
                         }
                         state
                             .metrics
                             .inner
                             .tokens_out_ema
                             .record(output_tokens, execution_started_at.elapsed());
-                        terminal = Some(TerminalEvent::Completed {
-                            finish_reason,
-                            usage: Usage {
-                                input_tokens,
-                                output_tokens,
-                                cached_tokens: cached_input_tokens,
-                            },
-                        });
+                        if delivery == EventSendResult::Sent {
+                            terminal = Some(TerminalEvent::Completed {
+                                finish_reason,
+                                usage: Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens: cached_input_tokens,
+                                },
+                            });
+                        }
+                        delivery
                     }
                     Some(ExecutionEvent::Failed(failure)) => {
                         terminal = Some(TerminalEvent::Failed(failure));
+                        EventSendResult::Sent
                     }
                     None => break,
                 }
+            }
+        };
+        match delivery {
+            EventSendResult::Sent => {}
+            EventSendResult::Oversized => {
+                terminal = Some(TerminalEvent::Failed(ExecutionFailure {
+                    code: InvocationErrorCode::OutputLimitExceeded,
+                    message: "encoded output event exceeded the worker limit".into(),
+                }));
+                cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
+                execution.request_cancel();
+            }
+            // The reader is gone, stalled past the slow-consumer timeout, or
+            // owes more text than one event can carry.
+            EventSendResult::Unavailable => {
+                cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
+                execution.request_cancel();
             }
         }
     }
@@ -1836,7 +1945,22 @@ async fn run_invocation<E: InvocationExecutor>(
             })
         })
     };
-    publish_terminal(&state, &request, &tx, sequence, terminal);
+    // A reader that already stalled past its budget gets no further wait.
+    let publish_deadline = if consumer_stalled {
+        Instant::now()
+    } else {
+        outbox.publish_deadline()
+    };
+    publish_terminal(
+        &state,
+        &request,
+        &tx,
+        &mut outbox,
+        sequence,
+        terminal,
+        publish_deadline,
+    )
+    .await;
 }
 
 async fn settle_abandoned_admission<E: InvocationExecutor>(
@@ -1936,6 +2060,149 @@ fn protocol_logprobs(
     )
 }
 
+/// Text deltas on their way to the NDJSON reader. While the reader lags (the
+/// bounded event channel is full), deltas and their logprobs merge, in
+/// order, into one pending delta that is flushed as a single event when the
+/// reader frees a slot. A slow reader therefore costs bytes, not queued
+/// events, and only a reader stalled past the slow-consumer timeout, or one
+/// owing more text than one event can carry, stops the invocation.
+struct TextOutbox {
+    pending: Option<PendingDelta>,
+    slow_consumer_timeout: Duration,
+}
+
+struct PendingDelta {
+    text: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    /// Upper bound on the encoded size of the merged delta.
+    encoded_bytes: usize,
+    since: Instant,
+}
+
+impl TextOutbox {
+    fn new(slow_consumer_timeout: Duration) -> Self {
+        Self {
+            pending: None,
+            slow_consumer_timeout,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// When a reader that has not accepted the pending delta is stalled.
+    fn stall_deadline(&self) -> Option<Instant> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.since + self.slow_consumer_timeout)
+    }
+
+    /// How long the terminal event may wait for the reader.
+    fn publish_deadline(&self) -> Instant {
+        self.stall_deadline()
+            .unwrap_or_else(|| Instant::now() + self.slow_consumer_timeout)
+    }
+
+    /// Send a delta now, or merge it into the pending delta while the reader
+    /// lags. `run_invocation` is the channel's only sender, so free capacity
+    /// observed here is still free when the event is sent.
+    fn offer<E>(
+        &mut self,
+        state: &WorkerState<E>,
+        request: &InvocationRequest,
+        tx: &mpsc::Sender<Bytes>,
+        sequence: &mut u64,
+        text: String,
+        logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    ) -> EventSendResult {
+        if self.pending.is_none() && tx.capacity() > 0 {
+            return send_text_delta(state, request, tx, sequence, text, logprobs);
+        }
+        if tx.is_closed() {
+            return EventSendResult::Unavailable;
+        }
+        let encoded_bytes = encoded_delta_bytes(&text, &logprobs);
+        let pending = self.pending.get_or_insert_with(|| PendingDelta {
+            text: String::new(),
+            logprobs: Vec::new(),
+            encoded_bytes: 0,
+            since: Instant::now(),
+        });
+        pending.text.push_str(&text);
+        pending.logprobs.extend(logprobs);
+        pending.encoded_bytes = pending.encoded_bytes.saturating_add(encoded_bytes);
+        if pending
+            .encoded_bytes
+            .saturating_add(EVENT_ENVELOPE_ALLOWANCE)
+            > state.config.max_event_bytes
+        {
+            state
+                .metrics
+                .inner
+                .event_delivery_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return EventSendResult::Unavailable;
+        }
+        EventSendResult::Sent
+    }
+
+    /// Send the pending delta if the reader has room; otherwise keep it.
+    fn flush<E>(
+        &mut self,
+        state: &WorkerState<E>,
+        request: &InvocationRequest,
+        tx: &mpsc::Sender<Bytes>,
+        sequence: &mut u64,
+    ) -> EventSendResult {
+        if tx.capacity() == 0 {
+            return EventSendResult::Unavailable;
+        }
+        match self.pending.take() {
+            Some(pending) => {
+                send_text_delta(state, request, tx, sequence, pending.text, pending.logprobs)
+            }
+            None => EventSendResult::Sent,
+        }
+    }
+}
+
+/// Encoded size of one delta's payload, an upper bound on what it adds to a
+/// merged delta.
+fn encoded_delta_bytes(text: &str, logprobs: &[izwi_core::engine::TokenLogprob]) -> usize {
+    serde_json::to_vec(&InvocationEventKind::TextDelta {
+        text: text.to_owned(),
+        logprobs: protocol_logprobs(logprobs),
+    })
+    .map_or(usize::MAX, |encoded| encoded.len())
+}
+
+fn send_text_delta<E>(
+    state: &WorkerState<E>,
+    request: &InvocationRequest,
+    tx: &mpsc::Sender<Bytes>,
+    sequence: &mut u64,
+    text: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+) -> EventSendResult {
+    let event = InvocationEvent {
+        schema_version: PROTOCOL_V1,
+        request_id: request.request_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        sequence: *sequence,
+        event: InvocationEventKind::TextDelta {
+            text,
+            logprobs: protocol_logprobs(&logprobs),
+        },
+    };
+    let result = try_send_event(&state.config, &state.metrics, tx, event);
+    if result == EventSendResult::Sent {
+        state.update_attempt(&request.attempt_id, AttemptState::Running, Some(*sequence));
+        *sequence = sequence.saturating_add(1);
+    }
+    result
+}
+
 enum TerminalEvent {
     Completed {
         finish_reason: FinishReason,
@@ -1945,13 +2212,22 @@ enum TerminalEvent {
     Failed(ExecutionFailure),
 }
 
-fn publish_terminal<E>(
+/// Publish the terminal event after any pending text, waiting for the
+/// reader until `deadline`. A terminal event is never dropped just because
+/// the channel is momentarily full, and never overtakes text.
+async fn publish_terminal<E>(
     state: &WorkerState<E>,
     request: &InvocationRequest,
     tx: &mpsc::Sender<Bytes>,
-    sequence: u64,
+    outbox: &mut TextOutbox,
+    mut sequence: u64,
     terminal: TerminalEvent,
+    deadline: Instant,
 ) {
+    if outbox.has_pending() {
+        let _ = tokio::time::timeout_at(deadline, tx.reserve()).await;
+        let _ = outbox.flush(state, request, tx, &mut sequence);
+    }
     let (attempt_state, event) = match terminal {
         TerminalEvent::Completed {
             finish_reason,
@@ -2001,10 +2277,12 @@ fn publish_terminal<E>(
         sequence,
         event,
     };
-    let published = matches!(
-        try_send_event(&state.config, &state.metrics, tx, event),
-        EventSendResult::Sent
-    );
+    let _ = tokio::time::timeout_at(deadline, tx.reserve()).await;
+    let published = !outbox.has_pending()
+        && matches!(
+            try_send_event(&state.config, &state.metrics, tx, event),
+            EventSendResult::Sent
+        );
     state.update_attempt(
         &request.attempt_id,
         attempt_state,
@@ -2068,10 +2346,7 @@ async fn query_attempt<E: InvocationExecutor>(
     let Ok(attempt_id) = AttemptId::new(raw_attempt_id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let mut table = state
-        .attempts
-        .lock()
-        .expect("worker attempt table poisoned");
+    let mut table = lock_recover(&state.attempts);
     let Some(record) = table.records.get(&attempt_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2124,10 +2399,7 @@ async fn cancel_attempt<E: InvocationExecutor>(
         return StatusCode::CONFLICT.into_response();
     }
     let (disposition, cancel) = {
-        let mut table = state
-            .attempts
-            .lock()
-            .expect("worker attempt table poisoned");
+        let mut table = lock_recover(&state.attempts);
         let expired = table
             .records
             .get(&request.identity.attempt_id)
@@ -2214,7 +2486,7 @@ fn rejection(
     let mut rejection = InvocationRejection::new(
         request.request_id.clone(),
         request.attempt_id.clone(),
-        code,
+        code.for_peer(request.schema_version),
         bounded_message(message.into()),
     );
     rejection.retry_after_ms = retry_after_ms;
@@ -2237,7 +2509,11 @@ fn rejection_status(code: RejectionCode) -> StatusCode {
         RejectionCode::CapacityExhausted | RejectionCode::QueueWaitExceeded => {
             StatusCode::TOO_MANY_REQUESTS
         }
-        RejectionCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        RejectionCode::InvalidRequest | RejectionCode::ContextLengthExceeded => {
+            StatusCode::BAD_REQUEST
+        }
+        // A worker never sends a code it does not know.
+        RejectionCode::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -2336,6 +2612,7 @@ mod tests {
             attempt_retention: Duration::from_secs(300),
             event_channel_capacity: 4,
             max_event_bytes: 4096,
+            slow_consumer_timeout: DEFAULT_SLOW_CONSUMER_TIMEOUT,
             realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
         }
     }
@@ -2486,6 +2763,220 @@ mod tests {
         assert_eq!(service.active_invocations(), 0);
     }
 
+    /// DP-F11: a gateway from before minor 4 sends no version header and
+    /// cannot decode minor-4 features, so the worker leaves them out for it.
+    #[tokio::test]
+    async fn descriptor_leaves_out_features_the_gateway_cannot_decode() {
+        let mut config = config();
+        config.descriptor.features.insert(WorkerFeature::ChatSeed);
+        let service = WorkerService::new(
+            config,
+            HealthExecutor {
+                health: Arc::new(Mutex::new(RuntimeHealth::Healthy)),
+            },
+        )
+        .unwrap();
+        let descriptor = |version: Option<&str>| {
+            let mut request = authorized_request("GET", WORKER_DESCRIPTOR_PATH, Body::empty());
+            if let Some(version) = version {
+                request
+                    .headers_mut()
+                    .insert(PROTOCOL_VERSION_HEADER, version.parse().unwrap());
+            }
+            let router = service.router();
+            async move {
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        for (version, advertised) in [
+            (None, false),
+            (Some("1.3"), false),
+            (Some("not-a-version"), false),
+            (Some("1.4"), true),
+            (Some("1.9"), true),
+        ] {
+            let features = descriptor(version).await["features"].clone();
+            assert_eq!(
+                features
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("chat_seed")),
+                advertised,
+                "{version:?}: {features}"
+            );
+            assert!(features
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("streaming")));
+        }
+    }
+
+    struct OverflowExecutor;
+
+    #[async_trait]
+    impl InvocationExecutor for OverflowExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Err(AdmissionFailure::new(
+                RejectionCode::ContextLengthExceeded,
+                "This model's maximum context length is 32 tokens.",
+            ))
+        }
+    }
+
+    async fn rejection_for(
+        service: &WorkerService<OverflowExecutor>,
+        request: &InvocationRequest,
+    ) -> (StatusCode, InvocationRejection) {
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(request).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A control the worker does not advertise is refused, never ignored;
+    /// a rejection code a gateway cannot decode becomes the older one.
+    #[tokio::test]
+    async fn invocations_honour_advertised_controls_and_the_gateway_minor() {
+        let service = WorkerService::new(config(), OverflowExecutor).unwrap();
+        let mut seeded = invocation();
+        let InvocationInput::Chat { parameters, .. } = &mut seeded.input;
+        parameters.seed = Some(7);
+        let (status, rejection) = rejection_for(&service, &seeded).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::InvalidRequest);
+        assert!(
+            rejection.message.contains("`seed`"),
+            "{}",
+            rejection.message
+        );
+
+        let (status, rejection) = rejection_for(&service, &invocation()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::ContextLengthExceeded);
+        let mut minor3 = invocation();
+        minor3.schema_version = SchemaVersion::new(1, 3);
+        let (status, rejection) = rejection_for(&service, &minor3).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::InvalidRequest);
+        assert_eq!(
+            rejection.message,
+            "This model's maximum context length is 32 tokens."
+        );
+    }
+
+    struct HealthExecutor {
+        health: Arc<Mutex<RuntimeHealth>>,
+    }
+
+    #[async_trait]
+    impl InvocationExecutor for HealthExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Err(AdmissionFailure::new(
+                RejectionCode::CapacityExhausted,
+                "health-only executor",
+            ))
+        }
+
+        fn runtime_health(&self) -> RuntimeHealth {
+            self.health.lock().unwrap().clone()
+        }
+    }
+
+    async fn worker_status<E: InvocationExecutor>(service: &WorkerService<E>) -> WorkerStatus {
+        let response = service
+            .router()
+            .oneshot(authorized_request("GET", WORKER_STATUS_PATH, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_reports_runtime_health_instead_of_static_readiness() {
+        let health = Arc::new(Mutex::new(RuntimeHealth::Healthy));
+        let service = WorkerService::new(
+            config(),
+            HealthExecutor {
+                health: Arc::clone(&health),
+            },
+        )
+        .unwrap();
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Ready);
+
+        *health.lock().unwrap() = RuntimeHealth::Degraded {
+            reason: "Metal command buffer OOM".into(),
+        };
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+
+        *health.lock().unwrap() = RuntimeHealth::Failed {
+            reason: "fatal device fault".into(),
+        };
+        service.begin_draining().await;
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Failed);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+    }
+
+    #[tokio::test]
+    async fn status_fails_after_the_real_runtime_latches_a_device_fault() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(
+            izwi_core::RuntimeService::new_assigned(
+                izwi_core::EngineConfig {
+                    models_dir: models_dir.path().to_path_buf(),
+                    ..izwi_core::EngineConfig::default()
+                },
+                izwi_core::backends::RuntimeDeviceAssignment::Cpu,
+            )
+            .unwrap(),
+        );
+        let service = WorkerService::new(
+            config(),
+            RuntimeChatExecutor::new(
+                Arc::clone(&runtime),
+                izwi_core::ModelVariant::Lfm2512BInstructGguf,
+                true,
+            ),
+        )
+        .unwrap();
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Ready);
+        assert!(service.runtime_health().is_healthy());
+
+        assert!(runtime.latch_device_fault_for_test(&izwi_core::Error::InferenceError(
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"
+                .into(),
+        )));
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Failed);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+        assert!(service.runtime_health().is_failed());
+    }
+
     #[tokio::test]
     async fn worker_metrics_are_authenticated_bounded_and_fixed_cardinality() {
         let executor = ScriptExecutor {
@@ -2568,12 +3059,23 @@ mod tests {
             .all(|line| !line.contains('{')));
     }
 
+    fn ndjson_events(body: &[u8]) -> Vec<InvocationEvent> {
+        body.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<InvocationEvent>(line).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn bounded_output_backpressure_requests_cancel_without_holding_more_events() {
+    async fn paused_reader_receives_the_full_text_once_it_resumes() {
         let cancel_calls = Arc::new(AtomicUsize::new(0));
-        let mut events = (0..8)
-            .map(|index| ExecutionEvent::TextDelta {
-                text: format!("delta-{index}"),
+        let words = (0..64)
+            .map(|index| format!("w{index} "))
+            .collect::<Vec<_>>();
+        let mut events = words
+            .iter()
+            .map(|word| ExecutionEvent::TextDelta {
+                text: word.clone(),
                 logprobs: Vec::new(),
             })
             .collect::<VecDeque<_>>();
@@ -2581,7 +3083,7 @@ mod tests {
             text: None,
             finish_reason: FinishReason::Stop,
             input_tokens: 1,
-            output_tokens: 8,
+            output_tokens: 64,
             cached_input_tokens: None,
         });
         let executor = ScriptExecutor {
@@ -2601,16 +3103,114 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // The reader stays paused while the execution emits far more deltas
+        // than the three-slot channel holds and completes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cancel_calls.load(Ordering::Acquire), 0);
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let events = ndjson_events(&body);
+        let text = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                InvocationEventKind::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, words.concat());
+        assert!(events.len() < words.len() + 2, "deltas were coalesced");
+        assert!(matches!(
+            events.last().unwrap().event,
+            InvocationEventKind::Completed { .. }
+        ));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(service.active_invocations(), 0);
+    }
+
+    struct StallingExecutor {
+        deltas: usize,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InvocationExecutor for StallingExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Ok(AdmittedInvocation::new(Box::new(StallingExecution {
+                remaining: self.deltas,
+                cancel_calls: Arc::clone(&self.cancel_calls),
+            })))
+        }
+    }
+
+    /// Emits its deltas, then keeps generating (never finishes on its own).
+    struct StallingExecution {
+        remaining: usize,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AdmittedExecution for StallingExecution {
+        async fn next_event(&mut self) -> Option<ExecutionEvent> {
+            if self.remaining == 0 {
+                return std::future::pending().await;
+            }
+            self.remaining -= 1;
+            Some(ExecutionEvent::TextDelta {
+                text: "x".into(),
+                logprobs: Vec::new(),
+            })
+        }
+
+        fn request_cancel(&self) {
+            self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn wait_for_teardown(self: Box<Self>) -> ExecutionTeardown {
+            ExecutionTeardown::Cancelled
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_paused_past_the_slow_consumer_timeout_cancels_the_invocation() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let mut worker_config = config();
+        worker_config.event_channel_capacity = 3;
+        worker_config.slow_consumer_timeout = Duration::from_millis(50);
+        let service = WorkerService::new(
+            worker_config,
+            StallingExecutor {
+                deltas: 8,
+                cancel_calls: Arc::clone(&cancel_calls),
+            },
+        )
+        .unwrap();
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(&invocation()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
             while cancel_calls.load(Ordering::Acquire) == 0 || service.active_invocations() != 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("a reader stalled past the timeout cancels the invocation");
         assert_eq!(cancel_calls.load(Ordering::Acquire), 1);
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
-        assert!(body.len() <= 3 * config().max_event_bytes);
+        assert!(ndjson_events(&body)
+            .iter()
+            .all(|event| !matches!(event.event, InvocationEventKind::Completed { .. })));
     }
 
     #[tokio::test]
@@ -2709,6 +3309,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         assert!(serde_json::from_slice::<InvocationRejection>(&body).is_err());
+        let unknown: InvocationAdmissionUnknown = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unknown.attempt_id, request.attempt_id);
         assert!(!completed.load(Ordering::Acquire));
         assert_eq!(service.active_invocations(), 1);
 
@@ -2895,6 +3497,37 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("izwi_worker_body_limit_rejections_total 1\n"));
         assert!(body.contains("izwi_worker_rejected_total 1\n"));
+    }
+
+    /// HYG-R4: a panic while the attempt table was held must not take the
+    /// worker down with it; later requests recover the lock.
+    #[tokio::test]
+    async fn a_poisoned_attempt_table_keeps_serving() {
+        let executor = ScriptExecutor {
+            events: Mutex::new(Some(VecDeque::new())),
+            teardown: ExecutionTeardown::Completed,
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let service = WorkerService::new(config(), executor).unwrap();
+        let state = Arc::clone(&service.state);
+        let poisoner = std::thread::spawn(move || {
+            let _table = state.attempts.lock().unwrap();
+            panic!("poison the attempt table");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(service.state.attempts.is_poisoned());
+
+        assert_eq!(service.request_cancel_all(), 0);
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(&invocation()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

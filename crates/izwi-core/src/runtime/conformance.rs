@@ -4,49 +4,18 @@
 //! and future fake adapters a stable checklist before execution behavior is
 //! moved behind new broker, adapter, or pipeline boundaries.
 
+use super::adapters::CapabilityKind;
+#[cfg(test)]
+use super::adapters::{capability_row, RuntimeAdapterRegistry};
+#[cfg(test)]
+use crate::backends::BackendKind;
+#[cfg(test)]
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
-use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
-
+#[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 45;
+#[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ConformanceCapability {
-    Tts,
-    StreamingTts,
-    Asr,
-    SpeakerAttributedAsr,
-    RealtimeAsr,
-    Chat,
-    AudioChat,
-    SpeechToSpeech,
-    Diarization,
-    ForcedAlignment,
-    Vad,
-    Endpointing,
-    Tokenizer,
-}
-
-impl ConformanceCapability {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tts => "tts",
-            Self::StreamingTts => "streaming_tts",
-            Self::Asr => "asr",
-            Self::SpeakerAttributedAsr => "speaker_attributed_asr",
-            Self::RealtimeAsr => "realtime_asr",
-            Self::Chat => "chat",
-            Self::AudioChat => "audio_chat",
-            Self::SpeechToSpeech => "speech_to_speech",
-            Self::Diarization => "diarization",
-            Self::ForcedAlignment => "forced_alignment",
-            Self::Vad => "vad",
-            Self::Endpointing => "endpointing",
-            Self::Tokenizer => "tokenizer",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -61,7 +30,7 @@ pub enum ConformanceExecutionClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityConformanceCase {
     pub id: &'static str,
-    pub capability: ConformanceCapability,
+    pub capability: CapabilityKind,
     pub execution_class: ConformanceExecutionClass,
     pub fixture: &'static str,
 }
@@ -69,7 +38,7 @@ pub struct CapabilityConformanceCase {
 impl CapabilityConformanceCase {
     pub const fn new(
         id: &'static str,
-        capability: ConformanceCapability,
+        capability: CapabilityKind,
         execution_class: ConformanceExecutionClass,
         fixture: &'static str,
     ) -> Self {
@@ -82,98 +51,98 @@ impl CapabilityConformanceCase {
     }
 }
 
-pub const REQUIRED_CONFORMANCE_CAPABILITIES: &[ConformanceCapability] = &[
-    ConformanceCapability::Tts,
-    ConformanceCapability::StreamingTts,
-    ConformanceCapability::Asr,
-    ConformanceCapability::SpeakerAttributedAsr,
-    ConformanceCapability::RealtimeAsr,
-    ConformanceCapability::Chat,
-    ConformanceCapability::AudioChat,
-    ConformanceCapability::SpeechToSpeech,
-    ConformanceCapability::Diarization,
-    ConformanceCapability::ForcedAlignment,
-    ConformanceCapability::Vad,
-    ConformanceCapability::Endpointing,
-    ConformanceCapability::Tokenizer,
+pub const REQUIRED_CONFORMANCE_CAPABILITIES: &[CapabilityKind] = &[
+    CapabilityKind::Tts,
+    CapabilityKind::StreamingTts,
+    CapabilityKind::Asr,
+    CapabilityKind::SpeakerAttributedAsr,
+    CapabilityKind::RealtimeAsr,
+    CapabilityKind::Chat,
+    CapabilityKind::AudioChat,
+    CapabilityKind::SpeechToSpeech,
+    CapabilityKind::Diarization,
+    CapabilityKind::ForcedAlignment,
+    CapabilityKind::Vad,
+    CapabilityKind::Endpointing,
+    CapabilityKind::Tokenizer,
 ];
 
 pub const CAPABILITY_CONFORMANCE_CASES: &[CapabilityConformanceCase] = &[
     CapabilityConformanceCase::new(
         "tts.short_text.binary",
-        ConformanceCapability::Tts,
+        CapabilityKind::Tts,
         ConformanceExecutionClass::Scheduled,
         "short text with explicit model, voice option, and binary response format",
     ),
     CapabilityConformanceCase::new(
         "streaming_tts.short_text",
-        ConformanceCapability::StreamingTts,
+        CapabilityKind::StreamingTts,
         ConformanceExecutionClass::Streaming,
         "short text with first audio chunk, multiple chunks, and terminal event",
     ),
     CapabilityConformanceCase::new(
         "asr.short_wav.transcript",
-        ConformanceCapability::Asr,
+        CapabilityKind::Asr,
         ConformanceExecutionClass::Batch,
         "short wav input with transcript text, language hint, and format mapping",
     ),
     CapabilityConformanceCase::new(
         "speaker_attributed_asr.short_multispeaker",
-        ConformanceCapability::SpeakerAttributedAsr,
+        CapabilityKind::SpeakerAttributedAsr,
         ConformanceExecutionClass::Pipeline,
         "short multi-speaker audio producing attributed transcript turns",
     ),
     CapabilityConformanceCase::new(
         "realtime_asr.partial_final",
-        ConformanceCapability::RealtimeAsr,
+        CapabilityKind::RealtimeAsr,
         ConformanceExecutionClass::Realtime,
         "pcm frames with partial update, final update, cancellation, and close",
     ),
     CapabilityConformanceCase::new(
         "chat.single_prompt.streaming",
-        ConformanceCapability::Chat,
+        CapabilityKind::Chat,
         ConformanceExecutionClass::Scheduled,
         "single user prompt with non-streaming and streaming delta responses",
     ),
     CapabilityConformanceCase::new(
         "audio_chat.audio_prompt.response",
-        ConformanceCapability::AudioChat,
+        CapabilityKind::AudioChat,
         ConformanceExecutionClass::Scheduled,
         "audio bytes plus optional text prompt returning text and/or audio output",
     ),
     CapabilityConformanceCase::new(
         "speech_to_speech.audio_stream",
-        ConformanceCapability::SpeechToSpeech,
+        CapabilityKind::SpeechToSpeech,
         ConformanceExecutionClass::Streaming,
         "audio request to streaming audio response with cancellation",
     ),
     CapabilityConformanceCase::new(
         "diarization.short_multispeaker",
-        ConformanceCapability::Diarization,
+        CapabilityKind::Diarization,
         ConformanceExecutionClass::Pipeline,
         "short multi-speaker fixture with speaker labels and ASR attribution",
     ),
     CapabilityConformanceCase::new(
         "forced_alignment.words",
-        ConformanceCapability::ForcedAlignment,
+        CapabilityKind::ForcedAlignment,
         ConformanceExecutionClass::Batch,
         "transcript plus audio fixture producing ordered word timestamps",
     ),
     CapabilityConformanceCase::new(
         "voice.vad.speech_events",
-        ConformanceCapability::Vad,
+        CapabilityKind::Vad,
         ConformanceExecutionClass::Realtime,
         "pcm frames producing speech start and speech end events",
     ),
     CapabilityConformanceCase::new(
         "voice.endpointing.turn_boundary",
-        ConformanceCapability::Endpointing,
+        CapabilityKind::Endpointing,
         ConformanceExecutionClass::Realtime,
         "speech activity stream producing stable turn boundary decisions",
     ),
     CapabilityConformanceCase::new(
         "tokenizer.model_artifact.round_trip",
-        ConformanceCapability::Tokenizer,
+        CapabilityKind::Tokenizer,
         ConformanceExecutionClass::Artifact,
         "tokenizer artifact load with deterministic encode/decode smoke check",
     ),
@@ -183,25 +152,24 @@ pub fn capability_conformance_cases() -> &'static [CapabilityConformanceCase] {
     CAPABILITY_CONFORMANCE_CASES
 }
 
-pub fn required_conformance_capabilities() -> &'static [ConformanceCapability] {
+pub fn required_conformance_capabilities() -> &'static [CapabilityKind] {
     REQUIRED_CONFORMANCE_CAPABILITIES
 }
 
-/// Target retained-state ownership recorded before the physical-state
-/// migration starts. This is descriptive scaffolding only; it does not select
-/// an execution path.
-#[allow(dead_code)]
+/// Retained-state ownership of a binding: managed when its capability table
+/// row requires retained state, which load-time state publication enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum RetainedStateExpectation {
     Managed,
     Stateless,
 }
 
-/// Invocation workspace requirement recorded independently from retained
-/// state. Every capability must eventually publish a workspace contract, while
-/// atomic capabilities with internal iterative state require a non-empty one.
-#[allow(dead_code)]
+/// Invocation workspace requirement, independent of retained state: required
+/// when the binding's row requires invocation state, which load-time state
+/// publication enforces as a non-empty workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum WorkspaceExpectation {
     DeclaredMayBeEmpty,
     InvocationStateRequired,
@@ -210,8 +178,8 @@ pub(crate) enum WorkspaceExpectation {
 /// Frozen product expectation for an exact model/capability/backend cell.
 /// `RequiredWhenCompiled` still permits normal runtime hardware admission to
 /// reject an unavailable or unsupported physical device.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum BackendConformanceExpectation {
     RequiredWhenCompiled,
     Unsupported,
@@ -219,8 +187,8 @@ pub(crate) enum BackendConformanceExpectation {
     NotApplicable,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct BackendConformanceExpectations {
     pub(crate) cpu: BackendConformanceExpectation,
     pub(crate) metal: BackendConformanceExpectation,
@@ -230,11 +198,11 @@ pub(crate) struct BackendConformanceExpectations {
 /// One entry per runtime-registry model/capability binding. The binding set is
 /// derived from `ModelVariant::all()` and the built-in adapter registry so a
 /// catalog addition cannot silently escape conformance coverage.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CatalogStateConformanceCase {
     pub(crate) variant: ModelVariant,
-    pub(crate) capability: ConformanceCapability,
+    pub(crate) capability: CapabilityKind,
     pub(crate) catalog_enabled: bool,
     pub(crate) retained_state: RetainedStateExpectation,
     pub(crate) workspace: WorkspaceExpectation,
@@ -242,25 +210,35 @@ pub(crate) struct CatalogStateConformanceCase {
     pub(crate) fixture_id: &'static str,
 }
 
-/// Build the Phase-0 catalog/state/backend manifest without affecting model
-/// loading, routing, or execution.
-#[allow(dead_code)]
+/// Build the catalog/state/backend manifest from the capability table without
+/// affecting model loading, routing, or execution.
+#[cfg(test)]
 pub(crate) fn catalog_state_conformance_manifest() -> Vec<CatalogStateConformanceCase> {
     let registry = RuntimeAdapterRegistry::built_in();
     let mut manifest = Vec::with_capacity(EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT);
 
     for variant in ModelVariant::all().iter().copied() {
         for metadata in registry.capabilities_for(variant) {
-            let capability = conformance_capability(metadata.capability);
-            let retained_state = retained_state_expectation(variant, capability);
+            let capability = metadata.capability;
+            let row = capability_row(capability, variant)
+                .expect("registry bindings come from the capability table");
+            let state = row.state_requirement;
 
             manifest.push(CatalogStateConformanceCase {
                 variant,
                 capability,
                 catalog_enabled: variant.is_enabled(),
-                retained_state,
-                workspace: workspace_expectation(variant, capability),
-                backends: backend_expectations(variant),
+                retained_state: if state.requires_retained() {
+                    RetainedStateExpectation::Managed
+                } else {
+                    RetainedStateExpectation::Stateless
+                },
+                workspace: if state.requires_invocation() {
+                    WorkspaceExpectation::InvocationStateRequired
+                } else {
+                    WorkspaceExpectation::DeclaredMayBeEmpty
+                },
+                backends: backend_expectations(variant, row.backends),
                 fixture_id: fixture_id_for(capability),
             });
         }
@@ -269,66 +247,8 @@ pub(crate) fn catalog_state_conformance_manifest() -> Vec<CatalogStateConformanc
     manifest
 }
 
-fn workspace_expectation(
-    variant: ModelVariant,
-    capability: ConformanceCapability,
-) -> WorkspaceExpectation {
-    use ConformanceCapability as Capability;
-    use WorkspaceExpectation::{DeclaredMayBeEmpty, InvocationStateRequired};
-
-    match (variant.family(), capability) {
-        // The tokenizer is an artifact operation, not a tensor execution
-        // capability. It must still publish a workspace contract, but an empty
-        // resolved contract is valid.
-        (ModelFamily::Tokenizer, Capability::Tokenizer)
-        | (ModelFamily::Qwen3ForcedAligner, Capability::ForcedAlignment)
-        | (ModelFamily::KokoroTts, Capability::Tts | Capability::StreamingTts) => {
-            DeclaredMayBeEmpty
-        }
-
-        // Qwen TTS has a frame-local code-predictor cache in addition to its
-        // retained talker state. Nemotron realtime has chunk-local staging in
-        // addition to its retained streaming state. These entries keep the
-        // retained-state and invocation-workspace axes independent.
-        (ModelFamily::Qwen3Tts, Capability::Tts | Capability::StreamingTts)
-        | (ModelFamily::NemotronAsr, Capability::RealtimeAsr)
-        | (ModelFamily::Voxtral, Capability::RealtimeAsr) => InvocationStateRequired,
-
-        // Current atomic model implementations keep their cache-like numeric
-        // state within one invocation. Their final stateless declaration is
-        // therefore paired with an explicit physical workspace contract.
-        (_, _)
-            if retained_state_expectation(variant, capability)
-                == RetainedStateExpectation::Stateless =>
-        {
-            InvocationStateRequired
-        }
-
-        // Other managed capabilities may still resolve ordinary kernel
-        // scratch, but do not require a cache-like invocation-state domain.
-        _ => DeclaredMayBeEmpty,
-    }
-}
-
-fn conformance_capability(capability: CapabilityKind) -> ConformanceCapability {
-    match capability {
-        CapabilityKind::Asr => ConformanceCapability::Asr,
-        CapabilityKind::SpeakerAttributedAsr => ConformanceCapability::SpeakerAttributedAsr,
-        CapabilityKind::RealtimeAsr => ConformanceCapability::RealtimeAsr,
-        CapabilityKind::Tts => ConformanceCapability::Tts,
-        CapabilityKind::StreamingTts => ConformanceCapability::StreamingTts,
-        CapabilityKind::Chat => ConformanceCapability::Chat,
-        CapabilityKind::AudioChat => ConformanceCapability::AudioChat,
-        CapabilityKind::SpeechToSpeech => ConformanceCapability::SpeechToSpeech,
-        CapabilityKind::Diarization => ConformanceCapability::Diarization,
-        CapabilityKind::ForcedAlignment => ConformanceCapability::ForcedAlignment,
-        CapabilityKind::Vad => ConformanceCapability::Vad,
-        CapabilityKind::Endpointing => ConformanceCapability::Endpointing,
-        CapabilityKind::Tokenizer => ConformanceCapability::Tokenizer,
-    }
-}
-
-fn fixture_id_for(capability: ConformanceCapability) -> &'static str {
+#[cfg(test)]
+fn fixture_id_for(capability: CapabilityKind) -> &'static str {
     capability_conformance_cases()
         .iter()
         .find(|case| case.capability == capability)
@@ -341,100 +261,11 @@ fn fixture_id_for(capability: ConformanceCapability) -> &'static str {
         })
 }
 
-fn retained_state_expectation(
+#[cfg(test)]
+fn backend_expectations(
     variant: ModelVariant,
-    capability: ConformanceCapability,
-) -> RetainedStateExpectation {
-    use ConformanceCapability as Capability;
-    use RetainedStateExpectation::{Managed, Stateless};
-
-    match variant.family() {
-        ModelFamily::Qwen3Tts => match capability {
-            Capability::Tts | Capability::StreamingTts => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::Qwen3Asr => match capability {
-            Capability::Asr => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::Qwen3MoeChat
-        | ModelFamily::Qwen3Chat
-        | ModelFamily::Qwen35Chat
-        | ModelFamily::Qwen35MoeChat
-        | ModelFamily::Qwen38Chat
-        | ModelFamily::Lfm2Chat
-        | ModelFamily::Gemma3Chat => match capability {
-            Capability::Chat => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::NemotronAsr => match capability {
-            Capability::RealtimeAsr => Managed,
-            Capability::Asr => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::KokoroTts => match capability {
-            Capability::Tts | Capability::StreamingTts => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::VibeVoiceTts => match capability {
-            Capability::Tts => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::FishS2Tts => match capability {
-            Capability::Tts | Capability::StreamingTts => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::VoxtralTts => match capability {
-            Capability::Tts => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr => {
-            match capability {
-                Capability::Asr => Stateless,
-                _ => unexpected_capability(variant, capability),
-            }
-        }
-        ModelFamily::Voxtral => match capability {
-            Capability::Asr | Capability::RealtimeAsr => Managed,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::GraniteSpeechAsr => match capability {
-            Capability::Asr | Capability::SpeakerAttributedAsr => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::SortformerDiarization => match capability {
-            Capability::Diarization => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::Lfm25Audio => match capability {
-            Capability::Asr
-            | Capability::Tts
-            | Capability::AudioChat
-            | Capability::SpeechToSpeech => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::Qwen3ForcedAligner => match capability {
-            Capability::ForcedAlignment => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-        ModelFamily::Tokenizer => match capability {
-            Capability::Tokenizer => Stateless,
-            _ => unexpected_capability(variant, capability),
-        },
-    }
-}
-
-fn unexpected_capability(
-    variant: ModelVariant,
-    capability: ConformanceCapability,
-) -> RetainedStateExpectation {
-    panic!(
-        "runtime registry published unexpected capability {} for {variant}",
-        capability.as_str()
-    )
-}
-
-fn backend_expectations(variant: ModelVariant) -> BackendConformanceExpectations {
+    row_backends: &[BackendKind],
+) -> BackendConformanceExpectations {
     use BackendConformanceExpectation as Expectation;
 
     if !variant.is_enabled() {
@@ -453,9 +284,16 @@ fn backend_expectations(variant: ModelVariant) -> BackendConformanceExpectations
         };
     }
 
+    let served = |backend: BackendKind| {
+        if row_backends.contains(&backend) {
+            Expectation::RequiredWhenCompiled
+        } else {
+            Expectation::Unsupported
+        }
+    };
     let cuda = match variant.cuda_support_level() {
         CudaSupportLevel::NativeCuda | CudaSupportLevel::CandleCudaGeneric => {
-            Expectation::RequiredWhenCompiled
+            served(BackendKind::Cuda)
         }
         CudaSupportLevel::CpuOnly => Expectation::Unsupported,
         CudaSupportLevel::Disabled => Expectation::CatalogDisabled,
@@ -465,8 +303,8 @@ fn backend_expectations(variant: ModelVariant) -> BackendConformanceExpectations
     };
 
     BackendConformanceExpectations {
-        cpu: Expectation::RequiredWhenCompiled,
-        metal: Expectation::RequiredWhenCompiled,
+        cpu: served(BackendKind::Cpu),
+        metal: served(BackendKind::Metal),
         cuda,
     }
 }
@@ -479,7 +317,7 @@ mod tests {
     fn manifest_case(
         manifest: &[CatalogStateConformanceCase],
         variant: ModelVariant,
-        capability: ConformanceCapability,
+        capability: CapabilityKind,
     ) -> CatalogStateConformanceCase {
         manifest
             .iter()
@@ -544,7 +382,7 @@ mod tests {
                 registry
                     .capabilities_for(variant)
                     .into_iter()
-                    .map(move |metadata| (variant, conformance_capability(metadata.capability)))
+                    .map(move |metadata| (variant, metadata.capability))
             })
             .collect::<HashSet<_>>();
         let actual = manifest
@@ -572,10 +410,6 @@ mod tests {
 
         for case in &manifest {
             assert_eq!(case.catalog_enabled, case.variant.is_enabled());
-            assert_eq!(
-                case.workspace,
-                workspace_expectation(case.variant, case.capability)
-            );
 
             if !case.catalog_enabled {
                 assert_eq!(case.backends.cpu, Backend::CatalogDisabled);
@@ -608,48 +442,39 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            44
+            52
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            20
+            12
         );
 
         assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::Qwen3827BFp8,
-                ConformanceCapability::Chat,
-            )
-            .retained_state,
+            manifest_case(&manifest, ModelVariant::Qwen3827BFp8, CapabilityKind::Chat,)
+                .retained_state,
             Managed
         );
         assert_eq!(
             manifest_case(
                 &manifest,
                 ModelVariant::Qwen3Tts12Hz06BBase,
-                ConformanceCapability::Tts,
+                CapabilityKind::Tts,
             )
             .workspace,
             InvocationStateRequired
         );
         assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::Qwen3827BFp8,
-                ConformanceCapability::Chat,
-            )
-            .workspace,
+            manifest_case(&manifest, ModelVariant::Qwen3827BFp8, CapabilityKind::Chat,).workspace,
             DeclaredMayBeEmpty
         );
         assert_eq!(
             manifest_case(
                 &manifest,
                 ModelVariant::Nemotron35AsrStreaming06B,
-                ConformanceCapability::RealtimeAsr,
+                CapabilityKind::RealtimeAsr,
             )
             .retained_state,
             Managed
@@ -658,7 +483,7 @@ mod tests {
             manifest_case(
                 &manifest,
                 ModelVariant::Nemotron35AsrStreaming06B,
-                ConformanceCapability::Asr,
+                CapabilityKind::Asr,
             )
             .retained_state,
             Stateless
@@ -666,7 +491,7 @@ mod tests {
         let voxtral_realtime = manifest_case(
             &manifest,
             ModelVariant::VoxtralMini4BRealtime2602,
-            ConformanceCapability::RealtimeAsr,
+            CapabilityKind::RealtimeAsr,
         );
         assert_eq!(voxtral_realtime.retained_state, Managed);
         assert_eq!(voxtral_realtime.workspace, InvocationStateRequired);
@@ -683,7 +508,7 @@ mod tests {
             manifest_case(
                 &manifest,
                 ModelVariant::Qwen3TtsTokenizer12Hz,
-                ConformanceCapability::Tokenizer,
+                CapabilityKind::Tokenizer,
             )
             .workspace,
             DeclaredMayBeEmpty
@@ -692,15 +517,40 @@ mod tests {
             manifest_case(
                 &manifest,
                 ModelVariant::GraniteSpeech412BPlus,
-                ConformanceCapability::SpeakerAttributedAsr,
+                CapabilityKind::SpeakerAttributedAsr,
             )
             .retained_state,
             Stateless
         );
-        for capability in [
-            ConformanceCapability::Asr,
-            ConformanceCapability::SpeakerAttributedAsr,
+        // The recurrent and sequence ASR/TTS adapters publish retained physical
+        // state; load-time publication rejects any other declaration. The
+        // pre-table manifest called these stateless.
+        for (variant, capability) in [
+            (ModelVariant::FishAudioS2Pro, CapabilityKind::Tts),
+            (ModelVariant::FishAudioS2Pro, CapabilityKind::StreamingTts),
+            (ModelVariant::WhisperLargeV3Turbo, CapabilityKind::Asr),
+            (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
+            (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),
+            (ModelVariant::GraniteSpeech412B, CapabilityKind::Asr),
+            (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Asr),
+            (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Tts),
         ] {
+            let case = manifest_case(&manifest, variant, capability);
+            assert_eq!(case.retained_state, Managed, "{variant} {capability:?}");
+            assert_eq!(case.workspace, InvocationStateRequired);
+        }
+        // Voxtral's offline ASR keeps only invocation state; its retained
+        // state belongs to the realtime capability.
+        assert_eq!(
+            manifest_case(
+                &manifest,
+                ModelVariant::VoxtralMini4BRealtime2602,
+                CapabilityKind::Asr,
+            )
+            .retained_state,
+            Stateless
+        );
+        for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
             assert_eq!(
                 manifest_case(&manifest, ModelVariant::GraniteSpeech412BPlus, capability,)
                     .workspace,
@@ -712,7 +562,7 @@ mod tests {
             manifest_case(
                 &manifest,
                 ModelVariant::GraniteSpeech412B,
-                ConformanceCapability::Asr,
+                CapabilityKind::Asr,
             )
             .workspace,
             InvocationStateRequired
@@ -720,6 +570,6 @@ mod tests {
         assert!(!manifest
             .iter()
             .any(|case| case.variant == ModelVariant::GraniteSpeech412B
-                && case.capability == ConformanceCapability::SpeakerAttributedAsr));
+                && case.capability == CapabilityKind::SpeakerAttributedAsr));
     }
 }

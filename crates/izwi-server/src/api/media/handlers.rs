@@ -13,7 +13,7 @@ use std::{
 
 use crate::api::audio_payload::decode_base64_media_payload;
 use crate::api::openai::audio::resolve_audio_upload_limit_bytes;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, MediaIngestError, MediaIngestRequest,
 };
@@ -92,6 +92,7 @@ fn listable_media_root(state: &AppState) -> Result<PathBuf, ApiError> {
                 message:
                     "GET /v1/media listing is only available for local media storage providers"
                         .to_string(),
+                detail: None,
             }),
         None => Ok(storage_layout::resolve_media_root()),
     }
@@ -99,7 +100,7 @@ fn listable_media_root(state: &AppState) -> Result<PathBuf, ApiError> {
 
 pub async fn create_media(
     State(state): State<AppState>,
-    Json(req): Json<UploadMediaRequest>,
+    ApiJson(req): ApiJson<UploadMediaRequest>,
 ) -> Result<Json<UploadMediaResponse>, ApiError> {
     let raw_data = req
         .data_base64

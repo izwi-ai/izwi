@@ -1,42 +1,10 @@
-use clap::ValueEnum;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+//! Process logging. The format, filter and subscriber are izwi-gateway's,
+//! which both roles share; this server logs as `izwi-server`.
+
+pub use izwi_gateway::logging::{LogFormat, SERVICE_VERSION};
 
 pub const SERVICE_NAME: &str = "izwi-server";
-pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum LogFormat {
-    Text,
-    Json,
-}
-
-impl LogFormat {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        }
-    }
-}
 
 pub fn init_tracing(log_format: LogFormat) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "izwi_server=warn,izwi_core=warn,tower_http=warn".into());
-
-    match log_format {
-        LogFormat::Text => tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer())
-            .init(),
-        LogFormat::Json => tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_current_span(true)
-                    .with_span_list(true),
-            )
-            .init(),
-    }
+    izwi_gateway::logging::init_tracing(log_format, SERVICE_NAME);
 }

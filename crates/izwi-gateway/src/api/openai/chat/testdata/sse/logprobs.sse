@@ -1,0 +1,12 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[72,105],"logprob":-0.25,"token":"Hi","top_logprobs":[{"bytes":[72,105],"logprob":-0.25,"token":"Hi"},{"bytes":[72,101,121],"logprob":-1.5,"token":"Hey"}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"!"},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[33],"logprob":-0.5,"token":"!","top_logprobs":[{"bytes":[33],"logprob":-0.5,"token":"!"},{"bytes":[46],"logprob":-2.0,"token":"."}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[69,78,68],"logprob":-0.75,"token":"END","top_logprobs":[{"bytes":[69,78,68],"logprob":-0.75,"token":"END"},{"bytes":[32],"logprob":-3.0,"token":" "}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: [DONE]
+

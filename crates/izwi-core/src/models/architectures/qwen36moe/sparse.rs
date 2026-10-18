@@ -901,7 +901,9 @@ mod tests {
         #[cfg(feature = "metal")]
         #[test]
         fn metal_fused_block_matches_the_metal_dispatcher_and_the_cpu_block() {
-            let Some(gpu) = crate::backends::metal_device_if_available(0) else {
+            let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+                "metal_fused_block_matches_the_metal_dispatcher_and_the_cpu_block",
+            ) else {
                 return;
             };
             let to_gpu = |linear: Qwen36MoeLinear| match linear {

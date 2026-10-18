@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use uuid::Uuid;
 
+pub use izwi_model_catalog::chat::ChatGeneration;
+
 /// Server-side scheduling and admission metadata carried with an inference request.
 ///
 /// This is deliberately skipped by serde on public request payloads. API layers
@@ -192,23 +194,6 @@ pub struct DiarizationPipelineOptions {
     /// Stops the pipeline at its next stage (between ASR chunks and aligner
     /// windows) once cancelled.
     pub cancellation: crate::runtime::coordinator::JobCancellation,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatGeneration {
-    pub latency_breakdown: Option<crate::engine::LatencyBreakdown>,
-    pub finish_reason: Option<crate::engine::OutputFinishReason>,
-    pub text: String,
-    pub prompt_tokens: usize,
-    pub tokens_generated: usize,
-    pub generation_time_ms: f64,
-    /// DS9.1: prompt tokens served from the managed prefix cache. Always a
-    /// subset of `prompt_tokens`; `None` when the executing runtime did not
-    /// measure prefix reuse (unavailable, not a zero measurement).
-    pub cached_prompt_tokens: Option<u64>,
-    /// DS9.3: per-token logprob entries for the generated text. Empty
-    /// unless the request asked for logprobs.
-    pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 #[derive(Debug, Clone)]

@@ -229,7 +229,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn persistent_metal_copy_uses_exact_sized_backing() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "persistent_metal_copy_uses_exact_sized_backing",
+        ) else {
             return;
         };
         let pooled = Tensor::zeros((3,), candle_core::DType::F32, &device).unwrap();
@@ -244,7 +246,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn persistent_metal_copy_materializes_non_contiguous_views() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "persistent_metal_copy_materializes_non_contiguous_views",
+        ) else {
             return;
         };
         let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();

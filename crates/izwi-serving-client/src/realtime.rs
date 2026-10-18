@@ -21,21 +21,33 @@
 //! running until its own deadline; the owner is responsible for an explicit
 //! HTTP `cancel_attempt` in that case, exactly as for an uncertain HTTP
 //! invocation.
+//!
+//! [`dial`] is the one worker WebSocket dialer: [`connect`] builds a
+//! validating session on it, and the gateway relay uses it directly to
+//! forward frames verbatim. HTTPS workers are verified against the public
+//! web roots plus the configured private CA roots, presenting the mTLS
+//! client identity when one is configured, exactly like the HTTP client.
 
 use futures::{SinkExt, StreamExt};
 use izwi_serving_protocol::{
     decode_realtime_audio_frame, encode_realtime_audio_frame, InvocationEvent, InvocationEventKind,
     RealtimeAudioSpec, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
-    RealtimeSessionBounds, RealtimeStageInput, ServiceCredentials, MAX_REALTIME_INPUT_TEXT_BYTES,
-    PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH, SERVICE_AUTHORIZATION_HEADER,
-    SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
+    RealtimeSessionBounds, RealtimeStageInput, ServiceCredentials, TraceContext,
+    MAX_REALTIME_INPUT_TEXT_BYTES, PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH,
+    SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
+    TRACEPARENT_HEADER,
 };
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio_rustls::rustls;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderValue, Error as WsError, Message,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+
+/// A worker session socket.
+pub type WorkerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Bound on events buffered while a caller drains audio instead. Events are
 /// tiny and rare (accepted, terminal); overflowing means the caller is
@@ -53,6 +65,8 @@ pub struct RealtimeClientConfig {
     pub event_timeout: Duration,
     /// Deadline for any single outbound frame write.
     pub send_timeout: Duration,
+    /// Private CA roots and mTLS identity for HTTPS workers.
+    pub tls: crate::WorkerClientTlsConfig,
 }
 
 impl Default for RealtimeClientConfig {
@@ -62,6 +76,7 @@ impl Default for RealtimeClientConfig {
             admit_timeout: Duration::from_secs(10),
             event_timeout: Duration::from_secs(30),
             send_timeout: Duration::from_secs(5),
+            tls: crate::WorkerClientTlsConfig::default(),
         }
     }
 }
@@ -139,7 +154,7 @@ pub struct RealtimeAudioChunk {
 
 /// One admitted realtime session over a worker WebSocket.
 pub struct RealtimeSession {
-    stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    stream: WorkerSocket,
     admission: RealtimeAdmission,
     expected_request_id: String,
     config: RealtimeClientConfig,
@@ -167,6 +182,24 @@ impl std::fmt::Debug for RealtimeSession {
     }
 }
 
+/// A worker session that echoed the admit, before any session frame.
+pub struct DialedSession {
+    pub stream: WorkerSocket,
+    pub admission: RealtimeAdmission,
+    /// The worker's `Admitted` frame exactly as received, for relays that
+    /// forward it verbatim.
+    pub admitted_frame: String,
+}
+
+impl std::fmt::Debug for DialedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DialedSession")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Opens the session: upgrade, subprotocol negotiation, and the mandatory
 /// first admit frame, resolved only once the worker's `Admitted` echo
 /// arrives and matches the admit identity.
@@ -176,6 +209,38 @@ pub async fn connect(
     admit: RealtimeSessionAdmit,
     config: RealtimeClientConfig,
 ) -> Result<RealtimeSession, RealtimeClientError> {
+    let DialedSession {
+        stream, admission, ..
+    } = dial(endpoint, credentials, &admit, None, &config).await?;
+    Ok(RealtimeSession {
+        stage_emits_audio: matches!(admit.input, RealtimeStageInput::TextStream { .. }),
+        stream,
+        admission,
+        expected_request_id: admit.request_id.to_string(),
+        config,
+        accepted_seen: false,
+        terminal_seen: false,
+        closed: false,
+        last_event_sequence: None,
+        next_audio_sequence: 1,
+        audio_bytes: 0,
+        text_bytes: 0,
+        last_received_audio_sequence: None,
+        pending_events: VecDeque::new(),
+        pending_audio: VecDeque::new(),
+    })
+}
+
+/// Dials the worker's realtime socket, sends `admit`, and waits for the
+/// matching `Admitted` echo. `trace` names the caller's span as the worker
+/// session's parent.
+pub async fn dial(
+    endpoint: &str,
+    credentials: &ServiceCredentials,
+    admit: &RealtimeSessionAdmit,
+    trace: Option<&TraceContext>,
+    config: &RealtimeClientConfig,
+) -> Result<DialedSession, RealtimeClientError> {
     let base =
         crate::validated_session_endpoint(endpoint).map_err(|rejection| match rejection {
             crate::EndpointRejection::Parse(error) => RealtimeClientError::InvalidEndpoint(error),
@@ -188,6 +253,12 @@ pub async fn connect(
             "realtime admission is not a valid izwi-realtime-v1 admit",
         ));
     }
+    if base.scheme() != "https" && config.tls.is_configured() {
+        return Err(RealtimeClientError::InvalidConfiguration(
+            "custom TLS trust or mTLS identity requires an HTTPS worker endpoint",
+        ));
+    }
+    let connector = tls_connector(&config.tls)?;
     let mut ws_url = base
         .join(REALTIME_WS_PATH.trim_start_matches('/'))
         .map_err(|error| RealtimeClientError::InvalidEndpoint(error.to_string()))?;
@@ -227,8 +298,15 @@ pub async fn connect(
         RealtimeClientError::InvalidConfiguration("credential id is not a valid header value")
     })?;
     headers.insert(SERVICE_CREDENTIAL_ID_HEADER, credential);
+    if let Some(trace) = trace {
+        let traceparent = HeaderValue::from_str(&trace.header_value()).map_err(|_| {
+            RealtimeClientError::InvalidConfiguration("traceparent is not a valid header value")
+        })?;
+        headers.insert(TRACEPARENT_HEADER, traceparent);
+    }
 
-    let handshake = tokio_tungstenite::connect_async(request);
+    let handshake =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector);
     let (mut stream, response) = tokio::time::timeout(config.connect_timeout, handshake)
         .await
         .map_err(|_| RealtimeClientError::Connect(WsError::ConnectionClosed))?
@@ -252,7 +330,7 @@ pub async fn connect(
     .await?;
 
     // The admitted echo is the first server frame; identity must match.
-    let admission = loop {
+    loop {
         let message = tokio::time::timeout(config.admit_timeout, stream.next())
             .await
             .map_err(|_| RealtimeClientError::AdmitTimeout)?
@@ -283,13 +361,14 @@ pub async fn connect(
                             "admitted bounds exceed the protocol caps".into(),
                         )
                     })?;
-                    let stage_emits_audio = matches!(admit.input, RealtimeStageInput::TextStream);
+                    let stage_emits_audio =
+                        matches!(admit.input, RealtimeStageInput::TextStream { .. });
                     if stage_emits_audio && output_audio.is_none() {
                         return Err(RealtimeClientError::Protocol(
                             "text-stream sessions must announce an output audio spec".into(),
                         ));
                     }
-                    break RealtimeAdmission {
+                    let admission = RealtimeAdmission {
                         session_id: session_id.to_string(),
                         attempt_id: attempt_id.to_string(),
                         worker_id: worker_id.to_string(),
@@ -299,8 +378,17 @@ pub async fn connect(
                         bounds,
                         output_audio,
                     };
+                    return Ok(DialedSession {
+                        stream,
+                        admission,
+                        admitted_frame: text.to_string(),
+                    });
                 }
-                Ok(RealtimeServerFrame::Event { .. } | RealtimeServerFrame::Pong) => {
+                Ok(
+                    RealtimeServerFrame::Event { .. }
+                    | RealtimeServerFrame::Pong
+                    | RealtimeServerFrame::Unknown,
+                ) => {
                     return Err(RealtimeClientError::Protocol(
                         "admitted frame must be the first server frame".into(),
                     ));
@@ -323,29 +411,52 @@ pub async fn connect(
                 ));
             }
         }
-    };
+    }
+}
 
-    Ok(RealtimeSession {
-        stage_emits_audio: matches!(admit.input, RealtimeStageInput::TextStream),
-        stream,
-        admission,
-        expected_request_id: admit.request_id.to_string(),
-        config,
-        accepted_seen: false,
-        terminal_seen: false,
-        closed: false,
-        last_event_sequence: None,
-        next_audio_sequence: 1,
-        audio_bytes: 0,
-        text_bytes: 0,
-        last_received_audio_sequence: None,
-        pending_events: VecDeque::new(),
-        pending_audio: VecDeque::new(),
-    })
+/// The TLS connector for `wss` dials. Without private roots or a client
+/// identity this is the dialer's default (public web roots); otherwise the
+/// public roots plus the private CA roots, with the mTLS identity presented.
+fn tls_connector(
+    tls: &crate::WorkerClientTlsConfig,
+) -> Result<Option<Connector>, RealtimeClientError> {
+    if !tls.is_configured() {
+        return Ok(None);
+    }
+    let invalid = |message| RealtimeClientError::InvalidConfiguration(message);
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for pem in &tls.private_ca_roots_pem {
+        for der in
+            crate::pem_certificates(pem).map_err(|_| invalid("private CA root is not valid PEM"))?
+        {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .map_err(|_| invalid("private CA root is not a valid certificate"))?;
+        }
+    }
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| invalid("TLS client configuration could not be constructed"))?
+    .with_root_certificates(roots);
+    let config = match &tls.client_identity_pem {
+        None => builder.with_no_client_auth(),
+        Some(identity) => {
+            let (certificates, key) = crate::pem_identity(identity)
+                .map_err(|_| invalid("mTLS identity is not valid PEM"))?;
+            builder
+                .with_client_auth_cert(certificates, key)
+                .map_err(|_| invalid("mTLS identity could not be used for TLS"))?
+        }
+    };
+    Ok(Some(Connector::Rustls(Arc::new(config))))
 }
 
 async fn send_control_frame(
-    stream: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    stream: &mut WorkerSocket,
     send_timeout: Duration,
     frame: &RealtimeClientFrame,
 ) -> Result<(), RealtimeClientError> {
@@ -488,7 +599,8 @@ impl RealtimeSession {
                             let event = self.validate_event(event)?;
                             return Ok(Some(event));
                         }
-                        RealtimeServerFrame::Pong => continue,
+                        // A frame type from a newer minor is skipped.
+                        RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown => continue,
                         RealtimeServerFrame::Admitted { .. } => {
                             return Err(RealtimeClientError::Protocol(
                                 "duplicate admitted frame".into(),
@@ -576,7 +688,8 @@ impl RealtimeSession {
                             }
                             self.pending_events.push_back(event);
                         }
-                        RealtimeServerFrame::Pong => continue,
+                        // A frame type from a newer minor is skipped.
+                        RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown => continue,
                         RealtimeServerFrame::Admitted { .. } => {
                             return Err(RealtimeClientError::Protocol(
                                 "duplicate admitted frame".into(),
@@ -707,7 +820,9 @@ impl RealtimeSession {
                 }
                 self.terminal_seen = true;
             }
-            InvocationEventKind::TextDelta { .. } | InvocationEventKind::Usage { .. } => {
+            InvocationEventKind::TextDelta { .. }
+            | InvocationEventKind::Usage { .. }
+            | InvocationEventKind::Unknown => {
                 if !self.accepted_seen {
                     return Err(RealtimeClientError::Protocol(
                         "stream event arrived before accepted".into(),
@@ -791,6 +906,178 @@ mod tests {
                 "unexpected error for {endpoint}: {error}"
             );
             assert!(error.proves_session_unaccepted());
+        }
+    }
+
+    // A test CA, a localhost/127.0.0.1 server certificate and a client
+    // (mTLS) certificate it signed, all valid until 2126.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBqDCCAU2gAwIBAgIUTSeQRvVl8fjJWjOAr5v+z9ErlUIwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVaXp3aS1yZWFsdGltZS10ZXN0LWNhMCAXDTI2MTAxNjE2MDQz
+NVoYDzIxMjYwOTIyMTYwNDM1WjAgMR4wHAYDVQQDDBVpendpLXJlYWx0aW1lLXRl
+c3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASDRarRenz0/t4mgONOgdwR
+cGehlkVMpZ+b4S3GVcNQEM/wX1VmjNqaiZf8F8S6c5xc4hyqu386taS/NTAYg20s
+o2MwYTAdBgNVHQ4EFgQUZYkQdE5VD/eWOILaOvxYqwWJynQwHwYDVR0jBBgwFoAU
+ZYkQdE5VD/eWOILaOvxYqwWJynQwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8E
+BAMCAgQwCgYIKoZIzj0EAwIDSQAwRgIhAPKi8OxP4WuBMQNh5LlHYo0yyB3EWKK6
+hmsSvcKYLtGpAiEA3S/fw3eOxwH0d9rDFB8IgrEeF5Y7XFcXhTZ7IlmSRtU=
+-----END CERTIFICATE-----
+";
+    const TEST_SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBzDCCAXGgAwIBAgIUV4Od/WnkLvfvSzndwkwZ+2KKSBcwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVaXp3aS1yZWFsdGltZS10ZXN0LWNhMCAXDTI2MTAxNjE2MDQz
+NVoYDzIxMjYwOTIyMTYwNDM1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAAQ41lnWt9tcH8FdAmpa393twxE3Dnl0piN0m9XR
+uOOyXqukdeoOebkOONMlnQDTu5wRHdJ7zLoDyCVoZpH/oRYpo4GSMIGPMBoGA1Ud
+EQQTMBGCCWxvY2FsaG9zdIcEfwAAATAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQE
+AwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUs9/z0fzMQ/xmyO6B
+IHCP+1jusCMwHwYDVR0jBBgwFoAUZYkQdE5VD/eWOILaOvxYqwWJynQwCgYIKoZI
+zj0EAwIDSQAwRgIhALJfKxGxbeAR1Wzvd08Xqt1QmZYksv0WxsIySlYqQh/IAiEA
+/yRaLXt/VZEuRmi0eDvz7lBZnDXDv2xLZH6zJXwt/YE=
+-----END CERTIFICATE-----
+";
+    const TEST_SERVER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqMNQEzVw4fFfbGO4
+OfOjjdS8jdcFVyE+N+9oSwUGoA6hRANCAAQ41lnWt9tcH8FdAmpa393twxE3Dnl0
+piN0m9XRuOOyXqukdeoOebkOONMlnQDTu5wRHdJ7zLoDyCVoZpH/oRYp
+-----END PRIVATE KEY-----
+";
+    const TEST_CLIENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBsDCCAVagAwIBAgIUV4Od/WnkLvfvSzndwkwZ+2KKSBgwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVaXp3aS1yZWFsdGltZS10ZXN0LWNhMCAXDTI2MTAxNjE2MDQz
+NVoYDzIxMjYwOTIyMTYwNDM1WjAXMRUwEwYDVQQDDAxpendpLWdhdGV3YXkwWTAT
+BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQc/MGdk7Hw/L8SwQ310bfgOIk1zLk34+my
+u+6qqH+fsAnu9WiQRDr+hzrC+Ae6lIKjktspbkiNQ0ad4EAP01bNo3UwczAMBgNV
+HRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAjAd
+BgNVHQ4EFgQUjYtq01QMeMM3cFBPcqOd1Sjh0AMwHwYDVR0jBBgwFoAUZYkQdE5V
+D/eWOILaOvxYqwWJynQwCgYIKoZIzj0EAwIDSAAwRQIhAI2UUfKhGcsl90WdVHRI
+owpIUlPejzCD78TLXCxcAw0hAiBJKSGM8usNlTQs/zMYMGr6u2t75wZi4fpbb4BY
+RDtcJw==
+-----END CERTIFICATE-----
+";
+    const TEST_CLIENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgpogiAPFDRSvtKgDe
+7vaqz2ON6O1LC6NEueNWcEwMzpOhRANCAAQc/MGdk7Hw/L8SwQ310bfgOIk1zLk3
+4+myu+6qqH+fsAnu9WiQRDr+hzrC+Ae6lIKjktspbkiNQ0ad4EAP01bN
+-----END PRIVATE KEY-----
+";
+
+    /// A TLS worker socket that requires a client certificate from the test
+    /// CA and echoes every admit. Returns its port.
+    // tungstenite's handshake callback signature returns its large error.
+    #[allow(clippy::result_large_err)]
+    async fn mtls_worker() -> u16 {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for der in crate::pem_certificates(TEST_CA_PEM.as_bytes()).unwrap() {
+            roots.add(CertificateDer::from(der)).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .unwrap();
+        let certificates = crate::pem_certificates(TEST_SERVER_CERT_PEM.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect();
+        let (_, key): (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) =
+            crate::pem_identity(TEST_SERVER_KEY_PEM.as_bytes()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    tls,
+                    |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        response.headers_mut().insert(
+                            "sec-websocket-protocol",
+                            HeaderValue::from_static(REALTIME_SUBPROTOCOL),
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    continue;
+                };
+                let Ok(RealtimeClientFrame::Admit { admit }) = serde_json::from_str(&text) else {
+                    continue;
+                };
+                let admitted = RealtimeServerFrame::Admitted {
+                    session_id: admit.session_id,
+                    attempt_id: admit.attempt_id,
+                    worker_id: izwi_serving_protocol::WorkerId::new("worker-1").unwrap(),
+                    node_id: izwi_serving_protocol::NodeId::new("node-1").unwrap(),
+                    incarnation_id: admit.expected_worker_incarnation,
+                    deployment_id: admit.deployment_id,
+                    model_generation: admit.expected_model_generation,
+                    output_audio: None,
+                    bounds: RealtimeSessionBounds {
+                        max_frame_bytes: 4096,
+                        max_in_flight_frames: 4,
+                        max_session_audio_bytes: 65_536,
+                    },
+                };
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::to_string(&admitted).unwrap().into(),
+                    ))
+                    .await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn dial_verifies_the_private_ca_and_presents_the_mtls_identity() {
+        let port = mtls_worker().await;
+        let endpoint = format!("https://localhost:{port}/");
+        let tls = |identity: bool| {
+            crate::WorkerClientTlsConfig::from_pem(
+                vec![TEST_CA_PEM.as_bytes().to_vec()],
+                identity.then(|| TEST_CLIENT_CERT_PEM.as_bytes().to_vec()),
+                identity.then(|| TEST_CLIENT_KEY_PEM.as_bytes().to_vec()),
+            )
+            .unwrap()
+        };
+        let dial_with = |tls| {
+            let endpoint = endpoint.clone();
+            async move {
+                let config = RealtimeClientConfig {
+                    tls,
+                    ..RealtimeClientConfig::default()
+                };
+                dial(&endpoint, &credentials(), &admission(), None, &config).await
+            }
+        };
+
+        let dialed = dial_with(tls(true)).await.unwrap();
+        assert_eq!(dialed.admission.session_id, "session-1");
+        assert!(dialed.admitted_frame.contains("\"admitted\""));
+
+        // Without the private CA the worker certificate is untrusted, and
+        // without the identity the worker refuses the handshake.
+        for config in [crate::WorkerClientTlsConfig::default(), tls(false)] {
+            let error = dial_with(config).await.unwrap_err();
+            assert!(error.proves_session_unaccepted(), "{error}");
         }
     }
 

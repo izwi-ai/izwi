@@ -8,26 +8,35 @@ use axum::{
     response::Response,
     Json,
 };
+use futures::Stream;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
+use crate::api::openai::convert::{
+    append_assistant_tool_calls, flatten_content, tool_result_message,
+};
+use crate::api::openai::tool_calls::{
+    parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallFormat, ToolCallParser,
+};
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, resolve_chat_request_config, spawn_chat_stream, ChatExecutionRequest,
-    ChatStreamEvent,
+    chat_top_k, generate_chat, resolve_chat_request_config, start_chat_stream,
+    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
-use crate::app::chat_content::{
-    flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
+use crate::app::chat_content::validate_media_inputs_for_variant;
+use crate::error::{ApiError, ApiJson, ErrorScope};
+use crate::ids::new_prefixed_id;
+use crate::state::{AppState, StoredFunctionCall, StoredResponseInputItem, StoredResponseRecord};
+use izwi_core::{
+    parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
 };
-use crate::error::ApiError;
-use crate::ids::new_uuid;
-use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
-use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole, ModelVariant};
 
 use super::dto::{
-    ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
-    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList,
-    ResponseInputTokensDetails, ResponseObject, ResponseOutputContent, ResponseOutputItem,
-    ResponseStreamCompletedPayload, ResponseStreamCreatedPayload, ResponseStreamDeltaPayload,
-    ResponseStreamEnvelope, ResponseUsage, ResponsesCreateRequest,
+    ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputItemContent,
+    ResponseInputItemObject, ResponseInputItemsList, ResponseInputTokensDetails, ResponseObject,
+    ResponseOutputContent, ResponseOutputItem, ResponseStreamCompletedPayload,
+    ResponseStreamCreatedPayload, ResponseStreamDeltaPayload, ResponseStreamEnvelope,
+    ResponseUsage, ResponsesCreateRequest,
 };
 
 const RESPONSE_STREAM_INTERRUPTED_ERROR: &str = "Response stream ended before a terminal event";
@@ -46,10 +55,32 @@ fn response_stream_interruption_payload(response_id: &str, saw_terminal: bool) -
         .then(|| response_stream_failure_payload(response_id, RESPONSE_STREAM_INTERRUPTED_ERROR))
 }
 
+/// Responses declares a function tool flat (`{"type": "function", "name",
+/// "parameters"}`) and names a forced one as `{"type": "function", "name"}`;
+/// chat completions nests both under `function`, which the chat templates
+/// and the tool policy read. The nested form is accepted as is.
+fn chat_completions_function(value: &Value) -> Value {
+    match value.as_object() {
+        Some(object)
+            if object.get("type").and_then(Value::as_str) == Some("function")
+                && !object.contains_key("function")
+                && object.contains_key("name") =>
+        {
+            let function = object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "type")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>();
+            json!({"type": "function", "function": function})
+        }
+        _ => value.clone(),
+    }
+}
+
 pub async fn create_response(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<ResponsesCreateRequest>,
+    ApiJson(req): ApiJson<ResponsesCreateRequest>,
 ) -> Result<Response<Body>, ApiError> {
     let model_variant = parse_chat_model_variant(Some(&req.model))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -58,9 +89,6 @@ pub async fn create_response(
         model_variant,
         req.instructions.as_deref(),
         req.input.clone(),
-        req.enable_thinking,
-        req.tools.clone(),
-        req.tool_choice.clone(),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -70,14 +98,30 @@ pub async fn create_response(
         ));
     }
 
+    let tools = req.tools.as_deref().map(|tools| {
+        tools
+            .iter()
+            .map(chat_completions_function)
+            .collect::<Vec<_>>()
+    });
+    let tool_choice = req.tool_choice.as_ref().map(chat_completions_function);
+    let tool_policy = resolve_tool_policy(model_variant, tools.as_deref(), tool_choice.as_ref())?;
+    let tool_format = tool_policy.format;
     let chat_config = resolve_chat_request_config(
         req.enable_thinking,
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        req.tools.clone().unwrap_or_default(),
+        tool_policy.tools,
         media_inputs,
+        req.truncation,
     )?;
+    if req.max_output_tokens == Some(0) {
+        return Err(ApiError::invalid_param(
+            "max_output_tokens",
+            "`max_output_tokens` must be at least 1",
+        ));
+    }
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages,
@@ -85,23 +129,47 @@ pub async fn create_response(
         max_tokens: None,
         temperature: req.temperature,
         top_p: req.top_p,
-        top_k: req.top_k,
+        top_k: chat_top_k(req.top_k)?,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        seed: None,
+        stop: Vec::new(),
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: req.skip_special_tokens,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
-        return create_streaming_response(state, req, execution_request, input_items).await;
+        let event_rx = start_chat_stream(state.clone(), execution_request).await?;
+        let stream = response_event_stream(
+            state,
+            ResponseStreamRequest {
+                response_id: new_prefixed_id("resp_"),
+                created_at: now_unix_secs(),
+                model: model_variant.dir_name().to_string(),
+                metadata: req.metadata,
+                store: req.store,
+                tenant_scope: ctx.tenant_scope(),
+                input_items,
+                tool_format,
+            },
+            event_rx,
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from_stream(stream))
+            .unwrap());
     }
 
     let output = generate_chat(&state, execution_request).await?;
 
-    let response_id = new_uuid();
+    let response_id = new_prefixed_id("resp_");
     let created_at = now_unix_secs();
 
     let usage = ResponseUsage {
@@ -112,6 +180,7 @@ pub async fn create_response(
             cached_tokens: output.cached_prompt_tokens.unwrap_or(0),
         },
     };
+    let (output_text, function_calls) = answer_output(tool_format, output.text);
 
     let response = ResponseObject {
         id: response_id.clone(),
@@ -119,7 +188,11 @@ pub async fn create_response(
         created_at,
         status: "completed".to_string(),
         model: model_variant.dir_name().to_string(),
-        output: vec![assistant_output_item(output.text.clone())],
+        output: output_items(
+            new_prefixed_id("msg_"),
+            output_text.clone(),
+            &function_calls,
+        ),
         usage: usage.clone(),
         error: None,
         metadata: req.metadata.clone(),
@@ -129,11 +202,13 @@ pub async fn create_response(
         &state,
         StoredResponseRecord {
             id: response_id,
+            tenant_scope: ctx.tenant_scope(),
             created_at,
             status: "completed".to_string(),
             model: model_variant.dir_name().to_string(),
             input_items,
-            output_text: Some(output.text),
+            output_text,
+            output_function_calls: function_calls,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             input_cached_tokens: usage.input_tokens_details.cached_tokens,
@@ -153,27 +228,96 @@ pub async fn create_response(
         .unwrap())
 }
 
+/// A whole answer's message text and tool calls: parsed in `tool_format`,
+/// or all text without one.
+fn answer_output(
+    tool_format: Option<ToolCallFormat>,
+    text: String,
+) -> (Option<String>, Vec<StoredFunctionCall>) {
+    match tool_format {
+        Some(format) => {
+            let (text, calls) = parse_answer(format, &text);
+            (text, calls.into_iter().map(stored_function_call).collect())
+        }
+        None => (Some(text), Vec::new()),
+    }
+}
+
+fn stored_function_call(call: ToolCall) -> StoredFunctionCall {
+    StoredFunctionCall {
+        id: new_prefixed_id("fc_"),
+        call_id: call.id,
+        name: call.function.name,
+        arguments: call.function.arguments,
+    }
+}
+
+/// A response's output: its message (when the answer has text, or made no
+/// call), then one `function_call` item per tool call.
+fn output_items(
+    message_id: String,
+    text: Option<String>,
+    calls: &[StoredFunctionCall],
+) -> Vec<ResponseOutputItem> {
+    let message = match text {
+        Some(text) => Some(assistant_output_item_with_id(message_id, text)),
+        None if calls.is_empty() => Some(assistant_output_item_with_id(message_id, String::new())),
+        None => None,
+    };
+    message
+        .into_iter()
+        .chain(calls.iter().map(function_call_item))
+        .collect()
+}
+
+fn function_call_item(call: &StoredFunctionCall) -> ResponseOutputItem {
+    ResponseOutputItem::FunctionCall {
+        id: call.id.clone(),
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        status: "completed",
+    }
+}
+
+/// Whether the caller's tenant owns a stored response. Another tenant's
+/// record is reported as missing, so ids do not leak across tenants.
+fn owned_by(record: &StoredResponseRecord, ctx: &RequestContext) -> bool {
+    record.tenant_scope == ctx.tenant_scope()
+}
+
+fn response_not_found() -> ApiError {
+    ApiError::not_found("Response not found")
+}
+
 pub async fn get_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseObject>, ApiError> {
     let store = state.response_store.read().await;
     let record = store
         .get(&response_id)
+        .filter(|record| owned_by(record, &ctx))
         .cloned()
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .ok_or_else(response_not_found)?;
 
     Ok(Json(record_to_response(record)))
 }
 
 pub async fn delete_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseDeletedObject>, ApiError> {
     let mut store = state.response_store.write().await;
-    if store.remove(&response_id).is_none() {
-        return Err(ApiError::not_found("Response not found"));
+    if !store
+        .get(&response_id)
+        .is_some_and(|record| owned_by(record, &ctx))
+    {
+        return Err(response_not_found());
     }
+    store.remove(&response_id);
 
     Ok(Json(ResponseDeletedObject {
         id: response_id,
@@ -184,12 +328,14 @@ pub async fn delete_response(
 
 pub async fn cancel_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseObject>, ApiError> {
     let mut store = state.response_store.write().await;
     let record = store
         .get_mut(&response_id)
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .filter(|record| owned_by(record, &ctx))
+        .ok_or_else(response_not_found)?;
 
     if record.status != "completed" {
         record.status = "cancelled".to_string();
@@ -201,26 +347,38 @@ pub async fn cancel_response(
 
 pub async fn list_response_input_items(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseInputItemsList>, ApiError> {
     let store = state.response_store.read().await;
     let record = store
         .get(&response_id)
+        .filter(|record| owned_by(record, &ctx))
         .cloned()
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .ok_or_else(response_not_found)?;
 
     let data = record
         .input_items
         .into_iter()
         .enumerate()
-        .map(|(idx, item)| ResponseInputItemObject {
-            id: format!("initem_{}_{idx}", response_id),
-            item_type: "message",
-            role: item.role,
-            content: vec![ResponseInputItemContent {
-                content_type: "input_text",
-                text: item.content,
-            }],
+        .map(|(idx, item)| {
+            let id = format!("initem_{}_{idx}", response_id);
+            match item.item {
+                Some(Value::Object(mut raw)) => {
+                    raw.insert("id".to_string(), Value::String(id));
+                    Value::Object(raw)
+                }
+                _ => serde_json::to_value(ResponseInputItemObject {
+                    id,
+                    item_type: "message",
+                    role: item.role,
+                    content: vec![ResponseInputItemContent {
+                        content_type: "input_text",
+                        text: item.content,
+                    }],
+                })
+                .unwrap_or_default(),
+            }
         })
         .collect();
 
@@ -230,124 +388,376 @@ pub async fn list_response_input_items(
     }))
 }
 
-async fn create_streaming_response(
-    state: AppState,
-    req: ResponsesCreateRequest,
-    execution_request: ChatExecutionRequest,
+/// What a streamed response needs besides its chat events.
+struct ResponseStreamRequest {
+    response_id: String,
+    created_at: u64,
+    model: String,
+    metadata: Option<Value>,
+    store: Option<bool>,
+    tenant_scope: String,
     input_items: Vec<StoredResponseInputItem>,
-) -> Result<Response<Body>, ApiError> {
-    let response_id = new_uuid();
-    let created_at = now_unix_secs();
-    let metadata = req.metadata.clone();
-    let response_id_for_task = response_id.clone();
-    let message_id = new_uuid();
-    let model_name = execution_request.variant.dir_name().to_string();
-    let store_state = state.clone();
-    let mut event_rx = spawn_chat_stream(state.clone(), execution_request);
+    /// The tool-call format to parse the answer in; `None` keeps it text.
+    tool_format: Option<ToolCallFormat>,
+}
 
-    let stream = async_stream::stream! {
+/// One streamed `function_call` output item.
+struct StreamedCall {
+    call: StoredFunctionCall,
+    output_index: usize,
+}
+
+/// The output items of a streamed response as they open: the assistant
+/// message on its first text, a `function_call` on each call's first
+/// fragment. Every method returns the SSE events it made.
+struct ResponseOutputStream {
+    response_id: String,
+    message_id: String,
+    parser: Option<ToolCallParser>,
+    next_output_index: usize,
+    /// The message's output index once it opened.
+    message_index: Option<usize>,
+    text: String,
+    calls: Vec<StreamedCall>,
+}
+
+impl ResponseOutputStream {
+    fn new(response_id: String, tool_format: Option<ToolCallFormat>) -> Self {
+        Self {
+            response_id,
+            message_id: new_prefixed_id("msg_"),
+            parser: tool_format.map(ToolCallParser::new),
+            next_output_index: 0,
+            message_index: None,
+            text: String::new(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, delta: String) -> Vec<String> {
+        let parsed = match self.parser.as_mut() {
+            Some(parser) => parser.push(&delta),
+            None => ParsedOutput {
+                content: delta,
+                tool_calls: Vec::new(),
+            },
+        };
+        self.apply(parsed)
+    }
+
+    fn apply(&mut self, parsed: ParsedOutput) -> Vec<String> {
+        let mut events = Vec::new();
+        if !parsed.content.is_empty() {
+            let output_index = self.open_message(&mut events);
+            self.text.push_str(&parsed.content);
+            events.push(sse_json(
+                "response.output_text.delta",
+                &ResponseStreamEnvelope {
+                    event_type: "response.output_text.delta",
+                    payload: ResponseStreamDeltaPayload {
+                        response_id: self.response_id.clone(),
+                        item_id: self.message_id.clone(),
+                        output_index,
+                        content_index: 0,
+                        delta: parsed.content,
+                    },
+                },
+            ));
+        }
+        for fragment in parsed.tool_calls {
+            if let Some(call_id) = fragment.id {
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                let call = StoredFunctionCall {
+                    id: new_prefixed_id("fc_"),
+                    call_id,
+                    name: fragment.function.name.unwrap_or_default(),
+                    arguments: String::new(),
+                };
+                events.push(sse_json(
+                    "response.output_item.added",
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": call.id,
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "call_id": call.call_id,
+                            "name": call.name,
+                            "arguments": "",
+                        },
+                    }),
+                ));
+                self.calls.push(StreamedCall { call, output_index });
+            }
+            let Some(streamed) = self.calls.get_mut(fragment.index) else {
+                continue;
+            };
+            if fragment.function.arguments.is_empty() {
+                continue;
+            }
+            streamed
+                .call
+                .arguments
+                .push_str(&fragment.function.arguments);
+            events.push(sse_json(
+                "response.function_call_arguments.delta",
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": streamed.call.id,
+                    "output_index": streamed.output_index,
+                    "delta": fragment.function.arguments,
+                }),
+            ));
+        }
+        events
+    }
+
+    fn open_message(&mut self, events: &mut Vec<String>) -> usize {
+        if let Some(index) = self.message_index {
+            return index;
+        }
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        self.message_index = Some(index);
+        events.push(sse_json(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+        ));
+        events.push(sse_json(
+            "response.content_part.added",
+            &json!({
+                "type": "response.content_part.added",
+                "item_id": self.message_id,
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }),
+        ));
+        index
+    }
+
+    /// Flush the parser and close every open item. `final_text` replaces
+    /// the streamed text of an answer without tools (the engine's whole
+    /// answer). Returns the events, the output items in output order, and
+    /// the message text and calls to store.
+    fn finish(mut self, final_text: &str) -> FinishedOutput {
+        let mut events = match self.parser.as_mut().map(ToolCallParser::finish) {
+            Some(tail) => self.apply(tail),
+            None => Vec::new(),
+        };
+        if self.parser.is_none() && !final_text.is_empty() {
+            self.text = final_text.to_string();
+        }
+        if self.message_index.is_none() && self.calls.is_empty() {
+            self.open_message(&mut events);
+        }
+        let mut closing: Vec<(usize, ResponseOutputItem, Vec<String>)> = Vec::new();
+        if let Some(index) = self.message_index {
+            let message = assistant_output_item_with_id(self.message_id.clone(), self.text.clone());
+            closing.push((
+                index,
+                message.clone(),
+                vec![
+                    sse_json(
+                        "response.output_text.done",
+                        &json!({
+                            "type": "response.output_text.done",
+                            "item_id": self.message_id,
+                            "output_index": index,
+                            "content_index": 0,
+                            "text": self.text,
+                        }),
+                    ),
+                    sse_json(
+                        "response.content_part.done",
+                        &json!({
+                            "type": "response.content_part.done",
+                            "item_id": self.message_id,
+                            "output_index": index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": self.text, "annotations": []},
+                        }),
+                    ),
+                    sse_json(
+                        "response.output_item.done",
+                        &json!({
+                            "type": "response.output_item.done",
+                            "output_index": index,
+                            "item": {
+                                "id": self.message_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": self.text,
+                                    "annotations": [],
+                                }],
+                            },
+                        }),
+                    ),
+                ],
+            ));
+        }
+        for streamed in &self.calls {
+            let call = &streamed.call;
+            closing.push((
+                streamed.output_index,
+                function_call_item(call),
+                vec![
+                    sse_json(
+                        "response.function_call_arguments.done",
+                        &json!({
+                            "type": "response.function_call_arguments.done",
+                            "item_id": call.id,
+                            "output_index": streamed.output_index,
+                            "arguments": call.arguments,
+                        }),
+                    ),
+                    sse_json(
+                        "response.output_item.done",
+                        &json!({
+                            "type": "response.output_item.done",
+                            "output_index": streamed.output_index,
+                            "item": function_call_item(call),
+                        }),
+                    ),
+                ],
+            ));
+        }
+        closing.sort_by_key(|(index, ..)| *index);
+        let mut output = Vec::with_capacity(closing.len());
+        for (_, item, item_events) in closing {
+            output.push(item);
+            events.extend(item_events);
+        }
+        FinishedOutput {
+            events,
+            output,
+            text: self.message_index.map(|_| self.text),
+            calls: self
+                .calls
+                .into_iter()
+                .map(|streamed| streamed.call)
+                .collect(),
+        }
+    }
+}
+
+struct FinishedOutput {
+    events: Vec<String>,
+    output: Vec<ResponseOutputItem>,
+    text: Option<String>,
+    calls: Vec<StoredFunctionCall>,
+}
+
+/// The SSE events of a streamed response: created and in progress, the
+/// output items as they open and grow, their done events, and the terminal
+/// `response.completed` or `response.failed`, then `[DONE]`.
+fn response_event_stream(
+    state: AppState,
+    request: ResponseStreamRequest,
+    mut event_rx: mpsc::Receiver<ChatStreamEvent>,
+) -> impl Stream<Item = Result<String, Infallible>> {
+    // The body is polled after the handler returns, outside the request's
+    // error scope; capture it here.
+    let errors = ErrorScope::current();
+    async_stream::stream! {
+        let ResponseStreamRequest {
+            response_id,
+            created_at,
+            model,
+            metadata,
+            store,
+            tenant_scope,
+            input_items,
+            tool_format,
+        } = request;
+        let record = |status: &str,
+                      output_text: Option<String>,
+                      output_function_calls: Vec<StoredFunctionCall>,
+                      generation: Option<&ChatGeneration>,
+                      error: Option<String>| StoredResponseRecord {
+            id: response_id.clone(),
+            tenant_scope: tenant_scope.clone(),
+            created_at,
+            status: status.to_string(),
+            model: model.clone(),
+            input_items: input_items.clone(),
+            output_text,
+            output_function_calls,
+            input_tokens: generation.map_or(0, |generation| generation.prompt_tokens),
+            output_tokens: generation.map_or(0, |generation| generation.tokens_generated),
+            input_cached_tokens: generation
+                .and_then(|generation| generation.cached_prompt_tokens)
+                .unwrap_or(0),
+            error,
+            metadata: metadata.clone(),
+        };
         let created_response = ResponseObject {
-            id: response_id_for_task.clone(),
+            id: response_id.clone(),
             object: "response",
             created_at,
             status: "in_progress".to_string(),
-            model: model_name.clone(),
+            model: model.clone(),
             output: Vec::new(),
             usage: ResponseUsage {
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
-                input_tokens_details: ResponseInputTokensDetails {
-                    cached_tokens: 0,
-                },
+                input_tokens_details: ResponseInputTokensDetails { cached_tokens: 0 },
             },
             error: None,
             metadata: metadata.clone(),
         };
-        let created_event = ResponseStreamEnvelope::<ResponseStreamCreatedPayload> {
-            event_type: "response.created",
-            payload: ResponseStreamCreatedPayload {
-                response: created_response.clone(),
-            },
-        };
-        yield Ok::<_, Infallible>(sse_event(
+        yield Ok::<_, Infallible>(sse_json(
             "response.created",
-            &serde_json::to_string(&created_event).unwrap_or_default(),
+            &ResponseStreamEnvelope {
+                event_type: "response.created",
+                payload: ResponseStreamCreatedPayload {
+                    response: created_response.clone(),
+                },
+            },
         ));
-        let in_progress_event = serde_json::json!({
-            "type": "response.in_progress",
-            "response": created_response,
-        });
-        yield Ok::<_, Infallible>(sse_event(
+        yield Ok(sse_json(
             "response.in_progress",
-            &in_progress_event.to_string(),
-        ));
-        let output_item_added_event = serde_json::json!({
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "item": {
-                "id": message_id.clone(),
-                "type": "message",
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            }
-        });
-        yield Ok::<_, Infallible>(sse_event(
-            "response.output_item.added",
-            &output_item_added_event.to_string(),
-        ));
-        let content_part_added_event = serde_json::json!({
-            "type": "response.content_part.added",
-            "item_id": message_id.clone(),
-            "output_index": 0,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": "",
-                "annotations": []
-            }
-        });
-        yield Ok::<_, Infallible>(sse_event(
-            "response.content_part.added",
-            &content_part_added_event.to_string(),
+            &json!({"type": "response.in_progress", "response": created_response}),
         ));
 
-        let mut full_text = String::new();
+        let mut output = ResponseOutputStream::new(response_id.clone(), tool_format);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
-            let (payload, terminal) = match event {
-                ChatStreamEvent::Started => continue,
+            match event {
+                ChatStreamEvent::Started => {}
                 ChatStreamEvent::Delta { text, .. } => {
-                    full_text.push_str(&text);
-                    (
-                        serde_json::to_string(&ResponseStreamEnvelope {
-                            event_type: "response.output_text.delta",
-                            payload: ResponseStreamDeltaPayload {
-                                response_id: response_id_for_task.clone(),
-                                delta: text,
-                            },
-                        })
-                        .unwrap_or_default(),
-                        false,
-                    )
+                    for event in output.push(text) {
+                        yield Ok(event);
+                    }
                 }
                 ChatStreamEvent::Completed(generation) => {
-                    let output_text = if generation.text.is_empty() {
-                        full_text.clone()
-                    } else {
-                        generation.text.clone()
-                    };
+                    let finished = output.finish(&generation.text);
+                    for event in finished.events {
+                        yield Ok(event);
+                    }
                     let completed = ResponseObject {
-                        id: response_id_for_task.clone(),
+                        id: response_id.clone(),
                         object: "response",
                         created_at,
                         status: "completed".to_string(),
-                        model: model_name.clone(),
-                        output: vec![assistant_output_item_with_id(
-                            message_id.clone(),
-                            output_text.clone(),
-                        )],
+                        model: model.clone(),
+                        output: finished.output,
                         usage: ResponseUsage {
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
@@ -359,176 +769,67 @@ async fn create_streaming_response(
                         error: None,
                         metadata: metadata.clone(),
                     };
-
                     persist_response(
-                        &store_state,
-                        StoredResponseRecord {
-                            id: response_id_for_task.clone(),
-                            created_at,
-                            status: "completed".to_string(),
-                            model: model_name.clone(),
-                            input_items: input_items.clone(),
-                            output_text: Some(output_text.clone()),
-                            input_tokens: generation.prompt_tokens,
-                            output_tokens: generation.tokens_generated,
-                            input_cached_tokens: generation
-                                .cached_prompt_tokens
-                                .unwrap_or(0),
-                            error: None,
-                            metadata: metadata.clone(),
-                        },
-                        req.store,
+                        &state,
+                        record(
+                            "completed",
+                            finished.text,
+                            finished.calls,
+                            Some(generation.as_ref()),
+                            None,
+                        ),
+                        store,
                     )
                     .await;
-
-                    let output_text_done_event = serde_json::json!({
-                        "type": "response.output_text.done",
-                        "item_id": message_id.clone(),
-                        "output_index": 0,
-                        "content_index": 0,
-                        "text": output_text,
-                    });
-                    yield Ok::<_, Infallible>(sse_event(
-                        "response.output_text.done",
-                        &output_text_done_event.to_string(),
-                    ));
-                    let content_part_done_event = serde_json::json!({
-                        "type": "response.content_part.done",
-                        "item_id": message_id.clone(),
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": {
-                            "type": "output_text",
-                            "text": completed.output[0].content[0].text,
-                            "annotations": []
-                        }
-                    });
-                    yield Ok::<_, Infallible>(sse_event(
-                        "response.content_part.done",
-                        &content_part_done_event.to_string(),
-                    ));
-                    let output_item_done_event = serde_json::json!({
-                        "type": "response.output_item.done",
-                        "output_index": 0,
-                        "item": {
-                            "id": message_id,
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": completed.output[0].content[0].text,
-                                "annotations": []
-                            }]
-                        }
-                    });
-                    yield Ok::<_, Infallible>(sse_event(
-                        "response.output_item.done",
-                        &output_item_done_event.to_string(),
-                    ));
-
-                    let payload = serde_json::to_string(&ResponseStreamEnvelope {
-                        event_type: "response.completed",
-                        payload: ResponseStreamCompletedPayload {
-                            response: completed,
+                    yield Ok(sse_json(
+                        "response.completed",
+                        &ResponseStreamEnvelope {
+                            event_type: "response.completed",
+                            payload: ResponseStreamCompletedPayload { response: completed },
                         },
-                    })
-                    .unwrap_or_default();
-                    (payload, true)
+                    ));
+                    saw_terminal = true;
+                    break;
                 }
                 ChatStreamEvent::Failed(error) => {
-                    let failed = response_stream_failure_payload(&response_id_for_task, error);
                     persist_response(
-                        &store_state,
-                        StoredResponseRecord {
-                            id: response_id_for_task.clone(),
-                            created_at,
-                            status: "failed".to_string(),
-                            model: model_name.clone(),
-                            input_items: input_items.clone(),
-                            output_text: None,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            input_cached_tokens: 0,
-                            error: Some("Response generation failed".to_string()),
-                            metadata: metadata.clone(),
-                        },
-                        req.store,
+                        &state,
+                        record(
+                            "failed",
+                            None,
+                            Vec::new(),
+                            None,
+                            Some("Response generation failed".to_string()),
+                        ),
+                        store,
                     )
                     .await;
-                    (failed, true)
+                    yield Ok(sse_event(
+                        "response.failed",
+                        &response_stream_failure_payload(&response_id, errors.client_message(&error)),
+                    ));
+                    saw_terminal = true;
+                    break;
                 }
-                ChatStreamEvent::ShuttingDown => {
-                    let failed = response_stream_failure_payload(
-                        &response_id_for_task,
-                        "Server is shutting down",
-                    );
-                    persist_response(
-                        &store_state,
-                        StoredResponseRecord {
-                            id: response_id_for_task.clone(),
-                            created_at,
-                            status: "failed".to_string(),
-                            model: model_name.clone(),
-                            input_items: input_items.clone(),
-                            output_text: None,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            input_cached_tokens: 0,
-                            error: Some("Server is shutting down".to_string()),
-                            metadata: metadata.clone(),
-                        },
-                        req.store,
-                    )
-                    .await;
-                    (failed, true)
-                }
-            };
-            let event_type = match serde_json::from_str::<serde_json::Value>(&payload)
-                .ok()
-                .and_then(|value| value.get("type").and_then(|value| value.as_str()).map(str::to_string))
-            {
-                Some(value) => value,
-                None => "response.event".to_string(),
-            };
-            yield Ok::<_, Infallible>(sse_event(&event_type, &payload));
-            if terminal {
-                saw_terminal = true;
-                break;
             }
         }
-        if let Some(payload) =
-            response_stream_interruption_payload(&response_id_for_task, saw_terminal)
-        {
+        if let Some(payload) = response_stream_interruption_payload(&response_id, saw_terminal) {
             persist_response(
-                &store_state,
-                StoredResponseRecord {
-                    id: response_id_for_task.clone(),
-                    created_at,
-                    status: "failed".to_string(),
-                    model: model_name.clone(),
-                    input_items: input_items.clone(),
-                    output_text: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    input_cached_tokens: 0,
-                    error: Some(RESPONSE_STREAM_INTERRUPTED_ERROR.to_string()),
-                    metadata: metadata.clone(),
-                },
-                req.store,
+                &state,
+                record(
+                    "failed",
+                    None,
+                    Vec::new(),
+                    None,
+                    Some(RESPONSE_STREAM_INTERRUPTED_ERROR.to_string()),
+                ),
+                store,
             )
             .await;
-            yield Ok::<_, Infallible>(sse_event("response.failed", &payload));
+            yield Ok(sse_event("response.failed", &payload));
         }
-        yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
-    };
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap())
+        yield Ok("data: [DONE]\n\n".to_string());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,17 +845,13 @@ struct NormalizedInputItem {
     role: String,
     display_content: String,
     runtime_content: String,
-    is_tool: bool,
     media_inputs: Vec<ChatMediaInput>,
 }
 
 fn build_input_messages(
-    _model_variant: ModelVariant,
+    model_variant: ModelVariant,
     instructions: Option<&str>,
     input: Option<ResponseInput>,
-    _enable_thinking: Option<bool>,
-    _tools: Option<Vec<serde_json::Value>>,
-    _tool_choice: Option<serde_json::Value>,
 ) -> Result<
     (
         Vec<ChatMessage>,
@@ -576,27 +873,70 @@ fn build_input_messages(
             stored.push(StoredResponseInputItem {
                 role: "system".to_string(),
                 content: instructions.to_string(),
+                item: None,
             });
         }
     }
 
-    let input_items = match input {
+    let items = match input {
         None => Vec::new(),
-        Some(ResponseInput::Text(text)) => vec![NormalizedInputItem {
-            role: "user".to_string(),
-            display_content: text.clone(),
-            runtime_content: text,
-            is_tool: false,
-            media_inputs: Vec::new(),
+        Some(ResponseInput::Text(text)) => vec![super::dto::ResponseInputItem {
+            role: Some("user".to_string()),
+            content: Some(crate::api::openai::convert::InboundContent::Text(text)),
+            ..Default::default()
         }],
-        Some(ResponseInput::One(item)) => vec![normalize_input_item(item)?],
-        Some(ResponseInput::Many(items)) => items
-            .into_iter()
-            .map(normalize_input_item)
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(ResponseInput::One(item)) => vec![item],
+        Some(ResponseInput::Many(items)) => items,
     };
 
-    for item in input_items {
+    // Consecutive `function_call` items are one assistant turn, written
+    // after the text of an assistant message right before them.
+    let mut pending_calls = Vec::new();
+    let mut previous_was_assistant_message = false;
+    for item in items {
+        match item.item_type.as_deref() {
+            Some("function_call") => {
+                let (call, raw) = function_call_input(&item)?;
+                pending_calls.push(call);
+                stored.push(StoredResponseInputItem {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    item: Some(raw),
+                });
+                continue;
+            }
+            Some("function_call_output") => {
+                flush_function_calls(
+                    model_variant,
+                    &mut messages,
+                    &mut pending_calls,
+                    previous_was_assistant_message,
+                )?;
+                previous_was_assistant_message = false;
+                let (output, raw) = function_call_output_input(&item)?;
+                messages.push(tool_result_message(model_variant, output.clone()));
+                stored.push(StoredResponseInputItem {
+                    role: "tool".to_string(),
+                    content: output,
+                    item: Some(raw),
+                });
+                continue;
+            }
+            None | Some("message") => {}
+            Some(other) => {
+                return Err(ApiError::invalid_param(
+                    "input",
+                    format!("Unsupported response input item type `{other}`"),
+                ));
+            }
+        }
+        flush_function_calls(
+            model_variant,
+            &mut messages,
+            &mut pending_calls,
+            previous_was_assistant_message,
+        )?;
+        let item = normalize_input_item(model_variant, item)?;
         let role = item.role.clone();
         let parsed_role = parse_input_role(&role)?;
         if item.runtime_content.trim().is_empty() && item.media_inputs.is_empty() {
@@ -605,68 +945,140 @@ fn build_input_messages(
             ));
         }
         media_inputs.extend(item.media_inputs.clone());
+        previous_was_assistant_message = parsed_role == ResponseInboundRole::Assistant;
 
-        match parsed_role {
+        let message = match parsed_role {
             ResponseInboundRole::System => {
                 if !item.media_inputs.is_empty() {
                     return Err(ApiError::bad_request(
                         "System response input items cannot contain images or videos",
                     ));
                 }
-                messages.push(ChatMessage {
+                ChatMessage {
                     role: ChatRole::System,
                     content: item.runtime_content.clone(),
-                });
-                stored.push(StoredResponseInputItem {
-                    role,
-                    content: item.display_content,
-                });
+                }
             }
-            ResponseInboundRole::User => {
-                messages.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: item.runtime_content.clone(),
-                });
-                stored.push(StoredResponseInputItem {
-                    role,
-                    content: item.display_content,
-                });
-            }
-            ResponseInboundRole::Assistant => {
-                messages.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: item.runtime_content.clone(),
-                });
-                stored.push(StoredResponseInputItem {
-                    role,
-                    content: item.display_content,
-                });
-            }
+            ResponseInboundRole::User => ChatMessage {
+                role: ChatRole::User,
+                content: item.runtime_content.clone(),
+            },
+            ResponseInboundRole::Assistant => ChatMessage {
+                role: ChatRole::Assistant,
+                content: item.runtime_content.clone(),
+            },
             ResponseInboundRole::Tool => {
-                let wrapped = if item.is_tool {
-                    format!(
-                        "<tool_response>\n{}\n</tool_response>",
-                        item.runtime_content.trim()
-                    )
-                } else {
-                    item.runtime_content.clone()
-                };
-                messages.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: wrapped,
-                });
-                stored.push(StoredResponseInputItem {
-                    role,
-                    content: item.display_content,
-                });
+                tool_result_message(model_variant, item.runtime_content.clone())
             }
-        }
+        };
+        messages.push(message);
+        stored.push(StoredResponseInputItem {
+            role,
+            content: item.display_content,
+            item: None,
+        });
     }
+    flush_function_calls(
+        model_variant,
+        &mut messages,
+        &mut pending_calls,
+        previous_was_assistant_message,
+    )?;
 
     Ok((messages, stored, media_inputs))
 }
 
+/// Write `pending` calls as an assistant turn: onto the assistant message
+/// they follow, or as a turn of their own.
+fn flush_function_calls(
+    variant: ModelVariant,
+    messages: &mut Vec<ChatMessage>,
+    pending: &mut Vec<Value>,
+    after_assistant_message: bool,
+) -> Result<(), ApiError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let calls = std::mem::take(pending);
+    match messages.last_mut() {
+        Some(last) if after_assistant_message => {
+            append_assistant_tool_calls(variant, &mut last.content, &calls)
+        }
+        _ => {
+            let mut content = String::new();
+            append_assistant_tool_calls(variant, &mut content, &calls)?;
+            messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// A `function_call` input item as a chat completions tool call, and as
+/// the item to list back.
+fn function_call_input(item: &super::dto::ResponseInputItem) -> Result<(Value, Value), ApiError> {
+    let name = item
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            ApiError::invalid_param("input", "A `function_call` input item needs a `name`")
+        })?;
+    let arguments = match &item.arguments {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(arguments)) => arguments.clone(),
+        Some(other) => other.to_string(),
+    };
+    let call_id = item.call_id.clone().unwrap_or_default();
+    Ok((
+        json!({
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }),
+        json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }),
+    ))
+}
+
+/// A `function_call_output` input item's result text, and the item to
+/// list back. Content parts contribute their text.
+fn function_call_output_input(
+    item: &super::dto::ResponseInputItem,
+) -> Result<(String, Value), ApiError> {
+    let output = match &item.output {
+        Some(Value::String(output)) => output.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => {
+            return Err(ApiError::invalid_param(
+                "input",
+                "A `function_call_output` input item needs an `output` string",
+            ))
+        }
+    };
+    Ok((
+        output.clone(),
+        json!({
+            "type": "function_call_output",
+            "call_id": item.call_id.clone().unwrap_or_default(),
+            "output": output,
+        }),
+    ))
+}
+
 fn normalize_input_item(
+    variant: ModelVariant,
     item: super::dto::ResponseInputItem,
 ) -> Result<NormalizedInputItem, ApiError> {
     let role = item
@@ -677,19 +1089,9 @@ fn normalize_input_item(
 
     let flattened = flatten_content(item.content)?;
     let mut runtime_content = flattened.runtime_text.clone();
-    if role == "assistant"
-        && item
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-    {
-        let tool_xml = render_tool_calls_xml(item.tool_calls.as_deref().unwrap_or(&[]))?;
-        if !tool_xml.is_empty() {
-            if !runtime_content.trim().is_empty() {
-                runtime_content.push_str("\n\n");
-            }
-            runtime_content.push_str(&tool_xml);
-        }
+    if role == "assistant" {
+        let tool_calls = item.tool_calls.as_deref().unwrap_or(&[]);
+        append_assistant_tool_calls(variant, &mut runtime_content, tool_calls)?;
     }
 
     if runtime_content.trim().is_empty() && !flattened.has_media() {
@@ -702,25 +1104,8 @@ fn normalize_input_item(
         role: role.clone(),
         display_content: flattened.display_text,
         runtime_content,
-        is_tool: role == "tool",
         media_inputs: flattened.media_inputs,
     })
-}
-
-fn flatten_content(
-    content: Option<ResponseInputContent>,
-) -> Result<FlattenedMultimodalContent, ApiError> {
-    match content {
-        None => Ok(FlattenedMultimodalContent::default()),
-        Some(ResponseInputContent::Text(text)) => Ok(FlattenedMultimodalContent {
-            display_text: text.clone(),
-            runtime_text: text,
-            media_inputs: Vec::new(),
-        }),
-        Some(ResponseInputContent::Parts(parts)) => {
-            flatten_content_parts(&content_parts_to_values(&parts)?).map_err(ApiError::bad_request)
-        }
-    }
 }
 
 fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
@@ -736,98 +1121,9 @@ fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
     }
 }
 
-fn content_parts_to_values(
-    parts: &[super::dto::ResponseInputContentPart],
-) -> Result<Vec<serde_json::Value>, ApiError> {
-    parts
-        .iter()
-        .map(|part| serde_json::to_value(part).map_err(|err| ApiError::internal(err.to_string())))
-        .collect()
-}
-
-fn render_tool_calls_xml(tool_calls: &[serde_json::Value]) -> Result<String, ApiError> {
-    let mut rendered = Vec::with_capacity(tool_calls.len());
-
-    for tool_call in tool_calls {
-        let function_obj = tool_call.get("function").unwrap_or(tool_call);
-        let name = function_obj
-            .get("name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
-
-        let args = normalize_tool_call_arguments(function_obj.get("arguments"));
-        let mut block = String::new();
-        block.push_str("<tool_call>\n");
-        block.push_str(&format!("<function={name}>\n"));
-
-        let mut keys: Vec<String> = args.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let value = args.get(&key).cloned().unwrap_or(serde_json::Value::Null);
-            block.push_str(&format!("<parameter={key}>\n"));
-            block.push_str(&tool_parameter_text(&value));
-            block.push_str("\n</parameter>\n");
-        }
-
-        block.push_str("</function>\n</tool_call>");
-        rendered.push(block);
-    }
-
-    Ok(rendered.join("\n"))
-}
-
-fn normalize_tool_call_arguments(
-    raw: Option<&serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    match raw {
-        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
-        Some(serde_json::Value::Object(map)) => map.clone(),
-        Some(serde_json::Value::String(raw_string)) => {
-            match serde_json::from_str::<serde_json::Value>(raw_string) {
-                Ok(serde_json::Value::Object(map)) => map,
-                Ok(value) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("arguments".to_string(), value);
-                    map
-                }
-                Err(_) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert(
-                        "arguments".to_string(),
-                        serde_json::Value::String(raw_string.clone()),
-                    );
-                    map
-                }
-            }
-        }
-        Some(value) => {
-            let mut map = serde_json::Map::new();
-            map.insert("arguments".to_string(), value.clone());
-            map
-        }
-    }
-}
-
-fn tool_parameter_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-        }
-        _ => value.to_string(),
-    }
-}
-
-fn assistant_output_item(text: String) -> ResponseOutputItem {
-    assistant_output_item_with_id(new_uuid(), text)
-}
-
 fn assistant_output_item_with_id(id: String, text: String) -> ResponseOutputItem {
-    ResponseOutputItem {
+    ResponseOutputItem::Message {
         id,
-        item_type: "message",
         role: "assistant",
         content: vec![ResponseOutputContent {
             content_type: "output_text",
@@ -843,11 +1139,15 @@ fn record_to_response(record: StoredResponseRecord) -> ResponseObject {
         created_at: record.created_at,
         status: record.status.clone(),
         model: record.model,
-        output: record
-            .output_text
-            .map(assistant_output_item)
-            .into_iter()
-            .collect(),
+        output: if record.output_text.is_none() && record.output_function_calls.is_empty() {
+            Vec::new()
+        } else {
+            output_items(
+                new_prefixed_id("msg_"),
+                record.output_text,
+                &record.output_function_calls,
+            )
+        },
         usage: ResponseUsage {
             input_tokens: record.input_tokens,
             output_tokens: record.output_tokens,
@@ -883,10 +1183,18 @@ fn sse_event(event_name: &str, payload: &str) -> String {
     format!("event: {event_name}\ndata: {payload}\n\n")
 }
 
+fn sse_json(event_name: &str, payload: &impl serde::Serialize) -> String {
+    sse_event(
+        event_name,
+        &serde_json::to_string(payload).unwrap_or_default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::dto::{ResponseInputContentPart, ResponseInputItem};
+    use super::super::dto::ResponseInputItem;
     use super::*;
+    use crate::api::openai::convert::{InboundContent, InboundContentPart};
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
@@ -918,11 +1226,13 @@ mod tests {
     fn stored_record_usage_reports_openai_shaped_cached_tokens() {
         let record = StoredResponseRecord {
             id: "resp_cached".to_string(),
+            tenant_scope: String::new(),
             created_at: 0,
             status: "completed".to_string(),
             model: "test".to_string(),
             input_items: Vec::new(),
             output_text: Some("done".to_string()),
+            output_function_calls: Vec::new(),
             input_tokens: 12,
             output_tokens: 3,
             input_cached_tokens: 7,
@@ -940,9 +1250,6 @@ mod tests {
             ModelVariant::Qwen359BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
-            None,
-            None,
-            None,
         )
         .expect("build input messages");
 
@@ -954,111 +1261,15 @@ mod tests {
     }
 
     #[test]
-    fn flattens_part_content() {
-        let flattened = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("input_text".to_string()),
-                text: None,
-                input_text: Some("part1".to_string()),
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("text".to_string()),
-                text: Some("part2".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten");
-        assert_eq!(flattened.runtime_text, "part1part2");
-        assert!(!flattened.has_media());
-    }
-
-    #[test]
-    fn flattens_multimodal_parts_without_inlining_tokens() {
-        let flattened = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("text".to_string()),
-                text: Some("Look ".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({"url":"https://example.com/img.png"})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("video".to_string()),
-                text: None,
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: Some(json!({"url":"https://example.com/clip.mp4"})),
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten");
-        assert_eq!(flattened.display_text, "Look ");
-        assert!(flattened.runtime_text.contains("<|image_pad|>"));
-        assert!(flattened.runtime_text.contains("<|video_pad|>"));
-        assert_eq!(flattened.media_inputs.len(), 2);
-    }
-
-    #[test]
-    fn flatten_content_rejects_multimodal_part_without_source() {
-        let err = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect_err("missing source should fail");
-
-        assert!(err.message.contains("missing a usable"));
-    }
-
-    #[test]
     fn normalizes_input_item_default_role() {
         let item = ResponseInputItem {
             role: None,
-            content: Some(ResponseInputContent::Text("hello".to_string())),
-            tool_calls: None,
+            content: Some(InboundContent::Text("hello".to_string())),
+            ..Default::default()
         };
-        let normalized = normalize_input_item(item).expect("normalize");
+        let normalized = normalize_input_item(ModelVariant::Qwen359BGguf, item).expect("normalize");
         assert_eq!(normalized.role, "user");
         assert_eq!(normalized.runtime_content, "hello");
-        assert!(!normalized.is_tool);
         assert!(normalized.media_inputs.is_empty());
     }
 
@@ -1074,17 +1285,53 @@ mod tests {
                     "arguments": "{\"city\":\"Harare\"}"
                 }
             })]),
+            ..Default::default()
         };
 
-        let normalized = normalize_input_item(item).expect("normalize tool call");
+        let normalized =
+            normalize_input_item(ModelVariant::Qwen359BGguf, item).expect("normalize tool call");
         assert_eq!(normalized.role, "assistant");
-        assert!(!normalized.is_tool);
         assert!(normalized.media_inputs.is_empty());
         assert!(normalized.runtime_content.contains("<tool_call>"));
         assert!(normalized
             .runtime_content
             .contains("<function=get_weather>"));
         assert!(normalized.runtime_content.contains("<parameter=city>"));
+    }
+
+    /// Responses renders tool turns in the model family's format, as chat
+    /// completions does.
+    #[test]
+    fn lfm25_tool_turns_use_the_lfm_wire_format() {
+        let item = |role: &str, content: Option<&str>, tool_calls| ResponseInputItem {
+            role: Some(role.to_string()),
+            content: content.map(|text| InboundContent::Text(text.to_string())),
+            tool_calls,
+            ..Default::default()
+        };
+        let (messages, _, _) = build_input_messages(
+            ModelVariant::Lfm2512BInstructGguf,
+            None,
+            Some(ResponseInput::Many(vec![
+                item("user", Some("Weather in Paris?"), None),
+                item(
+                    "assistant",
+                    None,
+                    Some(vec![json!({
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    })]),
+                ),
+                item("tool", Some("{\"temperature_c\": 21}"), None),
+            ])),
+        )
+        .expect("tool turns normalize");
+        assert_eq!(
+            messages[1].content,
+            "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
+        );
+        assert_eq!(messages[2].role, ChatRole::Tool);
+        assert_eq!(messages[2].content, "{\"temperature_c\": 21}");
     }
 
     #[test]
@@ -1094,24 +1341,19 @@ mod tests {
             None,
             Some(ResponseInput::Many(vec![ResponseInputItem {
                 role: Some("user".to_string()),
-                content: Some(ResponseInputContent::Parts(vec![
-                    ResponseInputContentPart {
-                        kind: Some("image_url".to_string()),
-                        text: None,
-                        input_text: None,
-                        image_url: Some(json!({"url":"https://example.com/img.png"})),
-                        input_image: None,
-                        image: None,
-                        video: None,
-                        video_url: None,
-                        input_video: None,
-                    },
-                ])),
-                tool_calls: None,
+                content: Some(InboundContent::Parts(vec![InboundContentPart {
+                    kind: Some("image_url".to_string()),
+                    text: None,
+                    input_text: None,
+                    image_url: Some(json!({"url":"https://example.com/img.png"})),
+                    input_image: None,
+                    image: None,
+                    video: None,
+                    video_url: None,
+                    input_video: None,
+                }])),
+                ..Default::default()
             }])),
-            None,
-            None,
-            None,
         )
         .expect("multimodal input should normalize");
 
@@ -1137,12 +1379,15 @@ mod tests {
     #[test]
     fn assistant_output_item_with_id_preserves_message_id() {
         let item = assistant_output_item_with_id("msg_custom".to_string(), "hello".to_string());
-        assert_eq!(item.id, "msg_custom");
-        assert_eq!(item.item_type, "message");
-        assert_eq!(item.role, "assistant");
-        assert_eq!(item.content.len(), 1);
-        assert_eq!(item.content[0].content_type, "output_text");
-        assert_eq!(item.content[0].text, "hello");
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            json!({
+                "type": "message",
+                "id": "msg_custom",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            })
+        );
     }
 
     #[tokio::test]
@@ -1163,14 +1408,326 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stored_responses_are_visible_only_to_the_owning_tenant() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("responses_tenant_scope");
+        let context = |tenant: &str| {
+            let mut principal = izwi_hooks::Principal::local_anonymous();
+            principal.id = format!("user-{tenant}");
+            principal.tenant_id = Some(tenant.to_string());
+            Extension(RequestContext::new("test".to_string(), principal))
+        };
+        let (owner, other) = (context("tenant-a"), context("tenant-b"));
+        let mut record = response_record("resp-a");
+        record.status = "in_progress".to_string();
+        record.tenant_scope = owner.0.tenant_scope();
+        state.store_response_record(record).await;
+        let id = || Path("resp-a".to_string());
+        let status = |err: ApiError| err.status;
+
+        let get = get_response(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(get.err().map(status), Some(StatusCode::NOT_FOUND));
+        let items = list_response_input_items(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(items.err().map(status), Some(StatusCode::NOT_FOUND));
+        let cancel = cancel_response(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(cancel.err().map(status), Some(StatusCode::NOT_FOUND));
+        let delete = delete_response(State(state.clone()), other, id()).await;
+        assert_eq!(delete.err().map(status), Some(StatusCode::NOT_FOUND));
+        assert_eq!(
+            state.response_store.read().await["resp-a"].status,
+            "in_progress",
+            "another tenant must not cancel or delete the record"
+        );
+
+        assert!(get_response(State(state.clone()), owner.clone(), id())
+            .await
+            .is_ok());
+        assert!(delete_response(State(state.clone()), owner.clone(), id())
+            .await
+            .is_ok());
+        assert!(state.response_store.read().await.is_empty());
+    }
+
+    const QWEN_CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+
+    fn generation(text: &str) -> ChatGeneration {
+        ChatGeneration {
+            latency_breakdown: None,
+            finish_reason: None,
+            text: text.to_string(),
+            prompt_tokens: 3,
+            tokens_generated: 5,
+            generation_time_ms: 0.0,
+            cached_prompt_tokens: None,
+            logprobs: Vec::new(),
+        }
+    }
+
+    /// The `data:` payloads of the stream `events` render to.
+    async fn stream_payloads(
+        state: &AppState,
+        tool_format: Option<ToolCallFormat>,
+        events: Vec<ChatStreamEvent>,
+    ) -> Vec<serde_json::Value> {
+        use futures::StreamExt;
+        let (tx, rx) = mpsc::channel(events.len().max(1));
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let request = ResponseStreamRequest {
+            response_id: "resp_test".to_string(),
+            created_at: 0,
+            model: "test".to_string(),
+            metadata: None,
+            store: None,
+            tenant_scope: String::new(),
+            input_items: Vec::new(),
+            tool_format,
+        };
+        let chunks: Vec<String> = response_event_stream(state.clone(), request, rx)
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    fn event_types(payloads: &[serde_json::Value]) -> Vec<&str> {
+        payloads
+            .iter()
+            .map(|payload| payload["type"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A tool call in the answer is a `function_call` output item, streamed
+    /// with its own events, never text.
+    #[tokio::test]
+    async fn streamed_tool_calls_become_function_call_items() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("responses_function_call_stream");
+        let answer = format!("Let me check. {QWEN_CALL}");
+        let payloads = stream_payloads(
+            &state,
+            Some(ToolCallFormat::QwenXml),
+            vec![
+                ChatStreamEvent::Started,
+                ChatStreamEvent::Delta {
+                    text: "Let me check. ".to_string(),
+                    logprobs: Vec::new(),
+                },
+                ChatStreamEvent::Delta {
+                    text: QWEN_CALL.to_string(),
+                    logprobs: Vec::new(),
+                },
+                ChatStreamEvent::Completed(Box::new(generation(&answer))),
+            ],
+        )
+        .await;
+        assert_eq!(
+            event_types(&payloads),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for payload in &payloads {
+            assert!(
+                !payload.to_string().contains("<tool_call>"),
+                "markup leaked: {payload}"
+            );
+        }
+        let call_added = &payloads[5];
+        assert_eq!(call_added["output_index"], 1);
+        assert_eq!(call_added["item"]["type"], "function_call");
+        assert_eq!(call_added["item"]["name"], "get_weather");
+        let arguments = payloads[10]["arguments"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
+            json!({"city": "Paris"})
+        );
+
+        let output = &payloads.last().unwrap()["response"]["output"];
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Let me check.");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["status"], "completed");
+        assert_eq!(output[1]["arguments"], arguments);
+        let call_id = output[1]["call_id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_"), "{call_id}");
+
+        // The stored response lists the same call.
+        let stored = record_to_response(state.response_store.read().await["resp_test"].clone());
+        assert_eq!(
+            serde_json::to_value(&stored.output).unwrap()[1]["call_id"],
+            call_id
+        );
+    }
+
+    /// Without tools the stream is the plain message sequence.
+    #[tokio::test]
+    async fn streamed_text_without_tools_is_one_message() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("responses_text_stream");
+        let payloads = stream_payloads(
+            &state,
+            None,
+            vec![
+                ChatStreamEvent::Started,
+                ChatStreamEvent::Delta {
+                    text: "Hello".to_string(),
+                    logprobs: Vec::new(),
+                },
+                ChatStreamEvent::Completed(Box::new(generation("Hello"))),
+            ],
+        )
+        .await;
+        assert_eq!(
+            event_types(&payloads),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(payloads[4]["delta"], "Hello");
+        assert_eq!(payloads[4]["output_index"], 0);
+        let output = &payloads.last().unwrap()["response"]["output"];
+        assert_eq!(output.as_array().unwrap().len(), 1);
+        assert_eq!(output[0]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn whole_answers_split_into_text_and_function_calls() {
+        let (text, calls) = answer_output(Some(ToolCallFormat::QwenXml), QWEN_CALL.to_string());
+        assert_eq!(text, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        let output = output_items("msg_x".to_string(), text, &calls);
+        assert_eq!(output.len(), 1, "a call-only answer has no message item");
+        let (text, calls) = answer_output(None, QWEN_CALL.to_string());
+        assert_eq!(text.as_deref(), Some(QWEN_CALL));
+        assert!(calls.is_empty());
+    }
+
+    /// `function_call` input items become the assistant turn that made them
+    /// (after an assistant message right before them), and
+    /// `function_call_output` items become tool results.
+    #[test]
+    fn function_call_input_items_render_the_tool_turns() {
+        let input = serde_json::from_value::<ResponseInput>(json!([
+            {"role": "user", "content": "Weather in Paris and Rome?"},
+            {"role": "assistant", "content": "Checking both."},
+            {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+             "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call", "call_id": "call_2", "name": "get_weather",
+             "arguments": "{\"city\":\"Rome\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "21C"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "25C"},
+        ]))
+        .unwrap();
+        let (messages, stored, _) =
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input)).unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, ChatRole::Assistant);
+        assert!(messages[1]
+            .content
+            .starts_with("Checking both.\n\n<tool_call>"));
+        assert_eq!(
+            messages[1]
+                .content
+                .matches("<function=get_weather>")
+                .count(),
+            2
+        );
+        assert!(messages[1].content.contains("Rome"));
+        assert_eq!(messages[2].role, ChatRole::User);
+        assert!(messages[2].content.contains("<tool_response>\n21C"));
+        assert!(messages[3].content.contains("25C"));
+        assert_eq!(stored.len(), 6);
+        assert_eq!(stored[2].item.as_ref().unwrap()["type"], "function_call");
+        assert_eq!(stored[4].item.as_ref().unwrap()["call_id"], "call_1");
+
+        // Calls with no message before them are a turn of their own.
+        let input = serde_json::from_value::<ResponseInput>(json!([
+            {"role": "user", "content": "Weather?"},
+            {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "21C"},
+        ]))
+        .unwrap();
+        let (messages, _, _) =
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input)).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[1].content.starts_with("<tool_call>"));
+
+        let unknown = serde_json::from_value::<ResponseInput>(json!([
+            {"type": "web_search_call", "id": "ws_1"}
+        ]))
+        .unwrap();
+        assert!(build_input_messages(ModelVariant::Qwen359BGguf, None, Some(unknown)).is_err());
+    }
+
+    /// Responses' flat function tools and named tool choice read like
+    /// chat completions' nested ones.
+    #[test]
+    fn flat_function_tools_are_accepted() {
+        let flat = json!({"type": "function", "name": "get_weather",
+                          "parameters": {"type": "object"}});
+        assert_eq!(
+            chat_completions_function(&flat),
+            json!({"type": "function", "function": {
+                "name": "get_weather", "parameters": {"type": "object"}}})
+        );
+        let nested = json!({"type": "function", "function": {"name": "get_weather"}});
+        assert_eq!(chat_completions_function(&nested), nested);
+        let policy = resolve_tool_policy(
+            ModelVariant::Qwen359BGguf,
+            Some(&[chat_completions_function(&flat)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(policy.format, Some(ToolCallFormat::QwenXml));
+        let named = chat_completions_function(&json!({"type": "function", "name": "get_weather"}));
+        assert_eq!(
+            resolve_tool_policy(ModelVariant::Qwen359BGguf, Some(&[nested]), Some(&named))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     fn response_record(id: &str) -> StoredResponseRecord {
         StoredResponseRecord {
             id: id.to_string(),
+            tenant_scope: String::new(),
             created_at: now_unix_secs(),
             status: "completed".to_string(),
             model: "test".to_string(),
             input_items: Vec::new(),
             output_text: Some("ok".to_string()),
+            output_function_calls: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
             input_cached_tokens: 0,

@@ -86,7 +86,7 @@ const MAX_MTP_DRAFT_TOKENS: usize = 3;
 /// (`IZWI_QWEN38_DECODE_QUANTUM`, 1-64; 1 is one token per step).
 pub(crate) const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN38_DECODE_QUANTUM";
 const DEFAULT_DECODE_QUANTUM: usize = 8;
-/// Kill switch for pipelined graph decode (`legacy`, `off`, `0`, `false`):
+/// Kill switch for pipelined graph decode (a false value or `legacy`):
 /// a graph-decode quantum then runs its steps one at a time.
 pub(crate) const DECODE_PIPELINE_ENV: &str = "IZWI_QWEN38_DECODE_PIPELINE";
 /// Qwen3.8-only kill switch for cross-turn prefix reuse (`0`, `false`, `no`,
@@ -97,14 +97,10 @@ pub(crate) const PREFIX_REUSE_ENV: &str = "IZWI_QWEN38_PREFIX_REUSE";
 /// Strict boolean for [`PREFIX_REUSE_ENV`]; unset keeps the registry's
 /// decision.
 fn qwen38_prefix_reuse_switch(raw: Option<&str>) -> Result<bool> {
-    match raw.map(str::trim).map(str::to_ascii_lowercase) {
-        None => Ok(true),
-        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => Ok(true),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => Ok(false),
-        Some(value) => Err(Error::ConfigError(format!(
-            "{PREFIX_REUSE_ENV} must be a boolean, got `{value}`"
-        ))),
-    }
+    raw.map_or(Ok(true), |value| {
+        izwi_env::parse_bool(PREFIX_REUSE_ENV, value)
+            .map_err(|error| Error::ConfigError(error.to_string()))
+    })
 }
 
 /// How the load decided cross-turn prefix reuse, and the prefills since:
@@ -155,8 +151,18 @@ impl Qwen38PrefixReuse {
     }
 }
 
+/// [`DECODE_QUANTUM_ENV`], read once.
+static DECODE_QUANTUM: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+    decode_quantum_from(crate::env::value(DECODE_QUANTUM_ENV).as_deref())
+});
+
+/// [`DECODE_PIPELINE_ENV`] asks for step-by-step graph decode; read once.
+static DECODE_PIPELINE_OFF: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+    crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV)
+});
+
 fn decode_quantum_tokens() -> usize {
-    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+    DECODE_QUANTUM.get()
 }
 
 fn decode_quantum_from(value: Option<&str>) -> usize {
@@ -234,21 +240,16 @@ pub(crate) enum Qwen38MtpPolicy {
 impl Qwen38MtpPolicy {
     fn from_process_environment() -> Result<Self> {
         Self::resolve(
-            std::env::var(MTP_ENABLED_ENV).ok().as_deref(),
-            std::env::var(MTP_DRAFT_TOKENS_ENV).ok().as_deref(),
+            crate::env::value(MTP_ENABLED_ENV).as_deref(),
+            crate::env::value(MTP_DRAFT_TOKENS_ENV).as_deref(),
         )
     }
 
     fn resolve(enabled: Option<&str>, draft_tokens: Option<&str>) -> Result<Self> {
-        let enabled = match enabled.map(str::trim).map(str::to_ascii_lowercase) {
+        let enabled = match enabled {
             None => DEFAULT_MTP_ENABLED,
-            Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
-            Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
-            Some(value) => {
-                return Err(Error::ConfigError(format!(
-                    "{MTP_ENABLED_ENV} must be a boolean, got `{value}`"
-                )))
-            }
+            Some(value) => izwi_env::parse_bool(MTP_ENABLED_ENV, value)
+                .map_err(|error| Error::ConfigError(error.to_string()))?,
         };
         if !enabled {
             return Ok(Self::Disabled);
@@ -294,20 +295,15 @@ impl Qwen38KvStorageProvider {
     fn select(
         backend: BackendKind,
         cuda_compute_capability: Option<(u32, u32)>,
-        cuda_bf16_override: Option<&str>,
+        bf16_kv: bool,
     ) -> Self {
         match backend {
             BackendKind::Cpu => Self::CpuF32,
             BackendKind::Metal => Self::MetalF16,
-            BackendKind::Cuda
-                if qwen38_bf16_kv_enabled(cuda_bf16_override)
-                    && qwen38_cuda_supports_bf16(cuda_compute_capability) =>
-            {
+            BackendKind::Cuda if bf16_kv && qwen38_cuda_supports_bf16(cuda_compute_capability) => {
                 Self::CudaBf16
             }
-            BackendKind::Cuda if qwen38_bf16_kv_enabled(cuda_bf16_override) => {
-                Self::CudaF16CapabilityFallback
-            }
+            BackendKind::Cuda if bf16_kv => Self::CudaF16CapabilityFallback,
             BackendKind::Cuda => Self::CudaF16Fallback,
         }
     }
@@ -347,22 +343,15 @@ fn qwen38_cuda_supports_bf16(compute_capability: Option<(u32, u32)>) -> bool {
     compute_capability.is_some_and(cuda_compute_capability_supports_bf16)
 }
 
-fn qwen38_bf16_kv_enabled(raw: Option<&str>) -> bool {
-    // BF16 activations must retain their exponent range in persistent KV.
-    // Narrowing finite values above 65504 to F16 inserts infinities into the
-    // cache; later attention (including masked P*V) can then produce NaNs.
-    matches!(
-        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        None | Some("1" | "true" | "yes" | "on")
-    )
-}
-
 fn qwen38_kv_storage_provider(
     backend: BackendKind,
     cuda_compute_capability: Option<(u32, u32)>,
 ) -> Qwen38KvStorageProvider {
-    let requested = std::env::var(CUDA_BF16_KV_ENV).ok();
-    Qwen38KvStorageProvider::select(backend, cuda_compute_capability, requested.as_deref())
+    // BF16 activations must retain their exponent range in persistent KV.
+    // Narrowing finite values above 65504 to F16 inserts infinities into the
+    // cache; later attention (including masked P*V) can then produce NaNs.
+    let bf16_kv = crate::env::flag_or(CUDA_BF16_KV_ENV, true);
+    Qwen38KvStorageProvider::select(backend, cuda_compute_capability, bf16_kv)
 }
 
 fn qwen38_projection_materialization(device: &DeviceProfile) -> Result<ProjectionMaterialization> {
@@ -1084,7 +1073,7 @@ impl Qwen38ChatModel {
             )));
         }
         let prefix_reuse_switch =
-            qwen38_prefix_reuse_switch(std::env::var(PREFIX_REUSE_ENV).ok().as_deref())?;
+            qwen38_prefix_reuse_switch(crate::env::value(PREFIX_REUSE_ENV).as_deref())?;
         let checkpoint =
             Qwen38NativeCheckpoint::open_with_options(model_dir, &performance.loading)?;
         let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
@@ -1231,7 +1220,7 @@ impl Qwen38ChatModel {
     /// pipelining chooses tokens with the device sampler, so it needs the
     /// device sampler the step-by-step decode uses.
     fn pipelining_refusal(&self) -> Option<String> {
-        if crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV) {
+        if DECODE_PIPELINE_OFF.get() {
             Some(format!("{DECODE_PIPELINE_ENV}=legacy"))
         } else if !self.device_sampling_enabled() {
             Some(
@@ -1690,7 +1679,7 @@ impl Qwen38ChatModel {
             unconsumed_output,
             pending_token,
             history_ids,
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             tokens_generated: 0,
             track_history,
             assembled: String::new(),
@@ -1921,7 +1910,7 @@ impl Qwen38ChatModel {
             unconsumed_output: None,
             pending_token: None,
             history_ids,
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             tokens_generated: 0,
             track_history,
             assembled: String::new(),
@@ -2144,10 +2133,12 @@ impl Qwen38ChatModel {
         drop(text_states);
         drop(caches);
 
+        // The device argmax has no logprobs, so a logprob row keeps the
+        // batch on the per-row sampler.
         let batch_greedy = self.device_sampling_enabled()
-            && states
-                .iter()
-                .all(|state| state.config.temperature <= 1e-5 && !state.track_history);
+            && states.iter().all(|state| {
+                state.config.temperature <= 1e-5 && !state.track_history && !state.config.logprobs
+            });
         let mut sampled = if batch_greedy {
             device_sampling::greedy(&target.logits.squeeze(1)?, self.tokenizer.vocab_size)?
         } else {
@@ -4722,46 +4713,31 @@ mod tests {
 
     #[test]
     fn cuda_bf16_kv_defaults_on_with_an_explicit_opt_out() {
-        for disabled in [Some(""), Some("0"), Some("false"), Some("no"), Some("off")] {
-            let provider =
-                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), disabled);
-            assert_eq!(provider, Qwen38KvStorageProvider::CudaF16Fallback);
-            assert_eq!(provider.dtype(), DType::F16);
-            assert!(provider.fallback_reason().is_some());
-        }
-        for enabled in [None, Some("1"), Some("true"), Some(" YES "), Some("on")] {
-            let provider =
-                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), enabled);
-            assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16);
-            assert_eq!(provider.dtype(), DType::BF16);
-            assert!(provider.fallback_reason().is_none());
-        }
-        assert_eq!(
-            Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), Some("invalid")),
-            Qwen38KvStorageProvider::CudaF16Fallback
-        );
+        let provider = Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), false);
+        assert_eq!(provider, Qwen38KvStorageProvider::CudaF16Fallback);
+        assert_eq!(provider.dtype(), DType::F16);
+        assert!(provider.fallback_reason().is_some());
+        let provider = Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), true);
+        assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16);
+        assert_eq!(provider.dtype(), DType::BF16);
+        assert!(provider.fallback_reason().is_none());
     }
 
     #[test]
     fn cuda_bf16_kv_requires_observed_ampere_or_newer_capability() {
         for compute_capability in [None, Some((7, 5))] {
-            for requested in [None, Some("1")] {
-                let provider = Qwen38KvStorageProvider::select(
-                    BackendKind::Cuda,
-                    compute_capability,
-                    requested,
-                );
-                assert_eq!(provider, Qwen38KvStorageProvider::CudaF16CapabilityFallback);
-                assert_eq!(provider.dtype(), DType::F16);
-                assert!(provider
-                    .fallback_reason()
-                    .expect("capability fallback reason")
-                    .contains("8.0 or newer"));
-            }
+            let provider =
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, compute_capability, true);
+            assert_eq!(provider, Qwen38KvStorageProvider::CudaF16CapabilityFallback);
+            assert_eq!(provider.dtype(), DType::F16);
+            assert!(provider
+                .fallback_reason()
+                .expect("capability fallback reason")
+                .contains("8.0 or newer"));
         }
         for capability in [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0)] {
             let provider =
-                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some(capability), None);
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some(capability), true);
             assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16);
             assert_eq!(provider.dtype(), DType::BF16);
             assert_eq!(provider.dtype().size_in_bytes(), DType::F16.size_in_bytes());
@@ -4770,7 +4746,7 @@ mod tests {
 
     #[test]
     fn cuda_bf16_kv_switch_does_not_change_portable_storage_policy() {
-        for candidate in [None, Some("0"), Some("1")] {
+        for candidate in [false, true] {
             let cpu = Qwen38KvStorageProvider::select(BackendKind::Cpu, None, candidate);
             let metal = Qwen38KvStorageProvider::select(BackendKind::Metal, None, candidate);
             assert_eq!(cpu, Qwen38KvStorageProvider::CpuF32);

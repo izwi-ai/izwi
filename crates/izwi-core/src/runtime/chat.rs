@@ -5,7 +5,10 @@ use crate::engine::{resolve_backend_model_context, GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen35::media_resource_estimate;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
+use crate::models::shared::chat::{
+    ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatTruncation,
+};
+use crate::runtime::chat_request::CHAT_MAX_TOKENS_UNSET;
 use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::{
     media_preparation_resources, retained_chat_preparation_input_bytes, AdmittedEngineRequest,
@@ -68,16 +71,37 @@ fn chat_messages_after_prefix(messages: &[ChatMessage], prefix_end: usize) -> Ve
     compacted
 }
 
-fn bounded_chat_completion_tokens(
+fn prompt_too_long(prompt_tokens: usize, context_limit: usize) -> Error {
+    Error::ContextLengthExceeded(format!(
+        "This model's maximum context length is {context_limit} tokens. However, your messages resulted in {prompt_tokens} tokens. Please reduce the length of the messages."
+    ))
+}
+
+/// The output budget a chat request runs with (D8). The prompt must leave at
+/// least one token. An unset budget takes the rest of the context, as in
+/// vLLM. An explicit budget that does not fit is an error unless the request
+/// opted into truncation, which shortens it to the remaining context.
+fn chat_completion_budget(
     prompt_tokens: usize,
     requested_max_tokens: usize,
     context_limit: usize,
-) -> Option<usize> {
-    (prompt_tokens < context_limit).then(|| {
-        requested_max_tokens
-            .max(1)
-            .min(context_limit - prompt_tokens)
-    })
+    truncation: ChatTruncation,
+) -> Result<usize> {
+    if prompt_tokens >= context_limit {
+        return Err(prompt_too_long(prompt_tokens, context_limit));
+    }
+    let requested_max_tokens = requested_max_tokens.max(1);
+    let remaining = context_limit - prompt_tokens;
+    if requested_max_tokens <= remaining
+        || requested_max_tokens == CHAT_MAX_TOKENS_UNSET
+        || truncation == ChatTruncation::Auto
+    {
+        return Ok(requested_max_tokens.min(remaining));
+    }
+    Err(Error::ContextLengthExceeded(format!(
+        "This model's maximum context length is {context_limit} tokens. However, you requested {} tokens ({prompt_tokens} in the messages, {requested_max_tokens} in the completion). Please reduce the length of the messages or completion.",
+        prompt_tokens + requested_max_tokens
+    )))
 }
 
 fn reconcile_streamed_chat_text(
@@ -101,6 +125,11 @@ fn reconcile_streamed_chat_text(
     )))
 }
 
+/// A streaming chat request that passed admission and has not started; see
+/// [`RuntimeService::admit_streaming_chat`]. Dropping it releases the
+/// admission.
+pub struct AdmittedChatStream(AdmittedEngineRequest);
+
 impl RuntimeService {
     /// Admit one chat request and return its worker-facing execution handle.
     ///
@@ -118,6 +147,7 @@ impl RuntimeService {
             correlation_id,
             runtime_context,
             streaming,
+            max_tokens_ceiling,
         } = invocation;
         let admitted = self
             .build_chat_request_with_params_and_config(
@@ -128,9 +158,21 @@ impl RuntimeService {
                 correlation_id.as_deref(),
                 runtime_context,
                 streaming,
+                max_tokens_ceiling,
             )
             .await?;
         self.start_admitted_chat_invocation(admitted).await
+    }
+
+    /// The chat config of the `max_new_tokens` helpers. Their callers are
+    /// product features (agent turns, voice sessions, transcript summaries)
+    /// that grow histories and pick budgets without the exact prompt size, so
+    /// they opt into truncation.
+    fn sized_budget_chat_config() -> ChatRequestConfig {
+        ChatRequestConfig {
+            truncation: ChatTruncation::Auto,
+            ..ChatRequestConfig::default()
+        }
     }
 
     fn prompt_token_config(
@@ -149,6 +191,7 @@ impl RuntimeService {
             logprobs: params.logprobs || params.top_logprobs > 0,
             top_logprobs: params.top_logprobs,
             constrain_json_object: params.constrain_json_object,
+            skip_special_tokens: params.skip_special_tokens,
         }
     }
 
@@ -161,6 +204,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         streaming: bool,
+        max_tokens_ceiling: Option<usize>,
     ) -> Result<AdmittedEngineRequest> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
@@ -213,15 +257,18 @@ impl RuntimeService {
                     if initial.0.len() < context_limit {
                         (original_messages, initial.0, initial.1, 0usize)
                     } else {
+                    if chat_config.truncation != ChatTruncation::Auto {
+                        return Err(prompt_too_long(initial.0.len(), context_limit));
+                    }
                     if !chat_config.media_inputs.is_empty() {
-                        return Err(Error::InvalidInput(format!(
+                        return Err(Error::ContextLengthExceeded(format!(
                             "Chat prompt has {} tokens in a {context_limit}-token context; automatic history compaction is disabled for media turns so inputs cannot become misaligned",
                             initial.0.len()
                         )));
                     }
                     let prefix_ends = complete_chat_turn_prefix_ends(&original_messages);
                     if prefix_ends.is_empty() {
-                        return Err(Error::InvalidInput(format!(
+                        return Err(Error::ContextLengthExceeded(format!(
                             "Chat prompt has {} tokens in a {context_limit}-token context and no older complete turn can be compacted",
                             initial.0.len()
                         )));
@@ -252,7 +299,7 @@ impl RuntimeService {
                         }
                     }
                     let Some((messages, prepared, prefix_end)) = selected else {
-                        return Err(Error::InvalidInput(format!(
+                        return Err(Error::ContextLengthExceeded(format!(
                             "Chat prompt has {} tokens in a {context_limit}-token context and remains too long after compacting all older complete turns",
                             initial.0.len()
                         )));
@@ -276,27 +323,23 @@ impl RuntimeService {
                 }
 
                 let requested_max_tokens = params.max_tokens.max(1);
-                params.max_tokens = bounded_chat_completion_tokens(
+                let budget = chat_completion_budget(
                     prompt_tokens.len(),
                     requested_max_tokens,
                     context_limit,
-                )
-                .ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "Chat prompt has {} tokens in a {context_limit}-token context",
-                        prompt_tokens.len()
-                    ))
-                })?;
-                if params.max_tokens < requested_max_tokens {
+                    chat_config.truncation,
+                )?;
+                if budget < requested_max_tokens && requested_max_tokens != CHAT_MAX_TOKENS_UNSET {
                     warn!(
                         model = %variant,
                         requested_max_tokens,
-                        max_tokens = params.max_tokens,
+                        max_tokens = budget,
                         prompt_tokens = prompt_tokens.len(),
                         context_limit,
                         "clamped chat completion budget to the remaining context"
                     );
                 }
+                params.max_tokens = budget.min(max_tokens_ceiling.unwrap_or(usize::MAX));
                 let mut request = ChatRuntimeRequest::from_messages(
                     variant,
                     messages,
@@ -365,10 +408,11 @@ impl RuntimeService {
                 variant,
                 messages,
                 params,
-                ChatRequestConfig::default(),
+                Self::sized_budget_chat_config(),
                 correlation_id,
                 runtime_context,
                 false,
+                None,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
@@ -448,6 +492,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 false,
+                None,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
@@ -525,7 +570,7 @@ impl RuntimeService {
             variant,
             messages,
             params,
-            ChatRequestConfig::default(),
+            Self::sized_budget_chat_config(),
             correlation_id,
             runtime_context,
             move |delta, _logprobs| on_delta(delta),
@@ -633,28 +678,70 @@ impl RuntimeService {
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<ChatGeneration>
     where
         F: FnMut(String, Vec<crate::engine::TokenLogprob>) + Send + 'static,
     {
         let admitted = self
-            .build_chat_request_with_params_and_config(
+            .admit_streaming_chat(
                 variant,
                 messages,
                 params,
                 chat_config,
                 correlation_id,
                 runtime_context,
-                true,
             )
             .await?;
+        self.run_admitted_streaming_chat(admitted, on_delta).await
+    }
+
+    /// Admit a streaming chat request without starting it: the prompt fits
+    /// the context (or the request fails with `ContextLengthExceeded`), and
+    /// the request holds its coordinator capacity and model residency until
+    /// [`Self::run_admitted_streaming_chat`] runs it or it is dropped. A
+    /// server admits before it commits to a streamed response, so an
+    /// admission failure is still a plain HTTP error.
+    pub async fn admit_streaming_chat(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        chat_config: ChatRequestConfig,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<AdmittedChatStream> {
+        self.build_chat_request_with_params_and_config(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            runtime_context,
+            true,
+            None,
+        )
+        .await
+        .map(AdmittedChatStream)
+    }
+
+    /// Run an admitted streaming chat request; `on_delta` receives each
+    /// text delta with its logprob entries.
+    pub async fn run_admitted_streaming_chat<F>(
+        &self,
+        admitted: AdmittedChatStream,
+        mut on_delta: F,
+    ) -> Result<ChatGeneration>
+    where
+        F: FnMut(String, Vec<crate::engine::TokenLogprob>) + Send + 'static,
+    {
+        let AdmittedChatStream(admitted) = admitted;
         let mut streamed_text = String::new();
         let output = self
             .run_admitted_streaming_request(admitted, |chunk| {
                 let crate::engine::StreamingOutput { text, logprobs, .. } = chunk;
                 if let Some(delta) = text {
-                    if !delta.is_empty() {
+                    if !delta.is_empty() || !logprobs.is_empty() {
                         streamed_text.push_str(&delta);
                         on_delta(delta, logprobs);
                     }
@@ -680,10 +767,11 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_chat_completion_tokens, chat_messages_after_prefix, complete_chat_turn_prefix_ends,
-        reconcile_streamed_chat_text,
+        chat_completion_budget, chat_messages_after_prefix, complete_chat_turn_prefix_ends,
+        reconcile_streamed_chat_text, CHAT_MAX_TOKENS_UNSET,
     };
-    use crate::models::shared::chat::{ChatMessage, ChatRole};
+    use crate::error::Error;
+    use crate::models::shared::chat::{ChatMessage, ChatRole, ChatTruncation};
 
     fn message(role: ChatRole, content: &str) -> ChatMessage {
         ChatMessage {
@@ -722,11 +810,38 @@ mod tests {
         assert_eq!(messages.len(), 2);
     }
 
+    /// D8: like OpenAI and vLLM, a request that does not fit is a 400 with
+    /// the token counts; only an unset budget or an explicit truncation
+    /// opt-in is shortened to the remaining context.
     #[test]
-    fn completion_budget_never_exceeds_remaining_context() {
-        assert_eq!(bounded_chat_completion_tokens(90, 32, 100), Some(10));
-        assert_eq!(bounded_chat_completion_tokens(90, 0, 100), Some(1));
-        assert_eq!(bounded_chat_completion_tokens(100, 1, 100), None);
+    fn completion_budget_rejects_what_does_not_fit_unless_truncation_is_on() {
+        let disabled = ChatTruncation::Disabled;
+        let budget = |prompt, requested, truncation| {
+            chat_completion_budget(prompt, requested, 100, truncation)
+        };
+        assert_eq!(budget(90, 10, disabled).unwrap(), 10);
+        assert_eq!(budget(90, 0, disabled).unwrap(), 1);
+        assert_eq!(budget(90, CHAT_MAX_TOKENS_UNSET, disabled).unwrap(), 10);
+        assert_eq!(budget(90, 32, ChatTruncation::Auto).unwrap(), 10);
+
+        match budget(90, 32, disabled) {
+            Err(Error::ContextLengthExceeded(message)) => assert!(
+                message.contains("maximum context length is 100 tokens")
+                    && message.contains(
+                        "you requested 122 tokens (90 in the messages, 32 in the completion)"
+                    ),
+                "{message}"
+            ),
+            other => panic!("expected a context-length error, got {other:?}"),
+        }
+        for truncation in [disabled, ChatTruncation::Auto] {
+            match budget(100, CHAT_MAX_TOKENS_UNSET, truncation) {
+                Err(Error::ContextLengthExceeded(message)) => {
+                    assert!(message.contains("resulted in 100 tokens"), "{message}")
+                }
+                other => panic!("expected a context-length error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

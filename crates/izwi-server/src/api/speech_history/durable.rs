@@ -1,7 +1,9 @@
 use super::*;
 use crate::api::tts_long_form::{generate_speech_plan_stream_with_progress, SpeechTextPlan};
 use crate::artifact_store::{ArtifactFileWrite, ArtifactRetention};
-use crate::batch_runtime::speech_progress::{SpeechCheckpoint, SpeechPcmBatch};
+use crate::batch_runtime::speech_progress::{
+    PcmPublicationBuffer, SpeechCheckpoint, SpeechPcmBatch,
+};
 use crate::batch_runtime::store::SpeechHistoryFinalization;
 
 pub(crate) struct DurableSpeechProgress {
@@ -9,17 +11,11 @@ pub(crate) struct DurableSpeechProgress {
     attempt: StageExecutionContext,
     artifact_tenant: crate::artifact_store::ArtifactTenant,
     checkpoint: SpeechCheckpoint,
+    publications: PcmPublicationBuffer,
 }
 
 fn opaque_final_audio_enabled() -> bool {
-    matches!(
-        std::env::var("IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    crate::env_config::tuning().tts_opaque_final_wav_enabled
 }
 
 impl DurableSpeechProgress {
@@ -35,11 +31,7 @@ impl DurableSpeechProgress {
             None => SpeechCheckpoint::new(
                 identity,
                 u32::try_from(total)?,
-                std::env::var("IZWI_TTS_MAX_JOURNAL_BYTES")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(8 * 1024 * 1024 * 1024),
+                crate::env_config::tuning().tts_max_journal_bytes,
             )?,
         };
         checkpoint.save(attempt).await?;
@@ -48,6 +40,7 @@ impl DurableSpeechProgress {
             attempt: attempt.clone(),
             artifact_tenant: crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key),
             checkpoint,
+            publications: PcmPublicationBuffer::configured(),
         })
     }
     pub(crate) fn artifact_fingerprint(&self) -> Option<&str> {
@@ -90,7 +83,37 @@ impl DurableSpeechProgress {
         self.checkpoint.begin_segment(&self.attempt).await?;
         Ok(())
     }
-    pub(crate) async fn publish_chunk(&mut self, chunk: &AudioChunk) -> anyhow::Result<()> {
+    /// Buffer one generated chunk. Returns the merged chunks that are now
+    /// durably published, in order; only those may reach listeners.
+    pub(crate) async fn publish_chunk(
+        &mut self,
+        chunk: AudioChunk,
+    ) -> anyhow::Result<Vec<AudioChunk>> {
+        let mut published = Vec::new();
+        if let Some(batch) = self.publications.push(chunk) {
+            published.push(self.publish_batch(batch).await?);
+        }
+        if let Some(batch) = self.publications.take_due(tokio::time::Instant::now()) {
+            published.push(self.publish_batch(batch).await?);
+        }
+        Ok(published)
+    }
+
+    /// Publish whatever is buffered: at a segment end, or when the buffered
+    /// audio reached `flush_deadline`.
+    pub(crate) async fn flush(&mut self) -> anyhow::Result<Option<AudioChunk>> {
+        match self.publications.take(tokio::time::Instant::now()) {
+            Some(batch) => Ok(Some(self.publish_batch(batch).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// When buffered audio must be published even if no chunk follows.
+    pub(crate) fn flush_deadline(&self) -> Option<tokio::time::Instant> {
+        self.publications.deadline()
+    }
+
+    async fn publish_batch(&mut self, chunk: AudioChunk) -> anyhow::Result<AudioChunk> {
         self.attempt.ensure_active().await?;
         let rate = chunk.sample_rate_or(self.state.runtime.sample_rate().await);
         let bytes: Vec<u8> = chunk
@@ -112,7 +135,7 @@ impl DurableSpeechProgress {
                 rate,
             )
             .await?;
-        Ok(())
+        Ok(chunk)
     }
     pub(crate) async fn complete_segment(
         &mut self,
@@ -121,6 +144,10 @@ impl DurableSpeechProgress {
         execution_ms: f32,
         duration_secs: f32,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.publications.is_empty(),
+            "Speech segment completed with unpublished audio"
+        );
         self.checkpoint.completed_tokens += tokens;
         self.checkpoint.completed_execution_ms += execution_ms;
         self.checkpoint.completed_duration_secs += duration_secs;
@@ -246,10 +273,8 @@ pub(super) async fn synthesize_fish_record(
                 .checkpoint
                 .sample_rate
                 .context("Speech completed without a sample rate")?;
-            let limit = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
+            let limit = crate::env_config::tuning()
+                .tts_stream_max_pcm_bytes
                 .unwrap_or(u32::MAX as usize - 44)
                 .min(u32::MAX as usize - 44);
             spool = Some(SpeechWavSpool::new_reserved(sample_rate, limit, exact_pcm_bytes).await?);
@@ -443,11 +468,7 @@ pub(super) async fn synthesize_fish_record(
         .context("Speech attempt lost ownership before completion")?;
         Ok::<_, anyhow::Error>((record, output_artifact))
     };
-    let max_secs = std::env::var("IZWI_TTS_MAX_JOB_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(24 * 3600);
+    let max_secs = crate::env_config::tuning().tts_max_job_seconds;
     let elapsed_secs = claimed
         .map(|claimed| {
             let now_ms = std::time::SystemTime::now()
@@ -490,10 +511,8 @@ async fn append_samples(
     rate: u32,
 ) -> anyhow::Result<()> {
     if spool.is_none() {
-        let limit = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        let limit = crate::env_config::tuning()
+            .tts_stream_max_pcm_bytes
             .unwrap_or(u32::MAX as usize - 44)
             .min(u32::MAX as usize - 44);
         *spool = Some(SpeechWavSpool::new(rate, limit)?);
@@ -697,7 +716,7 @@ pub(super) async fn replay_response(
                 }
                 Ok(Some(record)) if record.processing_status == SpeechHistoryProcessingStatus::Failed => {
                     match state.batch_runtime_store.get_job(&job.id).await {
-                        Ok(Some(job)) if matches!(job.status, RuntimeJobStatus::Created | RuntimeJobStatus::Queued | RuntimeJobStatus::Running | RuntimeJobStatus::Retrying | RuntimeJobStatus::Postprocessing) => {
+                        Ok(Some(job)) if matches!(job.status, RuntimeJobStatus::Queued | RuntimeJobStatus::Running | RuntimeJobStatus::Retrying) => {
                             tokio::time::sleep(Duration::from_millis(250)).await; continue;
                         }
                         _ => {}
@@ -760,11 +779,7 @@ async fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
 }
 
 pub(super) async fn cleanup_expired_replay(state: &AppState) -> anyhow::Result<()> {
-    let retention = std::env::var("IZWI_TTS_REPLAY_RETENTION_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(86400);
+    let retention = crate::env_config::tuning().tts_replay_retention.as_secs();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;

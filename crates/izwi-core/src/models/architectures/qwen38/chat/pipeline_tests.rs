@@ -6,6 +6,7 @@ use super::*;
 use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
 use crate::engine::ModelInstanceId;
 use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+use crate::models::architectures::qwen38::fast_path::counters_lock;
 use crate::models::architectures::qwen38::mtp::tests::{write_fp8_geometry_checkpoint, TestDir};
 use crate::models::architectures::qwen38::residency::force_cpu_native_fp8_for_tests;
 use crate::models::registry::NativeChatModel;
@@ -31,6 +32,9 @@ fn fixture() -> (TestDir, Qwen38NativeCheckpoint) {
 /// A chat model around the FP8-geometry trunk (native block FP8, F16, every
 /// fused fast path on the CPU references) without an MTP head, with the
 /// whole-step graph decode resolved for tests when `graphs`.
+///
+/// Its fused paths count in the process-wide fast-path counters, so tests
+/// hold `counters_lock` while they run it.
 fn chat_model(checkpoint: &Qwen38NativeCheckpoint, graphs: bool) -> Qwen38ChatModel {
     let _forced = force_cpu_native_fp8_for_tests();
     let performance = PerformanceConfig::default();
@@ -103,6 +107,12 @@ fn chat_model(checkpoint: &Qwen38NativeCheckpoint, graphs: bool) -> Qwen38ChatMo
 
 /// A fresh paged cache for the fixture's one attention layer (F16).
 fn cache(checkpoint: &Qwen38NativeCheckpoint) -> PhysicalPagedKvCache {
+    caches(checkpoint, 1).remove(0)
+}
+
+/// `rows` paged caches of four pages each, carved from one arena so a batch
+/// can lower their slots into one slot map.
+fn caches(checkpoint: &Qwen38NativeCheckpoint, rows: usize) -> Vec<PhysicalPagedKvCache> {
     let text = &checkpoint.config.text;
     let id = KvArenaId {
         model_instance: ModelInstanceId::new(3813),
@@ -120,7 +130,7 @@ fn cache(checkpoint: &Qwen38NativeCheckpoint) -> PhysicalPagedKvCache {
             id,
             group,
             page_tokens: 8,
-            capacity_pages: 4,
+            capacity_pages: 4 * rows as u32,
             growth: None,
             dtype: DType::F16,
             layers: vec![KvLayerConfig {
@@ -132,15 +142,19 @@ fn cache(checkpoint: &Qwen38NativeCheckpoint) -> PhysicalPagedKvCache {
         })
         .unwrap(),
     );
-    let blocks = (0..4)
-        .map(|index| CacheBlockRef {
-            arena: id,
-            group,
-            index,
-            slot_generation: 1,
+    (0..rows as u32)
+        .map(|row| {
+            let blocks = (4 * row..4 * row + 4)
+                .map(|index| CacheBlockRef {
+                    arena: id,
+                    group,
+                    index,
+                    slot_generation: 1,
+                })
+                .collect();
+            PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
         })
-        .collect();
-    PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
+        .collect()
 }
 
 struct Decoded {
@@ -212,6 +226,7 @@ fn pipelined(model: &Qwen38ChatModel) -> u64 {
 /// logprob per token when logprobs force step-by-step decode.
 #[test]
 fn a_pipelined_quantum_matches_step_by_step_decode() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let _sampling = force_device_sampling_for_tests();
     let (_dir, checkpoint) = fixture();
@@ -351,6 +366,7 @@ fn a_pipelined_quantum_matches_step_by_step_decode() {
 /// `getenv`.)
 #[test]
 fn graph_decode_prefers_a_sustained_quantum() {
+    let _counters = counters_lock();
     let _env = env_lock();
     assert_eq!(decode_quantum_from(None), 8);
     assert_eq!(decode_quantum_from(Some(" 3 ")), 3);
@@ -377,4 +393,52 @@ fn graph_decode_prefers_a_sustained_quantum() {
 
     let native = NativeChatModel::Qwen38(graphs);
     assert_eq!(native.speculative_decode_profile(), (8, true, false));
+}
+
+/// An all-greedy batch reads every row's token back from the device sampler
+/// at once, which has no logprobs: a row that asked for logprobs must keep
+/// the batch on the per-row sampler, or its entries are silently dropped.
+#[test]
+fn a_greedy_batch_keeps_a_rows_logprobs() {
+    let _counters = counters_lock();
+    let _env = env_lock();
+    let _sampling = force_device_sampling_for_tests();
+    let (_dir, checkpoint) = fixture();
+    let model = chat_model(&checkpoint, false);
+    let prepared = Qwen38PreparedPrompt {
+        prompt_ids: PROMPT.to_vec(),
+        prompt_positions: (0..PROMPT.len()).map(|position| [position; 3]).collect(),
+        next_text_position: PROMPT.len(),
+        history_boundary: None,
+    };
+    let mut caches = caches(&checkpoint, 2);
+    let mut start = |config: &ChatGenerationConfig| {
+        let mut state = model
+            .start_decode_state_physical(&[], 8, config, Some(&prepared), caches.remove(0), None)
+            .unwrap();
+        // The first token samples the stored prefill logits on its own.
+        model.decode_quantum(&mut state, 1).unwrap();
+        state.pending_logprobs.clear();
+        state
+    };
+    let greedy = ChatGenerationConfig::default();
+    let with_logprobs = ChatGenerationConfig {
+        logprobs: true,
+        top_logprobs: 2,
+        ..ChatGenerationConfig::default()
+    };
+    let mut plain = start(&greedy);
+    let mut logged = start(&with_logprobs);
+    for _ in 0..3 {
+        let steps = model
+            .decode_step_batch(&mut [&mut plain, &mut logged])
+            .unwrap();
+        assert!(steps.iter().all(|step| !step.finished));
+        assert!(plain.pending_logprobs.is_empty());
+        assert_eq!(
+            std::mem::take(&mut logged.pending_logprobs).len(),
+            1,
+            "one logprob entry per batched token"
+        );
+    }
 }

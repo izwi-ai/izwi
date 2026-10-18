@@ -1001,8 +1001,9 @@ fn cuda_synthetic_lm_head_passes_the_gate_and_the_device_check() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_native_fp8_tracks_cpu_f32_and_metal_expanded_loads() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
-        eprintln!("metal device unavailable; qwen38 FP8 metal leg not run");
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_native_fp8_tracks_cpu_f32_and_metal_expanded_loads",
+    ) else {
         return;
     };
     let _guard = super::super::fast_path::counters_lock();
@@ -1116,7 +1117,9 @@ fn metal_native_fp8_tracks_cpu_f32_and_metal_expanded_loads() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes",
+    ) else {
         return;
     };
     let _env = crate::env_test_lock()
@@ -1209,7 +1212,9 @@ fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_fp8_kernels_match_the_host_reference_at_qwen38_shapes() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_fp8_kernels_match_the_host_reference_at_qwen38_shapes",
+    ) else {
         return;
     };
     let pattern: Vec<u8> = (0..4093u32)

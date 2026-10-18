@@ -1097,6 +1097,117 @@ impl PhysicalPagedKvCache {
     }
 }
 
+/// Independent F32 caches of `capacity_tokens` each for `rows` sessions in
+/// one arena on `device` (CPU, or a Metal/CUDA accelerator arena), for model
+/// tests that decode through the physical path.
+#[cfg(test)]
+pub(crate) fn test_physical_caches_on(
+    device: &candle_core::Device,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    capacity_tokens: usize,
+    rows: usize,
+) -> Vec<PhysicalPagedKvCache> {
+    test_physical_caches_with_dtype_on(
+        device,
+        candle_core::DType::F32,
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        capacity_tokens,
+        rows,
+    )
+}
+
+/// [`test_physical_caches_on`] storing K/V as `dtype`, for models whose
+/// activations are not F32.
+#[cfg(test)]
+pub(crate) fn test_physical_caches_with_dtype_on(
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    capacity_tokens: usize,
+    rows: usize,
+) -> Vec<PhysicalPagedKvCache> {
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::KvGroupId;
+
+    let page_tokens = 16usize;
+    let capacity_pages = capacity_tokens.div_ceil(page_tokens);
+    let backend = if device.is_metal() {
+        BackendKind::Metal
+    } else if device.is_cuda() {
+        BackendKind::Cuda
+    } else {
+        BackendKind::Cpu
+    };
+    let id = KvArenaId {
+        model_instance: ModelInstanceId::new(4_242),
+        backend,
+        device_ordinal: (backend != BackendKind::Cpu).then_some(0),
+        generation: 1,
+    };
+    let group = KvGroupId::new(1);
+    let bindings = (0..num_layers as u32)
+        .map(|layer| KvLayerBinding {
+            model_layer: layer,
+            physical_layer: layer,
+        })
+        .collect::<Vec<_>>();
+    let config = KvArenaConfig {
+        id,
+        group,
+        page_tokens: page_tokens as u32,
+        capacity_pages: (capacity_pages * rows) as u32,
+        growth: None,
+        dtype,
+        layers: bindings
+            .iter()
+            .map(|&binding| KvLayerConfig {
+                binding,
+                num_kv_heads: num_kv_heads as u32,
+                key_head_dim: head_dim as u32,
+                value_head_dim: head_dim as u32,
+            })
+            .collect(),
+    };
+    let arena: Arc<dyn KvArena> = if backend == BackendKind::Cpu {
+        Arc::new(CpuKvArena::new(config).expect("test CPU KV arena"))
+    } else {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        {
+            Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    config,
+                    device.clone(),
+                )
+                .expect("test accelerator KV arena"),
+            )
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        unreachable!("an accelerator device without an accelerator feature")
+    };
+    (0..rows)
+        .map(|row| {
+            let blocks = (row * capacity_pages..(row + 1) * capacity_pages)
+                .map(|index| CacheBlockRef {
+                    arena: id,
+                    group,
+                    index: index as u32,
+                    slot_generation: 1,
+                })
+                .collect();
+            PhysicalPagedKvCache::new(arena.clone(), bindings.clone(), blocks, 0)
+                .expect("test physical cache")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,7 +1717,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fused_write_matches_write_and_attend_on_a_metal_arena() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "fused_write_matches_write_and_attend_on_a_metal_arena",
+        ) else {
             return;
         };
         let (kv_heads, heads, dim, page_tokens) = (2usize, 4usize, 8usize, 4u32);
@@ -1767,8 +1880,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_probe_cache_attends_causally_in_f16() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_probe_cache_attends_causally_in_f16")
+        else {
             return;
         };
         probe_cache_attends_causally(&device, candle_core::DType::F16);

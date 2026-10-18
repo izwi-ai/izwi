@@ -10,9 +10,12 @@
 //! append the standby's line only after its readiness, and scale-down must
 //! remove it, drain the worker, and never touch the core set.
 
+// The fake workers are executable scripts launched through unix permissions.
+#![cfg(unix)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use izwi_serving_protocol::{
@@ -21,6 +24,7 @@ use izwi_serving_protocol::{
     ModelReadiness, NodeId, OutputFormat, TaskKind, WorkerDescriptor, WorkerFeature, WorkerId,
     WorkerProcessState, WorkerStatus, PROTOCOL_V1,
 };
+use izwi_test_process::ProcessGuard;
 
 const FAKE_WORKER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import json, os, sys, threading, time
@@ -268,7 +272,9 @@ impl Rig {
         }
     }
 
-    fn spawn_supervisor(&self, extra_args: &[&str]) -> Child {
+    /// Spawns the supervisor under a guard, so a failed assertion never
+    /// leaves it or its fake workers behind on this shared host.
+    fn spawn_supervisor(&self, extra_args: &[&str]) -> ProcessGuard {
         let stderr = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -292,7 +298,7 @@ impl Rig {
         for arg in extra_args {
             command.arg(arg);
         }
-        command.spawn().expect("spawn supervisor")
+        ProcessGuard::spawn(&mut command).expect("spawn supervisor")
     }
 
     /// Rewrites one worker's status document with new queue/active signals,
@@ -382,21 +388,10 @@ fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-/// Kills the supervisor on drop so a failed assertion never leaves orphaned
-/// fake workers or a live supervisor behind on this shared host.
-struct SupervisorGuard(Child);
-
-impl Drop for SupervisorGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 fn sustained_queue_depth_scales_up_and_idle_window_scales_back_down() {
     let rig = Rig::build(true);
-    let supervisor = SupervisorGuard(rig.spawn_supervisor(&[]));
+    let supervisor = rig.spawn_supervisor(&[]);
 
     // Startup reconciliation approves exactly the min set: the core line is
     // added, the foreign line passes through, the standby is not approved.
@@ -505,7 +500,7 @@ fn sustained_queue_depth_scales_up_and_idle_window_scales_back_down() {
 fn disabled_autoscaling_launches_everything_and_never_touches_the_view() {
     let rig = Rig::build(false);
     let original_view = rig.approvals_text();
-    let _supervisor = SupervisorGuard(rig.spawn_supervisor(&[]));
+    let _supervisor = rig.spawn_supervisor(&[]);
 
     for worker in ["worker-a", "worker-b"] {
         assert!(

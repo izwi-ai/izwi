@@ -7,30 +7,26 @@
 //! replaces this smoke fixture before any performance claim.
 //!
 //! Hardware lanes without a build/device on the executing host stay
-//! `not run` (serving plan INV-18) — they are never reported as passed.
+//! `not run` (serving plan INV-18) — they print a `SKIP` line and fail
+//! outright when the lane requires the device (`IZWI_REQUIRE_METAL_PARITY=1`).
 
 mod common;
 
+#[cfg(feature = "metal")]
+use common::metal_leg_device;
 use common::{
     id, write_tiny_lfm_fixture, write_tiny_qwen38_hybrid_fixture, QWEN38_FIXTURE_REVISION,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
 use izwi_serving_worker::WORKER_METRICS_PATH;
+use izwi_test_process::ProcessGuard;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::TcpListener,
     process::Stdio,
     time::Duration,
 };
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 const PARITY_PROMPTS: [&str; 3] = ["hello", "ab", "a"];
 const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
@@ -50,7 +46,8 @@ async fn collect_lane_outputs(
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models_dir)
         .env("IZWI_WORKER_CREDENTIAL_ID", "parity-credential")
@@ -62,10 +59,8 @@ async fn collect_lane_outputs(
         .envs(backend_env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("parity-credential"),
@@ -133,6 +128,7 @@ async fn collect_lane_outputs(
                         top_p: Some(1.0),
                         seed: Some(0),
                         stop: Vec::new(),
+                        ..ChatParameters::default()
                     },
                 },
             })
@@ -171,25 +167,10 @@ async fn cpu_outputs_are_deterministic_across_worker_processes() {
     );
 }
 
-/// The strict Metal assignment lane requires the operator-provided device
-/// identity (`metal:<registryID>`). Tests discover it from the host's default
-/// GPU; when that is impossible the leg is recorded as not-run, never passed.
-#[cfg(feature = "metal")]
-fn host_metal_device_id() -> Option<String> {
-    let output = std::process::Command::new("swift")
-        .args(["-e", "import Metal; if let d = MTLCreateSystemDefaultDevice() { print(\"metal:\" + String(d.registryID)) }"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let id = stdout.trim().to_string();
-    (output.status.success() && id.starts_with("metal:")).then_some(id)
-}
-
 #[cfg(feature = "metal")]
 #[tokio::test]
 async fn metal_outputs_match_cpu_outputs_on_the_parity_fixture() {
-    let Some(device_id) = host_metal_device_id() else {
-        println!("metal parity leg not run: host default GPU registryID unavailable");
+    let Some(device_id) = metal_leg_device("metal parity leg") else {
         return;
     };
     let models = tempfile::tempdir().unwrap();
@@ -364,7 +345,8 @@ async fn collect_prefix_lane_with_env(
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models_dir)
         .envs(
@@ -374,10 +356,8 @@ async fn collect_prefix_lane_with_env(
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id(PREFIX_PARITY_CREDENTIAL),
@@ -442,6 +422,11 @@ async fn collect_prefix_lane_with_env(
                         top_p: Some(1.0),
                         seed: Some(0),
                         stop: Vec::new(),
+                        // The fixture's random weights emit the tokens its
+                        // config declares special; keep them so the compared
+                        // outputs carry every generated token.
+                        skip_special_tokens: Some(false),
+                        ..ChatParameters::default()
                     },
                 },
             })
@@ -586,8 +571,7 @@ async fn explicit_zero_prefix_caching_keeps_reuse_off() {
 #[cfg(feature = "metal")]
 #[tokio::test]
 async fn qwen38_shared_prefix_metal_lane_matches_cpu() {
-    let Some(device_id) = host_metal_device_id() else {
-        println!("qwen38 prefix metal leg not run: host default GPU registryID unavailable");
+    let Some(device_id) = metal_leg_device("qwen38 prefix metal leg") else {
         return;
     };
     let models = tempfile::tempdir().unwrap();

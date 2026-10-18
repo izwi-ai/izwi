@@ -35,6 +35,7 @@ class MockGatewayHandler(http.server.BaseHTTPRequestHandler):
     mode = "json"  # or "stream", "reject", "error", "flaky"
     last_payload = None
     attempts = 0
+    reply = "ready"
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -90,7 +91,7 @@ class MockGatewayHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         response = json.dumps({
             "id": "chatcmpl-1",
-            "choices": [{"message": {"role": "assistant", "content": "ready"}}],
+            "choices": [{"message": {"role": "assistant", "content": self.reply}}],
         }).encode("utf-8")
         self.wfile.write(response)
 
@@ -281,6 +282,31 @@ class GatewayBenchmarkTests(unittest.TestCase):
                 for word in payload["messages"][0]["content"].split())
         )
         self.assertEqual(len(payload["messages"][0]["content"].split()), 16)
+
+    def test_multi_turn_replays_replies_without_special_tokens(self):
+        # A text-only model rejects a prompt with an image placeholder, so a
+        # fixture's `<|image_pad|>` in a reply must not reach the next turn.
+        MockGatewayHandler.mode = "json"
+        MockGatewayHandler.reply = "a <|image_pad|> b<|pad|>"
+        try:
+            ok, _, _, _, _, _ = benchmark.run_one(
+                f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 8,
+                False, 0, workload="multi_turn", prefix_tokens=16,
+                suffix_tokens=12, vocab=["a", "b", "c"], turns=2,
+            )
+        finally:
+            MockGatewayHandler.reply = "ready"
+        self.assertTrue(ok)
+        messages = MockGatewayHandler.last_payload["messages"]
+        self.assertEqual([m["role"] for m in messages],
+                         ["system", "user", "assistant", "user"])
+        self.assertEqual(messages[2]["content"], "a b")
+
+    def test_a_reply_of_only_special_tokens_replays_as_a_vocab_word(self):
+        # An empty assistant message is a 400 as well.
+        self.assertEqual(benchmark.replayable_reply("<|pad|> <|pad|>", ["b", "c"]), "b")
+        self.assertEqual(benchmark.replayable_reply("a<|pad|>a", ["b"]), "a a")
+        self.assertIsNone(benchmark.replayable_reply(None, ["b"]))
 
 
 if __name__ == "__main__":

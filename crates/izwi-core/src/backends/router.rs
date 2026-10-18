@@ -51,6 +51,18 @@ impl BackendRouter {
         ))
     }
 
+    /// The backend of a config that names none: `IZWI_BACKEND`, else auto
+    /// detection. Unit tests always take the CPU (a router test sets
+    /// `IZWI_BACKEND`): their stub models make the device incidental, and
+    /// only a test holding the shared Metal device's lease may select it
+    /// (`backends::metal_test_device_or_skip`).
+    pub fn unset_preference() -> BackendPreference {
+        if cfg!(test) {
+            return BackendPreference::Cpu;
+        }
+        Self::env_preference().unwrap_or(BackendPreference::Auto)
+    }
+
     pub fn env_preference() -> Option<BackendPreference> {
         std::env::var("IZWI_BACKEND")
             .ok()
@@ -330,6 +342,10 @@ mod tests {
 
     #[test]
     fn explicit_preferences_record_requested_backend_even_on_fallback() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "explicit_preferences_record_requested_backend_even_on_fallback",
+        );
         for preference in [BackendPreference::Metal, BackendPreference::Cuda] {
             let router = BackendRouter::from_preference(preference);
             let context = router.context();
@@ -355,6 +371,9 @@ mod tests {
 
     #[test]
     fn auto_preference_selects_supported_backend() {
+        #[cfg(feature = "metal")]
+        let _lease =
+            crate::backends::metal_test_device_or_skip("auto_preference_selects_supported_backend");
         let backend = BackendRouter::from_preference(BackendPreference::Auto).default_backend();
         assert!(matches!(
             backend,
@@ -366,6 +385,9 @@ mod tests {
 
     #[test]
     fn env_auto_keeps_runtime_default_backend() {
+        #[cfg(feature = "metal")]
+        let _lease =
+            crate::backends::metal_test_device_or_skip("env_auto_keeps_runtime_default_backend");
         let _guard = env_test_lock().lock().expect("env lock poisoned");
         std::env::set_var("IZWI_BACKEND", "auto");
 

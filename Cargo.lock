@@ -3723,6 +3723,9 @@ dependencies = [
  "image",
  "indicatif 0.17.11",
  "izwi-asr-toolkit",
+ "izwi-env",
+ "izwi-model-catalog",
+ "izwi-prometheus",
  "izwi-vad",
  "memmap2",
  "objc2 0.6.3",
@@ -3756,6 +3759,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-db"
+version = "0.1.0-beta-18"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "sea-orm",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "izwi-desktop"
 version = "0.1.0-beta-18"
 dependencies = [
@@ -3778,6 +3794,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-env"
+version = "0.1.0-beta-18"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "izwi-gateway"
+version = "0.1.0-beta-18"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "clap",
+ "futures",
+ "hmac",
+ "http-body 1.0.1",
+ "http-body-util",
+ "izwi-db",
+ "izwi-env",
+ "izwi-hooks",
+ "izwi-model-catalog",
+ "izwi-prometheus",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
+ "izwi-serving-worker",
+ "izwi-test-process",
+ "rand 0.8.5",
+ "reqwest 0.11.27",
+ "scalar_api_reference",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "izwi-hooks"
 version = "0.1.0-beta-18"
 dependencies = [
@@ -3788,6 +3853,18 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
+
+[[package]]
+name = "izwi-model-catalog"
+version = "0.1.0-beta-18"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "izwi-prometheus"
+version = "0.1.0-beta-18"
 
 [[package]]
 name = "izwi-server"
@@ -3807,15 +3884,22 @@ dependencies = [
  "futures",
  "hmac",
  "hound",
+ "http-body 1.0.1",
+ "http-body-util",
  "izwi-agent",
  "izwi-core",
+ "izwi-db",
+ "izwi-gateway",
  "izwi-hooks",
  "izwi-serving-client",
  "izwi-serving-protocol",
+ "izwi-serving-worker",
+ "izwi-test-process",
  "izwi-vad",
  "libc",
  "rand 0.8.5",
  "reqwest 0.11.27",
+ "rubato 0.15.0",
  "scalar_api_reference",
  "sea-orm",
  "serde",
@@ -3840,8 +3924,6 @@ dependencies = [
 name = "izwi-serving-client"
 version = "0.1.0-beta-18"
 dependencies = [
- "async-stream",
- "axum",
  "bytes",
  "futures",
  "izwi-serving-protocol",
@@ -3851,18 +3933,36 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "izwi-serving-fence"
+version = "0.1.0-beta-18"
+dependencies = [
+ "fs2",
+ "izwi-serving-protocol",
+ "libc",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "izwi-serving-protocol"
 version = "0.1.0-beta-18"
 dependencies = [
+ "izwi-env",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]
@@ -3871,8 +3971,11 @@ version = "0.1.0-beta-18"
 dependencies = [
  "fs2",
  "izwi-serving-client",
+ "izwi-serving-fence",
  "izwi-serving-protocol",
+ "izwi-test-process",
  "libc",
+ "reqwest 0.11.27",
  "serde",
  "serde_json",
  "sha2",
@@ -3880,6 +3983,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.2",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3900,8 +4005,12 @@ dependencies = [
  "izwi-hooks",
  "izwi-server",
  "izwi-serving-client",
+ "izwi-serving-fence",
  "izwi-serving-protocol",
  "izwi-serving-supervisor",
+ "izwi-serving-worker",
+ "izwi-test-process",
+ "reqwest 0.11.27",
  "rustls-pemfile",
  "safetensors 0.4.5",
  "serde_json",
@@ -3916,6 +4025,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "izwi-test-process"
+version = "0.1.0-beta-18"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -7515,6 +7631,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "sha2",
@@ -7525,6 +7642,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

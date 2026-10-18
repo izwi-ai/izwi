@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::request_context::RequestContext;
 use crate::chat_store::ChatStore;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredAgentSessionRecord};
 use crate::voice_defaults::{
@@ -73,7 +73,7 @@ pub struct AgentTurnResponse {
 
 pub async fn create_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateAgentSessionRequest>,
+    ApiJson(req): ApiJson<CreateAgentSessionRequest>,
 ) -> Result<Json<AgentSessionResponse>, ApiError> {
     let agent_id = req
         .agent_id
@@ -131,7 +131,7 @@ pub async fn create_turn(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<CreateAgentTurnRequest>,
+    ApiJson(req): ApiJson<CreateAgentTurnRequest>,
 ) -> Result<Json<AgentTurnResponse>, ApiError> {
     let session_record = {
         let store = state.agent_session_store.read().await;
@@ -196,6 +196,7 @@ pub async fn create_turn(
                     req.max_output_tokens,
                 )?,
                 max_tool_calls: 1,
+                ..AgentTurnOptions::default()
             },
         )
         .await

@@ -12,8 +12,9 @@ use tracing::warn;
 
 use crate::{
     api::request_context::RequestContext,
-    batch_runtime::types::{
-        JobStage, RuntimeArtifact, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
+    batch_runtime::{
+        store::is_terminal_job_status,
+        types::{JobStage, RuntimeArtifact, RuntimeJob, RuntimeJobKind, RuntimeJobStatus},
     },
     error::ApiError,
     speech_history_store::{SpeechHistoryProcessingStatus, SpeechRouteKind},
@@ -36,21 +37,19 @@ pub struct RuntimeJobArtifactsResponse {
 
 pub async fn get_job(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(job_id): Path<String>,
 ) -> Result<Json<RuntimeJobTraceResponse>, ApiError> {
-    Ok(Json(load_job_trace(&state, &job_id).await?))
+    let job = load_owned_job(&state, &ctx, &job_id).await?;
+    Ok(Json(job_trace(&state, job).await?))
 }
 
 pub async fn list_job_artifacts(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(job_id): Path<String>,
 ) -> Result<Json<RuntimeJobArtifactsResponse>, ApiError> {
-    let job = state
-        .batch_runtime_store
-        .get_job(&job_id)
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Runtime job not found"))?;
+    let job = load_owned_job(&state, &ctx, &job_id).await?;
     let artifacts = state
         .batch_runtime_store
         .list_artifacts_for_job(&job.id)
@@ -65,15 +64,10 @@ pub async fn list_job_artifacts(
 
 pub async fn cancel_job(
     State(state): State<AppState>,
-    context: Option<Extension<RequestContext>>,
+    Extension(ctx): Extension<RequestContext>,
     Path(job_id): Path<String>,
 ) -> Result<Json<RuntimeJobTraceResponse>, ApiError> {
-    let existing = state
-        .batch_runtime_store
-        .get_job(&job_id)
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Runtime job not found"))?;
+    let existing = load_owned_job(&state, &ctx, &job_id).await?;
     if is_terminal_job_status(existing.status) {
         return Err(ApiError::bad_request("Runtime job is already terminal"));
     }
@@ -86,7 +80,7 @@ pub async fn cancel_job(
         .ok_or_else(|| ApiError::bad_request("Runtime job is not cancellable"))?;
     record_job_audit(
         &state,
-        context.as_ref().map(|Extension(ctx)| ctx),
+        Some(&ctx),
         &cancelled,
         "runtime_job.cancel",
         AuditOutcome::Success,
@@ -99,21 +93,13 @@ pub async fn cancel_job(
 
 pub async fn retry_job(
     State(state): State<AppState>,
-    context: Option<Extension<RequestContext>>,
+    Extension(ctx): Extension<RequestContext>,
     Path(job_id): Path<String>,
 ) -> Result<Json<RuntimeJobTraceResponse>, ApiError> {
-    let existing = state
-        .batch_runtime_store
-        .get_job(&job_id)
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Runtime job not found"))?;
-    if !matches!(
-        existing.status,
-        RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled | RuntimeJobStatus::Expired
-    ) {
+    let existing = load_owned_job(&state, &ctx, &job_id).await?;
+    if !matches!(existing.status, RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled) {
         return Err(ApiError::bad_request(
-            "Runtime job can only be retried from failed, cancelled, or expired status",
+            "Runtime job can only be retried from failed or cancelled status",
         ));
     }
 
@@ -126,7 +112,7 @@ pub async fn retry_job(
     update_route_projection_for_retry(&state, &retried).await?;
     record_job_audit(
         &state,
-        context.as_ref().map(|Extension(ctx)| ctx),
+        Some(&ctx),
         &retried,
         "runtime_job.retry",
         AuditOutcome::Success,
@@ -135,6 +121,34 @@ pub async fn retry_job(
     .await;
 
     Ok(Json(load_job_trace(&state, &job_id).await?))
+}
+
+/// Load a job the caller's tenant owns; another tenant's job (including its
+/// `request_json`) is reported as missing.
+async fn load_owned_job(
+    state: &AppState,
+    ctx: &RequestContext,
+    job_id: &str,
+) -> Result<RuntimeJob, ApiError> {
+    state
+        .batch_runtime_store
+        .get_job(job_id)
+        .await
+        .map_err(map_store_error)?
+        .filter(|job| job_owned_by(job, ctx))
+        .ok_or_else(|| ApiError::not_found("Runtime job not found"))
+}
+
+/// Jobs record their tenant only as the server-authored
+/// `request_json.tenant_key` (the scheduling key; `None` for the anonymous
+/// local principal). Jobs without one belong to the anonymous tenant, and a
+/// malformed key belongs to nobody.
+fn job_owned_by(job: &RuntimeJob, ctx: &RequestContext) -> bool {
+    match job.request_json.get("tenant_key") {
+        None => ctx.tenant_key().is_none(),
+        Some(value) => serde_json::from_value::<Option<[u8; 32]>>(value.clone())
+            .is_ok_and(|tenant_key| tenant_key == ctx.tenant_key()),
+    }
 }
 
 pub(crate) async fn cancel_active_audio_jobs_for_model(
@@ -190,6 +204,10 @@ async fn load_job_trace(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Runtime job not found"))?;
+    job_trace(state, job).await
+}
+
+async fn job_trace(state: &AppState, job: RuntimeJob) -> Result<RuntimeJobTraceResponse, ApiError> {
     let stages = state
         .batch_runtime_store
         .list_stages_for_job(&job.id)
@@ -310,16 +328,6 @@ fn parse_speech_route_kind(value: &str) -> Option<SpeechRouteKind> {
     }
 }
 
-fn is_terminal_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Completed
-            | RuntimeJobStatus::Failed
-            | RuntimeJobStatus::Cancelled
-            | RuntimeJobStatus::Expired
-    )
-}
-
 fn warn_if_projection_missing(updated: bool, job: &RuntimeJob) {
     if !updated {
         warn!(
@@ -332,16 +340,7 @@ fn warn_if_projection_missing(updated: bool, job: &RuntimeJob) {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    if err
-        .to_string()
-        .contains("Speech job admission capacity exhausted")
-    {
-        return ApiError {
-            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-            message: err.to_string(),
-        };
-    }
-    ApiError::internal(format!("Batch runtime storage error: {err}"))
+    crate::error::store_api_error(err, "Batch runtime storage error")
 }
 
 #[cfg(test)]

@@ -12,16 +12,18 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream_with_keepalive,
-    ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, parse_chat_model, resolve_chat_request_config, start_chat_stream_with_keepalive,
+    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs};
+use izwi_core::{
+    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation,
+};
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 const CHAT_EMPTY_RESPONSE_ERROR: &str =
@@ -78,7 +80,6 @@ pub struct UpdateChatThreadRequest {
     pub system_prompt: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateThreadMessageRequest {
     pub model: String,
@@ -111,6 +112,11 @@ pub struct CreateThreadMessageRequest {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// `"auto"` drops the thread's oldest turns when it outgrows the model's
+    /// context; `"disabled"` (the default) rejects the message with
+    /// `context_length_exceeded`. The chat UI opts in.
+    #[serde(default)]
+    pub truncation: Option<ChatTruncation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,7 +204,7 @@ pub async fn list_threads(
 
 pub async fn create_thread(
     State(state): State<AppState>,
-    Json(req): Json<CreateChatThreadRequest>,
+    ApiJson(req): ApiJson<CreateChatThreadRequest>,
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     let thread = state
         .chat_store
@@ -260,7 +266,7 @@ pub async fn delete_thread(
 pub async fn update_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
-    Json(req): Json<UpdateChatThreadRequest>,
+    ApiJson(req): ApiJson<UpdateChatThreadRequest>,
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     if req.title.is_none() && req.system_prompt.is_none() {
         return Err(ApiError::bad_request("No thread settings were provided"));
@@ -287,7 +293,7 @@ pub async fn create_thread_message(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<CreateThreadMessageRequest>,
+    ApiJson(req): ApiJson<CreateThreadMessageRequest>,
 ) -> Result<Response, ApiError> {
     let model_variant = parse_chat_model(&req.model)?;
     let model_id = model_variant.dir_name().to_string();
@@ -341,6 +347,7 @@ pub async fn create_thread_message(
         req.chat_template_kwargs.as_ref(),
         Vec::new(),
         media_inputs,
+        req.truncation,
     )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
@@ -352,12 +359,16 @@ pub async fn create_thread_message(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        seed: None,
+        stop: Vec::new(),
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: None,
         chat_config,
         correlation_id: Some(ctx.correlation_id),
     };
+    validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
         return create_streaming_thread_message(
@@ -414,7 +425,7 @@ async fn create_streaming_thread_message(
     let user_message_for_start = user_message.clone();
     let correlation_id = execution_request.correlation_id.clone();
     let (mut event_rx, stream_completion) =
-        spawn_chat_stream_with_keepalive(state, execution_request, turn_guard);
+        start_chat_stream_with_keepalive(state, execution_request, turn_guard).await?;
 
     let stream = async_stream::stream! {
         let mut stream_completion = Some(stream_completion);
@@ -484,11 +495,7 @@ async fn create_streaming_thread_message(
                     (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => (
-                    thread_stream_error_payload(error),
-                    true,
-                ),
-                ChatStreamEvent::ShuttingDown => (
-                    thread_stream_error_payload("Server is shutting down"),
+                    thread_stream_error_payload(error.message),
                     true,
                 ),
             };
@@ -595,9 +602,8 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 }
 
 fn map_store_or_not_found(err: anyhow::Error) -> ApiError {
-    let error_text = err.to_string();
-    if error_text.contains("Thread not found") {
-        ApiError::not_found("Thread not found")
+    if crate::error::StoreError::find(&err).is_some() {
+        crate::error::store_api_error(err, "Chat storage error")
     } else {
         map_store_error(err)
     }
@@ -818,7 +824,12 @@ mod tests {
              (code: 517) database is locked"
         );
 
-        let missing = map_store_or_not_found(anyhow::anyhow!("Thread not found"));
+        let missing =
+            map_store_or_not_found(crate::error::StoreError::not_found("Thread not found").into());
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.message, "Thread not found");
+        // The text alone no longer decides the status.
+        let text = map_store_or_not_found(anyhow::anyhow!("Thread not found"));
+        assert_eq!(text.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

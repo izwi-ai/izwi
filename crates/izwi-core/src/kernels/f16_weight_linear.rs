@@ -602,8 +602,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_uses_the_ggml_f16_f32_kernel_and_matches_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_uses_the_ggml_f16_f32_kernel_and_matches_f32",
+        ) else {
             return;
         };
         for (out_features, in_features, with_bias) in

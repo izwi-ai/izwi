@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -30,7 +30,7 @@ pub async fn get_preferences(
 
 pub async fn update_analytics_preference(
     State(state): State<AppState>,
-    Json(request): Json<UpdateAnalyticsPreferenceRequest>,
+    ApiJson(request): ApiJson<UpdateAnalyticsPreferenceRequest>,
 ) -> Result<Json<UserPreferencesResponse>, ApiError> {
     let stored = state
         .onboarding_store

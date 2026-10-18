@@ -16,9 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::backends::state::{
     InvocationRingDepthwiseConvTransaction, InvocationStaticAttentionArena, InvocationTensorArena,
-    InvocationTensorChronologicalSegment, InvocationTensorDomainKind, InvocationTensorSnapshot,
-    InvocationTensorUpdateV2, StaticAttentionLayerValue, StaticAttentionMetadata,
-    StaticAttentionRaggedRow,
+    InvocationTensorDomainKind, InvocationTensorSnapshot, InvocationTensorUpdateV2,
+    StaticAttentionLayerValue, StaticAttentionMetadata, StaticAttentionRaggedRow,
 };
 use crate::backends::BackendKind;
 use crate::engine::ModelInstanceId;
@@ -86,6 +85,7 @@ impl InvocationSlotArena for InvocationTensorArena {
     }
 
     fn reset_for_reuse(&mut self) -> Result<()> {
+        crate::backends::probe_device_op("invocation.reset_for_reuse");
         InvocationTensorArena::reset_for_reuse(self)
     }
 
@@ -122,6 +122,7 @@ impl InvocationSlotArena for InvocationStaticAttentionArena {
     }
 
     fn reset_for_reuse(&mut self) -> Result<()> {
+        crate::backends::probe_device_op("invocation.reset_for_reuse");
         InvocationStaticAttentionArena::reset_for_reuse(self)
     }
 
@@ -144,8 +145,6 @@ pub(crate) struct InvocationSlotPoolId {
     pub(crate) allocation_generation: u32,
 }
 
-pub(crate) type InvocationTensorPoolId = InvocationSlotPoolId;
-
 impl InvocationSlotPoolId {
     const fn backing_identity(self) -> InvocationWorkspaceBackingIdentityV2 {
         InvocationWorkspaceBackingIdentityV2::Typed {
@@ -166,8 +165,6 @@ pub(crate) struct InvocationSlotRef {
     pub(crate) nonce: u64,
 }
 
-pub(crate) type InvocationTensorSlotRef = InvocationSlotRef;
-
 #[derive(Debug)]
 pub(crate) struct InvocationSlotPoolOwner<A: InvocationSlotArena> {
     inner: Arc<InvocationSlotPoolInner<A>>,
@@ -184,10 +181,6 @@ pub(crate) struct InvocationSlotPoolHandle<A: InvocationSlotArena> {
     maximum_bytes: u64,
     inner: Weak<InvocationSlotPoolInner<A>>,
 }
-
-pub(crate) type InvocationTensorPoolHandle = InvocationSlotPoolHandle<InvocationTensorArena>;
-pub(crate) type InvocationStaticAttentionPoolHandle =
-    InvocationSlotPoolHandle<InvocationStaticAttentionArena>;
 
 impl<A: InvocationSlotArena> Clone for InvocationSlotPoolHandle<A> {
     fn clone(&self) -> Self {
@@ -422,12 +415,9 @@ impl<A: InvocationSlotArena> InvocationSlotPoolOwner<A> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> InvocationSlotPoolId {
         self.inner.id
-    }
-
-    pub(crate) fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
-        &self.inner.workspace_domain
     }
 
     pub(crate) fn maximum_bytes(&self) -> u64 {
@@ -447,6 +437,7 @@ impl<A: InvocationSlotArena> InvocationSlotPoolOwner<A> {
         Arc::new(self.handle())
     }
 
+    #[cfg(test)]
     pub(crate) fn lease(&self) -> Result<InvocationSlotLease<A>> {
         lease_from_inner(self.inner.clone())
     }
@@ -482,14 +473,7 @@ impl<A: InvocationSlotArena> Drop for InvocationSlotPoolOwner<A> {
 }
 
 impl<A: InvocationSlotArena> InvocationSlotPoolHandle<A> {
-    pub(crate) const fn id(&self) -> InvocationSlotPoolId {
-        self.id
-    }
-
-    pub(crate) fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
-        &self.workspace_domain
-    }
-
+    #[cfg(test)]
     pub(crate) const fn maximum_bytes(&self) -> u64 {
         self.maximum_bytes
     }
@@ -515,10 +499,6 @@ impl<A: InvocationSlotArena> InvocationSlotPoolHandle<A> {
             .upgrade()
             .ok_or_else(|| invalid("invocation slot pool retired during admission"))?;
         lease_from_inner(inner)
-    }
-
-    pub(crate) fn backing(&self) -> Arc<dyn InvocationWorkspaceBackingV2> {
-        Arc::new(self.clone())
     }
 }
 
@@ -593,6 +573,7 @@ impl<A: InvocationSlotArena> std::fmt::Debug for InvocationSlotLease<A> {
 }
 
 impl<A: InvocationSlotArena> InvocationSlotLease<A> {
+    #[cfg(test)]
     pub(crate) const fn slot(&self) -> InvocationSlotRef {
         self.slot
     }
@@ -655,12 +636,6 @@ impl InvocationSlotLease<InvocationTensorArena> {
         self.arena()?.read_snapshot()
     }
 
-    pub(crate) fn read_chronological_segments(
-        &self,
-    ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
-        self.arena()?.read_chronological_segments()
-    }
-
     /// Reuse this invocation-exclusive backing for a new nested logical
     /// sequence without releasing its authenticated pool slot.
     pub(crate) fn reset_invocation(&mut self) -> Result<()> {
@@ -693,6 +668,7 @@ impl InvocationSlotLease<InvocationStaticAttentionArena> {
         self.arena_mut()?.commit_install()
     }
 
+    #[cfg(test)]
     pub(crate) fn install(
         &mut self,
         intent: &DomainStepIntent,
@@ -821,6 +797,7 @@ impl<A: InvocationSlotArena> Drop for PreparingSlotGuard<A> {
     }
 }
 
+#[cfg(test)]
 fn begin_lease<A: InvocationSlotArena>(
     inner: &InvocationSlotPoolInner<A>,
 ) -> Result<InvocationSlotRef> {

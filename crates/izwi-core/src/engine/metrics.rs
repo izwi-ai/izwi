@@ -1,4 +1,4 @@
-//! Metrics and benchmarking infrastructure for the inference engine.
+//! Metrics infrastructure for the inference engine.
 //!
 //! Provides detailed performance tracking including:
 //! - Request latency histograms
@@ -18,6 +18,7 @@ use super::{
     BatchDispatch, BatchDispatchKind, DeadlinePhase, DispatchState, FailureOrigin, NativeBatchMode,
     OutcomeProvenance, PhysicalBatch, ResourceAmount,
 };
+use crate::runtime::prometheus::{buckets, HistogramFamily};
 
 /// Stable metric names for scheduler and KV-cache observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1126,6 +1127,7 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
+    pub capacity_replay_capped_total: u64,
     pub recompute_preemptions_total: u64,
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
@@ -1178,6 +1180,14 @@ pub(crate) fn record_capacity_replay(tokens: usize) {
     ENGINE_CAPACITY_REPLAY_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
 }
 
+static ENGINE_CAPACITY_REPLAY_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Every replayable claim holder had reached its replay cap, so capacity
+/// pressure fell through to the claim-deadlock breaker.
+pub(crate) fn record_capacity_replay_capped() {
+    ENGINE_CAPACITY_REPLAY_CAPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 static ENGINE_RECOMPUTE_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_CLAIM_DEADLOCK_ABORTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_KV_BLOCKED_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -1206,6 +1216,166 @@ pub(crate) fn record_engine_incremental_prefill_commit(tokens: usize, became_mul
     if became_multispan {
         ENGINE_MULTISPAN_PREFILL_REQUESTS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+static ENGINE_INTER_TOKEN_LATENCY: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_inter_token_latency_seconds",
+    "Gap between successive committed tokens (audio frames for speech models) of one request; a commit of k tokens after a gap g counts k gaps of g/k.",
+    &["model", "task"],
+    buckets::INTER_TOKEN_SECONDS,
+);
+static ENGINE_STEP_HOST_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_step_host_seconds",
+    "Host time of one engine step phase under the step gate: prepare (scheduling and batch planning), commit (state commit of one physical batch) and deliver (stream delivery and terminal routing).",
+    &["phase"],
+    buckets::STEP_SECONDS,
+);
+static ENGINE_BATCH_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_batch_rows",
+    "Rows in one dispatched physical batch.",
+    &[],
+    buckets::BATCH_ROWS,
+);
+static ENGINE_BATCH_TOKENS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_batch_tokens",
+    "Work units in one dispatched physical batch: tokens for text models, frames or samples for speech models.",
+    &[],
+    buckets::BATCH_TOKENS,
+);
+static ENGINE_MODEL_CALLS_PER_STEP: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_model_calls_per_step",
+    "Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch.",
+    &[],
+    buckets::BATCH_ROWS,
+);
+
+static ENGINE_DEVICE_IDLE_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_device_idle_seconds",
+    "Time a device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps.",
+    &["device"],
+    buckets::STEP_SECONDS,
+);
+
+/// Record the device idle gap before a model step that followed another
+/// step without the engine going idle in between.
+pub(crate) fn record_engine_device_idle(device: &str, idle: Duration) {
+    ENGINE_DEVICE_IDLE_SECONDS.observe_duration(&[device], idle);
+}
+
+static ENGINE_DEVICE_QUEUE_WAIT_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_device_queue_wait_seconds",
+    "Time a model dispatch waited on its device's queue before it started, by the workload class it was arbitrated as.",
+    &["device", "class"],
+    buckets::STEP_SECONDS,
+);
+
+/// Record how long a model dispatch waited for its device.
+pub(crate) fn record_engine_device_queue_wait(device: &str, class: &str, waited: Duration) {
+    ENGINE_DEVICE_QUEUE_WAIT_SECONDS.observe_duration(&[device, class], waited);
+}
+
+/// Observations and total seconds of one device's idle histogram.
+#[cfg(test)]
+pub(crate) fn engine_device_idle_totals(device: &str) -> (u64, f64) {
+    let snapshot = ENGINE_DEVICE_IDLE_SECONDS.series(&[device]).snapshot();
+    (snapshot.count, snapshot.sum)
+}
+
+/// Model entries one dispatched physical batch made.
+pub(crate) fn model_calls_for_dispatch(dispatch: BatchDispatch) -> usize {
+    match dispatch.kind {
+        BatchDispatchKind::NotDispatched => 0,
+        BatchDispatchKind::RequestParallel => dispatch.width,
+        BatchDispatchKind::Serial
+        | BatchDispatchKind::TensorStatic
+        | BatchDispatchKind::TensorContinuous
+        | BatchDispatchKind::TensorMixed => 1,
+    }
+}
+
+static ENGINE_MIXED_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_mixed_rows",
+    "Rows of each phase in one committed mixed prefill+decode batch.",
+    &["phase"],
+    buckets::BATCH_ROWS,
+);
+static ENGINE_MIXED_TOKENS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_mixed_tokens",
+    "Tokens (decode rows plus prefill spans) in one committed mixed prefill+decode batch.",
+    &[],
+    buckets::BATCH_TOKENS,
+);
+
+/// Record one committed mixed batch: its decode and prefill rows and its
+/// tokens.
+pub(crate) fn record_engine_mixed_batch(decode_rows: usize, prefill_rows: usize, tokens: usize) {
+    ENGINE_MIXED_ROWS.observe(&["decode"], decode_rows as f64);
+    ENGINE_MIXED_ROWS.observe(&["prefill"], prefill_rows as f64);
+    ENGINE_MIXED_TOKENS.observe(&[], tokens as f64);
+}
+
+/// Record the model calls of one committed engine step that dispatched work.
+pub(crate) fn record_engine_step_model_calls(calls: usize) {
+    if calls > 0 {
+        ENGINE_MODEL_CALLS_PER_STEP.observe(&[], calls as f64);
+    }
+}
+
+/// Host phases of one engine step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineStepPhase {
+    Prepare,
+    Commit,
+    Deliver,
+}
+
+impl EngineStepPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Deliver => "deliver",
+        }
+    }
+}
+
+pub(crate) fn record_engine_step_phase(phase: EngineStepPhase, elapsed: Duration) {
+    ENGINE_STEP_HOST_SECONDS.observe_duration(&[phase.as_str()], elapsed);
+}
+
+/// Record `tokens` tokens committed `gap` after the request's previous
+/// commit. Tokens of one commit arrive together, so the gap is spread evenly
+/// over them.
+pub(crate) fn record_engine_inter_token_gap(model: &str, task: &str, gap: Duration, tokens: usize) {
+    if tokens == 0 {
+        return;
+    }
+    let series = ENGINE_INTER_TOKEN_LATENCY.series(&[model, task]);
+    let per_token = gap.as_secs_f64() / tokens as f64;
+    for _ in 0..tokens {
+        series.observe(per_token);
+    }
+}
+
+/// Append the engine histograms in the Prometheus text format.
+pub fn push_engine_histograms(payload: &mut String) {
+    ENGINE_INTER_TOKEN_LATENCY.render(payload);
+    ENGINE_STEP_HOST_SECONDS.render(payload);
+    ENGINE_BATCH_ROWS.render(payload);
+    ENGINE_BATCH_TOKENS.render(payload);
+    ENGINE_MODEL_CALLS_PER_STEP.render(payload);
+    ENGINE_MIXED_ROWS.render(payload);
+    ENGINE_MIXED_TOKENS.render(payload);
+    ENGINE_DEVICE_IDLE_SECONDS.render(payload);
+    ENGINE_DEVICE_QUEUE_WAIT_SECONDS.render(payload);
+    payload.push_str(
+        "# HELP izwi_engine_device_ops_off_thread_total Device operations (model calls, KV page operations, state allocation and frees) that ran off their device thread. Zero in a healthy process.\n\
+         # TYPE izwi_engine_device_ops_off_thread_total counter\n",
+    );
+    payload.push_str(&format!(
+        "izwi_engine_device_ops_off_thread_total {}\n",
+        crate::backends::device_ops_off_thread_total()
+    ));
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
@@ -1288,6 +1458,10 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
             ENGINE_TENSOR_CONTINUOUS_BATCHES.fetch_add(1, Ordering::Relaxed);
             ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
         }
+        BatchDispatchKind::TensorMixed => {
+            ENGINE_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
+        }
         BatchDispatchKind::RequestParallel => {
             ENGINE_REQUEST_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
         }
@@ -1342,6 +1516,11 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
         total.saturating_add(row.cost.tensor_elements)
     });
+    let work_units = batch.rows.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.cost.logical_units)
+    });
+    ENGINE_BATCH_ROWS.observe(&[], batch.rows.len() as f64);
+    ENGINE_BATCH_TOKENS.observe(&[], work_units as f64);
     saturating_atomic_add(&ENGINE_PHYSICAL_BATCHES, 1);
     ENGINE_PHYSICAL_BATCH_MAX_WIDTH.fetch_max(batch.rows.len() as u64, Ordering::Relaxed);
     saturating_atomic_add(&ENGINE_PHYSICAL_BATCH_ROWS, batch.rows.len() as u64);
@@ -1372,7 +1551,9 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     }
     if !matches!(
         dispatch.kind,
-        BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous
+        BatchDispatchKind::TensorStatic
+            | BatchDispatchKind::TensorContinuous
+            | BatchDispatchKind::TensorMixed
     ) {
         record_engine_batch_dispatch(dispatch);
         return;
@@ -1548,6 +1729,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
+        capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),
         recompute_preemptions_total: ENGINE_RECOMPUTE_PREEMPTIONS.load(Ordering::Relaxed),
         claim_deadlock_aborts_total: ENGINE_CLAIM_DEADLOCK_ABORTS.load(Ordering::Relaxed),
         kv_blocked_requests: ENGINE_KV_BLOCKED_REQUESTS.load(Ordering::Relaxed),
@@ -1842,77 +2024,6 @@ fn compute_percentile(samples: &VecDeque<f64>, percentile: f64) -> f64 {
 
     let index = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
     sorted[index]
-}
-
-/// Benchmark results for a test run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkResult {
-    /// Test name/description
-    pub name: String,
-    /// Number of requests in the benchmark
-    pub num_requests: u64,
-    /// Total duration of the benchmark
-    pub total_duration_secs: f64,
-    /// Metrics snapshot at end of benchmark
-    pub metrics: MetricsSnapshot,
-    /// Throughput in requests per second
-    pub throughput_rps: f64,
-    /// Average time to first token (TTFT) in milliseconds
-    pub avg_ttft_ms: f64,
-    /// Average time per output token (TPOT) in milliseconds  
-    pub avg_tpot_ms: f64,
-}
-
-impl BenchmarkResult {
-    /// Create a new benchmark result.
-    pub fn new(
-        name: impl Into<String>,
-        num_requests: u64,
-        total_duration: Duration,
-        metrics: MetricsSnapshot,
-    ) -> Self {
-        let total_secs = total_duration.as_secs_f64();
-
-        Self {
-            name: name.into(),
-            num_requests,
-            total_duration_secs: total_secs,
-            metrics: metrics.clone(),
-            throughput_rps: if total_secs > 0.0 {
-                num_requests as f64 / total_secs
-            } else {
-                0.0
-            },
-            avg_ttft_ms: metrics.p50_latency_ms * 0.3, // Estimate TTFT as ~30% of total latency
-            avg_tpot_ms: if metrics.avg_tokens_per_sec > 0.0 {
-                1000.0 / metrics.avg_tokens_per_sec
-            } else {
-                0.0
-            },
-        }
-    }
-
-    /// Format as a summary string.
-    pub fn summary(&self) -> String {
-        format!(
-            "Benchmark: {}\n\
-             Requests: {}, Duration: {:.2}s\n\
-             Throughput: {:.2} req/s\n\
-             Latency: avg={:.1}ms, p50={:.1}ms, p90={:.1}ms, p99={:.1}ms\n\
-             RTF: {:.3} (< 1.0 = faster than real-time)\n\
-             Tokens/sec: {:.1}",
-            self.name,
-            self.num_requests,
-            self.total_duration_secs,
-            self.throughput_rps,
-            self.metrics.avg_latency_ms,
-            self.metrics.p50_latency_ms,
-            self.metrics.p90_latency_ms,
-            self.metrics.p99_latency_ms,
-            self.metrics.avg_rtf,
-            self.metrics.avg_tokens_per_sec,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -2219,7 +2330,7 @@ mod tests {
             active.effective_mode.labeled_values(),
             [("serial", 0), ("shadow", 0), ("concurrent", 1)]
         );
-        assert_eq!(active.dispatches_in_flight, before.dispatches_in_flight + 2);
+        assert!(active.dispatches_in_flight >= 2);
         assert!(active.dispatches_max_in_flight >= active.dispatches_in_flight);
         assert!(active.dispatches_started_total >= before.dispatches_started_total + 2);
         assert!(active.cohort_wait.observations_total > before.cohort_wait.observations_total);
@@ -2233,10 +2344,6 @@ mod tests {
             ENGINE_PHYSICAL_PERMIT_WAIT_NANOS.load(Ordering::Relaxed)
                 >= before_permit_wait_nanos
                     .saturating_add(duration_nanos(Duration::from_millis(5)))
-        );
-        assert_eq!(
-            active.dispatch_duration.observations_total,
-            before.dispatch_duration.observations_total
         );
         assert!(active.fallbacks.uncertified_profile > before.fallbacks.uncertified_profile);
         assert!(active.defers.workspace_capacity > before.defers.workspace_capacity);
@@ -2274,14 +2381,40 @@ mod tests {
         drop(second_dispatch);
         drop(first_dispatch);
         let after = engine_physical_execution_metrics_snapshot();
-        assert_eq!(after.dispatches_in_flight, before.dispatches_in_flight);
         assert!(after.dispatches_completed_total >= before.dispatches_completed_total + 2);
         assert!(
             after.dispatch_duration.observations_total
                 >= before.dispatch_duration.observations_total + 2
         );
-        assert_eq!(after.workspace_current, before.workspace_current);
         assert!(after.workspace_high_water.host >= active.workspace_current.host);
+
+        // The gauges are process-wide and other tests dispatch concurrently,
+        // so exact accounting is checked in a window no other dispatch
+        // touched. A gauge that leaks or double-counts has no such window.
+        let exact_window = (0..1_000).any(|_| {
+            let before = engine_physical_execution_metrics_snapshot();
+            let first = begin_engine_physical_dispatch();
+            let second = begin_engine_physical_dispatch();
+            let workspace = begin_engine_physical_workspace(ResourceVector {
+                host_bytes: ResourceAmount::Known(11),
+                ..ResourceVector::zero()
+            });
+            let active = engine_physical_execution_metrics_snapshot();
+            drop(workspace);
+            drop(second);
+            drop(first);
+            let after = engine_physical_execution_metrics_snapshot();
+            active.dispatches_in_flight == before.dispatches_in_flight + 2
+                && active.dispatch_duration.observations_total
+                    == before.dispatch_duration.observations_total
+                && active.workspace_current.host == before.workspace_current.host + 11
+                && after.dispatches_in_flight == before.dispatches_in_flight
+                && after.workspace_current == before.workspace_current
+        });
+        assert!(
+            exact_window,
+            "in-flight and workspace gauges never balanced in an undisturbed window"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use izwi_serving_fence::{DEFAULT_MODEL_LOAD_SLOTS, MAX_MODEL_LOAD_SLOTS};
 use izwi_serving_protocol::{
     ArtifactRevision, BackendKind, CancellationBehavior, Capability, CredentialId, DeploymentId,
     DeviceAssignment, DeviceId, InputFormat, ModelAlias, ModelGeneration, NodeId, OutputFormat,
@@ -22,8 +23,6 @@ pub const MAX_ACTIVE_INVOCATIONS_PER_WORKER: u32 = 1024;
 pub const MAX_REQUEST_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_ATTEMPTS_PER_WORKER: usize = 65_536;
 pub const MAX_EXECUTION_PROFILE_LABEL_BYTES: usize = 128;
-pub const DEFAULT_MODEL_LOAD_SLOTS: u32 = 1;
-pub const MAX_MODEL_LOAD_SLOTS: u32 = 64;
 pub const MIN_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 100;
 pub const MAX_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 60_000;
 pub const DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 1_000;
@@ -42,6 +41,8 @@ pub struct NodeConfig {
     pub workers: Vec<WorkerConfig>,
     #[serde(default)]
     pub readiness: ReadinessPolicy,
+    #[serde(default)]
+    pub liveness: LivenessPolicy,
     #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default)]
@@ -106,6 +107,7 @@ impl NodeConfig {
         }
         validate_directory("working_directory", &self.working_directory)?;
         self.readiness.validate()?;
+        self.liveness.validate()?;
         self.restart.validate()?;
         self.shutdown.validate()?;
         if let Some(autoscaling) = self.autoscaling.as_ref() {
@@ -285,6 +287,13 @@ impl NodeConfig {
                         "aggregate host memory budget",
                     )?;
                 }
+                // `validate_common` already rejected it.
+                DeviceAssignment::Unknown => {
+                    return Err(ConfigError::UnknownProtocolValue {
+                        worker: worker.worker_id.clone(),
+                        field: "assignment.backend",
+                    })
+                }
             }
         }
 
@@ -311,7 +320,7 @@ impl NodeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub worker_id: WorkerId,
@@ -338,11 +347,22 @@ pub struct WorkerConfig {
     /// host-memory check remains truthful.
     #[serde(default)]
     pub host_kv_pool_budget_bytes: u64,
+    /// Extra environment for this worker's process: operator switches
+    /// (`IZWI_*`) and loader paths, validated by
+    /// [`crate::env::validate_worker_environment`]. Never secrets.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 impl WorkerConfig {
     fn validate_common(&self) -> Result<(), ConfigError> {
+        self.reject_unknown_protocol_values()?;
         validate_env_name(&self.bearer_token_env)?;
+        crate::env::validate_worker_environment(
+            &self.worker_id,
+            &self.bearer_token_env,
+            &self.environment,
+        )?;
         validate_path_length("models_directory", &self.deployment.models_directory)?;
         if self.max_active_invocations == 0 {
             return Err(ConfigError::ZeroWorkerBudget {
@@ -425,6 +445,12 @@ impl WorkerConfig {
                 shared_memory_limit_bytes,
                 ..
             } => (*shared_memory_limit_bytes, "shared_memory_limit_bytes"),
+            DeviceAssignment::Unknown => {
+                return Err(ConfigError::UnknownProtocolValue {
+                    worker: self.worker_id.clone(),
+                    field: "assignment.backend",
+                })
+            }
         };
         if self.host_kv_pool_budget_bytes > limit {
             return Err(ConfigError::KvPoolBudgetExceedsWorkerLimit {
@@ -438,7 +464,7 @@ impl WorkerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentConfig {
     pub deployment_id: DeploymentId,
@@ -452,6 +478,37 @@ pub struct DeploymentConfig {
     pub tokenizer_revision: Option<ArtifactRevision>,
     pub capability: CapabilityProfileConfig,
     pub models_directory: PathBuf,
+}
+
+impl WorkerConfig {
+    /// Protocol enums decode a value from a newer protocol minor as
+    /// `Unknown`; in an operator's node file that is a typo, not a value.
+    fn reject_unknown_protocol_values(&self) -> Result<(), ConfigError> {
+        let deployment = &self.deployment;
+        let capability = &deployment.capability;
+        let field = if matches!(self.assignment, DeviceAssignment::Unknown) {
+            "assignment.backend"
+        } else if deployment.task == TaskKind::Unknown {
+            "deployment.task"
+        } else if deployment.backend == BackendKind::Unknown {
+            "deployment.backend"
+        } else if capability.cancellation == CancellationBehavior::Unknown {
+            "deployment.capability.cancellation"
+        } else if capability
+            .accepted_input_formats
+            .contains(&InputFormat::Unknown)
+        {
+            "deployment.capability.accepted_input_formats"
+        } else if capability.output_formats.contains(&OutputFormat::Unknown) {
+            "deployment.capability.output_formats"
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::UnknownProtocolValue {
+            worker: self.worker_id.clone(),
+            field,
+        })
+    }
 }
 
 impl DeploymentConfig {
@@ -491,6 +548,18 @@ impl DeploymentConfig {
                 worker: worker.worker_id.clone(),
             });
         }
+        // A chat worker advertises exactly these limits once its loaded model
+        // proves the context, so a chat deployment must state both.
+        if self.task == TaskKind::Chat
+            && !matches!(
+                (self.capability.max_context_tokens, self.capability.max_output_tokens),
+                (Some(context), Some(output)) if output <= context
+            )
+        {
+            return Err(ConfigError::ChatCapabilityTokenLimits {
+                worker: worker.worker_id.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -510,7 +579,7 @@ impl DeploymentConfig {
 }
 
 /// Exact invocation-shape contract that a deployment must advertise before it is ready.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityProfileConfig {
     pub streaming: bool,
@@ -606,6 +675,41 @@ impl ReadinessPolicy {
     }
 }
 
+/// How a ready worker is checked for liveness: its status endpoint must
+/// answer within `timeout_ms`, from the same incarnation, without reporting
+/// a failed runtime. `failure_threshold` consecutive failures (a wedged
+/// device or a deadlock) restart it like a crash.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LivenessPolicy {
+    pub period_ms: u64,
+    pub timeout_ms: u64,
+    pub failure_threshold: u32,
+}
+
+impl Default for LivenessPolicy {
+    fn default() -> Self {
+        Self {
+            period_ms: 5_000,
+            timeout_ms: 3_000,
+            failure_threshold: 3,
+        }
+    }
+}
+
+impl LivenessPolicy {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_duration("liveness.period_ms", self.period_ms)?;
+        validate_duration("liveness.timeout_ms", self.timeout_ms)?;
+        if !(1..=100).contains(&self.failure_threshold) {
+            return Err(ConfigError::InvalidPolicy(
+                "liveness failure threshold must be between one and 100",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RestartPolicy {
@@ -615,6 +719,9 @@ pub struct RestartPolicy {
     pub stable_reset_ms: u64,
     pub max_restarts_per_window: u16,
     pub jitter_percent: u8,
+    /// How long a quarantined worker waits before one more launch. Zero
+    /// leaves it quarantined until an operator clears it.
+    pub quarantine_retry_ms: u64,
 }
 
 impl Default for RestartPolicy {
@@ -626,6 +733,7 @@ impl Default for RestartPolicy {
             stable_reset_ms: 600_000,
             max_restarts_per_window: 5,
             jitter_percent: 20,
+            quarantine_retry_ms: 600_000,
         }
     }
 }
@@ -655,6 +763,11 @@ impl RestartPolicy {
         if self.jitter_percent > 100 {
             return Err(ConfigError::InvalidPolicy(
                 "restart jitter percentage exceeds 100",
+            ));
+        }
+        if self.quarantine_retry_ms > MAX_POLICY_DURATION_MS {
+            return Err(ConfigError::InvalidPolicy(
+                "quarantine retry interval is out of range",
             ));
         }
         Ok(())
@@ -696,7 +809,7 @@ impl ShutdownPolicy {
 /// declared replica count and `min_workers` the subset launched at startup.
 /// The remaining declared workers are standby replicas that only scale-up
 /// launches, so the config-time aggregate budget check already proves that
-/// any reachable scale-out state fits the node ledger.
+/// any reachable scale-out state fits the node.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoscalingConfig {
@@ -726,16 +839,16 @@ impl AutoscalingConfig {
             return Err(ConfigError::EmptyAutoscalingDeployments);
         }
         for (deployment_id, policy) in &self.deployments {
-            let declared = workers
+            let declared: Vec<&WorkerConfig> = workers
                 .iter()
                 .filter(|worker| worker.deployment.deployment_id.as_str() == deployment_id)
-                .count();
-            if declared == 0 {
+                .collect();
+            if declared.is_empty() {
                 return Err(ConfigError::UnknownAutoscalingDeployment(
                     deployment_id.clone(),
                 ));
             }
-            policy.validate(deployment_id, declared)?;
+            policy.validate(deployment_id, &declared)?;
         }
         Ok(())
     }
@@ -752,19 +865,26 @@ impl AutoscalingConfig {
 pub struct DeploymentAutoscalingPolicy {
     pub min_workers: usize,
     pub max_workers: usize,
-    /// Sustained queue depth that drives a scale-up: at least one running
-    /// worker of the deployment must report `queued_invocations` at or above
-    /// this depth for `scale_up_sustained_polls` consecutive evaluations.
+    /// Sustained load that drives a scale-up: at least one running worker
+    /// of the deployment must report this many outstanding invocations
+    /// (active plus queued) for `scale_up_sustained_polls` consecutive
+    /// evaluations. Workers do not queue today, so this is at most the
+    /// workers' `max_active_invocations`.
     pub scale_up_queue_depth: u64,
     pub scale_up_sustained_polls: u32,
-    /// Hysteresis window: no scale event (either direction) may start within
-    /// this window after a previous scale event, and a scale-down candidate
-    /// must stay fully idle for the whole window.
+    /// No scale-up may start within this window after the previous scale
+    /// event. Zero (the default) lets a burst scale out at once.
+    #[serde(default)]
+    pub scale_up_stabilization_window_ms: u64,
+    /// No scale-down may start within this window after the previous scale
+    /// event, and a scale-down candidate must stay fully idle for the whole
+    /// window.
     pub scale_down_stabilization_window_ms: u64,
 }
 
 impl DeploymentAutoscalingPolicy {
-    fn validate(&self, deployment: &str, declared: usize) -> Result<(), ConfigError> {
+    fn validate(&self, deployment: &str, workers: &[&WorkerConfig]) -> Result<(), ConfigError> {
+        let declared = workers.len();
         if self.min_workers == 0 {
             return Err(ConfigError::InvalidAutoscalingPolicy {
                 deployment: deployment.to_string(),
@@ -796,6 +916,15 @@ impl DeploymentAutoscalingPolicy {
                 reason: "scale_up_queue_depth is outside 1..=100000",
             });
         }
+        if workers
+            .iter()
+            .any(|worker| self.scale_up_queue_depth > u64::from(worker.max_active_invocations))
+        {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_queue_depth exceeds a worker's max_active_invocations, so the deployment could never scale up",
+            });
+        }
         if self.scale_up_sustained_polls == 0
             || self.scale_up_sustained_polls > MAX_SCALE_UP_SUSTAINED_POLLS
         {
@@ -812,11 +941,23 @@ impl DeploymentAutoscalingPolicy {
                 reason: "scale_down_stabilization_window_ms is outside 1000..=86400000",
             });
         }
+        if self.scale_up_stabilization_window_ms > MAX_POLICY_DURATION_MS {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_stabilization_window_ms is outside 0..=86400000",
+            });
+        }
         Ok(())
     }
 
-    /// Whether a scale event may start at `now_ms` given the last one.
-    pub fn hysteresis_elapsed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
+    /// Whether a scale-up may start at `now_ms` given the last scale event.
+    pub fn scale_up_allowed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
+        last_scale_event_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= self.scale_up_stabilization_window_ms)
+    }
+
+    /// Whether a scale-down may start at `now_ms` given the last scale event.
+    pub fn scale_down_allowed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
         last_scale_event_ms.is_none_or(|last| {
             now_ms.saturating_sub(last) >= self.scale_down_stabilization_window_ms
         })
@@ -930,6 +1071,11 @@ pub enum ConfigError {
         threads: u16,
         cpus: usize,
     },
+    #[error("worker {worker} {field} names a value this supervisor does not know")]
+    UnknownProtocolValue {
+        worker: WorkerId,
+        field: &'static str,
+    },
     #[error("aggregate CPU budget requests {requested} threads; {available} are effective")]
     CpuOvercommit { requested: u64, available: usize },
     #[error("duplicate exclusive {backend:?} device assignment {device}")]
@@ -990,12 +1136,25 @@ pub enum ConfigError {
     CapabilityStreamingMismatch { worker: WorkerId },
     #[error("worker {worker} capability token limits must be non-zero when specified")]
     ZeroCapabilityTokenLimit { worker: WorkerId },
+    #[error(
+        "worker {worker} chat deployment must set max_context_tokens and a max_output_tokens \
+         within it"
+    )]
+    ChatCapabilityTokenLimits { worker: WorkerId },
     #[error("worker {worker} retained attempt capacity is below active invocation capacity")]
     AttemptRetentionBelowCapacity { worker: WorkerId },
     #[error("worker {worker} attempt retention must be between one second and one day")]
     InvalidAttemptRetention { worker: WorkerId },
     #[error("invalid bearer-token environment variable name {0:?}")]
     InvalidEnvironmentName(String),
+    #[error("worker {worker} environment may not set {name}: {reason}")]
+    ForbiddenWorkerEnvironment {
+        worker: WorkerId,
+        name: String,
+        reason: &'static str,
+    },
+    #[error("worker {worker} environment exceeds its 64 entry or 64 KiB limit")]
+    WorkerEnvironmentTooLarge { worker: WorkerId },
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
     #[error(
@@ -1117,6 +1276,8 @@ fn validate_duration(name: &'static str, value: u64) -> Result<(), ConfigError> 
         return Err(ConfigError::InvalidPolicy(match name {
             "readiness.startup_timeout_ms" => "readiness startup timeout is out of range",
             "readiness.poll_interval_ms" => "readiness poll interval is out of range",
+            "liveness.period_ms" => "liveness probe period is out of range",
+            "liveness.timeout_ms" => "liveness probe timeout is out of range",
             "restart.initial_backoff_ms" => "initial restart backoff is out of range",
             "restart.maximum_backoff_ms" => "maximum restart backoff is out of range",
             "restart.restart_window_ms" => "restart window is out of range",
@@ -1129,7 +1290,7 @@ fn validate_duration(name: &'static str, value: u64) -> Result<(), ConfigError> 
     Ok(())
 }
 
-fn validate_env_name(name: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_env_name(name: &str) -> Result<(), ConfigError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_ENV_NAME_BYTES
         && name
@@ -1235,6 +1396,7 @@ fn reserve_exclusive(
         BackendKind::Cpu => 0,
         BackendKind::Metal => 1,
         BackendKind::Cuda => 2,
+        BackendKind::Unknown => 3,
     };
     if devices.insert((backend_key, device.clone())) {
         Ok(())
@@ -1317,9 +1479,11 @@ mod tests {
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,
                 host_kv_pool_budget_bytes: 0,
+                environment: Default::default(),
                 streaming: true,
             }],
             readiness: ReadinessPolicy::default(),
+            liveness: Default::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,
@@ -1398,6 +1562,18 @@ mod tests {
                 "min_workers",
                 Box::new(|policy: &mut DeploymentAutoscalingPolicy| policy.min_workers = 0),
             ),
+            (
+                "scale_up_queue_depth above the workers' max_active_invocations",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_queue_depth = 2
+                }),
+            ),
+            (
+                "scale-up stabilization window",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_stabilization_window_ms = MAX_POLICY_DURATION_MS + 1
+                }),
+            ),
         ] {
             let mut config = cpu_config(directory.path());
             let mut autoscaling = autoscaling_config("deployment-1", 1, 1);
@@ -1458,6 +1634,9 @@ max_input_bytes = 1048576
 max_context_tokens = 32
 max_output_tokens = 32
 
+[workers.environment]
+IZWI_ENABLE_PREFIX_CACHING = "0"
+
 [autoscaling]
 shared_approvals_path = "/tmp/shared-approvals"
 
@@ -1470,6 +1649,11 @@ scale_down_stabilization_window_ms = 60000
 "#
         );
         let parsed = NodeConfig::parse_bounded(toml.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.workers[0].environment,
+            BTreeMap::from([("IZWI_ENABLE_PREFIX_CACHING".to_string(), "0".to_string())]),
+            "a worker's [workers.environment] table parses"
+        );
         let autoscaling = parsed.autoscaling.expect("autoscaling block parses");
         assert_eq!(
             autoscaling.evaluation_interval_ms,
@@ -1482,6 +1666,10 @@ scale_down_stabilization_window_ms = 60000
         let policy = autoscaling.policy("deployment-1").unwrap();
         assert_eq!(policy.min_workers, 1);
         assert_eq!(policy.scale_up_queue_depth, 4);
+        assert_eq!(
+            policy.scale_up_stabilization_window_ms, 0,
+            "scale-up is not held back unless configured"
+        );
 
         let unknown_field = toml.replace(
             "scale_down_stabilization_window_ms = 60000",
@@ -1490,6 +1678,26 @@ scale_down_stabilization_window_ms = 60000
         assert!(matches!(
             NodeConfig::parse_bounded(unknown_field.as_bytes()),
             Err(ConfigError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn worker_environment_tables_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+        let mut config = cpu_config(directory.path());
+        config.workers[0].environment =
+            BTreeMap::from([("IZWI_KV_HOST_OFFLOAD".to_string(), "0".to_string())]);
+        config
+            .clone()
+            .validate(&inventory(), &binaries)
+            .expect("an operator switch is valid");
+        config.workers[0]
+            .environment
+            .insert("IZWI_WORKER_ID".to_string(), "spoofed".to_string());
+        assert!(matches!(
+            config.validate(&inventory(), &binaries),
+            Err(ConfigError::ForbiddenWorkerEnvironment { .. })
         ));
     }
 
@@ -1547,8 +1755,9 @@ scale_down_stabilization_window_ms = 60000
                 DeploymentAutoscalingPolicy {
                     min_workers,
                     max_workers,
-                    scale_up_queue_depth: 4,
+                    scale_up_queue_depth: 1,
                     scale_up_sustained_polls: 2,
+                    scale_up_stabilization_window_ms: 0,
                     scale_down_stabilization_window_ms: 60_000,
                 },
             )]),
@@ -1697,6 +1906,53 @@ max_output_tokens = 32
         ));
     }
 
+    /// Protocol enums tolerate values from newer minors as `Unknown`; in a
+    /// node file such a value is a typo and fails validation.
+    #[test]
+    fn rejects_protocol_values_the_supervisor_does_not_know() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+        type Mutation = fn(&mut WorkerConfig);
+        let mutations: [(&str, Mutation); 6] = [
+            ("assignment.backend", |worker| {
+                worker.assignment = DeviceAssignment::Unknown
+            }),
+            ("deployment.task", |worker| {
+                worker.deployment.task = TaskKind::Unknown
+            }),
+            ("deployment.backend", |worker| {
+                worker.deployment.backend = BackendKind::Unknown
+            }),
+            ("deployment.capability.cancellation", |worker| {
+                worker.deployment.capability.cancellation = CancellationBehavior::Unknown
+            }),
+            ("deployment.capability.accepted_input_formats", |worker| {
+                worker
+                    .deployment
+                    .capability
+                    .accepted_input_formats
+                    .insert(InputFormat::Unknown);
+            }),
+            ("deployment.capability.output_formats", |worker| {
+                worker
+                    .deployment
+                    .capability
+                    .output_formats
+                    .insert(OutputFormat::Unknown);
+            }),
+        ];
+        for (expected, mutate) in mutations {
+            let mut config = cpu_config(directory.path());
+            mutate(&mut config.workers[0]);
+            match config.validate(&inventory(), &binaries) {
+                Err(ConfigError::UnknownProtocolValue { field, .. }) => {
+                    assert_eq!(field, expected)
+                }
+                other => panic!("{expected}: expected UnknownProtocolValue, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn rejects_capability_profiles_that_disagree_with_worker_limits() {
         let directory = tempfile::tempdir().unwrap();
@@ -1715,6 +1971,18 @@ max_output_tokens = 32
             streaming.validate(&inventory(), &binaries),
             Err(ConfigError::CapabilityStreamingMismatch { .. })
         ));
+
+        // A chat worker advertises exactly the approved limits, so both must
+        // be stated and the output must fit the context.
+        for (context, output) in [(None, Some(32)), (Some(32), None), (Some(32), Some(64))] {
+            let mut limits = cpu_config(directory.path());
+            limits.workers[0].deployment.capability.max_context_tokens = context;
+            limits.workers[0].deployment.capability.max_output_tokens = output;
+            assert!(matches!(
+                limits.validate(&inventory(), &binaries),
+                Err(ConfigError::ChatCapabilityTokenLimits { .. })
+            ));
+        }
     }
 
     #[test]

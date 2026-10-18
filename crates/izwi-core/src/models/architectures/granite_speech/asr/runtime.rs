@@ -181,6 +181,8 @@ pub struct GraniteSpeechRuntime {
     encoder: GraniteSpeechEncoder,
     projector: GraniteSpeechProjector,
     text_model: GraniteLanguageModel,
+    /// Per-invocation decode-profile diagnostics (resolved engine config).
+    decode_profile: bool,
 }
 
 struct GraniteSpeechDecodeProfiler {
@@ -188,8 +190,8 @@ struct GraniteSpeechDecodeProfiler {
 }
 
 impl GraniteSpeechDecodeProfiler {
-    fn from_env(layer_count: usize) -> Option<Self> {
-        granite_decode_profile_enabled().then(|| Self {
+    fn when(enabled: bool, layer_count: usize) -> Option<Self> {
+        enabled.then(|| Self {
             profile: GraniteSpeechDecodeProfile {
                 timing_kind: "host_wall_clock_no_device_sync",
                 steps: 0,
@@ -249,18 +251,8 @@ impl GraniteSpeechDecodeProfiler {
     }
 }
 
-fn granite_decode_profile_enabled() -> bool {
-    std::env::var("IZWI_GRANITE_DECODE_PROFILE")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_DECODE_PROFILING").ok())
-        .and_then(|raw| parse_env_bool(&raw))
-        .unwrap_or(false)
-}
-
 fn granite_projection_fusion_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_GRANITE_PROJECTION_FUSION");
     granite_projection_fusion_policy(
         device.is_metal(),
         device.is_cuda(),
@@ -279,10 +271,8 @@ fn granite_projection_fusion_policy(
 }
 
 fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_GATE_UP_PROJECTION_FUSION")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_PROJECTION_FUSION").ok())
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_GRANITE_GATE_UP_PROJECTION_FUSION")
+        .or_else(|| crate::env::flag("IZWI_GRANITE_PROJECTION_FUSION"));
     granite_gate_up_projection_fusion_policy(
         device.is_metal(),
         device.is_cuda(),
@@ -301,9 +291,9 @@ fn granite_gate_up_projection_fusion_policy(
 }
 
 fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_KERNEL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_ROPE_KERNEL"));
+    let override_enabled = OVERRIDE.get();
     if !granite_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
         return false;
     }
@@ -314,9 +304,9 @@ fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -
 }
 
 fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_BHTD_KERNEL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_ROPE_BHTD_KERNEL"));
+    let override_enabled = OVERRIDE.get();
     if !granite_rope_bhtd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
@@ -327,9 +317,9 @@ fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usi
 }
 
 fn granite_rope_pair_bshd_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_PAIR_BSHD_KERNEL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_ROPE_PAIR_BSHD_KERNEL"));
+    let override_enabled = OVERRIDE.get();
     if !granite_rope_pair_bshd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
@@ -356,16 +346,16 @@ fn granite_rope_pair_bshd_kernel_policy(is_metal: bool, override_enabled: Option
 }
 
 fn granite_native_greedy_logits_enabled() -> bool {
-    std::env::var("IZWI_GRANITE_NATIVE_GREEDY_LOGITS")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw))
-        .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_GRANITE_NATIVE_GREEDY_LOGITS", true)
+    });
+    ENABLED.get()
 }
 
 fn granite_mlp_try_fused_silu_mul(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_FUSED_SILU_MUL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_FUSED_SILU_MUL"));
+    let override_enabled = OVERRIDE.get();
     granite_mlp_fused_silu_mul_policy(device.is_metal(), override_enabled)
 }
 
@@ -374,9 +364,9 @@ fn granite_mlp_fused_silu_mul_policy(_is_metal: bool, override_enabled: Option<b
 }
 
 fn granite_try_fused_rms_norm(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_FUSED_RMS_NORM")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_FUSED_RMS_NORM"));
+    let override_enabled = OVERRIDE.get();
     granite_fused_rms_norm_policy(device.is_metal(), override_enabled)
 }
 
@@ -385,9 +375,7 @@ fn granite_fused_rms_norm_policy(is_metal: bool, override_enabled: Option<bool>)
 }
 
 fn granite_residual_prescale_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_RESIDUAL_PRESCALE")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_GRANITE_RESIDUAL_PRESCALE");
     granite_residual_prescale_policy(device.is_metal(), override_enabled)
 }
 
@@ -399,9 +387,9 @@ fn granite_deferred_stop_check_enabled(decode_each_step: bool) -> bool {
     if decode_each_step {
         return false;
     }
-    let override_enabled = std::env::var("IZWI_GRANITE_DEFER_STOP_CHECK")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_DEFER_STOP_CHECK"));
+    let override_enabled = OVERRIDE.get();
     granite_deferred_stop_check_policy(override_enabled)
 }
 
@@ -415,9 +403,9 @@ fn granite_chunked_stop_check_enabled(device: &Device, decode_each_step: bool) -
     if decode_each_step {
         return false;
     }
-    let override_enabled = std::env::var("IZWI_GRANITE_CHUNKED_STOP_CHECK")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_CHUNKED_STOP_CHECK"));
+    let override_enabled = OVERRIDE.get();
     granite_chunked_stop_check_policy(device.is_metal(), override_enabled)
 }
 
@@ -429,24 +417,23 @@ fn granite_chunked_stop_check_policy(is_metal: bool, override_enabled: Option<bo
 }
 
 fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
-    let interval = std::env::var("IZWI_GRANITE_CHUNKED_STOP_INTERVAL")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8);
-    interval.clamp(1, max_new_tokens.max(1))
+    static INTERVAL: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        std::env::var("IZWI_GRANITE_CHUNKED_STOP_INTERVAL")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8)
+    });
+    INTERVAL.get().clamp(1, max_new_tokens.max(1))
 }
 
 /// Where the selective F16 LM switches default on: Metal, unless F32 is
-/// pinned by `IZWI_GRANITE_SPEECH_DTYPE=f32` or (with no family override)
-/// `IZWI_METAL_DTYPE=f32`, the escape hatches from every lower-precision
+/// pinned by the Granite speech dtype override (`IZWI_GRANITE_SPEECH_DTYPE`,
+/// resolved into the engine config) or, with no family override, by
+/// `IZWI_METAL_DTYPE=f32`: the escape hatches from every lower-precision
 /// Metal policy. Each `IZWI_GRANITE_F16_*` switch still overrides.
-fn granite_selective_f16_default(device: &Device) -> bool {
-    device.is_metal()
-        && !granite_f32_pinned(
-            std::env::var("IZWI_GRANITE_SPEECH_DTYPE").ok().as_deref(),
-            MetalDTypeOverride::from_env(),
-        )
+fn granite_selective_f16_default(device: &Device, speech_dtype: Option<&str>) -> bool {
+    device.is_metal() && !granite_f32_pinned(speech_dtype, MetalDTypeOverride::from_env())
 }
 
 fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool {
@@ -456,15 +443,9 @@ fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool 
     }
 }
 
-fn granite_f16_lm_head_enabled(device: &Device, dtype: DType) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_F16_LM_HEAD")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_lm_head_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+fn granite_f16_lm_head_enabled(selective_default: bool, dtype: DType) -> bool {
+    let override_enabled = crate::env::flag("IZWI_GRANITE_F16_LM_HEAD");
+    granite_f16_lm_head_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_lm_head_policy(
@@ -476,9 +457,9 @@ fn granite_f16_lm_head_policy(
 }
 
 fn granite_rope_cache_attention_dtype_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_CACHE_ATTENTION_DTYPE")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_GRANITE_ROPE_CACHE_ATTENTION_DTYPE"));
+    let override_enabled = OVERRIDE.get();
     granite_rope_cache_attention_dtype_policy(device.is_metal(), override_enabled)
 }
 
@@ -502,9 +483,7 @@ fn granite_rope_cache_dtype(
 }
 
 fn granite_cached_linear_t_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_CACHED_LINEAR_T")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_GRANITE_CACHED_LINEAR_T");
     granite_cached_linear_t_policy(device.is_metal(), override_enabled)
 }
 
@@ -512,31 +491,19 @@ fn granite_cached_linear_t_policy(is_metal: bool, override_enabled: Option<bool>
     override_enabled.unwrap_or(is_metal)
 }
 
-fn granite_f16_qkv_enabled(device: &Device, dtype: DType) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_F16_QKV")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_qkv_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+fn granite_f16_qkv_enabled(selective_default: bool, dtype: DType) -> bool {
+    let override_enabled = crate::env::flag("IZWI_GRANITE_F16_QKV");
+    granite_f16_qkv_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_qkv_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_attention_core_enabled(device: &Device, dtype: DType) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_F16_ATTENTION_CORE")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_F16_ATTN_CORE").ok())
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_core_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+fn granite_f16_attention_core_enabled(selective_default: bool, dtype: DType) -> bool {
+    let override_enabled = crate::env::flag("IZWI_GRANITE_F16_ATTENTION_CORE")
+        .or_else(|| crate::env::flag("IZWI_GRANITE_F16_ATTN_CORE"));
+    granite_f16_attention_core_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_attention_core_policy(
@@ -547,31 +514,19 @@ fn granite_f16_attention_core_policy(
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_mlp_enabled(device: &Device, dtype: DType) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_F16_MLP")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_mlp_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+fn granite_f16_mlp_enabled(selective_default: bool, dtype: DType) -> bool {
+    let override_enabled = crate::env::flag("IZWI_GRANITE_F16_MLP");
+    granite_f16_mlp_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_mlp_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_attention_output_enabled(device: &Device, dtype: DType) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_F16_ATTENTION_OUTPUT")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_F16_O_PROJ").ok())
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_output_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+fn granite_f16_attention_output_enabled(selective_default: bool, dtype: DType) -> bool {
+    let override_enabled = crate::env::flag("IZWI_GRANITE_F16_ATTENTION_OUTPUT")
+        .or_else(|| crate::env::flag("IZWI_GRANITE_F16_O_PROJ"));
+    granite_f16_attention_output_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_attention_output_policy(
@@ -606,15 +561,18 @@ impl GraniteTextExecutionPlan {
         self != Self::BASE_DTYPE
     }
 
-    fn for_device(device: &Device, dtype: DType) -> Self {
-        let selective_f16_qkv = granite_f16_qkv_enabled(device, dtype);
+    /// `speech_dtype` is the resolved Granite dtype override: f32 pins every
+    /// projection to the base dtype on Metal.
+    fn for_device(device: &Device, dtype: DType, speech_dtype: Option<&str>) -> Self {
+        let selective = granite_selective_f16_default(device, speech_dtype);
+        let selective_f16_qkv = granite_f16_qkv_enabled(selective, dtype);
         Self {
-            selective_f16_lm_head: granite_f16_lm_head_enabled(device, dtype),
+            selective_f16_lm_head: granite_f16_lm_head_enabled(selective, dtype),
             selective_f16_qkv,
             f16_attention_core: selective_f16_qkv
-                && granite_f16_attention_core_enabled(device, dtype),
-            selective_f16_mlp: granite_f16_mlp_enabled(device, dtype),
-            selective_f16_attention_output: granite_f16_attention_output_enabled(device, dtype),
+                && granite_f16_attention_core_enabled(selective, dtype),
+            selective_f16_mlp: granite_f16_mlp_enabled(selective, dtype),
+            selective_f16_attention_output: granite_f16_attention_output_enabled(selective, dtype),
         }
     }
 }
@@ -672,8 +630,9 @@ pub(crate) struct GraniteLoadRepresentation {
 pub(crate) fn granite_load_representation(
     device: &Device,
     dtype: DType,
+    speech_dtype: Option<&str>,
 ) -> GraniteLoadRepresentation {
-    let plan = GraniteTextExecutionPlan::for_device(device, dtype);
+    let plan = GraniteTextExecutionPlan::for_device(device, dtype, speech_dtype);
     GraniteLoadRepresentation {
         f16_lm_head: plan.selective_f16_lm_head,
         f16_qkv: plan.selective_f16_qkv,
@@ -710,14 +669,6 @@ fn granite_text_attention_geometry(config: &GraniteTextConfig) -> Result<Attenti
     Ok(geometry)
 }
 
-fn parse_env_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 fn profile_start(enabled: bool) -> Option<Instant> {
     enabled.then(Instant::now)
 }
@@ -733,6 +684,7 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
         encoder_precision: &DTypeSelection,
+        granite: &crate::config::GraniteSpeechOptions,
     ) -> Result<Self> {
         // Reject malformed text geometry before mapping a potentially large
         // checkpoint and before any head-dimension division occurs.
@@ -787,7 +739,11 @@ impl GraniteSpeechRuntime {
         let projector_elapsed = projector_started.elapsed();
 
         let language_model_started = Instant::now();
-        let lm_plan = GraniteTextExecutionPlan::for_device(&device.device, dtype);
+        let lm_plan = GraniteTextExecutionPlan::for_device(
+            &device.device,
+            dtype,
+            granite.speech_dtype.as_deref(),
+        );
         let lm_selection = granite_lm_precision(dtype, lm_plan, device);
         let load_lm = |loaded: DType| {
             if loaded == lm_selection.dtype {
@@ -862,6 +818,7 @@ impl GraniteSpeechRuntime {
             encoder,
             projector,
             text_model,
+            decode_profile: granite.decode_profile,
         })
     }
 
@@ -1149,7 +1106,8 @@ impl GraniteSpeechRuntime {
         let dense_decode_cache_enabled = false;
         let dense_head_decode_enabled = false;
         let cuda_device_argmax = self.device.is_cuda();
-        let mut profiler = GraniteSpeechDecodeProfiler::from_env(self.text_model.num_layers());
+        let mut profiler =
+            GraniteSpeechDecodeProfiler::when(self.decode_profile, self.text_model.num_layers());
         let profiling = profiler.is_some();
         let prefill_start = Instant::now();
         let rope_cache = self
@@ -2614,11 +2572,6 @@ struct GraniteLanguageModel {
 }
 
 impl GraniteLanguageModel {
-    fn load(config: &GraniteTextConfig, tie_word_embeddings: bool, vb: VarBuilder) -> Result<Self> {
-        let execution_plan = GraniteTextExecutionPlan::for_device(vb.device(), vb.dtype());
-        Self::load_with_execution_plan(config, tie_word_embeddings, vb, execution_plan)
-    }
-
     fn load_with_execution_plan(
         config: &GraniteTextConfig,
         tie_word_embeddings: bool,
@@ -5744,8 +5697,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_weight_only_f16_encoder_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_weight_only_f16_encoder_tracks_cpu_f32",
+        ) else {
             return;
         };
         assert_weight_only_f16_encoder_tracks_f32(&device);
@@ -5792,8 +5746,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_encoder_valid_key_mask_builds_on_the_gpu() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_encoder_valid_key_mask_builds_on_the_gpu",
+        ) else {
             return;
         };
         let mask = encoder_valid_key_mask(&[1, 3], 2, 2, &device, DType::F32).unwrap();
@@ -5927,8 +5882,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_selective_f16_lm_probe_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_selective_f16_lm_probe_tracks_cpu_f32",
+        ) else {
             return;
         };
         assert_selective_f16_lm_tracks_f32(&device);
@@ -5984,6 +5940,6 @@ mod tests {
         assert!(!granite_f32_pinned(Some("f16"), F32));
         assert!(granite_f32_pinned(Some("f32"), F16));
         assert!(granite_f32_pinned(Some(" "), F32));
-        assert!(!granite_selective_f16_default(&Device::Cpu));
+        assert!(!granite_selective_f16_default(&Device::Cpu, None));
     }
 }

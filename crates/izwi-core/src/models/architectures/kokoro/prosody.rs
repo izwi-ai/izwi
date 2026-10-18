@@ -1512,8 +1512,9 @@ mod tests {
     fn metal_fused_bilstm_matches_cpu() {
         use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
 
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_fused_bilstm_matches_cpu")
+        else {
             return;
         };
         let (input, hidden) = (40usize, 16usize);
@@ -1707,8 +1708,9 @@ mod tests {
     fn metal_adain_snake_matches_cpu_with_large_means() {
         use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_adain_snake_matches_cpu_with_large_means",
+        ) else {
             return;
         };
         let cpu = candle_core::Device::Cpu;

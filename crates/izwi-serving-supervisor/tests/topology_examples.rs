@@ -45,8 +45,8 @@ fn assert_explicit_chat_profile(worker: &izwi_serving_supervisor::WorkerConfig) 
         deployment.capability.max_input_bytes,
         worker.max_request_bytes as u64
     );
-    assert_eq!(deployment.capability.max_context_tokens, Some(32));
-    assert_eq!(deployment.capability.max_output_tokens, Some(32));
+    assert_eq!(deployment.capability.max_context_tokens, Some(8192));
+    assert_eq!(deployment.capability.max_output_tokens, Some(4096));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 use super::super::metrics::{
     record_engine_stream_backpressure, record_engine_stream_delivery_failure,
@@ -125,6 +125,169 @@ impl CommittedStreamDelivery {
     }
 }
 
+/// Outcome of offering committed outputs to a consumer without waiting.
+#[derive(Debug)]
+pub(crate) enum ImmediateDelivery {
+    Delivered,
+    Failed(StreamDeliveryFailureKind),
+    /// The consumer's channel was full at an output its policy lets wait:
+    /// that output and the rest continue from the session's delivery lane,
+    /// so the step gate never waits on a client (SCH-F10).
+    Blocked(CommittedStreamDelivery),
+}
+
+impl CommittedStreamDelivery {
+    /// Offer every output to the consumer's channel without waiting. A full
+    /// channel hands the remaining outputs back when they may wait: text
+    /// (a lagging reader then receives coalesced deltas) and every output
+    /// of a blocking policy. A full channel still fails credited or
+    /// fail-on-full audio, and drops a lossy policy's non-final output.
+    pub(crate) fn deliver_now(mut self) -> ImmediateDelivery {
+        let mut outputs = std::mem::take(&mut self.outputs).into_iter();
+        while let Some(CommittedStreamOutput {
+            output,
+            _progress_permit: permit,
+        }) = outputs.next()
+        {
+            if output.request_id != self.session.request_id {
+                record_engine_stream_delivery_failure();
+                return ImmediateDelivery::Failed(StreamDeliveryFailureKind::Delivery);
+            }
+            match self.tx.try_send(output) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    record_engine_stream_delivery_failure();
+                    return ImmediateDelivery::Failed(StreamDeliveryFailureKind::Delivery);
+                }
+                Err(mpsc::error::TrySendError::Full(output)) => {
+                    let may_wait = match self.policy {
+                        StreamBackpressurePolicy::BlockWithDeadline { .. } => true,
+                        StreamBackpressurePolicy::FailOnFull => output.samples.is_empty(),
+                        StreamBackpressurePolicy::DropNewest => false,
+                    };
+                    if may_wait {
+                        self.outputs = std::iter::once(CommittedStreamOutput {
+                            output,
+                            _progress_permit: permit,
+                        })
+                        .chain(outputs)
+                        .collect();
+                        return ImmediateDelivery::Blocked(self);
+                    }
+                    record_engine_stream_backpressure();
+                    if self.policy == StreamBackpressurePolicy::DropNewest && !output.is_final {
+                        continue;
+                    }
+                    record_engine_stream_delivery_failure();
+                    return ImmediateDelivery::Failed(StreamDeliveryFailureKind::Delivery);
+                }
+            }
+        }
+        ImmediateDelivery::Delivered
+    }
+
+    /// Append a later delivery of the same session, or hand it back when
+    /// the two cannot be delivered as one (a different channel or policy).
+    pub(crate) fn absorb(
+        &mut self,
+        later: CommittedStreamDelivery,
+    ) -> std::result::Result<(), CommittedStreamDelivery> {
+        if later.session != self.session
+            || later.policy != self.policy
+            || !later.tx.same_channel(&self.tx)
+        {
+            return Err(later);
+        }
+        self.outputs.extend(later.outputs);
+        self._audio_credits.extend(later._audio_credits);
+        Ok(())
+    }
+
+    /// Deliver from the session's delivery lane, off the step gate.
+    /// Adjacent text deltas merge into one, so a lagging reader gets fewer,
+    /// larger deltas instead of a cancelled generation. `merged` counts the
+    /// outputs this lane has merged away; every output's sequence moves down
+    /// by it, so the consumer still sees consecutive sequences. Text waits
+    /// for the consumer up to `text_timeout`; other outputs keep their
+    /// policy.
+    pub(crate) async fn deliver_coalesced(
+        mut self,
+        merged: &mut usize,
+        text_timeout: Duration,
+    ) -> std::result::Result<(), StreamDeliveryFailureKind> {
+        let mut pending: Option<(StreamingOutput, Vec<StreamProgressPermit>)> = None;
+        for CommittedStreamOutput {
+            mut output,
+            _progress_permit: permit,
+        } in std::mem::take(&mut self.outputs)
+        {
+            if output.request_id != self.session.request_id {
+                record_engine_stream_delivery_failure();
+                return Err(StreamDeliveryFailureKind::Delivery);
+            }
+            output.sequence = output.sequence.saturating_sub(*merged);
+            let mergeable = is_text_delta(&output);
+            if let Some((delta, permits)) = pending.as_mut() {
+                if mergeable {
+                    delta
+                        .text
+                        .get_or_insert_with(String::new)
+                        .push_str(output.text.as_deref().unwrap_or_default());
+                    delta.logprobs.extend(output.logprobs);
+                    permits.extend(permit);
+                    *merged += 1;
+                    continue;
+                }
+            }
+            if let Some((delta, _permits)) = pending.take() {
+                self.send_from_lane(delta, text_timeout).await?;
+            }
+            if mergeable {
+                pending = Some((output, permit.into_iter().collect()));
+            } else {
+                self.send_from_lane(output, text_timeout).await?;
+            }
+        }
+        if let Some((delta, _permits)) = pending {
+            self.send_from_lane(delta, text_timeout).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_from_lane(
+        &self,
+        output: StreamingOutput,
+        text_timeout: Duration,
+    ) -> std::result::Result<(), StreamDeliveryFailureKind> {
+        let result =
+            if self.policy == StreamBackpressurePolicy::FailOnFull && output.samples.is_empty() {
+                match tokio::time::timeout(text_timeout, self.tx.send(output)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(StreamDeliveryFailureKind::Delivery),
+                    Err(_) => {
+                        record_engine_stream_backpressure();
+                        Err(StreamDeliveryFailureKind::Deadline)
+                    }
+                }
+            } else {
+                send_committed_output(&self.tx, self.policy, output).await
+            };
+        if result.is_err() {
+            record_engine_stream_delivery_failure();
+        }
+        result
+    }
+}
+
+/// A non-final text delta that may merge with its neighbours.
+fn is_text_delta(output: &StreamingOutput) -> bool {
+    output.text.is_some()
+        && output.samples.is_empty()
+        && !output.is_final
+        && output.stats.is_none()
+        && output.asr_progress.is_none()
+}
+
 /// Deliver every committed row independently. A failed consumer is returned
 /// for exact-session cancellation after all peer rows have had a chance to
 /// flush their own outboxes.
@@ -156,9 +319,14 @@ pub(crate) async fn deliver_committed_streams(
 /// memory unbounded.
 pub(crate) struct IncrementalStreamDeliveryWorkers {
     senders: HashMap<SessionKey, mpsc::UnboundedSender<CommittedStreamDelivery>>,
-    tasks: HashMap<SessionKey, tokio::task::JoinHandle<()>>,
+    tasks: HashMap<SessionKey, IncrementalDeliveryTask>,
     failure_tx: mpsc::UnboundedSender<StreamDeliveryFailure>,
 }
+
+/// One session's ordered incremental delivery task; it ends with the
+/// session's delivery result.
+pub(crate) type IncrementalDeliveryTask =
+    tokio::task::JoinHandle<std::result::Result<(), StreamDeliveryFailureKind>>;
 
 const INCREMENTAL_COMMIT_FLUSH_GRACE: Duration = Duration::from_millis(10);
 
@@ -191,9 +359,10 @@ impl IncrementalStreamDeliveryWorkers {
                             session: worker_session.clone(),
                             kind,
                         });
-                        break;
+                        return Err(kind);
                     }
                 }
+                Ok(())
             });
             self.tasks.insert(session.clone(), task);
             self.senders.insert(session.clone(), tx);
@@ -214,10 +383,45 @@ impl IncrementalStreamDeliveryWorkers {
 
     /// Close and drain only the exact per-session lanes owned by one completed
     /// physical dispatch. Other dispatches keep their ordered lanes live.
+    /// A lane still blocked after the grace fails with a deadline.
     pub(crate) async fn finish_sessions(
         &mut self,
         sessions: &HashSet<SessionKey>,
     ) -> Vec<StreamDeliveryFailure> {
+        let blocked = self.detach_sessions(sessions).await;
+        let mut failures = Vec::with_capacity(blocked.len());
+        for (session, task) in blocked {
+            task.abort();
+            Self::join_finished(task).await;
+            record_engine_stream_backpressure();
+            record_engine_stream_delivery_failure();
+            failures.push(StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Deadline,
+            });
+        }
+        failures
+    }
+
+    /// A finished task reported its failure on the failure channel; only a
+    /// panic needs handling here.
+    async fn join_finished(task: IncrementalDeliveryTask) {
+        if let Err(error) = task.await {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
+            }
+        }
+    }
+
+    /// Close the exact per-session lanes of one committed dispatch. Lanes
+    /// that drain within a short scheduler grace are joined; lanes still
+    /// waiting on a reader are returned, so the caller can keep them running
+    /// ahead of the session's terminal output for the stream's own
+    /// backpressure deadline instead of failing them (EXE-F13).
+    pub(crate) async fn detach_sessions(
+        &mut self,
+        sessions: &HashSet<SessionKey>,
+    ) -> Vec<(SessionKey, IncrementalDeliveryTask)> {
         for session in sessions {
             self.senders.remove(session);
         }
@@ -237,13 +441,7 @@ impl IncrementalStreamDeliveryWorkers {
                     .tasks
                     .remove(&session)
                     .expect("finished delivery task remained registered");
-                match task.await {
-                    Ok(()) => {}
-                    Err(error) if error.is_panic() => {
-                        std::panic::resume_unwind(error.into_panic());
-                    }
-                    Err(_) => {}
-                }
+                Self::join_finished(task).await;
             }
             if sessions
                 .iter()
@@ -254,34 +452,20 @@ impl IncrementalStreamDeliveryWorkers {
             }
             tokio::task::yield_now().await;
         }
-
-        let timed_out = sessions
+        sessions
             .iter()
-            .filter(|session| self.tasks.contains_key(*session))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut failures = Vec::with_capacity(timed_out.len());
-        for session in timed_out {
-            let task = self
-                .tasks
-                .remove(&session)
-                .expect("timed-out delivery task remained registered");
-            task.abort();
-            match task.await {
-                Ok(()) => {}
-                Err(error) if error.is_panic() => {
-                    std::panic::resume_unwind(error.into_panic());
-                }
-                Err(_) => {}
-            }
-            record_engine_stream_backpressure();
-            record_engine_stream_delivery_failure();
-            failures.push(StreamDeliveryFailure {
-                session,
-                kind: StreamDeliveryFailureKind::Deadline,
-            });
-        }
-        failures
+            .filter_map(|session| {
+                self.tasks
+                    .remove(session)
+                    .map(|task| (session.clone(), task))
+            })
+            .collect()
+    }
+
+    /// [`Self::detach_sessions`] for every remaining lane.
+    pub(crate) async fn detach(mut self) -> Vec<(SessionKey, IncrementalDeliveryTask)> {
+        let sessions = self.tasks.keys().cloned().collect::<HashSet<_>>();
+        self.detach_sessions(&sessions).await
     }
 
     /// Close every ordered lane at the physical commit barrier. Deliveries
@@ -349,6 +533,7 @@ impl NativeExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -420,6 +605,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text_per_character(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -435,6 +621,7 @@ impl NativeExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text_per_character_with_policy(
         tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
@@ -452,6 +639,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_audio(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -527,6 +715,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_final_marker(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -547,20 +736,6 @@ impl NativeExecutor {
         sequence: &mut usize,
     ) -> Result<()> {
         Self::stream_audio_with_policy(tx, policy, request_id, sequence, Vec::new(), 0, true)
-    }
-}
-
-fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
-    match err {
-        mpsc::error::TrySendError::Closed(_) => {
-            Error::InferenceError("Streaming output channel closed".to_string())
-        }
-        mpsc::error::TrySendError::Full(_) => {
-            record_engine_stream_backpressure();
-            Error::InferenceError(
-                "Streaming output backpressure exceeded queue capacity".to_string(),
-            )
-        }
     }
 }
 

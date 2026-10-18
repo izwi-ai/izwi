@@ -1,0 +1,19 @@
+//! The chat API every entry path shares: message and request types, what a
+//! generation returns, and how a request's sampling and output budget
+//! resolve for its model.
+
+mod generation;
+mod messages;
+mod sampling;
+
+pub use generation::{
+    ChatGeneration, FinishReason, LatencyBreakdown, TokenLogprob, TopTokenLogprob,
+};
+pub use messages::{
+    ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole, ChatTemplateKwargs,
+    ChatTruncation,
+};
+pub use sampling::{
+    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
+    ChatGenerationControls, ChatSamplingRequest, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
+};

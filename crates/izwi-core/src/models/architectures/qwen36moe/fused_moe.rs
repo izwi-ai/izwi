@@ -29,7 +29,7 @@ use candle_nn::ops;
 
 use crate::error::{Error, Result};
 use crate::kernels::cuda::moe::{self, RouteSpec, SharedSlot};
-use crate::models::architectures::qwen36moe::fast_path::{compare_values, legacy_value};
+use crate::models::architectures::qwen36moe::fast_path::compare_values;
 use crate::models::architectures::qwen36moe::sparse::{
     Qwen36MoeExpertWeights, Qwen36MoeLinear, Qwen36MoeSharedExpertWeights,
 };
@@ -52,14 +52,20 @@ pub(crate) enum Qwen36MoeBackendRequest {
 
 impl Qwen36MoeBackendRequest {
     pub(crate) fn from_env() -> Self {
-        Self::parse(std::env::var(BACKEND_ENV).ok().as_deref())
+        Self::parse(crate::env::value(BACKEND_ENV).as_deref())
     }
 
+    /// `legacy` or a false boolean (`false`, `0`, `no`, `off`) asks for the
+    /// per-expert loop; anything else (`auto`, unset) leaves it to the gate.
     fn parse(value: Option<&str>) -> Self {
-        if legacy_value(value) {
-            Self::Legacy
-        } else {
-            Self::Auto
+        match value {
+            Some(value)
+                if value.trim().eq_ignore_ascii_case("legacy")
+                    || matches!(izwi_env::parse_bool(BACKEND_ENV, value), Ok(false)) =>
+            {
+                Self::Legacy
+            }
+            _ => Self::Auto,
         }
     }
 }
@@ -623,7 +629,15 @@ mod tests {
             Qwen36MoeBackendRequest::Legacy
         );
         assert_eq!(
+            Qwen36MoeBackendRequest::parse(Some(" No ")),
+            Qwen36MoeBackendRequest::Legacy
+        );
+        assert_eq!(
             Qwen36MoeBackendRequest::parse(Some("auto")),
+            Qwen36MoeBackendRequest::Auto
+        );
+        assert_eq!(
+            Qwen36MoeBackendRequest::parse(Some("on")),
             Qwen36MoeBackendRequest::Auto
         );
         assert_eq!(

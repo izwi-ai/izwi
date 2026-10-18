@@ -1,7 +1,8 @@
-use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs};
+use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
+use crate::api::openai::convert::InboundContent;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesCreateRequest {
     pub model: String,
@@ -16,13 +17,12 @@ pub struct ResponsesCreateRequest {
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// `-1` (vLLM) or `0` disables top-k sampling.
     #[serde(default)]
-    pub top_k: Option<usize>,
+    pub top_k: Option<i64>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
@@ -41,6 +41,14 @@ pub struct ResponsesCreateRequest {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenAI `truncation`: `"disabled"` (the default) rejects input that
+    /// does not fit the context; `"auto"` drops the oldest turns instead.
+    #[serde(default)]
+    pub truncation: Option<ChatTruncation>,
+    /// vLLM's OpenAI extension: `false` keeps the tokenizer's special tokens
+    /// in the reply text. Absent or `true` skips them.
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,43 +59,28 @@ pub enum ResponseInput {
     Many(Vec<ResponseInputItem>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// An input item: a message (the default), a `function_call` the model
+/// made in an earlier turn, or the `function_call_output` answering it.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResponseInputItem {
+    #[serde(default, rename = "type")]
+    pub item_type: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
-    pub content: Option<ResponseInputContent>,
+    pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ResponseInputContent {
-    Text(String),
-    Parts(Vec<ResponseInputContentPart>),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseInputContentPart {
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
     #[serde(default)]
-    pub text: Option<String>,
+    pub call_id: Option<String>,
     #[serde(default)]
-    pub input_text: Option<String>,
+    pub name: Option<String>,
+    /// A `function_call`'s JSON-encoded arguments.
     #[serde(default)]
-    pub image_url: Option<serde_json::Value>,
+    pub arguments: Option<serde_json::Value>,
+    /// A `function_call_output`'s result: a string, or content parts.
     #[serde(default)]
-    pub input_image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video_url: Option<serde_json::Value>,
-    #[serde(default)]
-    pub input_video: Option<serde_json::Value>,
+    pub output: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,16 +98,26 @@ pub struct ResponseObject {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ResponseOutputItem {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub item_type: &'static str,
-    pub role: &'static str,
-    pub content: Vec<ResponseOutputContent>,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseOutputItem {
+    Message {
+        id: String,
+        role: &'static str,
+        content: Vec<ResponseOutputContent>,
+    },
+    /// A tool call the client runs and answers with a
+    /// `function_call_output` input item carrying the same `call_id`.
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        status: &'static str,
+    },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResponseOutputContent {
     #[serde(rename = "type")]
     pub content_type: &'static str,
@@ -153,7 +156,8 @@ pub struct ResponseDeletedObject {
 #[derive(Debug, Serialize)]
 pub struct ResponseInputItemsList {
     pub object: &'static str,
-    pub data: Vec<ResponseInputItemObject>,
+    /// Message items, and function call items as they were sent.
+    pub data: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +195,9 @@ pub struct ResponseStreamCreatedPayload {
 #[derive(Debug, Serialize)]
 pub struct ResponseStreamDeltaPayload {
     pub response_id: String,
+    pub item_id: String,
+    pub output_index: usize,
+    pub content_index: usize,
     pub delta: String,
 }
 

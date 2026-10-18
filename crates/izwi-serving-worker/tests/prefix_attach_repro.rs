@@ -48,6 +48,7 @@ async fn run_chat(
             correlation_id: Some(id.into()),
             runtime_context,
             streaming: true,
+            max_tokens_ceiling: None,
         })
         .await?;
     let mut text = String::new();

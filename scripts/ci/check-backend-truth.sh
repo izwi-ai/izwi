@@ -9,9 +9,11 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-serving Run the serving crates' tests and the gateway process suites
   cargo-fleet-stores
                 Run fleet/durable store execution tests against real PostgreSQL
-                (requires IZWI_TEST_FLEET_PG_URL at a disposable database)
+                (requires IZWI_TEST_FLEET_PG_URL and IZWI_TEST_STORE_PG_URL at
+                disposable databases)
   cargo-metal   Require macOS 15+ and run Metal-focused validation
   cargo-metal-fallback
                 Require macOS 12-14 and prove Metal-enabled code falls back to CPU
@@ -365,10 +367,44 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
+    # CPU and Metal serve chat with chunked prefill off by default, while CUDA
+    # chat always chunks. Name the engine leg that runs chunked prefill on CPU
+    # (mixed prefill/decode steps under tensor-state and page pressure) so a
+    # filter or lane change cannot silently drop it.
+    cargo test --locked -p izwi-core --lib engine::core::tests::chunked_prefill_
     cargo test --locked -p izwi-server --lib
-    cargo test --locked -p izwi-server --test fleet_rig -- --test-threads=1
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
+}
+
+run_cargo_serving() {
+    require_command cargo
+
+    # Every serving crate's unit and integration tests (the client's contract
+    # suites run in the worker crate, against the real worker), the
+    # accelerator-free crates the gateway shares with the engine (model
+    # catalog, Prometheus exposition, durable store), plus the gateway's own
+    # tests and process suites and the process harness they spawn through.
+    # The fleet rig's gateway pairs share one coordination database per test,
+    # so it runs serially.
+    cargo test --locked --no-fail-fast \
+        -p izwi-test-process \
+        -p izwi-env \
+        -p izwi-model-catalog \
+        -p izwi-prometheus \
+        -p izwi-db \
+        -p izwi-serving-protocol \
+        -p izwi-serving-client \
+        -p izwi-serving-fence \
+        -p izwi-serving-supervisor \
+        -p izwi-serving-worker
+    cargo test --locked --no-fail-fast -p izwi-gateway \
+        --lib --bins \
+        --test gateway_only_process \
+        --test rollout_gateway
+    cargo test --locked -p izwi-gateway --test fleet_rig -- --test-threads=1
+    # `izwi-server --role gateway` delegates to the same gateway.
+    cargo test --locked -p izwi-server --test gateway_role_process
 }
 
 run_cargo_fleet_stores() {
@@ -382,7 +418,19 @@ run_cargo_fleet_stores() {
         exit 1
     fi
 
-    cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
+    cargo test --locked -p izwi-gateway --features db-postgres --lib fleet_postgres
+
+    # The durable store suite (migrations and the shipped schema in izwi-db;
+    # jobs, stages, claims, leases, idempotency, artifacts and retention), the batch
+    # worker, the artifact store and the saved-voice name constraint on
+    # PostgreSQL. Each test creates its own schema in this disposable database.
+    if [[ -z "${IZWI_TEST_STORE_PG_URL:-}" ]]; then
+        echo "IZWI_TEST_STORE_PG_URL must point at a disposable PostgreSQL database" >&2
+        exit 1
+    fi
+    cargo test --locked --no-fail-fast -p izwi-db --features db-postgres
+    cargo test --locked --no-fail-fast -p izwi-server --features db-postgres --lib -- \
+        batch_runtime artifact_store saved_voice_store
 }
 
 run_fleet_rig_postgres() {
@@ -397,7 +445,7 @@ run_fleet_rig_postgres() {
         exit 1
     fi
 
-    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig -- --test-threads=1
+    cargo test --locked -p izwi-gateway --features db-postgres --test fleet_rig -- --test-threads=1
 }
 
 run_cargo_metal() {
@@ -417,6 +465,10 @@ run_cargo_metal() {
     cargo check --locked -p izwi-server --features metal
     cargo test --locked -p izwi-core --features metal --lib --tests
     cargo test --locked -p izwi-server --features metal --lib
+    # The worker's Metal parity legs skip on a host without a GPU; this lane
+    # requires one, so a skipped leg fails here instead of reading as a pass.
+    IZWI_REQUIRE_METAL_PARITY=1 cargo test --locked -p izwi-serving-worker \
+        --features metal --test backend_parity
     scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
 }
 
@@ -484,6 +536,9 @@ run_hygiene() {
         cargo clippy --locked --workspace --all-targets -- -D warnings -A deprecated
     TAURI_CONFIG="${tauri_check_config}" \
         cargo check --locked --workspace --all-targets
+    # The gateway, transport, launch contract and supervisor stay
+    # accelerator-free, and the worker's backend features match the server's.
+    bash scripts/ci/check-serving-boundary.sh
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
     scripts/test-install-cli-backend-selection.sh
@@ -493,8 +548,11 @@ run_hygiene() {
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-streaming-benchmark.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-long-form-qualification.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-serving-capacity.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-gateway-chat-benchmark.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-asr-matrix.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-tts-matrix.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-serving-benchmark.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-voice-realtime-load.py
 }
 
 run_cargo_cuda_compile() {
@@ -629,6 +687,9 @@ main() {
             ;;
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-serving)
+            run_cargo_serving
             ;;
         cargo-fleet-stores)
             run_cargo_fleet_stores

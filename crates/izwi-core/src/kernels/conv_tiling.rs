@@ -165,8 +165,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_tiled_conv1d_matches_cpu() {
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_tiled_conv1d_matches_cpu")
+        else {
             return;
         };
         let run = |device: &Device| {

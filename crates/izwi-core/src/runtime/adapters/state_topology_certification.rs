@@ -5,6 +5,7 @@
 //! explicit topology classification before this test can pass.
 
 use super::*;
+use crate::catalog::ModelFamily;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CertifiedTopology {
@@ -23,10 +24,7 @@ enum CertifiedTopology {
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
     InvocationPaged,
-    InvocationPagedPaged,
     InvocationPagedRing,
-    InvocationPagedTensor,
-    InvocationPagedStaticAttention,
     InvocationTensor,
     InvocationTensorStatic,
 }
@@ -53,10 +51,7 @@ impl CertifiedTopology {
                 InferenceStateRequirement::RetainedAndInvocation
             }
             Self::InvocationPaged
-            | Self::InvocationPagedPaged
             | Self::InvocationPagedRing
-            | Self::InvocationPagedTensor
-            | Self::InvocationPagedStaticAttention
             | Self::InvocationTensor
             | Self::InvocationTensorStatic => InferenceStateRequirement::Invocation,
         }

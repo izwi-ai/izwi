@@ -1573,6 +1573,12 @@ fn qwen3_asr_admit_frames(
 }
 
 impl Qwen3AsrModel {
+    /// The loaded text decoder, for trunk tests on real weights.
+    #[cfg(test)]
+    pub(crate) fn into_text_model(self) -> Qwen3Model {
+        self.text_model
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_path = resolve_qwen_asr_gguf_path(model_dir, variant);
         let gguf_loader = if let Some(path) = gguf_path.as_ref() {
@@ -3453,7 +3459,7 @@ fn qwen3_asr_gguf_qmatmul_text_policy(override_enabled: Option<bool>) -> bool {
 }
 
 pub(crate) fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
-    let override_enabled = env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
+    let override_enabled = crate::env::flag("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
     qwen3_asr_gguf_qmatmul_text_policy(override_enabled)
 }
 
@@ -4553,17 +4559,6 @@ fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
         }
     }
     false
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().and_then(|raw| {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
 }
 
 /// The canonical resampler (soxr HQ response), so a direct caller at
@@ -6471,6 +6466,10 @@ mod tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and IZWI_ALIGNER_REFERENCE_DIR"]
     fn forced_aligner_matches_the_reference_timings() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_matches_the_reference_timings",
+        );
         let reference_dir = PathBuf::from(
             std::env::var("IZWI_ALIGNER_REFERENCE_DIR").expect("IZWI_ALIGNER_REFERENCE_DIR"),
         );
@@ -6579,6 +6578,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3-ForcedAligner checkpoints and a Metal device (~5 GB)"]
     fn forced_aligner_metal_matches_cpu() {
+        let _lease = crate::backends::metal_test_device_or_skip("forced_aligner_metal_matches_cpu");
         const MAX_BOUNDARY_DRIFT_MS: u32 = 80;
         let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let bytes = std::fs::read(data.join("fox.wav")).expect("fox.wav");
@@ -6642,6 +6642,9 @@ mod metal_f16_text_tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and a Metal device"]
     fn dense_aligner_f16_text_keeps_test_wav_boundaries() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "dense_aligner_f16_text_keeps_test_wav_boundaries",
+        );
         let _env = crate::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6859,6 +6862,9 @@ mod precision_tests {
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B-4bit checkpoint and a Metal device"]
     fn forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe",
+        );
         use std::io::Write;
         let model_dir = super::tests::local_models_root().join("Qwen3-ForcedAligner-0.6B-4bit");
         if !model_dir.join("model.safetensors").exists() {

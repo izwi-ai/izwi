@@ -12,25 +12,18 @@
 mod common;
 
 use axum::{body::Body, http::Request};
-use common::{id, write_tiny_qwen35_moe_fixture};
+use common::{id, single_worker_dispatcher, write_tiny_qwen35_moe_fixture};
 use izwi_core::ModelVariant;
 use izwi_hooks::EnterpriseHooks;
+use izwi_server::worker_registry::BackendPolicy;
 use izwi_server::{
-    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatExecution,
-    RemoteChatExecutionConfig,
+    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatDispatchConfig,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_test_process::ProcessGuard;
 use std::{collections::BTreeSet, net::TcpListener, process::Stdio, time::Duration};
 use tower::ServiceExt;
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 #[tokio::test]
 async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
@@ -42,7 +35,8 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models.path())
         .env("IZWI_WORKER_MODEL", "Qwen3.6-35B-A3B-FP8")
@@ -61,10 +55,8 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let _child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let _child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("qwen35-moe-cpu-credential"),
@@ -131,6 +123,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
                     top_p: Some(1.0),
                     seed: Some(0),
                     stop: Vec::new(),
+                    ..ChatParameters::default()
                 },
             },
         })
@@ -167,23 +160,23 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     assert!((0.0..=100.0).contains(&usage_pct));
     assert_eq!(deployment.observation_cost_units, Some(1));
 
-    let remote = RemoteChatExecution::new(
+    let dispatcher = single_worker_dispatcher(
         client,
-        RemoteChatExecutionConfig {
+        RemoteChatDispatchConfig {
             public_model_variant: ModelVariant::Qwen36Moe35BA3BFp8,
-            expected_worker_incarnation: descriptor.incarnation_id,
             deployment_id: id("qwen35-moe-cpu-v1"),
-            expected_model_generation: ModelGeneration::new(1).unwrap(),
             policy_revision: id("qwen35-moe-cpu-policy-v1"),
+            backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(2),
             max_output_tokens: 4,
             max_output_bytes: 1024,
             slow_consumer_timeout: Duration::from_secs(5),
+            prefix_affinity: None,
         },
     )
-    .unwrap();
+    .await;
     let gateway = GatewayState::new(
-        remote,
+        dispatcher,
         EnterpriseHooks::noop(),
         GatewayPerimeterConfig::new_for_test("qwen35-moe-test-api-key", 1024 * 1024).unwrap(),
         10,
@@ -241,10 +234,8 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     );
     assert!(body.contains("[DONE]"), "terminal stream marker expected");
 
-    // The json_object allowlist admits the family end to end: this request
-    // must reach the worker instead of failing with the grammar-aware-sampler
-    // 400. (The fixture tokenizer has no JSON characters, so the constrained
-    // decode legitimately finishes immediately on a stop token.)
+    // JSON mode reaches the worker (protocol minor 4) instead of a 400; the
+    // local/remote parity suite compares the constrained output itself.
     let constrained = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

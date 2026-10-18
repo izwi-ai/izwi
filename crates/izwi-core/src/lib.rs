@@ -35,43 +35,33 @@
     clippy::type_complexity
 )]
 
-// Dead-code analysis is restored module by module. Every module below that
-// still carries `#[allow(dead_code)]` has not been audited yet; remove the
-// attribute once a module compiles warning-free on every feature lane.
-#[allow(dead_code)]
+// Dead-code analysis is restored module by module: every module without an
+// attribute below is checked by the compiler (and so by `clippy -D warnings`).
+// `backends`, `kernels` and `models` still opt out: much of their code is
+// reachable only from CUDA builds, which this gate cannot compile on every
+// lane. Remove an attribute once its module compiles warning-free on every
+// feature lane, including `cargo-cuda-compile`.
 pub mod artifacts;
-#[allow(dead_code)]
 pub mod audio;
 #[allow(dead_code)]
 pub mod backends;
-#[allow(dead_code)]
 pub mod catalog;
-#[allow(dead_code)]
 pub mod codecs;
-#[allow(dead_code)]
 pub mod config;
-#[allow(dead_code)]
 pub mod engine;
-#[allow(dead_code)]
+pub mod env;
 pub mod error;
 #[allow(dead_code)]
 pub mod kernels;
 pub mod kv;
-#[allow(dead_code)]
 pub mod model;
 #[allow(dead_code)]
 mod models;
-#[allow(dead_code)]
 pub mod performance;
-#[allow(dead_code)]
 pub mod residency;
-#[allow(dead_code)]
 pub mod runtime;
-#[allow(dead_code)]
 pub mod runtime_models;
-#[allow(dead_code)]
 pub mod serve_runtime;
-#[allow(dead_code)]
 pub mod tokenizer;
 
 // Re-export main types from the new engine module
@@ -97,10 +87,11 @@ pub use engine::{
 
 // Legacy re-exports for backward compatibility
 pub use config::{
-    BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionCapacity,
-    PhysicalExecutionMode, PhysicalInFlightLimit,
+    BatchSizePreference, ContextLengthPreference, EngineConfig, GraniteSpeechOptions,
+    PhysicalExecutionCapacity, PhysicalExecutionMode, PhysicalInFlightLimit,
+    RealtimeAsrSessionConfig,
 };
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 /// The separator between two transcript pieces: none where a script is
 /// written without spaces (CJK, Thai) or punctuation closes, else a space.
 pub use izwi_asr_toolkit::spacing_between;
@@ -115,37 +106,40 @@ pub use performance::{
 pub use runtime::{
     capability_conformance_cases, prometheus_voice_metric_name, prometheus_voice_metric_type,
     required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,
-    CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,
-    VoiceMetricDescriptor, VOICE_ASR_FINAL_MS, VOICE_ASR_FIRST_PARTIAL_MS,
+    CapabilityConformanceCase, CapabilityKind, ConformanceExecutionClass, VoiceLatency,
+    VoiceMetricDescriptor, VOICE_ASR_FINAL_SECONDS, VOICE_ASR_FIRST_PARTIAL_SECONDS,
     VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
-    VOICE_AUDIO_INGRESS_JITTER_MS, VOICE_BARGE_IN_LATENCY_MS, VOICE_BARGE_IN_TOTAL,
-    VOICE_ENDPOINTING_LATENCY_MS, VOICE_LLM_FIRST_TOKEN_MS, VOICE_METRIC_CATALOG,
-    VOICE_MODEL_READY_TOTAL, VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_DURATION_MS,
-    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
-    VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
+    VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_SECONDS,
+    VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG, VOICE_SESSION_CLOSED_TOTAL,
+    VOICE_SESSION_DURATION_SECONDS, VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL,
+    VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
 };
 pub use runtime::{
-    runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase, AudioChunk,
-    CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
-    InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
-    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
-    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardown,
-    RuntimeChatTeardownDisposition, RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot,
+    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
+    validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
+    ChatGeneration, ChatGenerationControls, ChatSamplingRequest, ChunkStats, DiarizationConfig,
+    DiarizationPipelineOptions, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
+    DiarizationUtterance, DiarizationWord, GenerationRequest, GenerationResult, JobCancellation,
+    ResolvedChatSampling, TtsStopReason, TtsStreamingMode, WindowedAlignment,
+    CHAT_MAX_TOKENS_UNSET,
+};
+pub use runtime::{
+    runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,
+    trace_contract_for_phase, AdmittedChatStream, AudioChunk, CoordinatorSnapshot,
+    EngineRuntimeTelemetrySnapshot, GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot,
+    InferenceOptions, PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeAsrRealtimeEvent,
+    RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
+    RuntimeChatInvocationRequest, RuntimeChatTeardown, RuntimeChatTeardownDisposition,
+    RuntimeHealth, RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot,
     RuntimeObservationContext, RuntimeReplayRecord, RuntimeRequestContext, RuntimeService,
     RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
     RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
-    RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration, VoiceRuntimeTelemetrySnapshot,
-    VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
+    RuntimeWorkloadClassTelemetrySnapshot, SessionModelLeases, SpeechToSpeechGeneration,
+    VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase,
+    DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
     TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
     TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
     TRACE_STREAMING_MODE,
-};
-pub use runtime::{
-    validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
-    ChatGeneration, ChunkStats, DiarizationConfig, DiarizationPipelineOptions, DiarizationResult,
-    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationRequest, GenerationResult, JobCancellation, TtsStopReason, TtsStreamingMode,
-    WindowedAlignment,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
@@ -167,7 +161,7 @@ pub use catalog::{
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
-    ChatTemplateKwargs,
+    ChatTemplateKwargs, ChatTruncation,
 };
 
 // Canonical native registry/device exports.

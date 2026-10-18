@@ -9,6 +9,22 @@ use candle_core::{DType, Device, Tensor};
 use std::sync::Arc;
 
 fn tiny_lfm_model() -> Lfm2ChatModel {
+    tiny_lfm_model_with(|shape| Tensor::ones(shape, DType::F32, &Device::Cpu).unwrap())
+}
+
+/// The tiny model with xorshift weights from `seed`: unlike the all-ones
+/// model it does not end every reply at once.
+pub(super) fn random_tiny_lfm_model(seed: u64) -> Lfm2ChatModel {
+    let mut seed = seed;
+    tiny_lfm_model_with(move |shape| {
+        seed += 1;
+        let values =
+            crate::kernels::numeric_check::xorshift_values(shape.iter().product(), seed, 1.0);
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    })
+}
+
+fn tiny_lfm_model_with(mut weight: impl FnMut(&[usize]) -> Tensor) -> Lfm2ChatModel {
     let variant = ModelVariant::Lfm2512BInstructGguf;
     let directory =
         std::env::temp_dir().join(format!("izwi-lfm-contract-{}", uuid::Uuid::new_v4()));
@@ -56,7 +72,7 @@ fn tiny_lfm_model() -> Lfm2ChatModel {
     ];
     let mut weights = vec![];
     let mut add = |name: String, shape: &[usize]| {
-        let tensor = Tensor::ones(shape, DType::F32, &Device::Cpu).unwrap();
+        let tensor = weight(shape);
         weights.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
     };
     add("token_embd.weight".into(), &[7, 4]);
@@ -261,16 +277,57 @@ fn lfm2_never_selects_a_control_token_greedy_or_sampled() {
 #[test]
 fn lfm2_json_constrained_rows_never_take_the_batched_argmax() {
     let model = tiny_lfm_model();
-    let plain = new_state(&model, ChatGenerationConfig::default());
-    assert!(plain.greedy);
-    let json = new_state(
+    let mut plain = new_state(&model, ChatGenerationConfig::default());
+    let mut json = new_state(
         &model,
         ChatGenerationConfig {
             constrain_json_object: true,
             ..Default::default()
         },
     );
-    assert!(!json.greedy);
+    // "b" (4) is the argmax, but no JSON value starts with it: the grammar
+    // leaves the JSON row only its end-of-turn token, <|im_end|> (2).
+    let row = [-1000f32, -1000., 1., 1., 2., -1000., -1000.];
+    let logits = Tensor::new(&[row, row], &Device::Cpu).unwrap();
+    let picked = model
+        .select_batch_tokens(&mut [&mut plain, &mut json], &logits)
+        .unwrap();
+    assert_eq!((picked[0].0, picked[1].0), (4, 2));
+}
+
+#[test]
+fn lfm2_batch_selection_reads_back_once_for_mixed_rows() {
+    let model = tiny_lfm_model();
+    let mut greedy = new_state(&model, ChatGenerationConfig::default());
+    let mut sampled = new_state(
+        &model,
+        ChatGenerationConfig {
+            temperature: 1.0,
+            top_k: 3,
+            seed: 7,
+            ..Default::default()
+        },
+    );
+    let mut logprobs = new_state(
+        &model,
+        ChatGenerationConfig {
+            logprobs: true,
+            top_logprobs: 2,
+            ..Default::default()
+        },
+    );
+    let row = [-1000f32, -1000., 1., 1., 2., 0.5, -1000.];
+    let logits = Tensor::new(&[row, row, row], &Device::Cpu).unwrap();
+    let before = crate::models::shared::telemetry::thread_host_reads();
+    let picked = model
+        .select_batch_tokens(&mut [&mut greedy, &mut sampled, &mut logprobs], &logits)
+        .unwrap();
+    assert_eq!(
+        crate::models::shared::telemetry::thread_host_reads() - before,
+        1
+    );
+    assert_eq!(picked[0], (4, None));
+    assert!(picked[2].1.is_some());
 }
 
 #[test]
@@ -389,5 +446,204 @@ fn cuda_lfm2_decode_rejects_nonfinite_logits_before_argmax() {
             .to_string();
         assert!(error.contains("non-finite"), "{error}");
         assert!(state.generated_ids.is_empty());
+    }
+}
+
+/// A mixed step whose op shapes equal a split call's (only decode rows, or
+/// one prefill row) is that call: same tokens and state.
+#[test]
+fn lfm2_mixed_steps_with_split_shapes_are_the_split_calls() {
+    let model = random_tiny_lfm_model(3);
+    let config = ChatGenerationConfig::default();
+    let summary = |state: &ChatDecodeState| {
+        (
+            state.position,
+            state.prefill_progress,
+            state.pending_token,
+            state.generated_ids.clone(),
+            state.physical_kv.context_len(),
+            state.shortconv.cursor(),
+        )
+    };
+    let prompt = [1, 3, 4, 5];
+    let prefilled = || {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 16, &config, cache())
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        model.decode_step(&mut state).unwrap();
+        state
+    };
+    let (mut split, mut mixed) = (prefilled(), prefilled());
+    for _ in 0..3 {
+        let expected = model.decode_step_batch(&mut [&mut split]).unwrap();
+        let (actual, prefill) = model.step_mixed(&mut [&mut mixed], &mut []).unwrap();
+        assert!(prefill.is_empty());
+        assert_eq!(expected[0].delta, actual[0].delta);
+        assert_eq!(summary(&split), summary(&mixed));
+    }
+
+    let prompt = [1, 4, 3, 6, 5];
+    let fresh = || {
+        model
+            .begin_resumable_prefill_state_managed(&prompt, 16, &config, cache())
+            .unwrap()
+    };
+    let (mut split, mut mixed) = (fresh(), fresh());
+    for (start, end) in [(0, 3), (3, prompt.len())] {
+        let complete = model
+            .continue_resumable_prefill_managed(&mut split, &prompt, start, end)
+            .unwrap();
+        let expected = complete.then(|| model.decode_step(&mut split).unwrap());
+        let (decode, mut prefill) = model
+            .step_mixed(
+                &mut [],
+                &mut [MixedPrefillRow {
+                    state: &mut mixed,
+                    prompt: &prompt,
+                    span_start: start,
+                    span_end: end,
+                }],
+            )
+            .unwrap();
+        assert!(decode.is_empty());
+        assert_eq!(
+            expected.map(|step| step.delta),
+            prefill.remove(0).map(|step| step.delta)
+        );
+        assert_eq!(summary(&split), summary(&mixed));
+    }
+}
+
+/// Run the pending token's forward on the retained path and leave its logits
+/// for `decode_step` to sample, returning them.
+fn pending_logits(model: &Lfm2ChatModel, state: &mut ChatDecodeState) -> Vec<f32> {
+    let pending = state.pending_token.take().expect("pending token");
+    let input = Tensor::from_slice(&[pending], (1, 1), &Device::Cpu).unwrap();
+    let logits = model
+        .text_model
+        .forward_tokens_retained(
+            &input,
+            state.position,
+            &mut state.physical_kv,
+            &mut state.shortconv,
+            true,
+        )
+        .unwrap()
+        .expect("logits");
+    state.position += 1;
+    state.unconsumed_output = Some(logits.clone());
+    logits.flatten_all().unwrap().to_vec1().unwrap()
+}
+
+/// D3: a hybrid LFM2 session released for capacity mid-generation and
+/// rebuilt in a fresh cache and ShortConv state by replaying its prompt and
+/// generated tokens over the original span boundaries resumes exactly:
+/// bit-identical next-step logits (attention KV and ShortConv state both
+/// rebuilt) and the same greedy and seeded streams. A one-span replay runs
+/// other op shapes and is held to a tolerance.
+#[test]
+fn lfm2_replayed_session_resumes_exactly() {
+    const MAX_NEW_TOKENS: usize = 20;
+    const SUSPEND_AT: usize = 6;
+    let model = random_tiny_lfm_model(3);
+    let prompt = [1, 3, 4, 5];
+    let sampled = ChatGenerationConfig {
+        temperature: 1.,
+        seed: 97,
+        ..Default::default()
+    };
+    for config in [ChatGenerationConfig::default(), sampled] {
+        for one_span in [false, true] {
+            let mut caches = crate::models::shared::attention::physical::test_physical_caches_on(
+                &Device::Cpu,
+                1,
+                1,
+                4,
+                prompt.len() + MAX_NEW_TOKENS + 1,
+                3,
+            );
+            let fresh = caches.pop().unwrap();
+            let mut rows = caches
+                .into_iter()
+                .map(|cache| {
+                    let mut state = model
+                        .begin_resumable_prefill_state_managed(
+                            &prompt,
+                            MAX_NEW_TOKENS,
+                            &config,
+                            cache,
+                        )
+                        .unwrap();
+                    model
+                        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+                        .unwrap();
+                    state
+                })
+                .collect::<Vec<_>>();
+            let mut suspended = rows.pop().unwrap();
+            let mut baseline = rows.pop().unwrap();
+            for _ in 0..SUSPEND_AT {
+                let step = model.decode_step(&mut baseline).unwrap();
+                assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+            }
+            assert!(
+                !baseline.finished,
+                "the fixture ended before the suspension"
+            );
+            let checkpoint = suspended.replay_checkpoint().unwrap();
+            assert_eq!(checkpoint.replay_tokens(), prompt.len() + SUSPEND_AT - 1);
+            drop(suspended);
+            let mut replayed = model.begin_replay_managed(&checkpoint, fresh).unwrap();
+            assert!(model.decode_step(&mut replayed).is_err());
+            let spans = if one_span {
+                vec![(0, checkpoint.replay_tokens())]
+            } else {
+                std::iter::once((0, prompt.len()))
+                    .chain(
+                        (prompt.len()..checkpoint.replay_tokens()).map(|start| (start, start + 1)),
+                    )
+                    .collect()
+            };
+            for (index, (start, end)) in spans.iter().copied().enumerate() {
+                let complete = model
+                    .continue_replay(&mut replayed, &prompt, start, end)
+                    .unwrap();
+                assert_eq!(complete, index + 1 == spans.len());
+            }
+            assert_eq!(replayed.shortconv.cursor(), baseline.shortconv.cursor());
+            let expected = pending_logits(&model, &mut baseline);
+            let actual = pending_logits(&model, &mut replayed);
+            if one_span {
+                let error = expected
+                    .iter()
+                    .zip(&actual)
+                    .map(|(left, right)| abs_err(*left, *right))
+                    .fold(0.0, f32::max);
+                assert!(error < 1e-4, "one-span replay logits differ by {error}");
+                continue;
+            }
+            assert_eq!(actual, expected, "rebuilt next-step logits");
+            while !baseline.finished {
+                let step = model.decode_step(&mut baseline).unwrap();
+                let resumed = model.decode_step(&mut replayed).unwrap();
+                assert_eq!(resumed.delta, step.delta);
+                assert_eq!(resumed.text, step.text);
+            }
+            assert!(replayed.finished);
+            assert_eq!(replayed.generated_ids, baseline.generated_ids);
+        }
+    }
+}
+
+/// Non-finite differences saturate to infinity, so they can never pass.
+fn abs_err(lhs: f32, rhs: f32) -> f32 {
+    let error = (lhs - rhs).abs();
+    if error.is_finite() {
+        error
+    } else {
+        f32::INFINITY
     }
 }

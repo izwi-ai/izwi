@@ -60,6 +60,7 @@ pub(super) fn static_estimate(
 
 /// [`static_estimate`] as a resource plan. CUDA authorizes its host
 /// conversion window separately from the device peak.
+#[cfg(test)]
 pub(super) fn static_resource_plan(
     backend: BackendKind,
     performance: &PerformanceConfig,
@@ -591,7 +592,9 @@ mod tests {
         use crate::models::architectures::qwen38::residency::{
             Qwen38ProjectionPlan, METAL_FP8_PREFILL_DEQUANT_BYTES,
         };
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_admission_prices_raw_fp8_and_the_expansion_once_poisoned",
+        ) else {
             return;
         };
         let _env = crate::env_test_lock()

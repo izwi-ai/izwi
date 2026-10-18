@@ -6,7 +6,7 @@
 
 use crate::catalog::ModelVariant;
 use crate::runtime::telemetry::RuntimeTracePhase;
-use crate::runtime::ConformanceCapability;
+use crate::runtime::CapabilityKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayRedaction {
@@ -25,14 +25,14 @@ impl ReplayRedaction {
 pub struct RuntimeReplayRecord {
     pub request_id: String,
     pub correlation_id: Option<String>,
-    pub capability: ConformanceCapability,
+    pub capability: CapabilityKind,
     pub model_variant: Option<ModelVariant>,
     pub phase: RuntimeTracePhase,
     pub redaction: ReplayRedaction,
 }
 
 impl RuntimeReplayRecord {
-    pub fn sanitized(request_id: impl Into<String>, capability: ConformanceCapability) -> Self {
+    pub fn sanitized(request_id: impl Into<String>, capability: CapabilityKind) -> Self {
         Self {
             request_id: request_id.into(),
             correlation_id: None,
@@ -71,7 +71,7 @@ pub const RUNTIME_REPLAY_REDACTION: ReplayRedaction = ReplayRedaction::Sanitized
 
 pub fn sanitized_replay_record(
     request_id: impl Into<String>,
-    capability: ConformanceCapability,
+    capability: CapabilityKind,
     model_variant: Option<ModelVariant>,
     correlation_id: Option<String>,
     phase: RuntimeTracePhase,
@@ -94,14 +94,14 @@ mod tests {
 
     #[test]
     fn replay_record_is_sanitized_metadata_only() {
-        let record = RuntimeReplayRecord::sanitized("req-1", ConformanceCapability::Chat)
+        let record = RuntimeReplayRecord::sanitized("req-1", CapabilityKind::Chat)
             .with_correlation_id("corr-1")
             .with_model_variant(ModelVariant::Qwen359BGguf)
             .with_phase(RuntimeTracePhase::Decode);
 
         assert_eq!(record.request_id, "req-1");
         assert_eq!(record.correlation_id.as_deref(), Some("corr-1"));
-        assert_eq!(record.capability, ConformanceCapability::Chat);
+        assert_eq!(record.capability, CapabilityKind::Chat);
         assert_eq!(record.model_variant, Some(ModelVariant::Qwen359BGguf));
         assert_eq!(record.phase, RuntimeTracePhase::Decode);
         assert_eq!(record.redaction, ReplayRedaction::SanitizedMetadataOnly);
@@ -113,7 +113,7 @@ mod tests {
     fn replay_helper_preserves_routing_metadata_without_payloads() {
         let record = sanitized_replay_record(
             "req-audio",
-            ConformanceCapability::SpeechToSpeech,
+            CapabilityKind::SpeechToSpeech,
             Some(ModelVariant::Lfm25Audio15BGguf),
             Some("corr-audio".to_string()),
             RuntimeTracePhase::FirstChunk,
@@ -121,7 +121,7 @@ mod tests {
 
         assert_eq!(record.request_id, "req-audio");
         assert_eq!(record.correlation_id.as_deref(), Some("corr-audio"));
-        assert_eq!(record.capability, ConformanceCapability::SpeechToSpeech);
+        assert_eq!(record.capability, CapabilityKind::SpeechToSpeech);
         assert_eq!(record.model_variant, Some(ModelVariant::Lfm25Audio15BGguf));
         assert_eq!(record.phase, RuntimeTracePhase::FirstChunk);
         assert!(!record.contains_payload());

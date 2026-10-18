@@ -1,0 +1,8 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"Partial"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"error":{"code":"service_unavailable","message":"Chat stream consumer is too slow; generation was cancelled","param":null,"type":"service_unavailable_error"}}
+
+data: [DONE]
+

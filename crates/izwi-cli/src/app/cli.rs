@@ -1,7 +1,6 @@
 //! Izwi CLI - World-class command-line interface for audio inference
 //!
 //! Inspired by vLLM, SGlang, Ollama, and llama.cpp CLIs
-#![allow(dead_code)]
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use izwi_core::backends::BackendPreference;
@@ -201,9 +200,15 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "server", env = "IZWI_SERVE_MODE")]
         mode: ServeMode,
 
-        /// Host to bind to
+        /// Host to bind to (default 127.0.0.1). Binding any other address
+        /// requires IZWI_API_KEY unless --allow-unauthenticated-network.
         #[arg(short = 'H', long)]
         host: Option<String>,
+
+        /// Serve a non-loopback address without an API key. Anyone who can
+        /// reach the port can then manage models and read history.
+        #[arg(long, env = "IZWI_ALLOW_UNAUTHENTICATED_NETWORK")]
+        allow_unauthenticated_network: bool,
 
         /// Port to listen on
         #[arg(short, long)]
@@ -748,17 +753,6 @@ pub enum BenchCommands {
         stream: bool,
     },
 
-    /// Benchmark system throughput
-    Throughput {
-        /// Duration in seconds
-        #[arg(short, long, default_value = "30")]
-        duration: u64,
-
-        /// Concurrent requests
-        #[arg(short, long, default_value = "1")]
-        concurrent: u32,
-    },
-
     /// Run a benchmark manifest
     Run {
         /// Benchmark manifest path (TOML)
@@ -946,6 +940,14 @@ mod tests {
             }
             _ => panic!("expected tts command"),
         }
+    }
+
+    /// HYG-T5: `bench throughput` timed `/livez`, not inference, and is gone;
+    /// serving throughput comes from scripts/bench/run-serving-benchmark.py.
+    #[test]
+    fn bench_throughput_is_not_a_command() {
+        assert!(Cli::try_parse_from(["izwi", "bench", "throughput"]).is_err());
+        assert!(Cli::try_parse_from(["izwi", "bench", "chat"]).is_ok());
     }
 
     /// PIPE-3: the server validates the diarization and ASR ids strictly, so

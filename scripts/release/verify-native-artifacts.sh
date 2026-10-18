@@ -139,6 +139,7 @@ verify_tar_archive() {
         izwi-cli-*.tar.gz)
             require_pattern "${contents_file}" '^izwi$' "public CLI"
             require_pattern "${contents_file}" '^izwi-server$' "gateway-capable public server"
+            require_pattern "${contents_file}" '^izwi-gateway$' "standalone public gateway"
             require_pattern "${contents_file}" '^izwi-serving-supervisor$' "node supervisor"
             require_pattern "${contents_file}" '^izwi-serving-worker$' "private inference worker"
             require_pattern "${contents_file}" '^izwi-serving-node\.example\.toml$' "bounded node configuration example"
@@ -166,6 +167,7 @@ verify_zip() {
         izwi-cli-*.zip)
             require_pattern "${contents_file}" '(^|/)izwi\.exe$' "public CLI"
             require_pattern "${contents_file}" '(^|/)izwi-server\.exe$' "gateway-capable public server"
+            require_pattern "${contents_file}" '(^|/)izwi-gateway\.exe$' "standalone public gateway"
             require_pattern "${contents_file}" '(^|/)izwi-serving-supervisor\.exe$' "node supervisor"
             require_pattern "${contents_file}" '(^|/)izwi-serving-worker\.exe$' "private inference worker"
             require_pattern "${contents_file}" '(^|/)izwi-serving-node\.example\.toml$' "bounded node configuration example"

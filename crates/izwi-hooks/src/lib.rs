@@ -3,6 +3,14 @@
 //! The open-source build uses the no-op implementations in this crate. A private
 //! enterprise repository can depend on these traits, implement them, and pass an
 //! [`EnterpriseHooks`] bundle into the reusable server entry point.
+//!
+//! Prefer `izwi_server::run_from_cli_blocking(hooks)` from a synchronous
+//! `fn main`: it sizes the engine's CPU thread pools before any thread starts,
+//! then runs the server on its own Tokio runtime. The async
+//! `izwi_server::run_from_cli(hooks).await` stays supported for a
+//! `#[tokio::main]` binary and behaves as before. To migrate, drop
+//! `#[tokio::main]`, make `main` synchronous, build the hooks without
+//! `.await`, and call `run_from_cli_blocking`.
 
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
@@ -283,6 +291,22 @@ pub struct QuotaRequest {
     pub action: EnterpriseAction,
     pub resource: ResourceDescriptor,
     pub estimated_units: Option<u64>,
+    pub metadata: HookMetadata,
+}
+
+/// What an admitted request actually used, reported once it completes so a
+/// metering backend can settle against the estimate it admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaUsage {
+    pub principal: Option<Principal>,
+    pub action: EnterpriseAction,
+    pub resource: ResourceDescriptor,
+    /// The `estimated_units` the request was evaluated with.
+    pub estimated_units: Option<u64>,
+    /// Input units consumed (prompt tokens for chat).
+    pub input_units: u64,
+    /// Output units produced (completion tokens for chat).
+    pub output_units: u64,
     pub metadata: HookMetadata,
 }
 
@@ -592,6 +616,13 @@ pub trait ObservabilitySink: Send + Sync {
 #[async_trait]
 pub trait QuotaLimiter: Send + Sync {
     async fn evaluate(&self, request: &QuotaRequest) -> HookResult<QuotaDecision>;
+
+    /// Records the actual usage of a request `evaluate` admitted, once it
+    /// completes. Best effort: the response has already been served, so a
+    /// failure here is logged, never surfaced to the caller.
+    async fn commit(&self, _usage: &QuotaUsage) -> HookResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

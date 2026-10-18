@@ -46,7 +46,7 @@ If another page says something different, this page should win.
 | **Single-host Linux server on NVIDIA GPU** | Supported / Preview by artifact | Use the Docker CUDA image/profile, or build from source with `--features cuda`. Native Linux release artifacts are CPU-only. |
 | **Windows desktop evaluation** | Stable CPU | Native Windows release artifacts are CPU-only. CUDA on Windows is source-build preview only. |
 | **Docker Compose on CPU** | Stable | Use the default `izwi` service. |
-| **Docker Compose on NVIDIA GPU** | Preview | Use `docker compose --profile cuda up`; the profile runs the `izwi-cuda` service and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
+| **Docker Compose on NVIDIA GPU** | Preview | Use `IZWI_API_KEY=<key> docker compose --profile cuda up`; the profile runs the `izwi-cuda` service, which binds `0.0.0.0` and therefore requires an API key, and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
 | **Kubernetes / Helm / multi-node production orchestration** | Not yet supported | Not published in OSS today. |
 
 ---
@@ -343,7 +343,7 @@ Use the following expectations when validating a host:
 - **Apple Silicon, macOS 15+:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
 - **macOS 12-14:** run with `--backend cpu`; `auto` and explicit `metal` requests fall back to CPU.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
+- **Docker CUDA on NVIDIA Linux hosts:** run `IZWI_API_KEY=<key> docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` (with `Authorization: Bearer <key>`) or `izwi status --detailed` from a client environment that exports the same `IZWI_API_KEY`. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
 - **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
 
 ---

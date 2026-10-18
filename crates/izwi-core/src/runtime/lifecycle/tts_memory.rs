@@ -713,7 +713,8 @@ mod tests {
         assert!(super::super::checkpoint_resource_plan(
             ModelVariant::FishAudioS2Pro,
             &missing,
-            &device
+            &device,
+            &Default::default()
         )
         .is_err());
         std::fs::remove_dir_all(missing).unwrap();
@@ -843,7 +844,7 @@ mod tests {
                 variant,
                 backend,
                 &performance,
-                Some((&dir, &device)),
+                Some((&dir, &device, &Default::default())),
             );
             assert_eq!(admitted, ResourceAmount::Known(retry), "{backend:?}");
             assert!(retry < super::super::model_memory_estimate(variant).load_peak_bytes);

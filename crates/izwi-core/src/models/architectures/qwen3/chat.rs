@@ -5,9 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use candle_core::{DType, Tensor};
 #[cfg(test)]
-use candle_core::D;
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{IndexOp, D};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,13 +22,16 @@ use crate::kv::v2::StateDomainId;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
+use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRole,
+};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
-use crate::models::shared::sampling::ChatSampler;
+use crate::models::shared::sampling::{sample_chat_rows, ChatSampler};
 use crate::models::shared::weights::gguf::GgufLoader;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -52,12 +55,37 @@ pub struct ChatDecodeState {
     prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    assembled: String,
+    decoder: IncrementalDecoder,
     max_new_tokens: usize,
     finished: bool,
+    /// Cache length a capacity replay is rebuilding; the state decodes again
+    /// once its cache reaches it.
+    replay_end: Option<usize>,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each step entry.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+}
+
+/// CPU continuation record of a session released for capacity: the
+/// generated-token journal (the prompt is the request's own) and the sampler
+/// and text state at a quantum boundary. It owns no tensors; the released
+/// cache is rebuilt by replaying the prompt and every generated token but the
+/// pending one.
+#[derive(Clone)]
+pub(crate) struct ChatReplayCheckpoint {
+    replay_tokens: usize,
+    pending_token: u32,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    decoder: IncrementalDecoder,
+    max_new_tokens: usize,
+}
+
+impl ChatReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.replay_tokens
+    }
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -68,7 +96,7 @@ pub(crate) struct ChatDecodeCheckpoint {
     prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    assembled: String,
+    decoder: IncrementalDecoder,
     finished: bool,
 }
 
@@ -79,6 +107,36 @@ impl ChatDecodeState {
 
     pub fn uses_managed_kv(&self) -> bool {
         true
+    }
+
+    /// The replay a capacity suspension still has to rebuild, if any.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay_end
+    }
+
+    /// Capture the CPU continuation record at a quantum boundary, before the
+    /// caller releases the cache.
+    pub(crate) fn replay_checkpoint(&self) -> Result<ChatReplayCheckpoint> {
+        let replay_tokens = self.replay_end.unwrap_or(self.pos);
+        let pending_token = self.pending_token.filter(|_| {
+            !self.finished
+                && self.unconsumed_output.is_none()
+                && replay_tokens + 1 == self.prefill_progress + self.generated_ids.len()
+        });
+        let Some(pending_token) = pending_token else {
+            return Err(Error::InvalidInput(
+                "a Qwen3 session suspends only between decode quanta".into(),
+            ));
+        };
+        Ok(ChatReplayCheckpoint {
+            replay_tokens,
+            pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            decoder: self.decoder.clone(),
+            max_new_tokens: self.max_new_tokens,
+        })
     }
 
     pub(crate) fn take_managed_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
@@ -121,7 +179,7 @@ impl ChatDecodeState {
             prefill_progress: self.prefill_progress,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
-            assembled: self.assembled.clone(),
+            decoder: self.decoder.clone(),
             finished: self.finished,
         };
         Ok(checkpoint)
@@ -135,9 +193,18 @@ impl ChatDecodeState {
         self.prefill_progress = checkpoint.prefill_progress;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
-        self.assembled = checkpoint.assembled;
+        self.decoder = checkpoint.decoder;
         self.finished = checkpoint.finished;
     }
+}
+
+/// One prefill row of a mixed step: the prompt span `[span_start,
+/// span_end)` that continues `state`'s resumable prefill.
+pub(crate) struct MixedPrefillRow<'s, 'p> {
+    pub(crate) state: &'s mut ChatDecodeState,
+    pub(crate) prompt: &'p [u32],
+    pub(crate) span_start: usize,
+    pub(crate) span_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -221,13 +288,13 @@ impl ChatTokenizer {
         self.inner.encode(text)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
+    /// The text `id` adds to the generated sequence. Ids past the vocabulary
+    /// add nothing, as a whole-sequence decode skips them.
+    fn decode_next(&self, decoder: &mut IncrementalDecoder, id: u32) -> Result<String> {
+        if id as usize >= self.vocab_size {
+            return Ok(String::new());
+        }
+        self.inner.decode_incrementally(decoder, id)
     }
 }
 
@@ -416,19 +483,20 @@ impl Qwen3ChatModel {
     }
 
     /// Start a native safetensors session directly in authoritative physical
-    /// KV pages supplied by the engine. The prompt is written into the arena
-    /// during prefill; no model-owned prompt history survives this boundary.
+    /// KV pages supplied by the engine, prefilling the request's sealed prompt
+    /// (the tokens a capacity replay writes back). The prompt is written into
+    /// the arena during prefill; no model-owned prompt history survives this
+    /// boundary.
     pub fn start_decode_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        let prompt_ids = self.build_prompt(messages)?;
         let mut state =
-            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
-        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+            self.begin_resumable_prefill_managed(prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, prompt_ids, 0, prompt_ids.len())?;
         Ok(state)
     }
 
@@ -465,11 +533,82 @@ impl Qwen3ChatModel {
                 .flatten()
                 .collect(),
             ),
-            assembled: String::new(),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            replay_end: None,
             pending_logprobs: Vec::new(),
         })
+    }
+
+    /// Start rebuilding a suspended session in an empty reservation. The
+    /// state decodes again after [`Self::continue_replay`] reaches the end
+    /// of the checkpoint's replay.
+    pub(crate) fn begin_replay_managed(
+        &self,
+        saved: &ChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0 || saved.replay_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 replay requires an empty reservation and a non-empty journal".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            cache,
+            unconsumed_output: None,
+            pos: 0,
+            pending_token: Some(saved.pending_token),
+            prefill_progress: saved.prefill_progress,
+            generated_ids: saved.generated_ids.clone(),
+            sampler: saved.sampler.clone(),
+            decoder: saved.decoder.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            replay_end: Some(saved.replay_tokens),
+            pending_logprobs: Vec::new(),
+        })
+    }
+
+    /// Write `[span_start, span_end)` of the replay journal (the prompt, then
+    /// the generated tokens) into the cache without sampling or emitting.
+    /// Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let replay_end = state
+            .replay_end
+            .ok_or_else(|| Error::InvalidInput("Qwen3 state has no pending replay".into()))?;
+        if span_start != state.pos
+            || span_start != state.cache.context_len()
+            || span_start >= span_end
+            || span_end > replay_end
+            || prompt_ids.len() != state.prefill_progress
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 replay span [{span_start},{span_end}) does not continue cursor {} of {replay_end}",
+                state.pos
+            )));
+        }
+        let ids = replay_journal_span(prompt_ids, &state.generated_ids, span_start, span_end)?;
+        let input_ids = Tensor::from_vec(ids, (1, span_end - span_start), &self.device.device)?;
+        let embeds = self.text_model.embeddings(&input_ids)?;
+        self.text_model.forward_managed_prefill_only_with_embeds(
+            &embeds,
+            span_start,
+            &mut state.cache,
+            None,
+        )?;
+        state.pos = span_end;
+        let complete = span_end == replay_end;
+        if complete {
+            state.replay_end = None;
+        }
+        Ok(complete)
     }
 
     pub(crate) fn continue_resumable_prefill(
@@ -569,14 +708,13 @@ impl Qwen3ChatModel {
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         let text_model = &self.text_model;
 
+        if state.replay_end.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3 decode cannot run before its replay completes".into(),
+            ));
+        }
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
-            state.finished = true;
-            return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: true,
-            });
+            return self.finish_decode(state, String::new());
         }
 
         if let Some(pending) = state.pending_token.take() {
@@ -590,38 +728,7 @@ impl Qwen3ChatModel {
             Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
         })?;
         let (next, logprob_entry) = self.sample_token(state, &output)?;
-
-        if next == self.tokenizer.specials.im_end
-            || next == self.tokenizer.specials.eos
-            || self.tokenizer.specials.eos_alt == Some(next)
-            || state.sampler.is_configured_stop(next)
-        {
-            state.finished = true;
-            return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: true,
-            });
-        }
-
-        Self::record_logprob(state, logprob_entry);
-        state.generated_ids.push(next);
-        state.pending_token = Some(next);
-        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-        let delta = text_delta(&state.assembled, &decoded);
-        state.assembled = decoded;
-
-        if state.generated_ids.len() >= state.max_new_tokens {
-            state.finished = true;
-        }
-
-        Ok(ChatDecodeStep {
-            delta,
-            text: state.assembled.trim().to_string(),
-            tokens_generated: state.generated_ids.len(),
-            finished: state.finished,
-        })
+        self.accept_token(state, next, logprob_entry)
     }
 
     /// Decode one token for a changing set of independent chat sessions in a
@@ -635,10 +742,21 @@ impl Qwen3ChatModel {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        if states.iter().any(|state| state.unconsumed_output.is_some()) {
+        if states
+            .iter()
+            .any(|state| state.unconsumed_output.is_some() || state.replay_end.is_some())
+        {
             return Err(Error::InferenceError(
-                "continuous Qwen3 decode crossed a quantum with unconsumed model output"
+                "continuous Qwen3 decode crossed a quantum with unconsumed model output or replay"
                     .to_string(),
+            ));
+        }
+        if states
+            .iter()
+            .any(|state| state.finished || state.generated_ids.len() >= state.max_new_tokens)
+        {
+            return Err(Error::InvalidInput(
+                "Continuous chat batch contains a terminal decode state".to_string(),
             ));
         }
 
@@ -662,51 +780,240 @@ impl Qwen3ChatModel {
             text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?;
         for state in states.iter_mut() {
             state.pos = state.pos.saturating_add(1);
+            state.pending_logprobs.clear();
         }
 
-        let mut steps = Vec::with_capacity(states.len());
-        for (row, state) in states.iter_mut().enumerate() {
-            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
-                return Err(Error::InvalidInput(
-                    "Continuous chat batch contains a terminal decode state".to_string(),
-                ));
-            }
+        // Every row samples from one readback of the whole step.
+        let next_logits = next_logits.reshape((states.len(), ()))?;
+        let mut samplers = states
+            .iter_mut()
+            .map(|state| &mut state.sampler)
+            .collect::<Vec<_>>();
+        let sampled = sample_chat_rows(&mut samplers, &next_logits, self.tokenizer.vocab_size)?;
+        states
+            .iter_mut()
+            .zip(sampled)
+            .map(|(state, (next, raw))| {
+                let entry = raw
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
+                self.accept_token(state, next, entry)
+            })
+            .collect()
+    }
 
-            let row_output = next_logits.i(row)?.unsqueeze(0)?;
-            let (next, logprob_entry) = self.sample_token(state, &row_output)?;
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-                || state.sampler.is_configured_stop(next)
+    /// One mixed step: `decode` rows take one token each and every
+    /// `prefill` row continues its resumable prefill over `[span_start,
+    /// span_end)` of its prompt, in one model forward and one sampling
+    /// readback. Returns each decode row's step, and for each prefill row its
+    /// bootstrap token when the span ends the prompt. A step of only decode
+    /// rows, or of one prefill row, is exactly the split path's call.
+    pub(crate) fn step_mixed(
+        &self,
+        decode: &mut [&mut ChatDecodeState],
+        prefill: &mut [MixedPrefillRow<'_, '_>],
+    ) -> Result<(Vec<ChatDecodeStep>, Vec<Option<ChatDecodeStep>>)> {
+        match (decode.is_empty(), &mut *prefill) {
+            (_, []) => return Ok((self.decode_step_batch(decode)?, Vec::new())),
+            (true, [row]) => {
+                let complete = self.continue_resumable_prefill(
+                    &mut *row.state,
+                    row.prompt,
+                    row.span_start,
+                    row.span_end,
+                )?;
+                let bootstrap = complete
+                    .then(|| self.decode_step(&mut *row.state))
+                    .transpose()?;
+                return Ok((Vec::new(), vec![bootstrap]));
+            }
+            _ => {}
+        }
+        if decode.iter().any(|state| {
+            state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3 mixed step contains a non-decodable decode row".to_string(),
+            ));
+        }
+        let mut prefill_spans = Vec::with_capacity(prefill.len());
+        let mut prefill_ids = Vec::new();
+        for row in prefill.iter() {
+            let state = &*row.state;
+            let physical_start = state.cache.context_len();
+            if state.prefill_progress != row.span_start
+                || row.span_start >= row.span_end
+                || row.span_end > row.prompt.len()
+                || state.finished
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_some()
+                || !state.generated_ids.is_empty()
+                || state.pos != physical_start
+                || physical_start >= row.span_end
+                || (row.span_start != 0 && physical_start != row.span_start)
             {
-                state.finished = true;
-                steps.push(ChatDecodeStep {
-                    delta: String::new(),
-                    text: state.assembled.trim().to_string(),
-                    tokens_generated: state.generated_ids.len(),
-                    finished: true,
-                });
-                continue;
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 mixed prefill span [{},{}) is incompatible with cursor {} and prompt length {}",
+                    row.span_start,
+                    row.span_end,
+                    state.prefill_progress,
+                    row.prompt.len()
+                )));
             }
-
-            Self::record_logprob(state, logprob_entry);
-            state.generated_ids.push(next);
-            state.pending_token = Some(next);
-            let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-            let delta = text_delta(&state.assembled, &decoded);
-            state.assembled = decoded;
-            if state.generated_ids.len() >= state.max_new_tokens {
-                state.finished = true;
-            }
-            steps.push(ChatDecodeStep {
-                delta,
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: state.finished,
+            prefill_spans.push(MixedRowSpan {
+                start_pos: physical_start,
+                q_len: row.span_end - physical_start,
             });
+            prefill_ids.extend_from_slice(&row.prompt[physical_start..row.span_end]);
+        }
+        let mut spans = Vec::with_capacity(decode.len() + prefill.len());
+        let mut input_ids = Vec::with_capacity(decode.len() + prefill_ids.len());
+        for state in decode.iter_mut() {
+            spans.push(MixedRowSpan {
+                start_pos: state.pos,
+                q_len: 1,
+            });
+            input_ids.push(state.pending_token.take().expect("pending token checked"));
+        }
+        spans.extend(prefill_spans);
+        input_ids.extend(prefill_ids);
+        let completes = prefill
+            .iter()
+            .map(|row| row.span_end == row.prompt.len())
+            .collect::<Vec<_>>();
+        let sample_rows = (0..decode.len())
+            .chain(
+                completes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, complete)| **complete)
+                    .map(|(row, _)| decode.len() + row),
+            )
+            .collect::<Vec<_>>();
+        let layout = MixedRowLayout::new(spans, decode.len())?;
+        let logits = {
+            let mut caches = decode
+                .iter_mut()
+                .map(|state| &mut state.cache)
+                .chain(prefill.iter_mut().map(|row| &mut row.state.cache))
+                .collect::<Vec<_>>();
+            self.text_model
+                .forward_managed_mixed(&input_ids, layout, &mut caches, &sample_rows)?
+        };
+        for state in decode.iter_mut() {
+            state.pos += 1;
+            state.pending_logprobs.clear();
+        }
+        for row in prefill.iter_mut() {
+            row.state.pos = row.span_end;
+            row.state.prefill_progress = row.span_end;
+            row.state.pending_logprobs.clear();
         }
 
-        Ok(steps)
+        let Some(logits) = logits else {
+            return Ok((Vec::new(), prefill.iter().map(|_| None).collect()));
+        };
+        // Decode rows and final spans sample from one readback.
+        let sampled = {
+            let mut samplers = decode
+                .iter_mut()
+                .map(|state| &mut state.sampler)
+                .chain(
+                    prefill
+                        .iter_mut()
+                        .zip(&completes)
+                        .filter(|(_, complete)| **complete)
+                        .map(|(row, _)| &mut row.state.sampler),
+                )
+                .collect::<Vec<_>>();
+            sample_chat_rows(&mut samplers, &logits, self.tokenizer.vocab_size)?
+        };
+        let mut sampled = sampled.into_iter();
+        let mut accept = |state: &mut ChatDecodeState| {
+            let (next, raw) = sampled
+                .next()
+                .ok_or_else(|| Error::InferenceError("Qwen3 mixed step lost a row".into()))?;
+            let entry = raw
+                .map(|raw| {
+                    crate::models::shared::sampling::resolve_token_logprob(
+                        &self.tokenizer.inner,
+                        &raw,
+                    )
+                })
+                .transpose()?;
+            self.accept_token(state, next, entry)
+        };
+        let decode_steps = decode
+            .iter_mut()
+            .map(|state| accept(state))
+            .collect::<Result<Vec<_>>>()?;
+        let prefill_steps = prefill
+            .iter_mut()
+            .zip(completes)
+            .map(|(row, complete)| complete.then(|| accept(&mut *row.state)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((decode_steps, prefill_steps))
+    }
+
+    /// Emit `next`, or end the row on a stop token. Text is decoded
+    /// incrementally, so a step costs the same however long the reply is.
+    fn accept_token(
+        &self,
+        state: &mut ChatDecodeState,
+        next: u32,
+        logprob_entry: Option<crate::engine::TokenLogprob>,
+    ) -> Result<ChatDecodeStep> {
+        if next == self.tokenizer.specials.im_end
+            || next == self.tokenizer.specials.eos
+            || self.tokenizer.specials.eos_alt == Some(next)
+            || state.sampler.is_configured_stop(next)
+        {
+            return self.finish_decode(state, String::new());
+        }
+
+        Self::record_logprob(state, logprob_entry);
+        state.generated_ids.push(next);
+        state.pending_token = Some(next);
+        let delta = self.tokenizer.decode_next(&mut state.decoder, next)?;
+        if state.generated_ids.len() >= state.max_new_tokens {
+            return self.finish_decode(state, delta);
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: String::new(),
+            tokens_generated: state.generated_ids.len(),
+            finished: false,
+        })
+    }
+
+    /// Finish the row: flush text the decoder still holds (an incomplete
+    /// UTF-8 sequence decodes as a whole-sequence decode renders it) and
+    /// return the whole text, which only a terminal step carries.
+    fn finish_decode(
+        &self,
+        state: &mut ChatDecodeState,
+        mut delta: String,
+    ) -> Result<ChatDecodeStep> {
+        state.finished = true;
+        let suffix = self
+            .tokenizer
+            .inner
+            .finish_incremental_decode(&mut state.decoder)?;
+        delta.push_str(&suffix);
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.decoder.decoded_text().trim().to_string(),
+            tokens_generated: state.generated_ids.len(),
+            finished: true,
+        })
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
@@ -970,18 +1277,6 @@ fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
     argmax_last_sequence_output(&output)
 }
 
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
-    }
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current.chars().skip(common).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1059,5 +1354,581 @@ mod tests {
 
         let dtype = select_qwen3_dense_dtype(&profile, None, Some(DType::F16)).unwrap();
         assert_eq!(dtype, DType::F16);
+    }
+}
+
+/// The tiny Qwen3 chat model: eight whole-character pieces, and specials
+/// past the vocabulary, so a row ends only at its token budget.
+#[cfg(test)]
+pub(crate) fn tiny_chat_model_for_test(device: &candle_core::Device) -> Qwen3ChatModel {
+    stream_tests::tiny_chat_model(device, stream_tests::ASCII_PIECES)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::backends::{DeviceCapabilities, DeviceKind};
+    use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+    use crate::models::shared::attention::physical::test_physical_caches_on;
+    use crate::models::shared::telemetry::thread_host_reads;
+    use candle_core::Device;
+
+    const PROMPT: [u32; 3] = [0, 1, 7];
+
+    /// Byte-level pieces for the tiny model's eight ids: "a", " ", the two
+    /// bytes of "é", the three bytes of "€", and "b".
+    const SPLIT_PIECES: &str = r#"{"a":0,"Ġ":1,"Ã":2,"©":3,"â":4,"Ĥ":5,"¬":6,"b":7}"#;
+    /// Eight whole-character pieces.
+    pub(super) const ASCII_PIECES: &str = r#"{"a":0,"Ġ":1,"b":2,"c":3,"Ġd":4,"e":5,"f":6,"g":7}"#;
+
+    /// The tiny model with a byte-level WordLevel tokenizer over `pieces`.
+    /// The specials sit past the vocabulary, so a row ends only at its token
+    /// budget.
+    pub(super) fn tiny_chat_model(device: &Device, pieces: &str) -> Qwen3ChatModel {
+        let inner = Tokenizer::from_hf_json_bytes(
+            format!(
+                r#"{{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},
+            "model":{{"type":"WordLevel","unk_token":"a","vocab":{pieces}}}
+        }}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        Qwen3ChatModel {
+            device: DeviceProfile {
+                device: device.clone(),
+                kind: if device.is_metal() {
+                    DeviceKind::Metal
+                } else {
+                    DeviceKind::Cpu
+                },
+                capabilities: DeviceCapabilities::default(),
+                memory_pool: None,
+            },
+            compute_dtype: DType::F32,
+            tokenizer: ChatTokenizer {
+                inner,
+                vocab_size: 8,
+                specials: SpecialTokenIds {
+                    im_start: 8,
+                    im_end: 9,
+                    eos: 9,
+                    eos_alt: None,
+                },
+            },
+            text_model: tiny_qwen3_model_for_test(device),
+            prefix_reuse: false,
+        }
+    }
+
+    fn prefilled_rows(
+        model: &Qwen3ChatModel,
+        device: &Device,
+        configs: &[ChatGenerationConfig],
+        max_new_tokens: usize,
+    ) -> Vec<ChatDecodeState> {
+        let capacity = PROMPT.len() + max_new_tokens + 1;
+        test_physical_caches_on(device, 1, 1, 2, capacity, configs.len())
+            .into_iter()
+            .zip(configs)
+            .map(|(cache, config)| {
+                let mut state = model
+                    .begin_resumable_prefill_managed(&PROMPT, max_new_tokens, config, cache)
+                    .unwrap();
+                model
+                    .continue_resumable_prefill(&mut state, &PROMPT, 0, PROMPT.len())
+                    .unwrap();
+                state
+            })
+            .collect()
+    }
+
+    /// Each row's generated ids, streamed deltas and terminal text, decoded
+    /// through the continuous batch after one single-row step per row.
+    fn generate(
+        model: &Qwen3ChatModel,
+        device: &Device,
+        configs: &[ChatGenerationConfig],
+        max_new_tokens: usize,
+    ) -> Vec<(Vec<u32>, Vec<String>, String)> {
+        let mut states = prefilled_rows(model, device, configs, max_new_tokens);
+        let mut deltas = vec![Vec::new(); states.len()];
+        let mut texts = vec![None; states.len()];
+        let mut record = |row: usize, step: ChatDecodeStep| {
+            deltas[row].push(step.delta);
+            if step.finished {
+                texts[row] = Some(step.text);
+            } else {
+                assert!(step.text.is_empty(), "a non-terminal step copied the text");
+            }
+        };
+        for (row, state) in states.iter_mut().enumerate() {
+            record(row, model.decode_step(state).unwrap());
+        }
+        loop {
+            let (rows, mut live): (Vec<usize>, Vec<&mut ChatDecodeState>) = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, state)| !state.finished)
+                .unzip();
+            if live.is_empty() {
+                break;
+            }
+            let steps = model.decode_step_batch(&mut live).unwrap();
+            for (row, step) in rows.into_iter().zip(steps) {
+                record(row, step);
+            }
+        }
+        states
+            .into_iter()
+            .zip(deltas)
+            .zip(texts)
+            .map(|((state, deltas), text)| (state.generated_ids, deltas, text.unwrap()))
+            .collect()
+    }
+
+    /// The deltas the old path streamed: the whole sequence decoded again
+    /// after every token and diffed against the previous decode.
+    fn whole_sequence_deltas(model: &Qwen3ChatModel, ids: &[u32]) -> Vec<String> {
+        let mut previous = String::new();
+        (1..=ids.len())
+            .map(|end| {
+                let current = model.tokenizer.inner.decode(&ids[..end]).unwrap();
+                let delta = match current.strip_prefix(previous.as_str()) {
+                    Some(delta) => delta.to_string(),
+                    None => {
+                        let common = previous
+                            .chars()
+                            .zip(current.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        current.chars().skip(common).collect()
+                    }
+                };
+                previous = current;
+                delta
+            })
+            .collect()
+    }
+
+    /// A greedy and two seeded 2,048-token runs through the continuous
+    /// batch stream exactly the whole-sequence decode, and step for step
+    /// what the old whole-sequence path streamed wherever that was
+    /// well-formed. Returns how many characters the runs split across
+    /// tokens.
+    fn assert_stream_matches_whole_sequence_decode(device: &Device, pieces: &str) -> usize {
+        let model = tiny_chat_model(device, pieces);
+        let sampled = |seed, top_k| ChatGenerationConfig {
+            temperature: 1.5,
+            top_k,
+            seed,
+            ..ChatGenerationConfig::default()
+        };
+        let configs = [
+            ChatGenerationConfig::default(),
+            sampled(11, 0),
+            sampled(12, 6),
+        ];
+        let max_new_tokens = 2_048;
+        let mut split_characters = 0;
+        let rows = generate(&model, device, &configs, max_new_tokens);
+        for (row, (ids, deltas, text)) in rows.iter().enumerate() {
+            assert_eq!(ids.len(), max_new_tokens, "row {row} ended early");
+            assert_eq!(deltas.len(), ids.len(), "row {row}: one step per token");
+            let whole = model.tokenizer.inner.decode(ids).unwrap();
+            assert_eq!(deltas.concat(), whole, "row {row}: stream != whole decode");
+            assert_eq!(text, whole.trim(), "row {row}: terminal text");
+            // The old stream sent a U+FFFD for a split character before
+            // the character itself; elsewhere both streams agree per step.
+            let old = whole_sequence_deltas(&model, ids);
+            if old.iter().all(|delta| !delta.contains('\u{FFFD}')) {
+                assert_eq!(deltas, &old, "row {row}: per-step deltas");
+            }
+            split_characters += whole.matches(['é', '€']).count();
+        }
+        split_characters
+    }
+
+    fn assert_streams_on(device: &Device) {
+        assert_eq!(
+            assert_stream_matches_whole_sequence_decode(device, ASCII_PIECES),
+            0
+        );
+        assert!(
+            assert_stream_matches_whole_sequence_decode(device, SPLIT_PIECES) > 0,
+            "the runs never split a character across tokens"
+        );
+    }
+
+    /// Run the pending token's forward as `decode_step` does and return
+    /// the logits it leaves for sampling.
+    fn pending_logits(model: &Qwen3ChatModel, state: &mut ChatDecodeState) -> Vec<f32> {
+        let pending = state.pending_token.take().expect("pending token");
+        let input = Tensor::from_vec(vec![pending], (1, 1), &model.device.device).unwrap();
+        let logits = model
+            .text_model
+            .forward_managed(&input, state.pos, &mut state.cache)
+            .unwrap();
+        state.pos += 1;
+        state.unconsumed_output = Some(logits.clone());
+        logits.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    /// D2: a session released for capacity after `SUSPEND_AT` tokens and
+    /// rebuilt in a fresh cache by replaying its prompt and generated tokens
+    /// over the original span boundaries (the prompt, then one decode-shaped
+    /// span per token) resumes exactly: the rebuilt next-step logits equal an
+    /// unpreempted run's bit for bit, and the greedy and seeded streams match
+    /// delta for delta. A replay in one span runs other op shapes, so it is
+    /// held to a tolerance.
+    fn assert_replay_resumes_exactly(device: &Device) {
+        const MAX_NEW_TOKENS: usize = 24;
+        const SUSPEND_AT: usize = 7;
+        let model = tiny_chat_model(device, ASCII_PIECES);
+        let sampled = ChatGenerationConfig {
+            temperature: 1.5,
+            seed: 11,
+            ..ChatGenerationConfig::default()
+        };
+        for config in [ChatGenerationConfig::default(), sampled] {
+            for one_span in [false, true] {
+                let mut caches =
+                    test_physical_caches_on(device, 1, 1, 2, PROMPT.len() + MAX_NEW_TOKENS + 1, 3);
+                let fresh = caches.pop().unwrap();
+                let mut rows = caches
+                    .into_iter()
+                    .map(|cache| {
+                        let mut state = model
+                            .begin_resumable_prefill_managed(
+                                &PROMPT,
+                                MAX_NEW_TOKENS,
+                                &config,
+                                cache,
+                            )
+                            .unwrap();
+                        model
+                            .continue_resumable_prefill(&mut state, &PROMPT, 0, PROMPT.len())
+                            .unwrap();
+                        state
+                    })
+                    .collect::<Vec<_>>();
+                let mut suspended = rows.pop().unwrap();
+                let mut baseline = rows.pop().unwrap();
+                let mut deltas = Vec::new();
+                for _ in 0..SUSPEND_AT {
+                    let step = model.decode_step(&mut baseline).unwrap();
+                    assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+                    deltas.push(step.delta);
+                }
+                let checkpoint = suspended.replay_checkpoint().unwrap();
+                assert_eq!(checkpoint.replay_tokens(), PROMPT.len() + SUSPEND_AT - 1);
+                drop(suspended);
+                let mut replayed = model.begin_replay_managed(&checkpoint, fresh).unwrap();
+                assert!(model.decode_step(&mut replayed).is_err());
+                let spans = if one_span {
+                    vec![(0, checkpoint.replay_tokens())]
+                } else {
+                    std::iter::once((0, PROMPT.len()))
+                        .chain(
+                            (PROMPT.len()..checkpoint.replay_tokens())
+                                .map(|start| (start, start + 1)),
+                        )
+                        .collect()
+                };
+                for (index, (start, end)) in spans.iter().copied().enumerate() {
+                    let complete = model
+                        .continue_replay(&mut replayed, &PROMPT, start, end)
+                        .unwrap();
+                    assert_eq!(complete, index + 1 == spans.len());
+                }
+                let expected = pending_logits(&model, &mut baseline);
+                let actual = pending_logits(&model, &mut replayed);
+                if one_span {
+                    let error = expected
+                        .iter()
+                        .zip(&actual)
+                        .map(|(left, right)| {
+                            let error = (left - right).abs();
+                            if error.is_finite() {
+                                error
+                            } else {
+                                f32::INFINITY
+                            }
+                        })
+                        .fold(0.0, f32::max);
+                    assert!(error < 1e-4, "one-span replay logits differ by {error}");
+                    continue;
+                }
+                assert_eq!(actual, expected, "rebuilt next-step logits");
+                while !baseline.finished {
+                    let step = model.decode_step(&mut baseline).unwrap();
+                    assert_eq!(model.decode_step(&mut replayed).unwrap().delta, step.delta);
+                    deltas.push(step.delta);
+                }
+                assert!(replayed.finished);
+                assert_eq!(replayed.generated_ids, baseline.generated_ids);
+                assert_eq!(deltas.len(), MAX_NEW_TOKENS);
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_session_resumes_exactly_on_cpu() {
+        assert_replay_resumes_exactly(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn replayed_session_resumes_exactly_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen3 replayed_session_resumes_exactly_on_metal",
+        ) else {
+            return;
+        };
+        assert_replay_resumes_exactly(&device);
+    }
+
+    #[test]
+    fn incremental_stream_matches_whole_sequence_decode_on_cpu() {
+        assert_streams_on(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn incremental_stream_matches_whole_sequence_decode_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen3 incremental_stream_matches_whole_sequence_decode_on_metal",
+        ) else {
+            return;
+        };
+        assert_streams_on(&device);
+    }
+
+    /// Two request streams on one Metal device, run concurrently, read back
+    /// exactly what they read back alone, on every iteration: a tiny model
+    /// decoding through the accelerator KV arena, and greedy sampling of
+    /// uploaded logits (Phase 2.2 saw this sampler read back token 0 while a
+    /// model decoded on another thread). Each stream's device work runs on
+    /// the device thread, interleaved step by step as the engine interleaves
+    /// requests. Ignored soak:
+    /// `cargo test -p izwi-core --features metal --lib concurrent_streams_on_one_metal_device -- --ignored`
+    /// (`IZWI_DEVICE_SOAK_ITERATIONS`, default 50).
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "Metal soak; run explicitly"]
+    fn concurrent_streams_on_one_metal_device_match_a_serial_run() {
+        use crate::models::shared::sampling::ChatSampler;
+
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen3 concurrent_streams_on_one_metal_device_match_a_serial_run",
+        ) else {
+            return;
+        };
+        let iterations = std::env::var("IZWI_DEVICE_SOAK_ITERATIONS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(50);
+        let device_thread =
+            crate::backends::DeviceThread::for_device(&device).expect("device thread");
+        let on_device = |work: &mut (dyn FnMut() + Send)| {
+            device_thread.run_sync(work).expect("device job");
+        };
+        let model = tiny_chat_model(&device, ASCII_PIECES);
+        let configs = [ChatGenerationConfig::default()];
+        let decode_stream = || {
+            let mut state = None;
+            on_device(&mut || state = prefilled_rows(&model, &device, &configs, 40).pop());
+            let mut state = state.expect("prefilled row");
+            for _ in 0..32 {
+                on_device(&mut || {
+                    model.decode_step(&mut state).expect("decode step");
+                });
+            }
+            state.generated_ids.clone()
+        };
+        // Unstructured logits whose greedy pick the host knows exactly.
+        const WIDTH: usize = 1_500;
+        let logits = |step: u64| {
+            let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ step.wrapping_mul(0x2545_F491);
+            (0..WIDTH)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 24) as f32 * 8.0 - 4.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let sampler_stream = || {
+            let mut sampler = ChatSampler::new(ChatGenerationConfig::default(), &[]);
+            (0..64)
+                .map(|step| {
+                    let mut token = None;
+                    let values = logits(step);
+                    on_device(&mut || {
+                        let logits = Tensor::from_vec(values.clone(), WIDTH, &device).unwrap();
+                        token = Some(sampler.sample(&logits, WIDTH).expect("sample"));
+                    });
+                    token.expect("sampled token")
+                })
+                .collect::<Vec<_>>()
+        };
+        let greedy = (0..64)
+            .map(|step| {
+                let values = logits(step);
+                (0..WIDTH)
+                    .max_by(|&left, &right| values[left].total_cmp(&values[right]))
+                    .expect("non-empty logits") as u32
+            })
+            .collect::<Vec<_>>();
+        let expected_decode = decode_stream();
+        assert_eq!(expected_decode.len(), 32);
+        assert_eq!(sampler_stream(), greedy);
+        for iteration in 0..iterations {
+            let (decoded, sampled) = std::thread::scope(|scope| {
+                let decode = scope.spawn(decode_stream);
+                let sample = scope.spawn(sampler_stream);
+                (
+                    decode.join().expect("decode stream"),
+                    sample.join().expect("sampler stream"),
+                )
+            });
+            assert_eq!(decoded, expected_decode, "iteration {iteration}: decode stream");
+            assert_eq!(sampled, greedy, "iteration {iteration}: sampler stream");
+        }
+    }
+
+    /// A step of a multi-row batch reads the device back once, whatever mix
+    /// of greedy, sampled and logprob rows it holds.
+    fn assert_one_readback_per_batch_step(device: &Device) {
+        let model = tiny_chat_model(device, ASCII_PIECES);
+        let configs = [
+            ChatGenerationConfig::default(),
+            ChatGenerationConfig {
+                temperature: 0.8,
+                top_k: 4,
+                seed: 5,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 2,
+                ..ChatGenerationConfig::default()
+            },
+        ];
+        let mut states = prefilled_rows(&model, device, &configs, 32);
+        for state in &mut states {
+            model.decode_step(state).unwrap();
+        }
+        for _ in 0..16 {
+            let mut rows = states.iter_mut().collect::<Vec<_>>();
+            let before = thread_host_reads();
+            let steps = model.decode_step_batch(&mut rows).unwrap();
+            assert_eq!(thread_host_reads() - before, 1, "readbacks per step");
+            assert_eq!(steps.len(), 3);
+            assert_eq!(states[2].pending_logprobs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn continuous_batch_reads_back_once_per_step_on_cpu() {
+        assert_one_readback_per_batch_step(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn continuous_batch_reads_back_once_per_step_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen3 continuous_batch_reads_back_once_per_step_on_metal",
+        ) else {
+            return;
+        };
+        assert_one_readback_per_batch_step(&device);
+    }
+
+    /// A mixed step whose op shapes equal a split call's (only decode rows,
+    /// or one prefill row) is that call: same tokens, logprobs and state.
+    #[test]
+    fn mixed_steps_with_split_shapes_are_the_split_calls() {
+        let device = Device::Cpu;
+        let model = tiny_chat_model(&device, ASCII_PIECES);
+        let configs = [
+            ChatGenerationConfig {
+                temperature: 0.8,
+                seed: 3,
+                logprobs: true,
+                top_logprobs: 2,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig::default(),
+        ];
+        let summary = |state: &ChatDecodeState| {
+            (
+                state.pos,
+                state.prefill_progress,
+                state.pending_token,
+                state.generated_ids.clone(),
+                state.cache.context_len(),
+            )
+        };
+        let mut split = prefilled_rows(&model, &device, &configs, 8);
+        let mut mixed = prefilled_rows(&model, &device, &configs, 8);
+        for (split, mixed) in split.iter_mut().zip(&mut mixed) {
+            model.decode_step(split).unwrap();
+            model.decode_step(mixed).unwrap();
+        }
+        for _ in 0..3 {
+            let expected = model
+                .decode_step_batch(&mut split.iter_mut().collect::<Vec<_>>())
+                .unwrap();
+            let (actual, prefill) = model
+                .step_mixed(&mut mixed.iter_mut().collect::<Vec<_>>(), &mut [])
+                .unwrap();
+            assert!(prefill.is_empty());
+            for (row, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(expected.delta, actual.delta);
+                assert_eq!(summary(&split[row]), summary(&mixed[row]));
+                assert_eq!(split[row].pending_logprobs, mixed[row].pending_logprobs);
+            }
+        }
+
+        let caches = test_physical_caches_on(&device, 1, 1, 2, 16, 2);
+        let mut states = caches
+            .into_iter()
+            .map(|cache| {
+                model
+                    .begin_resumable_prefill_managed(&PROMPT, 8, &configs[0], cache)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (mut split, mut mixed) = (states.remove(0), states.remove(0));
+        for (start, end) in [(0, 2), (2, PROMPT.len())] {
+            let complete = model
+                .continue_resumable_prefill(&mut split, &PROMPT, start, end)
+                .unwrap();
+            let expected = complete.then(|| model.decode_step(&mut split).unwrap());
+            let (decode, mut prefill) = model
+                .step_mixed(
+                    &mut [],
+                    &mut [MixedPrefillRow {
+                        state: &mut mixed,
+                        prompt: &PROMPT,
+                        span_start: start,
+                        span_end: end,
+                    }],
+                )
+                .unwrap();
+            assert!(decode.is_empty());
+            let actual = prefill.remove(0);
+            assert_eq!(
+                expected.map(|step| step.delta),
+                actual.map(|step| step.delta)
+            );
+            assert_eq!(summary(&split), summary(&mixed));
+            assert_eq!(split.pending_logprobs, mixed.pending_logprobs);
+        }
     }
 }

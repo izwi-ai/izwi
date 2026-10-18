@@ -101,34 +101,6 @@ impl ConvLayer {
 
         output
     }
-
-    /// Apply causal conv1d for a single timestep (incremental)
-    fn forward_incremental(&self, input_history: &[f32], current_t: usize) -> Vec<f32> {
-        let mut output = vec![0.0f32; self.out_channels];
-        let padding = self.kernel_size - 1;
-        let history_len = input_history.len() / self.in_channels;
-
-        for out_c in 0..self.out_channels {
-            let mut sum = self.bias[out_c];
-
-            for k in 0..self.kernel_size {
-                let input_t = current_t as isize - (padding as isize - k as isize);
-                if input_t >= 0 && (input_t as usize) < history_len {
-                    for in_c in 0..self.in_channels {
-                        let weight_idx = out_c * self.in_channels * self.kernel_size
-                            + in_c * self.kernel_size
-                            + k;
-                        let input_idx = (input_t as usize) * self.in_channels + in_c;
-                        sum += self.weight[weight_idx] * input_history[input_idx];
-                    }
-                }
-            }
-
-            output[out_c] = sum;
-        }
-
-        output
-    }
 }
 
 /// Apply GELU activation function

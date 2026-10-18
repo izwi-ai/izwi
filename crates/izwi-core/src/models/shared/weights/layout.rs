@@ -34,33 +34,6 @@ impl Default for RowInterleavedConfig {
 }
 
 impl RowInterleavedConfig {
-    /// Create a new config from environment variables.
-    ///
-    /// Environment variables:
-    /// - `IZWI_ROW_INTERLEAVED`: "1" or "true" to enable, "0" or "false" to disable
-    /// - `IZWI_ROW_INTERLEAVED_BLOCK`: block size (default: 4)
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("IZWI_ROW_INTERLEAVED")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-
-        let block_rows = std::env::var("IZWI_ROW_INTERLEAVED_BLOCK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
-
-        Self {
-            block_rows: block_rows.max(1),
-            enabled,
-        }
-    }
-
     /// Check if row-interleaved layout is enabled for the given device.
     pub fn is_enabled_for_device(&self, device: &Device) -> bool {
         // Currently only enabled for Metal devices
@@ -195,7 +168,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config_from_env_defaults() {
+    fn test_config_defaults() {
         let config = RowInterleavedConfig::default();
         assert!(config.enabled);
         assert_eq!(config.block_rows, 4);

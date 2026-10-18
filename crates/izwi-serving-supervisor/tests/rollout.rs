@@ -9,6 +9,9 @@
 //! liveness, and old-generation drain are all asserted on real files and
 //! real processes.
 
+// The fake workers are executable scripts launched through unix permissions.
+#![cfg(unix)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,6 +23,7 @@ use izwi_serving_protocol::{
     ModelReadiness, NodeId, OutputFormat, TaskKind, WorkerDescriptor, WorkerFeature,
     WorkerId, WorkerProcessState, WorkerStatus, PROTOCOL_V1,
 };
+use izwi_test_process::ProcessGuard;
 
 const FAKE_WORKER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import json, os, sys, threading, time
@@ -97,6 +101,39 @@ if die_after is not None:
 exit_when_stdin_closes(server)
 "#;
 
+/// A gateway admin endpoint that reports whatever status file the test
+/// writes, so the test decides when "the gateway" adopted a view.
+const FAKE_GATEWAY_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATUS, KEY, PORT = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/internal/admin/approvals":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.headers.get("Authorization") != "Bearer " + KEY:
+            self.send_response(401)
+            self.end_headers()
+            return
+        body = open(STATUS, "rb").read()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"#;
+
+const GATEWAY_ADMIN_KEY: &str = "rollout-rig-gateway-admin-key";
+
 /// One fake worker the test renders configs and payloads for.
 struct FakeWorker {
     worker_id: &'static str,
@@ -129,10 +166,37 @@ struct Rig {
     approvals: PathBuf,
     original_approvals: String,
     worker_binary: PathBuf,
+    old_port: u16,
 }
 
 impl Rig {
     fn build(window_secs: u64, abort_grace_secs: u64) -> Self {
+        Self::build_with_commit_grace(window_secs, abort_grace_secs, 1)
+    }
+
+    /// The rig's gateways are modelled with a 1s approvals refresh, the
+    /// smallest the gateway accepts, so windows of 2s and up are valid.
+    fn build_with_commit_grace(
+        window_secs: u64,
+        abort_grace_secs: u64,
+        commit_grace_secs: u64,
+    ) -> Self {
+        Self::build_full(window_secs, abort_grace_secs, commit_grace_secs, false)
+    }
+
+    /// The replacement takes over the old worker's bind, as on a one-GPU
+    /// node where both generations want the same device: the two cannot run
+    /// side by side, so the rollout recreates.
+    fn build_recreate() -> Self {
+        Self::build_full(2, 1, 1, true)
+    }
+
+    fn build_full(
+        window_secs: u64,
+        abort_grace_secs: u64,
+        commit_grace_secs: u64,
+        share_bind: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap().keep();
         let run_dir = root.join("run");
         let work_dir = root.join("work");
@@ -142,7 +206,7 @@ impl Rig {
         }
 
         let old_port = free_port();
-        let new_port = free_port();
+        let new_port = if share_bind { old_port } else { free_port() };
         let workers = [
             (OLD_WORKER, old_port, "TOKEN_OLD"),
             (REPLACEMENT, new_port, "TOKEN_NEW"),
@@ -265,7 +329,7 @@ impl Rig {
         std::fs::write(
             &plan,
             format!(
-                "schema_version = 1\ntarget_node_config = \"{}\"\nshared_approvals_path = \"{}\"\ncanary_worker_id = \"{}\"\nwindow_secs = {window_secs}\nabort_grace_secs = {abort_grace_secs}\n",
+                "schema_version = 1\ntarget_node_config = \"{}\"\nshared_approvals_path = \"{}\"\ncanary_worker_id = \"{}\"\ngateway_approvals_refresh_secs = 1\nwindow_secs = {window_secs}\nabort_grace_secs = {abort_grace_secs}\ncommit_grace_secs = {commit_grace_secs}\n",
                 target_config.display(),
                 approvals.display(),
                 REPLACEMENT.worker_id,
@@ -281,6 +345,7 @@ impl Rig {
             approvals,
             original_approvals,
             worker_binary,
+            old_port,
         }
     }
 
@@ -292,7 +357,7 @@ impl Rig {
         self.runtime_directory().join("rollout-state.json")
     }
 
-    fn spawn_supervisor(&self, extra_args: &[&str]) -> Child {
+    fn spawn_supervisor(&self, extra_args: &[&str]) -> ProcessGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"));
         command
             .arg("--config")
@@ -305,16 +370,17 @@ impl Rig {
             .arg("8589934592")
             .env("TOKEN_OLD", "secret-old")
             .env("TOKEN_NEW", "secret-new")
+            .env("ROLLOUT_RIG_GATEWAY_ADMIN_KEY", GATEWAY_ADMIN_KEY)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for arg in extra_args {
             command.arg(arg);
         }
-        command.spawn().expect("spawn supervisor")
+        ProcessGuard::spawn(&mut command).expect("spawn supervisor")
     }
 
-    fn spawn_supervisor_captured(&self, extra_args: &[&str]) -> Child {
+    fn spawn_supervisor_captured(&self, extra_args: &[&str]) -> ProcessGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"));
         command
             .arg("--config")
@@ -333,7 +399,71 @@ impl Rig {
         for arg in extra_args {
             command.arg(arg);
         }
-        command.spawn().expect("spawn supervisor")
+        ProcessGuard::spawn(&mut command).expect("spawn supervisor")
+    }
+}
+
+/// A fake gateway admin endpoint plus the plan section that points the
+/// rollout at it.
+struct FakeGateway {
+    _child: ProcessGuard,
+    status: PathBuf,
+}
+
+impl FakeGateway {
+    fn start(rig: &Rig, timeout_secs: u64) -> Self {
+        let port = free_port();
+        let script = rig.root.join("fake-gateway.py");
+        std::fs::write(&script, FAKE_GATEWAY_SCRIPT).unwrap();
+        make_executable(&script);
+        let status = rig.root.join("gateway-status.json");
+        let gateway = Self {
+            _child: ProcessGuard::spawn(
+                Command::new(&script)
+                    .arg(&status)
+                    .arg(GATEWAY_ADMIN_KEY)
+                    .arg(port.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap(),
+            status,
+        };
+        gateway.report(&rig.original_approvals, 1);
+        let mut plan = read_file(&rig.plan);
+        // With acknowledgement the timers are no longer needed.
+        plan = plan
+            .lines()
+            .filter(|line| {
+                !line.starts_with("window_secs") && !line.starts_with("commit_grace_secs")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        plan.push_str(&format!(
+            "\n[gateway_ack]\nadmin_urls = [\"http://127.0.0.1:{port}\"]\nadmin_key_env = \"ROLLOUT_RIG_GATEWAY_ADMIN_KEY\"\ntimeout_secs = {timeout_secs}\n"
+        ));
+        std::fs::write(&rig.plan, plan).unwrap();
+        gateway
+    }
+
+    /// Reports the approvals of `view` adopted, with the chat pool routing
+    /// to `eligible`.
+    fn report(&self, view: &str, eligible: u64) {
+        let status = izwi_serving_protocol::GatewayApprovalsStatus {
+            file_digest: None,
+            adoptions: 1,
+            approvals: entries(view),
+            pools: vec![izwi_serving_protocol::GatewayPoolStatus {
+                task: TaskKind::Chat,
+                public_model: ModelAlias::new("chat-model").unwrap(),
+                deployment_id: DeploymentId::new("chat-prod").unwrap(),
+                eligible_generation: Some(ModelGeneration::new(eligible).unwrap()),
+                generations: vec![ModelGeneration::new(eligible).unwrap()],
+            }],
+        };
+        let temporary = self.status.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&status).unwrap()).unwrap();
+        std::fs::rename(&temporary, &self.status).unwrap();
     }
 }
 
@@ -388,11 +518,6 @@ fn read_file(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn terminate(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 #[test]
 fn canary_readiness_failure_aborts_and_restores_approvals() {
     let rig = Rig::build(2, 1);
@@ -429,12 +554,13 @@ fn canary_readiness_failure_aborts_and_restores_approvals() {
         supervisor.try_wait().unwrap().is_none(),
         "the supervisor keeps supervising the old generation after the abort"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
 fn promote_path_commits_and_drains_the_old_generation() {
-    let rig = Rig::build(2, 1);
+    let commit_grace = Duration::from_secs(3);
+    let rig = Rig::build_with_commit_grace(2, 1, commit_grace.as_secs());
     let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
 
     // Window view: both generations approved, and the persisted state
@@ -447,18 +573,24 @@ fn promote_path_commits_and_drains_the_old_generation() {
     });
     assert!(window_open, "the window view must approve both generations");
 
-    // Commit view: only the successor generation remains, with the state
-    // recording the commit and the replacement worker record.
-    let committed = wait_until(Duration::from_secs(60), || {
+    // Commit view: only the successor generation remains.
+    let commit_view = wait_until(Duration::from_secs(60), || {
         let approvals = read_file(&rig.approvals);
-        let state = read_file(&rig.state_file());
         approvals.contains("chat-prod|2")
             && !approvals.contains("chat-prod|1")
             && approvals.contains("asr-prod|4")
-            && state.contains("committed")
-            && state.contains("worker-new")
     });
-    assert!(committed, "the commit view must replace the old generation");
+    assert!(
+        commit_view,
+        "the commit view must replace the old generation"
+    );
+    let commit_view_seen = Instant::now();
+    // The gateways keep routing to the old generation until their next
+    // approvals refresh, so it must keep serving through the commit grace.
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation must not drain the moment the commit view lands"
+    );
 
     // The old generation drained only after it stopped serving; its fake
     // writes the exit marker when stdin (the ownership pipe) closes.
@@ -466,8 +598,20 @@ fn promote_path_commits_and_drains_the_old_generation() {
         rig.root.join("worker-old.exited").exists()
     });
     assert!(old_exited, "the old worker must drain to exit");
+    assert!(
+        commit_view_seen.elapsed() >= commit_grace / 2,
+        "the old generation drained {:?} after the commit view was seen, inside the {commit_grace:?} grace",
+        commit_view_seen.elapsed()
+    );
 
-    terminate(&mut supervisor);
+    // The state records the commit and the replacement worker record.
+    let committed = wait_until(Duration::from_secs(30), || {
+        let state = read_file(&rig.state_file());
+        state.contains("committed") && state.contains("worker-new")
+    });
+    assert!(committed, "the rollout state must record the commit");
+
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -507,20 +651,221 @@ fn replacement_exit_during_window_aborts_and_restores() {
         supervisor.try_wait().unwrap().is_none(),
         "the supervisor keeps supervising the old generation after the abort"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
+}
+
+/// The approvals as a sorted list of entries, ignoring order and comments.
+fn entries(text: &str) -> Vec<String> {
+    let mut entries: Vec<String> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn serving(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+/// With gateway_ack the rollout commits only once the gateway reports the
+/// window view adopted and cut over, and drains the old generation only
+/// once it reports the commit view adopted, however long that takes.
+#[test]
+fn commit_waits_for_the_gateways_to_acknowledge_each_view() {
+    let rig = Rig::build(2, 1);
+    let gateway = FakeGateway::start(&rig, 60);
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must be written");
+    let window = read_file(&rig.approvals);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        read_file(&rig.approvals).contains("chat-prod|1"),
+        "no commit view before the gateway acknowledges the window"
+    );
+
+    gateway.report(&window, 2);
+    let commit_view = wait_until(Duration::from_secs(30), || {
+        !read_file(&rig.approvals).contains("chat-prod|1")
+    });
+    assert!(commit_view, "the acknowledged window must commit");
+    let commit = read_file(&rig.approvals);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation must not drain before the gateway acknowledges the commit view"
+    );
+
+    gateway.report(&commit, 2);
+    let drained = wait_until(Duration::from_secs(30), || {
+        rig.root.join("worker-old.exited").exists()
+            && read_file(&rig.state_file()).contains("committed")
+    });
+    assert!(
+        drained,
+        "the acknowledged commit view must drain the old generation"
+    );
+    let _ = supervisor.kill();
+}
+
+/// A gateway that never acknowledges the window view aborts the rollout.
+#[test]
+fn an_unacknowledged_window_aborts_the_rollout() {
+    let rig = Rig::build(2, 1);
+    let _gateway = FakeGateway::start(&rig, 2);
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must be written");
+    let aborted = wait_until(Duration::from_secs(30), || {
+        !rig.state_file().exists() && read_file(&rig.approvals) == rig.original_approvals
+    });
+    assert!(
+        aborted,
+        "an unacknowledged window must abort and restore the view"
+    );
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation never stopped serving"
+    );
+    let _ = supervisor.kill();
+}
+
+#[test]
+fn a_node_without_room_for_both_generations_recreates() {
+    let rig = Rig::build_recreate();
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let committed = wait_until(Duration::from_secs(60), || {
+        read_file(&rig.state_file()).contains("committed")
+    });
+    let state = read_file(&rig.state_file());
+    assert!(committed, "the recreate rollout must commit: {state}");
+    assert!(state.contains("\"recreate\""), "{state}");
+    assert!(
+        rig.root.join("worker-old.exited").exists(),
+        "the old generation drains before the replacement takes its bind"
+    );
+    let approvals = read_file(&rig.approvals);
+    assert!(approvals.contains("worker-new|chat|chat-model|chat-prod|2"));
+    assert!(!approvals.contains("chat-prod|1"), "{approvals}");
+    assert!(approvals.contains("asr-prod|4"), "{approvals}");
+    assert!(
+        serving(rig.old_port),
+        "the replacement serves on the shared bind"
+    );
+    let _ = supervisor.kill();
+}
+
+#[test]
+fn a_failed_recreate_rolls_back_to_the_old_generation() {
+    let rig = Rig::build_recreate();
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(rig.root.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest[REPLACEMENT.worker_id]["serve"] = serde_json::json!(false);
+    std::fs::write(
+        rig.root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let script = FAKE_WORKER_SCRIPT.replace(
+        "{manifest}",
+        &rig.root.join("manifest.json").display().to_string(),
+    );
+    std::fs::write(&rig.worker_binary, script).unwrap();
+    make_executable(&rig.worker_binary);
+
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let drained = wait_until(Duration::from_secs(30), || {
+        rig.root.join("worker-old.exited").exists()
+    });
+    assert!(drained, "the recreate drains the old generation first");
+    let rolled_back = wait_until(Duration::from_secs(60), || {
+        !rig.state_file().exists()
+            && entries(&read_file(&rig.approvals)) == entries(&rig.original_approvals)
+            && serving(rig.old_port)
+    });
+    assert!(
+        rolled_back,
+        "a replacement that never gets ready restores the approvals and relaunches the old generation: {}",
+        read_file(&rig.approvals)
+    );
+    assert!(
+        supervisor.try_wait().unwrap().is_none(),
+        "the supervisor keeps supervising the old generation"
+    );
+    let _ = supervisor.kill();
+}
+
+#[test]
+fn abort_keeps_a_peer_edit_made_during_the_window() {
+    let rig = Rig::build(8, 1);
+    // The replacement serves readiness, then dies inside the window.
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(rig.root.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest[REPLACEMENT.worker_id]["die_after_secs"] = serde_json::json!(4);
+    std::fs::write(
+        rig.root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let script = FAKE_WORKER_SCRIPT.replace(
+        "{manifest}",
+        &rig.root.join("manifest.json").display().to_string(),
+    );
+    std::fs::write(&rig.worker_binary, script).unwrap();
+    make_executable(&rig.worker_binary);
+
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must land first");
+
+    // Another writer (an operator, or a second supervisor's autoscaler)
+    // approves its own worker while the window is open.
+    let peer = "v1|http://127.0.0.1:9700|node-b|worker-p|chat|chat-model|chat-prod|1\n";
+    let window = read_file(&rig.approvals);
+    std::fs::write(&rig.approvals, format!("{window}{peer}")).unwrap();
+
+    let expected = format!("{}{peer}", rig.original_approvals);
+    let restored = wait_until(Duration::from_secs(60), || {
+        !rig.state_file().exists() && read_file(&rig.approvals) == expected
+    });
+    assert!(
+        restored,
+        "the abort removes only the rollout's lines and keeps the peer's: {}",
+        read_file(&rig.approvals)
+    );
+    let _ = supervisor.kill();
 }
 
 #[test]
 fn resume_after_crash_commits_and_fresh_start_fails_closed() {
     let rig = Rig::build(4, 1);
     let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    // The coordinator writes the window view first and persists
+    // `window_open` after it; a crash between the two resumes from
+    // `launching_replacement`. Crash only once both have landed, so the test
+    // exercises the window-open resume it names.
     let window_open = wait_until(Duration::from_secs(30), || {
         read_file(&rig.approvals).contains("chat-prod|2")
+            && read_file(&rig.state_file()).contains("window_open")
     });
     assert!(window_open, "the window must open before the crash");
 
-    // Crash the supervisor mid-window: state stays, workers self-drain.
-    let _ = supervisor.kill();
+    // Crash the supervisor mid-window: state stays, workers self-drain. Kill
+    // the supervisor alone, not its process group, so the workers outlive it.
+    let _ = Child::kill(&mut supervisor);
     let _ = supervisor.wait();
     let state = read_file(&rig.state_file());
     assert!(
@@ -556,37 +901,28 @@ fn resume_after_crash_commits_and_fresh_start_fails_closed() {
             && !read_file(&rig.approvals).contains("chat-prod|1")
     });
     assert!(committed, "the resumed rollout must commit");
-    terminate(&mut resumed);
+    let _ = resumed.kill();
 }
 
 #[test]
 fn rollout_status_and_abort_commands_manage_persisted_state() {
     let rig = Rig::build(2, 1);
-    // Stage a hand-written non-terminal state with a matching approvals
-    // backup, exactly as the coordinator would.
-    let backup = rig.original_approvals.clone();
-    std::fs::write(
-        rig.runtime_directory().join("rollout-approvals-backup"),
-        &backup,
-    )
-    .unwrap();
-    let digest = {
-        use sha2::{Digest, Sha256};
-        format!("sha256:{:x}", Sha256::digest(backup.as_bytes()))
-    };
+    // Stage a hand-written non-terminal state, exactly as the coordinator
+    // would after writing its window view.
+    let added = "v1|http://127.0.0.1:9999|node-a|worker-x|chat|chat-model|chat-prod|2";
     std::fs::write(
         rig.state_file(),
         format!(
-            r#"{{"schema_version":1,"plan_digest":"sha256:placeholder","phase":"window_open","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approvals_backup_digest":"{digest}"}}"#,
+            r#"{{"schema_version":2,"plan_digest":"sha256:placeholder","phase":"window_open","strategy":"blue_green","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approval_lines":["{added}"]}}"#,
             rig.approvals.display(),
             rig.target_config.display(),
         ),
     )
     .unwrap();
-    // The rollout rewrote the approvals; abort must restore them.
+    // The rollout appended its line; abort must remove it.
     std::fs::write(
         &rig.approvals,
-        "v1|http://127.0.0.1:9999|node-a|worker-x|chat|chat-model|chat-prod|2\n",
+        format!("{}{added}\n", rig.original_approvals),
     )
     .unwrap();
 
@@ -605,12 +941,6 @@ fn rollout_status_and_abort_commands_manage_persisted_state() {
         "abort restores the pre-rollout approvals byte-identically"
     );
     assert!(!rig.state_file().exists(), "abort clears the state");
-    assert!(
-        !rig.runtime_directory()
-            .join("rollout-approvals-backup")
-            .exists(),
-        "abort clears the backup"
-    );
 
     let repeat = rig.spawn_supervisor_captured(&["--rollout-abort"]);
     let output = repeat.wait_with_output().unwrap();

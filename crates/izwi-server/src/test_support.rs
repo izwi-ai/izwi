@@ -7,3 +7,4 @@ pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         .lock()
         .expect("environment lock poisoned")
 }
+

@@ -19,8 +19,42 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 use crate::identity::{DeploymentId, ModelAlias, ModelGeneration, NodeId, WorkerId};
 use crate::types::TaskKind;
+
+/// The gateway's admin route reporting the approvals view it adopted.
+pub const GATEWAY_APPROVALS_STATUS_PATH: &str = "/internal/admin/approvals";
+
+/// What a gateway reports about the approvals view it has adopted. A
+/// rollout coordinator writes a view to the shared file and waits until
+/// every gateway reports it adopted before it moves on, instead of guessing
+/// from the refresh interval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayApprovalsStatus {
+    /// SHA-256 (`sha256:<hex>`) of the shared approvals file text the
+    /// gateway last adopted; `None` without a shared file.
+    pub file_digest: Option<String>,
+    /// Shared-file views adopted since the gateway started.
+    pub adoptions: u64,
+    /// The effective approvals (command-line plus file), canonical lines.
+    pub approvals: Vec<String>,
+    /// Each deployment pool and the generation it routes new work to.
+    pub pools: Vec<GatewayPoolStatus>,
+}
+
+/// One deployment pool in a [`GatewayApprovalsStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayPoolStatus {
+    pub task: TaskKind,
+    pub public_model: ModelAlias,
+    pub deployment_id: DeploymentId,
+    /// The generation new admissions go to; `None` while none is eligible.
+    pub eligible_generation: Option<ModelGeneration>,
+    /// Every approved generation, ascending: two during a rollout window.
+    pub generations: Vec<ModelGeneration>,
+}
 
 /// Hard ceiling on one rendered approval line.
 pub const MAX_APPROVAL_LINE_BYTES: usize = 4 * 1024;
@@ -68,6 +102,8 @@ impl GatewayWorkerApproval {
             TaskKind::Chat => "chat",
             TaskKind::TextToSpeech => "text_to_speech",
             TaskKind::SpeechToText => "speech_to_text",
+            // Parsing never yields an unknown task.
+            TaskKind::Unknown => "unknown",
         };
         let tail = format!(
             "{}|{}|{}|{}",

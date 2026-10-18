@@ -8,7 +8,7 @@ use candle_core::{
 };
 use rayon::prelude::*;
 
-use crate::backends::BackendKind;
+use crate::backends::{probe_device_op, BackendKind};
 use crate::error::Error;
 use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
 use crate::Result;
@@ -209,6 +209,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn lower_slots(&self, slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>> {
+        probe_device_op("kv.lower_slots");
         let mut flat_slots = Vec::with_capacity(slots.len());
         let mut unique = HashSet::with_capacity(slots.len());
         for slot in slots {
@@ -243,6 +244,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence> {
+        probe_device_op("kv.zero_pages");
         if pages.is_empty() {
             return Ok(ready_fence());
         }
@@ -270,6 +272,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence> {
+        probe_device_op("kv.copy_pages");
         if copies.is_empty() {
             return Ok(ready_fence());
         }
@@ -305,6 +308,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn capture_page(&self, page: CacheBlockRef, destination: &mut [u8]) -> Result<()> {
+        probe_device_op("kv.capture_page");
         let page = self.validate_block(page)?;
         let expected = arena_page_bytes(&self.config) as usize;
         if destination.len() != expected {
@@ -332,6 +336,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn restore_page(&self, page: CacheBlockRef, source: &[u8]) -> Result<()> {
+        probe_device_op("kv.restore_page");
         let page = self.validate_block(page)?;
         let expected = arena_page_bytes(&self.config) as usize;
         if source.len() != expected {
@@ -359,6 +364,7 @@ impl KvArena for CpuKvArena {
         binding: KvLayerBinding,
         args: KvWriteArgs<'_>,
     ) -> Result<KvWriteCompletion> {
+        probe_device_op("kv.write_slots");
         let slots = self.cpu_slots(args.slots)?;
         let layer = self.layer(binding)?;
         validate_write_tensor(
@@ -398,6 +404,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
+        probe_device_op("kv.paged_decode");
         let layer = self.layer(binding)?;
         let query_dims = args.queries.dims();
         if query_dims.len() != 3 {
@@ -516,6 +523,7 @@ impl KvArena for CpuKvArena {
         binding: KvLayerBinding,
         args: PagedKvPrefillArgs<'_>,
     ) -> Result<Tensor> {
+        probe_device_op("kv.paged_prefill");
         let layer = self.layer(binding)?;
         let query_dims = args.queries.dims();
         if query_dims.len() != 3 || query_dims[2] != layer.key_head_dim {
@@ -719,6 +727,7 @@ impl KvArena for CpuKvArena {
     }
 
     fn drain(&self) -> Result<()> {
+        probe_device_op("kv.drain");
         Ok(())
     }
 }
@@ -1011,6 +1020,7 @@ impl KvBackendRuntime for CpuKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CpuKvArena::new(config)?))
     }
 }

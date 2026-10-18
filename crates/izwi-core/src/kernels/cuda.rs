@@ -44,10 +44,6 @@ pub fn fused_kernels_available() -> bool {
     cuda_kernels_compiled()
 }
 
-pub fn use_block_fusion() -> bool {
-    false
-}
-
 pub fn status() -> CudaKernelStatus {
     if !cuda_kernels_compiled() {
         return CudaKernelStatus {
@@ -4125,7 +4121,7 @@ pub(crate) fn cuda_test_device() -> Option<candle_core::Device> {
         crate::backends::BackendPreference::Cuda,
     )
     .expect("CUDA test backend detection");
-    if std::env::var("IZWI_REQUIRE_CUDA_TEST_DEVICE").as_deref() == Ok("1") {
+    if crate::env::flag_or("IZWI_REQUIRE_CUDA_TEST_DEVICE", false) {
         assert!(
             profile.device.is_cuda(),
             "hardware CI required a usable CUDA device"

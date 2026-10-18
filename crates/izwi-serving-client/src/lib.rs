@@ -5,20 +5,21 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+pub use izwi_serving_protocol::TraceContext;
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, AttemptQueryResponse, CancelAttemptRequest, CancelAttemptResponse,
-    InvocationEvent, InvocationEventKind, InvocationRejection, InvocationRequest,
-    NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials, WorkerDescriptor,
-    WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1, SERVICE_AUTHORIZATION_HEADER,
-    SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
+    InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind, InvocationRejection,
+    InvocationRequest, NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials,
+    WorkerDescriptor, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1,
+    PROTOCOL_VERSION_HEADER, SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME,
+    SERVICE_CREDENTIAL_ID_HEADER, TRACEPARENT_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
 use std::{collections::VecDeque, fmt, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
-#[cfg(any(test, feature = "mock-worker"))]
-pub mod mock;
+pub mod otlp;
 pub mod realtime;
 
 pub const DEFAULT_MAX_REQUEST_JSON_BYTES: usize = 1024 * 1024;
@@ -172,6 +173,55 @@ fn parse_pem_items(
         .map_err(|_| WorkerClientError::InvalidConfiguration(error))
 }
 
+/// The DER certificates of validated PEM material.
+fn pem_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, WorkerClientError> {
+    Ok(parse_pem_items(pem, "certificate PEM is invalid")?
+        .into_iter()
+        .filter_map(|item| match item {
+            rustls_pemfile::Item::X509Certificate(der) => Some(der),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The certificate chain and private key of a validated mTLS identity.
+fn pem_identity(
+    pem: &[u8],
+) -> Result<
+    (
+        Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    WorkerClientError,
+> {
+    use tokio_rustls::rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    };
+    let mut certificates = Vec::new();
+    let mut key = None;
+    for item in parse_pem_items(pem, "mTLS identity is not valid PEM")? {
+        match item {
+            rustls_pemfile::Item::X509Certificate(der) => {
+                certificates.push(CertificateDer::from(der));
+            }
+            rustls_pemfile::Item::PKCS8Key(der) => {
+                key = Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)));
+            }
+            rustls_pemfile::Item::RSAKey(der) => {
+                key = Some(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)));
+            }
+            rustls_pemfile::Item::ECKey(der) => {
+                key = Some(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)));
+            }
+            _ => {}
+        }
+    }
+    let key = key.ok_or(WorkerClientError::InvalidConfiguration(
+        "mTLS identity has no private key",
+    ))?;
+    Ok((certificates, key))
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerClientConfig {
     pub max_in_flight: usize,
@@ -180,8 +230,12 @@ pub struct WorkerClientConfig {
     /// first contract-valid admission event.
     pub request_timeout: Duration,
     /// Maximum wait from worker acceptance to the first non-empty model output
-    /// or a legitimate terminal event.
+    /// or a legitimate terminal event, for an empty prompt.
     pub first_output_timeout: Duration,
+    /// Extra first-output allowance per KiB of invocation JSON, so a long
+    /// prompt's prefill (minutes on CPU) is not cancelled by a deadline sized
+    /// for short ones. The total invocation deadline still bounds it.
+    pub first_output_timeout_per_kib: Duration,
     /// Maximum idle time between non-empty model output events. Raw HTTP
     /// chunks, empty deltas, and usage-only events do not reset it.
     pub progress_timeout: Duration,
@@ -199,6 +253,7 @@ impl Default for WorkerClientConfig {
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(10),
             first_output_timeout: Duration::from_secs(60),
+            first_output_timeout_per_kib: Duration::ZERO,
             progress_timeout: Duration::from_secs(30),
             max_request_json_bytes: DEFAULT_MAX_REQUEST_JSON_BYTES,
             max_control_body_bytes: DEFAULT_MAX_CONTROL_BODY_BYTES,
@@ -256,6 +311,11 @@ pub enum WorkerClientError {
     HttpStatus { status: StatusCode, body: String },
     #[error("worker rejected invocation with {rejection:?}")]
     Rejected { rejection: InvocationRejection },
+    /// The worker answered but could not finish admission within the queue
+    /// budget. The attempt may still be admitted, so it is never retried
+    /// elsewhere; the worker is busy, not failing.
+    #[error("worker admission outcome is unknown: {message}")]
+    AdmissionUnknown { message: String },
     #[error("worker response body exceeded {limit} bytes")]
     ResponseTooLarge { limit: usize },
     #[error("invalid worker JSON response: {0}")]
@@ -294,9 +354,17 @@ struct WorkerClientInner {
     http: reqwest::Client,
     endpoint: reqwest::Url,
     credentials: ServiceCredentials,
-    permits: Arc<tokio::sync::Semaphore>,
+    /// Invocations, each holding its permit for the stream's lifetime.
+    invocation_permits: Arc<tokio::sync::Semaphore>,
+    /// Status, descriptor, attempt query, and cancel requests. Kept apart so
+    /// long-running streams can never starve health polls or cancellation.
+    control_permits: Arc<tokio::sync::Semaphore>,
     config: WorkerClientConfig,
 }
+
+/// Concurrent control requests per worker client. Control requests are short
+/// and bounded by `request_timeout`, so a few slots suffice.
+const MAX_CONTROL_IN_FLIGHT: usize = 4;
 
 impl std::fmt::Debug for WorkerClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -360,7 +428,8 @@ impl WorkerClient {
                 http,
                 endpoint,
                 credentials,
-                permits: Arc::new(tokio::sync::Semaphore::new(config.max_in_flight)),
+                invocation_permits: Arc::new(tokio::sync::Semaphore::new(config.max_in_flight)),
+                control_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_IN_FLIGHT)),
                 config,
             }),
         })
@@ -435,7 +504,7 @@ impl WorkerClient {
                 limit: self.inner.config.max_request_json_bytes,
             });
         }
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_control_permit().await?;
         let response = tokio::time::timeout(
             self.inner.config.request_timeout,
             self.authorized(self.inner.http.post(self.url(&format!(
@@ -459,7 +528,17 @@ impl WorkerClient {
     /// Starts exactly one invocation POST. This method never retries.
     pub async fn invoke(
         &self,
+        request: InvocationRequest,
+    ) -> Result<InvocationStream, WorkerClientError> {
+        self.invoke_traced(request, None).await
+    }
+
+    /// Like [`Self::invoke`], naming `trace` as the worker span's parent in a
+    /// W3C `traceparent` header.
+    pub async fn invoke_traced(
+        &self,
         mut request: InvocationRequest,
+        trace: Option<&TraceContext>,
     ) -> Result<InvocationStream, WorkerClientError> {
         request.validate()?;
         let total_deadline = Instant::now()
@@ -497,6 +576,13 @@ impl WorkerClient {
                 limit: self.inner.config.max_request_json_bytes,
             });
         }
+        let prompt_kib = u32::try_from(encoded.len() / 1024).unwrap_or(u32::MAX);
+        let first_output_timeout = self.inner.config.first_output_timeout.saturating_add(
+            self.inner
+                .config
+                .first_output_timeout_per_kib
+                .saturating_mul(prompt_kib),
+        );
         // From this point until an explicit rejection or a live response stream, dropping this
         // future leaves admission uncertain. A tombstoned cancel also closes the race where the
         // cancellation reaches the worker just before the invocation POST.
@@ -507,15 +593,15 @@ impl WorkerClient {
             .config
             .request_timeout
             .min(total_deadline.saturating_duration_since(Instant::now()));
-        let response = tokio::time::timeout(
-            header_budget,
-            self.authorized(self.inner.http.post(self.url(INVOCATIONS_PATH)))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(encoded)
-                .send(),
-        )
-        .await
-        .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?;
+        let mut post = self
+            .authorized(self.inner.http.post(self.url(INVOCATIONS_PATH)))
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(trace) = trace {
+            post = post.header(TRACEPARENT_HEADER, trace.header_value());
+        }
+        let response = tokio::time::timeout(header_budget, post.body(encoded).send())
+            .await
+            .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?;
         let response = match response {
             Ok(response) => response,
             Err(error) if error.is_connect() => {
@@ -568,6 +654,7 @@ impl WorkerClient {
             total_deadline,
             phase_deadline,
             deadline_phase: DeadlinePhase::InvocationAdmission,
+            first_output_timeout,
         };
         // The live stream now owns best-effort cancellation for every exit path.
         admission_guard.disarm();
@@ -593,7 +680,7 @@ impl WorkerClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, WorkerClientError> {
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_control_permit().await?;
         let response = tokio::time::timeout(
             self.inner.config.request_timeout,
             self.authorized(self.inner.http.get(self.url(path))).send(),
@@ -608,10 +695,10 @@ impl WorkerClient {
         result
     }
 
-    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, WorkerClientError> {
+    async fn acquire_control_permit(&self) -> Result<OwnedSemaphorePermit, WorkerClientError> {
         tokio::time::timeout(
             self.inner.config.request_timeout,
-            Arc::clone(&self.inner.permits).acquire_owned(),
+            Arc::clone(&self.inner.control_permits).acquire_owned(),
         )
         .await
         .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::InFlightPermit))?
@@ -628,7 +715,7 @@ impl WorkerClient {
         }
         tokio::time::timeout(
             self.inner.config.request_timeout.min(remaining),
-            Arc::clone(&self.inner.permits).acquire_owned(),
+            Arc::clone(&self.inner.invocation_permits).acquire_owned(),
         )
         .await
         .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::InFlightPermit))?
@@ -648,6 +735,9 @@ impl WorkerClient {
                 SERVICE_CREDENTIAL_ID_HEADER,
                 self.inner.credentials.credential_id.as_str(),
             )
+            // A worker leaves out of its answers what this version cannot
+            // decode.
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_V1.to_string())
     }
 
     fn url(&self, path: &str) -> reqwest::Url {
@@ -692,20 +782,36 @@ impl WorkerClient {
         )
         .await
         {
-            Ok(bytes) => match serde_json::from_slice::<InvocationRejection>(&bytes) {
-                Ok(rejection)
-                    if rejection.is_valid()
-                        && rejection.schema_version.major == PROTOCOL_V1.major
-                        && rejection.request_id == request.request_id
-                        && rejection.attempt_id == request.attempt_id =>
-                {
-                    WorkerClientError::Rejected { rejection }
+            Ok(bytes) => {
+                if status == StatusCode::GATEWAY_TIMEOUT {
+                    if let Ok(unknown) =
+                        serde_json::from_slice::<InvocationAdmissionUnknown>(&bytes)
+                    {
+                        if unknown.schema_version.major == PROTOCOL_V1.major
+                            && unknown.request_id == request.request_id
+                            && unknown.attempt_id == request.attempt_id
+                        {
+                            return WorkerClientError::AdmissionUnknown {
+                                message: unknown.message,
+                            };
+                        }
+                    }
                 }
-                _ => WorkerClientError::HttpStatus {
-                    status,
-                    body: lossy_bounded(&bytes),
-                },
-            },
+                match serde_json::from_slice::<InvocationRejection>(&bytes) {
+                    Ok(rejection)
+                        if rejection.is_valid()
+                            && rejection.schema_version.major == PROTOCOL_V1.major
+                            && rejection.request_id == request.request_id
+                            && rejection.attempt_id == request.attempt_id =>
+                    {
+                        WorkerClientError::Rejected { rejection }
+                    }
+                    _ => WorkerClientError::HttpStatus {
+                        status,
+                        body: lossy_bounded(&bytes),
+                    },
+                }
+            }
             Err(error) => error,
         }
     }
@@ -879,6 +985,8 @@ pub struct InvocationStream {
     total_deadline: Instant,
     phase_deadline: Instant,
     deadline_phase: DeadlinePhase,
+    /// This invocation's first-output deadline, scaled by its prompt size.
+    first_output_timeout: Duration,
 }
 
 impl std::fmt::Debug for InvocationStream {
@@ -1054,10 +1162,7 @@ impl InvocationStream {
         self.last_sequence = Some(event.sequence);
         match &event.event {
             InvocationEventKind::Accepted { .. } => {
-                self.reset_phase_deadline(
-                    DeadlinePhase::FirstOutput,
-                    self.client.inner.config.first_output_timeout,
-                );
+                self.reset_phase_deadline(DeadlinePhase::FirstOutput, self.first_output_timeout);
             }
             InvocationEventKind::TextDelta { text, .. } if !text.is_empty() => {
                 self.reset_phase_deadline(
@@ -1075,7 +1180,9 @@ impl InvocationStream {
                     self.client.inner.config.progress_timeout,
                 );
             }
-            InvocationEventKind::TextDelta { .. } | InvocationEventKind::Usage { .. } => {}
+            InvocationEventKind::TextDelta { .. }
+            | InvocationEventKind::Usage { .. }
+            | InvocationEventKind::Unknown => {}
         }
         if event.is_terminal() {
             self.terminal_seen = true;
@@ -1163,6 +1270,10 @@ MAECAQ==
         assert!(
             WorkerClientError::Deadline(DeadlinePhase::InFlightPermit).proves_attempt_unaccepted()
         );
+        assert!(!WorkerClientError::AdmissionUnknown {
+            message: "busy".into()
+        }
+        .proves_attempt_unaccepted());
 
         let mut accepted_rejection = InvocationRejection::new(
             RequestId::new("request-2").expect("static request ID"),

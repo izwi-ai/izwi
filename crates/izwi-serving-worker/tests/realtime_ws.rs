@@ -11,8 +11,9 @@ use izwi_core::{AudioChunk, RuntimeAsrRealtimeEvent};
 use izwi_serving_protocol::*;
 use izwi_serving_worker::{AdmissionFailure, AdmittedInvocation, WorkerConfigError};
 use izwi_serving_worker::{
-    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsStageStream,
-    RuntimeRealtimeSessionLimits, WorkerConfig, WorkerService, REALTIME_SESSION_DEFAULT_LIMITS,
+    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsOptions,
+    RealtimeTtsStageStream, RuntimeRealtimeSessionLimits, WorkerConfig, WorkerService,
+    REALTIME_SESSION_DEFAULT_LIMITS,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
@@ -222,6 +223,7 @@ fn realtime_config(limits: RuntimeRealtimeSessionLimits) -> WorkerConfig {
         max_retained_attempts: 4,
         attempt_retention: Duration::from_secs(300),
         event_channel_capacity: 4,
+        slow_consumer_timeout: izwi_serving_worker::DEFAULT_SLOW_CONSUMER_TIMEOUT,
         max_event_bytes: 4096,
         realtime_session_limits: limits,
     }
@@ -357,7 +359,9 @@ async fn next_frame(ws: &mut WsStream) -> NextFrame {
             Message::Text(text) => match serde_json::from_str::<RealtimeServerFrame>(&text) {
                 Ok(RealtimeServerFrame::Admitted { .. }) => return NextFrame::Admitted,
                 Ok(RealtimeServerFrame::Event { event }) => return NextFrame::Event(event),
-                Ok(RealtimeServerFrame::Pong) => return NextFrame::Other,
+                Ok(RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown) => {
+                    return NextFrame::Other
+                }
                 Err(_) => return NextFrame::Other,
             },
             Message::Binary(bytes) => match decode_realtime_audio_frame(&bytes) {
@@ -550,7 +554,7 @@ async fn realtime_fencing_rejects_stale_admission_identity() {
         (
             Box::new(|admit: &mut RealtimeSessionAdmit| {
                 admit.task = TaskKind::TextToSpeech;
-                admit.input = RealtimeStageInput::TextStream;
+                admit.input = RealtimeStageInput::text_stream();
             }),
             RealtimeSessionCloseCode::IncompatibleTask.code(),
         ),
@@ -918,6 +922,8 @@ struct FakeTtsRunner {
     fail_start: Arc<AsyncMutex<bool>>,
     error_after_chunks: Arc<AtomicUsize>,
     chunk_delay: Arc<AsyncMutex<Duration>>,
+    /// The text and voice of every synthesis started, in order.
+    started: Arc<Mutex<Vec<(String, RealtimeTtsOptions)>>>,
 }
 
 impl FakeTtsRunner {
@@ -934,6 +940,7 @@ impl FakeTtsRunner {
             fail_start: Arc::new(AsyncMutex::new(false)),
             error_after_chunks: Arc::new(AtomicUsize::new(usize::MAX)),
             chunk_delay: Arc::new(AsyncMutex::new(Duration::ZERO)),
+            started: Arc::default(),
         }
     }
 
@@ -1026,9 +1033,11 @@ impl RealtimeStageRunner for FakeTtsRunner {
 
     async fn start_tts_stream(
         &self,
-        _text: String,
+        text: String,
+        options: &RealtimeTtsOptions,
         _deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, izwi_core::Error> {
+        self.started.lock().unwrap().push((text, options.clone()));
         self.counters.start_calls.fetch_add(1, Ordering::AcqRel);
         if *self.fail_start.lock().await {
             return Err(izwi_core::Error::InferenceError(
@@ -1094,7 +1103,7 @@ fn tts_admit_frame(
     admit_frame(attempt, |admit| {
         admit.deployment_id = id("asr-cpu-v1");
         admit.task = TaskKind::TextToSpeech;
-        admit.input = RealtimeStageInput::TextStream;
+        admit.input = RealtimeStageInput::text_stream();
         mutate(admit);
     })
 }
@@ -1163,6 +1172,85 @@ async fn drive_tts_session_to_completion(
         }
     }
     panic!("session never reached a terminal outcome");
+}
+
+/// SPK-F10: an incremental text stream synthesizes each complete sentence
+/// as its input arrives, before `Finish`, with the admission's voice and
+/// language; the session still ends with exactly one final frame.
+#[tokio::test]
+async fn incremental_tts_session_speaks_each_sentence_with_its_voice() {
+    let runner = FakeTtsRunner::new();
+    let service = WorkerService::new(
+        tts_config(REALTIME_SESSION_DEFAULT_LIMITS),
+        FakeTtsRealtimeExecutor {
+            runner: runner.clone(),
+        },
+    )
+    .unwrap();
+    let addr = spawn_worker(&service).await;
+    let (mut ws, _) = connect(addr, true, true).await.unwrap();
+
+    send_text(
+        &mut ws,
+        tts_admit_frame("attempt-incremental", |admit| {
+            admit.input = RealtimeStageInput::TextStream {
+                speaker: Some("af_heart".into()),
+                language: Some("en".into()),
+                incremental: true,
+            };
+        }),
+    )
+    .await;
+    assert!(matches!(next_frame(&mut ws).await, NextFrame::Admitted));
+    assert!(matches!(next_frame(&mut ws).await, NextFrame::Event(_)));
+
+    send_json(
+        &mut ws,
+        &RealtimeClientFrame::Input {
+            text: "Hello there. How ".into(),
+        },
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while runner.counters.start_calls.load(Ordering::Acquire) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first sentence is synthesized before finish"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    send_json(
+        &mut ws,
+        &RealtimeClientFrame::Input {
+            text: "are you? Fine".into(),
+        },
+    )
+    .await;
+    send_json(&mut ws, &RealtimeClientFrame::Finish).await;
+
+    let mut finals = Vec::new();
+    loop {
+        match next_frame(&mut ws).await {
+            NextFrame::Binary { is_final, .. } => finals.push(is_final),
+            NextFrame::Event(_) => {}
+            NextFrame::Close(code) => {
+                assert_eq!(code, 1000, "orderly session close");
+                break;
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(finals.iter().filter(|is_final| **is_final).count(), 1);
+    assert_eq!(finals.last(), Some(&true), "the final frame comes last");
+
+    let started = runner.started.lock().unwrap().clone();
+    let texts: Vec<&str> = started.iter().map(|(text, _)| text.as_str()).collect();
+    assert_eq!(texts, ["Hello there.", "How are you?", "Fine"]);
+    let voice = RealtimeTtsOptions {
+        speaker: Some("af_heart".into()),
+        language: Some("en".into()),
+    };
+    assert!(started.iter().all(|(_, options)| *options == voice));
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ use crate::api::audio_payload::{
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::{AlignmentSource, WindowedAlignment, WorkloadClass};
 
@@ -128,7 +128,8 @@ pub async fn align(
             req.language.as_deref(),
             req.model.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     let AlignmentOutcome {
         alignments,
@@ -136,7 +137,7 @@ pub async fn align(
         alignment_source,
         warnings,
         windows,
-    } = alignment_outcome(alignment)?;
+    } = alignment_outcome(alignment).map_err(core_api_error)?;
 
     match response_format.as_str() {
         "json" => json_response(&AlignmentResponse {
@@ -270,6 +271,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 

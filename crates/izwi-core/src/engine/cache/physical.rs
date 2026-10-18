@@ -151,6 +151,7 @@ impl RetainedTensorStateRuntimeV2 {
         Ok(transaction)
     }
 
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         sequence: PhysicalStateSequenceId,
@@ -446,6 +447,7 @@ impl PhysicalStateManager {
         Ok(runtime)
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_retained_static_attention(
         &mut self,
         model_instance: ModelInstanceId,

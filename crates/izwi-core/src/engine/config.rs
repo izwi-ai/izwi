@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
-use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
+use crate::backends::{BackendKind, BackendRouter, BackendSelectionSource};
 use crate::config::{
     resolve_kv_cache_policy, BatchSizePreference, PhysicalExecutionCapacity, PhysicalExecutionMode,
     PhysicalInFlightLimit, ResolvedKvCachePolicy, DEFAULT_MAX_PREFIX_CACHE_PAGES,
@@ -95,6 +95,13 @@ pub struct EngineCoreConfig {
     /// modes still resolve actual physical execution to one in-flight launch.
     #[serde(default)]
     pub max_physical_in_flight: PhysicalInFlightLimit,
+
+    /// Run one step driver per execution lane (loaded model instance)
+    /// instead of one for the whole engine, so one model's long dispatch
+    /// does not hold every other model's steps. Off by default; set with
+    /// IZWI_LANE_STEP_DRIVERS=1.
+    #[serde(default = "default_lane_step_drivers")]
+    pub lane_step_drivers: bool,
 
     /// Maximum retained sequence/session rows in managed model state.
     #[serde(default = "default_max_retained_sequences")]
@@ -235,10 +242,6 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_num_codebooks")]
     pub num_codebooks: usize,
 
-    /// Chunk size for streaming output (samples)
-    #[serde(default = "default_streaming_chunk_size")]
-    pub streaming_chunk_size: usize,
-
     /// Selected backend for execution and device policy.
     #[serde(default = "default_backend_kind")]
     pub backend: BackendKind,
@@ -251,10 +254,20 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_enable_preemption")]
     pub enable_preemption: bool,
 
+    /// Recompute preemption under managed KV pressure: when every claim
+    /// holder of a model waits to grow, suspend the lowest-priority, then
+    /// youngest, session of a family that declares token replay and rebuild
+    /// it by replaying its tokens once the protected request leaves, instead
+    /// of failing a request. Operators can disable it with
+    /// IZWI_CAPACITY_REPLAY=0 (CUDA incremental chat keeps its replay).
+    #[serde(default = "default_capacity_replay")]
+    pub enable_capacity_replay: bool,
+
     /// Output tokens a chat request claims in managed KV beyond its prompt and
     /// current step. Claims grow by this quantum as generation proceeds
     /// instead of reserving the whole output budget up front, so concurrent
     /// requests are admitted together; zero restores full up-front claims.
+    /// Set with IZWI_MANAGED_CHAT_CLAIM_QUANTUM_TOKENS; default 1024.
     #[serde(default = "default_managed_chat_claim_quantum_tokens")]
     pub managed_chat_claim_quantum_tokens: usize,
 
@@ -343,6 +356,41 @@ fn default_max_seq_len() -> usize {
 fn default_max_tokens_per_step() -> usize {
     384
 }
+
+/// Scheduler step sizes a backend uses when the operator leaves them
+/// automatic (zero), SCH-F3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendStepSizes {
+    pub(crate) max_tokens_per_step: usize,
+    pub(crate) chunked_prefill_threshold: usize,
+}
+
+/// Automatic step sizes per backend. An engine step launches one physical
+/// dispatch in the default serial mode and prefill is one request per
+/// dispatch, so with chunked prefill on, a step's prefill span is the chunk
+/// threshold (or the model's preferred span for an isolated request).
+///
+/// - CUDA always chunks (incremental chat turns it on). A 512-token chunk
+///   keeps the GPU's prefill matmuls wide; the 2,048-token budget covers a
+///   chunk beside a full decode batch. A larger budget would not widen a
+///   step until prefill rows batch across requests.
+/// - CPU and Metal leave chunked prefill off, so prefill runs whole prompts
+///   (full prefill ignores the chunk and the budget) and the budget only
+///   bounds decode, which needs at most 64 tokens (8 rows of 8-token quanta).
+///   The sizes apply when an operator turns chunking on, and stay at the
+///   historical 384 and 192.
+pub(crate) const fn backend_step_sizes(backend: BackendKind) -> BackendStepSizes {
+    match backend {
+        BackendKind::Cuda => BackendStepSizes {
+            max_tokens_per_step: 2_048,
+            chunked_prefill_threshold: 512,
+        },
+        BackendKind::Metal | BackendKind::Cpu => BackendStepSizes {
+            max_tokens_per_step: 384,
+            chunked_prefill_threshold: 192,
+        },
+    }
+}
 fn default_block_size() -> usize {
     64
 }
@@ -352,12 +400,16 @@ fn default_kv_cache_dtype() -> String {
 fn default_max_blocks() -> usize {
     1024
 }
-fn default_cuda_incremental_chat() -> bool {
-    cuda_incremental_chat_from_env(std::env::var("IZWI_CUDA_INCREMENTAL_CHAT").ok().as_deref())
+fn default_lane_step_drivers() -> bool {
+    crate::env::flag_or("IZWI_LANE_STEP_DRIVERS", false)
 }
 
-fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
-    value.is_none_or(|value| matches!(value, "1" | "true" | "on"))
+fn default_capacity_replay() -> bool {
+    crate::env::flag_or("IZWI_CAPACITY_REPLAY", true)
+}
+
+fn default_cuda_incremental_chat() -> bool {
+    crate::env::flag_or("IZWI_CUDA_INCREMENTAL_CHAT", true)
 }
 
 pub(crate) const DEFAULT_CUDA_STATE_BUDGET_FRACTION: f64 = 0.25;
@@ -422,13 +474,10 @@ fn default_sample_rate() -> u32 {
 fn default_num_codebooks() -> usize {
     8
 }
-fn default_streaming_chunk_size() -> usize {
-    4800
-} // 200ms at 24kHz
 
 fn default_backend_kind() -> BackendKind {
-    BackendRouter::resolve_context_from_env_or(
-        BackendPreference::Auto,
+    BackendRouter::resolve_context(
+        BackendRouter::unset_preference(),
         BackendSelectionSource::Default,
     )
     .backend_kind
@@ -440,7 +489,20 @@ fn default_num_threads() -> usize {
         .min(8)
 }
 fn default_managed_chat_claim_quantum_tokens() -> usize {
-    1024
+    claim_quantum_from_env(
+        std::env::var("IZWI_MANAGED_CHAT_CLAIM_QUANTUM_TOKENS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The chat claim quantum, overridable with
+/// IZWI_MANAGED_CHAT_CLAIM_QUANTUM_TOKENS (zero restores full claims); an
+/// unparsable value keeps the default.
+fn claim_quantum_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1024)
 }
 
 fn default_portable_auto_context_cap_tokens() -> usize {
@@ -491,13 +553,7 @@ fn default_thermal_pressure_hint() -> f64 {
         .clamp(0.0, 1.0)
 }
 fn default_power_save_mode() -> bool {
-    std::env::var("IZWI_POWER_SAVE")
-        .ok()
-        .map(|raw| {
-            let value = raw.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    crate::env::flag_or("IZWI_POWER_SAVE", false)
 }
 fn default_enable_decode_quanta() -> bool {
     false
@@ -583,6 +639,7 @@ impl Default for EngineCoreConfig {
             max_tensor_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
+            lane_step_drivers: default_lane_step_drivers(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             automatic_row_limits: AutomaticRowLimits::default(),
@@ -612,10 +669,10 @@ impl Default for EngineCoreConfig {
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
-            streaming_chunk_size: default_streaming_chunk_size(),
             backend: default_backend_kind(),
             num_threads: default_num_threads(),
             enable_preemption: default_enable_preemption(),
+            enable_capacity_replay: default_capacity_replay(),
             managed_chat_claim_quantum_tokens: default_managed_chat_claim_quantum_tokens(),
             portable_auto_context_cap_tokens: default_portable_auto_context_cap_tokens(),
             enable_adaptive_batching: default_enable_adaptive_batching(),
@@ -664,6 +721,24 @@ impl EngineCoreConfig {
 
     pub(crate) fn effective_chunked_prefill(&self) -> bool {
         self.enable_chunked_prefill || self.cuda_incremental_chat_enabled()
+    }
+
+    /// Set the step token budget and prefill chunk threshold from the
+    /// operator's values, where zero takes this backend's automatic size.
+    pub(crate) fn resolve_step_sizes(
+        &mut self,
+        max_tokens_per_step: usize,
+        chunked_prefill_threshold: usize,
+    ) {
+        let automatic = backend_step_sizes(self.backend);
+        self.max_tokens_per_step = match max_tokens_per_step {
+            0 => automatic.max_tokens_per_step,
+            tokens => tokens,
+        };
+        self.chunked_prefill_threshold = match chunked_prefill_threshold {
+            0 => automatic.chunked_prefill_threshold,
+            tokens => tokens,
+        };
     }
 
     /// Resolve rollout-aware dispatch and physical-launch capacity axes.
@@ -760,25 +835,14 @@ impl EngineCoreConfig {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        resolve_backend_model_context, tts_explicit_output_limit, EngineCoreConfig,
-        CUDA_MAX_NATIVE_CONTEXT_TOKENS,
+        claim_quantum_from_env, resolve_backend_model_context, tts_explicit_output_limit,
+        EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
     };
     use crate::backends::BackendKind;
     use crate::config::{
         KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::model::ModelVariant;
-
-    #[test]
-    fn incremental_chat_defaults_on_and_preserves_explicit_opt_out() {
-        assert!(super::cuda_incremental_chat_from_env(None));
-        for value in ["1", "true", "on"] {
-            assert!(super::cuda_incremental_chat_from_env(Some(value)));
-        }
-        for value in ["0", "false", "off", "", "invalid"] {
-            assert!(!super::cuda_incremental_chat_from_env(Some(value)));
-        }
-    }
 
     #[test]
     fn prefix_snapshot_budget_parses_a_bounded_count() {
@@ -810,6 +874,14 @@ mod managed_kv_default_tests {
     }
 
     #[test]
+    fn chat_claim_quantum_takes_the_operator_override() {
+        assert_eq!(claim_quantum_from_env(None), 1024);
+        assert_eq!(claim_quantum_from_env(Some(" 16 ")), 16);
+        assert_eq!(claim_quantum_from_env(Some("0")), 0);
+        assert_eq!(claim_quantum_from_env(Some("lots")), 1024);
+    }
+
+    #[test]
     fn incremental_chat_rollout_requires_cuda_and_enables_resumable_prefill() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let mut config = EngineCoreConfig {
@@ -831,6 +903,32 @@ mod managed_kv_default_tests {
             assert!(!config.effective_chunked_prefill());
             config.enable_chunked_prefill = true;
             assert!(config.effective_chunked_prefill());
+        }
+    }
+
+    #[test]
+    fn automatic_step_sizes_are_per_backend() {
+        use super::backend_step_sizes;
+        let cuda = backend_step_sizes(BackendKind::Cuda);
+        assert_eq!(cuda.max_tokens_per_step, 2_048);
+        assert_eq!(cuda.chunked_prefill_threshold, 512);
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let automatic = backend_step_sizes(backend);
+            // A chunk always fits the budget beside a full CUDA decode batch.
+            assert!(automatic.chunked_prefill_threshold + 32 <= automatic.max_tokens_per_step);
+            let mut config = EngineCoreConfig {
+                backend,
+                ..Default::default()
+            };
+            config.resolve_step_sizes(0, 0);
+            assert_eq!(config.max_tokens_per_step, automatic.max_tokens_per_step);
+            assert_eq!(
+                config.chunked_prefill_threshold,
+                automatic.chunked_prefill_threshold
+            );
+            config.resolve_step_sizes(4_096, 256);
+            assert_eq!(config.max_tokens_per_step, 4_096);
+            assert_eq!(config.chunked_prefill_threshold, 256);
         }
     }
 

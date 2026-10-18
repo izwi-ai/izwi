@@ -36,6 +36,13 @@ impl NativeExecutor {
         request.speech_messages_for_execution()
     }
 
+    /// A cancelled turn publishes nothing: its staged stream output is
+    /// dropped, and its workspace leases abort when they drop.
+    fn cancelled_audio_chat(request: &EngineCoreRequest) -> ModelSessionResult {
+        let _ = request.take_staged_stream_outputs();
+        ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()))
+    }
+
     pub(super) fn audio_chat_request(
         &self,
         request: &EngineCoreRequest,
@@ -78,6 +85,10 @@ impl NativeExecutor {
             )
         });
         let input_transcription = leases.fence_on_error(input_transcription)?;
+        if request.is_cancelled() {
+            return Ok(Self::cancelled_audio_chat(request));
+        }
+        let mut should_stop = || request.is_cancelled();
         let output = Self::run_blocking(|| {
             if let Some(tx) = stream_tx.as_ref() {
                 let stream_sequence = std::cell::Cell::new(0usize);
@@ -135,6 +146,7 @@ impl NativeExecutor {
                         &stream_config,
                         true,
                         &mut leases,
+                        &mut should_stop,
                         &mut emit_text,
                         &mut emit_audio,
                     )?;
@@ -166,12 +178,16 @@ impl NativeExecutor {
                     &stream_config,
                     false,
                     &mut leases,
+                    &mut should_stop,
                     &mut no_text,
                     &mut no_audio,
                 )
             }
         });
-        let output = leases.fence_on_error(output)?;
+        let output = match leases.fence_on_error(output) {
+            Err(Error::Cancelled(_)) => return Ok(Self::cancelled_audio_chat(request)),
+            output => output?,
+        };
         let completions = leases.release()?;
         if completions.len() != 3 {
             return Err(Error::InferenceError(

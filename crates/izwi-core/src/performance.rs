@@ -509,7 +509,7 @@ impl PerformanceConfigOverrides {
                 if binding.mode {
                     let parsed = aliases
                         .iter()
-                        .map(|value| parse_env_mode(value))
+                        .map(|value| parse_env_mode(binding.key, value))
                         .collect::<Result<Vec<_>>>()
                         .map_err(contextual_error)?;
                     if parsed.contains(&OptimizationMode::Off) {
@@ -525,7 +525,7 @@ impl PerformanceConfigOverrides {
             };
             if let Some(value) = value {
                 let value = if binding.mode {
-                    match parse_env_mode(&value).map_err(contextual_error)? {
+                    match parse_env_mode(binding.key, &value).map_err(contextual_error)? {
                         OptimizationMode::Auto => "auto",
                         OptimizationMode::Off => "off",
                     }
@@ -607,7 +607,7 @@ impl PerformanceConfigOverrides {
                         |error| Error::ConfigError(format!("{key}: {error}")),
                     )?)?)
             }
-            "cuda.mtp_adaptive" => self.cuda.mtp_adaptive = Some(parse_bool(value)?),
+            "cuda.mtp_adaptive" => self.cuda.mtp_adaptive = Some(parse_bool(key, value)?),
             "cuda.mtp_in_continuous" => {
                 self.cuda.mtp_in_continuous = Some(
                     value
@@ -696,18 +696,14 @@ impl PerformanceConfigOverrides {
     }
 }
 
-fn parse_bool(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(Error::ConfigError(format!("expected boolean, got {value}"))),
-    }
+fn parse_bool(name: &str, value: &str) -> Result<bool> {
+    izwi_env::parse_bool(name, value).map_err(|error| Error::ConfigError(error.to_string()))
 }
-fn parse_env_mode(value: &str) -> Result<OptimizationMode> {
+fn parse_env_mode(name: &str, value: &str) -> Result<OptimizationMode> {
     if value.eq_ignore_ascii_case("auto") {
         return Ok(OptimizationMode::Auto);
     }
-    parse_bool(value).map(|enabled| {
+    parse_bool(name, value).map(|enabled| {
         if enabled {
             OptimizationMode::Auto
         } else {

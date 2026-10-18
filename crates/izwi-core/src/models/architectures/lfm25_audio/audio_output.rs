@@ -1509,8 +1509,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_end_of_audio_frame_override_matches_host() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_end_of_audio_frame_override_matches_host",
+        ) else {
             return;
         };
         for tokens in [
@@ -1612,8 +1613,9 @@ mod tests {
     fn metal_sampled_audio_codes_stay_on_device() {
         use super::super::sampling::{Lfm25SamplingConfig, SimpleRng};
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_sampled_audio_codes_stay_on_device")
+        else {
             return;
         };
         let head = eoa_favouring_head_on(3, &device);
@@ -1669,8 +1671,9 @@ mod tests {
     fn metal_depthformer_rope_matches_cpu() {
         use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_depthformer_rope_matches_cpu")
+        else {
             return;
         };
         let x = xorshift_tensor(&[1, 2, 3, 32], 5, 1.0, &Device::Cpu).unwrap();

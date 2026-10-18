@@ -816,8 +816,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_depthwise_conv2d_matches_cpu() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_depthwise_conv2d_matches_cpu")
+        else {
             return;
         };
         let mut rng = XorShift(0x0BAD_5EED_1234_5678);
@@ -844,8 +845,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_depthwise_transposed_conv_matches_cpu() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_depthwise_transposed_conv_matches_cpu",
+        ) else {
             return;
         };
         let mut rng = XorShift(0x1234_5678_9ABC_DEF1);

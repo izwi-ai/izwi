@@ -18,6 +18,14 @@ max_parallel_model_loads = 1
 startup_timeout_ms = 120000
 poll_interval_ms = 200
 
+# A ready worker's status endpoint must answer within timeout_ms, from the
+# same incarnation, without reporting a failed runtime. failure_threshold
+# consecutive failures (a wedged device, a deadlock) restart it like a crash.
+[liveness]
+period_ms = 5000
+timeout_ms = 3000
+failure_threshold = 3
+
 [restart]
 initial_backoff_ms = 250
 maximum_backoff_ms = 30000
@@ -25,6 +33,10 @@ restart_window_ms = 300000
 stable_reset_ms = 600000
 max_restarts_per_window = 5
 jitter_percent = 20
+# A worker that exhausts its restart budget is quarantined and retried once
+# every quarantine_retry_ms (0: only an operator clears it, with SIGHUP or
+# izwi-serving-supervisor --clear-quarantine WORKER_ID|all).
+quarantine_retry_ms = 600000
 
 [shutdown]
 drain_grace_ms = 30000
@@ -67,5 +79,15 @@ cancellation = "cooperative"
 accepted_input_formats = ["chat_messages"]
 output_formats = ["text"]
 max_input_bytes = 1048576
-max_context_tokens = 32
-max_output_tokens = 32
+max_context_tokens = 8192
+max_output_tokens = 4096
+
+# Optional extra environment for this worker. The supervisor clears the
+# child environment, so operator switches (IZWI_*) and loader paths
+# (LD_LIBRARY_PATH, CUDA_HOME, CUDA_PATH, HF_HOME, HF_HUB_OFFLINE,
+# RUST_BACKTRACE) reach a worker only through this table. Names the
+# supervisor sets itself and anything that looks like a credential are
+# rejected at validation.
+# [workers.environment]
+# IZWI_KV_HOST_OFFLOAD = "0"
+# IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS = "60000"

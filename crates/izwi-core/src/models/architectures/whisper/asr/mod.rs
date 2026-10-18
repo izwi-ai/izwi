@@ -831,11 +831,13 @@ struct WhisperRuntimeTuning {
 impl WhisperRuntimeTuning {
     fn from_env() -> Self {
         Self {
-            no_fallback: env_bool("IZWI_WHISPER_NO_FALLBACK").unwrap_or(false),
+            no_fallback: crate::env::flag_or("IZWI_WHISPER_NO_FALLBACK", false),
             max_fallback_retries: env_usize("IZWI_WHISPER_MAX_FALLBACK_RETRIES")
                 .unwrap_or(DEFAULT_MAX_FALLBACK_RETRIES),
-            adaptive_decode_budget: env_bool("IZWI_WHISPER_ADAPTIVE_MAX_NEW_TOKENS")
-                .unwrap_or(true),
+            adaptive_decode_budget: crate::env::flag_or(
+                "IZWI_WHISPER_ADAPTIVE_MAX_NEW_TOKENS",
+                true,
+            ),
             max_new_tokens_per_second: env_f32("IZWI_WHISPER_MAX_NEW_TOKENS_PER_SECOND")
                 .unwrap_or(DEFAULT_ADAPTIVE_MAX_NEW_TOKENS_PER_SECOND),
             min_new_tokens: env_usize("IZWI_WHISPER_MIN_NEW_TOKENS")
@@ -845,7 +847,7 @@ impl WhisperRuntimeTuning {
             decode_budget_buffer_tokens: env_usize("IZWI_WHISPER_MAX_NEW_TOKENS_BUFFER")
                 .unwrap_or(DEFAULT_ADAPTIVE_BUDGET_BUFFER_TOKENS),
             default_language: env_nonempty_string("IZWI_WHISPER_DEFAULT_LANGUAGE"),
-            trim_silence: env_bool("IZWI_WHISPER_TRIM_SILENCE").unwrap_or(true),
+            trim_silence: crate::env::flag_or("IZWI_WHISPER_TRIM_SILENCE", true),
             silence_trim_threshold_scale: env_f32("IZWI_WHISPER_SILENCE_TRIM_THRESHOLD_SCALE")
                 .unwrap_or(DEFAULT_SILENCE_TRIM_THRESHOLD_SCALE),
             silence_trim_min_abs: env_f32("IZWI_WHISPER_SILENCE_TRIM_MIN_ABS")
@@ -858,12 +860,12 @@ impl WhisperRuntimeTuning {
                 .unwrap_or(DEFAULT_SILENCE_TRIM_MIN_TRAILING_MS),
             silence_trim_min_clip_secs: env_f32("IZWI_WHISPER_SILENCE_TRIM_MIN_CLIP_SECS")
                 .unwrap_or(DEFAULT_SILENCE_TRIM_MIN_CLIP_SECS),
-            suppress_blank: env_bool("IZWI_WHISPER_SUPPRESS_BLANK").unwrap_or(true),
-            suppress_numerals: env_bool("IZWI_WHISPER_SUPPRESS_NUMERALS").unwrap_or(false),
+            suppress_blank: crate::env::flag_or("IZWI_WHISPER_SUPPRESS_BLANK", true),
+            suppress_numerals: crate::env::flag_or("IZWI_WHISPER_SUPPRESS_NUMERALS", false),
             initial_prompt_max_tokens: env_usize("IZWI_WHISPER_INITIAL_PROMPT_MAX_TOKENS")
                 .unwrap_or(DEFAULT_INITIAL_PROMPT_MAX_TOKENS),
-            profile_sync_timings: env_bool("IZWI_WHISPER_PROFILE_SYNC").unwrap_or(false),
-            device_greedy_decode: env_bool("IZWI_WHISPER_DEVICE_GREEDY").unwrap_or(true),
+            profile_sync_timings: crate::env::flag_or("IZWI_WHISPER_PROFILE_SYNC", false),
+            device_greedy_decode: crate::env::flag_or("IZWI_WHISPER_DEVICE_GREEDY", true),
         }
     }
 }
@@ -3533,17 +3535,6 @@ fn has_whisper_language_token(
 ) -> bool {
     let token = format!("<|{}|>", code);
     generation_lang_to_id.contains_key(&token) || tokenizer.token_to_id(&token).is_some()
-}
-
-fn env_bool(key: &str) -> Option<bool> {
-    std::env::var(key).ok().and_then(|raw| {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
 }
 
 fn env_usize(key: &str) -> Option<usize> {

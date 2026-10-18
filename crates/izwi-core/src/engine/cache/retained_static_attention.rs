@@ -5,7 +5,7 @@
 //! sequence's immutable read view. Static initialization is one-shot, so the
 //! number of committed plus staging slots can never exceed sequence capacity.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,13 +16,15 @@ use crate::backends::state::{
     InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
     StaticAttentionRaggedRow,
 };
-use crate::backends::BackendKind;
 use crate::engine::ModelInstanceId;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     DomainStepIntent, InferenceStateContract, ResolvedStatePlan, StateDomainId, StatePlanId,
     StateUpdateKind,
 };
+
+#[cfg(test)]
+use crate::backends::BackendKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct RetainedStaticAttentionRuntimeIdV2 {
@@ -42,13 +44,6 @@ pub(crate) struct RetainedStaticAttentionSequenceId {
 pub(crate) struct RetainedStaticAttentionTransactionId {
     runtime: RetainedStaticAttentionRuntimeIdV2,
     nonce: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RetainedStaticAttentionBatchRow {
-    pub(crate) sequence: RetainedStaticAttentionSequenceId,
-    pub(crate) query_start: u32,
-    pub(crate) query_len: u32,
 }
 
 #[derive(Debug)]
@@ -74,7 +69,6 @@ struct RuntimeState {
 pub(crate) struct RetainedStaticAttentionRuntimeV2 {
     id: RetainedStaticAttentionRuntimeIdV2,
     plan: Arc<ResolvedStatePlan>,
-    backend: BackendKind,
     per_sequence_bytes: u64,
     maximum_bytes: u64,
     arenas: Vec<Mutex<InvocationStaticAttentionArena>>,
@@ -154,7 +148,6 @@ impl RetainedStaticAttentionRuntimeV2 {
                 state_plan: plan.id,
                 domain,
             },
-            backend: plan.backend,
             plan,
             per_sequence_bytes,
             maximum_bytes,
@@ -180,10 +173,6 @@ impl RetainedStaticAttentionRuntimeV2 {
 
     pub(crate) fn sequence_capacity(&self) -> u32 {
         u32::try_from(self.arenas.len()).unwrap_or(u32::MAX)
-    }
-
-    pub(crate) const fn per_sequence_bytes(&self) -> u64 {
-        self.per_sequence_bytes
     }
 
     pub(crate) const fn maximum_bytes(&self) -> u64 {
@@ -389,69 +378,6 @@ impl RetainedStaticAttentionRuntimeV2 {
             self.lock_arena(slot)?
         };
         arena.attend(model_layer, queries, rows, softmax_scale)
-    }
-
-    /// One authenticated physical envelope for rows backed by distinct static
-    /// memories. CPU uses a portable per-row inner loop after validating every
-    /// sequence and query partition. Accelerators remain unavailable until an
-    /// exact multi-memory provider is published.
-    pub(crate) fn attend_batch_distinct(
-        &self,
-        model_layer: u32,
-        queries: &Tensor,
-        rows: &[RetainedStaticAttentionBatchRow],
-        softmax_scale: f32,
-    ) -> Result<Tensor> {
-        if rows.is_empty() || queries.rank() != 3 {
-            return Err(invalid(
-                "retained static-attention batch requires rank-three queries and rows",
-            ));
-        }
-        let total_queries = u32::try_from(queries.dim(0)?)
-            .map_err(|_| invalid("retained static-attention query count exceeds u32"))?;
-        let mut cursor = 0_u32;
-        let mut identities = HashSet::with_capacity(rows.len());
-        for row in rows {
-            self.authenticate_sequence(row.sequence)?;
-            if row.query_len == 0 || row.query_start != cursor || !identities.insert(row.sequence) {
-                return Err(invalid("retained static-attention rows must be a canonical distinct-sequence partition"));
-            }
-            cursor = cursor
-                .checked_add(row.query_len)
-                .ok_or_else(|| invalid("retained static-attention query partition overflow"))?;
-        }
-        if cursor != total_queries {
-            return Err(invalid(
-                "retained static-attention rows do not cover the query tensor",
-            ));
-        }
-        if self.backend != BackendKind::Cpu {
-            return Err(invalid(
-                "retained distinct-memory static-attention batching has no exact accelerator provider",
-            ));
-        }
-        let state = self.lock_state()?;
-        let mut outputs = Vec::with_capacity(rows.len());
-        for row in rows {
-            let slot = self.committed_slot(&state, row.sequence)?;
-            let query = queries.narrow(
-                0,
-                usize::try_from(row.query_start)
-                    .map_err(|_| invalid("query start exceeds usize"))?,
-                usize::try_from(row.query_len)
-                    .map_err(|_| invalid("query length exceeds usize"))?,
-            )?;
-            outputs.push(self.lock_arena(slot)?.attend(
-                model_layer,
-                &query,
-                &[StaticAttentionRaggedRow {
-                    query_start: 0,
-                    query_len: row.query_len,
-                }],
-                softmax_scale,
-            )?);
-        }
-        Tensor::cat(&outputs, 0).map_err(Error::from)
     }
 
     pub(crate) fn release_sequence(
@@ -684,50 +610,6 @@ mod tests {
             )
             .unwrap(),
         }
-    }
-
-    #[test]
-    fn two_sequences_attend_through_one_distinct_memory_batch_envelope() {
-        let runtime = build_runtime(1, 2);
-        assert_eq!(runtime.maximum_bytes(), runtime.per_sequence_bytes() * 2);
-        let first = runtime.register_sequence().unwrap();
-        let second = runtime.register_sequence().unwrap();
-        runtime
-            .install(first, [1; 32], vec![layer(2, 0.0)])
-            .unwrap();
-        runtime
-            .install(second, [2; 32], vec![layer(2, 100.0)])
-            .unwrap();
-        let queries = Tensor::from_vec(
-            [1.0_f32, 0.0, 0.5, 0.5, 0.0, 1.0, -0.5, 0.5].repeat(2),
-            (2, 4, 2),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let output = runtime
-            .attend_batch_distinct(
-                0,
-                &queries,
-                &[
-                    RetainedStaticAttentionBatchRow {
-                        sequence: first,
-                        query_start: 0,
-                        query_len: 1,
-                    },
-                    RetainedStaticAttentionBatchRow {
-                        sequence: second,
-                        query_start: 1,
-                        query_len: 1,
-                    },
-                ],
-                1.0,
-            )
-            .unwrap();
-        assert_eq!(output.dims(), &[2, 4, 2]);
-        assert_ne!(
-            output.narrow(0, 0, 1).unwrap().to_vec3::<f32>().unwrap(),
-            output.narrow(0, 1, 1).unwrap().to_vec3::<f32>().unwrap()
-        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeTelemetryContext {
@@ -598,7 +598,6 @@ struct BenchmarkRunConfig {
     reference_audio: Option<String>,
     reference_text: Option<String>,
     language: Option<String>,
-    duration_secs: Option<u64>,
     request_timeout_secs: Option<u64>,
 }
 
@@ -740,7 +739,6 @@ struct BenchmarkManifestCase {
     reference_text: Option<String>,
     reference_text_file: Option<String>,
     language: Option<String>,
-    duration_secs: Option<u64>,
     matrix: Option<BenchmarkManifestMatrix>,
 }
 
@@ -762,7 +760,6 @@ struct BenchmarkManifestMatrix {
     reference_text: Option<Vec<String>>,
     reference_text_file: Option<Vec<String>>,
     language: Option<Vec<String>>,
-    duration_secs: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -789,7 +786,6 @@ enum MatrixValue {
     ReferenceText(String),
     ReferenceTextFile(String),
     Language(String),
-    DurationSecs(u64),
 }
 
 #[derive(Debug, Serialize)]
@@ -974,12 +970,6 @@ pub async fn execute(
         )
         .await
         .and_then(|report| finish_report(&options, &report)),
-        BenchCommands::Throughput {
-            duration,
-            concurrent,
-        } => bench_throughput(server, duration, concurrent, &options, theme)
-            .await
-            .and_then(|report| finish_report(&options, &report)),
         BenchCommands::Run {
             manifest,
             artifact_dir,
@@ -1159,7 +1149,6 @@ impl MatrixValue {
             MatrixValue::ReferenceText(value) => case.reference_text = Some(value.clone()),
             MatrixValue::ReferenceTextFile(value) => case.reference_text_file = Some(value.clone()),
             MatrixValue::Language(value) => case.language = Some(value.clone()),
-            MatrixValue::DurationSecs(value) => case.duration_secs = Some(*value),
         }
     }
 
@@ -1179,7 +1168,6 @@ impl MatrixValue {
             MatrixValue::Iterations(value) => value.to_string(),
             MatrixValue::Concurrent(value) => value.to_string(),
             MatrixValue::MaxTokens(value) => value.to_string(),
-            MatrixValue::DurationSecs(value) => value.to_string(),
             MatrixValue::Warmup(value) => value.to_string(),
             MatrixValue::Stream(value) => value.to_string(),
         }
@@ -1249,12 +1237,6 @@ impl BenchmarkManifestMatrix {
             "language",
             &self.language,
             MatrixValue::Language,
-        )?;
-        add_matrix_dimension(
-            &mut dimensions,
-            "duration_secs",
-            &self.duration_secs,
-            MatrixValue::DurationSecs,
         )?;
         if dimensions.is_empty() {
             return Err(CliError::InvalidInput(
@@ -1662,14 +1644,11 @@ async fn bench_manifest(
                 .await?
             }
             "throughput" => {
-                bench_throughput(
-                    &suite_server,
-                    case.duration_secs.unwrap_or(30),
-                    case.concurrent.unwrap_or(1),
-                    options,
-                    theme,
-                )
-                .await?
+                return Err(CliError::InvalidInput(
+                    "Benchmark manifest command `throughput` was removed: it timed /livez, not \
+                     inference. Use `chat` cases or scripts/bench/run-serving-benchmark.py."
+                        .to_string(),
+                ));
             }
             other => {
                 return Err(CliError::InvalidInput(format!(
@@ -2065,7 +2044,6 @@ async fn bench_chat(
             reference_audio: None,
             reference_text: None,
             language: None,
-            duration_secs: None,
             request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
@@ -2398,7 +2376,6 @@ async fn bench_tts(
             reference_audio: reference.reference_audio_path.clone(),
             reference_text: reference.reference_text.clone(),
             language: None,
-            duration_secs: None,
             request_timeout_secs: Some(timeout_secs),
         },
         summary: BenchmarkSummary {
@@ -2723,7 +2700,6 @@ async fn bench_asr(
             reference_audio: None,
             reference_text: None,
             language: language.as_deref().map(|value| value.to_string()),
-            duration_secs: None,
             request_timeout_secs: None,
         },
         summary: BenchmarkSummary {
@@ -2756,138 +2732,6 @@ async fn bench_asr(
             delta_available: metrics_before.is_some() && metrics_after.is_some(),
             before: metrics_before,
             after: metrics_after,
-        },
-    })
-}
-
-async fn bench_throughput(
-    server: &str,
-    duration: u64,
-    concurrent: u32,
-    options: &BenchOptions,
-    theme: &Theme,
-) -> Result<BenchmarkReport> {
-    if duration == 0 {
-        return Err(CliError::InvalidInput(
-            "Duration must be greater than 0 seconds".to_string(),
-        ));
-    }
-    if concurrent == 0 {
-        return Err(CliError::InvalidInput(
-            "Concurrent requests must be greater than 0".to_string(),
-        ));
-    }
-
-    if options.interactive() {
-        theme.step(
-            1,
-            1,
-            &format!("Throughput test: {}s, {} concurrent", duration, concurrent),
-        );
-    }
-    if options.human_output() {
-        println!("Running throughput benchmark against /livez...");
-    }
-    let client = http::client(Some(Duration::from_secs(5)))?;
-    let started_at = Utc::now();
-    let run_start = Instant::now();
-    let deadline = run_start + Duration::from_secs(duration);
-
-    let mut workers = Vec::new();
-    for _ in 0..concurrent {
-        let client = client.clone();
-        let server = server.to_string();
-        workers.push(tokio::spawn(async move {
-            let mut success = 0u64;
-            let mut failed = 0u64;
-            while std::time::Instant::now() < deadline {
-                match client.get(format!("{}/livez", server)).send().await {
-                    Ok(resp) if resp.status().is_success() => success += 1,
-                    _ => failed += 1,
-                }
-            }
-            (success, failed)
-        }));
-    }
-
-    let mut success = 0u64;
-    let mut failed = 0u64;
-    for worker in workers {
-        let (ok, err) = worker
-            .await
-            .map_err(|e| CliError::Other(format!("Benchmark worker failed: {}", e)))?;
-        success += ok;
-        failed += err;
-    }
-
-    let total = success + failed;
-    let measured_elapsed = run_start.elapsed();
-    let rps = throughput_rps(total, measured_elapsed);
-    if options.human_output() {
-        println!("\n{}", console::style("Results:").bold().underlined());
-        println!("  Successful: {:.0}", success);
-        println!("  Failed:     {:.0}", failed);
-        println!("  Total:      {:.0}", total);
-        println!("  Throughput: {:.2} req/s", rps);
-    }
-    let ended_at = Utc::now();
-    Ok(BenchmarkReport {
-        schema_version: 1,
-        command: "throughput",
-        server: server.to_string(),
-        started_at,
-        ended_at,
-        duration_ms: measured_elapsed.as_secs_f64() * 1000.0,
-        config: BenchmarkRunConfig {
-            chat_sampling: None,
-            model: None,
-            iterations: None,
-            concurrent: Some(concurrent),
-            warmup: false,
-            stream: false,
-            prompt: None,
-            system: None,
-            max_tokens: None,
-            text: None,
-            speaker: None,
-            file: None,
-            saved_voice_id: None,
-            reference_audio: None,
-            reference_text: None,
-            language: None,
-            duration_secs: Some(duration),
-            request_timeout_secs: None,
-        },
-        summary: BenchmarkSummary {
-            latency_ms: None,
-            ttft_ms: None,
-            first_audio_ms: None,
-            inter_frame_ms: None,
-            first_transcript_ms: None,
-            inter_transcript_ms: None,
-            end_to_end_ms: None,
-            itl_ms: None,
-            completion_tps: None,
-            server_request_tps: None,
-            decode_wall_tps: None,
-            tokens_per_second: None,
-            server_generation_ms: None,
-            server_processing_ms: None,
-            audio_duration_secs: None,
-            rtf: None,
-            prompt_tokens_avg: None,
-            completion_tokens_avg: None,
-            throughput_rps: Some(rps),
-            successful: Some(success),
-            failed: Some(failed),
-            total: Some(total),
-            quality_gates: BenchmarkQualityGateSummary::default(),
-        },
-        samples: Vec::new(),
-        telemetry: RuntimeTelemetryReport {
-            delta_available: false,
-            before: None,
-            after: None,
         },
     })
 }
@@ -3497,15 +3341,6 @@ fn stats(data: &[f64]) -> Option<Stats> {
         p95: percentile(data, 0.95),
         p99: percentile(data, 0.99),
     })
-}
-
-fn throughput_rps(total: u64, elapsed: Duration) -> f64 {
-    let elapsed_secs = elapsed.as_secs_f64();
-    if elapsed_secs > 0.0 {
-        total as f64 / elapsed_secs
-    } else {
-        0.0
-    }
 }
 
 fn progress_bar(visible: bool, len: u64) -> ProgressBar {
@@ -6613,6 +6448,36 @@ mod tests {
         .expect("reordered same-name suite cases should compare successfully");
     }
 
+    /// HYG-T5: the old `throughput` case timed `/livez`, not inference; a
+    /// manifest that still names it fails and points at the replacement.
+    #[tokio::test]
+    async fn manifest_throughput_case_is_rejected_with_its_replacement() {
+        let dir = tempdir().expect("temp dir should be created");
+        let manifest = dir.path().join("throughput.toml");
+        std::fs::write(
+            &manifest,
+            "server = \"http://127.0.0.1:9\"\n\n[[benchmarks]]\ncommand = \"throughput\"\nduration_secs = 1\n",
+        )
+        .expect("manifest should be written");
+
+        let error = bench_manifest(
+            "http://127.0.0.1:9",
+            &manifest,
+            None,
+            &BenchOptions {
+                output_format: OutputFormat::Json,
+                quiet: true,
+                quality_mode: BenchmarkQualityMode::Strict,
+            },
+            &Theme::no_color(),
+        )
+        .await
+        .expect_err("a throughput case must not run");
+        let message = error.to_string();
+        assert!(message.contains("/livez"), "{message}");
+        assert!(message.contains("run-serving-benchmark.py"), "{message}");
+    }
+
     #[tokio::test]
     async fn bench_compare_fails_on_quality_gate_before_latency_comparison() {
         let dir = tempdir().expect("temp dir should be created");
@@ -6965,11 +6830,5 @@ speaker = ["af_bella", "am_adam"]
         );
         assert_eq!(cases[0].speaker.as_deref(), Some("af_bella"));
         assert_eq!(cases[1].speaker.as_deref(), Some("am_adam"));
-    }
-
-    #[test]
-    fn throughput_rps_uses_measured_elapsed() {
-        assert_eq!(throughput_rps(10, Duration::from_millis(2500)), 4.0);
-        assert_eq!(throughput_rps(10, Duration::ZERO), 0.0);
     }
 }
