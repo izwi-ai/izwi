@@ -19,7 +19,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { StatePanel } from "@/components/ui/state-panel";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { getSpeakerProfilesForVariant, isLfm25AudioVariant } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
@@ -28,7 +27,13 @@ import {
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
-import { VoiceLibraryTable } from "@/features/voices/components/VoiceLibraryTable";
+import { VoiceLibraryGrid } from "@/features/voices/components/VoiceLibraryGrid";
+import {
+  HistoryToolbar,
+  SearchField,
+  SegmentedFilter,
+} from "@/components/history/HistoryToolbar";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { type VoiceLibraryItem } from "@/features/voices/types";
 import { cn } from "@/lib/utils";
 
@@ -128,6 +133,7 @@ export function VoicesPage({
 }: VoicesPageProps) {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<VoiceLibraryTab>("saved");
+  const [voiceSearch, setVoiceSearch] = useState("");
   const [savedVoices, setSavedVoices] = useState<SavedVoiceSummary[]>([]);
   const [savedVoicesLoading, setSavedVoicesLoading] = useState(true);
   const [savedVoicesLoadingMore, setSavedVoicesLoadingMore] = useState(false);
@@ -402,126 +408,111 @@ export function VoicesPage({
       );
     }
   };
-  const tableActionButtonClass =
-    "h-8 w-[7.5rem] rounded-[0.6rem] px-3 text-xs font-semibold";
   const deleteTargetVoice = savedVoices.find(
     (voice) => voice.id === deleteConfirmVoiceId,
   );
+  const builtInModelLabel = resolvedSelectedModel
+    ? getModelDisplayName(resolvedSelectedModel)
+    : null;
 
-  const savedVoiceItems: VoiceLibraryItem[] = savedVoices.map(
-    (voice) => ({
+  const savedVoiceItems: VoiceLibraryItem[] = savedVoices.map((voice) => {
+    const kind = savedVoiceSourceLabel(voice.source_route_kind).replace(
+      / voice$/,
+      "",
+    );
+    return {
       id: voice.id,
       name: voice.name,
-      secondaryLabel: shouldShowSavedVoiceCreatedDate(voice.source_route_kind)
-        ? `Created ${formatRelativeDate(voice.created_at)}`
-        : undefined,
-      categoryLabel: savedVoiceSourceLabel(voice.source_route_kind),
+      meta: shouldShowSavedVoiceCreatedDate(voice.source_route_kind)
+        ? `${kind} · ${formatRelativeDate(voice.created_at)}`
+        : kind,
+      kindLabel: kind,
       description: voice.reference_text_preview,
       previewUrl: api.savedVoiceAudioUrl(voice.id),
-      actions: (
-        <>
-          <Button
-            size="sm"
-            className={tableActionButtonClass}
-            onClick={(event) => {
-              event.stopPropagation();
-              handleUseSavedVoice(voice.id);
-            }}
-          >
-            <Mic2 className="h-4 w-4" />
-            Use in TTS
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className={cn(
-              tableActionButtonClass,
-              "border-[var(--border-strong)] bg-[color-mix(in_srgb,var(--bg-surface-1)_72%,transparent)]",
-            )}
-            onClick={(event) => {
-              event.stopPropagation();
-              setDeleteConfirmVoiceId(voice.id);
-              setDeleteConfirmError(null);
-            }}
-            disabled={deletingVoiceId === voice.id}
-          >
-            {deletingVoiceId === voice.id ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Trash2 className="h-4 w-4" />
-            )}
-            Delete
-          </Button>
-        </>
-      ),
-    }),
-  );
+      primaryAction: {
+        label: "Use in TTS",
+        icon: Mic2,
+        onClick: () => handleUseSavedVoice(voice.id),
+      },
+      menuItems: [
+        {
+          id: "use",
+          label: "Use in TTS",
+          icon: Mic2,
+          onSelect: () => handleUseSavedVoice(voice.id),
+        },
+        {
+          id: "delete",
+          label: "Delete",
+          icon: Trash2,
+          danger: true,
+          separatorBefore: true,
+          disabled: deletingVoiceId === voice.id,
+          onSelect: () => {
+            setDeleteConfirmVoiceId(voice.id);
+            setDeleteConfirmError(null);
+          },
+        },
+      ],
+    };
+  });
 
-  const builtInVoiceItems: VoiceLibraryItem[] = builtInVoices.map(
-    (voice) => {
-      const previewKey = buildPreviewKey(resolvedSelectedModel, voice.id);
-      const previewUrl = previewUrls[previewKey] ?? null;
-      const isPreviewLoading = previewLoadingVoiceId === previewKey;
-      return {
-        id: voice.id,
-        name: voice.name,
-        categoryLabel: "Built-in voice",
-        description: voice.description,
-        previewUrl,
-        previewLoading: isPreviewLoading,
-        previewMessage: previewUrl
-          ? null
-          : isPreviewLoading
-            ? "Generating a preview sample for this speaker."
-            : "Generate a preview sample to audition this built-in voice.",
-        actions: (
-          <>
-            <Button
-              size="sm"
-              onClick={(event) => {
-                event.stopPropagation();
-                handleUseBuiltInVoice(voice.id);
-              }}
-              className={tableActionButtonClass}
-            >
-              <Mic2 className="h-4 w-4" />
-              Use in TTS
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={(event) => {
-                event.stopPropagation();
-                void handlePreviewBuiltInVoice(voice.id, voice.language);
-              }}
-              disabled={isPreviewLoading}
-              className={cn(
-                tableActionButtonClass,
-                "border-[var(--border-strong)] bg-[color-mix(in_srgb,var(--bg-surface-1)_72%,transparent)]",
-              )}
-            >
-              {isPreviewLoading ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Sparkles className="h-4 w-4" />
-              )}
-              Preview
-            </Button>
-          </>
-        ),
-      };
-    },
-  );
+  const builtInVoiceItems: VoiceLibraryItem[] = builtInVoices.map((voice) => {
+    const previewKey = buildPreviewKey(resolvedSelectedModel, voice.id);
+    const previewUrl = previewUrls[previewKey] ?? null;
+    const isPreviewLoading = previewLoadingVoiceId === previewKey;
+    return {
+      id: voice.id,
+      name: voice.name,
+      meta: builtInModelLabel ? `Built-in · ${builtInModelLabel}` : "Built-in",
+      kindLabel: "Built-in",
+      description: voice.description,
+      previewUrl,
+      previewLoading: isPreviewLoading,
+      onRequestPreview: () =>
+        void handlePreviewBuiltInVoice(voice.id, voice.language),
+      primaryAction: {
+        label: "Use in TTS",
+        icon: Mic2,
+        onClick: () => handleUseBuiltInVoice(voice.id),
+      },
+      menuItems: [
+        {
+          id: "use",
+          label: "Use in TTS",
+          icon: Mic2,
+          onSelect: () => handleUseBuiltInVoice(voice.id),
+        },
+        {
+          id: "preview",
+          label: previewUrl ? "Preview ready" : "Generate preview",
+          icon: Sparkles,
+          disabled: Boolean(previewUrl) || isPreviewLoading,
+          onSelect: () =>
+            void handlePreviewBuiltInVoice(voice.id, voice.language),
+        },
+      ],
+    };
+  });
 
   const totalSavedVoices = savedVoices.length;
   const totalBuiltInVoices = builtInVoices.length;
   const allVoiceItems = [...savedVoiceItems, ...builtInVoiceItems];
-  const activeItems =
+  const tabItems =
     activeTab === "all"
       ? allVoiceItems
       : activeTab === "saved"
         ? savedVoiceItems
         : builtInVoiceItems;
+  // Search the loaded voices by name, notes and kind.
+  const searchTerm = voiceSearch.trim().toLowerCase();
+  const activeItems = searchTerm
+    ? tabItems.filter((item) =>
+        [item.name, item.description, item.meta]
+          .filter(Boolean)
+          .some((value) => value!.toLowerCase().includes(searchTerm)),
+      )
+    : tabItems;
   const showSavedVoiceLoadMore =
     (activeTab === "saved" || activeTab === "all") &&
     savedVoices.length > 0 &&
@@ -532,44 +523,33 @@ export function VoicesPage({
 
   const workspaceContent = (
     <div className="flex flex-col">
-      <Tabs
-        value={activeTab}
-        onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
-        className="w-full"
-      >
+      <div>
         <div className={cn("pb-4 sm:pb-5", embedded && "pb-3 sm:pb-4")}>
-          <div className="flex flex-col gap-4 pb-4">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-              <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
-                <TabsTrigger
-                  value="all"
-                  className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-                >
-                  All Voices
-                </TabsTrigger>
-                <TabsTrigger
-                  value="saved"
-                  className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-                >
-                  <span>My Voices</span>
-                  <span className="rounded-full border border-[color-mix(in_srgb,currentColor_20%,transparent)] px-2 py-0.5 text-[10px] font-semibold">
-                    {totalSavedVoices}
-                  </span>
-                </TabsTrigger>
-                <TabsTrigger
-                  value="built-in"
-                  className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-                >
-                  <span>Built-in Voices</span>
-                  <span className="rounded-full border border-[color-mix(in_srgb,currentColor_20%,transparent)] px-2 py-0.5 text-[10px] font-semibold">
-                    {totalBuiltInVoices}
-                  </span>
-                </TabsTrigger>
-              </TabsList>
-
-            </div>
-
-          </div>
+          <HistoryToolbar>
+            <SegmentedFilter
+              label="Show"
+              options={[
+                {
+                  id: "all",
+                  label: "All",
+                  count: totalSavedVoices + totalBuiltInVoices,
+                },
+                { id: "saved", label: "My voices", count: totalSavedVoices },
+                {
+                  id: "built-in",
+                  label: "Built-in",
+                  count: totalBuiltInVoices,
+                },
+              ]}
+              value={activeTab}
+              onChange={setActiveTab}
+            />
+            <SearchField
+              value={voiceSearch}
+              onChange={setVoiceSearch}
+              placeholder="Search voices…"
+            />
+          </HistoryToolbar>
 
           {showSavedVoiceError ? (
             <div className="mt-4">
@@ -581,7 +561,7 @@ export function VoicesPage({
             </div>
           ) : null}
 
-          <VoiceLibraryTable
+          <VoiceLibraryGrid
             items={activeItems}
             emptyTitle={
               activeTab === "all"
@@ -607,8 +587,7 @@ export function VoicesPage({
                     ? "Load a CustomVoice, Kokoro, or Voxtral TTS model to browse built-in voices."
                     : "Try a different built-in voice model."
             }
-            className="mt-5"
-            compact={embedded}
+            className="mt-1"
           />
 
           {showSavedVoiceLoadMore ? (
@@ -629,7 +608,7 @@ export function VoicesPage({
             </div>
           ) : null}
         </div>
-      </Tabs>
+      </div>
     </div>
   );
 

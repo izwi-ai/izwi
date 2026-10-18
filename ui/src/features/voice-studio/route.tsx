@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Settings2 } from "lucide-react";
+import { Settings2 } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
@@ -13,10 +13,8 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
-import {
-  newItemShortcutTitle,
-  useNewItemShortcut,
-} from "@/hooks/useNewItemShortcut";
+import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
+import { NewItemButton } from "@/components/history/NewItemButton";
 import { VoicesPage } from "@/features/voices/route";
 import { VIEW_CONFIGS } from "@/types";
 
@@ -128,18 +126,10 @@ export function VoiceStudioPage({
   return (
     <PageShell>
       <PageHeader
-        title="Voice Studio"
-        description="Manage saved and built-in voices, then create new cloned or designed voices from one place."
+        title="Voices"
+        description="Saved and built-in voices you can use across Text to Speech, Studio and Voice."
         actions={
           <>
-            <Button
-              onClick={openNewVoice}
-              title={newItemShortcutTitle("New voice")}
-              className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
-            >
-              <Plus className="h-4 w-4" />
-              New Voice
-            </Button>
             <Button
               type="button"
               variant="outline"
@@ -152,11 +142,12 @@ export function VoiceStudioPage({
               <Settings2 className="h-4 w-4" />
               Models
             </Button>
+            <NewItemButton label="New voice" onClick={openNewVoice} />
           </>
         }
       />
 
-      <div className="mt-5 pb-4 sm:pb-5">
+      <div className="pb-4 sm:pb-5">
         <VoicesPage
           models={models}
           selectedModel={selectedModel}

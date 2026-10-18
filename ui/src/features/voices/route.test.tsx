@@ -161,7 +161,7 @@ describe("VoicesPage", () => {
     onError: vi.fn(),
   };
 
-  it("renders voice rows in a table and keeps built-in preview flow", async () => {
+  it("renders voice cards and keeps the built-in preview flow", async () => {
     render(
       <MemoryRouter>
         <VoicesPage {...baseProps} />
@@ -172,34 +172,35 @@ describe("VoicesPage", () => {
     expect(apiMocks.listSavedVoices).toHaveBeenCalled(),
     );
 
-    expect(screen.getByRole("columnheader", { name: "Voice" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Type" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Preview" })).toBeInTheDocument();
-    expect(
-      screen.queryByRole("columnheader", { name: "Metadata" }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByTestId("voice-row-voice-balanced")).toBeInTheDocument();
-    expect(screen.queryByTestId("voice-card-voice-balanced")).not.toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Voices" })).toBeInTheDocument();
+    expect(screen.getByTestId("voice-card-voice-balanced")).toBeInTheDocument();
 
     expect(screen.getByText("Balanced 21 yo")).toBeInTheDocument();
-    expect(screen.getByText(/^Created /i)).toBeInTheDocument();
-    expect(screen.getByText("Designed voice")).toBeInTheDocument();
+    expect(screen.getByText(/^Designed · /)).toBeInTheDocument();
+    expect(screen.getByText("Designed")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Use in TTS" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    const menu = screen.getByRole("button", {
+      name: "More actions for Balanced 21 yo",
+    });
+    fireEvent.pointerDown(menu, { button: 0, ctrlKey: false });
+    fireEvent.click(menu);
+    expect(
+      await screen.findByRole("menuitem", { name: "Delete" }),
+    ).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 
-    const builtInTab = screen.getByRole("tab", { name: /Built-in Voices/i });
-    fireEvent.mouseDown(builtInTab, { button: 0 });
-    fireEvent.click(builtInTab);
+    const builtInFilter = screen.getByRole("radio", { name: /^Built-in/ });
+    fireEvent.click(builtInFilter);
+    await waitFor(() => expect(builtInFilter).toBeChecked());
 
-    await waitFor(() =>
-      expect(builtInTab).toHaveAttribute("data-state", "active"),
-    );
-
-    expect(screen.getByTestId("voice-row-alloy")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-card-alloy")).toBeInTheDocument();
     expect(await screen.findByText("Alloy")).toBeInTheDocument();
-    expect(screen.getAllByText("Built-in voice").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Built-in").length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    // Play on a built-in voice generates its preview first.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Play preview for Alloy" }),
+    );
 
     await waitFor(() =>
       expect(apiMocks.generateTTSWithStats).toHaveBeenCalledWith({
@@ -209,10 +210,11 @@ describe("VoicesPage", () => {
       }),
     );
 
-    expect(
-      await screen.findByText("Generating a preview sample for this speaker."),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Preview" })).toBeDisabled();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Play preview for Alloy" }),
+      ).toBeDisabled(),
+    );
   });
 
   it("includes a saved-voice-capable model when redirecting saved voices to text to speech", async () => {
@@ -328,7 +330,12 @@ describe("VoicesPage", () => {
 
     await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
+    const menu = screen.getByRole("button", {
+      name: "More actions for Balanced 21 yo",
+    });
+    fireEvent.pointerDown(menu, { button: 0, ctrlKey: false });
+    fireEvent.click(menu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
 
     expect(
       await screen.findByRole("dialog", { name: "Delete voice?" }),
@@ -340,8 +347,29 @@ describe("VoicesPage", () => {
     );
     await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalledTimes(2));
     await waitFor(() =>
-      expect(screen.queryByTestId("voice-row-voice-balanced")).not.toBeInTheDocument(),
+      expect(screen.queryByTestId("voice-card-voice-balanced")).not.toBeInTheDocument(),
     );
+  });
+
+  it("searches the loaded voices by name and notes", async () => {
+    render(
+      <MemoryRouter>
+        <VoicesPage {...baseProps} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: /^All/ }));
+    expect(await screen.findByTestId("voice-card-voice-balanced")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search voices" }), {
+      target: { value: "alloy" },
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("voice-card-voice-balanced")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("voice-card-alloy")).toBeInTheDocument();
   });
 
   it("keeps only top-level model action while removing secondary strips", async () => {
@@ -353,17 +381,12 @@ describe("VoicesPage", () => {
 
     await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalled());
 
-    const allVoicesTab = screen.getByRole("tab", { name: /All Voices/i });
-    fireEvent.mouseDown(allVoicesTab, { button: 0 });
-    fireEvent.click(allVoicesTab);
-
-    await waitFor(() =>
-      expect(allVoicesTab).toHaveAttribute("data-state", "active"),
-    );
+    const allVoicesFilter = screen.getByRole("radio", { name: /^All/ });
+    fireEvent.click(allVoicesFilter);
+    await waitFor(() => expect(allVoicesFilter).toBeChecked());
 
     expect(await screen.findByText("Balanced 21 yo")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
-    expect(screen.queryByRole("radio", { name: "All" })).not.toBeInTheDocument();
     expect(screen.queryByRole("radio", { name: "Cloned" })).not.toBeInTheDocument();
     expect(screen.queryByRole("radio", { name: "Designed" })).not.toBeInTheDocument();
     expect(
@@ -475,13 +498,9 @@ describe("VoicesPage", () => {
 
     await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalled());
 
-    const builtInTab = screen.getByRole("tab", { name: /Built-in Voices/i });
-    fireEvent.mouseDown(builtInTab, { button: 0 });
-    fireEvent.click(builtInTab);
-
-    await waitFor(() =>
-      expect(builtInTab).toHaveAttribute("data-state", "active"),
-    );
+    const builtInFilter = screen.getByRole("radio", { name: /^Built-in/ });
+    fireEvent.click(builtInFilter);
+    await waitFor(() => expect(builtInFilter).toBeChecked());
 
     expect(await screen.findByText("Alice")).toBeInTheDocument();
     expect(screen.queryByText("Chelsie")).not.toBeInTheDocument();
@@ -512,7 +531,9 @@ describe("VoicesPage", () => {
     expect(await screen.findByText("Chelsie")).toBeInTheDocument();
     expect(screen.queryByText("Alice")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Play preview for Chelsie" }),
+    );
 
     await waitFor(() =>
       expect(apiMocks.generateTTSWithStats).toHaveBeenCalledWith({

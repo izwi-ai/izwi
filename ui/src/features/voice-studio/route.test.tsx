@@ -106,7 +106,7 @@ describe("VoiceStudioPage", () => {
   it("opens creation modal from the page header action", () => {
     renderVoiceStudio("/voices");
 
-    fireEvent.click(screen.getByRole("button", { name: "New Voice" }));
+    fireEvent.click(screen.getByRole("button", { name: "New voice" }));
 
     expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Clone Voice/i })).toBeInTheDocument();

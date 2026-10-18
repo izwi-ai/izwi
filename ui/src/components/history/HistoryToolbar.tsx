@@ -73,6 +73,8 @@ export function SearchField({ value, onChange, placeholder }: SearchFieldProps) 
 export interface SegmentOption<T extends string> {
   id: T;
   label: string;
+  /** Known count for this option; otherwise only the selected one shows a count. */
+  count?: number;
 }
 
 interface SegmentedFilterProps<T extends string> {
@@ -99,6 +101,8 @@ export function SegmentedFilter<T extends string>({
     >
       {options.map((option) => {
         const selected = option.id === value;
+        const count =
+          option.count ?? (selected ? (selectedCount ?? undefined) : undefined);
         return (
           <button
             key={option.id}
@@ -114,10 +118,10 @@ export function SegmentedFilter<T extends string>({
             )}
           >
             {option.label}
-            {selected && selectedCount != null ? " " : null}
-            {selected && selectedCount != null ? (
+            {count != null ? " " : null}
+            {count != null ? (
               <span className="text-[11px] text-[var(--text-subtle)]">
-                {selectedCount}
+                {count}
               </span>
             ) : null}
           </button>

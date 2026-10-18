@@ -19,6 +19,7 @@ export interface AudioPlayback {
   playbackRate: number;
   error: string | null;
   toggle: () => Promise<void>;
+  pause: () => void;
   seek: (time: number) => void;
   skip: (deltaSeconds: number) => void;
   setPlaybackRate: (rate: number) => void;
@@ -84,6 +85,10 @@ export function useAudioPlayback(
     }
   }, [playErrorMessage, src]);
 
+  const pause = useCallback(() => {
+    audioRef.current?.pause();
+  }, []);
+
   const seek = useCallback(
     (time: number) => {
       const clamped = Math.max(0, Math.min(time, duration || 0));
@@ -115,6 +120,7 @@ export function useAudioPlayback(
     playbackRate,
     error,
     toggle,
+    pause,
     seek,
     skip,
     setPlaybackRate,
