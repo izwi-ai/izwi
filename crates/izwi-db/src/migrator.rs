@@ -1155,6 +1155,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
+        table: "chat_messages",
+        column: "model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "chat_messages",
+        column: "finish_reason",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
         table: "onboarding_state",
         column: "analytics_opt_in",
         definition: "INTEGER NOT NULL DEFAULT 0",

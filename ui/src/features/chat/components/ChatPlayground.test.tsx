@@ -1430,6 +1430,33 @@ describe("ChatPlayground", () => {
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
   });
 
+  it("parses past replies by the model that wrote them", async () => {
+    const thread = {
+      id: "mixed-thread", title: "Mixed models", model_id: "LFM2.5-1.2B-Instruct-GGUF",
+      created_at: 1, updated_at: 3, last_message_preview: null, message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+      { id: "u1", thread_id: thread.id, role: "user", content: "Question", created_at: 1,
+        tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant",
+        content: "private planning</think>Visible answer", created_at: 2,
+        tokens_generated: 12, generation_time_ms: 50, model_id: "Qwen3.5-4B",
+        finish_reason: "stop" },
+    ] });
+    render(<MemoryRouter initialEntries={["/chat?threadId=mixed-thread"]}>
+      <ChatPlayground selectedModel="LFM2.5-1.2B-Instruct-GGUF" selectedModelReady={true}
+        supportsThinking={false} modelLabel="LFM2.5 1.2B Instruct"
+        modelOptions={[{ value: "LFM2.5-1.2B-Instruct-GGUF", label: "LFM2.5 1.2B Instruct",
+          statusLabel: "Ready", isReady: true }]}
+        modelSupportsThinking={(variant) => variant.startsWith("Qwen3.5")}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+
+    expect(await screen.findByText("Visible answer")).toBeInTheDocument();
+    expect(screen.queryByText(/private planning<\/think>/)).not.toBeInTheDocument();
+  });
+
   it("shows decode speed and TTFT for a streamed turn after history refreshes", async () => {
     const model = "Qwen3.5-4B";
     const thread = { id: "timed-thread", title: "Timed answer", model_id: model,

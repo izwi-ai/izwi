@@ -637,6 +637,10 @@ ALTER TABLE runtime_artifacts ADD COLUMN IF NOT EXISTS publication_key TEXT NULL
 
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS content_parts TEXT NULL;
 
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS model_id TEXT NULL;
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS finish_reason TEXT NULL;
+
 ALTER TABLE onboarding_state ADD COLUMN IF NOT EXISTS analytics_opt_in BIGINT NOT NULL DEFAULT 0;
 
 ALTER TABLE transcription_records ADD COLUMN IF NOT EXISTS transcription_mode TEXT NOT NULL DEFAULT 'transcription';

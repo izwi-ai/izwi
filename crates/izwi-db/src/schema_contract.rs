@@ -56,6 +56,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "created_at",
             "tokens_generated",
             "generation_time_ms",
+            "model_id",
+            "finish_reason",
         ],
     },
     RequiredSchemaTable {

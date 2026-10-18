@@ -1576,21 +1576,33 @@ export function ChatPlayground({
                         index === visibleMessages.length - 1 &&
                         isStreaming &&
                         streamingThreadId === activeThreadId;
+                      // Parse each reply by the model that wrote it (stored
+                      // per message; the thread model for older replies), so
+                      // past reasoning does not depend on today's toggle.
+                      const writerImplicitThink = message.model_id
+                        ? (modelSupportsThinking?.(message.model_id) ??
+                          supportsImplicitOpenThinkTagParsing(message.model_id))
+                        : implicitOpenThinkTagModel;
+                      // Models without thinking support never show reasoning:
+                      // stray think tags from them are artifacts to hide.
+                      const showsReasoning =
+                        !isUser &&
+                        (writerImplicitThink ||
+                          (isLastAssistant && isStreaming && thinkingEnabledForModel));
                       const assistantDisplayContent = isUser
                         ? message.content
-                        : thinkingEnabledForModel
+                        : showsReasoning
                           ? message.content
                           : stripThinkingArtifacts(message.content || "");
-                      const parsed = isUser
-                        ? null
-                        : thinkingEnabledForModel
-                          ? parseAssistantContent(message.content || "", {
-                              implicitOpenThinkTag:
-                                implicitOpenThinkTagModel &&
-                                thinkingEnabledForModel,
-                              treatNoTagAsThinking: isLastAssistant && isStreaming,
-                            })
-                          : null;
+                      const parsed = showsReasoning
+                        ? parseAssistantContent(message.content || "", {
+                            implicitOpenThinkTag: writerImplicitThink,
+                            treatNoTagAsThinking:
+                              isLastAssistant &&
+                              isStreaming &&
+                              thinkingEnabledForModel,
+                          })
+                        : null;
                       const messageKey = message.id;
                       const isThoughtExpanded = !!expandedThoughts[messageKey];
                       const showStreamingThinking =

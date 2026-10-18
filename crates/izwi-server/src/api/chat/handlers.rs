@@ -27,7 +27,8 @@ use crate::chat_store::{
 use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::{
-    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation,
+    ChatFinishReason, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole,
+    ChatTemplateKwargs, ChatTruncation,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -441,6 +442,7 @@ pub async fn create_thread_message(
             model_id.clone(),
             generation.tokens_generated,
             generation.generation_time_ms,
+            chat_finish_reason(&generation),
             requested_system_prompt,
         )
         .await
@@ -514,7 +516,8 @@ async fn create_streaming_thread_message(
                                 model_id_for_task.clone(),
                                 generation.tokens_generated,
                                 generation.generation_time_ms,
-                                system_prompt_update.clone(),
+                                chat_finish_reason(&generation),
+                                system_prompt_update.clone()
                             )
                             .await
                         {
@@ -569,6 +572,19 @@ async fn create_streaming_thread_message(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+/// Why an assistant reply ended, in the OpenAI vocabulary the UI already
+/// knows: `length` at the token limit, `stop` otherwise for a completed
+/// reply.
+fn chat_finish_reason(generation: &ChatGeneration) -> Option<String> {
+    let reason = match generation.finish_reason {
+        Some(ChatFinishReason::MaxTokens) => "length",
+        Some(ChatFinishReason::Aborted) => "cancelled",
+        Some(ChatFinishReason::Error) => "error",
+        Some(ChatFinishReason::StopToken | ChatFinishReason::StopSequence) | None => "stop",
+    };
+    Some(reason.to_string())
 }
 
 /// Placeholder for a past image turn when the target model reads text only
@@ -790,6 +806,8 @@ mod tests {
                 created_at: index as u64,
                 tokens_generated: Some(48),
                 generation_time_ms: Some(224.0),
+                model_id: None,
+                finish_reason: None,
             })
             .collect::<Vec<_>>();
         let (messages, _) = build_runtime_messages(
@@ -821,6 +839,8 @@ mod tests {
                 created_at: 1,
                 tokens_generated: None,
                 generation_time_ms: None,
+                model_id: None,
+                finish_reason: None,
             }],
             &FlattenedMultimodalContent {
                 display_text: "How are you?".to_string(),
@@ -854,6 +874,8 @@ mod tests {
                 created_at: 1,
                 tokens_generated: None,
                 generation_time_ms: None,
+                model_id: None,
+                finish_reason: None,
             }],
             &FlattenedMultimodalContent {
                 display_text: "Describe this".to_string(),
@@ -886,6 +908,8 @@ mod tests {
             created_at: 1,
             tokens_generated: None,
             generation_time_ms: None,
+            model_id: None,
+            finish_reason: None,
         }
     }
 

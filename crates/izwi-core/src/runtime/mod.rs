@@ -82,7 +82,7 @@ pub use telemetry::{
     TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
 };
 pub use types::{
-    AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig,
+    AsrTranscription, AudioChunk, ChatFinishReason, ChatGeneration, ChunkStats, DiarizationConfig,
     DiarizationPipelineOptions, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord, GenerationConfig, GenerationRequest, GenerationResult,
     InferenceOptions, RuntimeRequestContext, SpeakerAttributedAsrResult,

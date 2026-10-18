@@ -631,6 +631,8 @@ mod tests {
         ("job_stages", "cancellation_state"),
         ("chat_threads", "system_prompt"),
         ("chat_messages", "content_parts"),
+        ("chat_messages", "model_id"),
+        ("chat_messages", "finish_reason"),
         ("media_assets", "source_asset_id"),
         ("media_assets", "canonical_profile_version"),
         ("provider_write_reservations", "provider_request_json"),

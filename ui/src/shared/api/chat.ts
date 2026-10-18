@@ -78,6 +78,8 @@ export interface ChatThread {
   updated_at: number;
   last_message_preview: string | null;
   message_count: number;
+  /** Whether any message in the thread carries an image. */
+  has_images?: boolean;
 }
 
 export interface ChatThreadMessageRecord {
@@ -89,6 +91,10 @@ export interface ChatThreadMessageRecord {
   created_at: number;
   tokens_generated: number | null;
   generation_time_ms: number | null;
+  /** Model that wrote an assistant reply (absent for older messages). */
+  model_id?: string | null;
+  /** Why an assistant reply ended: stop, length, cancelled or error. */
+  finish_reason?: string | null;
 }
 
 export interface ChatThreadDetail {

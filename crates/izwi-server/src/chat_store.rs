@@ -73,6 +73,13 @@ pub struct ChatThreadMessage {
     pub created_at: u64,
     pub tokens_generated: Option<usize>,
     pub generation_time_ms: Option<f64>,
+    /// Model that wrote an assistant message (None for user messages and
+    /// messages saved before this was recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Why an assistant reply ended: stop, length, cancelled or error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -148,6 +155,8 @@ impl ChatStore {
             created_at: i64_to_u64(created_at),
             tokens_generated: None,
             generation_time_ms: None,
+            model_id: None,
+            finish_reason: None,
         })
     }
 
@@ -375,6 +384,7 @@ impl ChatStore {
             .transpose()
             .context("Failed serializing chat message content_parts")?;
 
+        let message_model_id = (role == "assistant").then(|| model_id.clone()).flatten();
         chat_messages::Entity::insert(chat_messages::ActiveModel {
             id: Set(message_id.clone()),
             thread_id: Set(thread_id.clone()),
@@ -384,6 +394,8 @@ impl ChatStore {
             created_at: Set(created_at),
             tokens_generated: Set(tokens_i64),
             generation_time_ms: Set(generation_time_ms),
+            model_id: Set(message_model_id.clone()),
+            finish_reason: Set(None),
         })
         .exec(&tx)
         .await
@@ -410,6 +422,8 @@ impl ChatStore {
             created_at: i64_to_u64(created_at),
             tokens_generated,
             generation_time_ms,
+            model_id: message_model_id,
+            finish_reason: None,
         })
     }
 
@@ -426,6 +440,7 @@ impl ChatStore {
         model_id: String,
         tokens_generated: usize,
         generation_time_ms: f64,
+        finish_reason: Option<String>,
         system_prompt_update: Option<String>,
     ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
         if user_message.role != "user" {
@@ -473,6 +488,8 @@ impl ChatStore {
             created_at: i64_to_u64(assistant_created_at),
             tokens_generated: Some(tokens_generated),
             generation_time_ms: Some(generation_time_ms),
+            model_id: Some(model_id.clone()),
+            finish_reason,
         };
 
         insert_thread_message(&tx, &user_message).await?;
@@ -538,6 +555,8 @@ where
         created_at: Set(i64::try_from(message.created_at).unwrap_or(i64::MAX)),
         tokens_generated: Set(opt_usize_to_i64(message.tokens_generated)?),
         generation_time_ms: Set(message.generation_time_ms),
+        model_id: Set(message.model_id.clone()),
+        finish_reason: Set(message.finish_reason.clone()),
     })
     .exec(db)
     .await
@@ -634,7 +653,9 @@ const CHAT_MESSAGES_LIST_SQL: &str = r#"
         content_parts,
         created_at,
         tokens_generated,
-        generation_time_ms
+        generation_time_ms,
+        model_id,
+        finish_reason
     FROM chat_messages
     WHERE thread_id = ?1
     ORDER BY created_at ASC, id ASC
@@ -693,6 +714,8 @@ fn map_thread_message(row: &QueryResult) -> anyhow::Result<ChatThreadMessage> {
         created_at: i64_to_u64(row.try_get_by_index(5)?),
         tokens_generated: tokens_generated_raw.map(i64_to_usize),
         generation_time_ms: row.try_get_by_index(7)?,
+        model_id: row.try_get_by_index(8)?,
+        finish_reason: row.try_get_by_index(9)?,
     })
 }
 
@@ -900,6 +923,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turns_record_the_model_and_finish_reason() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread(None, None)
+                .await
+                .expect("thread should create");
+            let pending = store
+                .prepare_user_message(thread.id.clone(), "Hi".to_string(), None)
+                .await
+                .expect("pending user message");
+            let (user, assistant) = store
+                .append_turn_with_system_prompt(
+                    pending,
+                    "Hello!".to_string(),
+                    "Qwen3.5-4B".to_string(),
+                    3,
+                    10.0,
+                    Some("length".to_string()),
+                    None,
+                )
+                .await
+                .expect("turn should persist");
+            assert_eq!(user.model_id, None);
+            assert_eq!(assistant.model_id.as_deref(), Some("Qwen3.5-4B"));
+
+            let messages = store
+                .list_messages(thread.id.clone())
+                .await
+                .expect("messages should list");
+            assert_eq!(messages[0].model_id, None);
+            assert_eq!(messages[1].model_id.as_deref(), Some("Qwen3.5-4B"));
+            assert_eq!(messages[1].finish_reason.as_deref(), Some("length"));
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn persists_threads_messages_and_content_parts() {
         with_env_lock(async {
             let (_temp, store) = setup_store();
@@ -1058,6 +1120,7 @@ mod tests {
                         "LFM2.5-1.2B-Thinking-GGUF".into(),
                         48,
                         224.0,
+                        None,
                         Some("new prompt".into()),
                     )
                     .await;
@@ -1083,6 +1146,7 @@ mod tests {
                     "LFM2.5-1.2B-Thinking-GGUF".into(),
                     8,
                     100.0,
+                    None,
                     None,
                 )
                 .await
@@ -1124,6 +1188,7 @@ mod tests {
                     "Qwen3.5-4B".to_string(),
                     7,
                     12.5,
+                    None,
                     None,
                 )
                 .await
@@ -1172,6 +1237,7 @@ mod tests {
                     "Qwen3.5-4B".to_string(),
                     2,
                     1.0,
+                    None,
                     Some("updated prompt".to_string()),
                 )
                 .await
@@ -1191,6 +1257,7 @@ mod tests {
                     "Qwen3.5-4B".to_string(),
                     2,
                     1.0,
+                    None,
                     None,
                 )
                 .await
@@ -1240,6 +1307,7 @@ mod tests {
                     "Qwen3.5-4B".to_string(),
                     usize::MAX,
                     1.0,
+                    None,
                     Some("must not persist".to_string()),
                 )
                 .await
@@ -1312,6 +1380,7 @@ mod tests {
                         "Qwen3.6-35B-A3B-FP8".to_string(),
                         8,
                         1.0,
+                        None,
                         None,
                     )
                     .await
