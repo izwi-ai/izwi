@@ -38,13 +38,6 @@ function matches(command: Command, query: string): boolean {
     .every((term) => haystack.includes(term));
 }
 
-export function isMacPlatform(): boolean {
-  return (
-    typeof navigator !== "undefined" &&
-    /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent)
-  );
-}
-
 interface CommandPaletteProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;

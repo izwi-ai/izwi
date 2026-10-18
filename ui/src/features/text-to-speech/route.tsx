@@ -19,6 +19,10 @@ import { useTextToSpeechHistory } from "@/features/text-to-speech/hooks/useTextT
 import { useSpeechStreamPlayback } from "@/features/text-to-speech/hooks/useSpeechStreamPlayback";
 import { useTextToSpeechRecord } from "@/features/text-to-speech/hooks/useTextToSpeechRecord";
 import {
+  newItemShortcutTitle,
+  useNewItemShortcut,
+} from "@/hooks/useNewItemShortcut";
+import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
 } from "@/features/text-to-speech/support";
@@ -256,6 +260,8 @@ export function TextToSpeechPage({
       setStreamingRecord(null);
     }
   }, [record, streamingRecord]);
+
+  useNewItemShortcut(() => setIsNewTextToSpeechModalOpen(true));
 
   // ?create=speech (the command palette) opens the creation modal, then
   // drops the parameter so a refresh or Back does not reopen it.
@@ -495,6 +501,7 @@ export function TextToSpeechPage({
                   size="sm"
                   className="h-9 gap-2"
                   onClick={() => setIsNewTextToSpeechModalOpen(true)}
+                  title={newItemShortcutTitle("New generation")}
                 >
                   New generation
                 </Button>

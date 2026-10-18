@@ -8,13 +8,8 @@ import {
   type SpeechHistoryRecord,
   type SpeechHistoryRecordCreateRequest,
 } from "@/api";
+import { CreationDialog } from "@/components/CreationDialog";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { StatusBadge } from "@/components/ui/status-badge";
 import {
@@ -369,39 +364,20 @@ export function NewTextToSpeechModal({
     : "mt-3 h-9 w-full gap-2";
 
   return (
-    <Dialog
+    <CreationDialog
       open={isOpen}
+      onClose={onClose}
       modal={!isModelManagerOpen}
-      onOpenChange={(open) => !open && onClose()}
+      blockDismiss={isModelManagerOpen}
+      className="max-w-[52rem]"
+      title="New text-to-speech job"
+      description="Create a generation job and open it on its own record page immediately."
+      onSubmit={() => void submitGeneration()}
+      submitLabel="Create generation"
+      submitIcon={<Sparkles className="h-4 w-4" />}
+      submitting={isSubmitting}
+      footerStart={`${Array.from(text).length} characters`}
     >
-      <DialogContent
-        className="max-w-[52rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
-        onEscapeKeyDown={(event) => {
-          if (isModelManagerOpen) {
-            event.preventDefault();
-          }
-        }}
-        onPointerDownOutside={(event) => {
-          if (isModelManagerOpen) {
-            event.preventDefault();
-          }
-        }}
-        onInteractOutside={(event) => {
-          if (isModelManagerOpen) {
-            event.preventDefault();
-          }
-        }}
-      >
-        <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-          <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-            New text-to-speech job
-          </DialogTitle>
-          <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-            Create a generation job and open it on its own record page
-            immediately.
-          </DialogDescription>
-        </div>
-
         <div className="grid gap-0 lg:grid-cols-[minmax(0,1.15fr),minmax(18rem,0.85fr)]">
           <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
             <div className="mb-3 flex items-start justify-between gap-3">
@@ -430,25 +406,6 @@ export function NewTextToSpeechModal({
               className="min-h-[15rem] w-full resize-y rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 text-sm leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-muted)] focus:border-[var(--status-info-text)]"
             />
 
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs text-[var(--text-muted)]">
-                {Array.from(text).length} characters
-              </div>
-              <Button
-                type="button"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={() => void submitGeneration()}
-                disabled={isSubmitting}
-              >
-                {isSubmitting ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Sparkles className="h-4 w-4" />
-                )}
-                Create generation
-              </Button>
-            </div>
           </div>
 
           <div className="px-5 py-5 sm:px-6">
@@ -618,7 +575,6 @@ export function NewTextToSpeechModal({
             ) : null}
           </div>
         </div>
-      </DialogContent>
-    </Dialog>
+    </CreationDialog>
   );
 }

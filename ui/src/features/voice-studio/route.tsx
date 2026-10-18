@@ -13,6 +13,10 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import {
+  newItemShortcutTitle,
+  useNewItemShortcut,
+} from "@/hooks/useNewItemShortcut";
 import { VoicesPage } from "@/features/voices/route";
 import { VIEW_CONFIGS } from "@/types";
 
@@ -53,6 +57,12 @@ export function VoiceStudioPage({
   // /voice-cloning and /voice-design redirect here with ?tab=clone|design:
   // open the creation modal on that step, then drop the parameter so a
   // refresh or Back does not reopen it.
+  const openNewVoice = () => {
+    setCreationStep("choice");
+    setIsCreationModalOpen(true);
+  };
+  useNewItemShortcut(openNewVoice);
+
   const requestedTab = searchParams.get("tab");
   useEffect(() => {
     if (requestedTab !== "clone" && requestedTab !== "design") {
@@ -123,10 +133,8 @@ export function VoiceStudioPage({
         actions={
           <>
             <Button
-              onClick={() => {
-                setCreationStep("choice");
-                setIsCreationModalOpen(true);
-              }}
+              onClick={openNewVoice}
+              title={newItemShortcutTitle("New voice")}
               className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
             >
               <Plus className="h-4 w-4" />

@@ -24,7 +24,8 @@ import {
   type NavItem,
 } from "@/app/layouts/navigation";
 import { RuntimeCard } from "@/app/layouts/RuntimeCard";
-import { CommandPalette, isMacPlatform } from "@/app/command/CommandPalette";
+import { CommandPalette } from "@/app/command/CommandPalette";
+import { isMacPlatform } from "@/lib/platform";
 
 const appIconUrl = APP_ICON_URL;
 const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";

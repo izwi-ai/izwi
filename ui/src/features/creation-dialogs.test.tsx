@@ -35,16 +35,18 @@ describe("viewport-safe creation dialogs", () => {
       />,
     );
 
+    // CreationDialog frame: the viewport-capped dialog keeps its header and
+    // footer in place while the body between them scrolls.
     const dialog = screen.getByRole("dialog", {
       name: "New text-to-speech job",
     });
-    expect(dialog).toHaveClass("overflow-y-auto");
-    expect(dialog).not.toHaveClass("overflow-hidden");
+    expect(dialog).toHaveClass("flex", "flex-col", "overflow-hidden");
+    const body = screen.getByText("Stream results").closest(".overflow-y-auto");
+    expect(body).not.toBeNull();
+    expect(dialog).toContainElement(body as HTMLElement);
+    const submit = screen.getByRole("button", { name: "Create generation" });
+    expect(body).not.toContainElement(submit);
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Create generation" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Stream results")).toBeInTheDocument();
   });
 
   it("keeps the transcription title, upload action, and final setting reachable", () => {

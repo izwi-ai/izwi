@@ -42,6 +42,10 @@ import {
 } from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
+import {
+  newItemShortcutTitle,
+  useNewItemShortcut,
+} from "@/hooks/useNewItemShortcut";
 import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
 import { AnimatePresence, motion } from "framer-motion";
 import { Settings2 } from "lucide-react";
@@ -479,6 +483,7 @@ export function TranscriptionPage({
     setNewSpeechTextMode("transcription");
     setIsNewTranscriptionModalOpen(true);
   }, []);
+  useNewItemShortcut(handleOpenNewTranscriptionModal);
   const handleCloseNewTranscriptionModal = useCallback(() => {
     setIsNewTranscriptionModalOpen(false);
     if (searchParams.has("create")) {
@@ -802,6 +807,7 @@ export function TranscriptionPage({
                   size="sm"
                   className="h-9 gap-2"
                   onClick={handleOpenNewTranscriptionModal}
+                  title={newItemShortcutTitle("New transcript")}
                 >
                   New transcript
                 </Button>
