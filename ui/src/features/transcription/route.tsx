@@ -49,6 +49,8 @@ import {
   SegmentedFilter,
 } from "@/components/history/HistoryToolbar";
 import { NewItemButton } from "@/components/history/NewItemButton";
+import { CREATION_DIALOG_CONTENT_CLASS } from "@/components/CreationDialog";
+import { cn } from "@/lib/utils";
 import {
   parseTranscriptionFilter,
   TRANSCRIPTION_FILTER_OPTIONS,
@@ -901,7 +903,7 @@ export function TranscriptionPage({
             }}
           >
             <DialogContent
-              className="max-w-[52rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+              className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-[52rem]")}
               onEscapeKeyDown={(event) => {
                 if (isModelModalOpen) {
                   event.preventDefault();
@@ -921,6 +923,7 @@ export function TranscriptionPage({
               <AnimatePresence initial={false} mode="wait">
                 <motion.div
                   key={newSpeechTextMode}
+                  className="flex min-h-0 flex-1 flex-col"
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -6 }}

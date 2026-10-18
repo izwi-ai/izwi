@@ -6,13 +6,11 @@ import {
   type TranscriptionProcessingProgress,
   type TranscriptionRecord,
 } from "@/api";
-import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  CreationDialog,
+  CreationDialogFrame,
+} from "@/components/CreationDialog";
+import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { LANGUAGE_OPTIONS } from "@/features/transcription/playground/support";
 import {
@@ -572,21 +570,6 @@ export function NewTranscriptionModal({
           : "Creating job";
 
   const modalBody = (
-    <>
-      <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-          {modalTitle}
-        </DialogTitle>
-        <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-          Upload a recording, choose streaming, and open the job page once the
-          upload is accepted.
-        </DialogDescription>
-        <SpeechTextModeSwitch
-          selectedMode={selectedMode}
-          onSelectMode={onSelectMode}
-        />
-      </div>
-
       <div className="grid lg:grid-cols-[minmax(0,1.08fr),minmax(18rem,0.84fr)]">
         <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
           <div className="mb-4 flex items-start justify-between gap-4">
@@ -838,54 +821,41 @@ export function NewTranscriptionModal({
               ) : null}
             </div>
 
-          <div className="mt-4 flex justify-end">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={onClose}
-              disabled={isSubmitting}
-            >
-              Cancel
-            </Button>
-          </div>
         </div>
       </div>
-    </>
   );
+  const frameProps = {
+    title: modalTitle,
+    description:
+      "Upload a recording, choose streaming, and open the job page once the upload is accepted.",
+    header: (
+      <SpeechTextModeSwitch
+        selectedMode={selectedMode}
+        onSelectMode={onSelectMode}
+      />
+    ),
+    onClose,
+    footerStart: isSubmitting
+      ? `${submissionStatusLabel}…`
+      : "The job starts when you choose a file.",
+  };
 
   if (!renderInDialog) {
-    return modalBody;
+    return (
+      <CreationDialogFrame {...frameProps} cancelDisabled={isSubmitting}>
+        {modalBody}
+      </CreationDialogFrame>
+    );
   }
 
   return (
-    <Dialog
+    <CreationDialog
+      {...frameProps}
       open={isOpen}
-      onOpenChange={(open) => {
-        if (!open && !isSubmitting) {
-          onClose();
-        }
-      }}
+      blockDismiss={blockOutsideDismiss || isSubmitting}
+      className="max-w-[46rem]"
     >
-      <DialogContent
-        className="max-w-[46rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
-        onEscapeKeyDown={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-        onPointerDownOutside={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-        onInteractOutside={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-      >
-        {modalBody}
-      </DialogContent>
-    </Dialog>
+      {modalBody}
+    </CreationDialog>
   );
 }

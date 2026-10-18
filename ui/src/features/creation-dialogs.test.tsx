@@ -65,9 +65,15 @@ describe("viewport-safe creation dialogs", () => {
       />,
     );
 
+    // CreationDialog frame: the last setting sits in the scrolling body,
+    // Cancel stays in the fixed footer.
     const dialog = screen.getByRole("dialog", { name: "New transcript" });
-    expect(dialog).toHaveClass("overflow-y-auto");
-    expect(dialog).not.toHaveClass("overflow-hidden");
+    expect(dialog).toHaveClass("flex", "flex-col", "overflow-hidden");
+    const body = screen.getByText("Generate summary").closest(".overflow-y-auto");
+    expect(body).not.toBeNull();
+    expect(body).not.toContainElement(
+      screen.getByRole("button", { name: "Cancel" }),
+    );
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Upload audio file" }),
@@ -146,9 +152,15 @@ describe("viewport-safe creation dialogs", () => {
       />,
     );
 
+    // CreationDialog frame: the last setting sits in the scrolling body,
+    // Cancel stays in the fixed footer.
     const dialog = screen.getByRole("dialog", { name: "New diarization" });
-    expect(dialog).toHaveClass("overflow-y-auto");
-    expect(dialog).not.toHaveClass("overflow-hidden");
+    expect(dialog).toHaveClass("flex", "flex-col", "overflow-hidden");
+    const body = screen.getByText("Min silence (ms)").closest(".overflow-y-auto");
+    expect(body).not.toBeNull();
+    expect(body).not.toContainElement(
+      screen.getByRole("button", { name: "Cancel" }),
+    );
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Upload audio file" }),

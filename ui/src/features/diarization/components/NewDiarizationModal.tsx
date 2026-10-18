@@ -9,13 +9,11 @@ import {
 } from "lucide-react";
 
 import { api, type DiarizationRecord, type ModelInfo } from "@/api";
-import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  CreationDialog,
+  CreationDialogFrame,
+} from "@/components/CreationDialog";
+import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/ui/status-badge";
 import {
   clampIntegerDraft,
@@ -585,21 +583,6 @@ export function NewDiarizationModal({
           : "Creating run";
 
   const modalBody = (
-    <>
-      <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-          New diarization
-        </DialogTitle>
-        <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-          Upload a recording or mic capture, then open the job page once the
-          upload is accepted.
-        </DialogDescription>
-        <SpeechTextModeSwitch
-          selectedMode={selectedMode}
-          onSelectMode={onSelectMode}
-        />
-      </div>
-
       <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">
         <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
           <div className="mb-4 flex items-start justify-between gap-4">
@@ -882,37 +865,44 @@ export function NewDiarizationModal({
               ) : null}
             </div>
 
-          <div className="mt-4 flex justify-end">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={onClose}
-              disabled={isSubmitting || isRecording}
-            >
-              Cancel
-            </Button>
-          </div>
         </div>
       </div>
-    </>
   );
+  const busy = isSubmitting || isRecording;
+  const frameProps = {
+    title: "New diarization",
+    description:
+      "Upload a recording or mic capture, then open the job page once the upload is accepted.",
+    header: (
+      <SpeechTextModeSwitch
+        selectedMode={selectedMode}
+        onSelectMode={onSelectMode}
+      />
+    ),
+    onClose,
+    footerStart: isSubmitting
+      ? `${submissionStatusLabel}…`
+      : isRecording
+        ? "Recording…"
+        : "The run starts when you choose or record audio.",
+  };
 
   if (!renderInDialog) {
-    return modalBody;
+    return (
+      <CreationDialogFrame {...frameProps} cancelDisabled={busy}>
+        {modalBody}
+      </CreationDialogFrame>
+    );
   }
 
   return (
-    <Dialog
+    <CreationDialog
+      {...frameProps}
       open={isOpen}
-      onOpenChange={(open) => {
-        if (!open && !isSubmitting && !isRecording) {
-          onClose();
-        }
-      }}
+      blockDismiss={busy}
+      className="max-w-[52rem]"
     >
-      <DialogContent className="max-w-[52rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
-        {modalBody}
-      </DialogContent>
-    </Dialog>
+      {modalBody}
+    </CreationDialog>
   );
 }
