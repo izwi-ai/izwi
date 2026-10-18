@@ -133,6 +133,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
 
             window::build_main_window(app, &window_config)?;
             tray::build_basic_tray(app.handle())?;
+            tray_visibility::restore_tray_visibility(app.handle());
             Ok(())
         })
         .build(context)
