@@ -55,8 +55,6 @@ import {
   fallbackThreadTitleFromUserMessage,
   formatThreadTimestamp,
   getErrorMessage,
-  isQwen35ThinkingModel,
-  isQwen38ThinkingModel,
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
@@ -102,6 +100,7 @@ export function ChatPlayground({
   chatCapabilities,
   modelLabel,
   modelOptions,
+  modelSupportsThinking,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
@@ -269,8 +268,12 @@ export function ChatPlayground({
   const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
   supportsImageAttachmentsRef.current = supportsImageAttachments;
   const renderModelId = activeThread?.model_id ?? selectedModel;
-  const implicitOpenThinkTagModel =
-    supportsImplicitOpenThinkTagParsing(renderModelId);
+  // Parse by the capabilities of the model that wrote the thread, not the
+  // model selected now.
+  const implicitOpenThinkTagModel = renderModelId
+    ? (modelSupportsThinking?.(renderModelId) ??
+      supportsImplicitOpenThinkTagParsing(renderModelId))
+    : false;
   const chatSecondaryButtonClass =
     "rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]";
   const chatSecondaryButtonActiveClass =
@@ -912,16 +915,12 @@ export function ChatPlayground({
       generation_time_ms: null,
     };
 
-    const systemPrompt = systemPromptForModel(
-      selectedModel,
-      thinkingEnabledForModel,
-    );
-    const enableThinking =
-      (isQwen35ThinkingModel(selectedModel) ||
-        isQwen38ThinkingModel(selectedModel)) &&
-      supportsThinking
-        ? thinkingEnabledForModel
-        : undefined;
+    const systemPrompt = systemPromptForModel(supportsThinking);
+    // Every thinking-capable template reads enable_thinking; sending it only
+    // for some families left Qwen3.6 thinking regardless of the toggle.
+    const enableThinking = supportsThinking
+      ? thinkingEnabledForModel
+      : undefined;
     const selectedReasoningEffort =
       thinkingEnabledForModel &&
       supportedReasoningEfforts.includes(reasoningEffort)

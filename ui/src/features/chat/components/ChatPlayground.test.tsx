@@ -1042,6 +1042,73 @@ describe("ChatPlayground", () => {
     expect(request).not.toHaveProperty("reasoning_effort", expect.anything());
   });
 
+  it("forwards enable_thinking for Qwen3.6, whose template reads it", async () => {
+    const thread = {
+      id: "thread-qwen36",
+      title: "Qwen3.6 direct answer",
+      model_id: "Qwen3.6-35B-A3B-FP8",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-qwen36"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.6-35B-A3B-FP8"
+          selectedModelReady={true}
+          supportsThinking={true}
+          chatCapabilities={{
+            supports_thinking: true,
+            default_thinking_enabled: true,
+            reasoning_efforts: [],
+            default_reasoning_effort: null,
+            supports_preserve_thinking: false,
+          }}
+          modelLabel="Qwen3.6 35B A3B (FP8)"
+          modelOptions={[
+            {
+              value: "Qwen3.6-35B-A3B-FP8",
+              label: "Qwen3.6 35B A3B (FP8)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-qwen36"),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Disable thinking mode" }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Answer directly." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+    const request = apiMocks.sendChatThreadMessageStream.mock.calls[0]?.[1];
+    expect(request).toEqual(
+      expect.objectContaining({
+        enable_thinking: false,
+        system_prompt: "You are a helpful assistant.",
+      }),
+    );
+  });
+
   it("renders Qwen3.5 close-only think output as reasoning plus final answer", async () => {
     const thread = {
       id: "thread-4",

@@ -21,16 +21,15 @@ export interface ChatPlaygroundProps {
   chatCapabilities?: ChatModelCapabilities | null;
   modelLabel?: string | null;
   modelOptions: ModelOption[];
+  /**
+   * Catalog lookup for whether a model supports thinking; undefined when the
+   * model is not in the catalog. Used for threads written by another model.
+   */
+  modelSupportsThinking?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
 }
-
-export const THINKING_SYSTEM_PROMPT: ChatMessage = {
-  role: "system",
-  content:
-    "You are a helpful assistant. Always reason inside <think>...</think> before giving the final answer. Keep thinking concise, always close </think>, then provide a clear final answer outside the tags.",
-};
 
 export const DEFAULT_SYSTEM_PROMPT: ChatMessage = {
   role: "system",
@@ -365,6 +364,13 @@ export function isQwen35ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+export function isQwen36ThinkingModel(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("qwen3.6-");
+}
+
 export function isQwen38ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -409,30 +415,30 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase() === "lfm2.5-1.2b-thinking-gguf";
 }
 
+/**
+ * Name-based fallback for models missing from the catalog: the Qwen3.5/3.6/
+ * 3.8 and LFM2.5 Thinking templates pre-open `<think>` in the generation
+ * prompt, so their output can start inside an unopened think block.
+ */
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
   return (
     isLfm25ThinkingModel(variant) ||
     isQwen35ThinkingModel(variant) ||
+    isQwen36ThinkingModel(variant) ||
     isQwen38ThinkingModel(variant)
   );
 }
 
-export function systemPromptForModel(
-  variant: string | null,
-  thinkingEnabled: boolean,
-): string {
-  if (isQwen35ThinkingModel(variant) || isQwen38ThinkingModel(variant)) {
-    return NEUTRAL_SYSTEM_PROMPT.content;
-  }
-  if (thinkingEnabled) {
-    if (isLfm25ThinkingModel(variant)) {
-      return NEUTRAL_SYSTEM_PROMPT.content;
-    }
-    return THINKING_SYSTEM_PROMPT.content;
-  }
-  return DEFAULT_SYSTEM_PROMPT.content;
+/**
+ * Models whose chat template controls thinking through `enable_thinking`
+ * get a neutral prompt; others are asked to answer without reasoning tags.
+ */
+export function systemPromptForModel(supportsThinking: boolean): string {
+  return supportsThinking
+    ? NEUTRAL_SYSTEM_PROMPT.content
+    : DEFAULT_SYSTEM_PROMPT.content;
 }
 
 export function buildChatThreadMessagePayload(options: {

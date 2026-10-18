@@ -1,3 +1,5 @@
+import { useCallback } from "react";
+
 import type { ModelInfo } from "@/api";
 import { PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -66,6 +68,16 @@ export function ChatPage({
       }),
   });
 
+  const modelSupportsThinking = useCallback(
+    (variant: string) => {
+      const model = models.find((candidate) => candidate.variant === variant);
+      return model
+        ? Boolean(model.chat_capabilities?.supports_thinking)
+        : undefined;
+    },
+    [models],
+  );
+
   return (
     <PageShell className="flex min-h-0 flex-col">
       <ChatPlayground
@@ -81,6 +93,7 @@ export function ChatPage({
         }
         chatCapabilities={selectedModelInfo?.chat_capabilities ?? null}
         modelOptions={modelOptions}
+        modelSupportsThinking={modelSupportsThinking}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
