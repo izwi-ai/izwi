@@ -16,6 +16,8 @@ type CreationStep = "choice" | "clone" | "design" | "success";
 interface VoiceCreationModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Step to show each time the modal opens; defaults to the chooser. */
+  initialStep?: "choice" | "clone" | "design";
   onUseSavedVoiceInTts?: (voiceId: string) => void;
   onVoiceCreated?: (voiceId: string) => void;
   designModel: string | null;
@@ -60,6 +62,7 @@ function stepDescription(step: CreationStep): string {
 export function VoiceCreationModal({
   open,
   onOpenChange,
+  initialStep = "choice",
   onUseSavedVoiceInTts,
   onVoiceCreated,
   designModel,
@@ -83,7 +86,16 @@ export function VoiceCreationModal({
       setHasDraftProgress(false);
       setShowDiscardPrompt(false);
       setSavedVoiceResult(null);
+      return;
     }
+    // Opening straight into clone or design (from "New voice" menu entries or
+    // old /voice-cloning and /voice-design links) skips the chooser.
+    if (initialStep !== "choice") {
+      setStep(initialStep);
+      setHasDraftProgress(true);
+    }
+    // Runs on open/close only: initialStep changing while the modal is open
+    // must not yank the user out of the step they are on.
   }, [open]);
 
   const requestClose = () => {

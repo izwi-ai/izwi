@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Plus, Settings2 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -44,7 +44,26 @@ export function VoiceStudioPage({
   onError,
 }: VoiceStudioPageProps) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [isCreationModalOpen, setIsCreationModalOpen] = useState(false);
+  const [creationStep, setCreationStep] = useState<
+    "choice" | "clone" | "design"
+  >("choice");
+
+  // /voice-cloning and /voice-design redirect here with ?tab=clone|design:
+  // open the creation modal on that step, then drop the parameter so a
+  // refresh or Back does not reopen it.
+  const requestedTab = searchParams.get("tab");
+  useEffect(() => {
+    if (requestedTab !== "clone" && requestedTab !== "design") {
+      return;
+    }
+    setCreationStep(requestedTab);
+    setIsCreationModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("tab");
+    setSearchParams(next, { replace: true });
+  }, [requestedTab, searchParams, setSearchParams]);
   const [voicesRefreshKey, setVoicesRefreshKey] = useState(0);
   const [voicesModelManagerRequestKey, setVoicesModelManagerRequestKey] =
     useState(0);
@@ -104,7 +123,10 @@ export function VoiceStudioPage({
         actions={
           <>
             <Button
-              onClick={() => setIsCreationModalOpen(true)}
+              onClick={() => {
+                setCreationStep("choice");
+                setIsCreationModalOpen(true);
+              }}
               className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
             >
               <Plus className="h-4 w-4" />
@@ -148,6 +170,7 @@ export function VoiceStudioPage({
       <VoiceCreationModal
         open={isCreationModalOpen}
         onOpenChange={setIsCreationModalOpen}
+        initialStep={creationStep}
         onVoiceCreated={() => {
           setVoicesRefreshKey((current) => current + 1);
         }}
