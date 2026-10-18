@@ -55,7 +55,12 @@ export function bootstrapDocumentTheme() {
     return;
   }
 
-  const storedPreference = getStoredThemePreference(window.localStorage);
+  let storedPreference: ThemePreference = "system";
+  try {
+    storedPreference = getStoredThemePreference(window.localStorage);
+  } catch {
+    // Storage can be blocked (private mode, sandboxing); follow the system.
+  }
   const resolvedTheme = resolveThemePreference(
     storedPreference,
     getCurrentSystemTheme(),

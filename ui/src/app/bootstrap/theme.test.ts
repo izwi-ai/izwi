@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import {
   THEME_STORAGE_KEY,
@@ -42,5 +45,11 @@ describe("theme bootstrap", () => {
     applyDocumentTheme("light", root);
     expect(root.classList.contains("theme-light")).toBe(true);
     expect(root.style.colorScheme).toBe("light");
+  });
+
+  it("keeps the pre-paint theme script on the same storage key", () => {
+    // Vitest runs from the ui package root.
+    const script = readFileSync(resolve("public/theme-init.js"), "utf8");
+    expect(script).toContain(`"${THEME_STORAGE_KEY}"`);
   });
 });
