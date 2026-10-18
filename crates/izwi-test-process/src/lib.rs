@@ -109,7 +109,9 @@ fn kill_group(leader: u32) {
 /// (std opens pipes close-on-exec, so spawned processes do not inherit it), and
 /// kills every group still listed when the pipe closes. Its own group and the
 /// ignored INT/HUP/TERM keep a terminal's Ctrl+C from killing it before it has
-/// done so.
+/// done so. The group is named as `kill -KILL -<group>` without `--`: dash
+/// (Debian and Ubuntu's `/bin/sh`) reads the word after a signal option as a
+/// pid, so `--` aborts its `kill` with "Illegal number" and kills nothing.
 #[cfg(unix)]
 mod watcher {
     use std::io::Write;
@@ -127,7 +129,7 @@ while read -r op group; do
          groups=$kept ;;
   esac
 done
-for g in $groups; do kill -KILL -- "-$g" 2>/dev/null; done
+for g in $groups; do kill -KILL "-$g" 2>/dev/null; done
 "#;
 
     fn pipe() -> Option<&'static Mutex<ChildStdin>> {

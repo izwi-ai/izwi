@@ -1836,8 +1836,19 @@ mod tests {
             return;
         };
         let family = metal_apple_gpu_family(&device).expect("Apple GPU family");
-        eprintln!("Metal device family: Apple{}", family.0);
-        assert!(family >= AppleGpuFamily(7), "{family:?}");
+        let Device::Metal(metal) = &device else {
+            unreachable!("metal_test_device_or_skip returns a Metal device");
+        };
+        let name = {
+            use objc2_metal::MTLDevice;
+            metal.device().as_ref().name().to_string()
+        };
+        eprintln!("Metal device family: Apple{} ({name})", family.0);
+        // macOS VMs (GitHub's hosted runners among them) expose an "Apple
+        // Paravirtual device" that reports an older family than its host.
+        if !name.contains("Paravirtual") {
+            assert!(family >= AppleGpuFamily(7), "{family:?} on {name}");
+        }
         assert_eq!(
             metal_supports_fast_bf16(&device),
             family >= AppleGpuFamily::FAST_BF16

@@ -768,6 +768,8 @@ impl BatchRuntimeStore {
                 vec![cutoff.into(), MAX_JOBS.into()],
             )?)
             .await?;
+        // A byte range over `speech-pcm/…` keys: publication_key is
+        // COLLATE "C" on PostgreSQL (app migration 6), BINARY on SQLite.
         let page_sql = concat!(
             select_runtime_artifacts!(),
             " WHERE job_id = ?1 AND publication_key >= 'speech-pcm/'",

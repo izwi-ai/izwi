@@ -1904,8 +1904,22 @@ async fn provider_without_reserved_writes_is_rejected_before_bytes_are_sent() {
 async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
     let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let mut store = conformance_store(&database, provider.clone()).await;
-    store.set_reservation_lifetime_for_test(Duration::from_millis(100));
+    // Both clocks are fixed so each 10 ms reservation expires only when the
+    // test advances them, however slowly it runs.
+    let clock = Arc::new(AtomicI64::new(1_000));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
+    metadata.set_test_clock(clock.clone());
+    provider.set_now_unix_ms(1_000);
+    let mut store = ArtifactStore::new(
+        Arc::new(metadata),
+        provider.clone(),
+        ArtifactStoreLimits {
+            max_object_bytes: 1024,
+            ..Default::default()
+        },
+    )
+    .expect("artifact store");
+    store.set_reservation_lifetime_for_test(Duration::from_millis(10));
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
 
     for key in [
@@ -1930,7 +1944,8 @@ async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
                 "invalid provider storage key"
             ))
         ));
-        tokio::time::sleep(Duration::from_millis(110)).await;
+        let now = clock.fetch_add(100, Ordering::SeqCst) + 100;
+        provider.set_now_unix_ms(now as u64);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
         assert_eq!(provider.object_count(), 0);
     }

@@ -605,6 +605,19 @@ pub async fn validate_provider_managed_schema(db: &DatabaseConnection) -> anyhow
         }
     }
 
+    // Speech replay selects publication keys by byte range; under a
+    // linguistic collation that range matches nothing (app migration 6).
+    if db.get_database_backend() == DbBackend::Postgres
+        && !missing_tables.contains(&"runtime_artifacts")
+        && load_column_collation(db, "runtime_artifacts", "publication_key")
+            .await?
+            .as_deref()
+            != Some("C")
+    {
+        missing_columns
+            .push("runtime_artifacts.publication_key (COLLATE \"C\", app migration 6)".to_string());
+    }
+
     if !missing_tables.is_empty() || !missing_columns.is_empty() || !missing_indexes.is_empty() {
         bail!(
             "Enterprise database schema is incomplete. Missing tables: [{}]. Missing columns: [{}]. Missing or invalid unique indexes: [{}]. Run the provider-managed schema setup before starting Izwi.",
@@ -734,6 +747,33 @@ async fn load_table_columns(
                 .map_err(Into::into)
         })
         .collect()
+}
+
+/// A PostgreSQL column's explicit collation; `None` when it uses the
+/// database default.
+async fn load_column_collation(
+    db: &DatabaseConnection,
+    table: &'static str,
+    column: &'static str,
+) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one_raw(raw::statement(
+            db,
+            r#"
+            SELECT collation_name
+            FROM information_schema.columns
+            WHERE table_schema = ANY (current_schemas(false))
+              AND table_name = ?1
+              AND column_name = ?2
+            "#,
+            vec![table.into(), column.into()],
+        )?)
+        .await
+        .with_context(|| format!("Failed to inspect the collation of {table}.{column}"))?;
+    Ok(row
+        .map(|row| row.try_get_by_index::<Option<String>>(0))
+        .transpose()?
+        .flatten())
 }
 
 async fn validate_required_seed_data(db: &DatabaseConnection) -> anyhow::Result<()> {

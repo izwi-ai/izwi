@@ -37,6 +37,7 @@ impl Schema {
                 (3, "artifact cleanup quota"),
                 (4, "media reference indexes"),
                 (5, "diarization alignment and node ownership"),
+                (6, "byte-ordered artifact publication keys"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -170,6 +171,12 @@ async fn apply_migration<C: ConnectionTrait>(
         (Schema::App, 5) => {
             for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
                 ensure_column(db, column).await?;
+            }
+        }
+        // SQLite already compares TEXT byte by byte (BINARY).
+        (Schema::App, 6) => {
+            if backend == DbBackend::Postgres {
+                db.execute_unprepared(PUBLICATION_KEY_BYTE_ORDER).await?;
             }
         }
         (Schema::Fleet, 1) => {
@@ -995,6 +1002,15 @@ const ALIGNMENT_AND_OWNERSHIP_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 6 (PostgreSQL): publication keys are machine identifiers that
+/// the speech replay and PCM entry-limit queries select by byte range
+/// (`>= 'speech-pcm/' AND < 'speech-pcm0'`). Under a database's default
+/// linguistic collation (`en_US.utf8` in the official image) glibc ignores
+/// punctuation, so `speech-pcm/…01` sorts after `speech-pcm0` and the range
+/// matched nothing. The `"C"` collation keeps the range and its index exact.
+pub(crate) const PUBLICATION_KEY_BYTE_ORDER: &str =
+    r#"ALTER TABLE runtime_artifacts ALTER COLUMN publication_key TYPE TEXT COLLATE "C""#;
+
 async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
         db.execute_unprepared(statement).await?;
@@ -1522,6 +1538,8 @@ pub(crate) fn postgres_schema_sql() -> String {
     for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
         push(&add_column(column));
     }
+    // Migration 6.
+    push(PUBLICATION_KEY_BYTE_ORDER);
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1590,6 +1608,52 @@ mod tests {
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'fleet'").await,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_keys_compare_byte_by_byte_on_postgres() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("app schema migrates");
+        if db.get_database_backend() != DbBackend::Postgres {
+            return;
+        }
+        let row = db
+            .query_one_raw(raw::statement_without_values(
+                db,
+                "SELECT collation_name FROM information_schema.columns \
+                 WHERE table_schema = ANY (current_schemas(false)) \
+                 AND table_name = 'runtime_artifacts' AND column_name = 'publication_key'",
+            ))
+            .await
+            .unwrap()
+            .expect("publication_key exists");
+        assert_eq!(
+            row.try_get_by_index::<Option<String>>(0)
+                .unwrap()
+                .as_deref(),
+            Some("C")
+        );
+        crate::schema_contract::validate_provider_managed_schema(db)
+            .await
+            .expect("the migrated schema meets the provider contract");
+
+        // A provider-managed schema left on the database's linguistic
+        // collation would select no speech replay entries, so it is refused.
+        db.execute_unprepared(
+            r#"ALTER TABLE runtime_artifacts ALTER COLUMN publication_key TYPE TEXT COLLATE "default""#,
+        )
+        .await
+        .unwrap();
+        let error = crate::schema_contract::validate_provider_managed_schema(db)
+            .await
+            .expect_err("a linguistic publication-key collation is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_artifacts.publication_key"),
+            "{error}"
         );
     }
 
