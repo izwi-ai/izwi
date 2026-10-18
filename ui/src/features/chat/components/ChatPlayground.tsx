@@ -16,14 +16,10 @@ import {
   Square,
   User,
   Loader2,
-  ChevronDown,
-  ChevronRight,
   Settings2,
   Plus,
   Trash2,
   AlertTriangle,
-  ImageIcon,
-  Film,
 } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
@@ -58,11 +54,8 @@ import {
   fallbackThreadTitleFromUserMessage,
   getErrorMessage,
   normalizeGeneratedThreadTitle,
-  parseAssistantContent,
-  parseUserMessageDisplayFromContentParts,
   readImageFileAsDataUrl,
   statsAfterHistoryRefresh,
-  stripThinkingArtifacts,
   summarizeChatStats,
   type StreamedTurnStats,
   systemPromptForModel,
@@ -77,7 +70,8 @@ import {
   type ChatThread,
   type ChatThreadMessageRecord,
 } from "@/api";
-import { MarkdownContent } from "@/components/ui/MarkdownContent";
+import { AssistantMessage } from "@/features/chat/components/messages/AssistantMessage";
+import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
@@ -1551,10 +1545,7 @@ export function ChatPlayground({
                   <div className="max-w-4xl mx-auto space-y-6">
                     {visibleMessages.map((message, index) => {
                       const isUser = message.role === "user";
-                      const parsedUserMessage = isUser
-                        ? parseUserMessageDisplayFromContentParts(message)
-                        : null;
-                      const isLastAssistant =
+                      const isStreamingReply =
                         !isUser &&
                         index === visibleMessages.length - 1 &&
                         isStreaming &&
@@ -1566,41 +1557,7 @@ export function ChatPlayground({
                         ? (modelSupportsThinking?.(message.model_id) ??
                           supportsImplicitOpenThinkTagParsing(message.model_id))
                         : implicitOpenThinkTagModel;
-                      // Models without thinking support never show reasoning:
-                      // stray think tags from them are artifacts to hide.
-                      const showsReasoning =
-                        !isUser &&
-                        (writerImplicitThink ||
-                          (isLastAssistant && isStreaming && thinkingEnabledForModel));
-                      const assistantDisplayContent = isUser
-                        ? message.content
-                        : showsReasoning
-                          ? message.content
-                          : stripThinkingArtifacts(message.content || "");
-                      const parsed = showsReasoning
-                        ? parseAssistantContent(message.content || "", {
-                            implicitOpenThinkTag: writerImplicitThink,
-                            treatNoTagAsThinking:
-                              isLastAssistant &&
-                              isStreaming &&
-                              thinkingEnabledForModel,
-                          })
-                        : null;
                       const messageKey = message.id;
-                      const isThoughtExpanded = !!expandedThoughts[messageKey];
-                      const showStreamingThinking =
-                        !isUser &&
-                        !!parsed &&
-                        isLastAssistant &&
-                        parsed.thinking.length > 0 &&
-                        (parsed.hasIncompleteThink ||
-                          parsed.answer.length === 0);
-                      const showAnswerOnly =
-                        !isUser &&
-                        !!parsed &&
-                        parsed.answer.length > 0 &&
-                        parsed.hasThink &&
-                        !showStreamingThinking;
 
                       return (
                         <motion.div
@@ -1642,154 +1599,28 @@ export function ChatPlayground({
                               )}
                             >
                               {isUser ? (
-                                <>
-                                  {(!parsedUserMessage ||
-                                    parsedUserMessage.text ||
-                                    parsedUserMessage.attachments.length ===
-                                      0) && (
-                                    <MarkdownContent
-                                      content={
-                                        parsedUserMessage &&
-                                        parsedUserMessage.attachments.length > 0
-                                          ? parsedUserMessage.text
-                                          : message.content
-                                      }
-                                      className="leading-relaxed [&_p]:m-0 [&_p]:bg-transparent [&_mark]:bg-transparent [&_code]:bg-transparent [&_code]:border-0 [&_code]:px-0 [&_code]:py-0 [&_code]:font-inherit"
-                                    />
-                                  )}
-                                  {parsedUserMessage &&
-                                    parsedUserMessage.attachments.length >
-                                      0 && (
-                                      <div
-                                        className={cn(
-                                          "flex flex-wrap gap-2",
-                                          parsedUserMessage.text && "mt-2",
-                                        )}
-                                      >
-                                        {parsedUserMessage.attachments.map(
-                                          (attachment, attachmentIndex) => (
-                                            <div
-                                              key={`${messageKey}-attachment-${attachmentIndex}`}
-                                            >
-                                              {attachment.kind === "image" &&
-                                              attachment.source ? (
-                                                <button
-                                                  type="button"
-                                                  onClick={() =>
-                                                    setImagePreview({
-                                                      source:
-                                                        attachment.source!,
-                                                      label: attachment.label,
-                                                    })
-                                                  }
-                                                  title={`Open ${attachment.label}`}
-                                                  className="block h-16 w-16 overflow-hidden rounded-md border border-primary-foreground/20 bg-primary-foreground/10 hover:bg-primary-foreground/15 transition-colors focus:outline-none focus:ring-2 focus:ring-primary-foreground/70"
-                                                >
-                                                  <img
-                                                    src={attachment.source}
-                                                    alt={attachment.label}
-                                                    loading="lazy"
-                                                    className="h-full w-full object-cover"
-                                                  />
-                                                </button>
-                                              ) : (
-                                                <div className="inline-flex max-w-[220px] items-center gap-1.5 rounded-md border border-primary-foreground/20 bg-primary-foreground/10 px-2 py-1 text-xs text-primary-foreground/90">
-                                                  {attachment.kind ===
-                                                  "image" ? (
-                                                    <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-                                                  ) : (
-                                                    <Film className="h-3.5 w-3.5 shrink-0" />
-                                                  )}
-                                                  <span className="truncate">
-                                                    {attachment.label}
-                                                  </span>
-                                                </div>
-                                              )}
-                                            </div>
-                                          ),
-                                        )}
-                                      </div>
-                                    )}
-                                </>
+                                <UserMessage
+                                  message={message}
+                                  onOpenImage={setImagePreview}
+                                />
                               ) : (
-                                <>
-                                  {showStreamingThinking && parsed && (
-                                    <div className="mb-3 rounded-lg bg-muted/50 border border-[var(--border-muted)] px-3 py-2 text-xs text-muted-foreground">
-                                      <div className="mb-2 flex items-center gap-1.5 uppercase tracking-wider text-[10px] font-semibold">
-                                        <Loader2 className="w-3 h-3 animate-spin text-primary" />
-                                        Thinking
-                                      </div>
-                                      <div
-                                        ref={streamingThinkingRef}
-                                        onScroll={handleStreamingThinkingScroll}
-                                        className="h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[color-mix(in_srgb,var(--border-muted)_70%,transparent)] bg-background/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed scrollbar-thin sm:h-48"
-                                      >
-                                        {parsed.thinking}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {parsed && parsed.answer.length > 0 ? (
-                                    <MarkdownContent content={parsed.answer} />
-                                  ) : parsed && parsed.hasThink ? (
-                                    <div className="italic text-muted-foreground opacity-70">
-                                      {isLastAssistant
-                                        ? "Thinking..."
-                                        : "No final answer was generated."}
-                                    </div>
-                                  ) : assistantDisplayContent.trim().length > 0 ? (
-                                    <MarkdownContent
-                                      content={assistantDisplayContent}
-                                    />
-                                  ) : !isLastAssistant ? (
-                                    <div className="italic text-muted-foreground opacity-70">
-                                      No visible answer was generated. Please retry the message.
-                                    </div>
-                                  ) : null}
-
-                                  {parsed &&
-                                    parsed.hasThink &&
-                                    !showStreamingThinking && (
-                                      <div className="mt-3 border-t pt-2">
-                                        <button
-                                          onClick={() =>
-                                            setExpandedThoughts((previous) => ({
-                                              ...previous,
-                                              [messageKey]:
-                                                !previous[messageKey],
-                                            }))
-                                          }
-                                          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground font-medium transition-colors"
-                                        >
-                                          {isThoughtExpanded ? (
-                                            <ChevronDown className="w-3 h-3" />
-                                          ) : (
-                                            <ChevronRight className="w-3 h-3" />
-                                          )}
-                                          {isThoughtExpanded
-                                            ? "Hide thought process"
-                                            : "Show thought process"}
-                                        </button>
-                                      </div>
-                                    )}
-
-                                  {parsed &&
-                                    parsed.hasThink &&
-                                    !showStreamingThinking &&
-                                    isThoughtExpanded && (
-                                      <div className="mt-2 h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-[var(--border-muted)] bg-muted/30 px-3 py-2 text-xs font-mono text-[11px] leading-relaxed text-muted-foreground scrollbar-thin sm:h-48">
-                                        {parsed.thinking}
-                                      </div>
-                                    )}
-
-                                  {isLastAssistant &&
-                                    ((parsed && parsed.answer.length > 0) ||
-                                      !showAnswerOnly) && (
-                                      <span className="inline-flex items-center ml-2 align-middle">
-                                        <span className="w-1.5 h-4 bg-primary animate-pulse inline-block" />
-                                      </span>
-                                    )}
-                                </>
+                                <AssistantMessage
+                                  message={message}
+                                  isStreamingReply={isStreamingReply}
+                                  implicitThink={writerImplicitThink}
+                                  thinkingEnabled={thinkingEnabledForModel}
+                                  isThoughtExpanded={!!expandedThoughts[messageKey]}
+                                  onToggleThought={() =>
+                                    setExpandedThoughts((previous) => ({
+                                      ...previous,
+                                      [messageKey]: !previous[messageKey],
+                                    }))
+                                  }
+                                  streamingThinkingRef={streamingThinkingRef}
+                                  onStreamingThinkingScroll={
+                                    handleStreamingThinkingScroll
+                                  }
+                                />
                               )}
                             </div>
                           </div>
