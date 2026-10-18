@@ -51,9 +51,10 @@ use crate::media_ingest::{
     MediaIngestRequest, MediaIngestResult,
 };
 use crate::speech_history_store::{
-    CompleteSpeechHistoryRecord, NewSpeechHistoryRecord, SpeechHistoryProcessingStatus,
-    SpeechHistoryRecord, SpeechHistoryRecordListCursor, SpeechHistoryRecordSummary,
-    SpeechRouteKind, SpeechWavSpool, StoredSpeechAudio,
+    CompleteSpeechHistoryRecord, NewSpeechHistoryRecord, SpeechHistoryListFilter,
+    SpeechHistoryProcessingStatus, SpeechHistoryRecord, SpeechHistoryRecordListCursor,
+    SpeechHistoryRecordSummary, SpeechHistoryVoiceKind, SpeechRouteKind, SpeechWavSpool,
+    StoredSpeechAudio,
 };
 use crate::state::AppState;
 use izwi_core::audio::{inspect_audio_bytes, AudioEncoder, AudioFormat};
@@ -86,6 +87,65 @@ pub(crate) struct RecordAudioQuery {
 pub struct SpeechHistoryRecordListResponse {
     pub records: Vec<SpeechHistoryRecordSummary>,
     pub pagination: CursorPagination,
+    /// Records matching the filters, ignoring paging.
+    pub total: usize,
+}
+
+/// Paging plus optional filters for history lists.
+#[derive(Debug, Default, Deserialize)]
+pub struct SpeechHistoryListParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Case-insensitive search over the input text and speaker name.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// `builtin` or `saved`.
+    #[serde(default)]
+    pub voice_kind: Option<String>,
+    /// Comma-separated statuses: pending, processing, ready, failed.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Unix milliseconds; only records created at or after this time.
+    #[serde(default)]
+    pub created_after: Option<u64>,
+}
+
+impl SpeechHistoryListParams {
+    fn filter(&self) -> Result<SpeechHistoryListFilter, ApiError> {
+        let voice_kind = match self.voice_kind.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some("builtin") | Some("built_in") => Some(SpeechHistoryVoiceKind::BuiltIn),
+            Some("saved") => Some(SpeechHistoryVoiceKind::Saved),
+            Some(other) => {
+                return Err(ApiError::bad_request(format!(
+                    "Invalid `voice_kind` {other:?}. Supported values: builtin, saved."
+                )))
+            }
+        };
+        let statuses = self
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+            .map(|status| {
+                SpeechHistoryProcessingStatus::from_db_value(status).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "Invalid `status` {status:?}. Supported values: pending, processing, ready, failed."
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SpeechHistoryListFilter {
+            search: self.q.clone(),
+            voice_kind,
+            statuses,
+            created_after: self.created_after,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -421,23 +481,23 @@ async fn prepare_stream_pcm(
 
 pub async fn list_text_to_speech_records(
     State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
+    Query(params): Query<SpeechHistoryListParams>,
 ) -> Result<Json<SpeechHistoryRecordListResponse>, ApiError> {
-    list_records(state, SpeechRouteKind::TextToSpeech, query).await
+    list_records(state, SpeechRouteKind::TextToSpeech, params).await
 }
 
 pub async fn list_voice_design_records(
     State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
+    Query(params): Query<SpeechHistoryListParams>,
 ) -> Result<Json<SpeechHistoryRecordListResponse>, ApiError> {
-    list_records(state, SpeechRouteKind::VoiceDesign, query).await
+    list_records(state, SpeechRouteKind::VoiceDesign, params).await
 }
 
 pub async fn list_voice_cloning_records(
     State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
+    Query(params): Query<SpeechHistoryListParams>,
 ) -> Result<Json<SpeechHistoryRecordListResponse>, ApiError> {
-    list_records(state, SpeechRouteKind::VoiceCloning, query).await
+    list_records(state, SpeechRouteKind::VoiceCloning, params).await
 }
 
 pub async fn get_text_to_speech_record(
@@ -594,23 +654,28 @@ pub async fn create_voice_cloning_record(
 async fn list_records(
     state: AppState,
     route_kind: SpeechRouteKind,
-    query: CursorPaginationQuery,
+    params: SpeechHistoryListParams,
 ) -> Result<Json<SpeechHistoryRecordListResponse>, ApiError> {
+    let filter = params.filter()?;
+    let query = CursorPaginationQuery {
+        limit: params.limit,
+        cursor: params.cursor,
+    };
     let limit = query.resolved_limit(HISTORY_LIST_LIMIT, 500);
     let cursor = query.decode_cursor::<SpeechHistoryRecordListCursor>()?;
-    let (records, next_cursor) = state
+    let page = state
         .speech_history_store
-        .list_records_page(route_kind, limit, cursor)
+        .list_records_filtered(route_kind, limit, cursor, &filter)
         .await
         .map_err(map_store_error)?;
-    let has_more = next_cursor.is_some();
     Ok(Json(SpeechHistoryRecordListResponse {
-        records,
+        records: page.records,
         pagination: CursorPagination {
-            next_cursor: next_cursor.map(|value| encode_cursor(&value)),
-            has_more,
+            has_more: page.next_cursor.is_some(),
+            next_cursor: page.next_cursor.map(|value| encode_cursor(&value)),
             limit,
         },
+        total: page.total,
     }))
 }
 

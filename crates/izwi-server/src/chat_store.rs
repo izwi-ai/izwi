@@ -170,7 +170,7 @@ impl ChatStore {
             .as_deref()
             .map(str::trim)
             .filter(|search| !search.is_empty())
-            .map(like_pattern);
+            .map(raw::like_contains_pattern);
         let after = query.after.as_ref();
         // SQLite treats a negative LIMIT as "no limit"; fetch one extra row to
         // learn whether another page exists.
@@ -672,20 +672,6 @@ fn map_thread_summary(row: &QueryResult) -> anyhow::Result<ChatThreadSummary> {
         message_count: i64_to_usize(message_count_raw),
         has_images: has_images_raw != 0,
     })
-}
-
-/// LIKE pattern for a literal substring: escape the wildcards with `\`.
-fn like_pattern(search: &str) -> String {
-    let mut pattern = String::with_capacity(search.len() + 2);
-    pattern.push('%');
-    for character in search.chars() {
-        if matches!(character, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(character);
-    }
-    pattern.push('%');
-    pattern
 }
 
 fn u64_to_i64(value: u64) -> i64 {

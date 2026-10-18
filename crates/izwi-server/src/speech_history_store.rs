@@ -289,7 +289,7 @@ impl SpeechHistoryProcessingStatus {
         }
     }
 
-    fn from_db_value(raw: &str) -> Option<Self> {
+    pub(crate) fn from_db_value(raw: &str) -> Option<Self> {
         match raw {
             "pending" => Some(Self::Pending),
             "processing" => Some(Self::Processing),
@@ -330,6 +330,35 @@ pub struct SpeechHistoryRecordSummary {
 pub struct SpeechHistoryRecordListCursor {
     pub created_at: u64,
     pub id: String,
+}
+
+/// Which kind of voice a record used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechHistoryVoiceKind {
+    /// A model's built-in speaker.
+    BuiltIn,
+    /// A saved (cloned or designed) voice.
+    Saved,
+}
+
+/// Optional list filters; the default lists every record.
+#[derive(Debug, Clone, Default)]
+pub struct SpeechHistoryListFilter {
+    /// Case-insensitive match on the input text or the speaker name.
+    pub search: Option<String>,
+    pub voice_kind: Option<SpeechHistoryVoiceKind>,
+    /// Only these statuses; empty means all.
+    pub statuses: Vec<SpeechHistoryProcessingStatus>,
+    /// Only records created at or after this Unix millisecond time.
+    pub created_after: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeechHistoryPage {
+    pub records: Vec<SpeechHistoryRecordSummary>,
+    pub next_cursor: Option<SpeechHistoryRecordListCursor>,
+    /// Records matching the filter, ignoring paging.
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -493,6 +522,8 @@ impl SpeechHistoryStore {
         self
     }
 
+    /// Unfiltered page; the API goes through `list_records_filtered`.
+    #[cfg(test)]
     pub async fn list_records_page(
         &self,
         route_kind: SpeechRouteKind,
@@ -502,44 +533,49 @@ impl SpeechHistoryStore {
         Vec<SpeechHistoryRecordSummary>,
         Option<SpeechHistoryRecordListCursor>,
     )> {
-        let db = self.db.connection().await?;
-        let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
-        let fetch_limit = list_limit.saturating_add(1);
+        let page = self
+            .list_records_filtered(
+                route_kind,
+                limit,
+                cursor,
+                &SpeechHistoryListFilter::default(),
+            )
+            .await?;
+        Ok((page.records, page.next_cursor))
+    }
 
-        let rows = if let Some(cursor) = cursor {
-            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(raw::statement(
-                db,
-                SPEECH_HISTORY_PAGE_AFTER_CURSOR_SQL,
-                vec![
-                    route_kind.as_db_value().into(),
-                    cursor_created_at.into(),
-                    cursor.id.into(),
-                    fetch_limit.into(),
-                ],
-            )?)
+    pub async fn list_records_filtered(
+        &self,
+        route_kind: SpeechRouteKind,
+        limit: usize,
+        cursor: Option<SpeechHistoryRecordListCursor>,
+        filter: &SpeechHistoryListFilter,
+    ) -> anyhow::Result<SpeechHistoryPage> {
+        let db = self.db.connection().await?;
+        let page_limit = limit.clamp(1, 500);
+        let fetch_limit = i64::try_from(page_limit + 1).unwrap_or(501);
+        let filter_values = speech_history_filter_values(route_kind, filter);
+
+        let mut values = filter_values.clone();
+        values.push(
+            cursor
+                .as_ref()
+                .map(|cursor| i64::try_from(cursor.created_at).unwrap_or(i64::MAX))
+                .into(),
+        );
+        values.push(cursor.map(|cursor| cursor.id).into());
+        values.push(fetch_limit.into());
+        let rows = db
+            .query_all_raw(raw::statement(db, SPEECH_HISTORY_PAGE_SQL, values)?)
             .await
-        } else {
-            db.query_all_raw(raw::statement(
-                db,
-                SPEECH_HISTORY_PAGE_SQL,
-                vec![route_kind.as_db_value().into(), fetch_limit.into()],
-            )?)
-            .await
-        }
-        .context("Failed to list speech history records")?;
+            .context("Failed to list speech history records")?;
 
         let mut records = rows
             .iter()
             .map(map_speech_history_summary)
             .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let page_limit = usize::try_from(list_limit).unwrap_or(200);
-        let has_more = records.len() > page_limit;
-        if has_more {
+        let next_cursor = if records.len() > page_limit {
             records.truncate(page_limit);
-        }
-        let next_cursor = if has_more {
             records.last().map(|record| SpeechHistoryRecordListCursor {
                 created_at: record.created_at,
                 id: record.id.clone(),
@@ -548,7 +584,20 @@ impl SpeechHistoryStore {
             None
         };
 
-        Ok((records, next_cursor))
+        let total = db
+            .query_one_raw(raw::statement(db, SPEECH_HISTORY_COUNT_SQL, filter_values)?)
+            .await
+            .context("Failed to count speech history records")?
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .transpose()?
+            .map(|count| usize::try_from(count).unwrap_or(0))
+            .unwrap_or(0);
+
+        Ok(SpeechHistoryPage {
+            records,
+            next_cursor,
+            total,
+        })
     }
 
     pub async fn get_record(
@@ -1231,33 +1280,64 @@ impl SpeechHistoryStore {
     }
 }
 
-const SPEECH_HISTORY_PAGE_SQL: &str = r#"
-    SELECT
-        id,
-        created_at,
-        route_kind,
-        processing_status,
-        processing_error,
-        model_id,
-        speaker,
-        language,
-        saved_voice_id,
-        speed,
-        input_text,
-        generation_time_ms,
-        audio_duration_secs,
-        rtf,
-        tokens_generated,
-        audio_mime_type,
-        audio_filename,
-        stop_reason
-    FROM speech_history_records
-    WHERE route_kind = ?1
-    ORDER BY created_at DESC, id DESC
-    LIMIT ?2
-"#;
+/// Bind values ?1-?5 for SPEECH_HISTORY_FILTER: route kind, search
+/// pattern, voice kind, ",status,…," list and created-after time (NULL =
+/// no filter).
+fn speech_history_filter_values(
+    route_kind: SpeechRouteKind,
+    filter: &SpeechHistoryListFilter,
+) -> Vec<sea_orm::Value> {
+    let search = filter
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty())
+        .map(raw::like_contains_pattern);
+    let voice_kind = filter.voice_kind.map(|kind| match kind {
+        SpeechHistoryVoiceKind::BuiltIn => "built_in",
+        SpeechHistoryVoiceKind::Saved => "saved",
+    });
+    let statuses = (!filter.statuses.is_empty()).then(|| {
+        let joined = filter
+            .statuses
+            .iter()
+            .map(|status| status.as_db_value())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(",{joined},")
+    });
+    vec![
+        route_kind.as_db_value().into(),
+        search.into(),
+        voice_kind.map(str::to_string).into(),
+        statuses.into(),
+        filter
+            .created_after
+            .map(|created_after| i64::try_from(created_after).unwrap_or(i64::MAX))
+            .into(),
+    ]
+}
 
-const SPEECH_HISTORY_PAGE_AFTER_CURSOR_SQL: &str = r#"
+macro_rules! speech_history_filter {
+    () => {
+        r#"
+    WHERE route_kind = ?1
+        AND (?2 IS NULL OR input_text LIKE ?2 ESCAPE '\' OR speaker LIKE ?2 ESCAPE '\')
+        AND (
+            ?3 IS NULL
+            OR (?3 = 'saved' AND saved_voice_id IS NOT NULL)
+            OR (?3 = 'built_in' AND saved_voice_id IS NULL AND speaker IS NOT NULL)
+        )
+        AND (?4 IS NULL OR instr(?4, ',' || processing_status || ',') > 0)
+        AND (?5 IS NULL OR created_at >= ?5)
+        "#
+    };
+}
+
+/// ?1-?5 filter (see speech_history_filter_values), ?6/?7 cursor (or NULL),
+/// ?8 limit.
+const SPEECH_HISTORY_PAGE_SQL: &str = concat!(
+    r#"
     SELECT
         id,
         created_at,
@@ -1277,12 +1357,19 @@ const SPEECH_HISTORY_PAGE_AFTER_CURSOR_SQL: &str = r#"
         audio_mime_type,
         audio_filename,
         stop_reason
-    FROM speech_history_records
-    WHERE route_kind = ?1
-        AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+    FROM speech_history_records"#,
+    speech_history_filter!(),
+    r#"
+        AND (?6 IS NULL OR created_at < ?6 OR (created_at = ?6 AND id < ?7))
     ORDER BY created_at DESC, id DESC
-    LIMIT ?4
-"#;
+    LIMIT ?8
+"#
+);
+
+const SPEECH_HISTORY_COUNT_SQL: &str = concat!(
+    "SELECT COUNT(1) FROM speech_history_records",
+    speech_history_filter!()
+);
 
 const SPEECH_HISTORY_RECORD_COLUMNS: &str = r#"
     id,
@@ -1767,6 +1854,112 @@ mod tests {
     }
 
     fn clear_env() {
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn filters_and_counts_history_records() {
+        let _guard = env_lock();
+        let (_temp_dir, store) = setup_store();
+        let records = [
+            NewSpeechHistoryRecord {
+                input_text: "The quick brown fox".to_string(),
+                ..ready_record()
+            },
+            NewSpeechHistoryRecord {
+                input_text: "Saved voice line".to_string(),
+                speaker: None,
+                saved_voice_id: Some("sv_one".to_string()),
+                ..ready_record()
+            },
+            NewSpeechHistoryRecord {
+                input_text: "A failed take".to_string(),
+                processing_status: SpeechHistoryProcessingStatus::Failed,
+                processing_error: Some("boom".to_string()),
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            },
+        ];
+        for record in records {
+            store.create_record(record).await.expect("record");
+        }
+        let list = |filter: SpeechHistoryListFilter| {
+            let store = store.clone();
+            async move {
+                store
+                    .list_records_filtered(SpeechRouteKind::TextToSpeech, 10, None, &filter)
+                    .await
+                    .expect("list")
+            }
+        };
+
+        let all = list(SpeechHistoryListFilter::default()).await;
+        assert_eq!((all.records.len(), all.total), (3, 3));
+
+        let fox = list(SpeechHistoryListFilter {
+            search: Some("BROWN".to_string()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(fox.total, 1);
+        assert_eq!(fox.records[0].input_preview, "The quick brown fox");
+
+        let by_speaker = list(SpeechHistoryListFilter {
+            search: Some("seren".to_string()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(by_speaker.total, 2, "the two built-in Serena records");
+
+        let saved = list(SpeechHistoryListFilter {
+            voice_kind: Some(SpeechHistoryVoiceKind::Saved),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(saved.total, 1);
+        let built_in = list(SpeechHistoryListFilter {
+            voice_kind: Some(SpeechHistoryVoiceKind::BuiltIn),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(built_in.total, 2);
+
+        let failed = list(SpeechHistoryListFilter {
+            statuses: vec![SpeechHistoryProcessingStatus::Failed],
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(failed.total, 1);
+        let active = list(SpeechHistoryListFilter {
+            statuses: vec![
+                SpeechHistoryProcessingStatus::Pending,
+                SpeechHistoryProcessingStatus::Processing,
+            ],
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(active.total, 0);
+
+        let future = list(SpeechHistoryListFilter {
+            created_after: Some(u64::MAX / 2),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(future.total, 0);
+
+        let paged = store
+            .list_records_filtered(
+                SpeechRouteKind::TextToSpeech,
+                2,
+                None,
+                &SpeechHistoryListFilter::default(),
+            )
+            .await
+            .expect("page");
+        assert_eq!((paged.records.len(), paged.total), (2, 3));
+        assert!(paged.next_cursor.is_some());
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
     }

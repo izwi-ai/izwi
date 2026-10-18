@@ -2668,6 +2668,35 @@ async fn root_and_v1_probe_routes_are_available() {
 }
 
 #[tokio::test]
+async fn text_to_speech_list_reports_total_and_validates_filters() {
+    let (app, _temp_dir) = test_api_app(
+        "text_to_speech_list_reports_total_and_validates_filters",
+        false,
+    );
+    let ok = send_request(
+        app.clone(),
+        build_request(
+            Method::GET,
+            "/v1/text-to-speech?q=hello&voice_kind=saved&status=ready,failed&created_after=0",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let body = read_json(ok).await;
+    assert_eq!(body["total"].as_u64(), Some(0));
+    assert_eq!(body["records"].as_array().map(Vec::len), Some(0));
+
+    for bad in [
+        "/v1/text-to-speech?voice_kind=robot",
+        "/v1/text-to-speech?status=done",
+    ] {
+        let response = send_request(app.clone(), build_request(Method::GET, bad, None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
 async fn chat_thread_list_supports_paging_and_search() {
     let (app, _temp_dir) = test_api_app("chat_thread_list_supports_paging_and_search", false);
     for title in ["First topic", "Second topic", "Unrelated"] {
