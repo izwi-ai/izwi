@@ -48,11 +48,23 @@ interface TextToSpeechHistoryTableProps {
   onRefresh?: () => void;
 }
 
+const LABEL_MAX_CHARS = 48;
+
+/**
+ * How a take is named in labels and notices: the opening of its text (as
+ * its record page title is), not the generated audio filename.
+ */
 function rowLabel(
   record: SpeechHistoryRecordSummary,
   voiceLabel: string,
 ): string {
-  return record.audio_filename || voiceLabel || record.model_id || record.id;
+  const text = record.input_preview.replace(/\s+/g, " ").trim();
+  if (text) {
+    return text.length > LABEL_MAX_CHARS
+      ? `${text.slice(0, LABEL_MAX_CHARS).trimEnd()}…`
+      : text;
+  }
+  return voiceLabel || record.model_id || record.id;
 }
 
 function initials(label: string): string {
@@ -337,7 +349,7 @@ export function TextToSpeechHistoryTable({
         columns={columns}
         getRowId={(record) => record.id}
         getRowLabel={(record) =>
-          `text-to-speech ${rowLabel(record, voiceLabelFor(record))}`
+          `speech "${rowLabel(record, voiceLabelFor(record))}"`
         }
         onOpenRow={(record) => onOpenRecord(record.id)}
         loading={loading}

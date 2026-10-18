@@ -506,7 +506,7 @@ describe("TextToSpeechPage", () => {
     expect(await screen.findByText("Hello world")).toBeInTheDocument();
 
     fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for voice-note\.wav/i }),
+      screen.getByRole("button", { name: "More actions for Hello world" }),
       { button: 0, ctrlKey: false },
     );
 
@@ -1257,7 +1257,7 @@ describe("TextToSpeechPage", () => {
     expect(await screen.findByText("Hello world")).toBeInTheDocument();
 
     fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for voice-note\.wav/i }),
+      screen.getByRole("button", { name: "More actions for Hello world" }),
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));

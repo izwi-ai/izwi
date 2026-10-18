@@ -421,7 +421,9 @@ export function TranscriptionHistoryTable({
         rows={records}
         columns={COLUMNS}
         getRowId={(record) => record.id}
-        getRowLabel={(record) => `${rowKind(record)} ${rowLabel(record)}`}
+        getRowLabel={(record) =>
+          `${rowKindLabel(record).toLowerCase()} ${rowLabel(record)}`
+        }
         onOpenRow={onOpenRecord}
         loading={loading}
         error={error}
