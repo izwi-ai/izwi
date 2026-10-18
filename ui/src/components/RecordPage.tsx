@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 
+import { usePageTitle } from "@/app/router/DocumentTitle";
 import { RowMenu, type RowMenuItem } from "@/components/history/RowMenu";
 import { PageHeader, type Breadcrumb } from "@/components/PageShell";
 
@@ -35,6 +36,7 @@ export function RecordPage({
   alerts,
   children,
 }: RecordPageProps) {
+  usePageTitle(title);
   return (
     <>
       <PageHeader

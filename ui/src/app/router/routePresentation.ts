@@ -1,6 +1,6 @@
 const APP_NAME = "Izwi";
 
-function withAppName(pageTitle: string): string {
+export function withAppName(pageTitle: string): string {
   return `${pageTitle} · ${APP_NAME}`;
 }
 

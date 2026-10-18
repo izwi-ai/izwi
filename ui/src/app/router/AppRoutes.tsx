@@ -17,6 +17,7 @@ import type {
   SharedPageProps,
   VoiceRouteProps,
 } from "@/app/router/types";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 
 const TextToSpeechPage = lazy(async () => {
@@ -160,9 +161,12 @@ export function AppRoutes() {
     onDelete: deleteModel,
     onRefresh: refreshModels,
   };
-  const selectedModelLabel =
-    models.find((model) => model.variant === selectedModel)?.variant ??
-    selectedModel;
+  const selectedModelInfo = models.find(
+    (model) => model.variant === selectedModel,
+  );
+  const selectedModelLabel = selectedModel
+    ? getModelDisplayName(selectedModel, selectedModelInfo?.display_name)
+    : null;
   useEffect(() => {
     if (!hasTrackedInitialRouteRef.current) {
       hasTrackedInitialRouteRef.current = true;
