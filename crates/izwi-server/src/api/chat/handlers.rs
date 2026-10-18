@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::{
     body::Body,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedMutexGuard;
 
+use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     generate_chat, parse_chat_model, resolve_chat_request_config, start_chat_stream_with_keepalive,
@@ -19,7 +20,10 @@ use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, variant_accepts_image_input,
     FlattenedMultimodalContent,
 };
-use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
+use crate::chat_store::{
+    sanitize_system_prompt, ChatThreadListCursor, ChatThreadListQuery, ChatThreadMessage,
+    ChatThreadSummary,
+};
 use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::{
@@ -49,6 +53,22 @@ fn validate_thread_response(text: &str, saw_nonempty_delta: bool) -> Result<(), 
 #[derive(Debug, Serialize)]
 pub struct ChatThreadListResponse {
     pub threads: Vec<ChatThreadSummary>,
+    /// Present when the request asked for a page (`limit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<CursorPagination>,
+    /// Threads matching `q`, ignoring paging.
+    pub total_count: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ChatThreadListParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Case-insensitive search over titles and message text.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,16 +211,38 @@ fn thread_stream_interruption_payload(saw_terminal: bool) -> Option<String> {
     (!saw_terminal).then(|| thread_stream_error_payload(CHAT_STREAM_INTERRUPTED_ERROR))
 }
 
+/// Lists threads, most recently updated first. Without `limit` every
+/// matching thread is returned, as before; with it, results are paged by
+/// `cursor`.
 pub async fn list_threads(
     State(state): State<AppState>,
+    Query(params): Query<ChatThreadListParams>,
 ) -> Result<Json<ChatThreadListResponse>, ApiError> {
-    let threads = state
+    let paging = CursorPaginationQuery {
+        limit: params.limit,
+        cursor: params.cursor,
+    };
+    let limit = params.limit.map(|_| paging.resolved_limit(50, 500));
+    let page = state
         .chat_store
-        .list_threads()
+        .list_threads_page(ChatThreadListQuery {
+            search: params.q,
+            limit,
+            after: paging.decode_cursor::<ChatThreadListCursor>()?,
+        })
         .await
         .map_err(map_store_error)?;
 
-    Ok(Json(ChatThreadListResponse { threads }))
+    let pagination = limit.map(|limit| CursorPagination {
+        has_more: page.next_cursor.is_some(),
+        next_cursor: page.next_cursor.as_ref().map(encode_cursor),
+        limit,
+    });
+    Ok(Json(ChatThreadListResponse {
+        threads: page.threads,
+        pagination,
+        total_count: page.total_count,
+    }))
 }
 
 pub async fn create_thread(

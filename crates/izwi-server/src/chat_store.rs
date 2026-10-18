@@ -6,7 +6,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     QueryResult, Set, TransactionTrait,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -17,6 +17,7 @@ use crate::db::{raw, write_transaction_options, StoreDatabase};
 use crate::entity::{chat_messages, chat_threads};
 use crate::error::StoreError;
 use crate::ids::new_uuid;
+use crate::text_preview::plain_text_preview;
 
 const DEFAULT_THREAD_TITLE: &str = "New chat";
 
@@ -28,8 +29,37 @@ pub struct ChatThreadSummary {
     pub system_prompt: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Plain-text, length-capped preview of the latest message.
     pub last_message_preview: Option<String>,
     pub message_count: usize,
+    /// Whether any message in the thread carries an image.
+    pub has_images: bool,
+}
+
+/// Position after the last thread of a page, in list order
+/// (updated_at, created_at, id, all descending).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatThreadListCursor {
+    pub updated_at: u64,
+    pub created_at: u64,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatThreadListQuery {
+    /// Case-insensitive match on the title or any message text.
+    pub search: Option<String>,
+    /// Page size; `None` lists every matching thread.
+    pub limit: Option<usize>,
+    pub after: Option<ChatThreadListCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatThreadPage {
+    pub threads: Vec<ChatThreadSummary>,
+    pub next_cursor: Option<ChatThreadListCursor>,
+    /// Threads matching the search, ignoring paging.
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,13 +151,79 @@ impl ChatStore {
         })
     }
 
+    /// Every thread, unpaged; the API goes through `list_threads_page`.
+    #[cfg(test)]
     pub async fn list_threads(&self) -> anyhow::Result<Vec<ChatThreadSummary>> {
+        Ok(self
+            .list_threads_page(ChatThreadListQuery::default())
+            .await?
+            .threads)
+    }
+
+    pub async fn list_threads_page(
+        &self,
+        query: ChatThreadListQuery,
+    ) -> anyhow::Result<ChatThreadPage> {
         let db = self.db.connection().await?;
+        let pattern = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|search| !search.is_empty())
+            .map(like_pattern);
+        let after = query.after.as_ref();
+        // SQLite treats a negative LIMIT as "no limit"; fetch one extra row to
+        // learn whether another page exists.
+        let fetch_limit = query
+            .limit
+            .map(|limit| i64::try_from(limit.clamp(1, 500)).unwrap_or(500) + 1)
+            .unwrap_or(-1);
         let rows = db
-            .query_all_raw(raw::statement_without_values(db, THREAD_SUMMARY_LIST_SQL))
+            .query_all_raw(raw::statement(
+                db,
+                THREAD_SUMMARY_PAGE_SQL,
+                vec![
+                    pattern.clone().into(),
+                    after.map(|cursor| u64_to_i64(cursor.updated_at)).into(),
+                    after.map(|cursor| u64_to_i64(cursor.created_at)).into(),
+                    after.map(|cursor| cursor.id.clone()).into(),
+                    fetch_limit.into(),
+                ],
+            )?)
             .await
             .context("Failed to list chat threads")?;
-        rows.iter().map(map_thread_summary).collect()
+        let mut threads = rows
+            .iter()
+            .map(map_thread_summary)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let next_cursor = match query.limit {
+            Some(limit) if threads.len() > limit => {
+                threads.truncate(limit);
+                threads.last().map(|thread| ChatThreadListCursor {
+                    updated_at: thread.updated_at,
+                    created_at: thread.created_at,
+                    id: thread.id.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        let total_row = db
+            .query_one_raw(raw::statement(db, THREAD_COUNT_SQL, vec![pattern.into()])?)
+            .await
+            .context("Failed to count chat threads")?;
+        let total_count = total_row
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .transpose()?
+            .map(i64_to_usize)
+            .unwrap_or(0);
+
+        Ok(ChatThreadPage {
+            threads,
+            next_cursor,
+            total_count,
+        })
     }
 
     pub async fn get_thread(&self, thread_id: String) -> anyhow::Result<Option<ChatThreadSummary>> {
@@ -177,6 +273,7 @@ impl ChatStore {
             updated_at: now as u64,
             last_message_preview: None,
             message_count: 0,
+            has_images: false,
         })
     }
 
@@ -449,8 +546,10 @@ where
     Ok(())
 }
 
-const THREAD_SUMMARY_LIST_SQL: &str = r#"
-    SELECT
+/// Columns map_thread_summary reads, in order.
+macro_rules! thread_summary_columns {
+    () => {
+        r#"
         t.id,
         t.title,
         t.model_id,
@@ -468,34 +567,63 @@ const THREAD_SUMMARY_LIST_SQL: &str = r#"
             SELECT COUNT(1)
             FROM chat_messages m
             WHERE m.thread_id = t.id
-        ) AS message_count
+        ) AS message_count,
+        EXISTS (
+            SELECT 1
+            FROM chat_messages m
+            WHERE m.thread_id = t.id
+              AND (m.content_parts LIKE '%input_image%' OR m.content_parts LIKE '%image_url%')
+        ) AS has_images
+        "#
+    };
+}
+
+/// ?1 search pattern (or NULL), ?2-?4 cursor (or NULL), ?5 limit (-1 = all).
+const THREAD_SUMMARY_PAGE_SQL: &str = concat!(
+    "SELECT",
+    thread_summary_columns!(),
+    r#"
     FROM chat_threads t
-    ORDER BY t.updated_at DESC, t.created_at DESC
+    WHERE (
+        ?1 IS NULL
+        OR t.title LIKE ?1 ESCAPE '\'
+        OR EXISTS (
+            SELECT 1 FROM chat_messages m
+            WHERE m.thread_id = t.id AND m.content LIKE ?1 ESCAPE '\'
+        )
+    )
+    AND (
+        ?2 IS NULL
+        OR t.updated_at < ?2
+        OR (t.updated_at = ?2 AND t.created_at < ?3)
+        OR (t.updated_at = ?2 AND t.created_at = ?3 AND t.id < ?4)
+    )
+    ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC
+    LIMIT ?5
+    "#
+);
+
+const THREAD_COUNT_SQL: &str = r#"
+    SELECT COUNT(1)
+    FROM chat_threads t
+    WHERE (
+        ?1 IS NULL
+        OR t.title LIKE ?1 ESCAPE '\'
+        OR EXISTS (
+            SELECT 1 FROM chat_messages m
+            WHERE m.thread_id = t.id AND m.content LIKE ?1 ESCAPE '\'
+        )
+    )
 "#;
 
-const THREAD_SUMMARY_BY_ID_SQL: &str = r#"
-    SELECT
-        t.id,
-        t.title,
-        t.model_id,
-        t.system_prompt,
-        t.created_at,
-        t.updated_at,
-        (
-            SELECT m.content
-            FROM chat_messages m
-            WHERE m.thread_id = t.id
-            ORDER BY m.created_at DESC, m.id DESC
-            LIMIT 1
-        ) AS last_message_preview,
-        (
-            SELECT COUNT(1)
-            FROM chat_messages m
-            WHERE m.thread_id = t.id
-        ) AS message_count
+const THREAD_SUMMARY_BY_ID_SQL: &str = concat!(
+    "SELECT",
+    thread_summary_columns!(),
+    r#"
     FROM chat_threads t
     WHERE t.id = ?1
-"#;
+    "#
+);
 
 const CHAT_MESSAGES_LIST_SQL: &str = r#"
     SELECT
@@ -529,6 +657,8 @@ async fn fetch_thread_summary(
 
 fn map_thread_summary(row: &QueryResult) -> anyhow::Result<ChatThreadSummary> {
     let message_count_raw: i64 = row.try_get_by_index(7)?;
+    let has_images_raw: i64 = row.try_get_by_index(8)?;
+    let latest_content: Option<String> = row.try_get_by_index(6)?;
     Ok(ChatThreadSummary {
         id: row.try_get_by_index(0)?,
         title: row.try_get_by_index(1)?,
@@ -536,9 +666,30 @@ fn map_thread_summary(row: &QueryResult) -> anyhow::Result<ChatThreadSummary> {
         system_prompt: row.try_get_by_index(3)?,
         created_at: i64_to_u64(row.try_get_by_index(4)?),
         updated_at: i64_to_u64(row.try_get_by_index(5)?),
-        last_message_preview: row.try_get_by_index(6)?,
+        last_message_preview: latest_content
+            .map(|content| plain_text_preview(&content))
+            .filter(|preview| !preview.is_empty()),
         message_count: i64_to_usize(message_count_raw),
+        has_images: has_images_raw != 0,
     })
+}
+
+/// LIKE pattern for a literal substring: escape the wildcards with `\`.
+fn like_pattern(search: &str) -> String {
+    let mut pattern = String::with_capacity(search.len() + 2);
+    pattern.push('%');
+    for character in search.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn map_thread_message(row: &QueryResult) -> anyhow::Result<ChatThreadMessage> {
@@ -652,6 +803,114 @@ mod tests {
     fn clear_env() {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn pages_searches_and_summarises_threads() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let mut ids = Vec::new();
+            for (title, content, parts) in [
+                ("Alpha", "**Bold** answer with [a link](https://x.test)", None),
+                (
+                    "Beta",
+                    "Look at this chart",
+                    Some(vec![
+                        json!({"type": "text", "text": "Look at this chart"}),
+                        json!({"type": "input_image", "input_image": {"image_url": "data:image/png;base64,AA"}}),
+                    ]),
+                ),
+                ("Gamma", "Zebra crossings 100% explained", None),
+            ] {
+                let thread = store
+                    .create_thread(Some(title.to_string()), None)
+                    .await
+                    .expect("thread should create");
+                store
+                    .append_message(
+                        thread.id.clone(),
+                        "user".to_string(),
+                        content.to_string(),
+                        parts,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("message should append");
+                ids.push(thread.id);
+            }
+
+            let first = store
+                .list_threads_page(ChatThreadListQuery {
+                    limit: Some(2),
+                    ..ChatThreadListQuery::default()
+                })
+                .await
+                .expect("first page");
+            assert_eq!(first.threads.len(), 2);
+            assert_eq!(first.total_count, 3);
+            let cursor = first.next_cursor.clone().expect("a second page exists");
+            let second = store
+                .list_threads_page(ChatThreadListQuery {
+                    limit: Some(2),
+                    after: Some(cursor),
+                    ..ChatThreadListQuery::default()
+                })
+                .await
+                .expect("second page");
+            assert_eq!(second.threads.len(), 1);
+            assert!(second.next_cursor.is_none());
+            let mut seen: Vec<String> = first
+                .threads
+                .iter()
+                .chain(second.threads.iter())
+                .map(|thread| thread.id.clone())
+                .collect();
+            seen.sort();
+            let mut expected = ids.clone();
+            expected.sort();
+            assert_eq!(seen, expected);
+
+            let all = store.list_threads().await.expect("all threads");
+            let by_title = |title: &str| all.iter().find(|thread| thread.title == title).unwrap();
+            assert_eq!(
+                by_title("Alpha").last_message_preview.as_deref(),
+                Some("Bold answer with a link")
+            );
+            assert!(by_title("Beta").has_images);
+            assert!(!by_title("Alpha").has_images);
+
+            // Search matches message text and titles, case-insensitively, and
+            // treats % as a literal.
+            let zebra = store
+                .list_threads_page(ChatThreadListQuery {
+                    search: Some("zebra".to_string()),
+                    ..ChatThreadListQuery::default()
+                })
+                .await
+                .expect("search");
+            assert_eq!(zebra.total_count, 1);
+            assert_eq!(zebra.threads[0].title, "Gamma");
+            let percent = store
+                .list_threads_page(ChatThreadListQuery {
+                    search: Some("100%".to_string()),
+                    ..ChatThreadListQuery::default()
+                })
+                .await
+                .expect("literal percent search");
+            assert_eq!(percent.total_count, 1);
+            let title = store
+                .list_threads_page(ChatThreadListQuery {
+                    search: Some("BETA".to_string()),
+                    ..ChatThreadListQuery::default()
+                })
+                .await
+                .expect("title search");
+            assert_eq!(title.threads.len(), 1);
+            clear_env();
+        })
+        .await;
     }
 
     #[tokio::test]

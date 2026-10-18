@@ -2668,6 +2668,64 @@ async fn root_and_v1_probe_routes_are_available() {
 }
 
 #[tokio::test]
+async fn chat_thread_list_supports_paging_and_search() {
+    let (app, _temp_dir) = test_api_app("chat_thread_list_supports_paging_and_search", false);
+    for title in ["First topic", "Second topic", "Unrelated"] {
+        let body = format!(r#"{{"title":"{title}"}}"#);
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/chat/threads", Some(body.as_str())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let unpaged = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/chat/threads", None),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unpaged["threads"].as_array().map(Vec::len), Some(3));
+    assert!(unpaged.get("pagination").is_none());
+    assert_eq!(unpaged["total_count"].as_u64(), Some(3));
+
+    let page = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/chat/threads?limit=2", None),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page["threads"].as_array().map(Vec::len), Some(2));
+    assert_eq!(page["pagination"]["has_more"].as_bool(), Some(true));
+    let cursor = page["pagination"]["next_cursor"].as_str().expect("cursor");
+    let rest = read_json(
+        send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/chat/threads?limit=2&cursor={cursor}"),
+                None,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(rest["threads"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rest["pagination"]["has_more"].as_bool(), Some(false));
+
+    let searched = read_json(
+        send_request(app, build_request(Method::GET, "/v1/chat/threads?q=topic", None)).await,
+    )
+    .await;
+    assert_eq!(searched["total_count"].as_u64(), Some(2));
+}
+
+#[tokio::test]
 async fn health_reports_system_memory_and_reserved_bytes() {
     let (app, _temp_dir) = test_api_app("health_reports_system_memory_and_reserved_bytes", false);
     let response = send_request(app, build_request(Method::GET, "/v1/health", None)).await;
