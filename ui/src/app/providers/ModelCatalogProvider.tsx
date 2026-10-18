@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -20,6 +21,7 @@ import {
   trackModelLoaded,
 } from "@/app/analytics/events";
 import { useNotifications } from "@/app/providers/NotificationProvider";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeStoredModelId } from "@/features/models/catalog/routeModelCatalog";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
@@ -128,10 +130,21 @@ export function ModelCatalogProvider({
   const suppressReconnectRef = useRef<Set<string>>(new Set());
   const lastDownloadTerminalStateRef = useRef<Record<string, string>>({});
 
+  // Notifications name models by display name. Read the catalog through a
+  // ref so the label lookup (and the stream callbacks that use it) stay
+  // stable across catalog refreshes.
+  const modelsRef = useRef(models);
+  useLayoutEffect(() => {
+    modelsRef.current = models;
+  });
   const getModelLabel = useCallback(
     (variant: string) =>
-      models.find((model) => model.variant === variant)?.variant ?? variant,
-    [models],
+      getModelDisplayName(
+        variant,
+        modelsRef.current.find((model) => model.variant === variant)
+          ?.display_name,
+      ),
+    [],
   );
 
   const adoptUserSelectedModel = useCallback((variant: string | null) => {
@@ -438,6 +451,9 @@ export function ModelCatalogProvider({
       clearDownloadProgress,
       clearReconnectTimer,
       closeDownloadStream,
+      getModelLabel,
+      notify,
+      queueDownloadProgress,
       refreshModels,
     ],
   );

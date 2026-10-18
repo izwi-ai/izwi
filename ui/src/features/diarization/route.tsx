@@ -381,11 +381,11 @@ export function DiarizationPage({
     modalIntentModel,
   ]);
 
-  const openModelManager = () => {
+  const openModelManager = useCallback(() => {
     setModalIntentModel(null);
     setAutoCloseOnIntentReady(false);
     setIsModelModalOpen(true);
-  };
+  }, []);
 
   const openModelManagerForPipeline = () => {
     const missingPipelineVariant =

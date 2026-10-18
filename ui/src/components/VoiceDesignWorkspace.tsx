@@ -114,12 +114,13 @@ export function VoiceDesignWorkspace({
     [candidates, selectedCandidateId],
   );
 
+  const selectedCandidateKey = selectedCandidate?.id ?? null;
   useEffect(() => {
-    if (!selectedCandidate) {
+    if (!selectedCandidateKey) {
       setSaveVoiceName("");
     }
     setSaveVoiceStatus(null);
-  }, [selectedCandidate?.id]);
+  }, [selectedCandidateKey]);
 
   const handleGenerate = async () => {
     if (!selectedModel || !selectedModelReady) {

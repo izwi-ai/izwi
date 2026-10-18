@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 interface WorkspaceShortcut {
   key: string;
@@ -27,10 +27,20 @@ function isEditableTarget(target: EventTarget | null): boolean {
   );
 }
 
+/**
+ * Window keyboard shortcuts. The listener is registered once and reads the
+ * latest list, so callers can pass a fresh array (and fresh handlers) on
+ * every render.
+ */
 export function useWorkspaceShortcuts(shortcuts: WorkspaceShortcut[]) {
+  const shortcutsRef = useRef(shortcuts);
+  useLayoutEffect(() => {
+    shortcutsRef.current = shortcuts;
+  });
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      for (const shortcut of shortcuts) {
+      for (const shortcut of shortcutsRef.current) {
         if (shortcut.enabled === false) {
           continue;
         }
@@ -64,5 +74,5 @@ export function useWorkspaceShortcuts(shortcuts: WorkspaceShortcut[]) {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [shortcuts]);
+  }, []);
 }

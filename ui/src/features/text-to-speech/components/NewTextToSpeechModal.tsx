@@ -344,6 +344,7 @@ export function NewTextToSpeechModal({
     usesBuiltInVoiceSelection,
     usesSavedVoiceSelection,
     usesVoiceDescription,
+    showsVoiceDescription,
   ]);
 
   const modelStatus = selectedModelReady ? "ready" : "not_ready";

@@ -417,22 +417,22 @@ export function SpeechHistoryPanel({
       ? selectedRecord
       : null;
 
+  // Reset the save-as-voice form when another record opens, not when the
+  // same record refreshes.
+  const activeRecordId = activeRecord?.id ?? null;
+  const activeRecordReferenceText =
+    activeRecord?.input_text?.trim() ||
+    activeRecord?.reference_text?.trim() ||
+    "";
   useEffect(() => {
-    if (route !== "voice-cloning" || !activeRecord) {
-      setHistoryVoiceName("");
-      setHistoryVoiceReferenceText("");
-      setHistoryVoiceStatus(null);
-      return;
-    }
-
     setHistoryVoiceName("");
     setHistoryVoiceReferenceText(
-      activeRecord.input_text?.trim() ||
-        activeRecord.reference_text?.trim() ||
-        "",
+      route === "voice-cloning" && activeRecordId
+        ? activeRecordReferenceText
+        : "",
     );
     setHistoryVoiceStatus(null);
-  }, [activeRecord?.id, route]);
+  }, [activeRecordId, activeRecordReferenceText, route]);
 
   const deleteTargetRecord = useMemo(() => {
     if (!deleteTargetRecordId) {

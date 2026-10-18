@@ -1,5 +1,13 @@
 import { motion } from "framer-motion";
 
+const BAR_COUNT = 24;
+// Fixed, uneven peak heights (16–48px). Picking them with Math.random during
+// render gave every re-render new targets and restarted the animation.
+const BAR_PEAKS = Array.from(
+  { length: BAR_COUNT },
+  (_, i) => 16 + 32 * (0.5 + 0.5 * Math.sin(i * 2.3 + 0.6)),
+);
+
 interface WaveformProps {
   isPlaying?: boolean;
   isGenerating?: boolean;
@@ -11,14 +19,13 @@ export function Waveform({
   isGenerating = false,
   className = "",
 }: WaveformProps) {
-  const bars = 24;
   const active = isPlaying || isGenerating;
 
   return (
     <div
       className={`flex items-center justify-center gap-[3px] h-12 ${className}`}
     >
-      {Array.from({ length: bars }).map((_, i) => (
+      {BAR_PEAKS.map((peak, i) => (
         <motion.div
           key={i}
           className={`w-1 rounded-full ${
@@ -28,7 +35,7 @@ export function Waveform({
           }`}
           initial={{ height: 8 }}
           animate={{
-            height: active ? [8, Math.random() * 32 + 16, 8] : 8,
+            height: active ? [8, peak, 8] : 8,
           }}
           transition={{
             duration: isGenerating ? 0.4 : 0.5,

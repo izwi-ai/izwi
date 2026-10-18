@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowLeft, AudioLines, Sparkles } from "lucide-react";
 import { VoiceCaptureWorkspace } from "@/components/VoiceCaptureWorkspace";
 import { VoiceDesignWorkspace } from "@/components/VoiceDesignWorkspace";
@@ -79,6 +79,12 @@ export function VoiceCreationModal({
     voiceId: string;
     source: "clone" | "design";
   } | null>(null);
+  // Read on open only: initialStep changing while the modal is open must
+  // not yank the user out of the step they are on.
+  const initialStepRef = useRef(initialStep);
+  useLayoutEffect(() => {
+    initialStepRef.current = initialStep;
+  });
 
   useEffect(() => {
     if (!open) {
@@ -90,12 +96,11 @@ export function VoiceCreationModal({
     }
     // Opening straight into clone or design (from "New voice" menu entries or
     // old /voice-cloning and /voice-design links) skips the chooser.
-    if (initialStep !== "choice") {
-      setStep(initialStep);
+    const openingStep = initialStepRef.current;
+    if (openingStep !== "choice") {
+      setStep(openingStep);
       setHasDraftProgress(true);
     }
-    // Runs on open/close only: initialStep changing while the modal is open
-    // must not yank the user out of the step they are on.
   }, [open]);
 
   const requestClose = () => {

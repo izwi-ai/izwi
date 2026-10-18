@@ -2097,7 +2097,7 @@ export function StudioWorkspace({
         setDeletingProject(false);
       }
     },
-    [deletingProject, loadProjects, onError],
+    [deletingProject, loadProjects, onError, setSelectedProjectId],
   );
 
   const openDeleteProjectConfirm = useCallback(
