@@ -1502,13 +1502,20 @@ html.theme-light .chat-thinking-toggle:hover {
 }
 
 .chat-caret,
+.chat-streaming-answer .chat-markdown > :is(p, h1, h2, h3, h4):last-child::after,
 .chat-streaming-answer
   .chat-markdown
-  > :is(p, h1, h2, h3, h4, blockquote):last-child::after,
+  > blockquote:last-child
+  > p:last-child::after,
 .chat-streaming-answer
   .chat-markdown
   > :is(ul, ol):last-child
-  > li:last-child::after,
+  > li:last-child:not(:has(> p))::after,
+.chat-streaming-answer
+  .chat-markdown
+  > :is(ul, ol):last-child
+  > li:last-child
+  > p:last-child::after,
 .chat-streaming-answer
   .chat-markdown
   > .chat-code-block:last-child
