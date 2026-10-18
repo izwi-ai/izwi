@@ -9,6 +9,7 @@ use url::Url;
 pub mod autostart;
 pub mod blocking;
 pub mod console;
+pub mod csp;
 pub mod downloads;
 pub mod install;
 pub mod server;
@@ -97,6 +98,9 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     builder = builder.plugin(tauri_plugin_autostart::Builder::new().build());
     builder = builder.plugin(tauri_plugin_process::init());
 
+    let mut context = tauri::generate_context!();
+    csp::allow_server_origin(context.config_mut(), &server_url);
+
     let app = builder
         .setup(move |app| {
             if let Some(server_child) = maybe_start_local_server(app.handle(), &server_url)? {
@@ -131,7 +135,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             tray::build_basic_tray(app.handle())?;
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .map_err(|e| anyhow::anyhow!("failed to build desktop app: {}", e))?;
 
     let exit_code = app.run_return(move |app_handle, event| {
