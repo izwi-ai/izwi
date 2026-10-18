@@ -8,8 +8,10 @@ export interface HistoryColumn<T> {
   id: string;
   /** Column heading; pass a visually hidden label for icon columns. */
   header: ReactNode;
-  /** Applied to the heading and every cell (widths, alignment). */
+  /** Applied to the heading and every cell: widths and alignment. */
   className?: string;
+  /** Applied to body cells only: text colour, size, numerals. */
+  cellClassName?: string;
   cell: (row: T) => ReactNode;
 }
 
@@ -179,6 +181,7 @@ export function HistoryTable<T>({
                     className={cn(
                       "border-b border-[var(--border-subtle)] px-3.5 py-2.5 align-middle",
                       column.className,
+                      column.cellClassName,
                     )}
                   >
                     {column.cell(row)}

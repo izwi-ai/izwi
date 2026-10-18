@@ -317,13 +317,15 @@ export function TextToSpeechHistoryTable({
     {
       id: "length",
       header: "Length",
-      className: "w-[5.5rem] whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+      className: "w-[5.5rem]",
+      cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
       cell: (record) => formatClockDuration(record.audio_duration_secs),
     },
     {
       id: "created",
       header: "Created",
-      className: "w-[8rem] whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
+      className: "w-[8rem]",
+      cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
       cell: (record) => formatHistoryDate(record.created_at),
     },
   ];
