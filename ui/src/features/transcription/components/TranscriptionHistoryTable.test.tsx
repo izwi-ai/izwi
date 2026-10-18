@@ -105,10 +105,10 @@ describe("TranscriptionHistoryTable job status", () => {
     );
 
     expect(screen.getByText("Queued")).toBeVisible();
-    expect(screen.getByText("Processing")).toBeVisible();
-    expect(screen.getByText("Ready")).toBeVisible();
-    expect(screen.getByText("Transcription is queued and waiting to start.")).toBeVisible();
-    expect(screen.getByText("Speaker transcription is in progress.")).toBeVisible();
+    expect(screen.getByText("Transcribing")).toBeVisible();
+    expect(screen.getByText("2 speakers")).toBeVisible();
+    // Partial output shows while running; the finished preview stays.
+    expect(screen.getByText("A useful transcript preview.")).toBeVisible();
     expect(screen.getAllByText("Speaker 1: Welcome.")).toHaveLength(2);
   });
 
@@ -149,7 +149,7 @@ describe("TranscriptionHistoryTable job status", () => {
       <TranscriptionHistoryTable records={[record]} onOpenRecord={vi.fn()} />,
     );
 
-    expect(screen.getByText("Status Unknown")).toBeVisible();
+    expect(screen.getByText("Status unknown")).toBeVisible();
     expect(
       screen.getByText("Job status is unavailable. Open the record for details."),
     ).toBeVisible();

@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import type { CursorPageResult, CursorPaginationQuery } from "@/api";
+import type { ListFilters } from "@/shared/api/pagination";
 import {
   usePolledCursorHistory,
   type UsePolledCursorHistoryResult,
@@ -21,6 +22,7 @@ interface UseSpeechTextHistoryOptions<TSummary extends SpeechTextHistoryRecordBa
   loadErrorMessage: string;
   loadMoreErrorMessage: string;
   enablePolling?: boolean;
+  filters?: ListFilters;
 }
 
 function isSpeechTextRecordActive(record: SpeechTextHistoryRecordBase): boolean {

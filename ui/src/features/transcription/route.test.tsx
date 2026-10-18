@@ -390,7 +390,7 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.getByRole("heading", { name: "No transcripts yet" }),
     ).toBeInTheDocument();
   });
 
@@ -517,7 +517,7 @@ describe("TranscriptionPage detail route", () => {
 
     try {
       expect(
-        await screen.findByText("Transcription is in progress."),
+        await screen.findByText("Transcribing"),
       ).toBeInTheDocument();
 
       await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled());
@@ -532,10 +532,10 @@ describe("TranscriptionPage detail route", () => {
       );
 
       expect(
-        screen.getByText("Transcription is in progress."),
+        screen.getByText("Transcribing"),
       ).toBeInTheDocument();
       expect(
-        screen.queryByText("Loading speech-text history..."),
+        screen.queryByText("Loading transcripts…"),
       ).not.toBeInTheDocument();
 
       backgroundRefresh.resolve([
@@ -1622,7 +1622,7 @@ describe("TranscriptionPage detail route", () => {
 
     expect(await screen.findByText("clip.wav")).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.queryByRole("heading", { name: "No transcripts yet" }),
     ).not.toBeInTheDocument();
   });
 
@@ -1979,7 +1979,7 @@ describe("TranscriptionPage detail route", () => {
       screen.queryByLabelText("Open transcription meeting.wav"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.getByRole("heading", { name: "No transcripts yet" }),
     ).toBeInTheDocument();
   });
 
