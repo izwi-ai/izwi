@@ -39,6 +39,7 @@ mod shutdown;
 mod speech_history_store;
 mod speech_resource_budget;
 mod speech_spool;
+mod speech_text_list;
 mod state;
 mod studio_project_store;
 #[cfg(test)]

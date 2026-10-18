@@ -451,6 +451,76 @@ async fn unified_transcription_job_list_pages_across_job_kinds() {
 }
 
 #[tokio::test]
+async fn unified_transcription_list_filters_and_totals() {
+    let (app, _temp_dir) = test_api_app("unified_transcription_list_filters_and_totals", true);
+    let audio_body = tiny_audio_json_body();
+    let saa_body = tiny_audio_json_body_with_fields(
+        r#""model_id":"Granite-Speech-4.1-2B-Plus","min_speakers":2"#,
+    );
+    for (uri, body) in [
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+        (
+            "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+            saa_body.as_str(),
+        ),
+        ("/v1/diarizations", audio_body.as_str()),
+    ] {
+        let response =
+            send_request(app.clone(), build_request(Method::POST, uri, Some(body))).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+    let total = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = send_request(app, build_request(Method::GET, uri, None)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = read_json(response).await;
+            let records = body["records"].as_array().map(Vec::len).unwrap_or(0);
+            (body["total"].as_u64().unwrap_or(u64::MAX), records)
+        }
+    };
+
+    assert_eq!(total("/v1/speech-to-text/jobs").await, (3, 3));
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?with_speakers=true").await,
+        (2, 2)
+    );
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?job_kind=transcription&with_speakers=true").await,
+        (0, 0)
+    );
+    // Jobs can fail in the background here (no model is installed), so check
+    // that every job matches exactly one status rather than which one.
+    let mut by_status = 0;
+    for uri in [
+        "/v1/speech-to-text/jobs?status=pending",
+        "/v1/speech-to-text/jobs?status=processing",
+        "/v1/speech-to-text/jobs?status=ready",
+        "/v1/speech-to-text/jobs?status=failed",
+    ] {
+        by_status += total(uri).await.0;
+    }
+    assert_eq!(by_status, 3);
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?status=pending,processing,ready,failed").await,
+        (3, 3)
+    );
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?q=no-such-text").await,
+        (0, 0)
+    );
+    let bad = send_request(
+        app.clone(),
+        build_request(Method::GET, "/v1/speech-to-text/jobs?status=done", None),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn deleting_a_transcription_cancels_its_durable_job() {
     let (state, _temp_dir) = test_state("deleting_a_transcription_cancels_its_durable_job", false);
     state.lifecycle.mark_ready();

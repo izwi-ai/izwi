@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::StoreError;
+use crate::speech_text_list::SpeechTextListFilter;
 use crate::{
     db::{raw, StoreDatabase},
     entity::{transcription_records, RuntimeProjectionAttempt},
@@ -165,6 +166,14 @@ pub struct TranscriptionRecordListCursor {
     pub id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscriptionRecordPage {
+    pub records: Vec<TranscriptionRecordSummary>,
+    pub next_cursor: Option<TranscriptionRecordListCursor>,
+    /// Records matching the filter, ignoring paging.
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptionRecord {
     pub id: String,
@@ -312,6 +321,8 @@ impl TranscriptionStore {
         self
     }
 
+    /// Unfiltered page; the API goes through `list_records_filtered`.
+    #[cfg(test)]
     pub async fn list_records_page(
         &self,
         limit: usize,
@@ -320,52 +331,14 @@ impl TranscriptionStore {
         Vec<TranscriptionRecordSummary>,
         Option<TranscriptionRecordListCursor>,
     )> {
-        let db = self.db.connection().await?;
-        let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
-        let fetch_limit = list_limit.saturating_add(1);
-        let rows = if let Some(cursor) = cursor {
-            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(raw::statement(
-                db,
-                TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL,
-                vec![
-                    cursor_created_at.into(),
-                    cursor.id.into(),
-                    fetch_limit.into(),
-                ],
-            )?)
-            .await
-        } else {
-            db.query_all_raw(raw::statement(
-                db,
-                TRANSCRIPTION_PAGE_SQL,
-                vec![fetch_limit.into()],
-            )?)
-            .await
-        }
-        .context("Failed to list transcription records")?;
-
-        let mut records = rows
-            .iter()
-            .map(map_transcription_summary)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let page_limit = usize::try_from(list_limit).unwrap_or(200);
-        let has_more = records.len() > page_limit;
-        if has_more {
-            records.truncate(page_limit);
-        }
-        let next_cursor = if has_more {
-            records.last().map(|record| TranscriptionRecordListCursor {
-                created_at: record.created_at,
-                id: record.id.clone(),
-            })
-        } else {
-            None
-        };
-
-        Ok((records, next_cursor))
+        let page = self
+            .list_records_filtered(None, limit, cursor, &SpeechTextListFilter::default())
+            .await?;
+        Ok((page.records, page.next_cursor))
     }
 
+    /// Unfiltered page; the API goes through `list_records_filtered`.
+    #[cfg(test)]
     pub async fn list_records_page_for_mode(
         &self,
         mode: TranscriptionRecordMode,
@@ -375,42 +348,48 @@ impl TranscriptionStore {
         Vec<TranscriptionRecordSummary>,
         Option<TranscriptionRecordListCursor>,
     )> {
-        let db = self.db.connection().await?;
-        let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
-        let fetch_limit = list_limit.saturating_add(1);
-        let rows = if let Some(cursor) = cursor {
-            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(raw::statement(
-                db,
-                TRANSCRIPTION_PAGE_FOR_MODE_AFTER_CURSOR_SQL,
-                vec![
-                    mode.as_db_value().into(),
-                    cursor_created_at.into(),
-                    cursor.id.into(),
-                    fetch_limit.into(),
-                ],
-            )?)
-            .await
-        } else {
-            db.query_all_raw(raw::statement(
-                db,
-                TRANSCRIPTION_PAGE_FOR_MODE_SQL,
-                vec![mode.as_db_value().into(), fetch_limit.into()],
-            )?)
-            .await
-        }
-        .context("Failed to list transcription records for mode")?;
+        let page = self
+            .list_records_filtered(Some(mode), limit, cursor, &SpeechTextListFilter::default())
+            .await?;
+        Ok((page.records, page.next_cursor))
+    }
 
+    /// One page of records (optionally one mode) matching `filter`, newest
+    /// first, with the total that match.
+    pub async fn list_records_filtered(
+        &self,
+        mode: Option<TranscriptionRecordMode>,
+        limit: usize,
+        cursor: Option<TranscriptionRecordListCursor>,
+        filter: &SpeechTextListFilter,
+    ) -> anyhow::Result<TranscriptionRecordPage> {
+        let db = self.db.connection().await?;
+        let page_limit = limit.clamp(1, 500);
+        let filter_values: Vec<sea_orm::Value> = vec![
+            mode.map(|mode| mode.as_db_value().to_string()).into(),
+            filter.search_pattern().into(),
+            filter.status_list().into(),
+            filter.with_speakers.then_some(1_i64).into(),
+        ];
+        let mut values = filter_values.clone();
+        values.push(
+            cursor
+                .as_ref()
+                .map(|cursor| i64::try_from(cursor.created_at).unwrap_or(i64::MAX))
+                .into(),
+        );
+        values.push(cursor.map(|cursor| cursor.id).into());
+        values.push(i64::try_from(page_limit + 1).unwrap_or(501).into());
+        let rows = db
+            .query_all_raw(raw::statement(db, TRANSCRIPTION_PAGE_SQL, values)?)
+            .await
+            .context("Failed to list transcription records")?;
         let mut records = rows
             .iter()
             .map(map_transcription_summary)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let page_limit = usize::try_from(list_limit).unwrap_or(200);
-        let has_more = records.len() > page_limit;
-        if has_more {
+        let next_cursor = if records.len() > page_limit {
             records.truncate(page_limit);
-        }
-        let next_cursor = if has_more {
             records.last().map(|record| TranscriptionRecordListCursor {
                 created_at: record.created_at,
                 id: record.id.clone(),
@@ -418,8 +397,19 @@ impl TranscriptionStore {
         } else {
             None
         };
-
-        Ok((records, next_cursor))
+        let total = db
+            .query_one_raw(raw::statement(db, TRANSCRIPTION_COUNT_SQL, filter_values)?)
+            .await
+            .context("Failed to count transcription records")?
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .transpose()?
+            .map(|count| usize::try_from(count).unwrap_or(0))
+            .unwrap_or(0);
+        Ok(TranscriptionRecordPage {
+            records,
+            next_cursor,
+            total,
+        })
     }
 
     pub async fn get_record(
@@ -1083,34 +1073,24 @@ impl TranscriptionStore {
     }
 }
 
-const TRANSCRIPTION_PAGE_SQL: &str = r#"
-    SELECT
-        id,
-        created_at,
-        transcription_mode,
-        model_id,
-        language,
-        processing_status,
-        processing_error,
-        processing_progress_json,
-        duration_secs,
-        processing_time_ms,
-        rtf,
-        audio_mime_type,
-        audio_filename,
-        transcription,
-        speaker_attributed_text,
-        speaker_turns_json,
-        saa_status,
-        saa_warnings_json,
-        summary_status,
-        summary_text
-    FROM transcription_records
-    ORDER BY created_at DESC, id DESC
-    LIMIT ?1
-"#;
+/// ?1 mode (or NULL), ?2 search pattern, ?3 ",status,…," list, ?4 1 to keep
+/// only speaker-attributed records (each NULL = no filter).
+macro_rules! transcription_filter {
+    () => {
+        r#"
+    WHERE (?1 IS NULL OR transcription_mode = ?1)
+      AND (?2 IS NULL OR transcription LIKE ?2 ESCAPE '\'
+           OR speaker_attributed_text LIKE ?2 ESCAPE '\'
+           OR audio_filename LIKE ?2 ESCAPE '\')
+      AND (?3 IS NULL OR instr(?3, ',' || processing_status || ',') > 0)
+      AND (?4 IS NULL OR transcription_mode = 'speaker_attributed_asr')
+        "#
+    };
+}
 
-const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
+/// Filter ?1-?4, cursor ?5/?6 (or NULL), limit ?7.
+const TRANSCRIPTION_PAGE_SQL: &str = concat!(
+    r#"
     SELECT
         id,
         created_at,
@@ -1132,68 +1112,19 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
         saa_warnings_json,
         summary_status,
         summary_text
-    FROM transcription_records
-    WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2)
+    FROM transcription_records"#,
+    transcription_filter!(),
+    r#"
+      AND (?5 IS NULL OR created_at < ?5 OR (created_at = ?5 AND id < ?6))
     ORDER BY created_at DESC, id DESC
-    LIMIT ?3
-"#;
+    LIMIT ?7
+"#
+);
 
-const TRANSCRIPTION_PAGE_FOR_MODE_SQL: &str = r#"
-    SELECT
-        id,
-        created_at,
-        transcription_mode,
-        model_id,
-        language,
-        processing_status,
-        processing_error,
-        processing_progress_json,
-        duration_secs,
-        processing_time_ms,
-        rtf,
-        audio_mime_type,
-        audio_filename,
-        transcription,
-        speaker_attributed_text,
-        speaker_turns_json,
-        saa_status,
-        saa_warnings_json,
-        summary_status,
-        summary_text
-    FROM transcription_records
-    WHERE transcription_mode = ?1
-    ORDER BY created_at DESC, id DESC
-    LIMIT ?2
-"#;
-
-const TRANSCRIPTION_PAGE_FOR_MODE_AFTER_CURSOR_SQL: &str = r#"
-    SELECT
-        id,
-        created_at,
-        transcription_mode,
-        model_id,
-        language,
-        processing_status,
-        processing_error,
-        processing_progress_json,
-        duration_secs,
-        processing_time_ms,
-        rtf,
-        audio_mime_type,
-        audio_filename,
-        transcription,
-        speaker_attributed_text,
-        speaker_turns_json,
-        saa_status,
-        saa_warnings_json,
-        summary_status,
-        summary_text
-    FROM transcription_records
-    WHERE transcription_mode = ?1
-      AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
-    ORDER BY created_at DESC, id DESC
-    LIMIT ?4
-"#;
+const TRANSCRIPTION_COUNT_SQL: &str = concat!(
+    "SELECT COUNT(1) FROM transcription_records",
+    transcription_filter!()
+);
 
 const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     id,
