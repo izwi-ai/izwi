@@ -237,6 +237,12 @@ pub async fn delete_record(
     State(state): State<AppState>,
     Path(record_id): Path<String>,
 ) -> Result<Json<DeleteTranscriptionRecordResponse>, ApiError> {
+    cancel_active_transcription_job(
+        &state,
+        &record_id,
+        "Cancelled because the transcription record was deleted",
+    )
+    .await?;
     let deleted = state
         .transcription_store
         .delete_record(record_id.clone())
@@ -251,6 +257,39 @@ pub async fn delete_record(
         id: record_id,
         deleted: true,
     }))
+}
+
+/// Cancel the queued or running durable job behind a transcription record so
+/// it does not keep using the model after the record is gone. Jobs are keyed
+/// by the record's mode, so both transcription-backed modes are checked.
+async fn cancel_active_transcription_job(
+    state: &AppState,
+    record_id: &str,
+    reason: &str,
+) -> Result<(), ApiError> {
+    for mode in [
+        TranscriptionRecordMode::Transcription,
+        TranscriptionRecordMode::SpeakerAttributedAsr,
+    ] {
+        let Some(job) = state
+            .batch_runtime_store
+            .get_active_job_for_route_record(
+                RuntimeJobKind::AsrTranscription,
+                mode.as_db_value(),
+                record_id,
+            )
+            .await
+            .map_err(map_store_error)?
+        else {
+            continue;
+        };
+        state
+            .batch_runtime_store
+            .cancel_job(&job.id, Some(reason.to_string()))
+            .await
+            .map_err(map_store_error)?;
+    }
+    Ok(())
 }
 
 pub async fn regenerate_summary(

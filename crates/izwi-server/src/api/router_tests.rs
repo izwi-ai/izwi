@@ -451,6 +451,63 @@ async fn unified_transcription_job_list_pages_across_job_kinds() {
 }
 
 #[tokio::test]
+async fn deleting_a_transcription_cancels_its_durable_job() {
+    let (state, _temp_dir) = test_state("deleting_a_transcription_cancels_its_durable_job", false);
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let audio_body = tiny_audio_json_body();
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+
+    let deleted = send_request(
+        app.clone(),
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{record_id}?job_kind=transcription"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    let job = state
+        .batch_runtime_store
+        .get_job(&job.id)
+        .await
+        .expect("job read")
+        .expect("job row is kept");
+    assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+}
+
+#[tokio::test]
 async fn unified_transcription_job_read_routes_support_both_job_kinds() {
     let (app, temp_dir) = test_api_app(
         "unified_transcription_job_read_routes_support_both_job_kinds",
