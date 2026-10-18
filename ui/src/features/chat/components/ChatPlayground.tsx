@@ -112,6 +112,12 @@ export function ChatPlayground({
   const [expandedThoughts, setExpandedThoughts] = useState<
     Record<string, boolean>
   >({});
+  // Reasoning time measured client-side while a reply streams, keyed by
+  // message id. Replies loaded from history have none.
+  const [reasoningDurations, setReasoningDurations] = useState<
+    Record<string, number>
+  >({});
+  const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
   // Drafts intentionally live only for this mounted session. Durable persistence
   // is out of scope; the thread key prevents in-session cross-conversation leaks.
   const [composerDrafts, setComposerDrafts] = useState<
@@ -167,8 +173,6 @@ export function ChatPlayground({
   const messageViewportRef = useRef<HTMLDivElement | null>(null);
   const followingOutputRef = useRef(true);
   const followingOutputThreadRef = useRef<string | null>(null);
-  const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
-  const followingStreamingThinkingRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
@@ -504,33 +508,12 @@ export function ChatPlayground({
       messageViewportRef.current.scrollHeight;
   }, [visibleMessages, isStreaming, activeThreadId]);
 
-  useLayoutEffect(() => {
-    if (
-      !isStreaming ||
-      !followingStreamingThinkingRef.current ||
-      !streamingThinkingRef.current
-    ) {
-      return;
-    }
-    streamingThinkingRef.current.scrollTop =
-      streamingThinkingRef.current.scrollHeight;
-  }, [isStreaming, messages]);
-
   const handleMessageViewportScroll = useCallback(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) {
       return;
     }
     followingOutputRef.current =
-      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
-  }, []);
-
-  const handleStreamingThinkingScroll = useCallback(() => {
-    const viewport = streamingThinkingRef.current;
-    if (!viewport) {
-      return;
-    }
-    followingStreamingThinkingRef.current =
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
   }, []);
 
@@ -954,8 +937,8 @@ export function ChatPlayground({
       optimisticAssistantMessage,
     ]);
     followingOutputRef.current = true;
-    followingStreamingThinkingRef.current = true;
     setIsStreaming(true);
+    setStreamStartedAt(timestamp);
     setStreamingThreadId(targetThreadId);
 
     let streamFailed = false;
@@ -1026,6 +1009,12 @@ export function ChatPlayground({
             });
           },
           onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
+            const carryOver = <T,>(previous: Record<string, T>) =>
+              assistantTempId in previous
+                ? { ...previous, [assistantMessage.id]: previous[assistantTempId] }
+                : previous;
+            setReasoningDurations(carryOver);
+            setExpandedThoughts(carryOver);
             setMessages((previous) => {
               let replaced = false;
               const updated = previous.map((message) => {
@@ -1604,9 +1593,15 @@ export function ChatPlayground({
                                     [messageKey]: !previous[messageKey],
                                   }))
                                 }
-                                streamingThinkingRef={streamingThinkingRef}
-                                onStreamingThinkingScroll={
-                                  handleStreamingThinkingScroll
+                                turnStartedAt={
+                                  isStreamingReply ? streamStartedAt : null
+                                }
+                                reasoningMs={reasoningDurations[messageKey] ?? null}
+                                onReasoningFinished={(durationMs) =>
+                                  setReasoningDurations((previous) => ({
+                                    ...previous,
+                                    [messageKey]: durationMs,
+                                  }))
                                 }
                               />
                             )}

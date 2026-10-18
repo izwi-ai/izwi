@@ -1472,15 +1472,16 @@ describe("ChatPlayground", () => {
     );
 
     expect(screen.getByText("Final answer")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Show thought process" }),
-    ).toBeInTheDocument();
+    // History has no measured duration, so the row is not timed.
+    const reasoningToggle = screen.getByRole("button", {
+      name: "Thought process",
+    });
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("reasoning first")).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show thought process" }),
-    );
+    fireEvent.click(reasoningToggle);
 
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("reasoning first")).toBeInTheDocument();
 
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -1494,6 +1495,43 @@ describe("ChatPlayground", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
     expect(writeText).toHaveBeenLastCalledWith("Solve this");
   });
+  it("shows live reasoning while it streams, then the time it took", async () => {
+    const model = "Qwen3.5-4B";
+    const thread = { id: "live-thread", title: "Live reasoning", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+    let now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
+    render(<MemoryRouter initialEntries={["/chat?threadId=live-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={true} modelLabel={model}
+        chatCapabilities={{ supports_thinking: true, default_thinking_enabled: true,
+          reasoning_efforts: [], default_reasoning_effort: null,
+          supports_preserve_thinking: false }}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        modelSupportsThinking={() => true}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Plan it" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+    const callbacks = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+
+    act(() => callbacks.onDelta("<think>Weighing the options"));
+    expect(screen.getByRole("button", { name: /^Thinking/ })).toBeInTheDocument();
+    expect(screen.getByText("Weighing the options")).toBeInTheDocument();
+
+    now += 6_000;
+    act(() => callbacks.onDelta("</think>Here is the plan."));
+    expect(await screen.findByRole("button", { name: "Thought for 6s" })).toBeInTheDocument();
+    expect(screen.getByText("Here is the plan.")).toBeInTheDocument();
+    expect(screen.queryByText("Weighing the options")).not.toBeInTheDocument();
+    dateNow.mockRestore();
+  });
+
   it.each([
     ["LFM2.5-1.2B-Instruct-GGUF", false, " \n", "No visible answer was generated. Please retry the message."],
     ["LFM2.5-1.2B-Instruct-GGUF", false, "<think>unfinished reasoning", "No visible answer was generated. Please retry the message."],

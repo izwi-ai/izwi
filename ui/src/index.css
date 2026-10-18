@@ -1478,6 +1478,42 @@ html.theme-light .chat-thinking-toggle:hover {
   padding: 0.75rem 0.875rem;
 }
 
+.chat-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--text-subtle) 0%,
+    var(--text-primary) 40%,
+    var(--text-subtle) 80%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: chat-shimmer 2.2s linear infinite;
+}
+
+@keyframes chat-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+.chat-reasoning-tail {
+  -webkit-mask-image: linear-gradient(transparent, #000 45%);
+  mask-image: linear-gradient(transparent, #000 45%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-shimmer {
+    animation: none;
+    color: var(--text-muted);
+    background: none;
+  }
+}
+
 .chat-markdown pre code {
   font-size: 0.8rem;
   line-height: 1.65;
