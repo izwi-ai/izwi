@@ -37,16 +37,19 @@ jobs:
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
       APTABASE_APP_KEY: ${{ secrets.APTABASE_APP_KEY }}
       IZWI_UPDATER_PUBKEY: ${{ secrets.IZWI_UPDATER_PUBKEY }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # The updater signing key is deliberately NOT job-scoped: it is passed
+      # only to the steps that validate it or run `cargo tauri build`, so npm
+      # lifecycle scripts, tests and other build steps never see it.
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Validate updater signing inputs (beta channel)
         if: startsWith(github.ref_name, 'v0.1.0-beta-')
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           if [ -z "${IZWI_UPDATER_PUBKEY}" ]; then
             echo "::error::Missing IZWI_UPDATER_PUBKEY secret."
@@ -77,7 +80,7 @@ jobs:
             patchelf
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "20"
           cache: npm
@@ -107,7 +110,7 @@ jobs:
         # with the version the lanes are verified with locally. No
         # rust-toolchain.toml: it would override the 1.88.0 (MSRV) CUDA
         # compile lanes, which install that version as the rustup default.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       # The workspace .cargo/config.toml sets an extensionless python
       # rustc-wrapper that only matters to Apple's linker. Windows cannot
@@ -119,7 +122,7 @@ jobs:
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             . -> target
@@ -212,6 +215,8 @@ jobs:
         if: runner.os == 'Linux'
         env:
           CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           cargo tauri build \
             --bundles deb,appimage
@@ -221,6 +226,8 @@ jobs:
         shell: pwsh
         env:
           CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           cargo tauri build --bundles ${{ matrix.bundle_kind }}
 
@@ -228,6 +235,8 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
         env:
           CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: |
           env -u APPLE_SIGNING_IDENTITY \
@@ -244,6 +253,8 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
         env:
           CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           MACOSX_DEPLOYMENT_TARGET: "12.0"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -404,7 +415,7 @@ jobs:
         run: scripts/release/verify-native-artifacts.ps1 -ArtifactDir release-assets
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.asset_suffix }}
           path: release-assets/*
@@ -416,10 +427,10 @@ jobs:
     needs: build
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Download built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           merge-multiple: true
@@ -529,7 +540,7 @@ jobs:
           done
 
       - name: Create release and upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: Izwi ${{ github.ref_name }}
           body_path: release-support.md
