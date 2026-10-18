@@ -74,6 +74,9 @@ struct UpdaterRuntimeConfig {
 impl UpdaterRuntimeConfig {
     fn from_env() -> Self {
         let disable_flag = env_bool_true("IZWI_DISABLE_APP_UPDATES");
+        // Without a pubkey the updater plugin is never registered, and asking
+        // it for a builder would panic, so treat that build as update-less.
+        let has_pubkey = configured_pubkey().is_some();
         let request_timeout_ms = env_u64(
             "IZWI_UPDATER_REQUEST_TIMEOUT_MS",
             DEFAULT_REQUEST_TIMEOUT_SECONDS * 1000,
@@ -89,9 +92,17 @@ impl UpdaterRuntimeConfig {
             .filter(|value| !value.is_empty())
             .and_then(|value| Url::parse(&value).ok());
 
+        let disable_reason = if disable_flag {
+            Some("IZWI_DISABLE_APP_UPDATES is set".to_string())
+        } else if !has_pubkey {
+            Some("this build has no updater public key".to_string())
+        } else {
+            None
+        };
+
         Self {
-            enabled: !disable_flag,
-            disable_reason: disable_flag.then(|| "IZWI_DISABLE_APP_UPDATES is set".to_string()),
+            enabled: disable_reason.is_none(),
+            disable_reason,
             request_timeout: Duration::from_millis(request_timeout_ms),
             max_check_attempts: max_check_attempts.max(1),
             retry_backoff: Duration::from_millis(retry_backoff_ms.max(1)),
@@ -343,6 +354,21 @@ where
     }
 
     Err(last_error.unwrap_or(UpdaterError::NoMatchingBetaRelease))
+}
+
+/// The minisign public key update signatures are checked against: baked in
+/// at compile time for release builds, or read from the environment.
+pub fn configured_pubkey() -> Option<String> {
+    option_env!("IZWI_UPDATER_PUBKEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("IZWI_UPDATER_PUBKEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn env_bool_true(name: &str) -> bool {

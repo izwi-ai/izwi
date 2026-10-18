@@ -88,7 +88,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
         builder = builder.plugin(tauri_plugin_aptabase::Builder::new(&app_key).build());
     }
 
-    if let Some(pubkey) = resolve_updater_pubkey() {
+    if let Some(pubkey) = updater::configured_pubkey() {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().pubkey(pubkey).build());
     } else {
         eprintln!("warning: updater pubkey is not configured; in-app update checks are disabled");
@@ -172,19 +172,6 @@ fn resolve_aptabase_app_key() -> Option<String> {
         .map(ToOwned::to_owned)
         .or_else(|| {
             std::env::var("APTABASE_APP_KEY")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-}
-
-fn resolve_updater_pubkey() -> Option<String> {
-    option_env!("IZWI_UPDATER_PUBKEY")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            std::env::var("IZWI_UPDATER_PUBKEY")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
