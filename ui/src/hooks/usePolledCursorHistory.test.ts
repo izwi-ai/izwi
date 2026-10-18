@@ -155,3 +155,43 @@ describe("usePolledCursorHistory", () => {
     expect(result.current.loading).toBe(false);
   });
 });
+
+describe("usePolledCursorHistory filters", () => {
+  it("sends filters, reports the total and reloads only when they change", async () => {
+    const listPage = vi.fn(async (query?: CursorPaginationQuery) => ({
+      ...page([row(String(query?.filters?.q ?? "all"), 10)], null),
+      total: query?.filters?.q ? 1 : 9,
+    }));
+    const { result, rerender } = renderHook(
+      ({ q }: { q: string }) =>
+        usePolledCursorHistory({
+          listPage,
+          isRecordActive: () => false,
+          loadErrorMessage: "load failed",
+          loadMoreErrorMessage: "more failed",
+          filters: { q: q || undefined },
+        }),
+      { initialProps: { q: "" } },
+    );
+
+    await waitFor(() => expect(result.current.total).toBe(9));
+    expect(listPage).toHaveBeenLastCalledWith({
+      limit: 25,
+      cursor: null,
+      filters: {},
+    });
+
+    // A fresh but equal filters object does not reload.
+    rerender({ q: "" });
+    expect(listPage).toHaveBeenCalledTimes(1);
+
+    rerender({ q: "fox" });
+    await waitFor(() => expect(result.current.total).toBe(1));
+    expect(result.current.records.map((r) => r.id)).toEqual(["fox"]);
+    expect(listPage).toHaveBeenLastCalledWith({
+      limit: 25,
+      cursor: null,
+      filters: { q: "fox" },
+    });
+  });
+});

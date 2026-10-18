@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { CursorPageResult, CursorPaginationQuery } from "@/api";
+import type { ListFilters } from "@/shared/api/pagination";
 
 const HISTORY_PAGE_LIMIT = 25;
 const HISTORY_POLL_INTERVAL_MS = 2500;
@@ -19,10 +20,14 @@ export interface UsePolledCursorHistoryOptions<TRecord extends HistoryRecordBase
   loadErrorMessage: string;
   loadMoreErrorMessage: string;
   enablePolling?: boolean;
+  /** Server-side filters; a change reloads the list from the first page. */
+  filters?: ListFilters;
 }
 
 export interface UsePolledCursorHistoryResult<TRecord> {
   records: TRecord[];
+  /** Rows matching the filters, when the server reports it. */
+  total: number | null;
   loading: boolean;
   loadingMore: boolean;
   error: string | null;
@@ -76,7 +81,15 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
     loadErrorMessage,
     loadMoreErrorMessage,
     enablePolling = true,
+    filters,
   } = options;
+  // Callers usually pass a fresh object each render: key on its contents so
+  // only a real change makes new loaders (and so reloads the list).
+  const filtersKey = JSON.stringify(filters ?? {});
+  const stableFilters = useMemo(
+    () => JSON.parse(filtersKey) as ListFilters,
+    [filtersKey],
+  );
 
   const [records, setRecords] = useState<TRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -84,6 +97,7 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
   const [error, setError] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
+  const [total, setTotal] = useState<number | null>(null);
   const recordsRef = useRef<TRecord[]>([]);
   // Bumped by every first-page request; a response is applied only if no
   // newer first-page request started after it.
@@ -107,10 +121,15 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
       }
 
       try {
-        const page = await listPage({ limit: HISTORY_PAGE_LIMIT, cursor: null });
+        const page = await listPage({
+          limit: HISTORY_PAGE_LIMIT,
+          cursor: null,
+          filters: stableFilters,
+        });
         if (requestId !== firstPageRequestRef.current) {
           return;
         }
+        setTotal(page.total ?? null);
         if (backgroundRefresh) {
           // Keep the cursor: it points past the oldest loaded row, which a
           // merge preserves.
@@ -137,7 +156,7 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
         }
       }
     },
-    [listPage, loadErrorMessage],
+    [listPage, loadErrorMessage, stableFilters],
   );
 
   const refresh = useCallback(async () => {
@@ -178,6 +197,7 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
       const page = await listPage({
         limit: HISTORY_PAGE_LIMIT,
         cursor: nextCursor,
+        filters: stableFilters,
       });
       if (generation !== listGenerationRef.current) {
         return;
@@ -196,10 +216,19 @@ export function usePolledCursorHistory<TRecord extends HistoryRecordBase>(
     } finally {
       setLoadingMore(false);
     }
-  }, [hasMore, listPage, loadMoreErrorMessage, loading, loadingMore, nextCursor]);
+  }, [
+    hasMore,
+    listPage,
+    loadMoreErrorMessage,
+    loading,
+    loadingMore,
+    nextCursor,
+    stableFilters,
+  ]);
 
   return {
     records,
+    total,
     loading,
     loadingMore,
     error,

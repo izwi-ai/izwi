@@ -370,10 +370,12 @@ describe("TextToSpeechPage", () => {
     expect(apiMocks.listTextToSpeechRecordPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listTextToSpeechRecordPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "tts-cursor-2",
+      filters: {},
     });
   });
 

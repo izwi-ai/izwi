@@ -362,10 +362,12 @@ describe("DiarizationPage routes", () => {
     expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "diar-cursor-2",
+      filters: {},
     });
   });
 

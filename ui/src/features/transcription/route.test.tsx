@@ -464,10 +464,12 @@ describe("TranscriptionPage detail route", () => {
     expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "txr-cursor-2",
+      filters: {},
     });
   });
 

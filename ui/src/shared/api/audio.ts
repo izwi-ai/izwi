@@ -6,6 +6,7 @@ import {
 import {
   buildCursorQueryString,
   normalizeCursorPaginationMeta,
+  readListTotal,
   type CursorPageResult,
   type CursorPaginationQuery,
 } from "@/shared/api/pagination";
@@ -1629,12 +1630,14 @@ export class AudioApiClient {
         has_more?: boolean;
         limit?: number;
       };
+      total?: number;
     }>(path);
     const items = payload.records ?? [];
     const fallbackLimit = query?.limit ?? Math.max(items.length, 1);
     return {
       items,
       pagination: normalizeCursorPaginationMeta(payload.pagination, fallbackLimit),
+      total: readListTotal(payload),
     };
   }
 
@@ -2405,6 +2408,7 @@ export class AudioApiClient {
     const cursorQuery = buildCursorQueryString({
       limit: query?.limit,
       cursor: query?.cursor,
+      filters: query?.filters,
     });
     const path = this.buildSpeechTextJobPath(
       `${this.speechTextJobsCollectionPath()}${cursorQuery}`,
@@ -2417,12 +2421,14 @@ export class AudioApiClient {
         has_more?: boolean;
         limit?: number;
       };
+      total?: number;
     }>(path);
     const items = payload.records ?? [];
     const fallbackLimit = query?.limit ?? Math.max(items.length, 1);
     return {
       items,
       pagination: normalizeCursorPaginationMeta(payload.pagination, fallbackLimit),
+      total: readListTotal(payload),
     };
   }
 
