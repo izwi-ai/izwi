@@ -838,6 +838,11 @@ izwi_inference_coordinator_poisoned {}\n",
         self.record_voice_stage_observation("voice.barge_in");
     }
 
+    pub fn record_voice_speech_rejected(&self) {
+        self.telemetry.record_voice_speech_rejected();
+        self.record_voice_stage_observation("voice.speech_rejected");
+    }
+
     pub fn record_voice_latency(
         &self,
         latency: crate::runtime::VoiceLatency,

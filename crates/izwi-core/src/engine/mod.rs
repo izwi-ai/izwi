@@ -44,7 +44,6 @@ mod output;
 mod request;
 pub mod resources;
 mod scheduler;
-pub mod signal_frontend;
 mod types;
 
 pub(crate) use cache::invocation::{

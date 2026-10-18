@@ -167,6 +167,8 @@ izwi serve --mode web --no-ui
 | `IZWI_LOG_FORMAT` | `--log-format` |
 | `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | Environment only: how long a streamed chat answer waits for a client that stopped reading before it fails (default `30000`). While the client lags, text is merged rather than dropped |
 | `IZWI_SERVE_MODE` | `--mode` |
+| `IZWI_ASR_REALTIME_NOISE_GATE` | Environment only: `0` stops silencing non-speech before it reaches Voxtral Realtime, which removes its 500 ms transcript delay but lets noise become text (default on) |
+| `IZWI_VAD_SNR_MARGIN_DB` | Environment only: how far (dB) audio must rise above its own noise floor to count as speech, for the ASR no-speech check, realtime voice turns, `/transcription` and the Voxtral Realtime noise gate (default `6`). `0` turns the noise-floor check off |
 
 Legacy aliases still resolve for one release cycle:
 

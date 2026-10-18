@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::StreamExt;
 use izwi_core::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass};
+use izwi_vad::{SpeechEvidence, SpeechEvidenceConfig, VadScorer};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -262,6 +263,13 @@ struct RealtimeSessionState {
     native_asr_stream: Option<RuntimeAsrRealtimeStream>,
     wire_protocol: TranscriptionWireProtocol,
     typed_session: Option<TypedTranscriptionSession>,
+    /// Scores every ingested frame, so the noise floor spans the session.
+    vad: VadScorer,
+    /// Speech evidence in the audio since the last scheduled re-decode. A
+    /// window that only grew by noise is not decoded again, so noise never
+    /// re-runs a model that hallucinates on it. `None` once scoring failed,
+    /// which turns the check off.
+    new_audio_evidence: Option<SpeechEvidence>,
 }
 
 impl Default for RealtimeSessionState {
@@ -284,6 +292,8 @@ impl Default for RealtimeSessionState {
             native_asr_stream: None,
             wire_protocol: TranscriptionWireProtocol::LegacyV2,
             typed_session: None,
+            vad: VadScorer::new(),
+            new_audio_evidence: Some(SpeechEvidence::new(SpeechEvidenceConfig::default())),
         }
     }
 }
@@ -662,6 +672,8 @@ async fn handle_worker_command(
             session.trailing_text.clear();
             session.native_stream_checked = false;
             session.native_asr_stream = None;
+            session.vad.reset();
+            session.new_audio_evidence = Some(SpeechEvidence::new(SpeechEvidenceConfig::default()));
             session.wire_protocol = wire_protocol;
             session.typed_session = match wire_protocol {
                 TranscriptionWireProtocol::LegacyV2 => None,
@@ -1141,6 +1153,7 @@ fn ingest_audio_frame(
 
     session.samples_i16.extend_from_slice(&samples);
     session.pending_recompute = true;
+    score_new_audio(session, &samples, sample_rate);
 
     let max_samples = ((sample_rate as f32) * MAX_STREAM_BUFFER_SECS) as usize;
     if session.samples_i16.len() > max_samples {
@@ -1149,6 +1162,33 @@ fn ingest_audio_frame(
     }
 
     Ok(samples)
+}
+
+fn score_new_audio(session: &mut RealtimeSessionState, samples: &[i16], sample_rate: u32) {
+    let Some(evidence) = session.new_audio_evidence.as_mut() else {
+        return;
+    };
+    match session.vad.push_i16(samples, sample_rate) {
+        Ok(frames) => {
+            for frame in &frames {
+                evidence.push(frame);
+            }
+        }
+        Err(err) => {
+            debug!("transcription realtime VAD disabled: {err}");
+            session.new_audio_evidence = None;
+        }
+    }
+}
+
+/// Whether the audio since the last re-decode holds speech. Inputs shorter
+/// than a second need proportionally less, so a short tail after a decode
+/// still gets decoded.
+fn new_audio_needs_decode(session: &RealtimeSessionState) -> bool {
+    session
+        .new_audio_evidence
+        .as_ref()
+        .is_none_or(SpeechEvidence::is_sufficient)
 }
 
 /// A native realtime stream failure. A `terminal` failure closed the runtime
@@ -1334,6 +1374,15 @@ fn maybe_schedule_inference(
                 return Ok(());
             }
         }
+    }
+    if !new_audio_needs_decode(session) {
+        // Noise since the last decode changes nothing worth decoding; the
+        // next frame re-arms the check and its evidence keeps accumulating.
+        session.pending_recompute = false;
+        return Ok(());
+    }
+    if let Some(evidence) = session.new_audio_evidence.as_mut() {
+        *evidence = SpeechEvidence::new(evidence.config().clone());
     }
 
     let window_samples = ((sample_rate as f32) * INFERENCE_WINDOW_SECS) as usize;
@@ -1910,7 +1959,8 @@ mod tests {
 
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
-        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_fatal_error,
+        negotiate_transcription_protocol, new_audio_needs_decode, pcm16_i16_to_f32,
+        send_session_fatal_error,
         send_session_finished, strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput,
         OutboundTx, RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
         TypedTranscriptionSession,
@@ -2362,5 +2412,45 @@ mod tests {
             !collapsed.contains("you're saying you know uh interpret uh what you are saying"),
             "contraction/wording variant restart should be collapsed: {collapsed}"
         );
+    }
+
+    /// Noise arriving after the last decode does not schedule another one;
+    /// speech does, and noise skipped earlier never blocks it.
+    #[test]
+    fn fallback_decodes_new_speech_but_not_new_noise() {
+        use izwi_vad::test_signals::pink_noise;
+
+        let ingest = |session: &mut RealtimeSessionState, samples: &[f32], first_seq: u32| {
+            for (index, chunk) in samples.chunks(320).enumerate() {
+                let payload: Vec<u8> = chunk
+                    .iter()
+                    .flat_map(|sample| ((sample.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+                    .collect();
+                ingest_audio_frame(session, first_seq + index as u32, 16_000, &payload)
+                    .expect("frame");
+            }
+            first_seq + samples.len().div_ceil(320) as u32
+        };
+        let mut session = RealtimeSessionState {
+            started: true,
+            ..RealtimeSessionState::default()
+        };
+
+        let next = ingest(&mut session, &pink_noise(16_000 * 3, 0.3, 4), 1);
+        assert!(session.pending_recompute);
+        assert!(!new_audio_needs_decode(&session), "pink noise alone");
+
+        let fox = {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+            let mut reader = hound::WavReader::open(path).expect("speech fixture");
+            let rate = reader.spec().sample_rate;
+            let samples: Vec<f32> = reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("sample") as f32 / 32768.0)
+                .collect();
+            izwi_vad::resample_linear_f32(&samples, rate, 16_000).expect("resample")
+        };
+        ingest(&mut session, &fox, next);
+        assert!(new_audio_needs_decode(&session), "speech after noise");
     }
 }

@@ -56,7 +56,9 @@ import {
   mergeSampleChunks,
   parseFinalAnswer,
   normalizeVoiceRealtimeV2Event,
-  shouldStopVoiceRealtimePlayback,
+  VOICE_REALTIME_DUCK_GAIN,
+  voiceRealtimeEndsUserSpeech,
+  voiceRealtimePlaybackAction,
   type VoiceRealtimeMode,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
   type RuntimeStatus,
@@ -173,6 +175,12 @@ export function VoicePage({
   const ttsStreamSessionRef = useRef(0);
   const playbackSpeedRef = useRef(1);
   const isOutputMutedRef = useRef(false);
+  /** Assistant playback is ducked while the user may be speaking over it. */
+  const playbackDuckedRef = useRef(false);
+  const playbackGainValue = useCallback(() => {
+    if (isOutputMutedRef.current) return 0;
+    return playbackDuckedRef.current ? VOICE_REALTIME_DUCK_GAIN : 1;
+  }, []);
   const voiceWsRef = useRef<WebSocket | null>(null);
   const voiceWsConnectingRef = useRef<Promise<WebSocket> | null>(null);
   const voiceWsSessionReadyRef = useRef(false);
@@ -185,6 +193,16 @@ export function VoicePage({
   const voiceWsInputFrameSeqRef = useRef(0);
   const voiceWsV2EventRef = useRef<VoiceRealtimeV2ServerEnvelope | null>(null);
   const voiceMinAcceptedAssistantSeqRef = useRef(0);
+  const voiceLatestSpeechSeqRef = useRef(0);
+  const setPlaybackDucked = useCallback(
+    (ducked: boolean) => {
+      playbackDuckedRef.current = ducked;
+      if (ttsPlaybackGainRef.current) {
+        ttsPlaybackGainRef.current.gain.value = playbackGainValue();
+      }
+    },
+    [playbackGainValue],
+  );
   const voiceUserEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceAssistantEntryIdsRef = useRef<Map<string, string>>(new Map());
   const loadAllDownloadRequestedRef = useRef<Set<string>>(new Set());
@@ -380,9 +398,9 @@ export function VoicePage({
     }
 
     if (ttsPlaybackGainRef.current) {
-      ttsPlaybackGainRef.current.gain.value = isOutputMuted ? 0 : 1;
+      ttsPlaybackGainRef.current.gain.value = playbackGainValue();
     }
-  }, [isOutputMuted]);
+  }, [isOutputMuted, playbackGainValue]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -690,6 +708,8 @@ export function VoicePage({
     closeVoiceRealtimeSocket("session_stopped");
     voiceWsPlaybackRef.current = null;
     voiceMinAcceptedAssistantSeqRef.current = 0;
+    voiceLatestSpeechSeqRef.current = 0;
+    playbackDuckedRef.current = false;
     voiceUserEntryIdsRef.current.clear();
     voiceAssistantEntryIdsRef.current.clear();
 
@@ -883,15 +903,29 @@ export function VoicePage({
         return;
       }
 
-      if (
-        shouldStopVoiceRealtimePlayback(
-          event,
-          voiceWsPlaybackRef.current?.utteranceSeq ?? null,
-        )
-      ) {
+      const playbackAction = voiceRealtimePlaybackAction(
+        event,
+        voiceWsPlaybackRef.current?.utteranceSeq ?? null,
+      );
+      if (playbackAction === "stop") {
         clearAudioPlayback();
+        playbackDuckedRef.current = false;
         voiceWsPlaybackRef.current = null;
         processingRef.current = false;
+      } else if (playbackAction === "duck" || playbackAction === "restore") {
+        setPlaybackDucked(playbackAction === "duck");
+      }
+
+      if (
+        voiceRealtimeEndsUserSpeech(event, voiceLatestSpeechSeqRef.current) &&
+        isSessionActiveRef.current &&
+        runtimeStatusRef.current === "user_speaking"
+      ) {
+        setRuntimeStatus(
+          voiceWsPlaybackRef.current?.playbackStarted
+            ? "assistant_speaking"
+            : "listening",
+        );
       }
 
       switch (event.type) {
@@ -917,8 +951,10 @@ export function VoicePage({
           );
           return;
         case "user_speech_start":
-          voiceMinAcceptedAssistantSeqRef.current = Math.max(
-            voiceMinAcceptedAssistantSeqRef.current,
+          // The reply keeps playing (ducked) until the server confirms the
+          // speech: noise and echo also start speech and get rejected.
+          voiceLatestSpeechSeqRef.current = Math.max(
+            voiceLatestSpeechSeqRef.current,
             event.utterance_seq,
           );
           if (isSessionActiveRef.current) {
@@ -926,12 +962,18 @@ export function VoicePage({
           }
           return;
         case "user_speech_rejected":
-          processingRef.current = false;
-          if (isSessionActiveRef.current) {
-            setRuntimeStatus("listening");
-          }
+          // Playback volume and status were restored above; a rejected
+          // speech start never touched the turn in progress.
           return;
         case "user_speech_end":
+          // A finished utterance becomes a turn that preempts earlier ones,
+          // so their remaining assistant events are stale; its own reply
+          // plays at full volume.
+          setPlaybackDucked(false);
+          voiceMinAcceptedAssistantSeqRef.current = Math.max(
+            voiceMinAcceptedAssistantSeqRef.current,
+            event.utterance_seq,
+          );
           processingRef.current = true;
           if (isSessionActiveRef.current) {
             setRuntimeStatus("processing");
@@ -1063,7 +1105,7 @@ export function VoicePage({
 
           const playbackContext = new AudioContext();
           const playbackGain = playbackContext.createGain();
-          playbackGain.gain.value = isOutputMutedRef.current ? 0 : 1;
+          playbackGain.gain.value = playbackGainValue();
           playbackGain.connect(playbackContext.destination);
           ttsPlaybackContextRef.current = playbackContext;
           ttsPlaybackGainRef.current = playbackGain;
@@ -1158,7 +1200,9 @@ export function VoicePage({
       clearAudioPlayback,
       finalizeVoiceWsPlaybackIfComplete,
       onError,
+      playbackGainValue,
       removeTranscriptEntry,
+      setPlaybackDucked,
       settleVoiceRealtimeInputStreamReady,
       setTranscriptEntryText,
     ],

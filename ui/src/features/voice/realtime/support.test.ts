@@ -15,8 +15,9 @@ import {
   normalizeVoiceRealtimeV2Event,
   parseFinalAnswer,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
-  shouldStopVoiceRealtimePlayback,
   type VoiceRealtimeServerEvent,
+  voiceRealtimeEndsUserSpeech,
+  voiceRealtimePlaybackAction,
   type VoiceRealtimeV2ServerEnvelope,
 } from "./support";
 
@@ -193,19 +194,24 @@ describe("voice realtime support", () => {
     ).toBe(true);
   });
 
-  it("cuts off scheduled playback immediately for barge-in and interruption", () => {
+  it("ducks playback on a speech start and stops it only once the server confirms", () => {
+    const next = { utterance_id: "next", utterance_seq: 8 };
     expect(
-      shouldStopVoiceRealtimePlayback(
-        {
-          type: "user_speech_start",
-          utterance_id: "next",
-          utterance_seq: 8,
-        },
+      voiceRealtimePlaybackAction({ type: "user_speech_start", ...next }, 7),
+    ).toBe("duck");
+    // Noise the server rejects brings the reply back, on either protocol.
+    expect(
+      voiceRealtimePlaybackAction({ type: "user_speech_rejected", ...next }, 7),
+    ).toBe("restore");
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "turn_done", ...next, status: "no_input" },
         7,
       ),
-    ).toBe(true);
+    ).toBe("restore");
+    // A confirmed barge-in or a new turn stops it.
     expect(
-      shouldStopVoiceRealtimePlayback(
+      voiceRealtimePlaybackAction(
         {
           type: "turn_interrupted",
           utterance_id: "active",
@@ -214,9 +220,16 @@ describe("voice realtime support", () => {
         },
         7,
       ),
-    ).toBe(true);
+    ).toBe("stop");
     expect(
-      shouldStopVoiceRealtimePlayback(
+      voiceRealtimePlaybackAction(
+        { type: "user_speech_end", ...next, reason: "silence" },
+        7,
+      ),
+    ).toBe("stop");
+    // Events about other utterances leave it alone.
+    expect(
+      voiceRealtimePlaybackAction(
         {
           type: "turn_done",
           utterance_id: "other",
@@ -224,6 +237,43 @@ describe("voice realtime support", () => {
           status: "interrupted",
         },
         7,
+      ),
+    ).toBeNull();
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "turn_done", utterance_id: "active", utterance_seq: 7, status: "no_input" },
+        7,
+      ),
+    ).toBeNull();
+    expect(
+      voiceRealtimePlaybackAction({ type: "user_speech_start", ...next }, null),
+    ).toBeNull();
+  });
+
+  it("ends the speaking status only for the latest rejected speech", () => {
+    expect(
+      voiceRealtimeEndsUserSpeech(
+        { type: "turn_done", utterance_id: "u", utterance_seq: 4, status: "no_input" },
+        4,
+      ),
+    ).toBe(true);
+    expect(
+      voiceRealtimeEndsUserSpeech(
+        { type: "user_speech_rejected", utterance_id: "u", utterance_seq: 4 },
+        4,
+      ),
+    ).toBe(true);
+    // An older turn with an empty transcript does not end newer speech.
+    expect(
+      voiceRealtimeEndsUserSpeech(
+        { type: "turn_done", utterance_id: "u", utterance_seq: 3, status: "no_input" },
+        4,
+      ),
+    ).toBe(false);
+    expect(
+      voiceRealtimeEndsUserSpeech(
+        { type: "turn_done", utterance_id: "u", utterance_seq: 4, status: "ok" },
+        4,
       ),
     ).toBe(false);
   });

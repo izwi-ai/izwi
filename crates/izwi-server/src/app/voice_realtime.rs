@@ -31,7 +31,8 @@ use izwi_core::{
     SessionModelLeases, VoiceLatency, VoiceSession, VoiceSessionPhase, WorkloadClass,
 };
 use izwi_vad::{
-    sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
+    configured_snr_margin_db, sanitize_score_threshold, sanitize_snr_margin, EndpointConfig,
+    EndpointDetector, EndpointEndReason, EndpointEvent, SpeechEvidence, SpeechEvidenceConfig,
     VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
     DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
 };
@@ -417,6 +418,10 @@ enum ClientEvent {
         pre_roll_ms: Option<u32>,
         #[serde(default)]
         barge_in_min_speech_ms: Option<u32>,
+        /// Energy above the noise floor, in dB, a frame needs to start an
+        /// utterance. Half of it keeps one going. `0` disables the check.
+        #[serde(default)]
+        vad_snr_margin_db: Option<f32>,
         #[serde(default)]
         input_sample_rate: Option<u32>,
         /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
@@ -805,10 +810,19 @@ struct StreamingInputConfig {
     max_utterance_ms: u32,
     pre_roll_ms: u32,
     barge_in_min_speech_ms: u32,
+    snr_margin_db: f32,
     input_sample_rate_hint: Option<u32>,
 }
 
 impl StreamingInputConfig {
+    fn evidence_config(&self) -> SpeechEvidenceConfig {
+        SpeechEvidenceConfig {
+            threshold: self.vad_threshold,
+            snr_margin_db: self.snr_margin_db,
+            ..SpeechEvidenceConfig::default()
+        }
+    }
+
     fn endpoint_config(&self) -> EndpointConfig {
         EndpointConfig {
             start_threshold: self.vad_threshold,
@@ -816,6 +830,8 @@ impl StreamingInputConfig {
             min_speech_ms: self.min_speech_ms,
             silence_ms: self.silence_duration_ms,
             max_utterance_ms: self.max_utterance_ms,
+            snr_margin_db: self.snr_margin_db,
+            continue_snr_margin_db: self.snr_margin_db * 0.5,
         }
     }
 }
@@ -829,6 +845,10 @@ struct StreamingActiveUtterance {
     total_ms: f32,
     silence_ms: f32,
     barge_in_confirmed: bool,
+    /// The offline no-speech gate's rule over this utterance's frames. An
+    /// utterance without it never becomes a turn, for modular and unified
+    /// (speech-to-speech) turns alike.
+    evidence: SpeechEvidence,
 }
 
 struct StreamingInputState {
@@ -1100,14 +1120,23 @@ struct SpeechStartEvent {
     utterance_seq: u64,
 }
 
+/// How an active utterance ended.
+#[derive(Debug)]
+enum UtteranceOutcome {
+    /// Enough voiced speech: it becomes a turn.
+    Finalized(PendingAudioCommit, Vec<u8>, UtteranceEndReason),
+    /// Too little voiced speech, or no speech evidence: the client resumes
+    /// whatever it ducked on `user_speech_start`.
+    Rejected(SpeechStartEvent),
+}
+
 #[derive(Debug)]
 struct StreamingFrameResult {
     sequence_gap: Option<(u32, u32)>,
     speech_start: Option<SpeechStartEvent>,
     /// The active utterance has just confirmed a barge-in.
     barge_in: bool,
-    speech_rejected: Option<SpeechStartEvent>,
-    finalized_utterance: Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>,
+    utterance_end: Option<UtteranceOutcome>,
 }
 
 impl StreamingInputState {
@@ -1153,8 +1182,7 @@ impl StreamingInputState {
                 sequence_gap,
                 speech_start: None,
                 barge_in: false,
-                speech_rejected: None,
-                finalized_utterance: None,
+                utterance_end: None,
             });
         }
         if !payload.len().is_multiple_of(2) {
@@ -1177,8 +1205,7 @@ impl StreamingInputState {
                 sequence_gap,
                 speech_start: None,
                 barge_in: false,
-                speech_rejected: None,
-                finalized_utterance: None,
+                utterance_end: None,
             });
         }
 
@@ -1194,10 +1221,12 @@ impl StreamingInputState {
         let mut end_reason: Option<UtteranceEndReason> = None;
 
         for vad_frame in &vad_frames {
-            let decision = self.endpoint.process_score(vad_frame.score, VAD_FRAME_MS);
+            // Voiced time, which confirms barge-in, counts only frames that
+            // clear the SNR margin as well as the score threshold.
+            let decision = self.endpoint.process_frame(vad_frame);
             if decision.is_speech {
                 chunk_has_speech = true;
-                chunk_voiced_ms += VAD_FRAME_MS;
+                chunk_voiced_ms += vad_frame.duration_ms();
             }
             for event in decision.events {
                 match event {
@@ -1212,8 +1241,7 @@ impl StreamingInputState {
             sequence_gap,
             speech_start: None,
             barge_in: false,
-            speech_rejected: None,
-            finalized_utterance: None,
+            utterance_end: None,
         };
 
         if speech_started && self.active.is_none() {
@@ -1229,6 +1257,7 @@ impl StreamingInputState {
                 total_ms: 0.0,
                 silence_ms: 0.0,
                 barge_in_confirmed: false,
+                evidence: SpeechEvidence::new(self.config.evidence_config()),
             };
             if !self.pre_roll.is_empty() {
                 capture.samples_i16.extend(self.pre_roll.iter().copied());
@@ -1256,6 +1285,9 @@ impl StreamingInputState {
         }
 
         if let Some(active) = self.active.as_mut() {
+            for vad_frame in &vad_frames {
+                active.evidence.push(vad_frame);
+            }
             active.voiced_ms += chunk_voiced_ms;
             active.total_ms += frame_ms;
             if chunk_has_speech {
@@ -1276,9 +1308,9 @@ impl StreamingInputState {
         }
 
         if let Some(reason) = end_reason {
-            result.finalized_utterance = self.finalize_active_utterance(reason)?;
+            result.utterance_end = self.finalize_active_utterance(reason)?;
         } else if noise_rejected {
-            result.speech_rejected = self.reject_active_utterance();
+            result.utterance_end = self.reject_active_utterance();
         }
 
         if !chunk_has_speech {
@@ -1288,25 +1320,17 @@ impl StreamingInputState {
         Ok(result)
     }
 
-    fn reject_active_utterance(&mut self) -> Option<SpeechStartEvent> {
+    fn reject_active_utterance(&mut self) -> Option<UtteranceOutcome> {
         let active = self.active.take()?;
-        Some(SpeechStartEvent {
+        Some(UtteranceOutcome::Rejected(SpeechStartEvent {
             utterance_id: active.utterance_id,
             utterance_seq: active.utterance_seq,
-        })
+        }))
     }
 
-    fn finish_stream(
-        &mut self,
-    ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
+    fn finish_stream(&mut self) -> Result<Option<UtteranceOutcome>, String> {
         match self.endpoint.finish() {
-            Some(EndpointEvent::SpeechEnd(EndpointEndReason::StreamStopped)) => {
-                self.finalize_active_utterance(UtteranceEndReason::StreamStopped)
-            }
-            Some(EndpointEvent::NoiseRejected) => {
-                self.active = None;
-                Ok(None)
-            }
+            Some(EndpointEvent::NoiseRejected) => Ok(self.reject_active_utterance()),
             _ => self.finalize_active_utterance(UtteranceEndReason::StreamStopped),
         }
     }
@@ -1315,9 +1339,7 @@ impl StreamingInputState {
     /// `input_stream_stop`. Silence and the utterance cap are measured in
     /// audio time by the endpoint detector, so delayed but contiguous frames
     /// (a network stall) cannot end an utterance early.
-    fn on_tick(
-        &mut self,
-    ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
+    fn on_tick(&mut self) -> Result<Option<UtteranceOutcome>, String> {
         if self.active.is_none() {
             return Ok(None);
         }
@@ -1333,22 +1355,27 @@ impl StreamingInputState {
         Ok(None)
     }
 
+    /// End the active utterance: a turn when it holds enough voiced speech,
+    /// otherwise a rejection the client must hear about, since it already saw
+    /// `user_speech_start`.
     fn finalize_active_utterance(
         &mut self,
         reason: UtteranceEndReason,
-    ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
+    ) -> Result<Option<UtteranceOutcome>, String> {
         let Some(active) = self.active.take() else {
             return Ok(None);
         };
         self.endpoint = EndpointDetector::new(self.config.endpoint_config());
+        if active.voiced_ms < self.config.min_speech_ms as f32 || !active.evidence.is_sufficient() {
+            return Ok(Some(UtteranceOutcome::Rejected(SpeechStartEvent {
+                utterance_id: active.utterance_id,
+                utterance_seq: active.utterance_seq,
+            })));
+        }
         let sample_rate = self
             .current_sample_rate
             .or(self.config.input_sample_rate_hint)
             .ok_or_else(|| "Missing input sample rate for streamed audio".to_string())?;
-
-        if active.voiced_ms < self.config.min_speech_ms as f32 {
-            return Ok(None);
-        }
 
         let wav_bytes = wav_bytes_from_pcm16_mono(&active.samples_i16, sample_rate)?;
         if wav_bytes.len() > MAX_UTTERANCE_BYTES {
@@ -1379,7 +1406,7 @@ impl StreamingInputState {
             endpointing_delay,
         };
 
-        Ok(Some((commit, wav_bytes, reason)))
+        Ok(Some(UtteranceOutcome::Finalized(commit, wav_bytes, reason)))
     }
 
     fn push_pre_roll(&mut self, samples: &[i16], sample_rate: u32) {
@@ -1393,6 +1420,51 @@ impl StreamingInputState {
         if self.pre_roll.len() > max_samples {
             let drain = self.pre_roll.len() - max_samples;
             self.pre_roll.drain(0..drain);
+        }
+    }
+}
+
+/// Tell the client how an utterance ended and, for a finished one, start its
+/// turn.
+fn dispatch_utterance_outcome(
+    state: &AppState,
+    correlation_id: &str,
+    out_tx: &OutboundTx,
+    conn: &mut ConnectionState,
+    outcome: UtteranceOutcome,
+) -> Result<(), String> {
+    match outcome {
+        UtteranceOutcome::Finalized(commit, wav_bytes, end_reason) => {
+            send_json(
+                out_tx,
+                json!({
+                    "type": "user_speech_end",
+                    "utterance_id": commit.utterance_id,
+                    "utterance_seq": commit.utterance_seq,
+                    "reason": end_reason.as_str(),
+                }),
+            );
+            finalize_stream_vad_utterance(
+                state,
+                correlation_id,
+                out_tx,
+                conn,
+                commit,
+                wav_bytes,
+                end_reason,
+            )
+        }
+        UtteranceOutcome::Rejected(evt) => {
+            state.runtime.record_voice_speech_rejected();
+            send_json(
+                out_tx,
+                json!({
+                    "type": "user_speech_rejected",
+                    "utterance_id": evt.utterance_id,
+                    "utterance_seq": evt.utterance_seq,
+                }),
+            );
+            Ok(())
         }
     }
 }
@@ -1562,24 +1634,13 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
                     None => Ok(None),
                 };
                 match timed_utterance {
-                    Ok(Some((commit, wav_bytes, end_reason))) => {
-                        send_json(
-                            &out_tx,
-                            json!({
-                                "type": "user_speech_end",
-                                "utterance_id": commit.utterance_id,
-                                "utterance_seq": commit.utterance_seq,
-                                "reason": end_reason.as_str(),
-                            }),
-                        );
-                        if let Err(err) = finalize_stream_vad_utterance(
+                    Ok(Some(outcome)) => {
+                        if let Err(err) = dispatch_utterance_outcome(
                             &state,
                             &correlation_id,
                             &out_tx,
                             &mut conn,
-                            commit,
-                            wav_bytes,
-                            end_reason,
+                            outcome,
                         ) {
                             send_error(&out_tx, None, None, err);
                         }
@@ -1719,6 +1780,7 @@ async fn handle_text_message(
             max_utterance_ms,
             pre_roll_ms,
             barge_in_min_speech_ms,
+            vad_snr_margin_db,
             input_sample_rate,
             output_audio_format,
         } => {
@@ -1854,6 +1916,9 @@ async fn handle_text_message(
                 barge_in_min_speech_ms: barge_in_min_speech_ms
                     .unwrap_or(DEFAULT_BARGE_IN_MIN_SPEECH_MS)
                     .min(5_000),
+                snr_margin_db: sanitize_snr_margin(
+                    vad_snr_margin_db.unwrap_or_else(configured_snr_margin_db),
+                ),
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
             }));
@@ -1869,6 +1934,7 @@ async fn handle_text_message(
                         "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
                         "score_sample_rate": VAD_SAMPLE_RATE,
                         "score_frame_ms": VAD_FRAME_MS,
+                        "snr_margin_db": conn.streaming_input.as_ref().map(|s| s.config.snr_margin_db),
                         "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
                         "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
                         "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
@@ -1884,25 +1950,8 @@ async fn handle_text_message(
         }
         ClientEvent::InputStreamStop => {
             if let Some(mut streaming) = conn.streaming_input.take() {
-                if let Some((commit, wav_bytes, end_reason)) = streaming.finish_stream()? {
-                    send_json(
-                        out_tx,
-                        json!({
-                            "type": "user_speech_end",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "reason": end_reason.as_str(),
-                        }),
-                    );
-                    finalize_stream_vad_utterance(
-                        state,
-                        correlation_id,
-                        out_tx,
-                        conn,
-                        commit,
-                        wav_bytes,
-                        end_reason,
-                    )?;
+                if let Some(outcome) = streaming.finish_stream()? {
+                    dispatch_utterance_outcome(state, correlation_id, out_tx, conn, outcome)?;
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
@@ -2034,36 +2083,8 @@ async fn handle_binary_message(
         conn.voice_session.interrupt("barge_in");
     }
 
-    if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
-        send_json(
-            out_tx,
-            json!({
-                "type": "user_speech_end",
-                "utterance_id": commit.utterance_id,
-                "utterance_seq": commit.utterance_seq,
-                "reason": end_reason.as_str(),
-            }),
-        );
-        finalize_stream_vad_utterance(
-            state,
-            correlation_id,
-            out_tx,
-            conn,
-            commit,
-            wav_bytes,
-            end_reason,
-        )?;
-    }
-
-    if let Some(evt) = frame_result.speech_rejected {
-        send_json(
-            out_tx,
-            json!({
-                "type": "user_speech_rejected",
-                "utterance_id": evt.utterance_id,
-                "utterance_seq": evt.utterance_seq,
-            }),
-        );
+    if let Some(outcome) = frame_result.utterance_end {
+        dispatch_utterance_outcome(state, correlation_id, out_tx, conn, outcome)?;
     }
 
     Ok(())
@@ -4569,8 +4590,29 @@ mod tests {
             max_utterance_ms: 10_000,
             pre_roll_ms: 100,
             barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
+            snr_margin_db: izwi_vad::DEFAULT_SNR_MARGIN_DB,
             input_sample_rate_hint: Some(16_000),
         })
+    }
+
+    /// Every frame voiced, whatever its content: the score threshold drops
+    /// to the minimum and the SNR check is off, since digital silence never
+    /// rises over its own noise floor.
+    fn always_voiced(input: &mut StreamingInputState) {
+        input.config.vad_threshold = 0.01;
+        input.config.snr_margin_db = 0.0;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+    }
+
+    fn finalized(
+        outcome: Option<UtteranceOutcome>,
+    ) -> Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)> {
+        match outcome {
+            Some(UtteranceOutcome::Finalized(commit, wav_bytes, reason)) => {
+                Some((commit, wav_bytes, reason))
+            }
+            _ => None,
+        }
     }
 
     /// Realtime voice refuses a reference-only TTS model at session
@@ -4756,10 +4798,8 @@ mod tests {
     #[test]
     fn barge_in_waits_for_sustained_speech() {
         let mut input = test_streaming_input();
-        // Every Earshot score clears the minimum threshold, so each frame is
-        // voiced and the utterance is pure sustained speech.
-        input.config.vad_threshold = 0.01;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        // Each frame is voiced, so the utterance is pure sustained speech.
+        always_voiced(&mut input);
         let frame = pcm16_frame(&[0; 320]);
 
         let mut barge_ins = Vec::new();
@@ -4783,12 +4823,14 @@ mod tests {
         assert!(barge_ins[0] > 1, "the first speech frame must not barge in");
     }
 
-    /// SPK-F3: a short noise burst (a cough or a door) starts speech and is
-    /// rejected, but never barges in.
+    /// SPK-F3: a short noise burst (a cough or a door) never barges in or
+    /// becomes a turn; any speech start it causes is rejected. A burst out of
+    /// silence clears any noise floor, so this holds on the model score: at
+    /// the default threshold, not a lowered one where its mid-range scores
+    /// sustain an utterance.
     #[test]
     fn short_noise_burst_never_barges_in() {
         let mut input = StreamingInputState::new(StreamingInputConfig {
-            vad_threshold: 0.3,
             min_speech_ms: DEFAULT_STREAM_MIN_SPEECH_MS,
             ..test_streaming_input().config
         });
@@ -4812,11 +4854,13 @@ mod tests {
                 .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(frame))
                 .expect("frame");
             starts += usize::from(result.speech_start.is_some());
-            rejections += usize::from(result.speech_rejected.is_some());
+            rejections += usize::from(matches!(
+                result.utterance_end,
+                Some(UtteranceOutcome::Rejected(_))
+            ));
             assert!(!result.barge_in, "a short burst must not barge in");
-            assert!(result.finalized_utterance.is_none());
+            assert!(finalized(result.utterance_end).is_none());
         }
-        assert!(starts >= 1, "the burst must start speech");
         assert_eq!(rejections, starts, "every start is rejected as noise");
     }
 
@@ -4826,8 +4870,7 @@ mod tests {
     #[test]
     fn network_stall_does_not_end_an_utterance() {
         let mut input = test_streaming_input();
-        input.config.vad_threshold = 0.01;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        always_voiced(&mut input);
         let frame = pcm16_frame(&[0; 320]);
         for frame_seq in 1..=10_u32 {
             input
@@ -4844,7 +4887,7 @@ mod tests {
                 .handle_pcm16_frame(frame_seq, 16_000, &frame)
                 .expect("late frame");
             assert!(result.speech_start.is_none());
-            assert!(result.finalized_utterance.is_none());
+            assert!(result.utterance_end.is_none());
         }
         assert_eq!(
             input.active.as_ref().expect("same utterance").utterance_id,
@@ -4854,9 +4897,7 @@ mod tests {
         input.last_frame_at = Some(
             Instant::now() - Duration::from_millis(silence_ms + CLIENT_PAUSE_STALL_ALLOWANCE_MS),
         );
-        let (commit, _, reason) = input
-            .on_tick()
-            .expect("tick")
+        let (commit, _, reason) = finalized(input.on_tick().expect("tick"))
             .expect("a client that stopped sending is paused");
         assert_eq!(commit.utterance_id, utterance_id);
         assert!(matches!(reason, UtteranceEndReason::ClientPause));
@@ -4872,8 +4913,7 @@ mod tests {
     #[test]
     fn silence_endpointing_reports_the_trailing_silence() {
         let mut input = test_streaming_input();
-        input.config.vad_threshold = 0.01;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        always_voiced(&mut input);
         let frame = pcm16_frame(&[0; 320]);
         for frame_seq in 1..=10_u32 {
             input
@@ -4881,10 +4921,12 @@ mod tests {
                 .expect("frame");
         }
         input.active.as_mut().expect("speech").silence_ms = 240.0;
-        let (commit, _, _) = input
-            .finalize_active_utterance(UtteranceEndReason::Silence)
-            .expect("finalize")
-            .expect("voiced utterance");
+        let (commit, _, _) = finalized(
+            input
+                .finalize_active_utterance(UtteranceEndReason::Silence)
+                .expect("finalize"),
+        )
+        .expect("voiced utterance");
         assert_eq!(commit.endpointing_delay, Some(Duration::from_millis(240)));
 
         for frame_seq in 11..=20_u32 {
@@ -4892,11 +4934,134 @@ mod tests {
                 .handle_pcm16_frame(frame_seq, 16_000, &frame)
                 .expect("frame");
         }
-        let (commit, _, _) = input
-            .finalize_active_utterance(UtteranceEndReason::MaxDuration)
-            .expect("finalize")
-            .expect("voiced utterance");
+        let (commit, _, _) = finalized(
+            input
+                .finalize_active_utterance(UtteranceEndReason::MaxDuration)
+                .expect("finalize"),
+        )
+        .expect("voiced utterance");
         assert_eq!(commit.endpointing_delay, None);
+    }
+
+    /// An utterance that ends without enough voiced speech is rejected, never
+    /// dropped silently: the client already saw its `user_speech_start`.
+    #[test]
+    fn short_utterance_is_rejected_on_every_forced_end() {
+        let frame = pcm16_frame(&[0; 320]);
+        let start = |input: &mut StreamingInputState| {
+            always_voiced(input);
+            input.config.min_speech_ms = 300;
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            for frame_seq in 1..=5_u32 {
+                input
+                    .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                    .expect("frame");
+            }
+            input.active.as_ref().expect("speech").utterance_id.clone()
+        };
+        let rejected = |outcome: Option<UtteranceOutcome>| match outcome {
+            Some(UtteranceOutcome::Rejected(evt)) => evt.utterance_id,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+
+        let mut input = test_streaming_input();
+        let utterance_id = start(&mut input);
+        let outcome = input
+            .finalize_active_utterance(UtteranceEndReason::MaxDuration)
+            .expect("finalize");
+        assert_eq!(rejected(outcome), utterance_id);
+
+        let mut input = test_streaming_input();
+        let utterance_id = start(&mut input);
+        input.last_frame_at = Some(
+            Instant::now()
+                - Duration::from_millis(
+                    u64::from(input.config.silence_duration_ms) + CLIENT_PAUSE_STALL_ALLOWANCE_MS,
+                ),
+        );
+        assert_eq!(rejected(input.on_tick().expect("tick")), utterance_id);
+
+        let mut input = test_streaming_input();
+        let utterance_id = start(&mut input);
+        assert_eq!(rejected(input.finish_stream().expect("stop")), utterance_id);
+        assert!(input.active.is_none());
+    }
+
+    /// 20 ms PCM16 frames of 16 kHz audio through the session input, counting
+    /// finished turns and confirmed barge-ins.
+    fn stream_turns(input: &mut StreamingInputState, samples: &[f32]) -> (usize, usize) {
+        let (mut turns, mut barge_ins) = (0, 0);
+        for (index, chunk) in samples.chunks(320).enumerate() {
+            let pcm: Vec<i16> = chunk
+                .iter()
+                .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .collect();
+            let result = input
+                .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(&pcm))
+                .expect("frame");
+            barge_ins += usize::from(result.barge_in);
+            turns += usize::from(finalized(result.utterance_end).is_some());
+        }
+        turns += usize::from(finalized(input.finish_stream().expect("stop")).is_some());
+        (turns, barge_ins)
+    }
+
+    /// Steady background noise, which Earshot alone scores as speech, never
+    /// becomes a turn or a barge-in; speech spoken over it becomes one turn.
+    #[test]
+    fn steady_noise_never_becomes_a_turn_but_speech_over_it_does() {
+        use izwi_vad::test_signals::{fan_noise, mains_hum, pink_noise};
+
+        let fox = {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+            let mut reader = hound::WavReader::open(path).expect("speech fixture");
+            let rate = reader.spec().sample_rate;
+            let samples: Vec<f32> = reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("sample") as f32 / 32768.0)
+                .collect();
+            izwi_vad::resample_linear_f32(&samples, rate, 16_000).expect("resample")
+        };
+        let rms = |samples: &[f32]| {
+            (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
+                .sqrt()
+        };
+        let len = 16_000 * 10;
+        for (name, noise) in [
+            ("fan", fan_noise(len, 0.3, 7)),
+            ("hum", mains_hum(len, 0.3)),
+            ("pink", pink_noise(len, 0.3, 7)),
+        ] {
+            let mut input = test_streaming_input();
+            input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
+            input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            assert_eq!(stream_turns(&mut input, &noise), (0, 0), "{name} alone");
+
+            // Fox 3 s in, 10 dB over the noise.
+            let gain = rms(&fox) / rms(&noise) * 10f32.powf(-10.0 / 20.0);
+            let mut mixed: Vec<f32> = noise.iter().map(|sample| sample * gain).collect();
+            for (idx, sample) in fox.iter().enumerate() {
+                mixed[16_000 * 3 + idx] += sample;
+            }
+            let mut input = test_streaming_input();
+            input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
+            input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            let (turns, barge_ins) = stream_turns(&mut input, &mixed);
+            assert_eq!((turns, barge_ins), (1, 1), "{name} with speech");
+        }
+
+        // A short reply ("the quick", about half a second) still clears the
+        // per-utterance speech evidence.
+        let mut short = vec![0.0f32; 16_000 / 2];
+        short.extend_from_slice(&fox[..16_000 * 3 / 4]);
+        short.extend(vec![0.0f32; 16_000 * 3 / 2]);
+        let mut input = test_streaming_input();
+        input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
+        input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        assert_eq!(stream_turns(&mut input, &short).0, 1, "short reply");
     }
 
     /// SPK-F6: audio sent after the client finished playing what it had is

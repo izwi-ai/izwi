@@ -175,6 +175,7 @@ impl RuntimeService {
         spawn_realtime_asr_watchdog(&resources, activity.clone());
         Ok(RuntimeAsrRealtimeStream {
             variant,
+            noise_gate: realtime_noise_gate(variant),
             resources,
             activity,
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -338,6 +339,7 @@ impl RuntimeService {
 
         Ok(Some(RuntimeAsrRealtimeStream {
             variant,
+            noise_gate: realtime_noise_gate(variant),
             resources,
             activity,
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -350,7 +352,30 @@ impl RuntimeService {
         }))
     }
 
+    /// Push input audio. For a model that hallucinates on non-speech the
+    /// audio first passes the stream's noise gate, which releases it after a
+    /// short lookahead with non-speech replaced by silence.
     pub async fn push_asr_realtime_samples(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        validate_realtime_input_copy(samples.len(), stream.max_samples)?;
+        match stream.noise_gate.as_mut() {
+            Some(gate) => {
+                let gated = gate.push(samples, sample_rate);
+                self.push_asr_realtime_model_samples(stream, &gated, sample_rate)
+                    .await
+            }
+            None => {
+                self.push_asr_realtime_model_samples(stream, samples, sample_rate)
+                    .await
+            }
+        }
+    }
+
+    async fn push_asr_realtime_model_samples(
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
         samples: &[f32],
@@ -712,7 +737,25 @@ impl RuntimeService {
         Ok(events)
     }
 
+    /// Finish the stream, first releasing the audio its noise gate holds.
     pub async fn finish_asr_realtime_stream(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let mut events = Vec::new();
+        if let Some((held, sample_rate)) = stream.noise_gate.take().and_then(|mut gate| {
+            let rate = gate.sample_rate()?;
+            Some((gate.flush(), rate))
+        }) {
+            events = self
+                .push_asr_realtime_model_samples(stream, &held, sample_rate)
+                .await?;
+        }
+        events.extend(self.finish_asr_realtime_model_stream(stream).await?);
+        Ok(events)
+    }
+
+    async fn finish_asr_realtime_model_stream(
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {

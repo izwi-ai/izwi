@@ -461,6 +461,8 @@ Multipart fields:
 }
 ```
 
+Audio without speech returns an empty transcript without running the model, for the models that otherwise hallucinate a short phrase on silence or noise (Whisper, Qwen3-ASR, Granite Speech, VibeVoice, Voxtral, LFM2.5 Audio). An input counts as speech when some second of it holds 200 ms of frames the VAD scores as speech that are also 6 dB above the input's own noise floor. Silence and steady noise (hum, fan, pink or white noise) at any level are skipped this way; tonal music and crowd babble are not, and reach the model. `verbose_json` reports a skipped input as `izwi_asr_diagnostics.no_speech_gate`, with the speech evidence found (`evidence_ms`) and needed (`required_evidence_ms`). `IZWI_VAD_SNR_MARGIN_DB` sets the margin (default `6`); `0` turns the noise-floor check off.
+
 `verbose_json` always includes `segments`. Without word or segment timestamps from the model or the aligner, each long-form chunk becomes one segment covering its time range, and a short file gets one segment spanning the whole audio. `words` appears only when `timestamp_granularities[]` includes `word`. If forced alignment fails, the transcript is still returned with segments, without `words`, and the failure is reported as `izwi_asr_diagnostics.alignment_error`.
 
 SSE events:
@@ -1194,6 +1196,11 @@ Constraints:
 - Sample rate must remain stable during a session.
 - Sample rates outside the accepted runtime range return an error.
 
+Noise handling:
+
+- Models that stream natively (Voxtral Realtime, Nemotron) transcribe as audio arrives. Voxtral would otherwise turn background noise into made-up words, so its input passes a noise gate: audio is held for 500 ms, and anything that is not confirmed speech (300 ms of voiced speech, 6 dB above the stream's own noise floor) reaches the model as silence. Its transcripts therefore arrive about 500 ms later. Steady noise such as a fan, hum or pink noise produces no text; music and crowd babble can still pass. `IZWI_ASR_REALTIME_NOISE_GATE=0` turns the gate off.
+- Other models re-transcribe a rolling window of recent audio. A window that only grew by non-speech since the last pass is not transcribed again.
+
 ### Voice Realtime
 
 `GET /v1/voice/realtime/ws`
@@ -1233,6 +1240,7 @@ Client JSON messages:
 | `max_output_tokens` | Reply token budget: default `384` in modular mode (a few spoken sentences), `1536` in unified mode. |
 | `output_audio_format` | `pcm_i16` (default: PCM16 at the model's rate), `g711_ulaw` or `g711_alaw` (8 kHz, one byte a sample). |
 | `vad_threshold` | Earshot speech score threshold, default `0.5`. Values are clamped to the valid score range. |
+| `vad_snr_margin_db` | How far, in dB, a frame must rise above the stream's own noise floor to start an utterance; half of it keeps one going. Default `6` (or `IZWI_VAD_SNR_MARGIN_DB`), clamped to `0..40`. Earshot scores steady noise such as a fan or hum as speech; this margin is what ignores it. `0` turns the check off. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
 | `max_utterance_ms` | Hard utterance duration cap. |
@@ -1271,11 +1279,11 @@ Server events:
 |------|-------|
 | `connected` | Socket accepted and protocol version announced. |
 | `session_ready` | Voice session initialized. |
-| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration, and the `output_audio_format`. |
+| `input_stream_ready` | Includes resolved VAD settings (backend, threshold, `snr_margin_db`, score sample rate and frame duration, speech and silence durations) and the `output_audio_format`. The typed v2 protocol's `session_started` does not carry them. |
 | `models_ready` | Sent once the stream's models have loaded in the background after `input_stream_start`: each model's `stage`, `model_id`, `ready`, and `error` when it could not load. |
 | `input_stream_stopped` | Input stream stopped. |
-| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. A client may duck assistant playback on `user_speech_start`; the server cancels the turn only after `barge_in_min_speech_ms` of speech. |
-| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. Ducked playback can resume. |
+| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. A client should duck, not stop, assistant playback on `user_speech_start`: the server cancels the turn only after `barge_in_min_speech_ms` of speech (`turn_interrupted`), and a `user_speech_end` starts a new turn that replaces it. |
+| `user_speech_rejected` | A speech start was rejected as noise (too little voiced speech, or no second with 200 ms of speech evidence) and the input stream remains ready. Every `user_speech_start` ends in either `user_speech_end` or this event. Ducked playback can resume. The typed v2 protocol reports it as `turn_completed` with status `no_input`. |
 | `turn_processing` | Turn started. |
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
 | `assistant_text_start`, `assistant_text_snapshot`, `assistant_text_final` | Assistant text events. A snapshot carries the whole reply so far; the final event also has `raw_text`. |

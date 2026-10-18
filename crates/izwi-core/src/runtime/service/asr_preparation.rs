@@ -1498,13 +1498,18 @@ impl RuntimeService {
         if !asr_no_speech_gate_applies(&request) {
             return Ok((request, None));
         }
-        self.coordinator
+        let (request, gate) = self
+            .coordinator
             .run_host_blocking_stage(job, move || {
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
                 let gate = AsrNoSpeechGate::evaluate(&samples, sample_rate);
                 Ok((request, gate))
             })
-            .await
+            .await?;
+        if gate.is_some() {
+            self.telemetry.record_asr_no_speech_gated();
+        }
+        Ok((request, gate))
     }
 }

@@ -3,8 +3,9 @@
 use std::cmp;
 
 use izwi_vad::{
-    detect_speech_regions_f32, sanitize_score_threshold, VadRegionConfig, VadScorer,
-    DEFAULT_EXIT_THRESHOLD, DEFAULT_SPEECH_THRESHOLD,
+    configured_snr_margin_db, detect_speech_regions_f32, SpeechEvidence, SpeechEvidenceConfig,
+    VadRegionConfig, VadScorer, DEFAULT_EVIDENCE_WINDOW_MS, DEFAULT_EXIT_THRESHOLD,
+    DEFAULT_MIN_EVIDENCE_MS, DEFAULT_SPEECH_THRESHOLD,
 };
 
 /// Tunables for long-form ASR chunking and transcript stitching.
@@ -100,6 +101,13 @@ pub struct AsrSpeechChunkConfig {
     pub speech_pad_secs: f32,
     /// Gaps at or below this length are merged into one speech region.
     pub merge_gap_secs: f32,
+    /// Energy above the noise floor, in dB, a frame needs to start a region or
+    /// to count as speech evidence. Earshot is level-blind, so without it
+    /// steady noise scores as speech. Defaults to `IZWI_VAD_SNR_MARGIN_DB`.
+    pub snr_margin_db: f32,
+    /// Speech-qualified time one second of input must hold for
+    /// [`scan_speech_presence`] to report speech.
+    pub min_evidence_secs: f32,
 }
 
 impl Default for AsrSpeechChunkConfig {
@@ -111,6 +119,8 @@ impl Default for AsrSpeechChunkConfig {
             min_silence_secs: 0.45,
             speech_pad_secs: 0.2,
             merge_gap_secs: 0.35,
+            snr_margin_db: configured_snr_margin_db(),
+            min_evidence_secs: DEFAULT_MIN_EVIDENCE_MS as f32 / 1000.0,
         }
     }
 }
@@ -355,53 +365,72 @@ pub fn plan_speech_audio_chunks(
 /// Whole-input speech presence, scored by the same VAD as the speech planner.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeechPresenceScan {
-    /// No scored frame reached `threshold`. Input too short to score a single
-    /// VAD frame is never reported as no-speech.
+    /// No window held enough speech evidence. Input too short to score a
+    /// single VAD frame is never reported as no-speech.
     pub no_speech: bool,
     /// The speech start threshold every frame was held to.
     pub threshold: f32,
+    /// Energy above the noise floor every frame was held to, in dB.
+    pub snr_margin_db: f32,
     /// Highest frame score seen before the scan stopped.
     pub peak_score: f32,
+    /// Most speech-qualified time found in one evidence window.
+    pub evidence_ms: f32,
+    /// Speech-qualified time one window had to hold.
+    pub required_ms: f32,
     /// Frames scored before the scan stopped.
     pub frames_scored: usize,
 }
 
-/// Decide whether a whole input holds any speech. This is stricter about
-/// declaring no-speech than [`plan_speech_audio_chunks`]: a single VAD frame
-/// at the planner's start threshold counts as speech, with no minimum speech
-/// duration. The scan stops at the first such frame, so speech costs only
-/// the frames before it.
+/// Decide whether a whole input holds any speech: some one-second window
+/// must hold `min_evidence_secs` of frames that reach the start threshold
+/// *and* rise `snr_margin_db` above the tracked noise floor. Earshot alone
+/// scores steady noise as speech on scattered frames, so neither a single
+/// frame nor a score without a level check is evidence. Short inputs need
+/// proportionally less. The scan stops once the evidence is found, so speech
+/// costs only the frames before it.
 pub fn scan_speech_presence(
     samples: &[f32],
     sample_rate: u32,
     speech_config: &AsrSpeechChunkConfig,
 ) -> SpeechPresenceScan {
-    let threshold = sanitize_score_threshold(speech_config.start_threshold);
-    let mut scan = SpeechPresenceScan {
-        no_speech: false,
-        threshold,
-        peak_score: 0.0,
-        frames_scored: 0,
+    let mut evidence = SpeechEvidence::new(SpeechEvidenceConfig {
+        threshold: speech_config.start_threshold,
+        snr_margin_db: speech_config.snr_margin_db,
+        window_ms: DEFAULT_EVIDENCE_WINDOW_MS,
+        min_evidence_ms: secs_to_ms(speech_config.min_evidence_secs),
+    });
+    let config = evidence.config().clone();
+    let scan = |evidence: &SpeechEvidence, no_speech: bool| SpeechPresenceScan {
+        no_speech,
+        threshold: config.threshold,
+        snr_margin_db: config.snr_margin_db,
+        peak_score: evidence.peak_score(),
+        evidence_ms: evidence.best_window_ms(),
+        required_ms: if no_speech {
+            evidence.required_ms()
+        } else {
+            config.min_evidence_ms as f32
+        },
+        frames_scored: evidence.frames(),
     };
     if sample_rate == 0 {
-        return scan;
+        return scan(&evidence, false);
     }
     let mut scorer = VadScorer::new();
     // About one second of input per push keeps the early exit cheap.
     for block in samples.chunks(sample_rate as usize) {
         let Ok(frames) = scorer.push_f32(block, sample_rate) else {
-            return scan;
+            return scan(&evidence, false);
         };
         for frame in frames {
-            scan.frames_scored += 1;
-            scan.peak_score = scan.peak_score.max(frame.score);
-            if frame.score >= threshold {
-                return scan;
+            if evidence.push(&frame) {
+                return scan(&evidence, false);
             }
         }
     }
-    scan.no_speech = scan.frames_scored > 0;
-    scan
+    let no_speech = evidence.frames() > 0 && !evidence.is_sufficient();
+    scan(&evidence, no_speech)
 }
 
 fn speech_config_to_vad_region_config(speech_config: &AsrSpeechChunkConfig) -> VadRegionConfig {
@@ -412,6 +441,7 @@ fn speech_config_to_vad_region_config(speech_config: &AsrSpeechChunkConfig) -> V
         min_silence_ms: secs_to_ms(speech_config.min_silence_secs),
         speech_pad_ms: secs_to_ms(speech_config.speech_pad_secs),
         merge_gap_ms: secs_to_ms(speech_config.merge_gap_secs),
+        start_snr_margin_db: speech_config.snr_margin_db,
     }
 }
 
@@ -1316,15 +1346,57 @@ mod tests {
     }
 
     #[test]
-    fn speech_presence_scan_stops_at_the_first_speech_frame() {
+    fn speech_presence_scan_stops_once_speech_evidence_is_found() {
         let (samples, sr) = load_wav_mono_f32("fox.wav");
 
         let scan = scan_speech_presence(&samples, sr, &AsrSpeechChunkConfig::default());
 
         assert!(!scan.no_speech);
         assert!(scan.peak_score >= scan.threshold);
+        assert!(scan.evidence_ms >= scan.required_ms);
+        assert_eq!(scan.required_ms, 200.0);
         let total_frames = samples.len() * 16_000 / sr as usize / izwi_vad::VAD_FRAME_SAMPLES;
         assert!(scan.frames_scored < total_frames);
+    }
+
+    #[test]
+    fn speech_presence_scan_reports_loud_steady_noise_as_no_speech() {
+        use izwi_vad::test_signals::{fan_noise, mains_hum, pink_noise, white_noise};
+
+        let sr = 16_000u32;
+        let len = sr as usize * 10;
+        for (name, samples) in [
+            ("pink 0.05", pink_noise(len, 0.05, 4)),
+            ("pink 0.3", pink_noise(len, 0.3, 4)),
+            ("pink 0.8", pink_noise(len, 0.8, 4)),
+            ("white 0.2", white_noise(len, 0.2, 4)),
+            ("hum 0.3", mains_hum(len, 0.3)),
+            ("fan 0.3", fan_noise(len, 0.3, 4)),
+        ] {
+            let scan = scan_speech_presence(&samples, sr, &AsrSpeechChunkConfig::default());
+            assert!(scan.no_speech, "{name}: {scan:?}");
+            assert_eq!(
+                scan.frames_scored,
+                len / izwi_vad::VAD_FRAME_SAMPLES,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn speech_planner_starts_no_region_on_steady_noise() {
+        use izwi_vad::test_signals::fan_noise;
+
+        let sr = 16_000u32;
+        let samples = fan_noise(sr as usize * 40, 0.3, 4);
+        let plan = plan_speech_audio_chunks(
+            &samples,
+            sr,
+            &AsrLongFormConfig::default(),
+            &AsrSpeechChunkConfig::default(),
+            Some(30.0),
+        );
+        assert!(plan.no_speech, "{:?}", plan.speech_regions);
     }
 
     #[test]
