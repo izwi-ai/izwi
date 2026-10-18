@@ -21,80 +21,60 @@ Everything runs locally with no cloud services.
 
 ## Getting Started
 
-### Required Models
+Open **Voice** in the sidebar. The first time, Izwi lists the models voice
+needs and downloads them with one click. Models load when you start a
+conversation, so there is no separate load step.
 
-Download the necessary models:
+Voice has two engines, chosen in **Voice settings › Engine**:
+
+| Engine | Models | Notes |
+|--------|--------|-------|
+| **Standard** (default) | `Parakeet-TDT-0.6B-v3` (speech recognition), `Qwen3.5-4B` (assistant), `Kokoro-82M` (voice) | Best answers and the full voice library |
+| **Compact** | `LFM2.5-Audio-1.5B-GGUF` | One model listens and speaks; smaller download, fewer voices |
+
+To download them from the command line instead:
 
 ```bash
-# Text-to-speech
-izwi pull Qwen3-TTS-12Hz-0.6B-Base
-
-# Speech recognition
-izwi pull Qwen3-ASR-0.6B-GGUF
-
-# Chat
+# Standard
+izwi pull Parakeet-TDT-0.6B-v3
 izwi pull Qwen3.5-4B
+izwi pull Kokoro-82M
 
-# Optional unified speech model
+# Compact
 izwi pull LFM2.5-Audio-1.5B-GGUF
 ```
-
-### Start Voice Mode
-
-1. Start the server:
-   ```bash
-   izwi serve
-   ```
-
-2. Open the web UI:
-   ```
-   http://localhost:8080/voice
-   ```
-
-3. Click the microphone button to start speaking
 
 ---
 
 ## Using Voice Mode
 
-### Web UI
-
 1. Navigate to **Voice** in the sidebar
-2. Click the **microphone button** to start recording
-3. Speak your message
-4. Click again to stop recording (or wait for auto-detection)
-5. Listen to the AI response
+2. Click **Start talking** (or press `Space`) and allow microphone access if asked
+3. Speak naturally; Izwi answers when you pause
+4. Start talking while Izwi speaks to interrupt it
+5. Click **End** (or press `Space`) when you are done
 
 ### Controls
 
 | Control | Action |
 |---------|--------|
-| **Microphone** | Start/stop recording |
-| **Speaker** | Mute/unmute assistant responses |
-| **Settings** | Configure models, playback speed, and speech detection |
+| **Microphone** | Mute or unmute your microphone |
+| **End** | End the conversation |
+| **Transcript** | Show what you and Izwi said |
+| **Voice settings** (top right) | Voice, instructions, memory and engine |
 
 ---
 
-## Configuration
+## Voice Settings
 
-### Select Voice
+- **Voice** — Choose the assistant's voice; press play to hear a preview
+- **Instructions** — How the assistant should answer. Saved when you leave the field and used from your next conversation; **Reset to default** restores the original
+- **Memory** — When on, Izwi remembers lasting preferences and facts you mention. **Manage memories** lists them so you can forget one or all
+- **Engine** — Standard or Compact, the status of its models, and a button to load or unload them
 
-Choose from available voices in the settings panel. Different TTS models offer different voice options.
-
-### Select Models
-
-Configure which models to use:
-- **ASR Model** — For speech recognition
-- **TTS Model** — For speech synthesis
-- **Chat Model** — For response generation
-
-### Voice Agent Prompt
-
-Use the **Voice Agent Prompt** section in settings to customize the assistant's speaking style and behavior. Prompt changes are saved locally and apply the next time you start a voice session.
-
-### Observational Memory
-
-Use **Observational Memory** in settings to review, enable, disable, or delete the stable user memories captured from modular voice conversations. You can forget individual memories or clear them all at any time.
+Turn detection is automatic: the server ends your turn after a short silence.
+Steady background noise does not start a turn, and a cough or noise burst
+while Izwi talks lowers its volume instead of cutting it off.
 
 ### API Routes
 
@@ -103,12 +83,6 @@ sessions, and low-latency WebSocket transport. See the
 [API Reference](/api#voice-profile-memory-and-sessions) for persisted
 voice state and [Voice Realtime](/api#voice-realtime) for the WebSocket
 protocol.
-
-### Audio Settings
-
-- **Automatic turn detection** — The server ends your turn after a short silence. Steady background noise (a fan, hum) does not start a turn, and a cough or a noise burst while the assistant talks lowers its volume instead of cutting it off
-- **Playback speed** — Adjust response playback speed from `0.75x` to `1.75x`
-- **Mute output** — Silence assistant playback without ending the session
 
 ---
 
@@ -125,11 +99,11 @@ protocol.
 
 | Shortcut | Action |
 |----------|--------|
-| `Space` | Start or stop the current voice session |
-| `Escape` | Stop the current voice session |
-| `M` | Mute/unmute |
+| `Space` | Start or end the conversation |
+| `Escape` | End the conversation |
+| `M` | Mute or unmute your microphone |
 
-> Shortcuts are ignored while focus is inside a text field or other editable control.
+> Shortcuts are ignored while focus is inside a text field or on a button.
 
 ---
 
@@ -141,17 +115,23 @@ protocol.
 2. Ensure the correct input device is selected
 3. Test your microphone in another application
 
+### "Couldn't load the voice models"
+
+The models do not fit in the memory Izwi can use alongside the other models
+it has loaded. Unload models you are not using on the **Models** page, or
+switch to the **Compact** engine in **Voice settings › Engine**.
+
 ### Responses are slow
 
-1. Use smaller models for faster responses
-2. Ensure models are loaded (not loading on-demand)
+1. The first reply after starting includes loading the models; later replies are faster
+2. Try the **Compact** engine
 3. Check system resources (RAM, CPU usage)
 
 ### Poor transcription accuracy
 
 1. Speak more clearly and slowly
 2. Reduce background noise
-3. Try a larger ASR model (`Qwen3-ASR-1.7B-GGUF`)
+3. Use an external microphone
 
 ---
 

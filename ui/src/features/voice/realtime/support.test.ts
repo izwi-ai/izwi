@@ -11,9 +11,7 @@ import {
   isVoiceRealtimeV2EnvelopeHeader,
   isVoiceRealtimeV2ServerEnvelope,
   isVoiceRealtimeServerEvent,
-  isUnifiedAudioChatVariant,
   makeTranscriptEntryId,
-  mergeSampleChunks,
   normalizeVoiceRealtimeV2Event,
   parseFinalAnswer,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
@@ -41,11 +39,6 @@ describe("voice realtime support", () => {
     expect(formatModelVariantLabel("LFM2.5-Audio-1.5B-GGUF")).toBe(
       "LFM2.5 Audio 1.5B GGUF",
     );
-  });
-
-  it("detects the unified lfm25 audio variant", () => {
-    expect(isUnifiedAudioChatVariant("LFM2.5-Audio-1.5B-GGUF")).toBe(true);
-    expect(isUnifiedAudioChatVariant("Qwen3.5-4B")).toBe(false);
   });
 
   it("keeps Voxtral out of modular voice ASR until native realtime support lands", () => {
@@ -103,14 +96,6 @@ describe("voice realtime support", () => {
       isFinal: true,
       pcm16Bytes: new Uint8Array([1, 2, 3]),
     });
-  });
-
-  it("merges sequential sample chunks", () => {
-    expect(
-      Array.from(
-        mergeSampleChunks([new Float32Array([1, 2]), new Float32Array([3])]),
-      ),
-    ).toEqual([1, 2, 3]);
   });
 
   it("models voice websocket ownership as process-local and non-resumable", () => {

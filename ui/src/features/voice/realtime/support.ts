@@ -327,8 +327,6 @@ export interface VoicePageProps {
 
 export const VOICE_AGENT_SYSTEM_PROMPT =
   "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
-export const VOICE_PIPELINE_LABEL = "Modular Voice Stack";
-export const UNIFIED_VOICE_PIPELINE_LABEL = "Unified LFM2.5 Audio";
 
 export const MODULAR_STACK_VARIANTS = {
   asr: "Parakeet-TDT-0.6B-v3",
@@ -369,10 +367,6 @@ export function isAsrVariant(variant: string): boolean {
     variant.includes("Whisper-Large-v3-Turbo") ||
     variant.includes("Parakeet-TDT")
   );
-}
-
-export function isUnifiedAudioChatVariant(variant: string): boolean {
-  return variant.trim() === "LFM2.5-Audio-1.5B-GGUF";
 }
 
 export function formatModelVariantLabel(variant: string): string {
@@ -481,17 +475,6 @@ export function decodePcmI16Base64(base64Data: string): Float32Array {
   }
 
   return out;
-}
-
-export function mergeSampleChunks(chunks: Float32Array[]): Float32Array {
-  const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const merged = new Float32Array(totalSamples);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
 }
 
 function encodeFloat32ToPcm16Bytes(samples: Float32Array): Uint8Array {
