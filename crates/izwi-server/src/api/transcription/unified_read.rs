@@ -51,6 +51,13 @@ pub struct UnifiedJobListResponse {
     pub pagination: CursorPagination,
 }
 
+/// Position of the last row returned by a `job_kind=all` page.
+#[derive(Debug, Serialize, Deserialize)]
+struct MergedJobListCursor {
+    created_at: u64,
+    id: String,
+}
+
 struct CombinedSummaryItem {
     created_at: u64,
     id: String,
@@ -140,20 +147,28 @@ pub async fn list_jobs(
             }
         }
         JobKindFilter::All => {
-            if pagination.cursor.is_some() {
-                return Err(ApiError::bad_request(
-                    "Cursor pagination is not supported when `job_kind=all`.",
-                ));
-            }
+            // Both stores page by (created_at DESC, id DESC) and record ids
+            // are unique across them, so the merged position of the last
+            // returned row is a valid "after" cursor for each store.
+            let cursor = pagination.decode_cursor::<MergedJobListCursor>()?;
+            let transcription_cursor =
+                cursor.as_ref().map(|cursor| TranscriptionRecordListCursor {
+                    created_at: cursor.created_at,
+                    id: cursor.id.clone(),
+                });
+            let diarization_cursor = cursor.map(|cursor| DiarizationRecordListCursor {
+                created_at: cursor.created_at,
+                id: cursor.id,
+            });
 
             let (transcription_records, transcription_next_cursor) = state
                 .transcription_store
-                .list_records_page(limit, None)
+                .list_records_page(limit, transcription_cursor)
                 .await
                 .map_err(map_store_error)?;
             let (diarization_records, diarization_next_cursor) = state
                 .diarization_store
-                .list_records_page(limit, None)
+                .list_records_page(limit, diarization_cursor)
                 .await
                 .map_err(map_store_error)?;
 
@@ -182,16 +197,22 @@ pub async fn list_jobs(
                     .cmp(&left.created_at)
                     .then_with(|| right.id.cmp(&left.id))
             });
-            let has_overflow = combined.len() > limit;
+            let has_more = combined.len() > limit
+                || transcription_next_cursor.is_some()
+                || diarization_next_cursor.is_some();
             combined.truncate(limit);
+            let next_cursor = has_more.then(|| combined.last()).flatten().map(|item| {
+                encode_cursor(&MergedJobListCursor {
+                    created_at: item.created_at,
+                    id: item.id.clone(),
+                })
+            });
 
             UnifiedJobListResponse {
                 records: combined.into_iter().map(|item| item.value).collect(),
                 pagination: CursorPagination {
-                    next_cursor: None,
-                    has_more: has_overflow
-                        || transcription_next_cursor.is_some()
-                        || diarization_next_cursor.is_some(),
+                    next_cursor,
+                    has_more,
                     limit,
                 },
             }

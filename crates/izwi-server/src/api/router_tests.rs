@@ -368,6 +368,89 @@ async fn canonical_history_routes_still_resolve() {
 }
 
 #[tokio::test]
+async fn unified_transcription_job_list_pages_across_job_kinds() {
+    let (app, _temp_dir) = test_api_app(
+        "unified_transcription_job_list_pages_across_job_kinds",
+        true,
+    );
+    let audio_body = tiny_audio_json_body();
+    let saa_body = tiny_audio_json_body_with_fields(
+        r#""model_id":"Granite-Speech-4.1-2B-Plus","min_speakers":2"#,
+    );
+    let mut created_ids = Vec::new();
+    for (uri, body) in [
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+        (
+            "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+            saa_body.as_str(),
+        ),
+        ("/v1/diarizations", audio_body.as_str()),
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+    ] {
+        let response =
+            send_request(app.clone(), build_request(Method::POST, uri, Some(body))).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload = read_json(response).await;
+        created_ids.push(
+            payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .expect("created job id")
+                .to_string(),
+        );
+    }
+
+    // Walk the merged list one row at a time. Before the merged cursor this
+    // returned `has_more: true` with `next_cursor: null` after the first page.
+    let mut seen_ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            Some(cursor) => format!("/v1/speech-to-text/jobs?job_kind=all&limit=1&cursor={cursor}"),
+            None => "/v1/speech-to-text/jobs?job_kind=all&limit=1".to_string(),
+        };
+        let response = send_request(app.clone(), build_request(Method::GET, &uri, None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        let records = payload["records"].as_array().expect("records array");
+        assert!(records.len() <= 1);
+        seen_ids.extend(
+            records
+                .iter()
+                .filter_map(|record| record["id"].as_str().map(str::to_string)),
+        );
+        let has_more = payload["pagination"]["has_more"].as_bool().unwrap();
+        let next_cursor = payload["pagination"]["next_cursor"]
+            .as_str()
+            .map(str::to_string);
+        assert_eq!(
+            has_more,
+            next_cursor.is_some(),
+            "has_more must come with a cursor"
+        );
+        if !has_more {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    let mut expected = created_ids.clone();
+    expected.sort();
+    let mut actual = seen_ids.clone();
+    actual.sort();
+    assert_eq!(
+        actual, expected,
+        "every job appears exactly once across pages"
+    );
+}
+
+#[tokio::test]
 async fn unified_transcription_job_read_routes_support_both_job_kinds() {
     let (app, temp_dir) = test_api_app(
         "unified_transcription_job_read_routes_support_both_job_kinds",
