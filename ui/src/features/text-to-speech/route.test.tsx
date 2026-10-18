@@ -72,6 +72,7 @@ vi.mock("@/api", () => ({
     listSavedVoices: apiMocks.listSavedVoices,
     downloadAudioFile: apiMocks.downloadAudioFile,
     cancelTextToSpeechRecord: apiMocks.cancelTextToSpeechRecord,
+    getHealth: () => new Promise(() => {}),
   },
 }));
 
@@ -194,9 +195,6 @@ function renderRoute(
                 readyModelsCount={1}
                 selectedModelLabel="FishAudio-S2-Pro"
                 catalogError={null}
-                resolvedTheme="dark"
-                themePreference="dark"
-                onThemePreferenceChange={vi.fn()}
                 onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
               />
             ) : undefined}

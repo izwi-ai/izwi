@@ -9,7 +9,6 @@ import {
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
 import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
-import { useTheme } from "@/app/providers/ThemeProvider";
 import { DocumentTitle } from "@/app/router/DocumentTitle";
 import { NotFoundPage } from "@/app/router/NotFoundPage";
 import { legacyDiarizationTarget } from "@/app/router/routePresentation";
@@ -102,7 +101,6 @@ function LegacyDiarizationRedirect() {
 export function AppRoutes() {
   const location = useLocation();
   const hasTrackedInitialRouteRef = useRef(false);
-  const { resolvedTheme, themePreference, setThemePreference } = useTheme();
   const {
     models,
     selectedModel,
@@ -187,9 +185,6 @@ export function AppRoutes() {
               readyModelsCount={readyModelsCount}
               selectedModelLabel={selectedModelLabel}
               catalogError={catalogError}
-              resolvedTheme={resolvedTheme}
-              themePreference={themePreference}
-              onThemePreferenceChange={setThemePreference}
               onRetryModelCatalog={refreshModels}
             />
           }

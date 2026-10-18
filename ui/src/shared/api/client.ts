@@ -1,5 +1,6 @@
 import { AudioApiClient } from "@/shared/api/audio";
 import { ChatApiClient } from "@/shared/api/chat";
+import { HealthApiClient } from "@/shared/api/health";
 import { ApiHttpClient, API_BASE } from "@/shared/api/http";
 import { ModelApiClient } from "@/shared/api/models";
 import { OnboardingApiClient } from "@/shared/api/onboarding";
@@ -160,6 +161,8 @@ const onboardingMethodNames = [
   "completeOnboarding",
 ] as const;
 
+const healthMethodNames = ["getHealth"] as const;
+
 const preferencesMethodNames = [
   "getPreferences",
   "updateAnalyticsPreference",
@@ -189,6 +192,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
   const voiceApi = new VoiceApiClient(http);
   const onboardingApi = new OnboardingApiClient(http);
   const preferencesApi = new PreferencesApiClient(http);
+  const healthApi = new HealthApiClient(http);
 
   return {
     baseUrl: http.baseUrl,
@@ -198,6 +202,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
     ...bindMethods(voiceApi, voiceMethodNames),
     ...bindMethods(onboardingApi, onboardingMethodNames),
     ...bindMethods(preferencesApi, preferencesMethodNames),
+    ...bindMethods(healthApi, healthMethodNames),
   };
 }
 

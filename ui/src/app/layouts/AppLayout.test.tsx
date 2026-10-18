@@ -9,6 +9,10 @@ function BrokenRoute(): ReactElement {
   throw new Error("Route render failed");
 }
 
+vi.mock("@/api", () => ({
+  api: { getHealth: vi.fn(() => new Promise(() => {})) },
+}));
+
 vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
   FirstRunOnboarding: () => null,
 }));
@@ -55,9 +59,6 @@ describe("AppLayout model catalog recovery", () => {
                 readyModelsCount={0}
                 selectedModelLabel={null}
                 catalogError="Local model service is offline"
-                resolvedTheme="dark"
-                themePreference="dark"
-                onThemePreferenceChange={vi.fn()}
                 onRetryModelCatalog={onRetryModelCatalog}
               />
             }
@@ -98,9 +99,6 @@ describe("AppLayout model catalog recovery", () => {
                   readyModelsCount={0}
                   selectedModelLabel={null}
                   catalogError={null}
-                  resolvedTheme="dark"
-                  themePreference="dark"
-                  onThemePreferenceChange={vi.fn()}
                   onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
                 />
               }

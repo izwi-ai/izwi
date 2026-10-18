@@ -4,6 +4,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppLayout } from "@/app/layouts/AppLayout";
 
+vi.mock("@/api", () => ({
+  api: { getHealth: vi.fn(() => new Promise(() => {})) },
+}));
+
 vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
   FirstRunOnboarding: () => null,
 }));
@@ -52,9 +56,6 @@ function renderLayout() {
               readyModelsCount={0}
               selectedModelLabel={null}
               catalogError={null}
-              resolvedTheme="dark"
-              themePreference="dark"
-              onThemePreferenceChange={vi.fn()}
               onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
             />
           }
@@ -92,9 +93,7 @@ describe("AppLayout compact navigation accessibility", () => {
     expect(menuTrigger).toHaveAccessibleName("Open navigation");
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false");
     expect(menuTrigger).toHaveAttribute("aria-controls", "app-sidebar-navigation");
-    expect(screen.getByTestId("mobile-theme-toggle")).toHaveAccessibleName(
-      "Switch to light mode",
-    );
+    expect(screen.queryByTestId("mobile-theme-toggle")).not.toBeInTheDocument();
 
     for (const link of within(sidebar).getAllByRole("link", { hidden: true })) {
       expect(link).toHaveAttribute("tabindex", "-1");
@@ -147,9 +146,17 @@ describe("AppLayout compact navigation accessibility", () => {
     expect(voiceLink).not.toHaveAttribute("tabindex", "-1");
     expect(collapse).toHaveAccessibleName("Collapse sidebar");
     expect(collapse).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("desktop-theme-toggle")).toHaveAccessibleName(
-      "Switch to light mode",
-    );
+    expect(screen.queryByTestId("desktop-theme-toggle")).not.toBeInTheDocument();
+    expect(
+      within(sidebar)
+        .getAllByRole("group")
+        .map((group) => group.getAttribute("aria-label")),
+    ).toEqual(["Converse", "Audio", "Library"]);
+    expect(
+      within(within(sidebar).getByRole("group", { name: "Audio" }))
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["Transcription", "Text to Speech", "Studio"]);
 
     fireEvent.click(collapse);
 
