@@ -267,6 +267,11 @@ export function ChatPlayground({
     supportsImageAttachmentsForModel(selectedModel);
   const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
   supportsImageAttachmentsRef.current = supportsImageAttachments;
+  // Attachments survive a switch to a text-only model so the user can switch
+  // back; sending is blocked until they are removed or the model changes.
+  const hasUnsupportedImages =
+    pendingImages.length > 0 && !supportsImageAttachments;
+  const unsupportedImagesMessage = `${modelLabel ?? "This model"} can't read images. Remove them or switch to a model that accepts images.`;
   const renderModelId = activeThread?.model_id ?? selectedModel;
   // Parse by the capabilities of the model that wrote the thread, not the
   // model selected now.
@@ -317,28 +322,6 @@ export function ChatPlayground({
     reasoningEffortOptionsKey,
     selectedModel,
     supportsThinking,
-  ]);
-
-  useEffect(() => {
-    if (supportsImageAttachments) {
-      return;
-    }
-    updateComposerDraft(activeDraftKey, (draft) => {
-      if (draft.pendingImages.length === 0) {
-        return draft;
-      }
-      revokeImagePreviews(draft.pendingImages);
-      return { ...draft, pendingImages: [] };
-    });
-    setImagePreview(null);
-    if (imageInputRef.current) {
-      imageInputRef.current.value = "";
-    }
-  }, [
-    activeDraftKey,
-    revokeImagePreviews,
-    supportsImageAttachments,
-    updateComposerDraft,
   ]);
 
   useEffect(() => {
@@ -834,6 +817,7 @@ export function ChatPlayground({
     const text = submittedDraft.input.trim();
     if (
       (text.length === 0 && submittedDraft.pendingImages.length === 0) ||
+      (submittedDraft.pendingImages.length > 0 && !supportsImageAttachments) ||
       isStreaming ||
       isPreparingThread
     ) {
@@ -1116,43 +1100,56 @@ export function ChatPlayground({
       )}
     >
       {pendingImages.length > 0 && (
-        <div className="flex flex-wrap gap-3 border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
-          {pendingImages.map((image) => (
-            <div
-              key={image.id}
-              className="group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]"
+        <div className="border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
+          {hasUnsupportedImages && (
+            <p
+              role="status"
+              className="mb-3 text-xs text-[var(--status-warning-text)]"
             >
-              <button
-                type="button"
-                onClick={() =>
-                  setImagePreview({
-                    source: image.previewUrl ?? image.source,
-                    label: image.label,
-                  })
-                }
-                className="h-full w-full"
-                title={`Preview ${image.label}`}
+              {unsupportedImagesMessage}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-3">
+            {pendingImages.map((image) => (
+              <div
+                key={image.id}
+                className={cn(
+                  "group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]",
+                  hasUnsupportedImages && "opacity-50",
+                )}
               >
-                <img
-                  src={image.source}
-                  alt={image.label}
-                  className="h-full w-full object-cover"
-                />
-              </button>
-              <button
-                type="button"
-                onClick={() => removePendingImage(image.id)}
-                className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-black/70 text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
-                title={`Remove ${image.label}`}
-                aria-label={`Remove ${image.label}`}
-              >
-                <Trash2 className="h-3 w-3" />
-              </button>
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
-                <span className="block truncate">{image.label}</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setImagePreview({
+                      source: image.previewUrl ?? image.source,
+                      label: image.label,
+                    })
+                  }
+                  className="h-full w-full"
+                  title={`Preview ${image.label}`}
+                >
+                  <img
+                    src={image.source}
+                    alt={image.label}
+                    className="h-full w-full object-cover"
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => removePendingImage(image.id)}
+                  className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-black/70 text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
+                  title={`Remove ${image.label}`}
+                  aria-label={`Remove ${image.label}`}
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
+                  <span className="block truncate">{image.label}</span>
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
 
@@ -1294,8 +1291,8 @@ export function ChatPlayground({
               isPreparingThread ||
               isReadingImages ||
               (!isStreaming &&
-                input.trim().length === 0 &&
-                pendingImages.length === 0)
+                (hasUnsupportedImages ||
+                  (input.trim().length === 0 && pendingImages.length === 0)))
             }
             variant="default"
             size="icon"
@@ -1304,7 +1301,9 @@ export function ChatPlayground({
                 ? "Cancel response"
                 : isPreparingThread
                   ? "Starting chat"
-                  : "Send message"
+                  : hasUnsupportedImages
+                    ? unsupportedImagesMessage
+                    : "Send message"
             }
             aria-label={
               isStreaming

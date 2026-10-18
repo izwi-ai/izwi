@@ -611,6 +611,70 @@ describe("ChatPlayground", () => {
     );
   });
 
+  it("keeps pending images on a text-only model and blocks sending them", async () => {
+    const thread = {
+      id: "thread-switch",
+      title: "Switch models",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    const renderWith = (model: string, label: string) => (
+      <MemoryRouter initialEntries={["/chat?threadId=thread-switch"]}>
+        <ChatPlayground
+          selectedModel={model}
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel={label}
+          modelOptions={[
+            { value: model, label, statusLabel: "Ready", isReady: true },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>
+    );
+
+    const { rerender } = render(renderWith("Qwen3.5-4B", "Qwen3.5 4B"));
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-switch"),
+    );
+    fireEvent.change(screen.getByTestId("chat-image-input"), {
+      target: { files: [new File(["image"], "chart.png", { type: "image/png" })] },
+    });
+    expect(
+      await screen.findByRole("button", { name: "Remove chart.png" }),
+    ).toBeInTheDocument();
+
+    rerender(renderWith("LFM2.5-1.2B-Instruct-GGUF", "LFM2.5 1.2B Instruct"));
+
+    expect(
+      screen.getByRole("button", { name: "Remove chart.png" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/LFM2\.5 1\.2B Instruct can't read images/),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Describe this" },
+    });
+    const send = screen.getByRole("button", { name: "Send message" });
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    expect(apiMocks.sendChatThreadMessageStream).not.toHaveBeenCalled();
+
+    // Switching back makes the same attachment sendable again.
+    rerender(renderWith("Qwen3.5-4B", "Qwen3.5 4B"));
+    expect(screen.queryByText(/can't read images/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+  });
+
   it("isolates and restores text and image drafts when switching threads", async () => {
     const threads = [
       {
