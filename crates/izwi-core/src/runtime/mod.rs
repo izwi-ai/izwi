@@ -55,7 +55,8 @@ pub use conformance::{
     ConformanceExecutionClass,
 };
 pub use coordinator::{
-    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobCancellation, JobSpec,
+    system_memory_snapshot, CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator,
+    JobCancellation, JobSpec,
 };
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 pub use forced_alignment::{AlignedWindow, AlignmentSource, AlignmentWindow, WindowedAlignment};

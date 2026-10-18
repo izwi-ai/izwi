@@ -2668,6 +2668,31 @@ async fn root_and_v1_probe_routes_are_available() {
 }
 
 #[tokio::test]
+async fn health_reports_system_memory_and_reserved_bytes() {
+    let (app, _temp_dir) = test_api_app("health_reports_system_memory_and_reserved_bytes", false);
+    let response = send_request(app, build_request(Method::GET, "/v1/health", None)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    let memory = &body["runtime"]["memory"];
+
+    assert!(memory["reserved_bytes"].as_u64().is_some());
+    match (
+        memory["system_total_bytes"].as_u64(),
+        memory["system_available_bytes"].as_u64(),
+    ) {
+        (Some(total), Some(available)) => {
+            assert!(total > 0);
+            assert!(available <= total);
+        }
+        (None, None) => {
+            // The OS probe is unavailable on this platform; both stay null.
+            assert!(memory["system_total_bytes"].is_null());
+        }
+        other => panic!("memory totals must be reported together: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn admin_models_expose_names_tasks_sizes_and_image_input() {
     let (app, _temp_dir) = test_api_app(
         "admin_models_expose_names_tasks_sizes_and_image_input",
