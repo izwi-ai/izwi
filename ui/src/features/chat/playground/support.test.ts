@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  isSameCalendarDay,
+  messageDayLabel,
   buildChatThreadMessagePayload,
   DEFAULT_THREAD_TITLE,
   defaultThinkingEnabledForModel,
@@ -293,5 +295,36 @@ describe("chat playground support", () => {
     expect(stripMarkdown("snake_case_name and 2*3*4")).toBe(
       "snake_case_name and 2*3*4",
     );
+  });
+
+  it("labels message days relative to now", () => {
+    const now = new Date(2026, 9, 18, 9, 30).getTime();
+    expect(messageDayLabel(new Date(2026, 9, 18, 0, 5).getTime(), now)).toBe(
+      "Today",
+    );
+    expect(messageDayLabel(new Date(2026, 9, 17, 23, 59).getTime(), now)).toBe(
+      "Yesterday",
+    );
+    const lastWeek = messageDayLabel(new Date(2026, 9, 12, 12).getTime(), now);
+    expect(lastWeek).toMatch(/12/);
+    expect(lastWeek).not.toMatch(/2026/);
+    expect(messageDayLabel(new Date(2025, 11, 31, 12).getTime(), now)).toMatch(
+      /2025/,
+    );
+  });
+
+  it("compares calendar days, not 24-hour windows", () => {
+    expect(
+      isSameCalendarDay(
+        new Date(2026, 9, 18, 0, 1).getTime(),
+        new Date(2026, 9, 18, 23, 59).getTime(),
+      ),
+    ).toBe(true);
+    expect(
+      isSameCalendarDay(
+        new Date(2026, 9, 17, 23, 59).getTime(),
+        new Date(2026, 9, 18, 0, 1).getTime(),
+      ),
+    ).toBe(false);
   });
 });

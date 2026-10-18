@@ -2,6 +2,8 @@ import type { Ref, UIEventHandler } from "react";
 import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 
 import type { ChatThreadMessageRecord } from "@/api";
+import { MessageTime } from "@/features/chat/components/messages/MessageParts";
+import { cn } from "@/lib/utils";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
   parseAssistantContent,
@@ -12,6 +14,8 @@ interface AssistantMessageProps {
   message: ChatThreadMessageRecord;
   /** This reply is the one streaming now. */
   isStreamingReply: boolean;
+  /** The newest reply in the thread keeps its footer visible. */
+  isLatestReply: boolean;
   /** The model that wrote this reply emits reasoning before `</think>`. */
   implicitThink: boolean;
   /** Thinking is on for the turn being streamed. */
@@ -25,6 +29,7 @@ interface AssistantMessageProps {
 export function AssistantMessage({
   message,
   isStreamingReply,
+  isLatestReply,
   implicitThink,
   thinkingEnabled,
   isThoughtExpanded,
@@ -56,7 +61,10 @@ export function AssistantMessage({
     !showStreamingThinking;
 
   return (
-    <>
+    <article
+      aria-label="Reply"
+      className="group flex flex-col gap-2.5 break-words text-[0.9375rem] leading-[1.7] text-[var(--text-primary)]"
+    >
       {showStreamingThinking && parsed && (
         <div className="mb-3 rounded-lg bg-muted/50 border border-[var(--border-muted)] px-3 py-2 text-xs text-muted-foreground">
           <div className="mb-2 flex items-center gap-1.5 uppercase tracking-wider text-[10px] font-semibold">
@@ -120,6 +128,17 @@ export function AssistantMessage({
             <span className="w-1.5 h-4 bg-primary animate-pulse inline-block" />
           </span>
         )}
-    </>
+      {!isStreamingReply && (
+        <footer
+          className={cn(
+            "-ml-1.5 flex h-7 items-center gap-0.5 text-[11.5px] text-[var(--text-subtle)] transition-opacity",
+            !isLatestReply &&
+              "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+          )}
+        >
+          <MessageTime timestamp={message.created_at} />
+        </footer>
+      )}
+    </article>
   );
 }

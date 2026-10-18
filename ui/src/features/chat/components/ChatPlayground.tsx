@@ -1,5 +1,6 @@
 import {
   type ChangeEvent,
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,12 +10,10 @@ import {
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Bot,
   Brain,
   History,
   Send,
   Square,
-  User,
   Loader2,
   Settings2,
   Plus,
@@ -53,6 +52,8 @@ import {
   extractLatestStats,
   fallbackThreadTitleFromUserMessage,
   getErrorMessage,
+  isSameCalendarDay,
+  messageDayLabel,
   normalizeGeneratedThreadTitle,
   readImageFileAsDataUrl,
   statsAfterHistoryRefresh,
@@ -72,6 +73,7 @@ import {
 } from "@/api";
 import { AssistantMessage } from "@/features/chat/components/messages/AssistantMessage";
 import { UserMessage } from "@/features/chat/components/messages/UserMessage";
+import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
@@ -254,6 +256,14 @@ export function ChatPlayground({
     () => messages.filter((message) => message.role !== "system"),
     [messages],
   );
+  const lastAssistantIndex = useMemo(() => {
+    for (let index = visibleMessages.length - 1; index >= 0; index -= 1) {
+      if (visibleMessages[index].role === "assistant") {
+        return index;
+      }
+    }
+    return -1;
+  }, [visibleMessages]);
   const historyBadgeLabel = useMemo(() => {
     if (threads.length > 99) {
       return "99+";
@@ -1534,7 +1544,7 @@ export function ChatPlayground({
                   </div>
                 ) : messagesLoading ? (
                   <div
-                    className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
+                    className="max-w-3xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
                     role="status"
                     aria-live="polite"
                   >
@@ -1542,7 +1552,7 @@ export function ChatPlayground({
                     Loading conversation...
                   </div>
                 ) : (
-                  <div className="max-w-4xl mx-auto space-y-6">
+                  <div className="mx-auto flex max-w-3xl flex-col gap-7">
                     {visibleMessages.map((message, index) => {
                       const isUser = message.role === "user";
                       const isStreamingReply =
@@ -1558,73 +1568,50 @@ export function ChatPlayground({
                           supportsImplicitOpenThinkTagParsing(message.model_id))
                         : implicitOpenThinkTagModel;
                       const messageKey = message.id;
+                      const previous = visibleMessages[index - 1];
+                      const startsDay =
+                        !previous ||
+                        !isSameCalendarDay(previous.created_at, message.created_at);
 
                       return (
-                        <motion.div
-                          key={messageKey}
-                          initial={{ opacity: 0, y: 8 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          className={cn(
-                            "flex gap-4 sm:gap-6",
-                            isUser && "flex-row-reverse",
+                        <Fragment key={messageKey}>
+                          {startsDay && (
+                            <DaySeparator
+                              label={messageDayLabel(message.created_at)}
+                            />
                           )}
-                        >
-                          <div
-                            className={cn(
-                              "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1",
-                              isUser
-                                ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] border border-[var(--border-muted)]"
-                                : "bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-sm",
-                            )}
+                          <motion.div
+                            initial={{ opacity: 0, y: 8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="flex flex-col"
                           >
                             {isUser ? (
-                              <User className="w-4 h-4" />
+                              <UserMessage
+                                message={message}
+                                onOpenImage={setImagePreview}
+                              />
                             ) : (
-                              <Bot className="w-4 h-4" />
+                              <AssistantMessage
+                                message={message}
+                                isStreamingReply={isStreamingReply}
+                                isLatestReply={index === lastAssistantIndex}
+                                implicitThink={writerImplicitThink}
+                                thinkingEnabled={thinkingEnabledForModel}
+                                isThoughtExpanded={!!expandedThoughts[messageKey]}
+                                onToggleThought={() =>
+                                  setExpandedThoughts((previous) => ({
+                                    ...previous,
+                                    [messageKey]: !previous[messageKey],
+                                  }))
+                                }
+                                streamingThinkingRef={streamingThinkingRef}
+                                onStreamingThinkingScroll={
+                                  handleStreamingThinkingScroll
+                                }
+                              />
                             )}
-                          </div>
-
-                          <div
-                            className={cn(
-                              "max-w-[85%] text-[0.9375rem] leading-relaxed break-words flex flex-col",
-                              isUser ? "items-end" : "items-start",
-                            )}
-                          >
-                            <div
-                              className={cn(
-                                "rounded-2xl px-5 py-3 shadow-sm",
-                                isUser
-                                  ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] rounded-tr-sm border border-[var(--border-muted)]"
-                                  : "bg-transparent text-[var(--text-primary)]",
-                              )}
-                            >
-                              {isUser ? (
-                                <UserMessage
-                                  message={message}
-                                  onOpenImage={setImagePreview}
-                                />
-                              ) : (
-                                <AssistantMessage
-                                  message={message}
-                                  isStreamingReply={isStreamingReply}
-                                  implicitThink={writerImplicitThink}
-                                  thinkingEnabled={thinkingEnabledForModel}
-                                  isThoughtExpanded={!!expandedThoughts[messageKey]}
-                                  onToggleThought={() =>
-                                    setExpandedThoughts((previous) => ({
-                                      ...previous,
-                                      [messageKey]: !previous[messageKey],
-                                    }))
-                                  }
-                                  streamingThinkingRef={streamingThinkingRef}
-                                  onStreamingThinkingScroll={
-                                    handleStreamingThinkingScroll
-                                  }
-                                />
-                              )}
-                            </div>
-                          </div>
-                        </motion.div>
+                          </motion.div>
+                        </Fragment>
                       );
                     })}
                   </div>
@@ -1632,7 +1619,7 @@ export function ChatPlayground({
               </div>
 
               <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 bg-[var(--bg-app)] px-4 pb-4 pt-4 sm:px-6">
-                <div className="max-w-4xl mx-auto pointer-events-auto">
+                <div className="max-w-3xl mx-auto pointer-events-auto">
                   <AnimatePresence>
                     {error && (
                       <motion.div

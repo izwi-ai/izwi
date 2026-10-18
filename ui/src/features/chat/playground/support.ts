@@ -187,6 +187,46 @@ export function formatThreadTimestamp(timestamp: number): string {
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+/** Clock time shown beside a message, e.g. "13:42" or "1:42 PM". */
+export function formatMessageTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/** Full date and time for a message's tooltip. */
+export function formatMessageDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString([], {
+    dateStyle: "full",
+    timeStyle: "short",
+  });
+}
+
+export function isSameCalendarDay(a: number, b: number): boolean {
+  return new Date(a).toDateString() === new Date(b).toDateString();
+}
+
+/** Label for the separator above the first message of a day. */
+export function messageDayLabel(timestamp: number, now = Date.now()): string {
+  if (isSameCalendarDay(timestamp, now)) {
+    return "Today";
+  }
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (isSameCalendarDay(timestamp, yesterday.getTime())) {
+    return "Yesterday";
+  }
+  const date = new Date(timestamp);
+  const sameYear = date.getFullYear() === new Date(now).getFullYear();
+  return date.toLocaleDateString([], {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric",
+  });
+}
+
 /** Values for the stats row under a finished chat turn. */
 export interface ChatStatsSummary {
   tokens: number;
