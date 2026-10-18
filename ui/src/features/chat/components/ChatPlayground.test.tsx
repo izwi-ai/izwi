@@ -806,6 +806,31 @@ describe("ChatPlayground", () => {
     expect(onSelectModel).toHaveBeenCalledWith("Qwen3.5-4B");
   });
 
+  it("follows the catalog image capability over the model name", async () => {
+    apiMocks.listChatThreads.mockResolvedValue([]);
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+          ]}
+          modelSupportsImages={() => false}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Attach image" })).not.toBeInTheDocument();
+  });
+
   it("isolates and restores text and image drafts when switching threads", async () => {
     const threads = [
       {

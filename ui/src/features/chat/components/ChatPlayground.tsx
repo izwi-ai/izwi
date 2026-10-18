@@ -102,6 +102,7 @@ export function ChatPlayground({
   modelLabel,
   modelOptions,
   modelSupportsThinking,
+  modelSupportsImages,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
@@ -263,8 +264,15 @@ export function ChatPlayground({
     chatCapabilities?.reasoning_efforts ?? [];
   const reasoningEffortOptionsKey = supportedReasoningEfforts.join(",");
   const firstSupportedReasoningEffort = supportedReasoningEfforts[0];
-  const supportsImageAttachments =
-    supportsImageAttachmentsForModel(selectedModel);
+  const acceptsImages = useCallback(
+    (variant: string | null) =>
+      variant
+        ? (modelSupportsImages?.(variant) ??
+          supportsImageAttachmentsForModel(variant))
+        : false,
+    [modelSupportsImages],
+  );
+  const supportsImageAttachments = acceptsImages(selectedModel);
   const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
   supportsImageAttachmentsRef.current = supportsImageAttachments;
   // Attachments survive a switch to a text-only model so the user can switch
@@ -281,7 +289,7 @@ export function ChatPlayground({
   const showHistoryImageNotice =
     Boolean(activeThreadId) && threadHasImages && !supportsImageAttachments;
   const imageModelOption = modelOptions.find((option) =>
-    supportsImageAttachmentsForModel(option.value),
+    acceptsImages(option.value),
   );
   const renderModelId = activeThread?.model_id ?? selectedModel;
   // Parse by the capabilities of the model that wrote the thread, not the

@@ -151,8 +151,8 @@ function groupModelsByProvider(models: ModelInfo[]): ProviderGroup[] {
     }));
 }
 
-function defaultModelLabel(variant: string): string {
-  return getModelDisplayName(variant);
+function defaultModelLabel(variant: string, displayName?: string): string {
+  return getModelDisplayName(variant, displayName);
 }
 
 function getModelSizeLabel(
@@ -226,7 +226,10 @@ export function RouteModelModal({
     if (getModelLabel) {
       return getModelLabel(variant);
     }
-    return defaultModelLabel(variant);
+    return defaultModelLabel(
+      variant,
+      orderedModels.find((model) => model.variant === variant)?.display_name,
+    );
   };
 
   const handleConfirmDelete = () => {

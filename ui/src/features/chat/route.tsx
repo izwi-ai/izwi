@@ -78,6 +78,16 @@ export function ChatPage({
     [models],
   );
 
+  const modelSupportsImages = useCallback(
+    (variant: string) => {
+      const model = models.find((candidate) => candidate.variant === variant);
+      return model?.modalities
+        ? model.modalities.includes("image_input")
+        : undefined;
+    },
+    [models],
+  );
+
   return (
     <PageShell className="flex min-h-0 flex-col">
       <ChatPlayground
@@ -94,6 +104,7 @@ export function ChatPage({
         chatCapabilities={selectedModelInfo?.chat_capabilities ?? null}
         modelOptions={modelOptions}
         modelSupportsThinking={modelSupportsThinking}
+        modelSupportsImages={modelSupportsImages}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {

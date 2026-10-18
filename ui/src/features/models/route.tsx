@@ -19,6 +19,7 @@ import {
   getModelProviderLabel,
   MODEL_DETAILS,
   getModelDisplayName,
+  resolveModelDetail,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
 import { withQwen3Prefix } from "@/utils/modelDisplay";
@@ -78,7 +79,10 @@ function getModelSizeBytes(model: ModelInfo): number {
     return model.size_bytes;
   }
   const fallback = MODEL_DETAILS[model.variant]?.size;
-  return fallback ? parseSize(fallback) : 0;
+  if (fallback) {
+    return parseSize(fallback);
+  }
+  return model.estimated_size_bytes ?? 0;
 }
 
 function getModelSizeLabel(model: ModelInfo): string {
@@ -163,8 +167,7 @@ export function MyModelsPage({
     return models
       .filter((m) => !m.variant.includes("Tokenizer"))
       .filter((m) => {
-        const details = MODEL_DETAILS[m.variant];
-        if (!details) return false;
+        const details = resolveModelDetail(m);
 
         // Search filter
         if (searchQuery) {
@@ -237,7 +240,7 @@ export function MyModelsPage({
 
   const stats = useMemo(() => {
     const visibleModels = models.filter(
-      (m) => !m.variant.includes("Tokenizer") && MODEL_DETAILS[m.variant],
+      (m) => !m.variant.includes("Tokenizer"),
     );
     return {
       total: visibleModels.length,
@@ -259,7 +262,10 @@ export function MyModelsPage({
     deleteTargetDetails && deleteModalVariant
       ? withQwen3Prefix(deleteTargetDetails.shortName, deleteModalVariant)
       : (removedModels.find((model) => model.variant === deleteModalVariant)
-          ?.display_name ?? deleteModalVariant);
+          ?.display_name ??
+        models.find((model) => model.variant === deleteModalVariant)
+          ?.display_name ??
+        deleteModalVariant);
 
   if (loading) {
     return (
@@ -427,10 +433,11 @@ export function MyModelsPage({
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 {section.models.map((model) => {
-                  const details = MODEL_DETAILS[model.variant];
-                  if (!details) return null;
-
-                  const displayName = getModelDisplayName(model.variant);
+                  const details = resolveModelDetail(model);
+                  const displayName = getModelDisplayName(
+                    model.variant,
+                    model.display_name,
+                  );
                   const isDownloading = model.status === "downloading";
                   const isLoading = model.status === "loading";
                   const isReady = model.status === "ready";

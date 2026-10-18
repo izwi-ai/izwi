@@ -28,6 +28,8 @@ export interface ChatPlaygroundProps {
    * model is not in the catalog. Used for threads written by another model.
    */
   modelSupportsThinking?: (variant: string) => boolean | undefined;
+  /** Catalog lookup for image input (`image_input` modality); undefined when unknown. */
+  modelSupportsImages?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
@@ -435,6 +437,7 @@ export function threadHasImageAttachments(
   );
 }
 
+/** Name-based fallback for models missing from the catalog. */
 export function supportsImageAttachmentsForModel(
   variant: string | null,
 ): boolean {
