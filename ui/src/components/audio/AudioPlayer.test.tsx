@@ -51,6 +51,11 @@ describe("RecordAudioPlayer", () => {
     expect(audio.playbackRate).toBe(1.5);
   });
 
+  it("rounds the total length like the rest of the app", () => {
+    render(<RecordAudioPlayer src="/audio/take.wav" durationHint={2.85} />);
+    expect(screen.getByText("/ 0:03")).toBeVisible();
+  });
+
   it("disables the controls without audio", () => {
     render(<RecordAudioPlayer src="" />);
     expect(screen.getByRole("button", { name: "Play" })).toBeDisabled();

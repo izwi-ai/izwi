@@ -486,12 +486,17 @@ export function MyModelsPage({
             memory ? (
               <>
                 <span className="text-xl font-semibold text-[var(--text-primary)]">
-                  {formatBytes(memory.reserved_bytes)}
+                  {memory.reserved_bytes > 0
+                    ? formatBytes(memory.reserved_bytes)
+                    : "None"}
                 </span>
                 {memory.system_total_bytes ? (
                   <span className="text-[13px]">
                     {" "}
                     of {formatBytes(memory.system_total_bytes)}
+                    {memory.system_available_bytes != null
+                      ? ` · ${formatBytes(memory.system_available_bytes)} free`
+                      : ""}
                   </span>
                 ) : null}
               </>

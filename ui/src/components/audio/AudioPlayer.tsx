@@ -2,11 +2,15 @@ import type { ReactNode } from "react";
 import { Pause, Play, SkipBack, SkipForward } from "lucide-react";
 
 import type { AudioPlayback } from "@/components/audio/useAudioPlayback";
+import { formatClockDuration } from "@/components/history/format";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 
+/** Elapsed time ("0:02"), floored like a running clock. Total lengths use
+ * formatClockDuration, which rounds, so a 2.85 s take reads 0:03 in the
+ * player, its facts and its list row alike. */
 export function formatClockTime(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
     return "0:00";
@@ -106,7 +110,7 @@ export function AudioPlayer({
         <div className="font-mono text-[13px] font-medium tabular-nums tracking-tight text-[var(--text-primary)]">
           {formatClockTime(currentTime)}{" "}
           <span className="font-normal text-[var(--text-muted)]">
-            / {formatClockTime(duration)}
+            / {formatClockDuration(duration)}
           </span>
         </div>
 

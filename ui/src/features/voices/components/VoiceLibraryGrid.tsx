@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Pause, Play } from "lucide-react";
 
-import { formatClockTime } from "@/components/audio/AudioPlayer";
 import { useAudioPlayback } from "@/components/audio/useAudioPlayback";
+import { formatClockDuration } from "@/components/history/format";
 import { RowBadge } from "@/components/history/RowBadge";
 import { RowMenu } from "@/components/history/RowMenu";
 import { Button } from "@/components/ui/button";
@@ -112,7 +112,7 @@ function VoicePreview({
         {item.previewLoading
           ? "…"
           : item.previewUrl
-            ? formatClockTime(playback.duration)
+            ? formatClockDuration(playback.duration)
             : "—"}
       </span>
     </div>
