@@ -263,67 +263,6 @@ export function summarizeChatStats(stats: ChatGenerationStats): ChatStatsSummary
   };
 }
 
-/** Stats of the turn that just streamed, keyed by its persisted id. */
-export interface StreamedTurnStats {
-  messageId: string;
-  stats: ChatGenerationStats;
-}
-
-/** Stats to show after a history refresh. Persisted turns do not store the
- * engine timing, so the refresh that follows a stream keeps the streamed
- * stats while the latest assistant turn is still that streamed turn. */
-export function statsAfterHistoryRefresh(
-  messages: ChatThreadMessageRecord[],
-  streamed: StreamedTurnStats | null,
-): ChatGenerationStats | null {
-  const latest = latestAssistantWithStats(messages);
-  if (!latest) {
-    return null;
-  }
-  if (streamed && latest.id === streamed.messageId) {
-    return streamed.stats;
-  }
-  return {
-    tokens_generated: latest.tokens_generated as number,
-    generation_time_ms: latest.generation_time_ms as number,
-  };
-}
-
-function latestAssistantWithStats(
-  messages: ChatThreadMessageRecord[],
-): ChatThreadMessageRecord | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message.role === "assistant" &&
-      typeof message.tokens_generated === "number" &&
-      typeof message.generation_time_ms === "number"
-    ) {
-      return message;
-    }
-  }
-  return null;
-}
-
-export function extractLatestStats(
-  messages: ChatThreadMessageRecord[],
-): ChatGenerationStats | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message.role === "assistant" &&
-      typeof message.tokens_generated === "number" &&
-      typeof message.generation_time_ms === "number"
-    ) {
-      return {
-        tokens_generated: message.tokens_generated,
-        generation_time_ms: message.generation_time_ms,
-      };
-    }
-  }
-  return null;
-}
-
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
     return text;

@@ -1,5 +1,11 @@
-import type { ChatThreadMessageRecord } from "@/api";
-import { MessageTime } from "@/features/chat/components/messages/MessageParts";
+import { Fragment } from "react";
+
+import type { ChatGenerationStats, ChatThreadMessageRecord } from "@/api";
+import {
+  MessageTime,
+  ReplyNotice,
+  StoppedChip,
+} from "@/features/chat/components/messages/MessageParts";
 import { ReasoningBlock } from "@/features/chat/components/messages/ReasoningBlock";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/CopyButton";
@@ -7,7 +13,21 @@ import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
   parseAssistantContent,
   stripThinkingArtifacts,
+  summarizeChatStats,
 } from "@/features/chat/playground/support";
+
+function speedTitle(stats: ReturnType<typeof summarizeChatStats>): string {
+  const parts = [
+    stats.decodeOnly
+      ? "Decode speed: generated tokens over decode time, excluding queue wait and prompt processing"
+      : "Generated tokens over total time, including queue wait and prompt processing",
+    `Total ${Math.round(stats.totalMs)} ms`,
+  ];
+  if (stats.ttftMs !== null) {
+    parts.push(`First token after ${Math.round(stats.ttftMs)} ms`);
+  }
+  return parts.join(". ");
+}
 
 interface AssistantMessageProps {
   message: ChatThreadMessageRecord;
@@ -15,6 +35,10 @@ interface AssistantMessageProps {
   isStreamingReply: boolean;
   /** The newest reply in the thread keeps its footer visible. */
   isLatestReply: boolean;
+  /** Display name of the model that wrote the reply. */
+  modelLabel: string | null;
+  /** Engine stats from streaming this reply in this session. */
+  stats: ChatGenerationStats | null;
   /** The model that wrote this reply emits reasoning before `</think>`. */
   implicitThink: boolean;
   /** Thinking is on for the turn being streamed. */
@@ -32,6 +56,8 @@ export function AssistantMessage({
   message,
   isStreamingReply,
   isLatestReply,
+  modelLabel,
+  stats,
   implicitThink,
   thinkingEnabled,
   isThoughtExpanded,
@@ -64,6 +90,38 @@ export function AssistantMessage({
     reasoningActive ||
     (!!parsed && parsed.hasThink && parsed.thinking.length > 0);
   const answerText = (parsed ? parsed.answer : displayContent).trim();
+  const turnStats =
+    stats ??
+    (typeof message.tokens_generated === "number" &&
+    typeof message.generation_time_ms === "number"
+      ? {
+          tokens_generated: message.tokens_generated,
+          generation_time_ms: message.generation_time_ms,
+        }
+      : null);
+  const statsSummary = turnStats ? summarizeChatStats(turnStats) : null;
+  const details = [
+    modelLabel ? (
+      <span key="model" className="min-w-0 truncate">
+        {modelLabel}
+      </span>
+    ) : null,
+    statsSummary ? (
+      <span key="tokens" className="whitespace-nowrap tabular-nums">
+        {statsSummary.tokens} tokens
+      </span>
+    ) : null,
+    statsSummary && statsSummary.tokensPerSecond > 0 ? (
+      <span
+        key="speed"
+        className="whitespace-nowrap tabular-nums"
+        title={speedTitle(statsSummary)}
+      >
+        {Math.round(statsSummary.tokensPerSecond)} tok/s
+      </span>
+    ) : null,
+  ].filter((detail) => detail !== null);
+  const finishReason = isStreamingReply ? null : message.finish_reason;
 
   return (
     <article
@@ -98,6 +156,18 @@ export function AssistantMessage({
         </div>
       ) : null}
 
+      {finishReason === "cancelled" ? <StoppedChip /> : null}
+      {finishReason === "length" ? (
+        <ReplyNotice tone="warning">
+          This reply reached the length limit, so it may be cut off.
+        </ReplyNotice>
+      ) : null}
+      {finishReason === "error" ? (
+        <ReplyNotice tone="danger">
+          The model hit an error before finishing this reply.
+        </ReplyNotice>
+      ) : null}
+
       {isStreamingReply && !reasoningActive && (
         <span className="inline-flex items-center ml-2 align-middle">
           <span className="w-1.5 h-4 bg-primary animate-pulse inline-block" />
@@ -114,6 +184,21 @@ export function AssistantMessage({
           {answerText ? (
             <CopyButton text={answerText} label="Copy reply" />
           ) : null}
+          {answerText ? (
+            <span
+              aria-hidden="true"
+              className="mx-1.5 h-3.5 w-px shrink-0 bg-[var(--border-subtle)]"
+            />
+          ) : null}
+          <span className="flex min-w-0 items-center gap-1.5 px-1">
+            {details.map((detail, index) => (
+              <Fragment key={detail.key}>
+                {index > 0 ? <span aria-hidden="true">·</span> : null}
+                {detail}
+              </Fragment>
+            ))}
+            {details.length > 0 ? <span aria-hidden="true">·</span> : null}
+          </span>
           <MessageTime timestamp={message.created_at} />
         </footer>
       )}

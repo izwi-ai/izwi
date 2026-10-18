@@ -268,10 +268,10 @@ describe("ChatPlayground", () => {
       screen.queryByText("Using Qwen3.5 4B GGUF (Q4_K_M)"),
     ).not.toBeInTheDocument();
 
-    const sendButton = screen.getByRole("button", { name: "Send message" });
-    const tokensStat = screen.getByText("12 tokens");
-    const position = sendButton.compareDocumentPosition(tokensStat);
-    expect(position & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    // Stats moved from under the composer into the reply's own footer.
+    const reply = screen.getByRole("article", { name: "Reply" });
+    expect(within(reply).getByText("12 tokens")).toBeInTheDocument();
+    expect(within(reply).getByText("100 tok/s")).toBeInTheDocument();
   });
 
   it("stops following streamed output while the user reads earlier messages", async () => {
@@ -1627,9 +1627,42 @@ describe("ChatPlayground", () => {
       callbacks.onClose();
     });
     await waitFor(() => expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(historyReads));
-    expect(await screen.findByText("100 t/s decode")).toBeInTheDocument();
-    expect(screen.getByText("1550 ms TTFT")).toBeInTheDocument();
+    const speed = await screen.findByText("100 tok/s");
+    expect(speed).toHaveAttribute(
+      "title",
+      expect.stringContaining("First token after 1550 ms"),
+    );
+    expect(speed.getAttribute("title")).toMatch(/^Decode speed/);
     expect(screen.getByText("41 tokens")).toBeInTheDocument();
+    expect(screen.getByText(model)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["cancelled", "Stopped"],
+    ["length", "This reply reached the length limit, so it may be cut off."],
+    ["error", "The model hit an error before finishing this reply."],
+  ])("says when a reply ended early (%s)", async (finishReason, expected) => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "ended-thread", title: "Ended", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 2 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+      { id: "u1", thread_id: thread.id, role: "user", content: "Write a story",
+        created_at: 1, tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant", content: "Once upon",
+        created_at: 2, tokens_generated: 3, generation_time_ms: 30, model_id: model,
+        finish_reason: finishReason },
+    ] });
+    render(<MemoryRouter initialEntries={["/chat?threadId=ended-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={false} modelLabel={model}
+        modelOptions={[{ value: model, label: "LFM2.5 1.2B", statusLabel: "Ready", isReady: true }]}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+
+    const reply = await screen.findByRole("article", { name: "Reply" });
+    expect(within(reply).getByText(expected)).toBeInTheDocument();
+    expect(within(reply).getByText("LFM2.5 1.2B")).toBeInTheDocument();
   });
 
   it("keeps failed streamed text visible when history refreshes", async () => {

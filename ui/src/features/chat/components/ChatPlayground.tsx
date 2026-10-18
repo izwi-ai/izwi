@@ -49,16 +49,12 @@ import {
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
-  extractLatestStats,
   fallbackThreadTitleFromUserMessage,
   getErrorMessage,
   isSameCalendarDay,
   messageDayLabel,
   normalizeGeneratedThreadTitle,
   readImageFileAsDataUrl,
-  statsAfterHistoryRefresh,
-  summarizeChatStats,
-  type StreamedTurnStats,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
   threadHasImageAttachments,
@@ -148,8 +144,11 @@ export function ChatPlayground({
     message: string;
   } | null>(null);
   const [threadLoadAttempt, setThreadLoadAttempt] = useState(0);
-  const [stats, setStats] = useState<ChatGenerationStats | null>(null);
-  const statsSummary = stats ? summarizeChatStats(stats) : null;
+  // Engine stats of replies streamed in this session, keyed by message id.
+  // Stored replies keep only their token count and total time.
+  const [streamedStats, setStreamedStats] = useState<
+    Record<string, ChatGenerationStats>
+  >({});
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
@@ -579,7 +578,6 @@ export function ChatPlayground({
     if (!activeThreadId) {
       setMessages([]);
       setExpandedThoughts({});
-      setStats(null);
       setMessagesLoading(false);
       return;
     }
@@ -611,7 +609,6 @@ export function ChatPlayground({
 
         setMessages(detail.messages);
         setExpandedThoughts({});
-        setStats(extractLatestStats(detail.messages));
         setThreads((previous) =>
           previous.map((thread) =>
             thread.id === detail.thread.id ? detail.thread : thread,
@@ -660,7 +657,6 @@ export function ChatPlayground({
             return;
           }
           setMessages(detail.messages);
-          setStats(extractLatestStats(detail.messages));
         })
         .catch(() => {
           // Ignore follow-up sync failures after cancel.
@@ -679,7 +675,6 @@ export function ChatPlayground({
       setActiveThreadInUrl(null);
       setMessages([]);
       setExpandedThoughts({});
-      setStats(null);
     }
     setError(null);
     textareaRef.current?.focus();
@@ -717,7 +712,6 @@ export function ChatPlayground({
           setActiveThreadInUrl(null, true);
           setMessages([]);
           setExpandedThoughts({});
-          setStats(null);
         }
       } catch (deleteError) {
         setError(getErrorMessage(deleteError, "Failed to delete this chat."));
@@ -861,7 +855,6 @@ export function ChatPlayground({
         setActiveThreadInUrl(createdThread.id);
         setMessages([]);
         setExpandedThoughts({});
-        setStats(null);
         targetThreadId = createdThread.id;
         targetDraftKey = draftKeyForThread(createdThread.id);
         setComposerDrafts((previous) => {
@@ -882,7 +875,6 @@ export function ChatPlayground({
     }
 
     setError(null);
-    setStats(null);
 
     const requestPayload = buildChatThreadMessagePayload({
       text,
@@ -942,7 +934,6 @@ export function ChatPlayground({
     setStreamingThreadId(targetThreadId);
 
     let streamFailed = false;
-    let streamedTurn: StreamedTurnStats | null = null;
     try {
       streamAbortRef.current = api.sendChatThreadMessageStream(
         targetThreadId,
@@ -1034,8 +1025,10 @@ export function ChatPlayground({
 
               return [...updated, assistantMessage];
             });
-            setStats(streamStats);
-            streamedTurn = { messageId: assistantMessage.id, stats: streamStats };
+            setStreamedStats((previous) => ({
+              ...previous,
+              [assistantMessage.id]: streamStats,
+            }));
 
             if (isFirstTurn) {
               void maybeGenerateThreadTitle({
@@ -1074,7 +1067,6 @@ export function ChatPlayground({
                   return;
                 }
                 setMessages(detail.messages);
-                setStats(statsAfterHistoryRefresh(detail.messages, streamedTurn));
               })
               .catch(() => {
                 // Ignore follow-up sync failures after stream close.
@@ -1586,6 +1578,15 @@ export function ChatPlayground({
                                 isLatestReply={index === lastAssistantIndex}
                                 implicitThink={writerImplicitThink}
                                 thinkingEnabled={thinkingEnabledForModel}
+                                modelLabel={
+                                  message.model_id
+                                    ? (modelOptions.find(
+                                        (option) =>
+                                          option.value === message.model_id,
+                                      )?.label ?? message.model_id)
+                                    : null
+                                }
+                                stats={streamedStats[messageKey] ?? null}
                                 isThoughtExpanded={!!expandedThoughts[messageKey]}
                                 onToggleThought={() =>
                                   setExpandedThoughts((previous) => ({
@@ -1655,38 +1656,6 @@ export function ChatPlayground({
                 </div>
               </div>
             </div>
-
-            {statsSummary && !isStreaming && (
-              <div className="px-4 pb-2 pt-3 sm:px-6">
-                <div className="mx-auto flex max-w-4xl items-center justify-center gap-3 text-[11px] font-medium text-muted-foreground">
-                  <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {statsSummary.tokens} tokens
-                  </span>
-                  <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {Math.round(statsSummary.totalMs)} ms
-                  </span>
-                  {statsSummary.ttftMs !== null && (
-                    <span
-                      className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
-                      title="Time to first token, including queue wait and prompt processing"
-                    >
-                      {Math.round(statsSummary.ttftMs)} ms TTFT
-                    </span>
-                  )}
-                  <span
-                    className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
-                    title={
-                      statsSummary.decodeOnly
-                        ? "Decode speed: generated tokens over decode time, excluding queue wait and prompt processing"
-                        : "Generated tokens over total time, including queue wait and prompt processing"
-                    }
-                  >
-                    {Math.round(statsSummary.tokensPerSecond)} t/s
-                    {statsSummary.decodeOnly ? " decode" : ""}
-                  </span>
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
