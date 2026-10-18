@@ -460,8 +460,8 @@ describe("DiarizationPage routes", () => {
     expect(
       await screen.findByRole("heading", { name: "New diarization" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Record audio/i })).toBeInTheDocument();
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
 
     const fileInput = document.querySelector(
       'input[type="file"]',
@@ -857,7 +857,7 @@ describe("DiarizationPage routes", () => {
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
 
     const openModelsButton = await screen.findByRole("button", {
-      name: "Open Models",
+      name: "Change diarization models",
     });
 
     fireEvent.click(openModelsButton);
@@ -897,7 +897,7 @@ describe("DiarizationPage routes", () => {
     expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
     expect(screen.getByText("Loaded")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change diarization models" }));
 
     const modelModal = await screen.findByTestId("route-model-modal");
     expect(modelModal.getAttribute("data-models")).not.toContain(

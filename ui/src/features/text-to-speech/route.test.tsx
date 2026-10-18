@@ -859,7 +859,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Open models/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Change model" }));
     expect(openModelManager).toHaveBeenCalledTimes(1);
   });
 

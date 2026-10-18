@@ -527,7 +527,7 @@ export function NewTextToSpeechModal({
                       <ModelRowAction
                         onClick={onOpenModelManager}
                         disabled={isSubmitting}
-                        aria-label="Open models"
+                        aria-label="Change model"
                       >
                         Change
                       </ModelRowAction>

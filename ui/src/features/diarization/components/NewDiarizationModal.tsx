@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Loader2,
   Mic,
-  Settings2,
   Square,
   Upload,
 } from "lucide-react";
@@ -13,8 +11,13 @@ import {
   CreationDialog,
   CreationDialogFrame,
 } from "@/components/CreationDialog";
-import { Button } from "@/components/ui/button";
-import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  CreationBody,
+  CreationField,
+  ModelRow,
+  ModelRowAction,
+} from "@/components/creation/CreationParts";
+import { cn } from "@/lib/utils";
 import {
   clampIntegerDraft,
   formatDraftValue,
@@ -556,8 +559,6 @@ export function NewDiarizationModal({
       : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
   const readinessLabel = "Diarization stack";
-  const readinessUnloadClass =
-    "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]";
   const selectedModelInCatalog =
     selectedModel != null &&
     diarizationModels.some((model) => model.variant === selectedModel);
@@ -583,290 +584,233 @@ export function NewDiarizationModal({
           : "Creating run";
 
   const modalBody = (
-      <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">
-        <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
-          <div className="mb-4 flex items-start justify-between gap-4">
-            <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                Audio source
-              </div>
-              <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-                Choose how to start
-              </h3>
-              <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
-                Bring in a saved clip or capture a fresh conversation, then
-                move straight into the dedicated diarization record page.
-              </p>
-            </div>
-            {isSubmitting ? (
-              <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {submissionStatusLabel}
-              </div>
-            ) : null}
-          </div>
+    <CreationBody
+      main={
+        <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(event) => {
+                event.preventDefault();
+                if (!isSubmitting && !isRecording) {
+                  setIsDraggingFile(true);
+                }
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(event) => void handleFileDrop(event)}
+              disabled={isSubmitting || isRecording}
+              aria-label="Upload audio file"
+              className={cn(
+                "flex min-h-[11rem] flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 border-dashed",
+                isDraggingFile
+                  ? "border-[var(--text-primary)] bg-[var(--surface-raised)]"
+                  : "border-[var(--border-strong)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+              )}
+            >
+              <span className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)]">
+                <Upload className="h-[18px] w-[18px] text-[var(--text-primary)]" />
+              </span>
+              <span className="text-[14px] font-medium text-[var(--text-primary)]">
+                {isDraggingFile ? "Drop to start the run" : "Upload a recording"}
+              </span>
+              <span className="text-xs text-[var(--text-subtle)]">
+                Drop a file or browse · WAV, MP3, M4A, AAC
+              </span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                className="hidden"
+                onChange={(event) => void handleFileUpload(event)}
+              />
+            </button>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  if (!isSubmitting && !isRecording) {
-                    setIsDraggingFile(true);
-                  }
-                }}
-                onDragLeave={() => setIsDraggingFile(false)}
-                onDrop={(event) => void handleFileDrop(event)}
-                disabled={isSubmitting || isRecording}
-                aria-label="Upload audio file"
-                className={`group flex min-h-[14rem] flex-col items-center justify-center rounded-[24px] border border-dashed p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                  isDraggingFile
-                    ? "border-[var(--status-info-text)] bg-[var(--bg-surface-2)]"
-                    : "border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                }`}
-              >
-                <div className="flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]">
-                  <Upload className="h-[22px] w-[22px] text-[var(--text-primary)]" />
-                </div>
-
-                <div className="mt-5 space-y-2">
-                  <div className="text-base font-semibold text-[var(--text-primary)]">
-                    Upload audio
-                  </div>
-                  <div className="max-w-[18rem] text-[13px] leading-5 text-[var(--text-muted)]">
-                    {isDraggingFile
-                      ? "Drop the file here to create a diarization run."
-                      : "Click to choose a recording or drag it here to upload."}
-                  </div>
-                </div>
-
-                <div className="mt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  WAV, MP3, M4A, AAC
-                </div>
-
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="audio/*"
-                  className="hidden"
-                  onChange={(event) => void handleFileUpload(event)}
-                />
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  if (isRecording) {
-                    handleStopRecording();
-                  } else {
-                    void handleStartRecording();
-                  }
-                }}
-                disabled={isSubmitting}
-                className={`group flex min-h-[14rem] flex-col items-center justify-center rounded-[24px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+            <button
+              type="button"
+              onClick={() => {
+                if (isRecording) {
+                  handleStopRecording();
+                } else {
+                  void handleStartRecording();
+                }
+              }}
+              disabled={isSubmitting}
+              className={cn(
+                "flex min-h-[11rem] flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                isRecording
+                  ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
+                  : "border-[var(--border-default)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+              )}
+            >
+              <span
+                className={cn(
+                  "flex h-11 w-11 items-center justify-center rounded-full",
                   isRecording
-                    ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
-                    : "border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                }`}
+                    ? "bg-[var(--status-warning-text)] text-white"
+                    : "border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[var(--text-primary)]",
+                )}
               >
-                <div
-                  className={`flex h-16 w-16 items-center justify-center rounded-full ${
-                    isRecording
-                      ? "bg-[var(--status-warning-text)] text-white"
-                      : "border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-primary)]"
-                  }`}
-                >
-                  {isRecording ? (
-                    <Square className="h-[22px] w-[22px] fill-current" />
-                  ) : (
-                    <Mic className="h-[22px] w-[22px]" />
-                  )}
-                </div>
-
-                <div className="mt-5 space-y-2">
-                  <div className="text-base font-semibold">
-                    {isRecording ? "Stop recording" : "Record audio"}
-                  </div>
-                  <div className="max-w-[18rem] text-[13px] leading-5 text-[var(--text-muted)]">
-                    {isRecording
-                      ? "Stop capture to submit the recording for diarization."
-                      : "Use your microphone to capture a fresh conversation."}
-                  </div>
-                </div>
-              </button>
-            </div>
-
-            {uploadState ? (
-              <div className="mt-3">
-                <SpeechTextUploadProgress
-                  {...uploadState}
-                  canCancel={
-                    isSubmitting &&
-                    (uploadState.phase === "preparing" ||
-                      uploadState.phase === "uploading")
-                  }
-                  onCancel={handleCancelUpload}
-                />
-              </div>
-            ) : null}
-
-            <div className="mt-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-[13px] leading-5 text-[var(--text-muted)]">
-              The run opens on its own page as soon as the upload is accepted.
-            </div>
+                {isRecording ? (
+                  <Square className="h-[18px] w-[18px] fill-current" />
+                ) : (
+                  <Mic className="h-[18px] w-[18px]" />
+                )}
+              </span>
+              <span className="text-[14px] font-medium">
+                {isRecording ? "Stop recording" : "Record audio"}
+              </span>
+              <span className="text-xs text-[var(--text-subtle)]">
+                {isRecording
+                  ? "Stop to submit the recording."
+                  : "Capture a conversation with your microphone."}
+              </span>
+            </button>
           </div>
 
-        <div className="px-6 py-5 sm:px-6">
-          <div className="space-y-2.5">
-            {!isGranitePipeline ? (
+          {uploadState ? (
+            <SpeechTextUploadProgress
+              {...uploadState}
+              canCancel={
+                isSubmitting &&
+                (uploadState.phase === "preparing" ||
+                  uploadState.phase === "uploading")
+              }
+              onCancel={handleCancelUpload}
+            />
+          ) : null}
+        </>
+      }
+      side={
+        <>
+          <CreationField label="Diarization model" htmlFor="diarization-model">
+            <select
+              id="diarization-model"
+              aria-label="Diarization model"
+              value={selectedModel ?? ""}
+              onChange={(event) => onSelectModel(event.target.value)}
+              disabled={isSubmitting || isRecording}
+              className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+            >
+              {pickerOptions.map((option) => (
+                <option key={option.variant} value={option.variant}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </CreationField>
+
+          <ModelRow
+            name={readinessLabel}
+            status={
+              isManagedModelActionBusy
+                ? "busy"
+                : readinessTone === "success"
+                  ? "ready"
+                  : "not_ready"
+            }
+            statusLabel={readinessStatusLabel}
+            actions={
               <>
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Speaker range
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
-                    <span>Min speakers</span>
-                    <input
-                      aria-label="Min speakers"
-                      type="text"
-                      inputMode="numeric"
-                      value={minSpeakers}
-                      onChange={(event) => setMinSpeakers(event.target.value)}
-                      onBlur={normalizeSettings}
-                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
-                    />
-                  </label>
-                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
-                    <span>Max speakers</span>
-                    <input
-                      aria-label="Max speakers"
-                      type="text"
-                      inputMode="numeric"
-                      value={maxSpeakers}
-                      onChange={(event) => setMaxSpeakers(event.target.value)}
-                      onBlur={normalizeSettings}
-                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
-                    />
-                  </label>
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Timing windows
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
-                    <span>Min speech (ms)</span>
-                    <input
-                      aria-label="Min speech (ms)"
-                      type="text"
-                      inputMode="numeric"
-                      value={minSpeechMs}
-                      onChange={(event) => setMinSpeechMs(event.target.value)}
-                      onBlur={normalizeSettings}
-                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
-                    />
-                  </label>
-                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
-                    <span>Min silence (ms)</span>
-                    <input
-                      aria-label="Min silence (ms)"
-                      type="text"
-                      inputMode="numeric"
-                      value={minSilenceMs}
-                      onChange={(event) =>
-                        setMinSilenceMs(event.target.value)
-                      }
-                      onBlur={normalizeSettings}
-                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
-                    />
-                  </label>
-                </div>
-              </div>
-              </>
-            ) : null}
-
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Model readiness
-                </div>
-
-                <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
-                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
-                    <span>Diarization model</span>
-                    <select
-                      aria-label="Diarization model"
-                      value={selectedModel ?? ""}
-                      onChange={(event) => onSelectModel(event.target.value)}
-                      disabled={isSubmitting || isRecording}
-                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
-                    >
-                      {pickerOptions.map((option) => (
-                        <option key={option.variant} value={option.variant}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <div className="mt-2.5 flex items-center justify-between gap-3">
-                    <span className="text-xs text-[var(--text-muted)]">
-                      {readinessLabel}
-                    </span>
-                    <StatusBadge tone={readinessTone}>
-                      {readinessStatusLabel}
-                    </StatusBadge>
-                  </div>
-
-                  {allManagedModelsReady ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className={readinessUnloadClass}
-                      onClick={onUnloadAllManagedModels}
-                      disabled={
-                        isSubmitting ||
-                        isRecording ||
-                        isManagedModelActionBusy ||
-                        !canUnloadAnyManagedModels
-                      }
-                    >
-                      {isManagedModelActionBusy ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : null}
-                      Unload Models
-                    </Button>
-                  ) : null}
-
-                  <Button
-                    type="button"
-                    variant="default"
-                    size="sm"
-                    className="mt-2 h-9 w-full gap-2"
-                    onClick={onOpenModelManager}
-                    disabled={isSubmitting || isRecording}
+                {allManagedModelsReady ? (
+                  <ModelRowAction
+                    onClick={onUnloadAllManagedModels}
+                    disabled={
+                      isSubmitting ||
+                      isRecording ||
+                      isManagedModelActionBusy ||
+                      !canUnloadAnyManagedModels
+                    }
+                    busy={isManagedModelActionBusy}
+                    aria-label="Unload Models"
                   >
-                    <Settings2 className="h-4 w-4" />
-                    Open Models
-                  </Button>
-                </div>
-              </div>
+                    Unload
+                  </ModelRowAction>
+                ) : null}
+                <ModelRowAction
+                  onClick={onOpenModelManager}
+                  disabled={isSubmitting || isRecording}
+                  aria-label="Change diarization models"
+                >
+                  Change
+                </ModelRowAction>
+              </>
+            }
+          />
 
-              {error ? (
-                <div className="rounded-2xl border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3.5 py-2.5 text-[13px] leading-5 text-[var(--danger-text)]">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                    <p>{error}</p>
-                  </div>
+          {!isGranitePipeline ? (
+            <>
+              <CreationField label="Speakers">
+                <div className="grid grid-cols-2 gap-2">
+                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                  Min speakers
+                  <input
+                    aria-label="Min speakers"
+                    type="text"
+                    inputMode="numeric"
+                    value={minSpeakers}
+                    onChange={(event) => setMinSpeakers(event.target.value)}
+                    onBlur={normalizeSettings}
+                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                  Max speakers
+                  <input
+                    aria-label="Max speakers"
+                    type="text"
+                    inputMode="numeric"
+                    value={maxSpeakers}
+                    onChange={(event) => setMaxSpeakers(event.target.value)}
+                    onBlur={normalizeSettings}
+                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                  />
+                </label>
                 </div>
-              ) : null}
+              </CreationField>
+              <CreationField label="Timing">
+                <div className="grid grid-cols-2 gap-2">
+                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                  Min speech (ms)
+                  <input
+                    aria-label="Min speech (ms)"
+                    type="text"
+                    inputMode="numeric"
+                    value={minSpeechMs}
+                    onChange={(event) => setMinSpeechMs(event.target.value)}
+                    onBlur={normalizeSettings}
+                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                  Min silence (ms)
+                  <input
+                    aria-label="Min silence (ms)"
+                    type="text"
+                    inputMode="numeric"
+                    value={minSilenceMs}
+                    onChange={(event) => setMinSilenceMs(event.target.value)}
+                    onBlur={normalizeSettings}
+                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                  />
+                </label>
+                </div>
+              </CreationField>
+            </>
+          ) : null}
+
+          {error ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+            >
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>{error}</p>
             </div>
-
-        </div>
-      </div>
+          ) : null}
+        </>
+      }
+    />
   );
   const busy = isSubmitting || isRecording;
   const frameProps = {

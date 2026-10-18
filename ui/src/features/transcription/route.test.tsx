@@ -10,6 +10,7 @@ import type { ComponentProps } from "react";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { TranscriptionPage } from "./route";
@@ -620,12 +621,13 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "Diarization" })).not.toBeChecked();
-    expect(screen.getByText("Bring in a recording")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Upload audio file" }),
+    ).toHaveTextContent("Drop a recording here or browse");
     expect(screen.getByText("Transcription model")).toBeInTheDocument();
-    expect(screen.getByText("Parakeet-TDT-0.6B-v3")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
-    expect(screen.getByText("Upload audio")).toBeInTheDocument();
+    expect(
+      screen.getByText(getModelDisplayName("Parakeet-TDT-0.6B-v3")),
+    ).toBeInTheDocument();
     expect(screen.getByText("Stream results")).toBeInTheDocument();
   });
 
@@ -647,8 +649,8 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New diarization" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
-    expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Record audio/i })).toBeInTheDocument();
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
   });
 
   it("opens transcription creation from a create intent", async () => {
@@ -677,7 +679,7 @@ describe("TranscriptionPage detail route", () => {
     );
   });
 
-  it("shows NOT LOADED readiness state in transcription mode when required models are not ready", async () => {
+  it("shows the missing-model state in transcription mode when no model is selected", async () => {
     baseProps.selectedModel = null;
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],
@@ -703,8 +705,14 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByText("NOT LOADED")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
+    expect(screen.getByText("Choose one in Models")).toBeInTheDocument();
+    // The aligner row appears once timestamps are on (streaming off first).
+    fireEvent.click(screen.getByRole("switch", { name: /Stream results/i }));
+    fireEvent.click(screen.getByRole("switch", { name: /Include timestamps/i }));
+    expect(screen.getByText("Timestamp aligner")).toBeInTheDocument();
+    expect(
+      screen.getByText(getModelDisplayName("Qwen3-ForcedAligner-0.6B")),
+    ).toBeInTheDocument();
   });
 
   it("clears ASR requirement errors after a transcription model becomes ready", async () => {
@@ -830,7 +838,7 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByText("LOADING")).toBeInTheDocument();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
   });
 
   it("opens model manager from the modal readiness button without raising an error toast", async () => {
@@ -861,7 +869,7 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open ASR models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change transcription model" }));
 
     expect(openModelManager).toHaveBeenCalledTimes(1);
     expect(requestModel).not.toHaveBeenCalled();
