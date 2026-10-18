@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capability for the main desktop window","local":true,"windows":["main"],"permissions":["core:default","aptabase:allow-track-event","autostart:default","updater:default","process:default"]}}
+{"default":{"identifier":"default","description":"Default capability for the main desktop window","local":true,"windows":["main"],"permissions":["core:default","aptabase:allow-track-event"]}}
