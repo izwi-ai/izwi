@@ -64,7 +64,12 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     let event_server_handle = Arc::clone(&managed_server);
     let event_shutdown_handle = Arc::clone(&server_shutdown);
 
+    // Must be the first plugin: a second launch hands its arguments to this
+    // instance and exits before it can spawn a second server, window or tray.
     let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = tray::show_main_window(app);
+        }))
         .invoke_handler(tauri::generate_handler![
             downloads::download_audio_file,
             autostart::launch_at_login_enabled,
