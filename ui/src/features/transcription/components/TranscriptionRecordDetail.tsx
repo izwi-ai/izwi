@@ -38,7 +38,6 @@ interface TranscriptionRecordDetailProps {
   error?: string | null;
   deleteError?: string | null;
   summaryModelGuidance?: string | null;
-  onBack?: () => void;
   onDelete?: () => Promise<void> | void;
   onRegenerateSummary?: () => void;
   deletePending?: boolean;
@@ -157,7 +156,6 @@ export function TranscriptionRecordDetail({
   error = null,
   deleteError = null,
   summaryModelGuidance = null,
-  onBack,
   onDelete,
   onRegenerateSummary,
   deletePending = false,
@@ -180,10 +178,6 @@ export function TranscriptionRecordDetail({
     () => (record?.transcription ?? "").trim().length > 0,
     [record?.transcription],
   );
-  const isSpeakerAttributedAsr =
-    record?.transcription_mode === "speaker_attributed_asr" ||
-    record?.saa_status === "warning" ||
-    (record?.speaker_turns?.length ?? 0) > 0;
   const saaWarning = useMemo(() => {
     const warnings = record?.saa_warnings ?? [];
     if (record?.saa_status !== "warning" || warnings.length === 0) {
@@ -222,11 +216,6 @@ export function TranscriptionRecordDetail({
 
   return (
     <SpeechTextRecordShell
-      title={record?.audio_filename || record?.model_id || "Transcription record"}
-      onBack={onBack}
-      backLabel={
-        isSpeakerAttributedAsr ? "Back to speech text" : "Back to transcriptions"
-      }
       metadata={
         <>
           {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}

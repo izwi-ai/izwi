@@ -746,12 +746,21 @@ export function TranscriptionPage({
     ? openSpeakerAttributedAsrModelManager
     : openTranscriptionModelManager;
 
+  const detailTitle =
+    visibleRecord?.audio_filename ||
+    visibleRecord?.model_id ||
+    "Transcription record";
+
   return (
     <PageShell className={recordId ? "pb-32 sm:pb-36" : undefined}>
       {recordId ? (
         <>
           <PageHeader
-            title="Transcription Record"
+            breadcrumbs={[
+              { label: "Transcription", to: "/transcription" },
+              { label: detailTitle },
+            ]}
+            title={detailTitle}
             description={detailDescription}
             actions={
               <Button
@@ -774,7 +783,6 @@ export function TranscriptionPage({
             error={recordError}
             deleteError={recordActionError}
             summaryModelGuidance={summaryModelReady ? null : summaryModelRequirementMessage}
-            onBack={() => navigate("/transcription")}
             onDelete={handleDetailDelete}
             onRegenerateSummary={() => void handleDetailRegenerateSummary()}
             deletePending={recordDeletePending}

@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import type { ComponentProps } from "react";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
@@ -997,7 +1004,7 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1095,7 +1102,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1362,7 +1369,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     await act(async () => {
@@ -1444,7 +1451,7 @@ describe("TranscriptionPage detail route", () => {
       },
     });
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     apiMocks.getTranscriptionRecord.mockResolvedValue({
@@ -1532,7 +1539,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
@@ -1604,11 +1611,11 @@ describe("TranscriptionPage detail route", () => {
       expect(apiMocks.listTranscriptionRecords).toHaveBeenCalledTimes(2),
     );
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Back to transcriptions/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     );
 
     expect(await screen.findByText("clip.wav")).toBeInTheDocument();
@@ -1684,14 +1691,14 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: "meeting.wav" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Hello there.")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Back to transcriptions/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/^Ready$/)).not.toBeInTheDocument();
     expect(screen.getByTestId("transcription-review-player")).toHaveClass(
@@ -1751,7 +1758,7 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
     expect(screen.getByText("31%")).toBeInTheDocument();
@@ -1759,7 +1766,7 @@ describe("TranscriptionPage detail route", () => {
       screen.getByRole("progressbar", { name: "ASR processing progress" }),
     ).toHaveAttribute("aria-valuenow", "31");
     expect(
-      screen.getByRole("button", { name: /Back to speech text/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     ).toBeInTheDocument();
   });
 

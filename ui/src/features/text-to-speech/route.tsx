@@ -317,6 +317,7 @@ export function TextToSpeechPage({
     };
   }, [record, recordId, streamingRecord]);
 
+  const detailTitle = visibleRecord?.model_id || "Speech generation";
   const detailDescription = useMemo(() => {
     if (!visibleRecord) {
       return "Inspect status and generation details for this text-to-speech record.";
@@ -449,7 +450,11 @@ export function TextToSpeechPage({
       {recordId ? (
         <>
           <PageHeader
-            title="Text-to-Speech Record"
+            breadcrumbs={[
+              { label: "Text to Speech", to: "/text-to-speech" },
+              { label: detailTitle },
+            ]}
+            title={detailTitle}
             description={detailDescription}
             actions={
               <Button
@@ -474,7 +479,6 @@ export function TextToSpeechPage({
             deleteError={recordActionError}
             deletePending={recordDeletePending}
             cancelPending={recordCancelPending}
-            onBack={() => navigate("/text-to-speech")}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
           />

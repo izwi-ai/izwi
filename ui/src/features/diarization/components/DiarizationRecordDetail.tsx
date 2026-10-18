@@ -66,7 +66,6 @@ interface DiarizationRecordDetailProps {
   loading?: boolean;
   error?: string | null;
   summaryModelGuidance?: string | null;
-  onBack?: () => void;
   onDelete?: (recordId: string) => Promise<void> | void;
   onSaveSpeakerCorrections?: (
     recordId: string,
@@ -86,7 +85,6 @@ export function DiarizationRecordDetail({
   loading = false,
   error = null,
   summaryModelGuidance = null,
-  onBack,
   onDelete,
   onSaveSpeakerCorrections,
   onRerun,
@@ -293,9 +291,6 @@ export function DiarizationRecordDetail({
 
   return (
     <SpeechTextRecordShell
-      title={record?.audio_filename || record?.id || "Diarization record"}
-      onBack={onBack}
-      backLabel="Back to transcription"
       metadata={
         <>
           {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}

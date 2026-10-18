@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
-  ArrowLeft,
   Check,
   Copy,
   Download,
@@ -34,7 +33,6 @@ interface TextToSpeechRecordDetailProps {
   deleteError?: string | null;
   deletePending?: boolean;
   cancelPending?: boolean;
-  onBack?: () => void;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
 }
@@ -48,7 +46,6 @@ export function TextToSpeechRecordDetail({
   deleteError = null,
   deletePending = false,
   cancelPending = false,
-  onBack,
   onCancel,
   onDelete,
 }: TextToSpeechRecordDetailProps) {
@@ -107,24 +104,9 @@ export function TextToSpeechRecordDetail({
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
-          {onBack ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="mb-4 h-10 gap-2 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 text-sm font-medium text-[var(--text-secondary)] shadow-sm hover:bg-[var(--bg-surface-1)]"
-              onClick={onBack}
-            >
-              <ArrowLeft className="h-4 w-4" />
-              Back to history
-            </Button>
-          ) : null}
-          <h2 className="truncate text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
-            {record?.model_id || "Speech generation"}
-          </h2>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
             {record ? <span>{formatSpeechCreatedAt(record.created_at)}</span> : null}
             {record?.audio_duration_secs != null ? (
               <span>{formatSpeechDuration(record.audio_duration_secs)}</span>

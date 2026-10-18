@@ -314,6 +314,10 @@ export function DiarizationPage({
     }
     return record;
   }, [latestRecord, record, recordId]);
+  const listTitle =
+    routeBasePath === "/transcription" ? "Transcription" : "Diarization";
+  const detailTitle =
+    visibleRecord?.audio_filename || visibleRecord?.id || "Diarization record";
   const detailDescription = useMemo(() => {
     if (!visibleRecord) {
       return "Inspect transcript output, speaker corrections, and quality reruns for this saved diarization record.";
@@ -400,9 +404,6 @@ export function DiarizationPage({
     [buildRoutePath, navigate],
   );
 
-  const handleCloseRecord = useCallback(() => {
-    navigate(buildRoutePath());
-  }, [buildRoutePath, navigate]);
   const handleOpenNewDiarizationModal = useCallback(() => {
     setIsNewDiarizationModalOpen(true);
   }, []);
@@ -519,7 +520,11 @@ export function DiarizationPage({
       {recordId ? (
         <>
           <PageHeader
-            title="Diarization Record"
+            breadcrumbs={[
+              { label: listTitle, to: buildRoutePath() },
+              { label: detailTitle },
+            ]}
+            title={detailTitle}
             description={detailDescription}
             actions={
               <Button
@@ -543,7 +548,6 @@ export function DiarizationPage({
             summaryModelGuidance={
               summaryModelReady ? null : summaryModelRequirementMessage
             }
-            onBack={handleCloseRecord}
             onDelete={handleDeleteRecord}
             onSaveSpeakerCorrections={handleSaveSpeakerCorrections}
             onRerun={handleRerunRecord}

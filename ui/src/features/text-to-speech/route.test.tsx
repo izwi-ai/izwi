@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1052,7 +1059,7 @@ describe("TextToSpeechPage", () => {
       await events.onChunk?.({ requestId: "existing-fish", sequence: 0, sampleCount: 1, audioBase64: "AAA=" });
     });
     expect(screen.getByText("Playing generated speech")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Back to history" }));
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Text to Speech" }));
     expect(controller.signal.aborted).toBe(true);
     expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
   });
@@ -1107,7 +1114,7 @@ describe("TextToSpeechPage", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(controller.signal.aborted).toBe(false);
@@ -1117,16 +1124,18 @@ describe("TextToSpeechPage", () => {
       await streamEvents.onChunk?.({ requestId: "request", sequence: 0, sampleCount: 1, audioBase64: "AAA=" });
     });
     expect(screen.getByText("Playing generated speech")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", {
-      name: leave ? "Back to history" : "Stop generation and playback",
-    }));
+    fireEvent.click(
+      leave
+        ? within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Text to Speech" })
+        : screen.getByRole("button", { name: "Stop generation and playback" }),
+    );
     expect(controller.signal.aborted).toBe(true);
     if (durable && leave) {
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
       // Returning to the record must not revive stale transport callbacks or
       // send a cancellation while the durable worker continues independently.
       fireEvent.click(await screen.findByText("Durable narration"));
-      expect(await screen.findByRole("heading", { name: "Text-to-Speech Record" })).toBeInTheDocument();
+      expect(await screen.findByRole("navigation", { name: "Breadcrumb" })).toBeInTheDocument();
       expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalledOnce();
       await act(async () => { streamEvents.onError?.("late disconnected callback"); });
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
@@ -1187,7 +1196,7 @@ describe("TextToSpeechPage", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1206,7 +1215,7 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
@@ -1281,7 +1290,7 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     expect(await screen.findByText("Voice: Narrator Prime")).toBeInTheDocument();
@@ -1302,7 +1311,7 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     expect(await screen.findByText("Voice: Anna")).toBeInTheDocument();

@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo } from "@/api";
@@ -482,7 +489,7 @@ describe("DiarizationPage routes", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "New diarization" }),
@@ -495,7 +502,7 @@ describe("DiarizationPage routes", () => {
     });
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Back to transcription/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
     );
 
     expect(
@@ -570,7 +577,7 @@ describe("DiarizationPage routes", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -995,8 +1002,9 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    expect(await screen.findByText("meeting.wav")).toBeInTheDocument();
-    expect(screen.getByText("Diarization Record")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "meeting.wav" }),
+    ).toBeInTheDocument();
     expect(screen.getByTestId("diarization-review-player")).toHaveClass("fixed");
   });
 
@@ -1015,7 +1023,7 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1029,7 +1037,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(
-      await screen.findByRole("button", { name: /Back to transcription/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
     );
 
     expect(
