@@ -1501,12 +1501,51 @@ html.theme-light .chat-thinking-toggle:hover {
   }
 }
 
+.chat-caret,
+.chat-streaming-answer
+  .chat-markdown
+  > :is(p, h1, h2, h3, h4, blockquote):last-child::after,
+.chat-streaming-answer
+  .chat-markdown
+  > :is(ul, ol):last-child
+  > li:last-child::after,
+.chat-streaming-answer
+  .chat-markdown
+  > .chat-code-block:last-child
+  code::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  border-radius: 2px;
+  background: var(--text-primary);
+  vertical-align: -0.2em;
+  opacity: 0.85;
+  animation: chat-caret-blink 1s steps(2, start) infinite;
+}
+
+.chat-caret {
+  align-self: flex-start;
+}
+
+@keyframes chat-caret-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
 .chat-reasoning-tail {
   -webkit-mask-image: linear-gradient(transparent, #000 45%);
   mask-image: linear-gradient(transparent, #000 45%);
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-caret,
+  .chat-streaming-answer .chat-markdown *::after {
+    animation: none;
+  }
+
   .chat-shimmer {
     animation: none;
     color: var(--text-muted);

@@ -10,6 +10,7 @@ import {
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
+  ArrowDown,
   Brain,
   History,
   Send,
@@ -51,6 +52,7 @@ import {
   displayThreadTitle,
   fallbackThreadTitleFromUserMessage,
   getErrorMessage,
+  parseAssistantContent,
   stripMarkdown,
   isSameCalendarDay,
   messageDayLabel,
@@ -117,6 +119,9 @@ export function ChatPlayground({
     Record<string, number>
   >({});
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  // Screen readers hear a finished reply once, not each streamed token.
+  const [replyAnnouncement, setReplyAnnouncement] = useState("");
   // Drafts intentionally live only for this mounted session. Durable persistence
   // is out of scope; the thread key prevents in-session cross-conversation leaks.
   const [composerDrafts, setComposerDrafts] = useState<
@@ -526,6 +531,27 @@ export function ChatPlayground({
     }
     followingOutputRef.current =
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
+    setShowJumpToLatest(!followingOutputRef.current);
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    const viewport = messageViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    followingOutputRef.current = true;
+    setShowJumpToLatest(false);
+    const reduceMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (typeof viewport.scrollTo === "function") {
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
+    } else {
+      viewport.scrollTop = viewport.scrollHeight;
+    }
   }, []);
 
   useEffect(() => {
@@ -1102,6 +1128,15 @@ export function ChatPlayground({
               ...previous,
               [assistantMessage.id]: streamStats,
             }));
+            const spokenAnswer = stripMarkdown(
+              parseAssistantContent(assistantMessage.content, {
+                implicitOpenThinkTag: true,
+                treatNoTagAsThinking: false,
+              }).answer,
+            ).trim();
+            setReplyAnnouncement(
+              spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
+            );
 
             if (isFirstTurn) {
               void maybeGenerateThreadTitle({
@@ -1696,7 +1731,17 @@ export function ChatPlayground({
               </div>
 
               <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 bg-[var(--bg-app)] px-4 pb-4 pt-4 sm:px-6">
-                <div className="max-w-3xl mx-auto pointer-events-auto">
+                <div className="relative max-w-3xl mx-auto pointer-events-auto">
+                  {showJumpToLatest && (
+                    <button
+                      type="button"
+                      onClick={jumpToLatest}
+                      className="absolute -top-12 left-1/2 inline-flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[12.5px] text-[var(--text-secondary)] shadow-[var(--shadow-soft)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                      Jump to latest
+                    </button>
+                  )}
                   <AnimatePresence>
                     {error && (
                       <motion.div
@@ -1734,11 +1779,19 @@ export function ChatPlayground({
                     </div>
                   )}
                   {renderComposer(false)}
+                  <p className="mt-2 text-center text-[11.5px] text-[var(--text-subtle)]">
+                    Runs on this device. Enter to send, Shift+Enter for a new
+                    line.
+                  </p>
                 </div>
               </div>
             </div>
           </div>
         )}
+      </div>
+
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {replyAnnouncement}
       </div>
 
       <Dialog

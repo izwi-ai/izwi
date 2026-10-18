@@ -359,18 +359,27 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(streamCallbacks).not.toBeNull());
     expect(viewport.scrollTop).toBe(scrollHeight);
 
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest" }),
+    ).not.toBeInTheDocument();
     viewport.scrollTop = 300;
     fireEvent.scroll(viewport);
     scrollHeight = 1_300;
     act(() => streamCallbacks?.onDelta("First token"));
     expect(viewport.scrollTop).toBe(300);
+    expect(
+      screen.getByRole("button", { name: "Jump to latest" }),
+    ).toBeInTheDocument();
 
     scrollHeight = 1_400;
     act(() => streamCallbacks?.onDelta(" second token"));
     expect(viewport.scrollTop).toBe(300);
 
-    viewport.scrollTop = 1_000;
-    fireEvent.scroll(viewport);
+    fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
+    expect(viewport.scrollTop).toBe(1_400);
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest" }),
+    ).not.toBeInTheDocument();
     scrollHeight = 1_500;
     act(() => streamCallbacks?.onDelta(" third token"));
     expect(viewport.scrollTop).toBe(scrollHeight);
@@ -1493,7 +1502,10 @@ describe("ChatPlayground", () => {
       value: { writeText },
     });
     fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Copied");
+    const reply = screen.getByRole("article", { name: "Reply" });
+    expect(await within(reply).findByRole("status")).toHaveTextContent(
+      "Copied",
+    );
     expect(writeText).toHaveBeenCalledWith("Final answer");
     fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
     expect(writeText).toHaveBeenLastCalledWith("Solve this");
@@ -1636,6 +1648,11 @@ describe("ChatPlayground", () => {
       expect.stringContaining("First token after 1550 ms"),
     );
     expect(speed.getAttribute("title")).toMatch(/^Decode speed/);
+    expect(
+      screen.getAllByRole("status").some(
+        (region) => region.textContent === "Reply: Final answer",
+      ),
+    ).toBe(true);
     expect(screen.getByText("41 tokens")).toBeInTheDocument();
     expect(screen.getByText(model)).toBeInTheDocument();
   });

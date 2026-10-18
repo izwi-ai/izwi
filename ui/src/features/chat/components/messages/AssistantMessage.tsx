@@ -95,6 +95,10 @@ export function AssistantMessage({
     reasoningActive ||
     (!!parsed && parsed.hasThink && parsed.thinking.length > 0);
   const answerText = (parsed ? parsed.answer : displayContent).trim();
+  // While the answer streams, the caret trails its last line (see
+  // .chat-streaming-answer); before any text it stands on its own.
+  const showInlineCaret =
+    isStreamingReply && !reasoningActive && answerText.length > 0;
   const turnStats =
     stats ??
     (typeof message.tokens_generated === "number" &&
@@ -131,7 +135,10 @@ export function AssistantMessage({
   return (
     <article
       aria-label="Reply"
-      className="group flex flex-col gap-2.5 break-words text-[0.9375rem] leading-[1.7] text-[var(--text-primary)]"
+      className={cn(
+        "group flex flex-col gap-2.5 break-words text-[0.9375rem] leading-[1.7] text-[var(--text-primary)]",
+        showInlineCaret && "chat-streaming-answer",
+      )}
     >
       {showReasoning && parsed && (
         <ReasoningBlock
@@ -173,11 +180,9 @@ export function AssistantMessage({
         </ReplyNotice>
       ) : null}
 
-      {isStreamingReply && !reasoningActive && (
-        <span className="inline-flex items-center ml-2 align-middle">
-          <span className="w-1.5 h-4 bg-primary animate-pulse inline-block" />
-        </span>
-      )}
+      {isStreamingReply && !reasoningActive && !showInlineCaret ? (
+        <span className="chat-caret" aria-hidden="true" />
+      ) : null}
       {!isStreamingReply && (
         <footer
           className={cn(
