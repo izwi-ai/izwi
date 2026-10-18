@@ -399,9 +399,21 @@ export function TranscriptionRecordDetail({
         loading={loading}
         autoScrollActiveEntry={true}
         fixedPlaybackFooter={true}
-        summaryModelGuidance={summaryModelGuidance}
-        emptyTitle="Transcription in progress"
-        emptyMessage="The transcript will appear here as soon as this record is ready."
+        summaryModelGuidance={
+          processingStatus === "ready" ? summaryModelGuidance : null
+        }
+        emptyTitle={
+          processingStatus === "pending" || processingStatus === "processing"
+            ? "Transcription in progress"
+            : "No transcript"
+        }
+        emptyMessage={
+          processingStatus === "failed"
+            ? "This job failed before producing a transcript."
+            : processingStatus === "pending" || processingStatus === "processing"
+              ? "The transcript will appear here as soon as this record is ready."
+              : "No speech was recognised in this recording."
+        }
       />
 
       <Dialog

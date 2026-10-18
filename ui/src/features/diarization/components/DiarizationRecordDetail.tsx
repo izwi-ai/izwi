@@ -277,6 +277,25 @@ export function DiarizationRecordDetail({
 
   const title =
     record?.audio_filename || record?.id || "Diarization record";
+  const isReady = processingStatus === "ready";
+  // Summaries need a finished transcript; the hint only helps then.
+  const visibleSummaryGuidance = isReady ? summaryModelGuidance : null;
+  const emptyState =
+    processingStatus === "failed"
+      ? {
+          title: "No transcript",
+          message:
+            "This run failed before producing a transcript. Re-run it from the Quality tab, or delete it.",
+        }
+      : processingStatus === "pending" || processingStatus === "processing"
+        ? {
+            title: "Diarization in progress",
+            message: "The transcript will appear here when the run finishes.",
+          }
+        : {
+            title: "No transcript",
+            message: "This run did not find any speech.",
+          };
   const speakerCount = record
     ? (record.corrected_speaker_count ?? record.speaker_count)
     : null;
@@ -286,7 +305,7 @@ export function DiarizationRecordDetail({
         ...(record.duration_secs != null
           ? [{ icon: Clock, label: formatClockDuration(record.duration_secs) }]
           : []),
-        ...(speakerCount != null
+        ...(speakerCount != null && (isReady || speakerCount > 0)
           ? [
               {
                 icon: Users,
@@ -433,9 +452,9 @@ export function DiarizationRecordDetail({
             </Card>
           ) : null}
 
-          {summaryModelGuidance ? (
+          {visibleSummaryGuidance ? (
             <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
-              {summaryModelGuidance}
+              {visibleSummaryGuidance}
             </Card>
           ) : null}
         </>
@@ -474,9 +493,9 @@ export function DiarizationRecordDetail({
             loading={loading}
             autoScrollActiveEntry={true}
             fixedPlaybackFooter={true}
-            summaryModelGuidance={summaryModelGuidance}
-            emptyTitle="Diarization record loading"
-            emptyMessage="The transcript will appear here once the diarization record is ready."
+            summaryModelGuidance={visibleSummaryGuidance}
+            emptyTitle={emptyState.title}
+            emptyMessage={emptyState.message}
           />
         </TabsContent>
 

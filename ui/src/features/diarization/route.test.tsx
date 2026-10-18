@@ -994,6 +994,32 @@ describe("DiarizationPage routes", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a failed run as failed, without a loading state or speaker count", async () => {
+    apiMocks.listDiarizationRecords.mockResolvedValue([]);
+    apiMocks.getDiarizationRecord.mockResolvedValue({
+      ...fullRecord,
+      processing_status: "failed",
+      processing_error: "invocation tensor input has incompatible device",
+      speaker_count: 0,
+      corrected_speaker_count: 0,
+      transcript: "",
+      raw_transcript: "",
+      asr_text: "",
+      utterances: [],
+      summary_status: "not_requested",
+    });
+
+    renderRoute("/diarization/diar-1");
+
+    expect(
+      await screen.findByText(
+        "This run failed before producing a transcript. Re-run it from the Quality tab, or delete it.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Diarization record loading/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 speakers/)).not.toBeInTheDocument();
+  });
+
   it("loads the selected diarization record on /diarization/:recordId", async () => {
     apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
     apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
