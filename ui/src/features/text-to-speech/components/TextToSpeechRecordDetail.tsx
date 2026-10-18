@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { api, type SpeechHistoryRecord } from "@/api";
+import { RecordAudioPlayer } from "@/components/audio/RecordAudioPlayer";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -221,7 +222,11 @@ export function TextToSpeechRecordDetail({
             Loading record...
           </p>
         ) : hasAudio ? (
-          <audio src={audioUrl || undefined} className="mt-3 h-11 w-full" controls />
+          <RecordAudioPlayer
+            src={audioUrl ?? ""}
+            durationHint={record?.audio_duration_secs}
+            className="mt-3"
+          />
         ) : (
           <p className="mt-3 text-sm text-[var(--text-muted)]">
             Audio is not available yet.
