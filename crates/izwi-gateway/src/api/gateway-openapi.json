@@ -162,6 +162,10 @@
           "deployment_state": {
             "type": "string"
           },
+          "display_name": {
+            "description": "Human-readable model name from the catalog.",
+            "type": "string"
+          },
           "download_progress": {
             "format": "float",
             "type": [
@@ -178,6 +182,12 @@
               "null"
             ]
           },
+          "estimated_size_bytes": {
+            "description": "Expected download size from the catalog, for models not yet on disk.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "license": {
             "type": [
               "string",
@@ -189,6 +199,11 @@
               "string",
               "null"
             ]
+          },
+          "memory_required_gb": {
+            "description": "Catalog estimate of memory needed to run the model, in GB.",
+            "format": "float",
+            "type": "number"
           },
           "modalities": {
             "items": {
@@ -225,12 +240,20 @@
           "status": {
             "type": "string"
           },
+          "task": {
+            "description": "Primary task: tts, asr, diarization, chat, forced_align, audio_chat\nor tokenizer.",
+            "type": "string"
+          },
           "variant": {
             "type": "string"
           }
         },
         "required": [
           "variant",
+          "display_name",
+          "task",
+          "estimated_size_bytes",
+          "memory_required_gb",
           "enabled",
           "status",
           "deployment_state",

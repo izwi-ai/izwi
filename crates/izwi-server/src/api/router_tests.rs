@@ -2668,6 +2668,51 @@ async fn root_and_v1_probe_routes_are_available() {
 }
 
 #[tokio::test]
+async fn admin_models_expose_names_tasks_sizes_and_image_input() {
+    let (app, _temp_dir) = test_api_app(
+        "admin_models_expose_names_tasks_sizes_and_image_input",
+        false,
+    );
+    let response = send_request(app, build_request(Method::GET, "/v1/admin/models", None)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    let models = body["models"].as_array().expect("models array");
+    let find = |variant: &str| {
+        models
+            .iter()
+            .find(|model| model["variant"].as_str() == Some(variant))
+            .unwrap_or_else(|| panic!("{variant} should be listed"))
+    };
+    let modalities = |model: &serde_json::Value| -> Vec<String> {
+        model["modalities"]
+            .as_array()
+            .expect("modalities array")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+
+    let vision_chat = find("Qwen3.5-4B");
+    assert_eq!(vision_chat["task"].as_str(), Some("chat"));
+    assert!(modalities(vision_chat).contains(&"image_input".to_string()));
+    assert!(vision_chat["display_name"]
+        .as_str()
+        .is_some_and(|name| !name.is_empty() && name != "Qwen3.5-4B"));
+
+    let text_chat = find("LFM2.5-1.2B-Instruct-GGUF");
+    assert!(!modalities(text_chat).contains(&"image_input".to_string()));
+
+    let tts = find("Kokoro-82M");
+    assert_eq!(tts["task"].as_str(), Some("tts"));
+    assert!(tts["estimated_size_bytes"]
+        .as_u64()
+        .is_some_and(|size| size > 0));
+    assert!(tts["memory_required_gb"]
+        .as_f64()
+        .is_some_and(|gb| gb > 0.0));
+}
+
+#[tokio::test]
 async fn admin_models_expose_voice_app_capabilities() {
     let (app, temp_dir) = test_api_app("admin_models_expose_voice_app_capabilities", false);
 

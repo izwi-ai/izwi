@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile, DeviceThread};
-use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
+use crate::catalog::{prefix_reuse_engages, ModelFamily, PrefixReuseMode};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, ReplayCapability,
     RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
@@ -6432,7 +6432,7 @@ fn loaded_model_diagnostics_entry(
         variant_id: variant.dir_name().to_string(),
         variant: variant.to_string(),
         family: model_family_name(family),
-        task: model_task_name(variant.primary_task()),
+        task: variant.primary_task().as_str(),
         handle_kind,
         loaded_model_kind,
         backend_kind: format!("{:?}", device.kind).to_ascii_lowercase(),
@@ -6475,18 +6475,6 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen3ForcedAligner => "qwen3_forced_aligner",
         ModelFamily::Voxtral => "voxtral",
         ModelFamily::Tokenizer => "tokenizer",
-    }
-}
-
-fn model_task_name(task: ModelTask) -> &'static str {
-    match task {
-        ModelTask::Tts => "tts",
-        ModelTask::Asr => "asr",
-        ModelTask::Diarization => "diarization",
-        ModelTask::Chat => "chat",
-        ModelTask::ForcedAlign => "forced_align",
-        ModelTask::AudioChat => "audio_chat",
-        ModelTask::Tokenizer => "tokenizer",
     }
 }
 
