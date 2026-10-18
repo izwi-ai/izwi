@@ -252,12 +252,15 @@ pub async fn install_beta_update(
         return Err(UpdaterError::UpdatesDisabled);
     }
 
+    // Keep the pending update until it installs: taking it before the
+    // download meant a failed download could not be retried ("there is no
+    // pending update") until the next check.
     let update = {
-        let mut pending_slot = updater_state
+        let pending_slot = updater_state
             .pending_update
             .lock()
             .expect("poisoned updater state mutex");
-        pending_slot.take().ok_or(UpdaterError::NoPendingUpdate)?
+        pending_slot.clone().ok_or(UpdaterError::NoPendingUpdate)?
     };
 
     let _ = on_event.send(DownloadEvent::Started {
@@ -277,6 +280,12 @@ pub async fn install_beta_update(
             },
         )
         .await?;
+
+    updater_state
+        .pending_update
+        .lock()
+        .expect("poisoned updater state mutex")
+        .take();
 
     let behavior = install_behavior_for_platform(std::env::consts::OS);
 
