@@ -73,6 +73,7 @@ import {
 import { AssistantMessage } from "@/features/chat/components/messages/AssistantMessage";
 import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
+import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
@@ -186,15 +187,6 @@ export function ChatPlayground({
   const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
-  // Read aloud: one reply plays at a time. The request counter drops audio
-  // that arrives after the user stopped it or picked another reply.
-  const [readAloud, setReadAloud] = useState<{
-    messageId: string;
-    status: "loading" | "playing";
-  } | null>(null);
-  const readAloudAudioRef = useRef<HTMLAudioElement | null>(null);
-  const readAloudUrlRef = useRef<string | null>(null);
-  const readAloudRequestRef = useRef(0);
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -703,19 +695,14 @@ export function ChatPlayground({
     }
   }, [refreshThreadList]);
 
-  const stopReadAloud = useCallback(() => {
-    readAloudRequestRef.current += 1;
-    readAloudAudioRef.current?.pause();
-    readAloudAudioRef.current = null;
-    if (readAloudUrlRef.current) {
-      URL.revokeObjectURL(readAloudUrlRef.current);
-      readAloudUrlRef.current = null;
-    }
-    setReadAloud(null);
-  }, []);
+  const {
+    state: readAloud,
+    start: startReadAloud,
+    stop: stopReadAloud,
+  } = useReadAloud(setError);
 
   const toggleReadAloud = useCallback(
-    async (messageId: string, text: string) => {
+    (messageId: string, text: string) => {
       if (readAloud?.messageId === messageId) {
         stopReadAloud();
         return;
@@ -724,41 +711,15 @@ export function ChatPlayground({
         onOpenSpeechModels?.();
         return;
       }
-      stopReadAloud();
-      readAloudRequestRef.current += 1;
-      const request = readAloudRequestRef.current;
-      setReadAloud({ messageId, status: "loading" });
-      try {
-        const audioBlob = await api.generateTTS({
-          text: stripMarkdown(text),
-          model_id: readAloudVoice.modelId,
-          speaker: readAloudVoice.speaker,
-        });
-        if (request !== readAloudRequestRef.current || !isMountedRef.current) {
-          return;
-        }
-        const url = URL.createObjectURL(audioBlob);
-        readAloudUrlRef.current = url;
-        const audio = new Audio(url);
-        readAloudAudioRef.current = audio;
-        audio.onended = () => {
-          if (request === readAloudRequestRef.current) {
-            stopReadAloud();
-          }
-        };
-        await audio.play();
-        if (request === readAloudRequestRef.current) {
-          setReadAloud({ messageId, status: "playing" });
-        }
-      } catch (readError) {
-        if (request !== readAloudRequestRef.current) {
-          return;
-        }
-        stopReadAloud();
-        setError(getErrorMessage(readError, "Couldn't read this reply aloud."));
-      }
+      startReadAloud(messageId, stripMarkdown(text), readAloudVoice);
     },
-    [onOpenSpeechModels, readAloud, readAloudVoice, stopReadAloud],
+    [
+      onOpenSpeechModels,
+      readAloud,
+      readAloudVoice,
+      startReadAloud,
+      stopReadAloud,
+    ],
   );
 
   // Audio belongs to the conversation on screen.
@@ -1701,7 +1662,7 @@ export function ChatPlayground({
                                     : "idle"
                                 }
                                 onReadAloud={(text) =>
-                                  void toggleReadAloud(messageKey, text)
+                                  toggleReadAloud(messageKey, text)
                                 }
                                 isThoughtExpanded={!!expandedThoughts[messageKey]}
                                 onToggleThought={() =>

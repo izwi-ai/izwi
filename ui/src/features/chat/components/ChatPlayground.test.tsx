@@ -18,7 +18,37 @@ const apiMocks = vi.hoisted(() => ({
   createChatThread: vi.fn(),
   deleteChatThread: vi.fn(),
   sendChatThreadMessageStream: vi.fn(),
-  generateTTS: vi.fn(),
+  generateTTSStream: vi.fn(),
+}));
+
+const playerMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    unlock: ReturnType<typeof vi.fn>;
+    start: ReturnType<typeof vi.fn>;
+    push: ReturnType<typeof vi.fn>;
+    finish: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+    onDrained: () => void;
+  }>,
+}));
+
+vi.mock("@/features/text-to-speech/pcmPlayer", () => ({
+  SpeechPcmPlayer: vi.fn().mockImplementation(function (
+    this: Record<string, unknown>,
+    _context: unknown,
+    onDrained: () => void,
+  ) {
+    const instance = {
+      unlock: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn(),
+      push: vi.fn().mockResolvedValue(undefined),
+      finish: vi.fn(),
+      stop: vi.fn(),
+      onDrained,
+    };
+    playerMocks.instances.push(instance);
+    return instance;
+  }),
 }));
 
 const createObjectUrlMock = vi.fn<(file: File) => string>();
@@ -33,7 +63,7 @@ vi.mock("@/api", () => ({
     createChatThread: apiMocks.createChatThread,
     deleteChatThread: apiMocks.deleteChatThread,
     sendChatThreadMessageStream: apiMocks.sendChatThreadMessageStream,
-    generateTTS: apiMocks.generateTTS,
+    generateTTSStream: apiMocks.generateTTSStream,
   },
 }));
 
@@ -46,7 +76,8 @@ describe("ChatPlayground", () => {
     apiMocks.createChatThread.mockReset();
     apiMocks.deleteChatThread.mockReset();
     apiMocks.sendChatThreadMessageStream.mockReset();
-    apiMocks.generateTTS.mockReset();
+    apiMocks.generateTTSStream.mockReset();
+    playerMocks.instances.length = 0;
     createObjectUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
     createObjectUrlMock.mockImplementation((file) => `blob:preview-${file.name}`);
@@ -1707,27 +1738,56 @@ describe("ChatPlayground", () => {
       </MemoryRouter>);
     };
 
-    it("reads a reply with the loaded voice and stops on request", async () => {
-      const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
-      const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-      createObjectUrlMock.mockReturnValue("blob:reply-audio");
-      apiMocks.generateTTS.mockResolvedValue(new Blob(["wav"], { type: "audio/wav" }));
+    it("streams a reply through the loaded voice and stops on request", async () => {
+      vi.stubGlobal("AudioContext", class {});
+      const controller = new AbortController();
+      apiMocks.generateTTSStream.mockReturnValue(controller);
       renderThread({ readAloudVoice: { modelId: "Kokoro-82M", speaker: "af_heart" } });
 
       fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
 
+      expect(apiMocks.generateTTSStream).toHaveBeenCalledWith(
+        { text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart", format: "pcm" },
+        expect.any(Object),
+      );
+      expect(
+        screen.getByRole("button", { name: "Preparing audio, select to cancel" }),
+      ).toBeInTheDocument();
+      const [player] = playerMocks.instances;
+      expect(player.unlock).toHaveBeenCalledOnce();
+
+      const callbacks = apiMocks.generateTTSStream.mock.calls[0][1];
+      act(() => callbacks.onStart({ requestId: "r1", sampleRate: 24000, audioFormat: "pcm_i16" }));
+      act(() => callbacks.onChunk({ requestId: "r1", sequence: 0, audioBase64: "AAAA",
+        sampleCount: 3, isFinal: false }));
       expect(await screen.findByRole("button", { name: "Stop reading" })).toBeInTheDocument();
-      expect(apiMocks.generateTTS).toHaveBeenCalledWith({
-        text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart",
-      });
-      expect(play).toHaveBeenCalledOnce();
+      expect(player.start).toHaveBeenCalledWith("r1", 24000, "pcm_i16");
+      expect(player.push).toHaveBeenCalledOnce();
 
       fireEvent.click(screen.getByRole("button", { name: "Stop reading" }));
-      expect(pause).toHaveBeenCalled();
-      expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:reply-audio");
+      expect(player.stop).toHaveBeenCalled();
+      expect(controller.signal.aborted).toBe(true);
       expect(screen.getByRole("button", { name: "Read aloud" })).toBeInTheDocument();
-      play.mockRestore();
-      pause.mockRestore();
+      vi.unstubAllGlobals();
+    });
+
+    it("returns to idle when playback drains after the stream finishes", async () => {
+      vi.stubGlobal("AudioContext", class {});
+      apiMocks.generateTTSStream.mockReturnValue(new AbortController());
+      renderThread({ readAloudVoice: { modelId: "Kokoro-82M", speaker: "af_heart" } });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+      const callbacks = apiMocks.generateTTSStream.mock.calls[0][1];
+      const [player] = playerMocks.instances;
+      act(() => callbacks.onStart({ requestId: "r1", sampleRate: 24000, audioFormat: "pcm_i16" }));
+      act(() => callbacks.onChunk({ requestId: "r1", sequence: 0, audioBase64: "AAAA",
+        sampleCount: 3, isFinal: true }));
+      act(() => callbacks.onFinal({}));
+      await waitFor(() => expect(player.finish).toHaveBeenCalledOnce());
+      act(() => player.onDrained());
+
+      expect(screen.getByRole("button", { name: "Read aloud" })).toBeInTheDocument();
+      vi.unstubAllGlobals();
     });
 
     it("opens the speech model manager when no voice is loaded", async () => {
@@ -1737,7 +1797,7 @@ describe("ChatPlayground", () => {
       fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
 
       expect(onOpenSpeechModels).toHaveBeenCalledOnce();
-      expect(apiMocks.generateTTS).not.toHaveBeenCalled();
+      expect(apiMocks.generateTTSStream).not.toHaveBeenCalled();
     });
   });
 
