@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type { ChatThreadMessageRecord } from "@/api";
 import { MessageTime } from "@/features/chat/components/messages/MessageParts";
 import { cn } from "@/lib/utils";
+import { CopyButton } from "@/components/ui/CopyButton";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
   parseAssistantContent,
@@ -54,6 +55,7 @@ export function AssistantMessage({
     isStreamingReply &&
     parsed.thinking.length > 0 &&
     (parsed.hasIncompleteThink || parsed.answer.length === 0);
+  const answerText = (parsed ? parsed.answer : displayContent).trim();
   const showAnswerOnly =
     !!parsed &&
     parsed.answer.length > 0 &&
@@ -136,6 +138,9 @@ export function AssistantMessage({
               "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
           )}
         >
+          {answerText ? (
+            <CopyButton text={answerText} label="Copy reply" />
+          ) : null}
           <MessageTime timestamp={message.created_at} />
         </footer>
       )}

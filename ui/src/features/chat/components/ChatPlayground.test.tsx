@@ -1482,6 +1482,17 @@ describe("ChatPlayground", () => {
     );
 
     expect(screen.getByText("reasoning first")).toBeInTheDocument();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied");
+    expect(writeText).toHaveBeenCalledWith("Final answer");
+    fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
+    expect(writeText).toHaveBeenLastCalledWith("Solve this");
   });
   it.each([
     ["LFM2.5-1.2B-Instruct-GGUF", false, " \n", "No visible answer was generated. Please retry the message."],

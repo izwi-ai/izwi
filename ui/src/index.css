@@ -1426,44 +1426,62 @@ html.theme-light .chat-thinking-toggle:hover {
 }
 
 .chat-markdown a {
-  color: #cbd1db;
+  color: var(--text-primary);
   text-decoration: underline;
+  text-decoration-color: var(--border-strong);
   text-underline-offset: 2px;
 }
 
 .chat-markdown a:hover {
-  color: #eef1f5;
+  text-decoration-color: currentColor;
 }
 
 .chat-markdown blockquote {
-  border-left: 2px solid #3f3f46;
+  border-left: 2px solid var(--border-default);
   padding-left: 0.75rem;
-  color: #9ca3af;
+  color: var(--text-muted);
 }
 
 .chat-markdown :not(pre) > code {
   display: inline-block;
   border-radius: 0.35rem;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-raised);
   padding: 0.05rem 0.35rem;
   font-size: 0.85em;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
 }
 
-.chat-markdown pre {
+.chat-code-block {
+  margin: 0.5rem 0;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  background: var(--surface-panel);
+}
+
+.chat-code-block-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.375rem 0.25rem 0.875rem;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 0.75rem;
+  color: var(--text-subtle);
+}
+
+.chat-markdown .chat-code-block pre {
+  margin: 0;
   overflow-x: auto;
-  border-radius: 0.65rem;
-  border: 1px solid #2e3137;
-  background: #111216;
-  padding: 0.75rem 0.85rem;
+  padding: 0.75rem 0.875rem;
 }
 
 .chat-markdown pre code {
-  font-size: 0.82rem;
-  line-height: 1.55;
-  color: #e5e7eb;
+  font-size: 0.8rem;
+  line-height: 1.65;
+  color: var(--text-primary);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
 }
@@ -1476,19 +1494,19 @@ html.theme-light .chat-thinking-toggle:hover {
 
 .chat-markdown th,
 .chat-markdown td {
-  border: 1px solid #32353a;
+  border: 1px solid var(--border-default);
   padding: 0.35rem 0.5rem;
   text-align: left;
 }
 
 .chat-markdown th {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--surface-raised);
   font-weight: 600;
 }
 
 .chat-markdown hr {
   border: none;
-  border-top: 1px solid #2f2f2f;
+  border-top: 1px solid var(--border-subtle);
 }
 
 .chat-markdown input[type="checkbox"] {

@@ -1,6 +1,7 @@
 import { Film, ImageIcon } from "lucide-react";
 
 import type { ChatThreadMessageRecord } from "@/api";
+import { CopyButton } from "@/components/ui/CopyButton";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
   type ImagePreviewState,
@@ -17,6 +18,8 @@ interface UserMessageProps {
 /** A sent message in its bubble, with its time shown on hover or focus. */
 export function UserMessage({ message, onOpenImage }: UserMessageProps) {
   const parsed = parseUserMessageDisplayFromContentParts(message);
+  const text =
+    parsed && parsed.attachments.length > 0 ? parsed.text : message.content;
 
   return (
     <article
@@ -26,11 +29,7 @@ export function UserMessage({ message, onOpenImage }: UserMessageProps) {
       <div className="break-words rounded-[18px] bg-[var(--surface-raised)] px-4 py-2.5 text-[0.9375rem] leading-relaxed text-[var(--text-primary)]">
         {(!parsed || parsed.text || parsed.attachments.length === 0) && (
           <MarkdownContent
-            content={
-              parsed && parsed.attachments.length > 0
-                ? parsed.text
-                : message.content
-            }
+            content={text}
             className="leading-relaxed [&_p]:m-0 [&_p]:bg-transparent [&_mark]:bg-transparent [&_code]:bg-transparent [&_code]:border-0 [&_code]:px-0 [&_code]:py-0 [&_code]:font-inherit"
           />
         )}
@@ -74,6 +73,7 @@ export function UserMessage({ message, onOpenImage }: UserMessageProps) {
       </div>
       <div className="flex h-7 items-center gap-0.5 text-[11.5px] text-[var(--text-subtle)] opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
         <MessageTime timestamp={message.created_at} />
+        {text.trim() ? <CopyButton text={text} label="Copy message" /> : null}
       </div>
     </article>
   );
