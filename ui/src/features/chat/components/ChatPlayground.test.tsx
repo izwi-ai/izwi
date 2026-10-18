@@ -1801,6 +1801,52 @@ describe("ChatPlayground", () => {
     });
   });
 
+  it("keeps a stopped turn on screen, marked Stopped, when the server did not store it", async () => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "stop-thread", title: "Stop", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    const controller = new AbortController();
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(controller);
+    render(<MemoryRouter initialEntries={["/chat?threadId=stop-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={false} modelLabel={model}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Tell me a long story" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+    const callbacks = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+    act(() =>
+      callbacks.onStart({ threadId: thread.id, modelId: model, userMessage: {
+        id: "server-user", thread_id: thread.id, role: "user", content: "Tell me a long story",
+        created_at: Date.now() + 50, tokens_generated: null, generation_time_ms: null } }),
+    );
+    act(() => callbacks.onDelta("Once upon a time"));
+
+    const historyReads = apiMocks.getChatThread.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Cancel response" }));
+    act(() => callbacks.onClose());
+
+    expect(controller.signal.aborted).toBe(true);
+    await waitFor(() =>
+      expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(historyReads),
+    );
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText("Tell me a long story")).toBeInTheDocument();
+    expect(screen.getByText("Once upon a time")).toBeInTheDocument();
+    expect(screen.queryByText(/No visible answer/)).not.toBeInTheDocument();
+    // The prompt stays above its reply even when the server dated it later.
+    const prompt = screen.getByText("Tell me a long story");
+    const chip = screen.getByText("Stopped");
+    expect(
+      prompt.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
   it("keeps failed streamed text visible when history refreshes", async () => {
     const model = "LFM2.5-1.2B-Instruct-GGUF";
     const thread = { id: "failed-thread", title: "Failed answer", model_id: model,

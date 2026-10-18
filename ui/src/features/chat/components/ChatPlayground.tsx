@@ -187,6 +187,12 @@ export function ChatPlayground({
   const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
+  const messagesRef = useRef<ChatThreadMessageRecord[]>([]);
+  // The server stores a streamed turn only when it completes, so a turn the
+  // user stops lives here for the rest of the session, per thread.
+  const stoppedTurnsRef = useRef<Map<string, ChatThreadMessageRecord[][]>>(
+    new Map(),
+  );
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -195,6 +201,33 @@ export function ChatPlayground({
   const pendingImages = activeDraft?.pendingImages ?? [];
 
   composerDraftsRef.current = composerDrafts;
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  /** History from the server plus this session's stopped turns, each kept
+   * whole and placed by when it was sent. A stopped turn the server did
+   * store wins over the local copy. */
+  const withStoppedTurns = useCallback(
+    (threadId: string, history: ChatThreadMessageRecord[]) => {
+      let merged = history;
+      for (const turn of stoppedTurnsRef.current.get(threadId) ?? []) {
+        if (history.some((stored) => stored.id === turn[0].id)) {
+          continue;
+        }
+        const insertAt = merged.findIndex(
+          (message) => message.created_at > turn[0].created_at,
+        );
+        merged =
+          insertAt === -1
+            ? [...merged, ...turn]
+            : [...merged.slice(0, insertAt), ...turn, ...merged.slice(insertAt)];
+      }
+      return merged;
+    },
+    [],
+  );
 
   const revokeImagePreviews = useCallback(
     (images: PendingImageAttachment[]) => {
@@ -637,7 +670,7 @@ export function ChatPlayground({
           return;
         }
 
-        setMessages(detail.messages);
+        setMessages(withStoppedTurns(requestedThreadId, detail.messages));
         setExpandedThoughts({});
         setThreads((previous) =>
           previous.map((thread) =>
@@ -667,7 +700,7 @@ export function ChatPlayground({
     return () => {
       cancelled = true;
     };
-  }, [activeThreadId, threadLoadAttempt]);
+  }, [activeThreadId, threadLoadAttempt, withStoppedTurns]);
 
   const stopStreaming = useCallback(() => {
     if (streamAbortRef.current) {
@@ -680,20 +713,43 @@ export function ChatPlayground({
 
     const activeId = activeThreadIdRef.current;
     if (activeId) {
+      // Keep the stopped prompt and partial reply, marked as stopped.
+      const current = messagesRef.current;
+      let lastUserIndex = -1;
+      for (let index = current.length - 1; index >= 0; index -= 1) {
+        if (current[index].role === "user") {
+          lastUserIndex = index;
+          break;
+        }
+      }
+      if (lastUserIndex >= 0) {
+        const stoppedTurn = current
+          .slice(lastUserIndex)
+          .map((message) =>
+            message.role === "assistant"
+              ? { ...message, finish_reason: "cancelled" }
+              : message,
+          );
+        stoppedTurnsRef.current.set(activeId, [
+          ...(stoppedTurnsRef.current.get(activeId) ?? []),
+          stoppedTurn,
+        ]);
+        setMessages([...current.slice(0, lastUserIndex), ...stoppedTurn]);
+      }
       void api
         .getChatThread(activeId)
         .then((detail) => {
           if (detail.thread.id !== activeThreadIdRef.current) {
             return;
           }
-          setMessages(detail.messages);
+          setMessages(withStoppedTurns(activeId, detail.messages));
         })
         .catch(() => {
           // Ignore follow-up sync failures after cancel.
         });
       void refreshThreadList(activeId);
     }
-  }, [refreshThreadList]);
+  }, [refreshThreadList, withStoppedTurns]);
 
   const {
     state: readAloud,
@@ -1135,7 +1191,7 @@ export function ChatPlayground({
                 if (activeThreadIdRef.current !== targetThreadId) {
                   return;
                 }
-                setMessages(detail.messages);
+                setMessages(withStoppedTurns(targetThreadId, detail.messages));
               })
               .catch(() => {
                 // Ignore follow-up sync failures after stream close.

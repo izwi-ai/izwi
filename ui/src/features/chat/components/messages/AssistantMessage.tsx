@@ -155,14 +155,14 @@ export function AssistantMessage({
       {answerStarted && parsed ? (
         <MarkdownContent content={parsed.answer} />
       ) : parsed && parsed.hasThink ? (
-        isStreamingReply ? null : (
+        isStreamingReply || finishReason === "cancelled" ? null : (
           <div className="italic text-muted-foreground opacity-70">
             No final answer was generated.
           </div>
         )
       ) : displayContent.trim().length > 0 ? (
         <MarkdownContent content={displayContent} />
-      ) : !isStreamingReply ? (
+      ) : !isStreamingReply && finishReason !== "cancelled" ? (
         <div className="italic text-muted-foreground opacity-70">
           No visible answer was generated. Please retry the message.
         </div>
