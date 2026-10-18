@@ -310,7 +310,7 @@ export function TextToSpeechHistoryTable({
     {
       id: "voice",
       header: "Voice",
-      className: "w-[10rem]",
+      className: "hidden w-[10rem] md:table-cell",
       cell: (record) => {
         const label = voiceLabelFor(record);
         return (
@@ -329,14 +329,14 @@ export function TextToSpeechHistoryTable({
     {
       id: "length",
       header: "Length",
-      className: "w-[5.5rem]",
+      className: "hidden w-[5.5rem] lg:table-cell",
       cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
       cell: (record) => formatClockDuration(record.audio_duration_secs),
     },
     {
       id: "created",
       header: "Created",
-      className: "w-[8rem]",
+      className: "hidden w-[8rem] lg:table-cell",
       cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
       cell: (record) => formatHistoryDate(record.created_at),
     },

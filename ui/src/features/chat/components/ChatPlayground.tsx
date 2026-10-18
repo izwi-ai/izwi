@@ -1115,7 +1115,7 @@ export function ChatPlayground({
       onSelect={onSelectModel}
       menuPlacement={menuPlacement}
       aria-label="Chat model"
-      className="w-[220px] max-w-[calc(100vw-12rem)]"
+      className="w-[180px] max-w-[calc(100vw-12rem)] sm:w-[220px]"
       triggerClassName="h-8 text-xs"
     />
   );

@@ -280,7 +280,7 @@ const COLUMNS: HistoryColumn<SpeechTextJobSummary>[] = [
   {
     id: "length",
     header: "Length",
-    className: "w-[5.5rem]",
+    className: "hidden w-[5.5rem] lg:table-cell",
     cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
     cell: (record) => formatClockDuration(record.duration_secs),
   },
@@ -293,7 +293,7 @@ const COLUMNS: HistoryColumn<SpeechTextJobSummary>[] = [
   {
     id: "created",
     header: "Created",
-    className: "w-[8rem]",
+    className: "hidden w-[8rem] lg:table-cell",
     cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
     cell: (record) => formatHistoryDate(record.created_at),
   },

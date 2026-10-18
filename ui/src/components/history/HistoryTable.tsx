@@ -125,7 +125,7 @@ export function HistoryTable<T>({
       aria-busy={loading || undefined}
     >
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[44rem] border-separate border-spacing-0 text-[13.5px]">
+        <table className="w-full min-w-[32rem] border-separate border-spacing-0 text-[13.5px]">
           <thead>
             <tr>
               {columns.map((column) => (

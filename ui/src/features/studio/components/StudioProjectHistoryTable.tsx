@@ -113,7 +113,7 @@ export function StudioProjectHistoryTable({
     {
       id: "chars",
       header: "Characters",
-      className: "w-[7rem]",
+      className: "hidden w-[7rem] lg:table-cell",
       cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
       cell: (project) => project.total_chars.toLocaleString(),
     },
@@ -128,7 +128,7 @@ export function StudioProjectHistoryTable({
     {
       id: "updated",
       header: "Edited",
-      className: "w-[8rem]",
+      className: "hidden w-[8rem] lg:table-cell",
       cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
       cell: (project) =>
         formatHistoryDate(project.updated_at || project.created_at),
