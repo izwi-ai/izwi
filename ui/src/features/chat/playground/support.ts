@@ -312,17 +312,40 @@ export function stripThinkingArtifacts(text: string): string {
 export function displayThreadTitle(
   rawTitle: string | null | undefined,
 ): string {
-  const cleaned = normalizeWhitespace(stripThinkingArtifacts(rawTitle ?? ""));
+  const cleaned = normalizeWhitespace(
+    stripMarkdown(stripThinkingArtifacts(rawTitle ?? "")),
+  );
   if (!cleaned) {
     return DEFAULT_THREAD_TITLE;
   }
   return truncateText(cleaned, MAX_THREAD_TITLE_CHARS);
 }
 
+/**
+ * Reduce markdown to the text a reader sees, for one-line previews and
+ * titles: drops code fences, emphasis, heading/list/quote markers and link
+ * targets.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/```[^\n]*\n?([\s\S]*?)```/g, " $1 ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(^|[\s(])([*_])(?=\S)(.+?)(?<=\S)\2(?=[\s).,!?:;]|$)/g, "$1$3")
+    .replace(/~~(.+?)~~/g, "$1")
+    .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*$/gm, " ")
+    .replace(/\|/g, " ");
+}
+
 export function threadPreviewFromContent(
   content: string | null | undefined,
 ): string {
-  const normalized = normalizeWhitespace(stripThinkingArtifacts(content ?? ""));
+  const normalized = normalizeWhitespace(
+    stripMarkdown(stripThinkingArtifacts(content ?? "")),
+  );
   if (!normalized) {
     return "No messages yet";
   }

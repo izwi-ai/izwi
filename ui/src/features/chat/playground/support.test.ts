@@ -10,8 +10,10 @@ import {
   parseUserMessageDisplayFromContentParts,
   summarizeChatStats,
   supportsImageAttachmentsForModel,
+  stripMarkdown,
   supportsImplicitOpenThinkTagParsing,
   systemPromptForModel,
+  threadPreviewFromContent,
 } from "./support";
 
 describe("chat playground support", () => {
@@ -271,5 +273,25 @@ describe("chat playground support", () => {
         },
       }),
     ).toMatchObject({ tokensPerSecond: 0, decodeOnly: false, ttftMs: null });
+  });
+
+  it("strips markdown from thread previews", () => {
+    expect(
+      threadPreviewFromContent(
+        "**MLOps** stands for **Machine Learning Operations**. See [the docs](https://x.test).",
+      ),
+    ).toBe("MLOps stands for Machine Learning Operations. See the docs.");
+    expect(threadPreviewFromContent("## Steps\n- Use `npm ci`\n- Run *tests*")).toBe(
+      "Steps Use npm ci Run tests",
+    );
+    expect(threadPreviewFromContent("<think>plan</think>> Quoted _answer_")).toBe(
+      "Quoted answer",
+    );
+  });
+
+  it("leaves underscores and asterisks inside words alone", () => {
+    expect(stripMarkdown("snake_case_name and 2*3*4")).toBe(
+      "snake_case_name and 2*3*4",
+    );
   });
 });
