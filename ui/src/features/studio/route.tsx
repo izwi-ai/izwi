@@ -9,6 +9,7 @@ import {
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 import type { SharedPageProps } from "@/app/router/types";
+import { isStudioRenderableModel } from "@/features/studio/modelFilter";
 
 export function StudioPage({
   models,
@@ -52,17 +53,8 @@ export function StudioPage({
     models,
     selectedModel,
     onSelect,
-    modelFilter: (variant) => {
-      const match = models.find((model) => model.variant === variant);
-      const capabilities = match?.speech_capabilities;
-      return Boolean(
-        capabilities &&
-          !variant.includes("Tokenizer") &&
-          (capabilities.supports_builtin_voices ||
-            capabilities.supports_reference_voice ||
-            capabilities.supports_voice_description),
-      );
-    },
+    modelFilter: (variant) =>
+      isStudioRenderableModel(models.find((model) => model.variant === variant)),
     resolveSelectedModel: (availableRouteModels, currentModel) =>
       resolvePreferredRouteModel({
         models: availableRouteModels,
