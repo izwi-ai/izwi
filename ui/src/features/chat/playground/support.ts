@@ -424,6 +424,17 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   return normalized.startsWith("qwen3-");
 }
 
+/** Whether any user turn in the thread carries an image attachment. */
+export function threadHasImageAttachments(
+  messages: ChatThreadMessageRecord[],
+): boolean {
+  return messages.some((message) =>
+    parseUserMessageDisplayFromContentParts(message)?.attachments.some(
+      (attachment) => attachment.kind === "image",
+    ),
+  );
+}
+
 export function supportsImageAttachmentsForModel(
   variant: string | null,
 ): boolean {

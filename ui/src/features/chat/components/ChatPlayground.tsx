@@ -65,6 +65,7 @@ import {
   type StreamedTurnStats,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
+  threadHasImageAttachments,
   supportsImplicitOpenThinkTagParsing,
   threadPreviewFromContent,
 } from "@/features/chat/playground/support";
@@ -271,6 +272,17 @@ export function ChatPlayground({
   const hasUnsupportedImages =
     pendingImages.length > 0 && !supportsImageAttachments;
   const unsupportedImagesMessage = `${modelLabel ?? "This model"} can't read images. Remove them or switch to a model that accepts images.`;
+  // Earlier image turns reach a text-only model as text (server side), so say
+  // so and offer a model that can see them.
+  const threadHasImages = useMemo(
+    () => threadHasImageAttachments(messages),
+    [messages],
+  );
+  const showHistoryImageNotice =
+    Boolean(activeThreadId) && threadHasImages && !supportsImageAttachments;
+  const imageModelOption = modelOptions.find((option) =>
+    supportsImageAttachmentsForModel(option.value),
+  );
   const renderModelId = activeThread?.model_id ?? selectedModel;
   // Parse by the capabilities of the model that wrote the thread, not the
   // model selected now.
@@ -1803,6 +1815,26 @@ export function ChatPlayground({
                     )}
                   </AnimatePresence>
 
+                  {showHistoryImageNotice && (
+                    <div
+                      role="note"
+                      className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[var(--status-info-border)] bg-[var(--status-info-bg)] px-3 py-2 text-xs text-[var(--status-info-text)]"
+                    >
+                      <span>
+                        This chat has images. {modelLabel ?? "This model"} reads
+                        text only, so earlier images are left out.
+                      </span>
+                      {imageModelOption && (
+                        <button
+                          type="button"
+                          className="ml-auto font-medium underline underline-offset-2"
+                          onClick={() => onSelectModel(imageModelOption.value)}
+                        >
+                          Switch to {imageModelOption.label}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {renderComposer(false)}
                 </div>
               </div>

@@ -733,6 +733,79 @@ describe("ChatPlayground", () => {
     expect(screen.getByRole("button", { name: "New chat" })).toBeEnabled();
   });
 
+  it("explains that a text-only model sees an image thread as text", async () => {
+    const thread = {
+      id: "thread-images",
+      title: "Chart questions",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "It is a bar chart",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "m1",
+          thread_id: thread.id,
+          role: "user",
+          content: "What is this?",
+          content_parts: [
+            { type: "text", text: "What is this?" },
+            {
+              type: "input_image",
+              input_image: { image_url: "data:image/png;base64,AAAA", detail: "auto" },
+            },
+          ],
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+        {
+          id: "m2",
+          thread_id: thread.id,
+          role: "assistant",
+          content: "It is a bar chart",
+          created_at: 2,
+          tokens_generated: 5,
+          generation_time_ms: 10,
+        },
+      ],
+    });
+    const onSelectModel = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-images"]}>
+        <ChatPlayground
+          selectedModel="LFM2.5-1.2B-Instruct-GGUF"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="LFM2.5 1.2B Instruct"
+          modelOptions={[
+            {
+              value: "LFM2.5-1.2B-Instruct-GGUF",
+              label: "LFM2.5 1.2B Instruct",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Downloaded", isReady: false },
+          ]}
+          onSelectModel={onSelectModel}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(/earlier images are left out/i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Qwen3.5 4B" }));
+    expect(onSelectModel).toHaveBeenCalledWith("Qwen3.5-4B");
+  });
+
   it("isolates and restores text and image drafts when switching threads", async () => {
     const threads = [
       {

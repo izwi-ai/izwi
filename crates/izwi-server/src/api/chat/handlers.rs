@@ -16,7 +16,8 @@ use crate::app::chat::{
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
-    flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
+    flatten_thread_content, validate_media_inputs_for_variant, variant_accepts_image_input,
+    FlattenedMultimodalContent,
 };
 use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
 use crate::error::{ApiError, ApiJson};
@@ -322,10 +323,14 @@ pub async fn create_thread_message(
         .await
         .map_err(map_store_error)?;
 
+    // A thread that once used an image model can continue on a text-only
+    // one: earlier turns are sent as their text, while a new attachment on
+    // this message is still rejected below.
     let (runtime_messages, media_inputs) = build_runtime_messages(
         &existing_messages,
         &flattened_content,
         effective_system_prompt.as_deref(),
+        variant_accepts_image_input(model_variant),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -524,10 +529,15 @@ async fn create_streaming_thread_message(
         .unwrap())
 }
 
+/// Placeholder for a past image turn when the target model reads text only
+/// and the turn has no text of its own.
+const OMITTED_IMAGE_TEXT: &str = "[Image attachment]";
+
 fn build_runtime_messages(
     existing: &[ChatThreadMessage],
     new_user_content: &FlattenedMultimodalContent,
     system_prompt: Option<&str>,
+    include_history_media: bool,
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut messages = Vec::new();
     let mut media_inputs = Vec::new();
@@ -556,11 +566,17 @@ fn build_runtime_messages(
             // not model answers and must not become assistant prompt turns.
             continue;
         }
-        media_inputs.extend(flattened.media_inputs);
-        messages.push(ChatMessage {
-            role,
-            content: flattened.runtime_text,
-        });
+        let content = if include_history_media || !flattened.has_media() {
+            media_inputs.extend(flattened.media_inputs);
+            flattened.runtime_text
+        } else if flattened.display_text.trim().is_empty() {
+            // runtime_text carries one vision placeholder per image, which
+            // must not reach the prompt without its media input.
+            OMITTED_IMAGE_TEXT.to_string()
+        } else {
+            flattened.display_text
+        };
+        messages.push(ChatMessage { role, content });
     }
 
     media_inputs.extend(new_user_content.media_inputs.clone());
@@ -742,6 +758,7 @@ mod tests {
                 media_inputs: Vec::new(),
             },
             None,
+            true,
         )
         .unwrap();
         assert_eq!(messages.len(), 3);
@@ -769,6 +786,7 @@ mod tests {
                 media_inputs: Vec::new(),
             },
             Some("Be concise."),
+            true,
         )
         .expect("runtime messages");
 
@@ -805,11 +823,74 @@ mod tests {
                 }],
             },
             None,
+            true,
         )
         .expect("runtime messages");
 
         assert_eq!(messages.len(), 2);
         assert_eq!(media_inputs.len(), 2);
+    }
+
+    fn image_turn(content: &str) -> ChatThreadMessage {
+        ChatThreadMessage {
+            id: "message-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            content_parts: Some(vec![
+                json!({"type":"text","text": content}),
+                json!({"type":"image_url","image_url":{"url":"https://example.com/history.png"}}),
+            ]),
+            created_at: 1,
+            tokens_generated: None,
+            generation_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn text_only_models_get_history_image_turns_as_text() {
+        let next = FlattenedMultimodalContent {
+            display_text: "Now summarise it".to_string(),
+            runtime_text: "Now summarise it".to_string(),
+            media_inputs: Vec::new(),
+        };
+        let (messages, media_inputs) =
+            build_runtime_messages(&[image_turn("What is in this chart?")], &next, None, false)
+                .expect("runtime messages");
+
+        assert!(media_inputs.is_empty());
+        assert_eq!(messages[0].content, "What is in this chart?");
+        assert!(messages
+            .iter()
+            .all(|message| !message.content.contains("<|image_pad|>")));
+
+        // The same history keeps its image for an image-capable model.
+        let (messages, media_inputs) =
+            build_runtime_messages(&[image_turn("What is in this chart?")], &next, None, true)
+                .expect("runtime messages");
+        assert_eq!(media_inputs.len(), 1);
+        assert!(messages[0].content.contains("<|image_pad|>"));
+    }
+
+    #[test]
+    fn text_only_models_get_a_placeholder_for_image_only_turns() {
+        let image_only = ChatThreadMessage {
+            content: String::new(),
+            content_parts: Some(vec![json!({
+                "type":"image_url",
+                "image_url":{"url":"https://example.com/history.png"}
+            })]),
+            ..image_turn("")
+        };
+        let next = FlattenedMultimodalContent {
+            display_text: "Thanks".to_string(),
+            runtime_text: "Thanks".to_string(),
+            media_inputs: Vec::new(),
+        };
+        let (messages, media_inputs) =
+            build_runtime_messages(&[image_only], &next, None, false).expect("runtime messages");
+        assert!(media_inputs.is_empty());
+        assert_eq!(messages[0].content, OMITTED_IMAGE_TEXT);
     }
 
     #[test]
