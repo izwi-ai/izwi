@@ -8,7 +8,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use super::updater_contract::{
-    github_manifest_url, github_releases_api_url, install_behavior_for_platform,
+    github_manifest_url, github_releases_api_url, install_behavior_for_platform, is_newer_release,
     parse_beta_sequence, updater_target_for_platform, PlatformInstallBehavior, UpdaterContract,
 };
 
@@ -201,6 +201,7 @@ pub async fn check_for_beta_update(
                 .updater_builder()
                 .timeout(runtime.request_timeout)
                 .target(updater_target)
+                .version_comparator(|current, release| is_newer_release(&current, &release.version))
                 .endpoints(vec![release_manifest_url])?
                 .build()?;
             updater.check().await.map_err(UpdaterError::from)

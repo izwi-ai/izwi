@@ -49,6 +49,36 @@ pub fn parse_beta_sequence(channel: UpdateChannel, tag_name: &str) -> Option<u64
     suffix.parse::<u64>().ok()
 }
 
+/// Numeric beta sequence of a semver prerelease label. Accepts the shipped
+/// `beta-N` form as well as the dotted `beta.N` form.
+fn beta_prerelease_sequence(prerelease: &str) -> Option<u64> {
+    let digits = prerelease
+        .strip_prefix("beta-")
+        .or_else(|| prerelease.strip_prefix("beta."))?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Whether `update` should replace `current`.
+///
+/// Semver compares `beta-18` as one alphanumeric identifier, so `beta-2`
+/// would sort above `beta-18`. When both versions carry a beta sequence on
+/// the same release core, compare the sequence numerically instead.
+pub fn is_newer_release(current: &semver::Version, update: &semver::Version) -> bool {
+    let core = |version: &semver::Version| (version.major, version.minor, version.patch);
+    if core(update) == core(current) {
+        if let (Some(current_beta), Some(update_beta)) = (
+            beta_prerelease_sequence(current.pre.as_str()),
+            beta_prerelease_sequence(update.pre.as_str()),
+        ) {
+            return update_beta > current_beta;
+        }
+    }
+    update > current
+}
+
 pub fn github_releases_api_url(contract: &UpdaterContract) -> String {
     format!(
         "https://api.github.com/repos/{}/{}/releases?per_page={}",
@@ -93,7 +123,8 @@ pub fn updater_target_for_platform(target_os: &str) -> &'static str {
 mod tests {
     use super::{
         github_manifest_url, github_releases_api_url, install_behavior_for_platform,
-        parse_beta_sequence, updater_target_for_platform, UpdateChannel, UpdaterContract,
+        is_newer_release, parse_beta_sequence, updater_target_for_platform, UpdateChannel,
+        UpdaterContract,
     };
 
     #[test]
@@ -152,5 +183,39 @@ mod tests {
         assert_eq!(updater_target_for_platform("macos"), "macos");
         assert_eq!(updater_target_for_platform("linux"), "linux");
         assert_eq!(updater_target_for_platform("dragonfly"), "unknown");
+    }
+
+    fn newer(current: &str, update: &str) -> bool {
+        is_newer_release(
+            &semver::Version::parse(current).unwrap(),
+            &semver::Version::parse(update).unwrap(),
+        )
+    }
+
+    #[test]
+    fn orders_beta_sequences_numerically() {
+        // Plain semver ranks "beta-2" above "beta-18"; the updater must not.
+        assert!(
+            semver::Version::parse("0.1.0-beta-2").unwrap()
+                > semver::Version::parse("0.1.0-beta-18").unwrap()
+        );
+        assert!(newer("0.1.0-beta-2", "0.1.0-beta-18"));
+        assert!(newer("0.1.0-beta-9", "0.1.0-beta-10"));
+        assert!(!newer("0.1.0-beta-18", "0.1.0-beta-2"));
+        assert!(!newer("0.1.0-beta-18", "0.1.0-beta-18"));
+    }
+
+    #[test]
+    fn mixes_dashed_and_dotted_beta_labels() {
+        assert!(newer("0.1.0-beta-18", "0.1.0-beta.19"));
+        assert!(!newer("0.1.0-beta.19", "0.1.0-beta-18"));
+    }
+
+    #[test]
+    fn falls_back_to_semver_outside_beta_sequences() {
+        assert!(newer("0.1.0-beta-18", "0.1.0"));
+        assert!(newer("0.1.0-beta-18", "0.2.0-beta-1"));
+        assert!(!newer("0.2.0-beta-1", "0.1.0-beta-99"));
+        assert!(newer("0.1.0", "0.1.1"));
     }
 }
