@@ -96,14 +96,30 @@ function rowKindLabel(record: SpeechTextJobSummary): string {
   }
 }
 
+/** Diarized text is stored as "SPEAKER_00 [0.00s - 4.49s]: …"; previews
+ * keep the speaker and drop the timestamps. */
+export function formatDiarizationPreview(text: string): string {
+  return text
+    .replace(/\s*\[\d+(?:\.\d+)?s\s*-\s*\d+(?:\.\d+)?s\]\s*:/g, ":")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The row's transcript preview, or "" when the job produced no text (the
+ * server fills empty previews with a "No transcript" placeholder). */
 function rowPreview(record: SpeechTextJobSummary): string {
   if (isDiarizationSummary(record)) {
-    return record.transcript_preview;
+    return record.transcript_chars > 0
+      ? formatDiarizationPreview(record.transcript_preview)
+      : "";
   }
   if (isSpeakerAttributedAsrSummary(record)) {
-    return record.speaker_attributed_text_preview || record.transcription_preview;
+    if ((record.speaker_attributed_text_chars ?? 0) > 0) {
+      return record.speaker_attributed_text_preview ?? "";
+    }
+    return record.transcription_chars > 0 ? record.transcription_preview : "";
   }
-  return record.transcription_preview;
+  return record.transcription_chars > 0 ? record.transcription_preview : "";
 }
 
 function rowLabel(record: SpeechTextJobSummary): string {
@@ -155,7 +171,10 @@ function StatusCell({ record }: { record: SpeechTextJobSummary }) {
         {speakers} speaker{speakers === 1 ? "" : "s"}
       </RowBadge>,
     );
-  } else if (record.kind === "speaker_attributed_asr") {
+  } else if (
+    isSpeakerAttributedAsrSummary(record) &&
+    (record.speaker_turn_count ?? 0) > 0
+  ) {
     badges.push(
       <RowBadge key="speakers" icon={<Users className="h-3 w-3" />}>
         Speakers
@@ -218,7 +237,7 @@ function PreviewCell({ record }: { record: SpeechTextJobSummary }) {
   }
   return (
     <span className="text-[13px] text-[var(--text-muted)]">
-      {preview || "No transcript text."}
+      {preview || "No speech recognised."}
     </span>
   );
 }

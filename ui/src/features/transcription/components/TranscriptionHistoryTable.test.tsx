@@ -67,6 +67,8 @@ function speakerAttributed(
     transcription_preview: "A panel transcript.",
     transcription_chars: 19,
     speaker_attributed_text_preview: "Speaker 1: Welcome.",
+    speaker_attributed_text_chars: 19,
+    speaker_turn_count: 1,
     ...overrides,
   };
 }
@@ -154,5 +156,35 @@ describe("TranscriptionHistoryTable job status", () => {
       screen.getByText("Job status is unavailable. Open the record for details."),
     ).toBeVisible();
     expect(screen.queryByText("Misleading output")).not.toBeInTheDocument();
+  });
+
+  it("drops diarization timestamps and shows empty jobs as empty", () => {
+    render(
+      <TranscriptionHistoryTable
+        records={[
+          diarization({
+            id: "diarized",
+            transcript_preview: "SPEAKER_00 [0.00s - 4.49s]: So Erin, in your email",
+            transcript_chars: 499,
+          }),
+          speakerAttributed({
+            id: "empty",
+            audio_filename: "silence.mp3",
+            transcription_preview: "No transcript",
+            transcription_chars: 0,
+            speaker_attributed_text_preview: null,
+            speaker_attributed_text_chars: 0,
+            speaker_turn_count: 0,
+          }),
+        ]}
+        onOpenRecord={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("SPEAKER_00: So Erin, in your email")).toBeVisible();
+    expect(screen.getByText("No speech recognised.")).toBeVisible();
+    expect(screen.queryByText("No transcript")).not.toBeInTheDocument();
+    // Only the diarization row identified speakers.
+    expect(screen.getAllByText(/speakers?$/i)).toHaveLength(1);
   });
 });
