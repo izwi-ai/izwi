@@ -6,6 +6,8 @@ import {
   formatClockTime,
 } from "@/components/audio/AudioPlayer";
 import { useAudioPlayback } from "@/components/audio/useAudioPlayback";
+import { FactsList, formatProcessingFact } from "@/components/FactsList";
+import { formatClockDuration } from "@/components/history/format";
 import { Card, CardContent } from "@/components/ui/card";
 import { StatusBadge } from "@/components/ui/status-badge";
 import type { TranscriptionRecord } from "@/api";
@@ -41,7 +43,8 @@ interface TranscriptionReviewWorkspaceProps {
     | "summary_text"
     | "summary_error"
     | "summary_updated_at"
-  > | null;
+  > &
+    Partial<Pick<TranscriptionRecord, "processing_time_ms" | "rtf">> | null;
   audioUrl?: string | null;
   loading?: boolean;
   emptyTitle?: string;
@@ -51,18 +54,6 @@ interface TranscriptionReviewWorkspaceProps {
   stickyPlaybackFooter?: boolean;
   fixedPlaybackFooter?: boolean;
   summaryModelGuidance?: string | null;
-}
-
-function formatDurationLabel(seconds: number | null | undefined): string {
-  if (!Number.isFinite(seconds) || seconds === null || seconds === undefined) {
-    return "Unknown";
-  }
-  if (seconds < 60) {
-    return `${seconds.toFixed(1)}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60);
-  return `${minutes}m ${remainingSeconds}s`;
 }
 
 function isEntryActive(
@@ -234,10 +225,10 @@ export function TranscriptionReviewWorkspace({
     ? "relative flex min-h-0 flex-col"
     : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
   const contentClassName = fixedPlaybackFooter
-    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr),220px]"
+    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr),260px]"
     : stickyPlaybackFooter
-    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr),220px]"
-    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),220px]";
+    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr),260px]"
+    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),260px]";
   const playbackClassName = fixedPlaybackFooter
     ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
     : stickyPlaybackFooter
@@ -377,60 +368,41 @@ export function TranscriptionReviewWorkspace({
           </div>
         </div>
 
-        <div className="space-y-3">
-          <div>
-            <h3 className="mb-2 text-[12px] font-semibold tracking-wide text-[var(--text-primary)]">
-              Overview
-            </h3>
-            <div className="space-y-2">
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Duration
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {formatDurationLabel(record.duration_secs)}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Words
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {wordCount}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Timestamps
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {timestamped ? "Enabled" : "Disabled"}
-                </div>
-                <div className="mt-0.5 text-[10px] leading-4 text-[var(--text-muted)]">
-                  {timestamped
-                    ? record.aligner_model_id || "Forced aligner"
-                    : "Plain transcript only"}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Language
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {record.language || "Unknown"}
-                </div>
-                {record.audio_filename ? (
-                  <div className="mt-0.5 truncate text-[10px] leading-4 text-[var(--text-muted)]">
-                    {record.audio_filename}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        </div>
+        <FactsList
+          label="Overview"
+          className="self-start"
+          facts={[
+            { label: "Duration", value: formatClockDuration(record.duration_secs) },
+            { label: "Words", value: wordCount },
+            { label: "Language", value: record.language || "Unknown" },
+            {
+              label: "Timestamps",
+              value: timestamped
+                ? record.words && record.words.length > 0
+                  ? "Word-level"
+                  : "Segment-level"
+                : "Off",
+            },
+            {
+              label: "Speakers",
+              value:
+                record.speaker_turns && record.speaker_turns.length > 0
+                  ? `${new Set(record.speaker_turns.map((turn) => turn.speaker)).size} identified`
+                  : "Not requested",
+            },
+            ...(formatProcessingFact(record.processing_time_ms, record.rtf)
+              ? [
+                  {
+                    label: "Processed in",
+                    value: formatProcessingFact(
+                      record.processing_time_ms,
+                      record.rtf,
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+        />
       </div>
 
       {showPlayback ? (

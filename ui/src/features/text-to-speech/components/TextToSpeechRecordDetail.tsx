@@ -29,6 +29,7 @@ import {
 } from "@/components/history/format";
 import type { RowMenuItem } from "@/components/history/RowMenu";
 import type { Breadcrumb } from "@/components/PageShell";
+import { FactsList, formatProcessingFact } from "@/components/FactsList";
 import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeSpeechProcessingStatus } from "@/features/text-to-speech/support";
@@ -246,71 +247,68 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Audio
-        </h3>
-        {loading ? (
-          <p
-            className="mt-3 text-sm text-[var(--text-muted)]"
-            role="status"
-            aria-live="polite"
-          >
-            Loading record...
-          </p>
-        ) : hasAudio ? (
-          <RecordAudioPlayer
-            src={audioUrl ?? ""}
-            durationHint={record?.audio_duration_secs}
-            className="mt-3"
-          />
-        ) : (
-          <p className="mt-3 text-sm text-[var(--text-muted)]">
-            Audio is not available yet.
-          </p>
-        )}
-      </Card>
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr),280px]">
+        <div className="space-y-5">
+    <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Audio
+            </h3>
+            {loading ? (
+              <p
+                className="mt-3 text-sm text-[var(--text-muted)]"
+                role="status"
+                aria-live="polite"
+              >
+                Loading record...
+              </p>
+            ) : hasAudio ? (
+              <RecordAudioPlayer
+                src={audioUrl ?? ""}
+                durationHint={record?.audio_duration_secs}
+                className="mt-3"
+              />
+            ) : (
+              <p className="mt-3 text-sm text-[var(--text-muted)]">
+                Audio is not available yet.
+              </p>
+            )}
+          </Card>
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Input text
-        </h3>
-        <p className="mt-3 whitespace-pre-wrap rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-sm leading-6 text-[var(--text-primary)]">
-          {record?.input_text || "No input text available."}
-        </p>
-      </Card>
+          <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Input text
+            </h3>
+            <p className="mt-3 whitespace-pre-wrap rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-sm leading-6 text-[var(--text-primary)]">
+              {record?.input_text || "No input text available."}
+            </p>
+          </Card>
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Generation stats
-        </h3>
-        <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Generation time</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record ? `${record.generation_time_ms.toFixed(0)} ms` : "n/a"}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Audio duration</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {formatClockDuration(record?.audio_duration_secs ?? null)}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">RTF</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record?.rtf != null ? record.rtf.toFixed(2) : "n/a"}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Tokens generated</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record?.tokens_generated ?? "n/a"}
-            </div>
-          </div>
+      
         </div>
-      </Card>
+        <FactsList
+          label="Generation"
+          className="self-start"
+          facts={[
+            {
+              label: "Generated in",
+              value:
+                formatProcessingFact(record?.generation_time_ms, record?.rtf) ??
+                "—",
+            },
+            {
+              label: "Length",
+              value: formatClockDuration(record?.audio_duration_secs ?? null),
+            },
+            { label: "Tokens", value: record?.tokens_generated ?? "—" },
+            ...(record?.speed != null && record.speed !== 1
+              ? [{ label: "Speed", value: `${record.speed}×` }]
+              : []),
+            ...(record?.language
+              ? [{ label: "Language", value: record.language }]
+              : []),
+          ]}
+        />
+      </div>
 
       <Dialog
         open={deleteConfirmOpen}

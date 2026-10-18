@@ -61,7 +61,7 @@ describe("TranscriptionReviewWorkspace", () => {
     );
 
     expect(screen.getByText("Timestamps")).toBeInTheDocument();
-    expect(screen.getByText("Enabled")).toBeInTheDocument();
+    expect(screen.getByText("Word-level")).toBeInTheDocument();
 
     const audio = container.querySelector("audio");
     expect(audio).not.toBeNull();
