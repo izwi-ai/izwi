@@ -329,18 +329,19 @@ fn probe_server(server_url: &Url, timeout: Duration) -> Result<()> {
     let live_url = server_url
         .join("/livez")
         .context("failed to construct izwi-server liveness URL")?;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("failed to build izwi-server probe client")?
-        .get(live_url)
-        .send()
-        .context("liveness probe failed")?
-        .error_for_status()
-        .context("liveness probe returned an error status")?;
-    let body = response
-        .text()
-        .context("failed to read liveness response")?;
+    // Runs during Tauri setup on the main thread, inside the Tokio runtime.
+    let body = super::blocking::run_off_runtime(move || -> Result<String> {
+        let response = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("failed to build izwi-server probe client")?
+            .get(live_url)
+            .send()
+            .context("liveness probe failed")?
+            .error_for_status()
+            .context("liveness probe returned an error status")?;
+        response.text().context("failed to read liveness response")
+    })?;
     validate_liveness_body(&body, env!("CARGO_PKG_VERSION"))
 }
 

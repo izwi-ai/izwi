@@ -7,6 +7,7 @@ use std::sync::{
 use url::Url;
 
 pub mod autostart;
+pub mod blocking;
 pub mod console;
 pub mod downloads;
 pub mod install;
