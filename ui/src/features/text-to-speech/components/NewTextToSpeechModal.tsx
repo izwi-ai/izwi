@@ -109,6 +109,12 @@ export function NewTextToSpeechModal({
   const usesBuiltInVoiceSelection =
     effectiveVoiceWorkflow === "built_in_voice";
   const usesVoiceDescription = effectiveVoiceWorkflow === "voice_description";
+  // A description is required only when it is the model's sole voice mode;
+  // models with built-in voices (Qwen3 1.7B CustomVoice) accept it as
+  // optional style direction alongside the speaker.
+  const showsVoiceDescription =
+    supportsVoiceDescription &&
+    (usesVoiceDescription || usesBuiltInVoiceSelection);
   const streamAvailable = supportsStreaming;
 
   const speakerOptions = useMemo(
@@ -297,7 +303,10 @@ export function NewTextToSpeechModal({
       text: trimmedText,
       speaker: usesBuiltInVoiceSelection ? resolvedBuiltInSpeaker : undefined,
       saved_voice_id: usesSavedVoiceSelection ? savedVoiceId : undefined,
-      voice_description: usesVoiceDescription ? trimmedVoiceDescription : undefined,
+      voice_description:
+        showsVoiceDescription && trimmedVoiceDescription
+          ? trimmedVoiceDescription
+          : undefined,
     };
 
     setIsSubmitting(true);
@@ -555,16 +564,27 @@ export function NewTextToSpeechModal({
                 </div>
               ) : null}
 
-              {usesVoiceDescription ? (
+              {showsVoiceDescription ? (
                 <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                    Voice direction
-                  </div>
+                  <label
+                    htmlFor="tts-voice-description"
+                    className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]"
+                  >
+                    {usesVoiceDescription
+                      ? "Voice direction"
+                      : "Style direction (optional)"}
+                  </label>
                   <Input
+                    id="tts-voice-description"
                     value={voiceDescription}
                     onChange={(event) => setVoiceDescription(event.target.value)}
                     disabled={isSubmitting}
-                    placeholder="Optional style guidance"
+                    required={usesVoiceDescription}
+                    placeholder={
+                      usesVoiceDescription
+                        ? "Describe the voice, e.g. a calm, warm narrator"
+                        : "e.g. speak slowly and warmly"
+                    }
                   />
                 </div>
               ) : null}

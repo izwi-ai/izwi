@@ -526,10 +526,10 @@ describe("TextToSpeechPage", () => {
     expect(screen.getByText("Built-in voice")).toBeInTheDocument();
     expect(screen.getByText("Vivian")).toBeInTheDocument();
     expect(screen.queryByText("Saved voice")).not.toBeInTheDocument();
-    expect(screen.queryByText("Voice direction")).not.toBeInTheDocument();
+    // This fixture also supports voice descriptions, offered as optional style.
     expect(
-      screen.queryByPlaceholderText("Optional style guidance"),
-    ).not.toBeInTheDocument();
+      screen.getByLabelText("Style direction (optional)"),
+    ).toBeInTheDocument();
   });
 
   it("resets modal state after close and reopen", async () => {
@@ -577,6 +577,78 @@ describe("TextToSpeechPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("offers optional style direction next to built-in voices", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: false,
+        },
+      },
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+
+    expect(await screen.findByText("Built-in voice")).toBeInTheDocument();
+    const style = screen.getByLabelText("Style direction (optional)");
+    expect(style).not.toBeRequired();
+  });
+
+  it("requires a voice description for description-only models", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: false,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: false,
+        },
+      },
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+
+    const direction = await screen.findByLabelText("Voice direction");
+    expect(direction).toBeRequired();
+    expect(direction).toHaveAttribute(
+      "placeholder",
+      expect.stringMatching(/^Describe the voice/),
+    );
+    expect(screen.queryByText("Built-in voice")).not.toBeInTheDocument();
+  });
+
   it("shows only saved voice controls for clone-capable models", async () => {
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],
@@ -617,10 +689,7 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Select saved voice")).toBeInTheDocument();
     expect(screen.queryByText("Built-in voice")).not.toBeInTheDocument();
-    expect(screen.queryByText("Voice direction")).not.toBeInTheDocument();
-    expect(
-      screen.queryByPlaceholderText("Optional style guidance"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/direction/i)).not.toBeInTheDocument();
   });
 
   it("shows kokoro built-in voices with display names in the modal", async () => {
