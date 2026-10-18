@@ -675,6 +675,64 @@ describe("ChatPlayground", () => {
     expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
   });
 
+  it("starts a new chat locally without creating an empty thread", async () => {
+    const thread = {
+      id: "thread-existing",
+      title: "Existing chat",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "Hello",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "m1",
+          thread_id: thread.id,
+          role: "user",
+          content: "Hello",
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-existing"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-existing"),
+    );
+    const newChat = screen.getByRole("button", { name: "New chat" });
+    expect(newChat).toBeEnabled();
+    fireEvent.click(newChat);
+
+    expect(
+      await screen.findByText(/No active chat selected/i),
+    ).toBeInTheDocument();
+    expect(apiMocks.createChatThread).not.toHaveBeenCalled();
+    // Still enabled on the empty state: clicking it just focuses the composer.
+    expect(screen.getByRole("button", { name: "New chat" })).toBeEnabled();
+  });
+
   it("isolates and restores text and image drafts when switching threads", async () => {
     const threads = [
       {

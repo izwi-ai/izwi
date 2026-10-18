@@ -257,7 +257,6 @@ export function ChatPlayground({
   const hasConversation =
     !!activeThreadId &&
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
-  const isEmptyChatWorkspace = !hasConversation;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const supportedReasoningEfforts =
     chatCapabilities?.reasoning_efforts ?? [];
@@ -639,31 +638,21 @@ export function ChatPlayground({
     }
   }, [refreshThreadList]);
 
-  const handleCreateThread = useCallback(async () => {
-    if (isEmptyChatWorkspace || isStreaming || isPreparingThread) {
+  // Starting a chat is local: the thread is created on the server by the
+  // first send, so abandoned "New chat" clicks no longer leave empty threads.
+  const handleStartNewChat = useCallback(() => {
+    if (isStreaming || isPreparingThread) {
       return;
     }
-
-    try {
-      const thread = await api.createChatThread({
-        model_id: selectedModel ?? undefined,
-      });
-      setThreads((previous) => [thread, ...previous]);
-      setActiveThreadInUrl(thread.id);
+    if (activeThreadId) {
+      setActiveThreadInUrl(null);
       setMessages([]);
       setExpandedThoughts({});
       setStats(null);
-      setError(null);
-    } catch (createError) {
-      setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
-  }, [
-    isEmptyChatWorkspace,
-    isPreparingThread,
-    isStreaming,
-    selectedModel,
-    setActiveThreadInUrl,
-  ]);
+    setError(null);
+    textareaRef.current?.focus();
+  }, [activeThreadId, isPreparingThread, isStreaming, setActiveThreadInUrl]);
 
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
     setDeleteTargetThreadId(threadId);
@@ -1473,8 +1462,8 @@ export function ChatPlayground({
             type="button"
             size="sm"
             className={cn("h-9 gap-2", chatAccentButtonClass)}
-            onClick={() => void handleCreateThread()}
-            disabled={isEmptyChatWorkspace || isStreaming || isPreparingThread}
+            onClick={handleStartNewChat}
+            disabled={isStreaming || isPreparingThread}
           >
             <Plus className="h-4 w-4" />
             New chat
