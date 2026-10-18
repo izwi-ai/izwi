@@ -1,4 +1,6 @@
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -14,15 +16,15 @@ use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQu
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     generate_chat, parse_chat_model, resolve_chat_request_config, start_chat_stream_with_keepalive,
-    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
+    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamCompletion, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, variant_accepts_image_input,
     FlattenedMultimodalContent,
 };
 use crate::chat_store::{
-    sanitize_system_prompt, ChatThreadListCursor, ChatThreadListQuery, ChatThreadMessage,
-    ChatThreadSummary,
+    sanitize_system_prompt, ChatStore, ChatThreadListCursor, ChatThreadListQuery,
+    ChatThreadMessage, ChatThreadSummary, ChatTurn, TurnPlacement, CANCELLED_FINISH_REASON,
 };
 use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
@@ -102,12 +104,10 @@ pub struct UpdateChatThreadRequest {
     pub system_prompt: Option<String>,
 }
 
+/// Generation settings shared by sending, editing and regenerating.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CreateThreadMessageRequest {
+pub struct ThreadGenerationOptions {
     pub model: String,
-    pub content: String,
-    #[serde(default)]
-    pub content_parts: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
     #[serde(default)]
@@ -139,6 +139,22 @@ pub struct CreateThreadMessageRequest {
     /// `context_length_exceeded`. The chat UI opts in.
     #[serde(default)]
     pub truncation: Option<ChatTruncation>,
+}
+
+/// A new message, or the new text of an edited one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateThreadMessageRequest {
+    pub content: String,
+    #[serde(default)]
+    pub content_parts: Option<Vec<serde_json::Value>>,
+    #[serde(flatten)]
+    pub options: ThreadGenerationOptions,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteChatMessageResponse {
+    pub id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -339,23 +355,209 @@ pub async fn create_thread_message(
     Extension(ctx): Extension<RequestContext>,
     ApiJson(req): ApiJson<CreateThreadMessageRequest>,
 ) -> Result<Response, ApiError> {
-    let model_variant = parse_chat_model(&req.model)?;
-    let model_id = model_variant.dir_name().to_string();
-    let prepared_content_parts = req.content_parts.clone();
-    let flattened_content = flatten_thread_content(&req.content, prepared_content_parts.as_deref())
-        .map_err(|err| {
-            ApiError::bad_request(format!("Invalid chat message content payload: {err}"))
-        })?;
-    if flattened_content.runtime_text.trim().is_empty() && !flattened_content.has_media() {
+    let target = TurnTarget::Append {
+        content: req.content,
+        content_parts: req.content_parts,
+    };
+    run_thread_turn(state, ctx, thread_id, req.options, target).await
+}
+
+/// Rewrites one of the user's messages, drops everything after it and
+/// generates a new reply. Nothing changes if generation fails.
+pub async fn edit_thread_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    Extension(ctx): Extension<RequestContext>,
+    ApiJson(req): ApiJson<CreateThreadMessageRequest>,
+) -> Result<Response, ApiError> {
+    let target = TurnTarget::Edit {
+        message_id,
+        content: req.content,
+        content_parts: req.content_parts,
+    };
+    run_thread_turn(state, ctx, thread_id, req.options, target).await
+}
+
+/// Replaces a reply (and anything after it) with a new one generated from
+/// the history before it, with the request's model.
+pub async fn regenerate_thread_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    Extension(ctx): Extension<RequestContext>,
+    ApiJson(options): ApiJson<ThreadGenerationOptions>,
+) -> Result<Response, ApiError> {
+    run_thread_turn(
+        state,
+        ctx,
+        thread_id,
+        options,
+        TurnTarget::Regenerate { message_id },
+    )
+    .await
+}
+
+pub async fn delete_thread_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+) -> Result<Json<DeleteChatMessageResponse>, ApiError> {
+    // Wait for a running turn so it cannot commit around the deletion.
+    let _turn_guard = state.chat_store.lock_turn(&thread_id).await;
+    get_thread_or_not_found(&state, &thread_id).await?;
+    let deleted = state
+        .chat_store
+        .delete_message(thread_id, message_id.clone())
+        .await
+        .map_err(map_store_error)?;
+    if !deleted {
+        return Err(ApiError::not_found("Message not found"));
+    }
+    Ok(Json(DeleteChatMessageResponse {
+        id: message_id,
+        deleted: true,
+    }))
+}
+
+/// Which turn a request generates.
+enum TurnTarget {
+    /// A new message after the thread's latest one.
+    Append {
+        content: String,
+        content_parts: Option<Vec<serde_json::Value>>,
+    },
+    /// A new reply to the user message before this assistant message.
+    Regenerate { message_id: String },
+    /// This user message with new text, and a new reply.
+    Edit {
+        message_id: String,
+        content: String,
+        content_parts: Option<Vec<serde_json::Value>>,
+    },
+}
+
+/// The history a turn generates from and the user message it commits.
+struct ResolvedTurn {
+    history: Vec<ChatThreadMessage>,
+    user_message: ChatThreadMessage,
+    content: FlattenedMultimodalContent,
+    placement: TurnPlacement,
+}
+
+fn flatten_request_content(
+    content: &str,
+    content_parts: Option<&[serde_json::Value]>,
+) -> Result<FlattenedMultimodalContent, ApiError> {
+    let flattened = flatten_thread_content(content, content_parts).map_err(|err| {
+        ApiError::bad_request(format!("Invalid chat message content payload: {err}"))
+    })?;
+    if flattened.runtime_text.trim().is_empty() && !flattened.has_media() {
         return Err(ApiError::bad_request("Message content cannot be empty"));
     }
+    Ok(flattened)
+}
+
+fn message_index(messages: &[ChatThreadMessage], message_id: &str) -> Result<usize, ApiError> {
+    messages
+        .iter()
+        .position(|message| message.id == message_id)
+        .ok_or_else(|| ApiError::not_found("Message not found"))
+}
+
+async fn resolve_turn(
+    state: &AppState,
+    thread_id: &str,
+    mut existing: Vec<ChatThreadMessage>,
+    target: TurnTarget,
+) -> Result<ResolvedTurn, ApiError> {
+    match target {
+        TurnTarget::Append {
+            content,
+            content_parts,
+        } => {
+            let flattened = flatten_request_content(&content, content_parts.as_deref())?;
+            let user_message = state
+                .chat_store
+                .prepare_user_message(
+                    thread_id.to_string(),
+                    flattened.display_text.clone(),
+                    content_parts,
+                )
+                .await
+                .map_err(map_store_or_not_found)?;
+            Ok(ResolvedTurn {
+                history: existing,
+                user_message,
+                content: flattened,
+                placement: TurnPlacement::Append,
+            })
+        }
+        TurnTarget::Regenerate { message_id } => {
+            let index = message_index(&existing, &message_id)?;
+            if existing[index].role != "assistant" {
+                return Err(ApiError::bad_request("Only a reply can be regenerated"));
+            }
+            let user_index = existing[..index]
+                .iter()
+                .rposition(|message| message.role == "user")
+                .ok_or_else(|| ApiError::bad_request("This reply has no message to answer"))?;
+            existing.truncate(user_index + 1);
+            let user_message = existing.pop().expect("the user message was kept");
+            let content = flatten_thread_content(
+                &user_message.content,
+                user_message.content_parts.as_deref(),
+            )
+            .map_err(|err| {
+                ApiError::internal(format!("Invalid stored chat message payload: {err}"))
+            })?;
+            Ok(ResolvedTurn {
+                history: existing,
+                user_message,
+                content,
+                placement: TurnPlacement::ReplaceFromUser,
+            })
+        }
+        TurnTarget::Edit {
+            message_id,
+            content,
+            content_parts,
+        } => {
+            let index = message_index(&existing, &message_id)?;
+            if existing[index].role != "user" {
+                return Err(ApiError::bad_request(
+                    "Only your own messages can be edited",
+                ));
+            }
+            let flattened = flatten_request_content(&content, content_parts.as_deref())?;
+            existing.truncate(index + 1);
+            let mut user_message = existing.pop().expect("the edited message was kept");
+            user_message.content = flattened.display_text.clone();
+            user_message.content_parts = content_parts;
+            Ok(ResolvedTurn {
+                history: existing,
+                user_message,
+                content: flattened,
+                placement: TurnPlacement::ReplaceFromUser,
+            })
+        }
+    }
+}
+
+async fn run_thread_turn(
+    state: AppState,
+    ctx: RequestContext,
+    thread_id: String,
+    options: ThreadGenerationOptions,
+    target: TurnTarget,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let model_variant = parse_chat_model(&options.model)?;
+    let model_id = model_variant.dir_name().to_string();
 
     // Hold one turn lock across history read, generation, and terminal
     // persistence. Concurrent sends to the same thread therefore observe the
     // preceding assistant response instead of branching from stale history.
     let turn_guard = state.chat_store.lock_turn(&thread_id).await;
     let thread = get_thread_or_not_found(&state, &thread_id).await?;
-    let requested_system_prompt = req.system_prompt.clone();
+    let requested_system_prompt = options.system_prompt.clone();
     let effective_system_prompt = match requested_system_prompt.as_deref() {
         Some(prompt) => sanitize_system_prompt(Some(prompt)),
         None => thread.system_prompt.clone(),
@@ -365,48 +567,39 @@ pub async fn create_thread_message(
         .list_messages(thread_id.clone())
         .await
         .map_err(map_store_error)?;
+    let turn = resolve_turn(&state, &thread_id, existing_messages, target).await?;
 
     // A thread that once used an image model can continue on a text-only
     // one: earlier turns are sent as their text, while a new attachment on
     // this message is still rejected below.
     let (runtime_messages, media_inputs) = build_runtime_messages(
-        &existing_messages,
-        &flattened_content,
+        &turn.history,
+        &turn.content,
         effective_system_prompt.as_deref(),
         variant_accepts_image_input(model_variant),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
 
-    let user_message = state
-        .chat_store
-        .prepare_user_message(
-            thread_id.clone(),
-            flattened_content.display_text.clone(),
-            prepared_content_parts.clone(),
-        )
-        .await
-        .map_err(map_store_or_not_found)?;
-
     let chat_config = resolve_chat_request_config(
-        req.enable_thinking,
-        req.reasoning_effort,
-        req.preserve_thinking,
-        req.chat_template_kwargs.as_ref(),
+        options.enable_thinking,
+        options.reasoning_effort,
+        options.preserve_thinking,
+        options.chat_template_kwargs.as_ref(),
         Vec::new(),
         media_inputs,
-        req.truncation,
+        options.truncation,
     )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages: runtime_messages,
-        max_completion_tokens: req.max_completion_tokens,
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
+        max_completion_tokens: options.max_completion_tokens,
+        max_tokens: options.max_tokens,
+        temperature: options.temperature,
+        top_p: options.top_p,
+        top_k: options.top_k,
+        repetition_penalty: options.repetition_penalty,
+        presence_penalty: options.presence_penalty,
         seed: None,
         stop: Vec::new(),
         logprobs: None,
@@ -418,15 +611,22 @@ pub async fn create_thread_message(
     };
     validate_chat_request_ranges(&execution_request)?;
 
-    if req.stream.unwrap_or(false) {
+    let commit = TurnCommit {
+        chat_store: state.chat_store.clone(),
+        user_message: turn.user_message,
+        model_id,
+        placement: turn.placement,
+        system_prompt_update: requested_system_prompt,
+    };
+
+    if options.stream.unwrap_or(false) {
         return create_streaming_thread_message(
             state,
-            model_id,
             thread_id,
-            user_message,
+            commit,
             execution_request,
             turn_guard,
-            requested_system_prompt,
+            started,
         )
         .await;
     }
@@ -434,23 +634,14 @@ pub async fn create_thread_message(
     let generation = generate_chat(&state, execution_request).await?;
     validate_thread_response(&generation.text, false).map_err(ApiError::internal)?;
 
-    let (user_message, assistant_message) = state
-        .chat_store
-        .append_turn_with_system_prompt(
-            user_message,
-            generation.text.clone(),
-            model_id.clone(),
-            generation.tokens_generated,
-            generation.generation_time_ms,
-            chat_finish_reason(&generation),
-            requested_system_prompt,
-        )
+    let (user_message, assistant_message) = commit
+        .completed(&generation, None)
         .await
         .map_err(map_store_or_not_found)?;
 
     let response = CreateThreadMessageResponse {
         thread_id,
-        model_id,
+        model_id: commit.model_id,
         user_message,
         assistant_message,
         stats: ChatGenerationStats::from_generation(&generation),
@@ -459,25 +650,173 @@ pub async fn create_thread_message(
     Ok(Json(response).into_response())
 }
 
+/// What a turn commits once its generation ends.
+struct TurnCommit {
+    chat_store: Arc<ChatStore>,
+    user_message: ChatThreadMessage,
+    model_id: String,
+    placement: TurnPlacement,
+    system_prompt_update: Option<String>,
+}
+
+impl TurnCommit {
+    fn turn(
+        &self,
+        assistant_content: String,
+        tokens_generated: Option<usize>,
+        generation_time_ms: Option<f64>,
+        reasoning_ms: Option<u64>,
+        finish_reason: Option<String>,
+    ) -> ChatTurn {
+        ChatTurn {
+            user_message: self.user_message.clone(),
+            assistant_content,
+            model_id: self.model_id.clone(),
+            tokens_generated,
+            generation_time_ms,
+            reasoning_ms,
+            finish_reason,
+            system_prompt_update: self.system_prompt_update.clone(),
+            placement: self.placement,
+        }
+    }
+
+    async fn completed(
+        &self,
+        generation: &ChatGeneration,
+        reasoning_ms: Option<u64>,
+    ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
+        self.chat_store
+            .commit_turn(self.turn(
+                generation.text.clone(),
+                Some(generation.tokens_generated),
+                Some(generation.generation_time_ms),
+                reasoning_ms,
+                chat_finish_reason(generation),
+            ))
+            .await
+    }
+}
+
+/// When a streamed reply's reasoning ended: the moment `</think>` first
+/// appears, measured from the start of the turn.
+struct ReasoningClock {
+    started: Instant,
+    reasoning_ms: Option<u64>,
+    scanned: usize,
+}
+
+impl ReasoningClock {
+    const CLOSE_TAG: &'static [u8] = b"</think>";
+
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            reasoning_ms: None,
+            scanned: 0,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// `text` is the reply so far; only its new tail is scanned.
+    fn observe(&mut self, text: &str) {
+        if self.reasoning_ms.is_some() {
+            return;
+        }
+        let from = self.scanned.saturating_sub(Self::CLOSE_TAG.len() - 1);
+        if text.as_bytes()[from..]
+            .windows(Self::CLOSE_TAG.len())
+            .any(|window| window.eq_ignore_ascii_case(Self::CLOSE_TAG))
+        {
+            self.reasoning_ms = Some(self.elapsed_ms());
+        }
+        self.scanned = text.len();
+    }
+
+    /// The reasoning time of a reply that ended with `text`: a reply that
+    /// never closed its reasoning reasoned until it ended.
+    fn finish(&self, text: &str) -> Option<u64> {
+        self.reasoning_ms.or_else(|| {
+            text.to_ascii_lowercase()
+                .contains("<think>")
+                .then(|| self.elapsed_ms())
+        })
+    }
+}
+
+/// Commits the partial reply as a stopped turn when the client goes away
+/// before the stream ends (the response body, and so this, is dropped
+/// mid-stream). It holds the stream's completion, which keeps the thread's
+/// turn lock until the stopped turn is stored.
+struct StopOnDisconnect {
+    commit: TurnCommit,
+    clock: ReasoningClock,
+    text: String,
+    completion: Option<ChatStreamCompletion>,
+}
+
+impl StopOnDisconnect {
+    /// The stream ended on its own; nothing is stored on drop.
+    fn finish(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.acknowledge();
+        }
+    }
+}
+
+impl Drop for StopOnDisconnect {
+    fn drop(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let text = std::mem::take(&mut self.text);
+        let reasoning_ms = self.clock.finish(&text);
+        let generation_time_ms = self.clock.started.elapsed().as_secs_f64() * 1000.0;
+        let turn = self.commit.turn(
+            text,
+            None,
+            Some(generation_time_ms),
+            reasoning_ms,
+            Some(CANCELLED_FINISH_REASON.to_string()),
+        );
+        let chat_store = self.commit.chat_store.clone();
+        runtime.spawn(async move {
+            if let Err(err) = chat_store.commit_turn(turn).await {
+                tracing::warn!(error = %format!("{err:#}"), "failed to store a stopped chat turn");
+            }
+            drop(completion);
+        });
+    }
+}
+
 async fn create_streaming_thread_message(
     state: AppState,
-    model_id: String,
     thread_id: String,
-    user_message: ChatThreadMessage,
+    commit: TurnCommit,
     execution_request: ChatExecutionRequest,
     turn_guard: OwnedMutexGuard<()>,
-    system_prompt_update: Option<String>,
+    started: Instant,
 ) -> Result<Response, ApiError> {
-    let chat_store = state.chat_store.clone();
     let thread_id_for_task = thread_id.clone();
-    let model_id_for_task = model_id.clone();
-    let user_message_for_start = user_message.clone();
+    let model_id_for_task = commit.model_id.clone();
+    let user_message_for_start = commit.user_message.clone();
     let correlation_id = execution_request.correlation_id.clone();
     let (mut event_rx, stream_completion) =
         start_chat_stream_with_keepalive(state, execution_request, turn_guard).await?;
 
     let stream = async_stream::stream! {
-        let mut stream_completion = Some(stream_completion);
+        let mut turn = StopOnDisconnect {
+            commit,
+            clock: ReasoningClock::new(started),
+            text: String::new(),
+            completion: Some(stream_completion),
+        };
         let mut saw_terminal = false;
         let mut saw_nonempty_delta = false;
         while let Some(event) = event_rx.recv().await {
@@ -494,6 +833,8 @@ async fn create_streaming_thread_message(
                 ),
                 ChatStreamEvent::Delta { text, .. } => {
                     saw_nonempty_delta |= !text.trim().is_empty();
+                    turn.text.push_str(&text);
+                    turn.clock.observe(&turn.text);
                     (
                         serde_json::to_string(&ThreadStreamDeltaEvent {
                             event: "delta",
@@ -509,18 +850,8 @@ async fn create_streaming_thread_message(
                     {
                         thread_stream_error_payload(error)
                     } else {
-                        match chat_store
-                            .append_turn_with_system_prompt(
-                                user_message_for_start.clone(),
-                                generation.text.clone(),
-                                model_id_for_task.clone(),
-                                generation.tokens_generated,
-                                generation.generation_time_ms,
-                                chat_finish_reason(&generation),
-                                system_prompt_update.clone()
-                            )
-                            .await
-                        {
+                        let reasoning_ms = turn.clock.finish(&generation.text);
+                        match turn.commit.completed(&generation, reasoning_ms).await {
                             Ok((_user_message, assistant_message)) => serde_json::to_string(&ThreadStreamDoneEvent {
                                 event: "done",
                                 thread_id: thread_id_for_task.clone(),
@@ -551,15 +882,15 @@ async fn create_streaming_thread_message(
             };
             if terminal {
                 saw_terminal = true;
-                if let Some(completion) = stream_completion.take() {
-                    completion.acknowledge();
-                }
+                turn.finish();
             }
             yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
             if terminal {
                 break;
             }
         }
+        // A stream that ends without a terminal event failed; it is not a stop.
+        turn.finish();
         if let Some(payload) = thread_stream_interruption_payload(saw_terminal) {
             yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
         }
@@ -634,16 +965,30 @@ fn build_runtime_messages(
         } else {
             flattened.display_text
         };
-        messages.push(ChatMessage { role, content });
+        push_runtime_message(&mut messages, role, content);
     }
 
     media_inputs.extend(new_user_content.media_inputs.clone());
-    messages.push(ChatMessage {
-        role: ChatRole::User,
-        content: new_user_content.runtime_text.clone(),
-    });
+    push_runtime_message(
+        &mut messages,
+        ChatRole::User,
+        new_user_content.runtime_text.clone(),
+    );
 
     Ok((messages, media_inputs))
+}
+
+/// Chat templates expect user and assistant turns to alternate. A deleted
+/// reply or a stopped turn with no text leaves two user messages in a row,
+/// so consecutive user messages are sent as one.
+fn push_runtime_message(messages: &mut Vec<ChatMessage>, role: ChatRole, content: String) {
+    match messages.last_mut() {
+        Some(last) if last.role == role && role == ChatRole::User => {
+            last.content.push_str("\n\n");
+            last.content.push_str(&content);
+        }
+        _ => messages.push(ChatMessage { role, content }),
+    }
 }
 
 fn parse_stored_role(role: &str) -> Result<ChatRole, ApiError> {
@@ -808,6 +1153,7 @@ mod tests {
                 generation_time_ms: Some(224.0),
                 model_id: None,
                 finish_reason: None,
+                reasoning_ms: None,
             })
             .collect::<Vec<_>>();
         let (messages, _) = build_runtime_messages(
@@ -841,6 +1187,7 @@ mod tests {
                 generation_time_ms: None,
                 model_id: None,
                 finish_reason: None,
+                reasoning_ms: None,
             }],
             &FlattenedMultimodalContent {
                 display_text: "How are you?".to_string(),
@@ -859,24 +1206,44 @@ mod tests {
         assert!(media_inputs.is_empty());
     }
 
+    fn reply(content: &str) -> ChatThreadMessage {
+        ChatThreadMessage {
+            id: "reply-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            content_parts: None,
+            created_at: 2,
+            tokens_generated: None,
+            generation_time_ms: None,
+            model_id: None,
+            finish_reason: None,
+            reasoning_ms: None,
+        }
+    }
+
     #[test]
     fn build_runtime_messages_collects_media_from_history_and_new_message() {
         let (messages, media_inputs) = build_runtime_messages(
-            &[ChatThreadMessage {
-                id: "message-1".to_string(),
-                thread_id: "thread-1".to_string(),
-                role: "user".to_string(),
-                content: "".to_string(),
-                content_parts: Some(vec![json!({
-                    "type":"image_url",
-                    "image_url":{"url":"https://example.com/history.png"}
-                })]),
-                created_at: 1,
-                tokens_generated: None,
-                generation_time_ms: None,
-                model_id: None,
-                finish_reason: None,
-            }],
+            &[
+                ChatThreadMessage {
+                    id: "message-1".to_string(),
+                    thread_id: "thread-1".to_string(),
+                    role: "user".to_string(),
+                    content: "".to_string(),
+                    content_parts: Some(vec![json!({
+                        "type":"image_url",
+                        "image_url":{"url":"https://example.com/history.png"}
+                    })]),
+                    created_at: 1,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    model_id: None,
+                    finish_reason: None,
+                    reasoning_ms: None,
+                },
+                reply("A bar chart."),
+            ],
             &FlattenedMultimodalContent {
                 display_text: "Describe this".to_string(),
                 runtime_text: "<|vision_start|><|image_pad|><|vision_end|>Describe this"
@@ -891,7 +1258,7 @@ mod tests {
         )
         .expect("runtime messages");
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(media_inputs.len(), 2);
     }
 
@@ -910,6 +1277,7 @@ mod tests {
             generation_time_ms: None,
             model_id: None,
             finish_reason: None,
+            reasoning_ms: None,
         }
     }
 
@@ -920,9 +1288,16 @@ mod tests {
             runtime_text: "Now summarise it".to_string(),
             media_inputs: Vec::new(),
         };
-        let (messages, media_inputs) =
-            build_runtime_messages(&[image_turn("What is in this chart?")], &next, None, false)
-                .expect("runtime messages");
+        let (messages, media_inputs) = build_runtime_messages(
+            &[
+                image_turn("What is in this chart?"),
+                reply("Sales by month."),
+            ],
+            &next,
+            None,
+            false,
+        )
+        .expect("runtime messages");
 
         assert!(media_inputs.is_empty());
         assert_eq!(messages[0].content, "What is in this chart?");
@@ -931,9 +1306,16 @@ mod tests {
             .all(|message| !message.content.contains("<|image_pad|>")));
 
         // The same history keeps its image for an image-capable model.
-        let (messages, media_inputs) =
-            build_runtime_messages(&[image_turn("What is in this chart?")], &next, None, true)
-                .expect("runtime messages");
+        let (messages, media_inputs) = build_runtime_messages(
+            &[
+                image_turn("What is in this chart?"),
+                reply("Sales by month."),
+            ],
+            &next,
+            None,
+            true,
+        )
+        .expect("runtime messages");
         assert_eq!(media_inputs.len(), 1);
         assert!(messages[0].content.contains("<|image_pad|>"));
     }
@@ -954,9 +1336,126 @@ mod tests {
             media_inputs: Vec::new(),
         };
         let (messages, media_inputs) =
-            build_runtime_messages(&[image_only], &next, None, false).expect("runtime messages");
+            build_runtime_messages(&[image_only, reply("A photo.")], &next, None, false)
+                .expect("runtime messages");
         assert!(media_inputs.is_empty());
         assert_eq!(messages[0].content, OMITTED_IMAGE_TEXT);
+    }
+
+    #[test]
+    fn reasoning_ends_when_the_close_tag_arrives_even_split_across_deltas() {
+        let started = Instant::now() - std::time::Duration::from_secs(5);
+        let mut clock = ReasoningClock::new(started);
+        clock.observe("<think>Planning the</th");
+        assert_eq!(clock.reasoning_ms, None);
+        clock.observe("<think>Planning the</think>Answer");
+        let reasoning_ms = clock.reasoning_ms.expect("the close tag ends reasoning");
+        assert!(reasoning_ms >= 5_000, "{reasoning_ms}");
+        assert_eq!(
+            clock.finish("<think>Planning the</think>Answer"),
+            Some(reasoning_ms)
+        );
+
+        let clock = ReasoningClock::new(started);
+        assert!(clock.finish("<think>still reasoning").is_some());
+        assert_eq!(clock.finish("A plain answer"), None);
+    }
+
+    #[test]
+    fn consecutive_user_messages_reach_the_model_as_one() {
+        let user = |id: &str, content: &str| ChatThreadMessage {
+            id: id.into(),
+            thread_id: "thread-1".into(),
+            role: "user".into(),
+            content: content.into(),
+            content_parts: None,
+            created_at: 1,
+            tokens_generated: None,
+            generation_time_ms: None,
+            model_id: None,
+            finish_reason: None,
+            reasoning_ms: None,
+        };
+        // A stopped turn with no reply text, then a new question.
+        let stopped_reply = ChatThreadMessage {
+            role: "assistant".into(),
+            finish_reason: Some(CANCELLED_FINISH_REASON.into()),
+            ..user("m2", "")
+        };
+        let (messages, _) = build_runtime_messages(
+            &[user("m1", "Tell me a story"), stopped_reply],
+            &FlattenedMultimodalContent {
+                display_text: "A short one".into(),
+                runtime_text: "A short one".into(),
+                media_inputs: Vec::new(),
+            },
+            Some("Be brief."),
+            true,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ChatRole::System);
+        assert_eq!(messages[1].role, ChatRole::User);
+        assert_eq!(messages[1].content, "Tell me a story\n\nA short one");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_stores_its_partial_reply_as_stopped() {
+        let _guard = crate::test_support::env_lock();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+        let store = Arc::new(ChatStore::initialize().unwrap());
+        let thread = store.create_thread(None, None).await.unwrap();
+        let pending = store
+            .prepare_user_message(thread.id.clone(), "Tell me a story".into(), None)
+            .await
+            .unwrap();
+        let commit = || TurnCommit {
+            chat_store: store.clone(),
+            user_message: pending.clone(),
+            model_id: "Qwen3.5-0.8B".into(),
+            placement: TurnPlacement::Append,
+            system_prompt_update: None,
+        };
+
+        // A stream that ended on its own stores nothing on drop.
+        let (completion, completion_rx) = ChatStreamCompletion::channel();
+        let mut finished = StopOnDisconnect {
+            commit: commit(),
+            clock: ReasoningClock::new(Instant::now()),
+            text: "Once upon".into(),
+            completion: Some(completion),
+        };
+        finished.finish();
+        drop(finished);
+        assert!(completion_rx.await.is_ok(), "finish acknowledges");
+        assert!(store
+            .list_messages(thread.id.clone())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A dropped one stores the prompt and partial reply before it lets
+        // the turn lock go.
+        let (completion, completion_rx) = ChatStreamCompletion::channel();
+        drop(StopOnDisconnect {
+            commit: commit(),
+            clock: ReasoningClock::new(Instant::now()),
+            text: "Once upon".into(),
+            completion: Some(completion),
+        });
+        let _ = completion_rx.await;
+        let messages = store.list_messages(thread.id.clone()).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, pending.id);
+        assert_eq!(messages[1].content, "Once upon");
+        assert_eq!(
+            messages[1].finish_reason.as_deref(),
+            Some(CANCELLED_FINISH_REASON)
+        );
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
     }
 
     #[test]

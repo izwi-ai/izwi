@@ -2,7 +2,10 @@
 
 mod handlers;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, patch, post},
+    Router,
+};
 
 use crate::state::AppState;
 
@@ -21,5 +24,13 @@ pub fn router() -> Router<AppState> {
         .route(
             "/chat/threads/{thread_id}/messages",
             get(handlers::list_thread_messages).post(handlers::create_thread_message),
+        )
+        .route(
+            "/chat/threads/{thread_id}/messages/{message_id}",
+            patch(handlers::edit_thread_message).delete(handlers::delete_thread_message),
+        )
+        .route(
+            "/chat/threads/{thread_id}/messages/{message_id}/regenerate",
+            post(handlers::regenerate_thread_message),
         )
 }

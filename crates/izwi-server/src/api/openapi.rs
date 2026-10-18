@@ -800,6 +800,40 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "List messages or send a new user message.",
         &[("thread_id", "Chat thread identifier")],
     );
+    let chat_message_params = [
+        ("thread_id", "Chat thread identifier"),
+        ("message_id", "Chat message identifier"),
+    ];
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}",
+        "patch",
+        "Chat",
+        "Update chat message",
+        "Replace one of your messages and every message after it, then generate a new reply.",
+        &chat_message_params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}",
+        "delete",
+        "Chat",
+        "Delete chat message",
+        "Delete one message from a chat thread.",
+        &chat_message_params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}/regenerate",
+        "post",
+        "Chat",
+        "Regenerate chat reply",
+        "Replace a reply with a new one generated from the history before it, optionally with another model.",
+        &chat_message_params,
+        preview_response(),
+    );
     add_operation(
         paths,
         "/v1/agent/sessions",

@@ -633,6 +633,7 @@ mod tests {
         ("chat_messages", "content_parts"),
         ("chat_messages", "model_id"),
         ("chat_messages", "finish_reason"),
+        ("chat_messages", "reasoning_ms"),
         ("media_assets", "source_asset_id"),
         ("media_assets", "canonical_profile_version"),
         ("provider_write_reservations", "provider_request_json"),

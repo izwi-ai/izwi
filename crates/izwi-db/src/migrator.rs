@@ -39,6 +39,7 @@ impl Schema {
                 (5, "diarization alignment and node ownership"),
                 (6, "byte-ordered artifact publication keys"),
                 (7, "chat message model and finish reason"),
+                (8, "chat message reasoning time"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -184,6 +185,9 @@ async fn apply_migration<C: ConnectionTrait>(
             for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
                 ensure_column(db, column).await?;
             }
+        }
+        (Schema::App, 8) => {
+            ensure_column(db, &CHAT_MESSAGE_REASONING_COLUMN).await?;
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1040,6 +1044,14 @@ const CHAT_MESSAGE_PROVENANCE_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 8: how long an assistant reply spent reasoning before its
+/// answer began, in milliseconds.
+const CHAT_MESSAGE_REASONING_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "chat_messages",
+    column: "reasoning_ms",
+    definition: "INTEGER NULL",
+};
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1566,6 +1578,8 @@ pub(crate) fn postgres_schema_sql() -> String {
     for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
         push(&add_column(column));
     }
+    // Migration 8.
+    push(&add_column(&CHAT_MESSAGE_REASONING_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1751,6 +1765,33 @@ mod tests {
                 column.column
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_7_gains_the_reasoning_time_column() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let column = &CHAT_MESSAGE_REASONING_COLUMN;
+        db.execute_unprepared(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            column.table, column.column
+        ))
+        .await
+        .expect("column drops");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 8",
+        )
+        .await
+        .expect("version row deletes");
+        assert!(!table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert!(table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
     }
 
     fn shipped_postgres_schema_path() -> std::path::PathBuf {

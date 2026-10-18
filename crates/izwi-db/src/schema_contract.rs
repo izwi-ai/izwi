@@ -58,6 +58,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "generation_time_ms",
             "model_id",
             "finish_reason",
+            "reasoning_ms",
         ],
     },
     RequiredSchemaTable {

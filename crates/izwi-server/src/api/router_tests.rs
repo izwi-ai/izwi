@@ -2767,6 +2767,90 @@ async fn text_to_speech_list_reports_total_and_validates_filters() {
 }
 
 #[tokio::test]
+async fn chat_message_routes_delete_and_refuse_the_wrong_targets() {
+    let (state, _root) = test_state("chat_message_routes", false);
+    state.lifecycle.mark_ready();
+    let thread = state.chat_store.create_thread(None, None).await.unwrap();
+    let pending = state
+        .chat_store
+        .prepare_user_message(thread.id.clone(), "Hi".into(), None)
+        .await
+        .unwrap();
+    let (user, reply) = state
+        .chat_store
+        .append_turn_with_system_prompt(
+            pending,
+            "Hello".into(),
+            "Qwen3.5-0.8B".into(),
+            1,
+            1.0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let message_path = |id: &str| format!("/v1/chat/threads/{}/messages/{id}", thread.id);
+
+    let cases = [
+        (
+            Method::POST,
+            format!("{}/regenerate", message_path(&user.id)),
+            r#"{"model":"Qwen3.5-0.8B"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            format!("{}/regenerate", message_path("missing")),
+            r#"{"model":"Qwen3.5-0.8B"}"#,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PATCH,
+            message_path(&reply.id),
+            r#"{"model":"Qwen3.5-0.8B","content":"Edited"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PATCH,
+            message_path(&user.id),
+            r#"{"model":"Qwen3.5-0.8B","content":"  "}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (method, path, body, status) in cases {
+        let response = send_request(app.clone(), build_request(method, &path, Some(body))).await;
+        assert_eq!(response.status(), status, "{path}");
+    }
+
+    let response = send_request(
+        app.clone(),
+        build_request(Method::DELETE, &message_path(&reply.id), None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["deleted"], true);
+    let response = send_request(
+        app.clone(),
+        build_request(Method::DELETE, &message_path(&reply.id), None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let messages = state
+        .chat_store
+        .list_messages(thread.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, user.id);
+}
+
+#[tokio::test]
 async fn chat_thread_list_supports_paging_and_search() {
     let (app, _temp_dir) = test_api_app("chat_thread_list_supports_paging_and_search", false);
     for title in ["First topic", "Second topic", "Unrelated"] {

@@ -80,7 +80,39 @@ pub struct ChatThreadMessage {
     /// Why an assistant reply ended: stop, length, cancelled or error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// How long the reply reasoned before its answer began, measured from
+    /// the start of the turn (None when it did not reason, or was not timed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_ms: Option<u64>,
 }
+
+/// Where a turn's messages go in its thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPlacement {
+    /// After the thread's latest message.
+    Append,
+    /// In place of the user message (same id and time) and everything after
+    /// it: a retried reply or an edited prompt.
+    ReplaceFromUser,
+}
+
+/// A finished, stopped or retried turn to commit in one transaction.
+#[derive(Debug, Clone)]
+pub struct ChatTurn {
+    pub user_message: ChatThreadMessage,
+    pub assistant_content: String,
+    pub model_id: String,
+    pub tokens_generated: Option<usize>,
+    pub generation_time_ms: Option<f64>,
+    pub reasoning_ms: Option<u64>,
+    pub finish_reason: Option<String>,
+    /// `Some("")` clears the thread's system prompt; `None` keeps it.
+    pub system_prompt_update: Option<String>,
+    pub placement: TurnPlacement,
+}
+
+/// A stopped reply may be empty: the user's prompt is still kept.
+pub const CANCELLED_FINISH_REASON: &str = "cancelled";
 
 #[derive(Clone)]
 pub struct ChatStore {
@@ -157,6 +189,7 @@ impl ChatStore {
             generation_time_ms: None,
             model_id: None,
             finish_reason: None,
+            reasoning_ms: None,
         })
     }
 
@@ -396,6 +429,7 @@ impl ChatStore {
             generation_time_ms: Set(generation_time_ms),
             model_id: Set(message_model_id.clone()),
             finish_reason: Set(None),
+            reasoning_ms: Set(None),
         })
         .exec(&tx)
         .await
@@ -424,18 +458,34 @@ impl ChatStore {
             generation_time_ms,
             model_id: message_model_id,
             finish_reason: None,
+            reasoning_ms: None,
         })
     }
 
-    /// Atomically append a complete user/assistant turn. A generation failure
-    /// never calls this method, so no orphan user message can become part of a
-    /// future prompt. The assistant timestamp is forced after the pending user
-    /// timestamp to make ordering deterministic even within one millisecond.
-    /// Append a successful turn and an optional thread system-prompt change in
-    /// one transaction. `Some("")` clears the prompt; `None` preserves it.
+    /// Delete one message. Returns false when the thread has no such message.
+    pub async fn delete_message(
+        &self,
+        thread_id: String,
+        message_id: String,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let result = chat_messages::Entity::delete_many()
+            .filter(chat_messages::Column::ThreadId.eq(thread_id))
+            .filter(chat_messages::Column::Id.eq(message_id))
+            .exec(db)
+            .await
+            .context("Failed to delete chat message")?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Atomically append a complete user/assistant turn and an optional
+    /// thread system-prompt change. `Some("")` clears the prompt; `None`
+    /// preserves it.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn append_turn_with_system_prompt(
         &self,
-        mut user_message: ChatThreadMessage,
+        user_message: ChatThreadMessage,
         assistant_content: String,
         model_id: String,
         tokens_generated: usize,
@@ -443,6 +493,40 @@ impl ChatStore {
         finish_reason: Option<String>,
         system_prompt_update: Option<String>,
     ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
+        self.commit_turn(ChatTurn {
+            user_message,
+            assistant_content,
+            model_id,
+            tokens_generated: Some(tokens_generated),
+            generation_time_ms: Some(generation_time_ms),
+            reasoning_ms: None,
+            finish_reason,
+            system_prompt_update,
+            placement: TurnPlacement::Append,
+        })
+        .await
+    }
+
+    /// Commit a user/assistant turn in one transaction. A failed generation
+    /// never calls this, so no orphan user message can become part of a
+    /// future prompt; a stopped one may, with an empty reply. The assistant
+    /// timestamp is forced after the user timestamp so ordering is
+    /// deterministic even within one millisecond.
+    pub async fn commit_turn(
+        &self,
+        turn: ChatTurn,
+    ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
+        let ChatTurn {
+            mut user_message,
+            assistant_content,
+            model_id,
+            tokens_generated,
+            generation_time_ms,
+            reasoning_ms,
+            finish_reason,
+            system_prompt_update,
+            placement,
+        } = turn;
         if user_message.role != "user" {
             return Err(anyhow!("Chat turn must start with a user message"));
         }
@@ -450,7 +534,8 @@ impl ChatStore {
             return Err(anyhow!("Chat turn requires a thread id"));
         }
 
-        if assistant_content.trim().is_empty() {
+        let stopped = finish_reason.as_deref() == Some(CANCELLED_FINISH_REASON);
+        if assistant_content.trim().is_empty() && !stopped {
             return Err(anyhow!(
                 "Cannot persist a chat turn with an empty assistant response"
             ));
@@ -467,12 +552,25 @@ impl ChatStore {
             .await
             .context("Failed to load chat thread")?
             .ok_or_else(|| StoreError::not_found("Thread not found"))?;
-        let previous_timestamp = latest_thread_message_timestamp(&tx, &user_message.thread_id)
-            .await?
-            .unwrap_or(thread.updated_at)
-            .max(thread.updated_at);
         let requested_user_timestamp = i64::try_from(user_message.created_at)
             .context("Pending chat user timestamp is out of range")?;
+        if placement == TurnPlacement::ReplaceFromUser {
+            chat_messages::Entity::delete_many()
+                .filter(chat_messages::Column::ThreadId.eq(user_message.thread_id.clone()))
+                .filter(chat_messages::Column::CreatedAt.gte(requested_user_timestamp))
+                .exec(&tx)
+                .await
+                .context("Failed to remove the replaced chat messages")?;
+        }
+        let latest_kept = latest_thread_message_timestamp(&tx, &user_message.thread_id).await?;
+        let previous_timestamp = match placement {
+            // The thread was touched after the replaced turn; only the kept
+            // messages bound the new timestamps.
+            TurnPlacement::ReplaceFromUser => latest_kept.unwrap_or(0),
+            TurnPlacement::Append => latest_kept
+                .unwrap_or(thread.updated_at)
+                .max(thread.updated_at),
+        };
         let user_created_at = requested_user_timestamp.max(previous_timestamp.saturating_add(1));
         if user_created_at == i64::MAX {
             return Err(anyhow!("Chat message timestamp space is exhausted"));
@@ -486,10 +584,11 @@ impl ChatStore {
             content: assistant_content,
             content_parts: None,
             created_at: i64_to_u64(assistant_created_at),
-            tokens_generated: Some(tokens_generated),
-            generation_time_ms: Some(generation_time_ms),
+            tokens_generated,
+            generation_time_ms,
             model_id: Some(model_id.clone()),
             finish_reason,
+            reasoning_ms,
         };
 
         insert_thread_message(&tx, &user_message).await?;
@@ -498,7 +597,7 @@ impl ChatStore {
         let mut thread_update = chat_threads::Entity::update_many()
             .col_expr(
                 chat_threads::Column::UpdatedAt,
-                Expr::value(assistant_created_at),
+                Expr::value(assistant_created_at.max(thread.updated_at)),
             )
             .col_expr(chat_threads::Column::ModelId, Expr::value(Some(model_id)));
         if let Some(system_prompt_update) = system_prompt_update {
@@ -557,6 +656,7 @@ where
         generation_time_ms: Set(message.generation_time_ms),
         model_id: Set(message.model_id.clone()),
         finish_reason: Set(message.finish_reason.clone()),
+        reasoning_ms: Set(message.reasoning_ms.map(u64_to_i64)),
     })
     .exec(db)
     .await
@@ -655,7 +755,8 @@ const CHAT_MESSAGES_LIST_SQL: &str = r#"
         tokens_generated,
         generation_time_ms,
         model_id,
-        finish_reason
+        finish_reason,
+        reasoning_ms
     FROM chat_messages
     WHERE thread_id = ?1
     ORDER BY created_at ASC, id ASC
@@ -716,6 +817,7 @@ fn map_thread_message(row: &QueryResult) -> anyhow::Result<ChatThreadMessage> {
         generation_time_ms: row.try_get_by_index(7)?,
         model_id: row.try_get_by_index(8)?,
         finish_reason: row.try_get_by_index(9)?,
+        reasoning_ms: row.try_get_by_index::<Option<i64>>(10)?.map(i64_to_u64),
     })
 }
 
@@ -956,6 +1058,167 @@ mod tests {
             assert_eq!(messages[0].model_id, None);
             assert_eq!(messages[1].model_id.as_deref(), Some("Qwen3.5-4B"));
             assert_eq!(messages[1].finish_reason.as_deref(), Some("length"));
+            clear_env();
+        })
+        .await;
+    }
+
+    fn retried_turn(user_message: ChatThreadMessage, reply: &str) -> ChatTurn {
+        ChatTurn {
+            user_message,
+            assistant_content: reply.to_string(),
+            model_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+            tokens_generated: Some(2),
+            generation_time_ms: Some(5.0),
+            reasoning_ms: Some(1_200),
+            finish_reason: Some("stop".to_string()),
+            system_prompt_update: None,
+            placement: TurnPlacement::ReplaceFromUser,
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_from_a_user_message_drops_it_and_everything_after() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store.create_thread(None, None).await.unwrap();
+            let mut turns = Vec::new();
+            for (question, answer) in [("First?", "One"), ("Second?", "Two")] {
+                let pending = store
+                    .prepare_user_message(thread.id.clone(), question.into(), None)
+                    .await
+                    .unwrap();
+                turns.push(
+                    store
+                        .append_turn_with_system_prompt(
+                            pending,
+                            answer.into(),
+                            "Qwen3.5-4B".into(),
+                            3,
+                            10.0,
+                            Some("stop".into()),
+                            None,
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            let first_user = turns[0].0.clone();
+
+            // Retry: the same prompt keeps its id and time and gets a new reply.
+            let (user, reply) = store
+                .commit_turn(retried_turn(first_user.clone(), "Uno"))
+                .await
+                .unwrap();
+            assert_eq!(user.id, first_user.id);
+            assert_eq!(user.created_at, first_user.created_at);
+            let messages = store.list_messages(thread.id.clone()).await.unwrap();
+            let contents = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(contents, ["First?", "Uno"]);
+            assert_eq!(messages[1].id, reply.id);
+            assert_eq!(messages[1].reasoning_ms, Some(1_200));
+            assert_eq!(
+                messages[1].model_id.as_deref(),
+                Some("LFM2.5-1.2B-Instruct-GGUF")
+            );
+
+            // Edit: new text for the same message.
+            let mut edited = first_user.clone();
+            edited.content = "First, edited?".into();
+            store
+                .commit_turn(retried_turn(edited, "Edited answer"))
+                .await
+                .unwrap();
+            let messages = store.list_messages(thread.id.clone()).await.unwrap();
+            let contents = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(contents, ["First, edited?", "Edited answer"]);
+            assert_eq!(messages[0].id, first_user.id);
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_keeps_its_prompt_even_without_reply_text() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store.create_thread(None, None).await.unwrap();
+            let pending = store
+                .prepare_user_message(thread.id.clone(), "Tell me a story".into(), None)
+                .await
+                .unwrap();
+            store
+                .commit_turn(ChatTurn {
+                    user_message: pending,
+                    assistant_content: String::new(),
+                    model_id: "Qwen3.5-0.8B".into(),
+                    tokens_generated: None,
+                    generation_time_ms: Some(40.0),
+                    reasoning_ms: None,
+                    finish_reason: Some(CANCELLED_FINISH_REASON.into()),
+                    system_prompt_update: None,
+                    placement: TurnPlacement::Append,
+                })
+                .await
+                .expect("a stopped turn persists");
+            let messages = store.list_messages(thread.id.clone()).await.unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "Tell me a story");
+            assert_eq!(messages[1].content, "");
+            assert_eq!(
+                messages[1].finish_reason.as_deref(),
+                Some(CANCELLED_FINISH_REASON)
+            );
+            assert_eq!(messages[1].tokens_generated, None);
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deletes_one_message_of_its_own_thread() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store.create_thread(None, None).await.unwrap();
+            let other = store.create_thread(None, None).await.unwrap();
+            let pending = store
+                .prepare_user_message(thread.id.clone(), "Hi".into(), None)
+                .await
+                .unwrap();
+            let (_, reply) = store
+                .append_turn_with_system_prompt(
+                    pending,
+                    "Hello".into(),
+                    "Qwen3.5-0.8B".into(),
+                    1,
+                    1.0,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(!store
+                .delete_message(other.id.clone(), reply.id.clone())
+                .await
+                .unwrap());
+            assert!(store
+                .delete_message(thread.id.clone(), reply.id.clone())
+                .await
+                .unwrap());
+            assert!(!store
+                .delete_message(thread.id.clone(), reply.id.clone())
+                .await
+                .unwrap());
+            let messages = store.list_messages(thread.id.clone()).await.unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "Hi");
             clear_env();
         })
         .await;
