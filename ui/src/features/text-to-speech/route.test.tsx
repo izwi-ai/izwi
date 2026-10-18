@@ -528,8 +528,8 @@ describe("TextToSpeechPage", () => {
     expect(
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Enter text for generation")).toBeInTheDocument();
-    expect(screen.getByText("Review settings")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Script" })).toBeInTheDocument();
+    expect(screen.getByText("Model")).toBeInTheDocument();
     expect(screen.getByText("Built-in voice")).toBeInTheDocument();
     expect(screen.getByText("Vivian")).toBeInTheDocument();
     expect(screen.queryByText("Saved voice")).not.toBeInTheDocument();
@@ -555,7 +555,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
     expect(screen.getByText("Enter text to generate speech.")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Temporary draft text" },
     });
 
@@ -577,7 +577,7 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByPlaceholderText("Write the text to speak...")).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "Script" })).toHaveValue("");
     expect(screen.getByRole("switch", { name: /Stream results/ })).toBeChecked();
     expect(
       screen.queryByText("Enter text to generate speech."),
@@ -772,7 +772,7 @@ describe("TextToSpeechPage", () => {
     expect(screen.getByText("Casual Female")).toBeInTheDocument();
     expect(screen.queryByText("Vivian")).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from Voxtral" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
@@ -821,7 +821,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Load model/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
     expect(onLoad).toHaveBeenCalledWith("Qwen3-TTS-12Hz-1.7B-Chat");
   });
 
@@ -923,7 +923,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Unload model/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Unload" }));
     expect(onUnload).toHaveBeenCalledWith("Qwen3-TTS-12Hz-1.7B-Chat");
   });
 
@@ -1103,7 +1103,7 @@ describe("TextToSpeechPage", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from modal" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
@@ -1185,7 +1185,7 @@ describe("TextToSpeechPage", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from final event" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));

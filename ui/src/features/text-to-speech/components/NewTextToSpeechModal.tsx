@@ -9,9 +9,15 @@ import {
   type SpeechHistoryRecordCreateRequest,
 } from "@/api";
 import { CreationDialog } from "@/components/CreationDialog";
-import { Button } from "@/components/ui/button";
+import {
+  CreationBody,
+  CreationField,
+  CreationOption,
+  ModelRow,
+  ModelRowAction,
+} from "@/components/creation/CreationParts";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { Input } from "@/components/ui/input";
-import { StatusBadge } from "@/components/ui/status-badge";
 import {
   Select,
   SelectContent,
@@ -19,7 +25,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { getSpeakerProfilesForVariant } from "@/types";
 
 interface NewTextToSpeechModalProps {
@@ -359,9 +364,6 @@ export function NewTextToSpeechModal({
           : isUnloadAction
             ? "Unload model"
             : "Load model";
-  const modelActionButtonClass = isUnloadAction
-    ? "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]"
-    : "mt-3 h-9 w-full gap-2";
 
   return (
     <CreationDialog
@@ -378,89 +380,31 @@ export function NewTextToSpeechModal({
       submitting={isSubmitting}
       footerStart={`${Array.from(text).length} characters`}
     >
-        <div className="grid gap-0 lg:grid-cols-[minmax(0,1.15fr),minmax(18rem,0.85fr)]">
-          <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                  Script
-                </div>
-                <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-                  Enter text for generation
-                </h3>
-              </div>
+        <CreationBody
+          main={
+            <>
+              <textarea
+                aria-label="Script"
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                disabled={isSubmitting}
+                rows={12}
+                autoFocus
+                placeholder="Write or paste the text to speak…"
+                className="min-h-[17rem] w-full flex-1 resize-y rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-4 py-3 text-[14.5px] leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)]"
+              />
               {isSubmitting ? (
-                <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
+                <div className="inline-flex items-center gap-2 text-xs text-[var(--text-muted)]">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   Creating job
                 </div>
               ) : null}
-            </div>
-
-            <textarea
-              value={text}
-              onChange={(event) => setText(event.target.value)}
-              disabled={isSubmitting}
-              rows={10}
-              placeholder="Write the text to speak..."
-              className="min-h-[15rem] w-full resize-y rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 text-sm leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-muted)] focus:border-[var(--status-info-text)]"
-            />
-
-          </div>
-
-          <div className="px-5 py-5 sm:px-6">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-              Configuration
-            </div>
-            <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-              Review settings
-            </h3>
-
-            <div className="mt-4 space-y-2.5">
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Model readiness
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <StatusBadge
-                    tone={modelStatus === "ready" ? "success" : "warning"}
-                  >
-                    {modelStatus === "ready" ? "Ready" : "Not ready"}
-                  </StatusBadge>
-                  <span className="text-xs text-[var(--text-muted)]">
-                    {selectedModel || "No model selected"}
-                  </span>
-                </div>
-                <Button
-                  type="button"
-                  variant={isUnloadAction ? "outline" : "default"}
-                  size="sm"
-                  className={modelActionButtonClass}
-                  onClick={() => void handleModelAction()}
-                  disabled={isSubmitting || !selectedModel || modelActionBusy}
-                >
-                  {modelActionBusy ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : null}
-                  {modelActionLabel}
-                </Button>
-                <Button
-                  type="button"
-                  variant="default"
-                  size="sm"
-                  className="mt-2 h-9 w-full gap-2"
-                  onClick={onOpenModelManager}
-                  disabled={isSubmitting}
-                >
-                  Open models
-                </Button>
-              </div>
-
+            </>
+          }
+          side={
+            <>
               {usesBuiltInVoiceSelection ? (
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                    Built-in voice
-                  </div>
+                <CreationField label="Built-in voice">
                   <Select
                     value={speaker}
                     onValueChange={setSpeaker}
@@ -468,7 +412,7 @@ export function NewTextToSpeechModal({
                   >
                     <SelectTrigger
                       aria-label="Built-in voice"
-                      className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                      className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
                     >
                       <SelectValue placeholder="Select built-in voice" />
                     </SelectTrigger>
@@ -480,58 +424,53 @@ export function NewTextToSpeechModal({
                       ))}
                     </SelectContent>
                   </Select>
-                </div>
+                </CreationField>
               ) : null}
 
               {usesSavedVoiceSelection ? (
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                    Saved voice
-                  </div>
-                  <div className="space-y-2">
-                    <Select
-                      value={savedVoiceId}
-                      onValueChange={setSavedVoiceId}
-                      disabled={isSubmitting || savedVoicesLoading}
-                    >
-                      <SelectTrigger
-                        aria-label="Saved voice"
-                        className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
-                      >
-                        <SelectValue placeholder="Select saved voice" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {savedVoices.map((voice) => (
-                          <SelectItem key={voice.id} value={voice.id}>
-                            {savedVoiceLabel(voice)}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {savedVoicesLoading ? (
-                      <div className="text-xs text-[var(--text-muted)]">
-                        Loading saved voices...
-                      </div>
-                    ) : null}
-                    {savedVoicesError ? (
-                      <div className="text-xs text-[var(--danger-text)]">
+                <CreationField
+                  label="Saved voice"
+                  hint={
+                    savedVoicesLoading ? (
+                      "Loading saved voices…"
+                    ) : savedVoicesError ? (
+                      <span className="text-[var(--danger-text)]">
                         {savedVoicesError}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
+                      </span>
+                    ) : undefined
+                  }
+                >
+                  <Select
+                    value={savedVoiceId}
+                    onValueChange={setSavedVoiceId}
+                    disabled={isSubmitting || savedVoicesLoading}
+                  >
+                    <SelectTrigger
+                      aria-label="Saved voice"
+                      className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+                    >
+                      <SelectValue placeholder="Select saved voice" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {savedVoices.map((voice) => (
+                        <SelectItem key={voice.id} value={voice.id}>
+                          {savedVoiceLabel(voice)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </CreationField>
               ) : null}
 
               {showsVoiceDescription ? (
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                  <label
-                    htmlFor="tts-voice-description"
-                    className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]"
-                  >
-                    {usesVoiceDescription
+                <CreationField
+                  label={
+                    usesVoiceDescription
                       ? "Voice direction"
-                      : "Style direction (optional)"}
-                  </label>
+                      : "Style direction (optional)"
+                  }
+                  htmlFor="tts-voice-description"
+                >
                   <Input
                     id="tts-voice-description"
                     value={voiceDescription}
@@ -544,37 +483,79 @@ export function NewTextToSpeechModal({
                         : "e.g. speak slowly and warmly"
                     }
                   />
-                </div>
+                </CreationField>
               ) : null}
 
-              <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-[var(--text-primary)]">
-                    Stream results
-                  </div>
-                  <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                    Send live chunks when model streaming is available.
-                  </div>
-                </div>
-                <Switch
-                  className="mt-0.5"
-                  checked={streamingEnabled}
-                  onCheckedChange={setStreamingEnabled}
-                  disabled={isSubmitting || !streamAvailable}
+              <CreationField label="Model">
+                <ModelRow
+                  name={
+                    selectedModel
+                      ? getModelDisplayName(
+                          selectedModel,
+                          selectedModelInfo?.display_name,
+                        )
+                      : "No model selected"
+                  }
+                  status={
+                    !selectedModel
+                      ? "missing"
+                      : modelActionBusy
+                        ? "busy"
+                        : modelStatus === "ready"
+                          ? "ready"
+                          : "not_ready"
+                  }
+                  statusLabel={
+                    modelActionBusy
+                      ? modelActionLabel.replace(/\.\.\.$/, "…")
+                      : modelStatus === "ready"
+                        ? "Loaded"
+                        : selectedModel
+                          ? "Not loaded"
+                          : "Choose one in Models"
+                  }
+                  actions={
+                    <>
+                      {selectedModel && !modelActionBusy ? (
+                        <ModelRowAction
+                          onClick={() => void handleModelAction()}
+                          disabled={isSubmitting}
+                        >
+                          {isUnloadAction ? "Unload" : "Load"}
+                        </ModelRowAction>
+                      ) : null}
+                      <ModelRowAction
+                        onClick={onOpenModelManager}
+                        disabled={isSubmitting}
+                        aria-label="Open models"
+                      >
+                        Change
+                      </ModelRowAction>
+                    </>
+                  }
                 />
-              </label>
-            </div>
+              </CreationField>
 
-            {error ? (
-              <div className="mt-4 rounded-xl border border-[var(--danger-border)] bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)]">
-                <div className="flex items-start gap-2">
+              <CreationOption
+                title="Stream results"
+                description="Start listening before the full take is ready."
+                checked={streamingEnabled}
+                onCheckedChange={setStreamingEnabled}
+                disabled={isSubmitting || !streamAvailable}
+              />
+
+              {error ? (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+                >
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>{error}</span>
                 </div>
-              </div>
-            ) : null}
-          </div>
-        </div>
+              ) : null}
+            </>
+          }
+        />
     </CreationDialog>
   );
 }
