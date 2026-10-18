@@ -107,6 +107,8 @@ interface StudioWorkspaceProps {
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
   onError: (message: string) => void;
+  /** The open project's name (null when none), for the route's header. */
+  onProjectTitleChange?: (title: string | null) => void;
 }
 
 interface StudioRenderQueueItem {
@@ -167,6 +169,7 @@ export function StudioWorkspace({
   onOpenModelManager,
   onModelRequired,
   onError,
+  onProjectTitleChange,
 }: StudioWorkspaceProps) {
   const [projects, setProjects] = useState<StudioProjectSummary[]>([]);
   const [projectsNextCursor, setProjectsNextCursor] = useState<string | null>(
@@ -193,6 +196,10 @@ export function StudioWorkspace({
   const [selectedProject, setSelectedProject] = useState<StudioProjectRecord | null>(
     null,
   );
+  const selectedProjectName = selectedProject?.name ?? null;
+  useEffect(() => {
+    onProjectTitleChange?.(selectedProjectName);
+  }, [onProjectTitleChange, selectedProjectName]);
   const [projectLoading, setProjectLoading] = useState(false);
   const [savedVoices, setSavedVoices] = useState<SavedVoiceSummary[]>([]);
   const [savedVoicesLoading, setSavedVoicesLoading] = useState(false);
@@ -883,7 +890,7 @@ export function StudioWorkspace({
   ]);
   const settingsFieldClass = "space-y-2.5";
   const settingsLabelClass =
-    "text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]";
+    "text-xs font-semibold text-[var(--text-primary)]";
   const settingsControlHeightClass = "h-11";
 
   useEffect(() => {
@@ -2237,7 +2244,7 @@ export function StudioWorkspace({
         <DialogContent className="max-w-4xl border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
           <DialogTitle className="sr-only">Create Studio project</DialogTitle>
           <div className="border-b border-[var(--border-muted)] px-5 py-4 sm:px-6">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+            <div className="text-xs font-medium text-[var(--text-subtle)]">
               New Project
             </div>
             <h3 className="mt-2 text-lg font-semibold text-[var(--text-primary)]">
@@ -2253,7 +2260,7 @@ export function StudioWorkspace({
           <div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_280px]">
             <div className="space-y-4">
               <div className="space-y-2">
-                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                <label className="text-xs font-semibold text-[var(--text-primary)]">
                   Project name
                 </label>
                 <Input
@@ -2265,7 +2272,7 @@ export function StudioWorkspace({
               </div>
 
               <div className="space-y-2">
-                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                <label className="text-xs font-semibold text-[var(--text-primary)]">
                   Source script
                 </label>
                 <Textarea
@@ -2324,7 +2331,7 @@ export function StudioWorkspace({
 
             <div className="space-y-4">
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                <div className="text-xs font-medium text-[var(--text-subtle)]">
                   Workflow
                 </div>
                 <div className="mt-3 grid gap-2 text-xs">
@@ -2341,7 +2348,7 @@ export function StudioWorkspace({
               </div>
 
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                <div className="text-xs font-medium text-[var(--text-subtle)]">
                   Initial render profile
                 </div>
                 <div className="mt-3 text-sm text-[var(--text-secondary)]">
@@ -2608,7 +2615,7 @@ export function StudioWorkspace({
           className="w-[min(92vw,30rem)] max-w-[30rem] gap-0 border-l border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-0"
         >
           <SheetHeader className="gap-0 border-b border-[var(--border-muted)] px-5 py-5 pr-14 sm:px-6">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+            <div className="text-xs font-medium text-[var(--text-subtle)]">
               Segment settings
             </div>
             <SheetTitle className="mt-2 text-base text-[var(--text-primary)]">
@@ -2792,33 +2799,14 @@ export function StudioWorkspace({
         ) : (
           <StudioWorkspaceScaffold
             overview={
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-                <div className="min-w-0">
-                  {onNavigateProject ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => onNavigateProject(null)}
-                      className="mb-4 h-10 gap-2 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 text-sm font-medium text-[var(--text-secondary)] shadow-sm hover:bg-[var(--bg-surface-1)]"
-                    >
-                      <ArrowLeft className="h-4 w-4" />
-                      Back to Studio
-                    </Button>
-                  ) : null}
-                  <h3 className="truncate text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
-                    {selectedProject.name}
-                  </h3>
-                </div>
-                <div className="text-xs text-[var(--text-muted)]">
-                  Updated {formatRelativeDate(selectedProject.updated_at)}
-                </div>
+              <div className="text-xs text-[var(--text-subtle)]">
+                Updated {formatRelativeDate(selectedProject.updated_at)}
               </div>
             }
             statsRail={
               <div className="space-y-6">
                 <div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <div className="text-xs font-medium text-[var(--text-subtle)]">
                     Status
                   </div>
                   <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
@@ -2838,7 +2826,7 @@ export function StudioWorkspace({
                 </div>
 
                 <div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <div className="text-xs font-medium text-[var(--text-subtle)]">
                     Project Stats
                   </div>
                   <div className="mt-2 space-y-2 text-sm">
@@ -2870,7 +2858,7 @@ export function StudioWorkspace({
                 </div>
 
                 <div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <div className="text-xs font-medium text-[var(--text-subtle)]">
                     Completion
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--bg-surface-2)]">
@@ -2885,7 +2873,7 @@ export function StudioWorkspace({
                 </div>
 
                 <section className="space-y-3">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <div className="text-xs font-medium text-[var(--text-subtle)]">
                     Render Queue
                   </div>
                   <div className="text-sm font-semibold text-[var(--text-primary)]">
@@ -2907,7 +2895,7 @@ export function StudioWorkspace({
                             <div className="text-sm text-[var(--text-primary)]">
                               {item.segmentLabel}
                             </div>
-                            <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
+                            <div className="text-xs text-[var(--text-muted)]">
                               {item.status}
                             </div>
                           </div>
@@ -3066,7 +3054,7 @@ export function StudioWorkspace({
             actionRail={
               <div className="space-y-8">
                 <div className="space-y-1">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <div className="text-xs font-medium text-[var(--text-subtle)]">
                     Configuration
                   </div>
                   <p className="text-sm text-[var(--text-secondary)]">
@@ -3085,7 +3073,7 @@ export function StudioWorkspace({
                           Project settings
                         </span>
                         {projectDirty ? (
-                          <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
+                          <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-warning-text)]">
                             Unsaved
                           </span>
                         ) : null}

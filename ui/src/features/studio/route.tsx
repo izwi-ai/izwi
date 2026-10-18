@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { StudioWorkspace } from "@/components/StudioWorkspace";
+import { usePageTitle } from "@/app/router/DocumentTitle";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
@@ -31,6 +32,8 @@ export function StudioPage({
   const [headerActionContainer, setHeaderActionContainer] =
     useState<HTMLDivElement | null>(null);
   const appliedQueryModelRef = useRef(false);
+  const [projectTitle, setProjectTitle] = useState<string | null>(null);
+  usePageTitle(projectId ? projectTitle : null);
   const handleNavigateProject = useCallback(
     (nextProjectId: string | null) => {
       const query = modelQuery ? `?model=${encodeURIComponent(modelQuery)}` : "";
@@ -82,8 +85,20 @@ export function StudioPage({
   return (
     <PageShell>
       <PageHeader
-        title="Studio"
-        description="Manage long-form text-to-speech scripts, render reusable segments, and export merged narration outputs."
+        title={projectId ? (projectTitle ?? "Studio project") : "Studio"}
+        breadcrumbs={
+          projectId
+            ? [
+                { label: "Studio", to: "/studio" },
+                { label: projectTitle ?? "Project" },
+              ]
+            : undefined
+        }
+        description={
+          projectId
+            ? undefined
+            : "Turn long scripts into narrated audio, segment by segment."
+        }
         actions={
           <div
             ref={setHeaderActionContainer}
@@ -101,6 +116,7 @@ export function StudioPage({
         modelOptions={modelOptions}
         headerActionContainer={headerActionContainer}
         onNavigateProject={handleNavigateProject}
+        onProjectTitleChange={setProjectTitle}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {

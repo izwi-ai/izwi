@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { RecordAudioPlayer } from "@/components/audio/RecordAudioPlayer";
 import {
   ArrowDown,
   ArrowUp,
@@ -413,12 +414,12 @@ export function StudioSegmentEditor({
                           className="h-5 w-9"
                         />
                       </div>
-                      <span className="whitespace-nowrap text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                      <span className="whitespace-nowrap text-xs font-semibold text-[var(--text-muted)]">
                         Segment {segment.position + 1}
                       </span>
                       <span
                         className={cn(
-                          "whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em]",
+                          "whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium",
                           segmentDirty
                             ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
                             : segment.speech_record_id
@@ -563,11 +564,10 @@ export function StudioSegmentEditor({
 
                 {segment.speech_record_id ? (
                   <div className="mt-4 space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
-                    <audio
+                    <RecordAudioPlayer
                       src={audioUrlForRecordId(segment.speech_record_id)}
-                      controls
-                      preload="none"
-                      className="h-10 w-full"
+                      durationHint={segment.audio_duration_secs}
+                      compact
                     />
                     <div className="text-xs text-[var(--text-muted)]">
                       {segmentDirty

@@ -8,6 +8,8 @@ interface UseAudioPlaybackOptions {
   durationHint?: number;
   loadErrorMessage?: string;
   playErrorMessage?: string;
+  /** "none" for long lists of players that should not fetch until played. */
+  preload?: "none" | "metadata";
 }
 
 export interface AudioPlayback {
@@ -27,7 +29,7 @@ export interface AudioPlayback {
   audioProps: {
     ref: React.RefObject<HTMLAudioElement>;
     src: string | undefined;
-    preload: "metadata";
+    preload: "none" | "metadata";
     onLoadedMetadata: (event: React.SyntheticEvent<HTMLAudioElement>) => void;
     onTimeUpdate: (event: React.SyntheticEvent<HTMLAudioElement>) => void;
     onPlay: () => void;
@@ -45,6 +47,7 @@ export function useAudioPlayback(
     durationHint = 0,
     loadErrorMessage = "Unable to load this audio.",
     playErrorMessage = "Unable to start playback.",
+    preload = "metadata",
   }: UseAudioPlaybackOptions = {},
 ): AudioPlayback {
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -127,7 +130,7 @@ export function useAudioPlayback(
     audioProps: {
       ref: audioRef,
       src: src ?? undefined,
-      preload: "metadata",
+      preload,
       onLoadedMetadata: (event) => {
         const value = event.currentTarget.duration;
         setMediaDuration(Number.isFinite(value) ? value : 0);
