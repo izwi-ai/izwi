@@ -1,5 +1,6 @@
 import { api, type SpeechHistoryRecordSummary } from "@/api";
 import { normalizeSpeechProcessingStatus } from "@/features/text-to-speech/support";
+import type { ListFilters } from "@/shared/api/pagination";
 import {
   usePolledCursorHistory,
   type UsePolledCursorHistoryResult,
@@ -19,8 +20,11 @@ function isTextToSpeechRecordActive(record: SpeechHistoryRecordSummary): boolean
   return status === "pending" || status === "processing";
 }
 
-export function useTextToSpeechHistory(): UseTextToSpeechHistoryResult {
+export function useTextToSpeechHistory(
+  filters?: ListFilters,
+): UseTextToSpeechHistoryResult {
   return usePolledCursorHistory({
+    filters,
     listPage: listTextToSpeechPage,
     isRecordActive: isTextToSpeechRecordActive,
     loadErrorMessage: "Failed to load text-to-speech history.",

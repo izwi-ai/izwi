@@ -18,10 +18,18 @@ import { TextToSpeechRecordDetail } from "@/features/text-to-speech/components/T
 import { useTextToSpeechHistory } from "@/features/text-to-speech/hooks/useTextToSpeechHistory";
 import { useSpeechStreamPlayback } from "@/features/text-to-speech/hooks/useSpeechStreamPlayback";
 import { useTextToSpeechRecord } from "@/features/text-to-speech/hooks/useTextToSpeechRecord";
+import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
 import {
-  newItemShortcutTitle,
-  useNewItemShortcut,
-} from "@/hooks/useNewItemShortcut";
+  HistoryToolbar,
+  SearchField,
+  SegmentedFilter,
+} from "@/components/history/HistoryToolbar";
+import { NewItemButton } from "@/components/history/NewItemButton";
+import {
+  parseSpeechFilter,
+  SPEECH_FILTER_OPTIONS,
+  speechListFilters,
+} from "@/features/text-to-speech/historyFilters";
 import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
@@ -104,15 +112,37 @@ export function TextToSpeechPage({
       }),
   });
 
+  // List search and filter live in the URL, so Back from a record keeps them.
+  const historySearch = searchParams.get("q") ?? "";
+  const historyFilter = parseSpeechFilter(searchParams.get("show"));
+  const setHistoryParam = useCallback(
+    (key: "q" | "show", value: string) => {
+      const next = new URLSearchParams(searchParams);
+      if (value && !(key === "show" && value === "all")) {
+        next.set(key, value);
+      } else {
+        next.delete(key);
+      }
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+  // "Today" starts at local midnight; fix it per filter choice so polling
+  // keeps the same query.
+  const historyFilters = useMemo(
+    () => speechListFilters(historySearch, historyFilter),
+    [historyFilter, historySearch],
+  );
   const {
     records,
+    total: historyTotal,
     loading: historyLoading,
     loadingMore: historyLoadingMore,
     error: historyError,
     hasMoreRecords,
     loadMoreRecords,
     refresh: refreshHistory,
-  } = useTextToSpeechHistory();
+  } = useTextToSpeechHistory(historyFilters);
   const {
     record,
     loading: recordLoading,
@@ -493,18 +523,9 @@ export function TextToSpeechPage({
         <>
           <PageHeader
             title="Text to Speech"
-            description="Monitor queued, processing, and completed speech generations in one operational history table."
+            description="Your generated speech. Play, reuse or export any take."
             actions={
               <>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-9 gap-2"
-                  onClick={() => setIsNewTextToSpeechModalOpen(true)}
-                  title={newItemShortcutTitle("New generation")}
-                >
-                  New generation
-                </Button>
                 <Button
                   type="button"
                   variant="outline"
@@ -515,12 +536,33 @@ export function TextToSpeechPage({
                   <Settings2 className="h-4 w-4" />
                   Models
                 </Button>
+                <NewItemButton
+                  label="New generation"
+                  onClick={() => setIsNewTextToSpeechModalOpen(true)}
+                />
               </>
             }
           />
 
+          <HistoryToolbar>
+            <SearchField
+              value={historySearch}
+              onChange={(value) => setHistoryParam("q", value)}
+              placeholder="Search text or voice…"
+            />
+            <SegmentedFilter
+              label="Show"
+              options={SPEECH_FILTER_OPTIONS}
+              value={historyFilter}
+              onChange={(value) => setHistoryParam("show", value)}
+              selectedCount={historyLoading ? null : historyTotal}
+            />
+          </HistoryToolbar>
+
           <TextToSpeechHistoryTable
             records={records}
+            total={historyTotal}
+            filtered={Boolean(historySearch.trim()) || historyFilter !== "all"}
             savedVoiceNameById={savedVoiceNameById}
             loading={historyLoading}
             error={historyError}

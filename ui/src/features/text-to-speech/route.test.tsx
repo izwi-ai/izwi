@@ -322,7 +322,7 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No text-to-speech jobs yet" }),
+      screen.getByRole("heading", { name: "No speech yet" }),
     ).toBeInTheDocument();
   });
 
@@ -1269,7 +1269,7 @@ describe("TextToSpeechPage", () => {
       expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalledTimes(2),
     );
     expect(
-      await screen.findByRole("heading", { name: "No text-to-speech jobs yet" }),
+      await screen.findByRole("heading", { name: "No speech yet" }),
     ).toBeInTheDocument();
   });
 
