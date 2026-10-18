@@ -19,6 +19,9 @@ const apiMocks = vi.hoisted(() => ({
   deleteChatThread: vi.fn(),
   sendChatThreadMessageStream: vi.fn(),
   generateTTSStream: vi.fn(),
+  regenerateChatThreadMessageStream: vi.fn(),
+  editChatThreadMessageStream: vi.fn(),
+  deleteChatThreadMessage: vi.fn(),
 }));
 
 const playerMocks = vi.hoisted(() => ({
@@ -64,6 +67,9 @@ vi.mock("@/api", () => ({
     deleteChatThread: apiMocks.deleteChatThread,
     sendChatThreadMessageStream: apiMocks.sendChatThreadMessageStream,
     generateTTSStream: apiMocks.generateTTSStream,
+    regenerateChatThreadMessageStream: apiMocks.regenerateChatThreadMessageStream,
+    editChatThreadMessageStream: apiMocks.editChatThreadMessageStream,
+    deleteChatThreadMessage: apiMocks.deleteChatThreadMessage,
   },
 }));
 
@@ -77,6 +83,9 @@ describe("ChatPlayground", () => {
     apiMocks.deleteChatThread.mockReset();
     apiMocks.sendChatThreadMessageStream.mockReset();
     apiMocks.generateTTSStream.mockReset();
+    apiMocks.regenerateChatThreadMessageStream.mockReset();
+    apiMocks.editChatThreadMessageStream.mockReset();
+    apiMocks.deleteChatThreadMessage.mockReset();
     playerMocks.instances.length = 0;
     createObjectUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
@@ -1845,6 +1854,169 @@ describe("ChatPlayground", () => {
     expect(
       prompt.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
+  });
+
+  describe("retry, edit and delete", () => {
+    const model = "Qwen3.5-4B";
+    const otherModel = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "turns-thread", title: "Turns", model_id: model,
+      created_at: 1, updated_at: 5, last_message_preview: null, message_count: 4 };
+    const history = [
+      { id: "u1", thread_id: thread.id, role: "user", content: "First question",
+        created_at: 1, tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant", content: "First answer",
+        created_at: 2, tokens_generated: 2, generation_time_ms: 20, model_id: model },
+      { id: "u2", thread_id: thread.id, role: "user", content: "Second question",
+        created_at: 3, tokens_generated: null, generation_time_ms: null },
+      { id: "a2", thread_id: thread.id, role: "assistant", content: "Second answer",
+        created_at: 4, tokens_generated: 2, generation_time_ms: 20, model_id: model },
+    ];
+    const onSelectModel = vi.fn();
+
+    const renderTurns = async () => {
+      onSelectModel.mockReset();
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: history });
+      render(<MemoryRouter initialEntries={["/chat?threadId=turns-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} modelLabel={model}
+          modelOptions={[
+            { value: model, label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+            { value: otherModel, label: "LFM2.5 1.2B", statusLabel: "Ready", isReady: true },
+            { value: "Qwen3.5-2B", label: "Qwen3.5 2B", statusLabel: "Not loaded", isReady: false },
+          ]}
+          onSelectModel={onSelectModel} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+      </MemoryRouter>);
+      await screen.findByText("Second answer");
+    };
+
+    const openMoreMenu = async (replyText: string) => {
+      const reply = screen.getByText(replyText).closest("article") as HTMLElement;
+      const trigger = within(reply).getByRole("button", { name: "More reply actions" });
+      fireEvent.pointerDown(trigger);
+      fireEvent.click(trigger);
+      return screen.findByRole("menu");
+    };
+
+    it("retries only the latest reply, streaming a new one in its place", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      const firstReply = screen.getByText("First answer").closest("article") as HTMLElement;
+      expect(within(firstReply).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a2", expect.objectContaining({ model_id: model, truncation: "auto" }),
+        expect.any(Object),
+      );
+      expect(screen.queryByText("Second answer")).not.toBeInTheDocument();
+      expect(screen.getByText("Second question")).toBeInTheDocument();
+      const callbacks = apiMocks.regenerateChatThreadMessageStream.mock.calls[0][3];
+      act(() => callbacks.onDelta("A better answer"));
+      expect(screen.getByText("A better answer")).toBeInTheDocument();
+    });
+
+    it("retries with another loaded model and keeps it selected", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      await openMoreMenu("Second answer");
+      const retryWith = screen.getByRole("menuitem", { name: "Retry with…" });
+      fireEvent.keyDown(retryWith, { key: "ArrowRight" });
+      const menus = await screen.findAllByRole("menu");
+      const submenu = menus[menus.length - 1];
+      expect(within(submenu).queryByText("Qwen3.5 2B")).not.toBeInTheDocument();
+      fireEvent.click(within(submenu).getByRole("menuitem", { name: /LFM2.5 1.2B/ }));
+
+      expect(onSelectModel).toHaveBeenCalledWith(otherModel);
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a2", expect.objectContaining({ model_id: otherModel }), expect.any(Object),
+      );
+    });
+
+    it("reloads history when a retry fails, since the server kept the old reply", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      const callbacks = apiMocks.regenerateChatThreadMessageStream.mock.calls[0][3];
+      act(() => {
+        callbacks.onError("Model crashed");
+        callbacks.onClose();
+      });
+
+      expect(await screen.findByText("Second answer")).toBeInTheDocument();
+      expect(screen.getByText("Model crashed")).toBeInTheDocument();
+    });
+
+    it("edits a message in place and replaces the replies after it", async () => {
+      apiMocks.editChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      const firstPrompt = screen.getByText("First question").closest("article") as HTMLElement;
+      fireEvent.click(within(firstPrompt).getByRole("button", { name: "Edit message" }));
+      const editor = screen.getByRole("textbox", { name: "Edit your message" });
+      expect(editor).toHaveValue("First question");
+      expect(screen.getByText("Sending replaces the replies below this message.")).toBeInTheDocument();
+      fireEvent.change(editor, { target: { value: "First question, reworded" } });
+      fireEvent.keyDown(editor, { key: "Enter" });
+
+      expect(apiMocks.editChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "u1",
+        expect.objectContaining({ content: "First question, reworded", model_id: model }),
+        expect.any(Object),
+      );
+      expect(screen.getByText("First question, reworded")).toBeInTheDocument();
+      for (const gone of ["First answer", "Second question", "Second answer"]) {
+        expect(screen.queryByText(gone)).not.toBeInTheDocument();
+      }
+    });
+
+    it("opens your last message for editing with up arrow, and Escape cancels", async () => {
+      await renderTurns();
+      const composer = screen.getByRole("textbox");
+      fireEvent.keyDown(composer, { key: "ArrowUp" });
+
+      const editor = screen.getByRole("textbox", { name: "Edit your message" });
+      expect(editor).toHaveValue("Second question");
+      fireEvent.keyDown(editor, { key: "Escape" });
+      expect(screen.queryByRole("textbox", { name: "Edit your message" })).not.toBeInTheDocument();
+      expect(apiMocks.editChatThreadMessageStream).not.toHaveBeenCalled();
+    });
+
+    it("deletes a reply after you confirm", async () => {
+      apiMocks.deleteChatThreadMessage.mockResolvedValue({ id: "a1", deleted: true });
+      await renderTurns();
+
+      await openMoreMenu("First answer");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete reply" }));
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText("Delete reply?")).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("button", { name: /Delete/ }));
+
+      await waitFor(() =>
+        expect(apiMocks.deleteChatThreadMessage).toHaveBeenCalledWith(thread.id, "a1"),
+      );
+      await waitFor(() => expect(screen.queryByText("First answer")).not.toBeInTheDocument());
+      expect(screen.getByText("Second answer")).toBeInTheDocument();
+    });
+
+    it("shows the stored reasoning time of a reply from history", async () => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+        history[0],
+        { ...history[1], content: "Weighing it</think>First answer", reasoning_ms: 6_200 },
+      ] });
+      render(<MemoryRouter initialEntries={["/chat?threadId=turns-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={true} modelLabel={model}
+          modelOptions={[{ value: model, label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true }]}
+          modelSupportsThinking={() => true}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+      </MemoryRouter>);
+
+      expect(await screen.findByRole("button", { name: "Thought for 6s" })).toBeInTheDocument();
+    });
   });
 
   it("keeps failed streamed text visible when history refreshes", async () => {

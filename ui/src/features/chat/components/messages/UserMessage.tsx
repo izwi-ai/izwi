@@ -1,6 +1,8 @@
-import { Film, ImageIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Film, ImageIcon, Pencil } from "lucide-react";
 
 import type { ChatThreadMessageRecord } from "@/api";
+import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
@@ -13,13 +15,111 @@ import { MessageTime } from "@/features/chat/components/messages/MessageParts";
 interface UserMessageProps {
   message: ChatThreadMessageRecord;
   onOpenImage: (preview: ImagePreviewState) => void;
+  /** Offer Edit: a text message while no turn is running. */
+  editable: boolean;
+  editing: boolean;
+  onEdit: () => void;
+  onCancelEdit: () => void;
+  onSubmitEdit: (text: string) => void;
 }
 
-/** A sent message in its bubble, with its time shown on hover or focus. */
-export function UserMessage({ message, onOpenImage }: UserMessageProps) {
+const actionButtonClass =
+  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+
+/** Edit-in-place for a sent message. Enter sends, Escape cancels. */
+function EditMessageForm({
+  initialText,
+  onCancel,
+  onSubmit,
+}: {
+  initialText: string;
+  onCancel: () => void;
+  onSubmit: (text: string) => void;
+}) {
+  const [draft, setDraft] = useState(initialText);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }, []);
+
+  const submit = () => {
+    if (draft.trim()) {
+      onSubmit(draft);
+    }
+  };
+
+  return (
+    <form
+      className="ml-[18%] flex flex-col gap-1.5 self-stretch rounded-2xl border border-[var(--border-strong)] bg-[var(--surface-panel)] px-3 py-2.5"
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <textarea
+        ref={textareaRef}
+        aria-label="Edit your message"
+        value={draft}
+        rows={Math.min(8, Math.max(2, draft.split("\n").length))}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            submit();
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          }
+        }}
+        className="w-full resize-none bg-transparent text-[0.9375rem] leading-relaxed text-[var(--text-primary)] focus:outline-none"
+      />
+      <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-subtle)]">
+        <span className="min-w-0 flex-1">
+          Sending replaces the replies below this message.
+        </span>
+        <Button type="button" variant="ghost" size="sm" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button type="submit" size="sm" disabled={!draft.trim()}>
+          Send
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/** A sent message in its bubble, with its time, Copy and Edit shown on
+ * hover or focus. */
+export function UserMessage({
+  message,
+  onOpenImage,
+  editable,
+  editing,
+  onEdit,
+  onCancelEdit,
+  onSubmitEdit,
+}: UserMessageProps) {
   const parsed = parseUserMessageDisplayFromContentParts(message);
   const text =
     parsed && parsed.attachments.length > 0 ? parsed.text : message.content;
+
+  if (editing) {
+    return (
+      <article aria-label="Editing your message" className="flex flex-col">
+        <EditMessageForm
+          initialText={message.content}
+          onCancel={onCancelEdit}
+          onSubmit={onSubmitEdit}
+        />
+      </article>
+    );
+  }
 
   return (
     <article
@@ -74,6 +174,17 @@ export function UserMessage({ message, onOpenImage }: UserMessageProps) {
       <div className="flex h-7 items-center gap-0.5 text-[11.5px] text-[var(--text-subtle)] opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
         <MessageTime timestamp={message.created_at} />
         {text.trim() ? <CopyButton text={text} label="Copy message" /> : null}
+        {editable ? (
+          <button
+            type="button"
+            onClick={onEdit}
+            aria-label="Edit message"
+            title="Edit"
+            className={actionButtonClass}
+          >
+            <Pencil className="h-[15px] w-[15px]" aria-hidden="true" />
+          </button>
+        ) : null}
       </div>
     </article>
   );

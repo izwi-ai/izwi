@@ -125,6 +125,7 @@ export type {
   ChatThreadCreateRequest,
   ChatThreadDetail,
   ChatThreadMessageRecord,
+  ChatThreadRegenerateRequest,
   ChatThreadSendMessageRequest,
   ChatThreadSendMessageResponse,
   ChatThreadStreamCallbacks,

@@ -1,5 +1,13 @@
 import { Fragment } from "react";
-import { Loader2, Square, Volume2 } from "lucide-react";
+import {
+  Check,
+  Loader2,
+  MoreHorizontal,
+  RotateCcw,
+  Square,
+  Trash2,
+  Volume2,
+} from "lucide-react";
 
 import type { ChatGenerationStats, ChatThreadMessageRecord } from "@/api";
 import {
@@ -10,12 +18,25 @@ import {
 import { ReasoningBlock } from "@/features/chat/components/messages/ReasoningBlock";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/CopyButton";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import {
   parseAssistantContent,
   stripThinkingArtifacts,
   summarizeChatStats,
 } from "@/features/chat/playground/support";
+
+const footerButtonClass =
+  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
 
 function speedTitle(stats: ReturnType<typeof summarizeChatStats>): string {
   const parts = [
@@ -42,6 +63,14 @@ interface AssistantMessageProps {
   stats: ChatGenerationStats | null;
   readAloudState: "idle" | "loading" | "playing";
   onReadAloud: (text: string) => void;
+  /** Offer Retry: the thread's last message, while no turn is running. */
+  canRetry: boolean;
+  /** Loaded chat models for Retry with…. */
+  retryModels: { value: string; label: string }[];
+  currentModelId: string | null;
+  onRetry: (modelId?: string) => void;
+  /** Absent while a turn is running. */
+  onDelete?: () => void;
   /** The model that wrote this reply emits reasoning before `</think>`. */
   implicitThink: boolean;
   /** Thinking is on for the turn being streamed. */
@@ -63,6 +92,11 @@ export function AssistantMessage({
   stats,
   readAloudState,
   onReadAloud,
+  canRetry,
+  retryModels,
+  currentModelId,
+  onRetry,
+  onDelete,
   implicitThink,
   thinkingEnabled,
   isThoughtExpanded,
@@ -206,7 +240,7 @@ export function AssistantMessage({
                     : "Stop reading"
               }
               title={readAloudState === "idle" ? "Read aloud" : "Stop"}
-              className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+              className={footerButtonClass}
             >
               {readAloudState === "loading" ? (
                 <Loader2
@@ -219,6 +253,73 @@ export function AssistantMessage({
                 <Volume2 className="h-[15px] w-[15px]" aria-hidden="true" />
               )}
             </button>
+          ) : null}
+          {canRetry ? (
+            <button
+              type="button"
+              onClick={() => onRetry()}
+              aria-label="Retry"
+              title="Retry"
+              className={footerButtonClass}
+            >
+              <RotateCcw className="h-[15px] w-[15px]" aria-hidden="true" />
+            </button>
+          ) : null}
+          {(canRetry && retryModels.length > 0) || onDelete ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="More reply actions"
+                  title="More"
+                  className={footerButtonClass}
+                >
+                  <MoreHorizontal
+                    className="h-[15px] w-[15px]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-48">
+                {canRetry && retryModels.length > 0 ? (
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger className="gap-2">
+                      <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                      Retry with…
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="w-56">
+                      {retryModels.map((model) => (
+                        <DropdownMenuItem
+                          key={model.value}
+                          onSelect={() => onRetry(model.value)}
+                          className="justify-between gap-2"
+                        >
+                          <span className="truncate">{model.label}</span>
+                          {model.value === currentModelId ? (
+                            <Check
+                              className="h-4 w-4 shrink-0"
+                              aria-label="Current model"
+                            />
+                          ) : null}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                ) : null}
+                {canRetry && retryModels.length > 0 && onDelete ? (
+                  <DropdownMenuSeparator />
+                ) : null}
+                {onDelete ? (
+                  <DropdownMenuItem
+                    onSelect={onDelete}
+                    className="gap-2 text-[var(--danger-text)] focus:text-[var(--danger-text)]"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    Delete reply
+                  </DropdownMenuItem>
+                ) : null}
+              </DropdownMenuContent>
+            </DropdownMenu>
           ) : null}
           {answerText ? (
             <span

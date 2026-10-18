@@ -69,14 +69,32 @@ import {
   type ChatReasoningEffort,
   type ChatThread,
   type ChatThreadMessageRecord,
+  type ChatThreadStreamCallbacks,
 } from "@/api";
 import { AssistantMessage } from "@/features/chat/components/messages/AssistantMessage";
 import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
+import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
+
+/** A turn the user stopped, kept on screen until the server's copy loads. */
+interface StoppedTurn {
+  /** The prompt and its partial reply, marked as stopped. */
+  messages: ChatThreadMessageRecord[];
+  /** Messages the thread had before the turn started. */
+  priorIds: Set<string>;
+  /** Messages the turn replaces (a retried reply, or replies after an edit). */
+  replacedIds: string[];
+}
+
+/** What a streaming turn started from, for keeping it if it is stopped. */
+interface TurnContext {
+  priorIds: Set<string>;
+  replacedIds: string[];
+}
 
 interface ChatComposerDraft {
   input: string;
@@ -85,6 +103,17 @@ interface ChatComposerDraft {
 
 function draftKeyForThread(threadId: string | null): string {
   return threadId ?? NEW_CHAT_DRAFT_KEY;
+}
+
+/** Text messages can be edited in place; ones with attachments cannot. */
+function isEditableUserMessage(message: ChatThreadMessageRecord): boolean {
+  return (
+    message.role === "user" &&
+    !message.id.startsWith("tmp-") &&
+    !(message.content_parts ?? []).some(
+      (part) => part.type !== "text" && part.type !== "input_text",
+    )
+  );
 }
 
 function isEmptyDraft(draft: ChatComposerDraft): boolean {
@@ -121,6 +150,14 @@ export function ChatPlayground({
   >({});
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(
+    null,
+  );
+  const [deleteReplyId, setDeleteReplyId] = useState<string | null>(null);
+  const [deleteReplyPending, setDeleteReplyPending] = useState(false);
+  const [deleteReplyError, setDeleteReplyError] = useState<string | null>(
+    null,
+  );
   // Screen readers hear a finished reply once, not each streamed token.
   const [replyAnnouncement, setReplyAnnouncement] = useState("");
   // Drafts intentionally live only for this mounted session. Durable persistence
@@ -188,11 +225,11 @@ export function ChatPlayground({
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
   const messagesRef = useRef<ChatThreadMessageRecord[]>([]);
-  // The server stores a streamed turn only when it completes, so a turn the
-  // user stops lives here for the rest of the session, per thread.
-  const stoppedTurnsRef = useRef<Map<string, ChatThreadMessageRecord[][]>>(
-    new Map(),
-  );
+  // The server stores a stopped turn once its stream has wound down, which
+  // can be after the history reload that follows Stop. Until then the turn
+  // lives here, per thread.
+  const stoppedTurnsRef = useRef<Map<string, StoppedTurn[]>>(new Map());
+  const turnContextRef = useRef<TurnContext | null>(null);
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -206,23 +243,38 @@ export function ChatPlayground({
     messagesRef.current = messages;
   }, [messages]);
 
-  /** History from the server plus this session's stopped turns, each kept
-   * whole and placed by when it was sent. A stopped turn the server did
-   * store wins over the local copy. */
+  /** History from the server plus this session's stopped turns that the
+   * server has not stored yet, each kept whole and placed by when it was
+   * sent. The server's copy is a new stopped reply right after the prompt. */
   const withStoppedTurns = useCallback(
     (threadId: string, history: ChatThreadMessageRecord[]) => {
       let merged = history;
       for (const turn of stoppedTurnsRef.current.get(threadId) ?? []) {
-        if (history.some((stored) => stored.id === turn[0].id)) {
+        const [prompt] = turn.messages;
+        const stored = history.some(
+          (message, index) =>
+            message.role === "assistant" &&
+            message.finish_reason === "cancelled" &&
+            !turn.priorIds.has(message.id) &&
+            history[index - 1]?.role === "user" &&
+            history[index - 1].content === prompt.content,
+        );
+        if (stored) {
           continue;
         }
+        const hidden = new Set([prompt.id, ...turn.replacedIds]);
+        merged = merged.filter((message) => !hidden.has(message.id));
         const insertAt = merged.findIndex(
-          (message) => message.created_at > turn[0].created_at,
+          (message) => message.created_at > prompt.created_at,
         );
         merged =
           insertAt === -1
-            ? [...merged, ...turn]
-            : [...merged.slice(0, insertAt), ...turn, ...merged.slice(insertAt)];
+            ? [...merged, ...turn.messages]
+            : [
+                ...merged.slice(0, insertAt),
+                ...turn.messages,
+                ...merged.slice(insertAt),
+              ];
       }
       return merged;
     },
@@ -301,6 +353,9 @@ export function ChatPlayground({
     () => messages.filter((message) => message.role !== "system"),
     [messages],
   );
+  const busy = isStreaming || isPreparingThread;
+  // Retry with… offers the loaded chat models.
+  const retryModelOptions = modelOptions.filter((option) => option.isReady);
   const lastAssistantIndex = useMemo(() => {
     for (let index = visibleMessages.length - 1; index >= 0; index -= 1) {
       if (visibleMessages[index].role === "assistant") {
@@ -732,7 +787,11 @@ export function ChatPlayground({
           );
         stoppedTurnsRef.current.set(activeId, [
           ...(stoppedTurnsRef.current.get(activeId) ?? []),
-          stoppedTurn,
+          {
+            messages: stoppedTurn,
+            priorIds: turnContextRef.current?.priorIds ?? new Set(),
+            replacedIds: turnContextRef.current?.replacedIds ?? [],
+          },
         ]);
         setMessages([...current.slice(0, lastUserIndex), ...stoppedTurn]);
       }
@@ -1004,8 +1063,6 @@ export function ChatPlayground({
 
     const timestamp = Date.now();
     const userTempId = `tmp-user-${timestamp}`;
-    const assistantTempId = `tmp-assistant-${timestamp}`;
-
     const optimisticUserMessage: ChatThreadMessageRecord = {
       id: userTempId,
       thread_id: targetThreadId,
@@ -1016,201 +1073,377 @@ export function ChatPlayground({
       tokens_generated: null,
       generation_time_ms: null,
     };
+    const threadIdForTurn = targetThreadId;
+    const draftKeyForTurn = targetDraftKey;
 
+    startTurnStream({
+      threadId: threadIdForTurn,
+      startedAt: timestamp,
+      shown: (previous) => [...previous, optimisticUserMessage],
+      promptId: userTempId,
+      replacedIds: [],
+      titleFrom: isFirstTurn ? requestPayload.content : null,
+      restoreOnFailure: false,
+      failureMessage: "Failed to send this message.",
+      start: (callbacks) =>
+        api.sendChatThreadMessageStream(
+          threadIdForTurn,
+          {
+            ...generationOptions(selectedModel),
+            content: requestPayload.content,
+            content_parts: requestPayload.contentParts,
+          },
+          callbacks,
+        ),
+      onStarted: () => {
+        clearComposerDraft(draftKeyForTurn);
+        setImagePreview(null);
+      },
+    });
+  };
+
+  /** Settings every turn sends: the model, thinking and truncation. */
+  const generationOptions = (modelId: string) => {
+    const enableThinking =
+      // Every thinking-capable template reads enable_thinking; sending it
+      // only for some families left Qwen3.6 thinking regardless of the toggle.
+      supportsThinking ? thinkingEnabledForModel : undefined;
+    return {
+      model_id: modelId,
+      system_prompt: systemPromptForModel(supportsThinking),
+      enable_thinking: enableThinking,
+      reasoning_effort:
+        thinkingEnabledForModel &&
+        supportedReasoningEfforts.includes(reasoningEffort)
+          ? reasoningEffort
+          : undefined,
+      // Long threads keep working: the server drops the oldest turns once
+      // the history outgrows the model's context.
+      truncation: "auto" as const,
+    };
+  };
+
+  /**
+   * Streams one turn into the view: a new message, a retried reply or an
+   * edited prompt. `shown` lays out the messages the turn streams after.
+   * A retry or edit that fails reloads history, since the server left the
+   * thread as it was.
+   */
+  const startTurnStream = ({
+    threadId,
+    startedAt,
+    shown,
+    promptId,
+    replacedIds,
+    titleFrom,
+    restoreOnFailure,
+    failureMessage,
+    start,
+    onStarted,
+  }: {
+    threadId: string;
+    startedAt: number;
+    shown: (previous: ChatThreadMessageRecord[]) => ChatThreadMessageRecord[];
+    promptId: string;
+    replacedIds: string[];
+    titleFrom: string | null;
+    restoreOnFailure: boolean;
+    failureMessage: string;
+    start: (callbacks: ChatThreadStreamCallbacks) => AbortController;
+    onStarted?: () => void;
+  }) => {
+    const assistantTempId = `tmp-assistant-${startedAt}`;
     const optimisticAssistantMessage: ChatThreadMessageRecord = {
       id: assistantTempId,
-      thread_id: targetThreadId,
+      thread_id: threadId,
       role: "assistant",
       content: "",
-      created_at: timestamp + 1,
+      created_at: startedAt + 1,
       tokens_generated: null,
       generation_time_ms: null,
     };
+    turnContextRef.current = {
+      priorIds: new Set(
+        messagesRef.current
+          .filter((message) => !message.id.startsWith("tmp-"))
+          .map((message) => message.id),
+      ),
+      replacedIds,
+    };
+    const reloadHistory = () =>
+      void api
+        .getChatThread(threadId)
+        .then((detail) => {
+          if (activeThreadIdRef.current !== threadId) {
+            return;
+          }
+          setMessages(withStoppedTurns(threadId, detail.messages));
+        })
+        .catch(() => {
+          // Ignore follow-up sync failures after stream close.
+        });
 
-    const systemPrompt = systemPromptForModel(supportsThinking);
-    // Every thinking-capable template reads enable_thinking; sending it only
-    // for some families left Qwen3.6 thinking regardless of the toggle.
-    const enableThinking = supportsThinking
-      ? thinkingEnabledForModel
-      : undefined;
-    const selectedReasoningEffort =
-      thinkingEnabledForModel &&
-      supportedReasoningEfforts.includes(reasoningEffort)
-        ? reasoningEffort
-        : undefined;
-
-    setMessages((previous) => [
-      ...previous,
-      optimisticUserMessage,
-      optimisticAssistantMessage,
-    ]);
+    setError(null);
+    setMessages((previous) => [...shown(previous), optimisticAssistantMessage]);
     followingOutputRef.current = true;
     setIsStreaming(true);
-    setStreamStartedAt(timestamp);
-    setStreamingThreadId(targetThreadId);
+    setStreamStartedAt(startedAt);
+    setStreamingThreadId(threadId);
 
     let streamFailed = false;
     try {
-      streamAbortRef.current = api.sendChatThreadMessageStream(
-        targetThreadId,
-        {
-          model_id: selectedModel,
-          content: requestPayload.content,
-          content_parts: requestPayload.contentParts,
-          system_prompt: systemPrompt,
-          enable_thinking: enableThinking,
-          reasoning_effort: selectedReasoningEffort,
-          // Long threads keep working: the server drops the oldest turns
-          // once the history outgrows the model's context.
-          truncation: "auto",
-        },
-        {
-          onStart: ({ userMessage }) => {
-            setMessages((previous) => {
-              let replaced = false;
-              const updated = previous.map((message) => {
-                if (message.id === userTempId) {
-                  replaced = true;
-                  return userMessage;
-                }
-                return message;
-              });
-
-              if (
-                replaced ||
-                updated.some((message) => message.id === userMessage.id)
-              ) {
-                return updated;
+      streamAbortRef.current = start({
+        onStart: ({ userMessage }) => {
+          setMessages((previous) => {
+            let replaced = false;
+            const updated = previous.map((message) => {
+              if (message.id === promptId) {
+                replaced = true;
+                return userMessage;
               }
-
-              return [...updated, userMessage];
+              return message;
             });
-          },
-          onDelta: (delta) => {
-            setMessages((previous) => {
-              let updatedAssistant = false;
-              const updated = previous.map((message) => {
-                if (message.id === assistantTempId) {
-                  updatedAssistant = true;
-                  return { ...message, content: `${message.content}${delta}` };
-                }
-                return message;
-              });
 
-              if (updatedAssistant) {
-                return updated;
-              }
-
-              if (
-                updated.some(
-                  (message) => message.id === optimisticAssistantMessage.id,
-                )
-              ) {
-                return updated;
-              }
-
-              return [
-                ...updated,
-                { ...optimisticAssistantMessage, content: delta },
-              ];
-            });
-          },
-          onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
-            const carryOver = <T,>(previous: Record<string, T>) =>
-              assistantTempId in previous
-                ? { ...previous, [assistantMessage.id]: previous[assistantTempId] }
-                : previous;
-            setReasoningDurations(carryOver);
-            setExpandedThoughts(carryOver);
-            setMessages((previous) => {
-              let replaced = false;
-              const updated = previous.map((message) => {
-                if (message.id === assistantTempId) {
-                  replaced = true;
-                  return assistantMessage;
-                }
-                return message;
-              });
-
-              if (
-                replaced ||
-                updated.some((message) => message.id === assistantMessage.id)
-              ) {
-                return updated;
-              }
-
-              return [...updated, assistantMessage];
-            });
-            setStreamedStats((previous) => ({
-              ...previous,
-              [assistantMessage.id]: streamStats,
-            }));
-            const spokenAnswer = stripMarkdown(
-              parseAssistantContent(assistantMessage.content, {
-                implicitOpenThinkTag: true,
-                treatNoTagAsThinking: false,
-              }).answer,
-            ).trim();
-            setReplyAnnouncement(
-              spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
-            );
-
-            if (isFirstTurn) {
-              void maybeGenerateThreadTitle({
-                threadId: targetThreadId,
-                userContent: requestPayload.content,
-                assistantContent: assistantMessage.content,
-                modelId,
-              });
+            if (
+              replaced ||
+              updated.some((message) => message.id === userMessage.id)
+            ) {
+              return updated;
             }
-          },
-          onError: (message) => {
-            streamFailed = true;
-            setError(message);
-            setMessages((previous) =>
-              previous.filter(
-                (entry) =>
-                  !(
-                    entry.id === assistantTempId &&
-                    entry.content.trim().length === 0
-                  ),
-              ),
-            );
-          },
-          onClose: () => {
-            setIsStreaming(false);
-            setStreamingThreadId(null);
-            streamAbortRef.current = null;
-            void refreshThreadList(targetThreadId);
-            // Failed partial text is useful feedback but is deliberately absent
-            // from persisted history. Keep it visible until the user navigates.
-            if (streamFailed) return;
-            void api
-              .getChatThread(targetThreadId)
-              .then((detail) => {
-                if (activeThreadIdRef.current !== targetThreadId) {
-                  return;
-                }
-                setMessages(withStoppedTurns(targetThreadId, detail.messages));
-              })
-              .catch(() => {
-                // Ignore follow-up sync failures after stream close.
-              });
-          },
+
+            return [...updated, userMessage];
+          });
         },
-      );
-      clearComposerDraft(targetDraftKey);
-      setImagePreview(null);
+        onDelta: (delta) => {
+          setMessages((previous) => {
+            let updatedAssistant = false;
+            const updated = previous.map((message) => {
+              if (message.id === assistantTempId) {
+                updatedAssistant = true;
+                return { ...message, content: `${message.content}${delta}` };
+              }
+              return message;
+            });
+
+            if (updatedAssistant) {
+              return updated;
+            }
+
+            return [
+              ...updated,
+              { ...optimisticAssistantMessage, content: delta },
+            ];
+          });
+        },
+        onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
+          const carryOver = <T,>(previous: Record<string, T>) =>
+            assistantTempId in previous
+              ? { ...previous, [assistantMessage.id]: previous[assistantTempId] }
+              : previous;
+          setReasoningDurations(carryOver);
+          setExpandedThoughts(carryOver);
+          setMessages((previous) => {
+            let replaced = false;
+            const updated = previous.map((message) => {
+              if (message.id === assistantTempId) {
+                replaced = true;
+                return assistantMessage;
+              }
+              return message;
+            });
+
+            if (
+              replaced ||
+              updated.some((message) => message.id === assistantMessage.id)
+            ) {
+              return updated;
+            }
+
+            return [...updated, assistantMessage];
+          });
+          setStreamedStats((previous) => ({
+            ...previous,
+            [assistantMessage.id]: streamStats,
+          }));
+          const spokenAnswer = stripMarkdown(
+            parseAssistantContent(assistantMessage.content, {
+              implicitOpenThinkTag: true,
+              treatNoTagAsThinking: false,
+            }).answer,
+          ).trim();
+          setReplyAnnouncement(
+            spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
+          );
+
+          if (titleFrom !== null) {
+            void maybeGenerateThreadTitle({
+              threadId,
+              userContent: titleFrom,
+              assistantContent: assistantMessage.content,
+              modelId,
+            });
+          }
+        },
+        onError: (message) => {
+          streamFailed = true;
+          setError(message);
+          setMessages((previous) =>
+            previous.filter(
+              (entry) =>
+                !(
+                  entry.id === assistantTempId &&
+                  entry.content.trim().length === 0
+                ),
+            ),
+          );
+        },
+        onClose: () => {
+          setIsStreaming(false);
+          setStreamingThreadId(null);
+          streamAbortRef.current = null;
+          void refreshThreadList(threadId);
+          // Failed partial text of a new message is useful feedback but is
+          // deliberately absent from persisted history. Keep it visible until
+          // the user navigates. A failed retry or edit changed nothing.
+          if (streamFailed && !restoreOnFailure) return;
+          reloadHistory();
+        },
+      });
+      onStarted?.();
     } catch (sendError) {
-      setMessages((previous) =>
-        previous.filter(
-          (message) =>
-            message.id !== userTempId && message.id !== assistantTempId,
-        ),
-      );
       setIsStreaming(false);
       setStreamingThreadId(null);
-      setError(getErrorMessage(sendError, "Failed to send this message."));
+      setError(getErrorMessage(sendError, failureMessage));
+      if (restoreOnFailure) {
+        reloadHistory();
+      } else {
+        setMessages((previous) =>
+          previous.filter(
+            (message) =>
+              message.id !== promptId && message.id !== assistantTempId,
+          ),
+        );
+      }
+    }
+  };
+
+  const canStartTurn = (modelId: string | null): modelId is string => {
+    if (!activeThreadId || isStreaming || isPreparingThread) {
+      return false;
+    }
+    if (!modelId || (modelId === selectedModel && !selectedModelReady)) {
+      onModelRequired();
+      return false;
+    }
+    return true;
+  };
+
+  /** Replaces the latest reply with a new one, optionally from another
+   * loaded model (which then stays selected for the chat). */
+  const retryReply = (replyId: string, modelId: string | null = selectedModel) => {
+    if (!canStartTurn(modelId) || !activeThreadId) {
+      return;
+    }
+    const current = messagesRef.current;
+    const replyIndex = current.findIndex((message) => message.id === replyId);
+    let promptIndex = -1;
+    for (let index = replyIndex - 1; index >= 0; index -= 1) {
+      if (current[index].role === "user") {
+        promptIndex = index;
+        break;
+      }
+    }
+    if (replyIndex === -1 || promptIndex === -1) {
+      return;
+    }
+    if (modelId !== selectedModel) {
+      onSelectModel(modelId);
+    }
+    const threadId = activeThreadId;
+    const prompt = current[promptIndex];
+    startTurnStream({
+      threadId,
+      startedAt: Date.now(),
+      shown: (previous) => {
+        const index = previous.findIndex((message) => message.id === prompt.id);
+        return index === -1 ? previous : previous.slice(0, index + 1);
+      },
+      promptId: prompt.id,
+      replacedIds: current.slice(promptIndex + 1).map((message) => message.id),
+      titleFrom: null,
+      restoreOnFailure: true,
+      failureMessage: "Failed to retry this reply.",
+      start: (callbacks) =>
+        api.regenerateChatThreadMessageStream(
+          threadId,
+          replyId,
+          generationOptions(modelId),
+          callbacks,
+        ),
+    });
+  };
+
+  /** Replaces one of your messages and the replies after it. */
+  const submitEdit = (messageId: string, text: string) => {
+    const content = text.trim();
+    if (!content || !canStartTurn(selectedModel) || !activeThreadId) {
+      return;
+    }
+    const current = messagesRef.current;
+    const index = current.findIndex((message) => message.id === messageId);
+    if (index === -1) {
+      return;
+    }
+    const threadId = activeThreadId;
+    const edited: ChatThreadMessageRecord = {
+      ...current[index],
+      content,
+      content_parts: null,
+    };
+    setEditingMessageId(null);
+    startTurnStream({
+      threadId,
+      startedAt: Date.now(),
+      shown: (previous) => {
+        const at = previous.findIndex((message) => message.id === messageId);
+        return at === -1 ? previous : [...previous.slice(0, at), edited];
+      },
+      promptId: messageId,
+      replacedIds: current.slice(index + 1).map((message) => message.id),
+      titleFrom: null,
+      restoreOnFailure: true,
+      failureMessage: "Failed to send your edit.",
+      start: (callbacks) =>
+        api.editChatThreadMessageStream(
+          threadId,
+          messageId,
+          { ...generationOptions(selectedModel), content },
+          callbacks,
+        ),
+    });
+  };
+
+  const confirmDeleteReply = async () => {
+    const replyId = deleteReplyId;
+    const threadId = activeThreadId;
+    if (!replyId || !threadId) {
+      return;
+    }
+    setDeleteReplyPending(true);
+    setDeleteReplyError(null);
+    try {
+      await api.deleteChatThreadMessage(threadId, replyId);
+      setMessages((previous) =>
+        previous.filter((message) => message.id !== replyId),
+      );
+      setDeleteReplyId(null);
+      void refreshThreadList(threadId);
+    } catch (deleteError) {
+      setDeleteReplyError(
+        getErrorMessage(deleteError, "Failed to delete this reply."),
+      );
+    } finally {
+      setDeleteReplyPending(false);
     }
   };
 
@@ -1307,6 +1540,17 @@ export function ChatPlayground({
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             void sendMessage();
+            return;
+          }
+          // ↑ in an empty composer edits your last message.
+          if (event.key === "ArrowUp" && input.length === 0 && !isStreaming) {
+            const lastUser = [...visibleMessages]
+              .reverse()
+              .find((message) => message.role === "user");
+            if (lastUser && isEditableUserMessage(lastUser)) {
+              event.preventDefault();
+              setEditingMessageId(lastUser.id);
+            }
           }
         }}
         placeholder={
@@ -1695,6 +1939,15 @@ export function ChatPlayground({
                               <UserMessage
                                 message={message}
                                 onOpenImage={setImagePreview}
+                                editable={
+                                  !busy && isEditableUserMessage(message)
+                                }
+                                editing={editingMessageId === messageKey}
+                                onEdit={() => setEditingMessageId(messageKey)}
+                                onCancelEdit={() => setEditingMessageId(null)}
+                                onSubmitEdit={(text) =>
+                                  submitEdit(messageKey, text)
+                                }
                               />
                             ) : (
                               <AssistantMessage
@@ -1730,7 +1983,29 @@ export function ChatPlayground({
                                 turnStartedAt={
                                   isStreamingReply ? streamStartedAt : null
                                 }
-                                reasoningMs={reasoningDurations[messageKey] ?? null}
+                                reasoningMs={
+                                  reasoningDurations[messageKey] ??
+                                  message.reasoning_ms ??
+                                  null
+                                }
+                                canRetry={
+                                  !busy &&
+                                  index === lastAssistantIndex &&
+                                  index === visibleMessages.length - 1
+                                }
+                                retryModels={retryModelOptions}
+                                currentModelId={selectedModel}
+                                onRetry={(modelId) =>
+                                  retryReply(messageKey, modelId)
+                                }
+                                onDelete={
+                                  busy
+                                    ? undefined
+                                    : () => {
+                                        setDeleteReplyError(null);
+                                        setDeleteReplyId(messageKey);
+                                      }
+                                }
                                 onReasoningFinished={(durationMs) =>
                                   setReasoningDurations((previous) => ({
                                     ...previous,
@@ -1806,6 +2081,15 @@ export function ChatPlayground({
           </div>
         )}
       </div>
+
+      <ConfirmDeleteDialog
+        noun={deleteReplyId ? "reply" : null}
+        description="The reply is removed from this chat, and the model no longer sees it in later turns."
+        pending={deleteReplyPending}
+        error={deleteReplyError}
+        onConfirm={() => void confirmDeleteReply()}
+        onCancel={() => setDeleteReplyId(null)}
+      />
 
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {replyAnnouncement}
