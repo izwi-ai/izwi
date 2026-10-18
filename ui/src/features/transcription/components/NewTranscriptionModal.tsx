@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Loader2, Upload } from "lucide-react";
+import { AlertTriangle, Loader2, Upload } from "lucide-react";
 
 import {
   api,
@@ -30,6 +30,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
@@ -736,21 +737,13 @@ export function NewTranscriptionModal({
                           "Add word and segment timing when the aligner path is ready."}
                       </div>
                     </div>
-                    <div className="relative mt-0.5 shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={includeTimestamps}
-                        onChange={(event) =>
-                          handleIncludeTimestampsChange(event.target.checked)
-                        }
-                        className="peer sr-only"
-                        disabled={isSubmitting || streamingEnabled}
-                        title={timestampsUnavailableReason ?? undefined}
-                      />
-                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                      </span>
-                    </div>
+                    <Switch
+                      className="mt-0.5"
+                      checked={includeTimestamps}
+                      onCheckedChange={handleIncludeTimestampsChange}
+                      disabled={isSubmitting || streamingEnabled}
+                      title={timestampsUnavailableReason ?? undefined}
+                    />
                   </label>
 
                   <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
@@ -763,21 +756,13 @@ export function NewTranscriptionModal({
                           "Start the job with live transcript updates instead of waiting for a single final response."}
                       </div>
                     </div>
-                    <div className="relative mt-0.5 shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={streamingEnabled}
-                        onChange={(event) =>
-                          handleStreamingEnabledChange(event.target.checked)
-                        }
-                        className="peer sr-only"
-                        disabled={isSubmitting || includeTimestamps}
-                        title={streamingUnavailableReason ?? undefined}
-                      />
-                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                      </span>
-                    </div>
+                    <Switch
+                      className="mt-0.5"
+                      checked={streamingEnabled}
+                      onCheckedChange={handleStreamingEnabledChange}
+                      disabled={isSubmitting || includeTimestamps}
+                      title={streamingUnavailableReason ?? undefined}
+                    />
                   </label>
                 </>
               )}
@@ -791,20 +776,12 @@ export function NewTranscriptionModal({
                     Create an AI summary after the transcript is ready.
                   </div>
                 </div>
-                <div className="relative mt-0.5 shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={generateSummary}
-                    onChange={(event) =>
-                      setGenerateSummary(event.target.checked)
-                    }
-                    className="peer sr-only"
-                    disabled={isSubmitting}
-                  />
-                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                  </span>
-                </div>
+                <Switch
+                  className="mt-0.5"
+                  checked={generateSummary}
+                  onCheckedChange={setGenerateSummary}
+                  disabled={isSubmitting}
+                />
               </label>
 
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">

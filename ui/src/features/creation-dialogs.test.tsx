@@ -90,17 +90,15 @@ describe("viewport-safe creation dialogs", () => {
       />,
     );
 
-    const streamToggle = screen.getByLabelText(
-      /Stream results/i,
-    ) as HTMLInputElement;
-    const timestampToggle = screen.getByLabelText(
-      /Include timestamps/i,
-    ) as HTMLInputElement;
+    const streamToggle = screen.getByRole("switch", { name: /Stream results/i });
+    const timestampToggle = screen.getByRole("switch", {
+      name: /Include timestamps/i,
+    });
 
     // Streaming defaults on, so timestamps are disabled with an explanation
     // instead of being allowed and silently flipping streaming off.
-    expect(streamToggle.checked).toBe(true);
-    expect(timestampToggle.disabled).toBe(true);
+    expect(streamToggle).toBeChecked();
+    expect(timestampToggle).toBeDisabled();
     expect(
       screen.getByText(
         /Timestamps are unavailable while streaming is enabled/i,
@@ -108,16 +106,16 @@ describe("viewport-safe creation dialogs", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(streamToggle);
-    expect(streamToggle.checked).toBe(false);
-    expect(timestampToggle.disabled).toBe(false);
+    expect(streamToggle).not.toBeChecked();
+    expect(timestampToggle).toBeEnabled();
 
     fireEvent.click(timestampToggle);
-    expect(timestampToggle.checked).toBe(true);
-    expect(streamToggle.disabled).toBe(true);
+    expect(timestampToggle).toBeChecked();
+    expect(streamToggle).toBeDisabled();
     expect(
       screen.getByText(/Streaming is unavailable while timestamps are enabled/i),
     ).toBeInTheDocument();
-    expect(streamToggle.checked).toBe(false);
+    expect(streamToggle).not.toBeChecked();
   });
 
   it("keeps the diarization title, capture actions, and final setting reachable", () => {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, Loader2, Sparkles } from "lucide-react";
 
 import {
   api,
@@ -24,6 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { getSpeakerProfilesForVariant } from "@/types";
 
 interface NewTextToSpeechModalProps {
@@ -577,18 +578,12 @@ export function NewTextToSpeechModal({
                     Send live chunks when model streaming is available.
                   </div>
                 </div>
-                <div className="relative mt-0.5 shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={streamingEnabled}
-                    onChange={(event) => setStreamingEnabled(event.target.checked)}
-                    className="peer sr-only"
-                    disabled={isSubmitting || !streamAvailable}
-                  />
-                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                  </span>
-                </div>
+                <Switch
+                  className="mt-0.5"
+                  checked={streamingEnabled}
+                  onCheckedChange={setStreamingEnabled}
+                  disabled={isSubmitting || !streamAvailable}
+                />
               </label>
             </div>
 

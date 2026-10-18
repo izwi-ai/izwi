@@ -552,7 +552,7 @@ describe("TextToSpeechPage", () => {
       target: { value: "Temporary draft text" },
     });
 
-    const streamToggle = screen.getByRole("checkbox");
+    const streamToggle = screen.getByRole("switch", { name: /Stream results/ });
     expect(streamToggle).toBeChecked();
     fireEvent.click(streamToggle);
     expect(streamToggle).not.toBeChecked();
@@ -571,7 +571,7 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
 
     expect(screen.getByPlaceholderText("Write the text to speak...")).toHaveValue("");
-    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByRole("switch", { name: /Stream results/ })).toBeChecked();
     expect(
       screen.queryByText("Enter text to generate speech."),
     ).not.toBeInTheDocument();
