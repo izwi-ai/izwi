@@ -51,6 +51,7 @@ import {
   displayThreadTitle,
   fallbackThreadTitleFromUserMessage,
   getErrorMessage,
+  stripMarkdown,
   isSameCalendarDay,
   messageDayLabel,
   normalizeGeneratedThreadTitle,
@@ -99,6 +100,8 @@ export function ChatPlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  readAloudVoice = null,
+  onOpenSpeechModels,
 }: ChatPlaygroundProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeThreadId = searchParams.get("threadId");
@@ -178,6 +181,15 @@ export function ChatPlayground({
   const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
+  // Read aloud: one reply plays at a time. The request counter drops audio
+  // that arrives after the user stopped it or picked another reply.
+  const [readAloud, setReadAloud] = useState<{
+    messageId: string;
+    status: "loading" | "playing";
+  } | null>(null);
+  const readAloudAudioRef = useRef<HTMLAudioElement | null>(null);
+  const readAloudUrlRef = useRef<string | null>(null);
+  const readAloudRequestRef = useRef(0);
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -664,6 +676,67 @@ export function ChatPlayground({
       void refreshThreadList(activeId);
     }
   }, [refreshThreadList]);
+
+  const stopReadAloud = useCallback(() => {
+    readAloudRequestRef.current += 1;
+    readAloudAudioRef.current?.pause();
+    readAloudAudioRef.current = null;
+    if (readAloudUrlRef.current) {
+      URL.revokeObjectURL(readAloudUrlRef.current);
+      readAloudUrlRef.current = null;
+    }
+    setReadAloud(null);
+  }, []);
+
+  const toggleReadAloud = useCallback(
+    async (messageId: string, text: string) => {
+      if (readAloud?.messageId === messageId) {
+        stopReadAloud();
+        return;
+      }
+      if (!readAloudVoice) {
+        onOpenSpeechModels?.();
+        return;
+      }
+      stopReadAloud();
+      readAloudRequestRef.current += 1;
+      const request = readAloudRequestRef.current;
+      setReadAloud({ messageId, status: "loading" });
+      try {
+        const audioBlob = await api.generateTTS({
+          text: stripMarkdown(text),
+          model_id: readAloudVoice.modelId,
+          speaker: readAloudVoice.speaker,
+        });
+        if (request !== readAloudRequestRef.current || !isMountedRef.current) {
+          return;
+        }
+        const url = URL.createObjectURL(audioBlob);
+        readAloudUrlRef.current = url;
+        const audio = new Audio(url);
+        readAloudAudioRef.current = audio;
+        audio.onended = () => {
+          if (request === readAloudRequestRef.current) {
+            stopReadAloud();
+          }
+        };
+        await audio.play();
+        if (request === readAloudRequestRef.current) {
+          setReadAloud({ messageId, status: "playing" });
+        }
+      } catch (readError) {
+        if (request !== readAloudRequestRef.current) {
+          return;
+        }
+        stopReadAloud();
+        setError(getErrorMessage(readError, "Couldn't read this reply aloud."));
+      }
+    },
+    [onOpenSpeechModels, readAloud, readAloudVoice, stopReadAloud],
+  );
+
+  // Audio belongs to the conversation on screen.
+  useEffect(() => stopReadAloud, [activeThreadId, stopReadAloud]);
 
   // Starting a chat is local: the thread is created on the server by the
   // first send, so abandoned "New chat" clicks no longer leave empty threads.
@@ -1587,6 +1660,14 @@ export function ChatPlayground({
                                     : null
                                 }
                                 stats={streamedStats[messageKey] ?? null}
+                                readAloudState={
+                                  readAloud?.messageId === messageKey
+                                    ? readAloud.status
+                                    : "idle"
+                                }
+                                onReadAloud={(text) =>
+                                  void toggleReadAloud(messageKey, text)
+                                }
                                 isThoughtExpanded={!!expandedThoughts[messageKey]}
                                 onToggleThought={() =>
                                   setExpandedThoughts((previous) => ({

@@ -1,14 +1,15 @@
-import { useCallback } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import type { ModelInfo } from "@/api";
 import { PageShell } from "@/components/PageShell";
-import { VIEW_CONFIGS } from "@/types";
+import { getSpeakerProfilesForVariant, VIEW_CONFIGS } from "@/types";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   CHAT_PREFERRED_MODELS,
   getChatRouteModelLabel,
   resolvePreferredRouteModel,
+  TEXT_TO_SPEECH_PREFERRED_MODELS,
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
@@ -88,6 +89,39 @@ export function ChatPage({
     [models],
   );
 
+  // Read aloud uses a loaded Text to Speech model with a built-in voice:
+  // the one picked in the speech model manager, else the preferred one.
+  const speechModels = useMemo(
+    () =>
+      models.filter((model) =>
+        VIEW_CONFIGS["custom-voice"].modelFilter(model.variant),
+      ),
+    [models],
+  );
+  const [chosenSpeechModel, setChosenSpeechModel] = useState<string | null>(
+    null,
+  );
+  const [isSpeechModelModalOpen, setIsSpeechModelModalOpen] = useState(false);
+  const readAloudVoice = useMemo(() => {
+    const readyModels = speechModels.filter(
+      (model) =>
+        model.status === "ready" &&
+        getSpeakerProfilesForVariant(model.variant).length > 0,
+    );
+    const modelId = resolvePreferredRouteModel({
+      models: readyModels,
+      selectedModel: chosenSpeechModel,
+      preferredVariants: TEXT_TO_SPEECH_PREFERRED_MODELS,
+    });
+    if (!modelId) {
+      return null;
+    }
+    const speakers = getSpeakerProfilesForVariant(modelId);
+    const speaker =
+      speakers.find((profile) => profile.id === "Vivian")?.id ?? speakers[0].id;
+    return { modelId, speaker };
+  }, [chosenSpeechModel, speechModels]);
+
   return (
     <PageShell className="flex min-h-0 flex-col">
       <ChatPlayground
@@ -111,6 +145,29 @@ export function ChatPage({
           requestModel();
           onError("Select a model and load it to start chatting.");
         }}
+        readAloudVoice={readAloudVoice}
+        onOpenSpeechModels={() => setIsSpeechModelModalOpen(true)}
+      />
+
+      <RouteModelModal
+        isOpen={isSpeechModelModalOpen}
+        onClose={() => setIsSpeechModelModalOpen(false)}
+        title="Speech Models"
+        description="Load a Text to Speech model to read replies aloud."
+        models={speechModels}
+        loading={loading}
+        selectedVariant={readAloudVoice?.modelId ?? null}
+        downloadProgress={downloadProgress}
+        onDownload={onDownload}
+        onCancelDownload={onCancelDownload}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        onDelete={onDelete}
+        onUseModel={(variant) => {
+          setChosenSpeechModel(variant);
+          setIsSpeechModelModalOpen(false);
+        }}
+        emptyMessage={VIEW_CONFIGS["custom-voice"].emptyStateDescription}
       />
 
       <RouteModelModal

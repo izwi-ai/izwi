@@ -18,6 +18,7 @@ const apiMocks = vi.hoisted(() => ({
   createChatThread: vi.fn(),
   deleteChatThread: vi.fn(),
   sendChatThreadMessageStream: vi.fn(),
+  generateTTS: vi.fn(),
 }));
 
 const createObjectUrlMock = vi.fn<(file: File) => string>();
@@ -32,6 +33,7 @@ vi.mock("@/api", () => ({
     createChatThread: apiMocks.createChatThread,
     deleteChatThread: apiMocks.deleteChatThread,
     sendChatThreadMessageStream: apiMocks.sendChatThreadMessageStream,
+    generateTTS: apiMocks.generateTTS,
   },
 }));
 
@@ -44,6 +46,7 @@ describe("ChatPlayground", () => {
     apiMocks.createChatThread.mockReset();
     apiMocks.deleteChatThread.mockReset();
     apiMocks.sendChatThreadMessageStream.mockReset();
+    apiMocks.generateTTS.mockReset();
     createObjectUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
     createObjectUrlMock.mockImplementation((file) => `blob:preview-${file.name}`);
@@ -1663,6 +1666,62 @@ describe("ChatPlayground", () => {
     const reply = await screen.findByRole("article", { name: "Reply" });
     expect(within(reply).getByText(expected)).toBeInTheDocument();
     expect(within(reply).getByText("LFM2.5 1.2B")).toBeInTheDocument();
+  });
+
+  describe("read aloud", () => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "spoken-thread", title: "Spoken", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 2 };
+
+    const renderThread = (props: Partial<Parameters<typeof ChatPlayground>[0]>) => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+        { id: "u1", thread_id: thread.id, role: "user", content: "Say hi",
+          created_at: 1, tokens_generated: null, generation_time_ms: null },
+        { id: "a1", thread_id: thread.id, role: "assistant", content: "**Hi** there",
+          created_at: 2, tokens_generated: 2, generation_time_ms: 20 },
+      ] });
+      render(<MemoryRouter initialEntries={["/chat?threadId=spoken-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} modelLabel={model}
+          modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()}
+          {...props} />
+      </MemoryRouter>);
+    };
+
+    it("reads a reply with the loaded voice and stops on request", async () => {
+      const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+      const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+      createObjectUrlMock.mockReturnValue("blob:reply-audio");
+      apiMocks.generateTTS.mockResolvedValue(new Blob(["wav"], { type: "audio/wav" }));
+      renderThread({ readAloudVoice: { modelId: "Kokoro-82M", speaker: "af_heart" } });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+
+      expect(await screen.findByRole("button", { name: "Stop reading" })).toBeInTheDocument();
+      expect(apiMocks.generateTTS).toHaveBeenCalledWith({
+        text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart",
+      });
+      expect(play).toHaveBeenCalledOnce();
+
+      fireEvent.click(screen.getByRole("button", { name: "Stop reading" }));
+      expect(pause).toHaveBeenCalled();
+      expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:reply-audio");
+      expect(screen.getByRole("button", { name: "Read aloud" })).toBeInTheDocument();
+      play.mockRestore();
+      pause.mockRestore();
+    });
+
+    it("opens the speech model manager when no voice is loaded", async () => {
+      const onOpenSpeechModels = vi.fn();
+      renderThread({ readAloudVoice: null, onOpenSpeechModels });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+
+      expect(onOpenSpeechModels).toHaveBeenCalledOnce();
+      expect(apiMocks.generateTTS).not.toHaveBeenCalled();
+    });
   });
 
   it("keeps failed streamed text visible when history refreshes", async () => {

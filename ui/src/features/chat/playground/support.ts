@@ -33,6 +33,10 @@ export interface ChatPlaygroundProps {
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
+  /** Loaded speech model and voice for Read aloud; null when none is ready. */
+  readAloudVoice?: { modelId: string; speaker: string } | null;
+  /** Opens the speech model manager when Read aloud has no model. */
+  onOpenSpeechModels?: () => void;
 }
 
 export const DEFAULT_SYSTEM_PROMPT: ChatMessage = {

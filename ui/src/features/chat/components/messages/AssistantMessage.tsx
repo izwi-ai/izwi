@@ -1,4 +1,5 @@
 import { Fragment } from "react";
+import { Loader2, Square, Volume2 } from "lucide-react";
 
 import type { ChatGenerationStats, ChatThreadMessageRecord } from "@/api";
 import {
@@ -39,6 +40,8 @@ interface AssistantMessageProps {
   modelLabel: string | null;
   /** Engine stats from streaming this reply in this session. */
   stats: ChatGenerationStats | null;
+  readAloudState: "idle" | "loading" | "playing";
+  onReadAloud: (text: string) => void;
   /** The model that wrote this reply emits reasoning before `</think>`. */
   implicitThink: boolean;
   /** Thinking is on for the turn being streamed. */
@@ -58,6 +61,8 @@ export function AssistantMessage({
   isLatestReply,
   modelLabel,
   stats,
+  readAloudState,
+  onReadAloud,
   implicitThink,
   thinkingEnabled,
   isThoughtExpanded,
@@ -183,6 +188,32 @@ export function AssistantMessage({
         >
           {answerText ? (
             <CopyButton text={answerText} label="Copy reply" />
+          ) : null}
+          {answerText ? (
+            <button
+              type="button"
+              onClick={() => onReadAloud(answerText)}
+              aria-label={
+                readAloudState === "idle"
+                  ? "Read aloud"
+                  : readAloudState === "loading"
+                    ? "Preparing audio, select to cancel"
+                    : "Stop reading"
+              }
+              title={readAloudState === "idle" ? "Read aloud" : "Stop"}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+            >
+              {readAloudState === "loading" ? (
+                <Loader2
+                  className="h-[15px] w-[15px] animate-spin"
+                  aria-hidden="true"
+                />
+              ) : readAloudState === "playing" ? (
+                <Square className="h-3 w-3 fill-current" aria-hidden="true" />
+              ) : (
+                <Volume2 className="h-[15px] w-[15px]" aria-hidden="true" />
+              )}
+            </button>
           ) : null}
           {answerText ? (
             <span
