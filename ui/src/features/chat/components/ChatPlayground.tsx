@@ -36,6 +36,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
+import { ChatThreadList } from "@/features/chat/components/ChatThreadList";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import {
   Dialog,
   DialogContent,
@@ -53,7 +55,6 @@ import {
   displayThreadTitle,
   extractLatestStats,
   fallbackThreadTitleFromUserMessage,
-  formatThreadTimestamp,
   getErrorMessage,
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
@@ -67,7 +68,6 @@ import {
   supportsImageAttachmentsForModel,
   threadHasImageAttachments,
   supportsImplicitOpenThinkTagParsing,
-  threadPreviewFromContent,
 } from "@/features/chat/playground/support";
 import {
   api,
@@ -145,6 +145,9 @@ export function ChatPlayground({
   );
   const [isReadingImages, setIsReadingImages] = useState(false);
   const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
+  // Desktop widths keep the thread list beside the conversation; narrower
+  // windows open it as a drawer.
+  const showThreadColumn = useMediaQuery("(min-width: 1024px)");
   const [deleteTargetThreadId, setDeleteTargetThreadId] = useState<
     string | null
   >(null);
@@ -1084,18 +1087,15 @@ export function ChatPlayground({
     onOpenModelManager();
   };
 
-  const renderModelSelector = (
-    placement: "composer" | "header" = "composer",
-  ) => (
+  const renderModelSelector = (menuPlacement: "top" | "bottom") => (
     <RouteModelSelect
       value={selectedModel}
       options={modelOptions}
       onSelect={onSelectModel}
-      className={cn(
-        placement === "header"
-          ? "w-full max-w-[320px]"
-          : "w-[240px] max-w-[calc(100vw-9rem)] sm:w-[300px]",
-      )}
+      menuPlacement={menuPlacement}
+      aria-label="Chat model"
+      className="w-[220px] max-w-[calc(100vw-12rem)]"
+      triggerClassName="h-8 text-xs"
     />
   );
 
@@ -1229,6 +1229,7 @@ export function ChatPlayground({
               )}
             </Button>
           )}
+          {renderModelSelector(centered ? "bottom" : "top")}
           <Button
             variant="outline"
             size="sm"
@@ -1336,22 +1337,60 @@ export function ChatPlayground({
     </div>
   );
 
+  const selectThread = (threadId: string) => {
+    if (isStreaming || isPreparingThread) {
+      return;
+    }
+    setActiveThreadInUrl(threadId);
+    setError(null);
+  };
+  const renderThreadList = (onAfterSelect?: () => void) => (
+    <ChatThreadList
+      threads={threads}
+      activeThreadId={activeThreadId}
+      loading={threadsLoading}
+      busy={isStreaming || isPreparingThread}
+      onSelect={(threadId) => {
+        selectThread(threadId);
+        onAfterSelect?.();
+      }}
+      onDelete={openDeleteThreadConfirm}
+      onNewChat={() => {
+        handleStartNewChat();
+        onAfterSelect?.();
+      }}
+      className="h-full w-full"
+    />
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <div className="mb-0 flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-[220px] max-w-full flex-1 sm:max-w-[420px]">
-          {renderModelSelector("header")}
+    <div className="flex min-h-0 flex-1 gap-6">
+      {showThreadColumn ? (
+        <aside
+          aria-label="Chat history"
+          className="flex w-[15rem] shrink-0 border-r border-[var(--border-subtle)] pr-4"
+        >
+          {renderThreadList()}
+        </aside>
+      ) : null}
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
+      <div
+        className={cn(
+          "mb-0 flex flex-wrap items-center justify-between gap-3",
+          showThreadColumn && !hasConversation && "hidden",
+        )}
+      >
+        <div className="min-w-0 flex-1">
           {hasConversation && (
-            <div className="mt-2 min-w-0">
-              <h2 className="truncate text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-                {activeThread
-                  ? displayThreadTitle(activeThread.title)
-                  : "Conversation"}
-              </h2>
-            </div>
+            <h2 className="truncate text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+              {activeThread
+                ? displayThreadTitle(activeThread.title)
+                : "Conversation"}
+            </h2>
           )}
         </div>
 
+        {showThreadColumn ? null : (
         <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
           <RouteHistoryDrawer
             title="Chat History"
@@ -1373,109 +1412,7 @@ export function ChatPlayground({
               </Button>
             }
           >
-            {({ close }) => (
-              <div className="app-sidebar-list">
-                {threadsLoading ? (
-                  <div className="app-sidebar-loading">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Loading chats...
-                  </div>
-                ) : threads.length === 0 ? (
-                  <div className="app-sidebar-empty">
-                    No chats yet. Create one to begin.
-                  </div>
-                ) : (
-                  <div className="flex flex-col gap-2.5">
-                    {threads.map((thread) => {
-                      const isActive = thread.id === activeThreadId;
-                      const preview = threadPreviewFromContent(
-                        thread.last_message_preview,
-                      );
-
-                      return (
-                        <div
-                          key={thread.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => {
-                            if (isStreaming || isPreparingThread) {
-                              return;
-                            }
-                            setActiveThreadInUrl(thread.id);
-                            setError(null);
-                            close();
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              if (isStreaming || isPreparingThread) {
-                                return;
-                              }
-                              setActiveThreadInUrl(thread.id);
-                              setError(null);
-                              close();
-                            }
-                          }}
-                          className={cn(
-                            "group app-sidebar-row",
-                            isActive
-                              ? "app-sidebar-row-active"
-                              : "app-sidebar-row-idle",
-                            (isStreaming || isPreparingThread) && "opacity-70",
-                          )}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <p className="app-sidebar-row-label truncate">
-                              {displayThreadTitle(thread.title)}
-                            </p>
-                            <div className="inline-flex items-center gap-1.5 shrink-0">
-                              <span className="app-sidebar-row-meta">
-                                {formatThreadTimestamp(thread.updated_at)}
-                              </span>
-                              <button
-                                type="button"
-                                onPointerDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  if (isStreaming || isPreparingThread) {
-                                    return;
-                                  }
-                                  openDeleteThreadConfirm(thread.id);
-                                }}
-                                disabled={isStreaming || isPreparingThread}
-                                className={cn(
-                                  "app-sidebar-delete-btn relative z-10",
-                                  (isStreaming || isPreparingThread) &&
-                                    "opacity-50",
-                                )}
-                                title="Delete chat"
-                                aria-label={`Delete ${displayThreadTitle(thread.title)}`}
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                          <p
-                            className="app-sidebar-row-preview"
-                            style={{
-                              display: "-webkit-box",
-                              WebkitLineClamp: 3,
-                              WebkitBoxOrient: "vertical",
-                              overflow: "hidden",
-                            }}
-                          >
-                            {preview}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
+            {({ close }) => renderThreadList(close)}
           </RouteHistoryDrawer>
 
           <Button
@@ -1489,6 +1426,7 @@ export function ChatPlayground({
             New chat
           </Button>
         </div>
+        )}
       </div>
 
       <div className="relative flex min-h-0 flex-1 flex-col">
@@ -1500,6 +1438,9 @@ export function ChatPlayground({
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.22 }}
               >
+                <h2 className="mb-6 text-center text-[1.75rem] font-semibold tracking-tight text-[var(--text-primary)]">
+                  What can I help with?
+                </h2>
                 {renderComposer(true)}
               </motion.div>
 
@@ -1976,6 +1917,7 @@ export function ChatPlayground({
           )}
         </DialogContent>
       </Dialog>
+    </div>
     </div>
   );
 }

@@ -61,7 +61,7 @@ describe("ChatPlayground", () => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
-  it("opens the header model dropdown and keeps the send action icon-only", async () => {
+  it("opens the composer model dropdown and keeps the send action icon-only", async () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
@@ -92,9 +92,14 @@ describe("ChatPlayground", () => {
 
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
-    fireEvent.click(
-      screen.getByRole("combobox", { name: "Qwen3.5 4B GGUF (Q4_K_M)" }),
-    );
+    const modelPicker = screen.getByRole("combobox", { name: "Chat model" });
+    expect(modelPicker).toHaveTextContent("Qwen3.5 4B GGUF (Q4_K_M)");
+    expect(
+      within(screen.getByTestId("chat-composer-actions")).getByRole("combobox", {
+        name: "Chat model",
+      }),
+    ).toBe(modelPicker);
+    fireEvent.click(modelPicker);
 
     const qwen38Option = await screen.findByRole("option", {
       name: /Qwen3.8 27B/,
@@ -915,7 +920,7 @@ describe("ChatPlayground", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
     let drawer = await screen.findByRole("dialog", { name: "Chat History" });
-    fireEvent.click(within(drawer).getByText("Thread B").closest('[role="button"]')!);
+    fireEvent.click(within(drawer).getByRole("button", { name: "Thread B" }));
 
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
     expect(
@@ -942,7 +947,7 @@ describe("ChatPlayground", () => {
     act(() => streamCallbacks?.onClose());
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
     drawer = await screen.findByRole("dialog", { name: "Chat History" });
-    fireEvent.click(within(drawer).getByText("Thread A").closest('[role="button"]')!);
+    fireEvent.click(within(drawer).getByRole("button", { name: "Thread A" }));
 
     await waitFor(() =>
       expect(screen.getByRole("textbox")).toHaveValue(

@@ -10,9 +10,15 @@ interface SearchFieldProps {
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
+  className?: string;
 }
 
-export function SearchField({ value, onChange, placeholder }: SearchFieldProps) {
+export function SearchField({
+  value,
+  onChange,
+  placeholder,
+  className,
+}: SearchFieldProps) {
   const [draft, setDraft] = useState(value);
   const onChangeRef = useRef(onChange);
   useEffect(() => {
@@ -36,7 +42,12 @@ export function SearchField({ value, onChange, placeholder }: SearchFieldProps) 
   }, [draft, value]);
 
   return (
-    <label className="flex h-[34px] w-full items-center gap-2 rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-2.5 text-[13px] text-[var(--text-subtle)] focus-within:border-[var(--border-strong)] sm:w-[300px]">
+    <label
+      className={cn(
+        "flex h-[34px] w-full items-center gap-2 rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-2.5 text-[13px] text-[var(--text-subtle)] focus-within:border-[var(--border-strong)] sm:w-[300px]",
+        className,
+      )}
+    >
       <Search aria-hidden="true" className="h-4 w-4 shrink-0" />
       <input
         type="search"
