@@ -22,6 +22,8 @@ interface RouteModelSelectOption {
   label: string;
   statusLabel: string;
   isReady: boolean;
+  /** Model status; drives the icon and tone when present. */
+  status?: OptionStatus;
   disabled?: boolean;
 }
 
@@ -38,64 +40,83 @@ interface RouteModelSelectProps {
   description?: string;
 }
 
+type OptionStatus =
+  | "not_downloaded"
+  | "downloading"
+  | "downloaded"
+  | "loading"
+  | "ready"
+  | "error";
+
+/**
+ * Prefer the option's status enum. Labels are only a fallback for callers
+ * that pass free text, and are matched so "Not downloaded" is never read as
+ * "Downloaded".
+ */
+function resolveOptionStatus(option: RouteModelSelectOption): OptionStatus | null {
+  if (option.isReady) {
+    return "ready";
+  }
+  if (option.status) {
+    return option.status;
+  }
+  const label = option.statusLabel.trim().toLowerCase();
+  if (label.startsWith("not downloaded")) return "not_downloaded";
+  if (label.includes("downloading")) return "downloading";
+  if (label.includes("loading")) return "loading";
+  if (label.startsWith("downloaded")) return "downloaded";
+  if (label.includes("error")) return "error";
+  return null;
+}
+
 function getStatusTone(
   option: RouteModelSelectOption,
 ): ComponentProps<typeof StatusBadge>["tone"] {
-  const normalizedStatus = option.statusLabel.toLowerCase();
-
-  if (option.isReady) {
-    return "success";
+  switch (resolveOptionStatus(option)) {
+    case "ready":
+      return "success";
+    case "downloading":
+    case "loading":
+      return "warning";
+    case "error":
+      return "danger";
+    default:
+      return "neutral";
   }
-  if (
-    normalizedStatus.includes("downloading") ||
-    normalizedStatus.includes("loading")
-  ) {
-    return "warning";
-  }
-  if (normalizedStatus.includes("error")) {
-    return "danger";
-  }
-  return "neutral";
 }
 
 function getStatusPresentation(option: RouteModelSelectOption): {
   icon: typeof CheckCircle2;
   className: string;
 } {
-  const normalizedStatus = option.statusLabel.toLowerCase();
-
-  if (option.isReady) {
-    return {
-      icon: CheckCircle2,
-      className: "text-[var(--status-positive-text)]",
-    };
+  switch (resolveOptionStatus(option)) {
+    case "ready":
+      return {
+        icon: CheckCircle2,
+        className: "text-[var(--status-positive-text)]",
+      };
+    case "downloaded":
+      return {
+        icon: ArrowDownToLine,
+        className: "text-[var(--status-info-text)]",
+      };
+    case "downloading":
+    case "loading":
+      return {
+        icon: Loader2,
+        className: "text-[var(--status-warning-text)]",
+      };
+    case "error":
+      return {
+        icon: AlertTriangle,
+        className: "text-[var(--danger-text)]",
+      };
+    default:
+      return {
+        icon: CircleDashed,
+        className: "text-[var(--text-muted)]",
+      };
   }
-  if (normalizedStatus.includes("downloaded")) {
-    return {
-      icon: ArrowDownToLine,
-      className: "text-[var(--status-info-text)]",
-    };
-  }
-  if (
-    normalizedStatus.includes("downloading") ||
-    normalizedStatus.includes("loading")
-  ) {
-    return {
-      icon: Loader2,
-      className: "text-[var(--status-warning-text)]",
-    };
-  }
-  if (normalizedStatus.includes("error")) {
-    return {
-      icon: AlertTriangle,
-      className: "text-[var(--danger-text)]",
-    };
-  }
-
-  return {
-    icon: CircleDashed,
-    className: "text-[var(--text-muted)]",
-  };
 }
 
 export function RouteModelSelect({

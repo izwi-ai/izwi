@@ -1,3 +1,5 @@
+import { withQwen3Prefix } from "@/utils/modelDisplay";
+
 export const PROVIDER_ORDER = [
   "Qwen",
   "OpenAI",
@@ -440,3 +442,12 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     size: "8.0 GB",
   },
 };
+
+/**
+ * Friendly display name for a model variant ("Qwen3 0.6B CustomVoice"),
+ * falling back to the raw variant id for models the catalog does not list.
+ */
+export function getModelDisplayName(variant: string): string {
+  const details = MODEL_DETAILS[variant];
+  return details ? withQwen3Prefix(details.shortName, variant) : variant;
+}

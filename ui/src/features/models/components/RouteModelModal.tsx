@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   compareQwenVersionRank,
+  getModelDisplayName,
   getModelProviderLabel,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
@@ -26,7 +27,6 @@ import type {
   ModelDownloadProgressEntry,
   ModelDownloadProgressMap,
 } from "@/features/models/downloadProgress";
-import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface RouteModelSection {
   key: string;
@@ -152,7 +152,7 @@ function groupModelsByProvider(models: ModelInfo[]): ProviderGroup[] {
 }
 
 function defaultModelLabel(variant: string): string {
-  return withQwen3Prefix(variant, variant);
+  return getModelDisplayName(variant);
 }
 
 function getModelSizeLabel(

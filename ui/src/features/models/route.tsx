@@ -18,6 +18,7 @@ import {
   compareQwenVersionRank,
   getModelProviderLabel,
   MODEL_DETAILS,
+  getModelDisplayName,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
 import { withQwen3Prefix } from "@/utils/modelDisplay";
@@ -429,10 +430,7 @@ export function MyModelsPage({
                   const details = MODEL_DETAILS[model.variant];
                   if (!details) return null;
 
-                  const displayName = withQwen3Prefix(
-                    details.shortName,
-                    model.variant,
-                  );
+                  const displayName = getModelDisplayName(model.variant);
                   const isDownloading = model.status === "downloading";
                   const isLoading = model.status === "loading";
                   const isReady = model.status === "ready";

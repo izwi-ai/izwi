@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   ChatThreadContentPart,
   ChatThreadMessageRecord,
+  ModelInfo,
 } from "@/api";
 import { API_BASE_URL } from "@/shared/config/runtime";
 
@@ -12,6 +13,7 @@ export interface ModelOption {
   label: string;
   statusLabel: string;
   isReady: boolean;
+  status?: ModelInfo["status"];
 }
 
 export interface ChatPlaygroundProps {
