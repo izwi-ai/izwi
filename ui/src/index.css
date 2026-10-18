@@ -75,7 +75,7 @@
   --shadow-overlay: 0 28px 72px rgba(0, 0, 0, 0.5);
   --app-shadow-soft: var(--shadow-soft);
   --app-shadow-hard: var(--shadow-raised);
-  --font-ui: "Inter", "Manrope", "Plus Jakarta Sans", "Segoe UI Variable", sans-serif;
+  --font-ui: "Inter Variable", "Inter", "Segoe UI Variable", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", monospace;
   --type-size-page-title: 1.75rem;
   --type-size-section-title: 1.125rem;
