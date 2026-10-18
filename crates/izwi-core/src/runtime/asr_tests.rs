@@ -294,6 +294,7 @@ async fn nemotron_public_push_and_finish_select_the_direct_native_path() {
     }));
     let mut stream = RuntimeAsrRealtimeStream {
         variant: ModelVariant::Nemotron35AsrStreaming06B,
+        noise_gate: None,
         resources,
         activity: Arc::new(Notify::new()),
         operation_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -326,6 +327,16 @@ async fn nemotron_public_push_and_finish_select_the_direct_native_path() {
     assert!(!finish.to_string().contains("Engine realtime ASR session"));
 }
 
+/// Only a model that hallucinates on non-speech pays the gate's lookahead:
+/// Voxtral is gated, the Nemotron transducer is not.
+#[test]
+fn realtime_noise_gate_covers_hallucinating_families_only() {
+    let gate = realtime_noise_gate(ModelVariant::VoxtralMini4BRealtime2602)
+        .expect("Voxtral realtime is gated");
+    assert_eq!(gate.lookahead_ms(), izwi_vad::DEFAULT_NOISE_GATE_LOOKAHEAD_MS);
+    assert!(realtime_noise_gate(ModelVariant::Nemotron35AsrStreaming06B).is_none());
+}
+
 fn fixture_realtime_stream(
     max_samples: usize,
     session_lease: Option<Arc<RealtimeAsrSessionLease>>,
@@ -349,6 +360,7 @@ fn fixture_realtime_stream(
     }));
     RuntimeAsrRealtimeStream {
         variant: ModelVariant::VoxtralMini4BRealtime2602,
+        noise_gate: None,
         resources,
         activity: Arc::new(Notify::new()),
         operation_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -740,6 +752,7 @@ async fn realtime_stream_drop_releases_detached_session_quota() {
     }));
     let stream = RuntimeAsrRealtimeStream {
         variant: ModelVariant::VoxtralMini4BRealtime2602,
+        noise_gate: None,
         resources,
         activity: Arc::new(Notify::new()),
         operation_gate: Arc::new(tokio::sync::Mutex::new(())),

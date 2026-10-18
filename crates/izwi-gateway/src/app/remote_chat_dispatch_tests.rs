@@ -983,6 +983,7 @@ async fn fleet_coordinator() -> (
     (
         Arc::new(
             crate::app::fleet_coordinator::FleetCoordinator::new(store, "gateway-test".to_string())
+                .with_claim_timeout(crate::app::fleet_coordinator::TEST_FLEET_CLAIM_TIMEOUT)
                 .opened()
                 .await,
         ),
@@ -1048,7 +1049,8 @@ async fn accepted_work_releases_its_fleet_claim_so_free_credits_stay_dispatchabl
         let coordinator = crate::app::fleet_coordinator::FleetCoordinator::new(
             FleetStore::new(StoreDatabase::new(fleet_db.clone())),
             gateway_id.to_string(),
-        );
+        )
+        .with_claim_timeout(crate::app::fleet_coordinator::TEST_FLEET_CLAIM_TIMEOUT);
         (registry, coordinator)
     };
     let open = |(registry, coordinator): (

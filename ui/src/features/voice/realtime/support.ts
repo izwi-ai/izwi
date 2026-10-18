@@ -926,24 +926,62 @@ export function isVoiceRealtimeServerEvent(
   }
 }
 
-export function shouldStopVoiceRealtimePlayback(
+/** Playback volume while the user may be speaking over the assistant. */
+export const VOICE_REALTIME_DUCK_GAIN = 0.25;
+
+export type VoiceRealtimePlaybackAction = "stop" | "duck" | "restore" | null;
+
+/**
+ * What a server event does to the assistant reply playing for
+ * `activeUtteranceSeq`. A speech start only ducks it: noise, a cough or
+ * speaker echo also start speech, and the server rejects those. The reply
+ * stops once the server interrupts it (a confirmed barge-in) or a newer
+ * utterance becomes a turn, and comes back to full volume when the speech
+ * that ducked it is rejected.
+ */
+export function voiceRealtimePlaybackAction(
   event: VoiceRealtimeServerEvent,
   activeUtteranceSeq: number | null,
-): boolean {
+): VoiceRealtimePlaybackAction {
   if (activeUtteranceSeq == null) {
-    return false;
+    return null;
   }
 
-  if (event.type === "user_speech_start") {
-    return activeUtteranceSeq < event.utterance_seq;
+  switch (event.type) {
+    case "user_speech_start":
+      return activeUtteranceSeq < event.utterance_seq ? "duck" : null;
+    case "user_speech_end":
+      return activeUtteranceSeq < event.utterance_seq ? "stop" : null;
+    case "user_speech_rejected":
+      return activeUtteranceSeq < event.utterance_seq ? "restore" : null;
+    case "turn_interrupted":
+      return activeUtteranceSeq === event.utterance_seq ? "stop" : null;
+    case "turn_done":
+      if (event.status === "interrupted") {
+        return activeUtteranceSeq === event.utterance_seq ? "stop" : null;
+      }
+      // The typed protocol reports a rejected speech start as `no_input`.
+      return event.status === "no_input" &&
+        activeUtteranceSeq < event.utterance_seq
+        ? "restore"
+        : null;
+    default:
+      return null;
   }
-  if (event.type === "turn_interrupted") {
-    return activeUtteranceSeq === event.utterance_seq;
+}
+
+/** Whether a turn event ends the speech the status shows as in progress. */
+export function voiceRealtimeEndsUserSpeech(
+  event: VoiceRealtimeServerEvent,
+  latestSpeechSeq: number,
+): boolean {
+  if (event.type === "user_speech_rejected") {
+    return event.utterance_seq >= latestSpeechSeq;
   }
   return (
     event.type === "turn_done" &&
-    event.status === "interrupted" &&
-    activeUtteranceSeq === event.utterance_seq
+    event.status === "no_input" &&
+    event.utterance_seq >= latestSpeechSeq
   );
 }
 

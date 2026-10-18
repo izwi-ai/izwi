@@ -115,8 +115,7 @@ crates/izwi-core/src/
 │   ├── executor.rs          # UnifiedExecutor, NativeExecutor, ModelExecutor trait
 │   ├── cache/               # Physical arenas, transactions, prefix/window tables
 │   ├── request_processor.rs # Tokenisation, prompt validation
-│   ├── output_processor.rs  # Token sampling, streaming output assembly
-│   └── signal_frontend.rs   # Audio pre-processing, VAD
+│   └── output_processor.rs  # Token sampling, streaming output assembly
 ├── runtime/
 │   ├── mod.rs               # Runtime module exports
 │   ├── service.rs           # RuntimeService — top-level orchestrator
@@ -354,11 +353,14 @@ Converts raw logits from the executor into user-facing output:
 - Streaming chunk assembly and back-pressure management
 - Audio token → waveform decoding (via `codecs/`)
 
-### 5.8 Signal Frontend
+### 5.8 Voice Activity Detection
 
-`signal_frontend.rs` handles audio pre-processing before tokens reach the scheduler:
-- Resampling, normalisation, mel-spectrogram extraction
-- **Voice Activity Detection (VAD):** shared Rust-native Earshot scoring and endpointing from `izwi-vad`.
+VAD lives in the `izwi-vad` crate, outside the engine. Earshot scores 16 ms frames at 16 kHz, and a noise-floor tracker adds each frame's energy above the quietest smoothed energy of the last 3 s (SNR). Earshot normalizes every frame by its own level, so the SNR is what tells steady noise (pink, white, fan, hum) from a voice. Its consumers:
+- **No-speech gate** (`runtime/asr_no_speech.rs` → `izwi-asr-toolkit::scan_speech_presence`): skips the model for hallucinating ASR families unless one second of input holds 200 ms of frames that clear both the score threshold and a 6 dB SNR margin.
+- **Whisper long-form planner** (`engine/executor/audio.rs`): speech regions may only start on an SNR-qualified frame.
+- **Realtime endpointing and barge-in** (`izwi-server` `voice_realtime.rs`): an utterance starts on raw frame SNR ≥ 6 dB and continues while smoothed SNR ≥ 3 dB.
+- **Sortformer diarization mask**: score only, unchanged.
+- **Native realtime ASR noise gate** (`runtime/asr.rs` `realtime_noise_gate`, `izwi_vad::NoiseGate`): for families that hallucinate on non-speech (Voxtral), input is held for a 500 ms lookahead and everything outside confirmed speech (the realtime endpointing rule above) is replaced with digital silence before the model sees it. Sample count and timing are unchanged.
 
 ---
 

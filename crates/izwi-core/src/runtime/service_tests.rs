@@ -2291,7 +2291,7 @@ async fn noise_only_streaming_asr_request_emits_a_terminal_empty_final() {
 
     let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
     let mut request =
-        EngineCoreRequest::asr_bytes(ten_second_wav(|len| pink_noise(len, 0.02, 4)))
+        EngineCoreRequest::asr_bytes(ten_second_wav(|len| pink_noise(len, 0.05, 4)))
             .with_model_variant(ModelVariant::Qwen3Asr17BGguf);
     request.streaming = true;
     let job = admitted_asr_job(&runtime, &request).await;

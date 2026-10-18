@@ -7,4 +7,16 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-earshot = "1.1.0"
+earshot = "1.2.2"
+
+[features]
+# Deterministic synthetic noise generators for tests and the eval example in
+# this and dependent crates.
+test-signals = []
+
+[dev-dependencies]
+hound = { workspace = true }
+
+[[example]]
+name = "vad_eval"
+required-features = ["test-signals"]

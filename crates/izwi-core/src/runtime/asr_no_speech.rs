@@ -6,8 +6,12 @@
 //! own no-speech heuristics keep. The gate runs once on the canonical decoded
 //! audio, before route preparation, for every model family whose capability
 //! says it hallucinates on non-speech. It returns an empty transcript only
-//! when no VAD frame of the whole input reaches the speech planner's start
-//! threshold. It never trims audio: any input with a speech-like frame reaches
+//! when no one-second window of the input holds 200 ms of frames that both
+//! reach the speech planner's start threshold and rise 6 dB over the tracked
+//! noise floor (`izwi_asr_toolkit::scan_speech_presence`). The SNR condition is
+//! what rejects steady noise (pink, white, fan, hum) at any level, which the
+//! level-blind VAD model alone scores as speech. Tonal music and babble still
+//! pass. The gate never trims audio: any input with speech evidence reaches
 //! the model unchanged.
 
 use std::time::Duration;
@@ -41,8 +45,8 @@ pub(crate) struct AsrNoSpeechGate {
 }
 
 impl AsrNoSpeechGate {
-    /// Gate decision for canonical decoded audio: `Some` when no VAD frame
-    /// reaches the speech planner's start threshold.
+    /// Gate decision for canonical decoded audio: `Some` when no window holds
+    /// enough speech evidence.
     pub(crate) fn evaluate(samples: &[f32], sample_rate: u32) -> Option<Self> {
         let scan = scan_speech_presence(samples, sample_rate, &AsrSpeechChunkConfig::default());
         scan.no_speech.then_some(Self {
@@ -64,8 +68,11 @@ impl AsrNoSpeechGate {
         json!({
             "no_speech_gate": {
                 "gated": true,
-                "rule": "no_vad_frame_reaches_speech_threshold",
+                "rule": "no_window_holds_speech_evidence",
                 "threshold": self.scan.threshold,
+                "snr_margin_db": self.scan.snr_margin_db,
+                "evidence_ms": self.scan.evidence_ms,
+                "required_evidence_ms": self.scan.required_ms,
                 "peak_score": self.scan.peak_score,
                 "frames_scored": self.scan.frames_scored,
                 "input_samples": self.input_samples,
@@ -114,51 +121,12 @@ pub(crate) mod tests {
     use crate::engine::EngineCoreRequest;
     use crate::runtime::audio_io::decode_audio_bytes_canonical;
 
+    pub(crate) use izwi_vad::test_signals::pink_noise;
+    use izwi_vad::test_signals::{
+        attenuated, brown_noise, fan_noise, keyboard_clicks, mains_hum, mix_at_snr, white_noise,
+    };
+
     pub(crate) const SAMPLE_RATE: u32 = 16_000;
-
-    /// Deterministic xorshift samples, uniform in `[-1, 1)`.
-    fn uniform_noise(len: usize, seed: u64) -> Vec<f32> {
-        let mut state = seed;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    pub(crate) fn white_noise(len: usize, amplitude: f32, seed: u64) -> Vec<f32> {
-        uniform_noise(len, seed)
-            .into_iter()
-            .map(|sample| sample * amplitude)
-            .collect()
-    }
-
-    /// Pink noise (Paul Kellet's filter over white noise), scaled to `peak`.
-    pub(crate) fn pink_noise(len: usize, peak: f32, seed: u64) -> Vec<f32> {
-        let mut b = [0.0f32; 7];
-        let mut samples = uniform_noise(len, seed)
-            .into_iter()
-            .map(|white| {
-                b[0] = 0.99886 * b[0] + white * 0.055_517_9;
-                b[1] = 0.99332 * b[1] + white * 0.075_075_9;
-                b[2] = 0.96900 * b[2] + white * 0.153_852;
-                b[3] = 0.86650 * b[3] + white * 0.310_485_6;
-                b[4] = 0.55000 * b[4] + white * 0.532_952_2;
-                b[5] = -0.7616 * b[5] - white * 0.016_898;
-                let pink = b.iter().sum::<f32>() + white * 0.5362;
-                b[6] = white * 0.115_926;
-                pink
-            })
-            .collect::<Vec<_>>();
-        let max = samples.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
-        for sample in &mut samples {
-            *sample *= peak / max;
-        }
-        samples
-    }
 
     pub(crate) fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -187,35 +155,60 @@ pub(crate) mod tests {
         decode_audio_bytes_canonical(&bytes).expect("canonical decode")
     }
 
-    fn attenuated(samples: &[f32], db: f32) -> Vec<f32> {
-        let gain = 10f32.powf(db / 20.0);
-        samples.iter().map(|sample| sample * gain).collect()
+    /// Samples as a live request carries them: 16-bit WAV through the
+    /// production canonical decode.
+    fn as_request_audio(samples: &[f32]) -> (Vec<f32>, u32) {
+        decode_audio_bytes_canonical(&wav_bytes(samples, SAMPLE_RATE)).expect("canonical decode")
     }
 
     #[test]
-    fn digital_silence_and_low_level_noise_are_gated() {
+    fn digital_silence_and_noise_at_any_level_are_gated() {
         let len = SAMPLE_RATE as usize * 10;
-        // Noise-floor levels whose frames stay below the speech threshold
-        // (peak frame score <= 0.39 for every seed tried). Louder noise can
-        // score single speech-like frames and is left to the model.
-        let inputs = [
-            ("digital silence", vec![0.0f32; len]),
-            ("pink noise", pink_noise(len, 0.02, 4)),
-            ("white noise", white_noise(len, 0.005, 4)),
-        ];
+        let mut inputs = vec![("digital silence".to_string(), vec![0.0f32; len])];
+        // Pink at peak 0.05 is the `run-asr-matrix.sh` noise fixture (sox
+        // `vol 0.05`) that used to reach Whisper as "you".
+        for peak in [0.02, 0.05, 0.1, 0.3, 0.8] {
+            inputs.push((format!("pink {peak}"), pink_noise(len, peak, 4)));
+        }
+        for peak in [0.005, 0.05, 0.2] {
+            inputs.push((format!("white {peak}"), white_noise(len, peak, 4)));
+        }
+        inputs.push(("brown 0.3".into(), brown_noise(len, 0.3, 4)));
+        inputs.push(("hum 0.3".into(), mains_hum(len, 0.3)));
+        inputs.push(("fan 0.3".into(), fan_noise(len, 0.3, 4)));
+        inputs.push(("keyboard 0.5".into(), keyboard_clicks(len, 0.5, 4)));
         for (name, samples) in inputs {
-            // Inputs travel as 16-bit WAV, like the live requests.
-            let (decoded, sample_rate) =
-                decode_audio_bytes_canonical(&wav_bytes(&samples, SAMPLE_RATE))
-                    .expect("canonical decode");
+            let (decoded, sample_rate) = as_request_audio(&samples);
             let gate = AsrNoSpeechGate::evaluate(&decoded, sample_rate)
                 .unwrap_or_else(|| panic!("{name} must be gated"));
             assert_eq!(gate.duration_secs(), 10.0, "{name}");
-            let diagnostics = gate.diagnostics();
-            let peak = diagnostics["no_speech_gate"]["peak_score"]
+            let diagnostics = &gate.diagnostics()["no_speech_gate"];
+            let evidence = diagnostics["evidence_ms"].as_f64().expect("evidence");
+            let required = diagnostics["required_evidence_ms"]
                 .as_f64()
-                .expect("peak score");
-            assert!(peak < 0.5, "{name} peak {peak}");
+                .expect("required");
+            assert!(evidence < required, "{name}: {diagnostics}");
+        }
+    }
+
+    #[test]
+    fn speech_under_noise_reaches_the_model_down_to_zero_db_snr() {
+        for name in ["fox.wav", "test.wav"] {
+            let (speech, sample_rate) = canonical_fixture(name);
+            for (noise_name, noise) in [
+                ("pink", pink_noise(speech.len(), 0.5, 9)),
+                ("white", white_noise(speech.len(), 0.5, 9)),
+                ("fan", fan_noise(speech.len(), 0.5, 9)),
+                ("hum", mains_hum(speech.len(), 0.5)),
+            ] {
+                for snr in [10.0, 0.0] {
+                    let (mixed, _) = as_request_audio(&mix_at_snr(&speech, &noise, snr));
+                    assert!(
+                        AsrNoSpeechGate::evaluate(&mixed, sample_rate).is_none(),
+                        "{name} + {noise_name} at {snr} dB SNR must reach the model"
+                    );
+                }
+            }
         }
     }
 

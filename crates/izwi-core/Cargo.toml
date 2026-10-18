@@ -114,6 +114,7 @@ accelerate = [
 
 [dev-dependencies]
 tokio-test = "0.4"
+izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }
 
 [build-dependencies]
 cudaforge = "0.1.5"

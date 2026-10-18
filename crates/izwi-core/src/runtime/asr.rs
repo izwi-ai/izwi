@@ -397,6 +397,26 @@ impl GraniteSaaPrefixMode {
     }
 }
 
+/// The noise gate a realtime stream on `variant` feeds its model through:
+/// one for model families that hallucinate on non-speech, unless
+/// `IZWI_ASR_REALTIME_NOISE_GATE=0`. It delays transcripts by
+/// [`izwi_vad::DEFAULT_NOISE_GATE_LOOKAHEAD_MS`].
+fn realtime_noise_gate(variant: ModelVariant) -> Option<izwi_vad::NoiseGate> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled =
+        *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_ASR_REALTIME_NOISE_GATE", true));
+    (variant.family().hallucinates_on_non_speech() && enabled).then(|| {
+        izwi_vad::NoiseGate::new(izwi_vad::NoiseGateConfig {
+            endpoint: izwi_vad::EndpointConfig {
+                snr_margin_db: izwi_vad::configured_snr_margin_db(),
+                continue_snr_margin_db: izwi_vad::configured_snr_margin_db() * 0.5,
+                ..izwi_vad::EndpointConfig::default()
+            },
+            ..izwi_vad::NoiseGateConfig::default()
+        })
+    })
+}
+
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
     capability_row(CapabilityKind::RealtimeAsr, variant).map(|_| variant)
@@ -579,6 +599,9 @@ pub(super) struct RealtimeAsrSessionPolicy {
 
 pub struct RuntimeAsrRealtimeStream {
     variant: ModelVariant,
+    /// Silences non-speech before it reaches a model that hallucinates on it
+    /// (see [`realtime_noise_gate`]).
+    noise_gate: Option<izwi_vad::NoiseGate>,
     resources: Arc<StdMutex<RuntimeAsrRealtimeResources>>,
     activity: Arc<Notify>,
     operation_gate: Arc<tokio::sync::Mutex<()>>,

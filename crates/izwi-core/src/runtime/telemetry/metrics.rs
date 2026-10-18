@@ -46,7 +46,8 @@ use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceLatency, VoiceMetricDescriptor, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
     VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
-    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
+    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_SPEECH_REJECTED_TOTAL,
+    VOICE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::runtime::CoordinatorSnapshot;
 use crate::runtime_models::LoadedModelDiagnostics;
@@ -248,6 +249,7 @@ pub struct VoiceRuntimeTelemetrySnapshot {
     pub sessions_closed: u64,
     pub interruptions: u64,
     pub barge_ins: u64,
+    pub speech_rejected: u64,
     pub stream_backpressure_total: u64,
     pub egress_underruns_total: u64,
     pub ingress_dropped_frames_total: u64,
@@ -323,6 +325,8 @@ pub struct PipelineRuntimeTelemetrySnapshot {
     pub diarization_transcripts: u64,
     pub batch_asr_transcriptions: u64,
     pub batch_tts_speech: u64,
+    /// ASR requests answered with an empty transcript by the no-speech gate.
+    pub asr_no_speech_gated: u64,
     pub stages_recorded: u64,
 }
 
@@ -560,6 +564,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     voice_sessions_closed: AtomicU64,
     voice_interruptions: AtomicU64,
     voice_barge_ins: AtomicU64,
+    voice_speech_rejected: AtomicU64,
     voice_stream_backpressure: AtomicU64,
     voice_egress_underruns: AtomicU64,
     voice_ingress_dropped_frames: AtomicU64,
@@ -574,6 +579,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     pipeline_diarization_transcripts: AtomicU64,
     pipeline_batch_asr_transcriptions: AtomicU64,
     pipeline_batch_tts_speech: AtomicU64,
+    asr_no_speech_gated: AtomicU64,
     pipeline_stages_recorded: AtomicU64,
     stage_observations_total: AtomicU64,
     stage_failures_total: AtomicU64,
@@ -604,6 +610,7 @@ impl RuntimeTelemetryCollector {
             voice_sessions_closed: AtomicU64::new(0),
             voice_interruptions: AtomicU64::new(0),
             voice_barge_ins: AtomicU64::new(0),
+            voice_speech_rejected: AtomicU64::new(0),
             voice_stream_backpressure: AtomicU64::new(0),
             voice_egress_underruns: AtomicU64::new(0),
             voice_ingress_dropped_frames: AtomicU64::new(0),
@@ -618,6 +625,7 @@ impl RuntimeTelemetryCollector {
             pipeline_diarization_transcripts: AtomicU64::new(0),
             pipeline_batch_asr_transcriptions: AtomicU64::new(0),
             pipeline_batch_tts_speech: AtomicU64::new(0),
+            asr_no_speech_gated: AtomicU64::new(0),
             pipeline_stages_recorded: AtomicU64::new(0),
             stage_observations_total: AtomicU64::new(0),
             stage_failures_total: AtomicU64::new(0),
@@ -746,6 +754,14 @@ impl RuntimeTelemetryCollector {
 
     pub(crate) fn record_voice_barge_in(&self) {
         self.voice_barge_ins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_voice_speech_rejected(&self) {
+        self.voice_speech_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_asr_no_speech_gated(&self) {
+        self.asr_no_speech_gated.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_voice_stream_backpressure(&self) {
@@ -895,6 +911,7 @@ impl RuntimeTelemetryCollector {
                 sessions_closed: self.voice_sessions_closed.load(Ordering::Relaxed),
                 interruptions: self.voice_interruptions.load(Ordering::Relaxed),
                 barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
+                speech_rejected: self.voice_speech_rejected.load(Ordering::Relaxed),
                 stream_backpressure_total: self.voice_stream_backpressure.load(Ordering::Relaxed),
                 egress_underruns_total: self.voice_egress_underruns.load(Ordering::Relaxed),
                 ingress_dropped_frames_total: self
@@ -922,6 +939,7 @@ impl RuntimeTelemetryCollector {
                     .pipeline_batch_asr_transcriptions
                     .load(Ordering::Relaxed),
                 batch_tts_speech: self.pipeline_batch_tts_speech.load(Ordering::Relaxed),
+                asr_no_speech_gated: self.asr_no_speech_gated.load(Ordering::Relaxed),
                 stages_recorded: self.pipeline_stages_recorded.load(Ordering::Relaxed),
             },
             observability: RuntimeObservabilityTelemetrySnapshot {
@@ -984,6 +1002,12 @@ impl RuntimeTelemetryCollector {
         );
         push_voice_counter(
             &mut payload,
+            VOICE_SPEECH_REJECTED_TOTAL,
+            "Speech starts the VAD rejected as noise: too little voiced speech or no speech evidence.",
+            snapshot.voice.speech_rejected,
+        );
+        push_voice_counter(
+            &mut payload,
             VOICE_STREAM_BACKPRESSURE_TOTAL,
             "Runtime stream backpressure events.",
             snapshot.voice.stream_backpressure_total,
@@ -1025,12 +1049,14 @@ izwi_realtime_transcription_stream_backpressure_total {}\n",
 # TYPE izwi_inference_pipeline_diarization_transcripts_total counter\nizwi_inference_pipeline_diarization_transcripts_total {}\n\
 # TYPE izwi_inference_pipeline_batch_asr_transcriptions_total counter\nizwi_inference_pipeline_batch_asr_transcriptions_total {}\n\
 # TYPE izwi_inference_pipeline_batch_tts_speech_total counter\nizwi_inference_pipeline_batch_tts_speech_total {}\n\
+# TYPE izwi_inference_pipeline_asr_no_speech_gated_total counter\nizwi_inference_pipeline_asr_no_speech_gated_total {}\n\
 # TYPE izwi_inference_pipeline_stages_recorded_total counter\nizwi_inference_pipeline_stages_recorded_total {}\n",
             snapshot.pipelines.modular_voice_turns,
             snapshot.pipelines.unified_voice_turns,
             snapshot.pipelines.diarization_transcripts,
             snapshot.pipelines.batch_asr_transcriptions,
             snapshot.pipelines.batch_tts_speech,
+            snapshot.pipelines.asr_no_speech_gated,
             snapshot.pipelines.stages_recorded
         ));
         payload.push_str(&format!(
@@ -1523,6 +1549,8 @@ mod tests {
         telemetry.record_voice_session_closed();
         telemetry.record_voice_interruption();
         telemetry.record_voice_barge_in();
+        telemetry.record_voice_speech_rejected();
+        telemetry.record_asr_no_speech_gated();
         telemetry.record_voice_stream_backpressure();
         telemetry.record_transcription_stream_backpressure();
 
@@ -1531,6 +1559,8 @@ mod tests {
         assert_eq!(snapshot.voice.sessions_closed, 1);
         assert_eq!(snapshot.voice.interruptions, 1);
         assert_eq!(snapshot.voice.barge_ins, 1);
+        assert_eq!(snapshot.voice.speech_rejected, 1);
+        assert_eq!(snapshot.pipelines.asr_no_speech_gated, 1);
         assert_eq!(snapshot.voice.stream_backpressure_total, 1);
         assert_eq!(snapshot.realtime.transcription_stream_backpressure_total, 1);
         assert!(snapshot
@@ -1545,6 +1575,8 @@ mod tests {
         assert!(payload.contains("izwi_realtime_transcription_stream_backpressure_total 1"));
         assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
         assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
+        assert!(payload.contains("izwi_voice_vad_speech_rejected_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_asr_no_speech_gated_total 1"));
         assert!(payload.contains("izwi_voice_metric_contract_info"));
     }
 

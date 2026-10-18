@@ -22,6 +22,7 @@ pub const VOICE_TTS_FIRST_AUDIO_SECONDS: &str = "voice.tts.first_audio_seconds";
 pub const VOICE_TURN_FIRST_AUDIO_SECONDS: &str = "voice.turn.first_audio_seconds";
 pub const VOICE_BARGE_IN_LATENCY_SECONDS: &str = "voice.barge_in.latency_seconds";
 pub const VOICE_BARGE_IN_TOTAL: &str = "voice.barge_in.events_total";
+pub const VOICE_SPEECH_REJECTED_TOTAL: &str = "voice.vad.speech_rejected_total";
 pub const VOICE_SESSION_INTERRUPTED_TOTAL: &str = "voice.session.interruptions_total";
 pub const VOICE_STREAM_BACKPRESSURE_TOTAL: &str = "voice.stream.backpressure_total";
 
@@ -127,6 +128,10 @@ pub const VOICE_METRIC_CATALOG: &[VoiceMetricDescriptor] = &[
     VoiceMetricDescriptor {
         name: VOICE_BARGE_IN_TOTAL,
         description: "Voice barge-in interruptions.",
+    },
+    VoiceMetricDescriptor {
+        name: VOICE_SPEECH_REJECTED_TOTAL,
+        description: "Speech starts the VAD rejected as noise: too little voiced speech or no speech evidence.",
     },
     VoiceMetricDescriptor {
         name: VOICE_SESSION_INTERRUPTED_TOTAL,

@@ -106,7 +106,7 @@ protocol.
 
 ### Audio Settings
 
-- **Auto-detect silence** — Automatically stop recording when you stop speaking
+- **Automatic turn detection** — The server ends your turn after a short silence. Steady background noise (a fan, hum) does not start a turn, and a cough or a noise burst while the assistant talks lowers its volume instead of cutting it off
 - **Playback speed** — Adjust response playback speed from `0.75x` to `1.75x`
 - **Mute output** — Silence assistant playback without ending the session
 

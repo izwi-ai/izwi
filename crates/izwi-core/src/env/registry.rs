@@ -63,6 +63,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Maximum concurrent realtime ASR sessions (positive integer; 0 or invalid ignored).",
     ),
     CoreEnvVar::new(
+        "IZWI_ASR_REALTIME_NOISE_GATE",
+        Flag,
+        "true",
+        Once,
+        "Silences non-speech before it reaches a realtime ASR model that hallucinates on it (Voxtral), at a 500 ms transcript delay; false lets noise reach the model.",
+    ),
+    CoreEnvVar::new(
         "IZWI_ASR_STREAM_CHUNK_MAX_SECS",
         Float,
         "3.2 (audio <=12s) else min(long-form max, 8)",
