@@ -6,7 +6,9 @@ import {
   encodeVoiceRealtimeClientPcm16Frame,
   formatModelVariantLabel,
   isAsrVariant,
+  isUsableVoiceModelStatus,
   isValidVoiceRealtimeV2Successor,
+  isVoiceRealtimeV2EnvelopeHeader,
   isVoiceRealtimeV2ServerEnvelope,
   isVoiceRealtimeServerEvent,
   isUnifiedAudioChatVariant,
@@ -174,6 +176,58 @@ describe("voice realtime support", () => {
     expect(isValidVoiceRealtimeV2Successor(next, { ...next, event_id: 3 })).toBe(
       false,
     );
+  });
+
+  it("reports which session models loaded through typed models_status", () => {
+    const models = [
+      { stage: "asr", model_id: "Parakeet-TDT-0.6B-v3", ready: true },
+      {
+        stage: "text",
+        model_id: "Qwen3.5-4B",
+        ready: false,
+        error: "Cannot load Qwen3.5 4B GGUF",
+      },
+    ];
+    const status = voiceV2Envelope(2, {
+      type: "models_status",
+      data: { models },
+    });
+
+    expect(isVoiceRealtimeV2ServerEnvelope(status)).toBe(true);
+    expect(normalizeVoiceRealtimeV2Event(status)).toEqual({
+      type: "models_ready",
+      models,
+    });
+    expect(
+      isVoiceRealtimeV2ServerEnvelope(
+        voiceV2Envelope(2, {
+          type: "models_status",
+          data: { models: [{ stage: "asr", ready: "yes" }] },
+        } as never),
+      ),
+    ).toBe(false);
+  });
+
+  it("counts an unknown typed event towards the sequence without handling it", () => {
+    const future = voiceV2Envelope(3, { type: "from_the_future" } as never);
+
+    expect(isVoiceRealtimeV2EnvelopeHeader(future)).toBe(true);
+    expect(isVoiceRealtimeV2ServerEnvelope(future)).toBe(false);
+    expect(
+      isValidVoiceRealtimeV2Successor(
+        voiceV2Envelope(2, { type: "session_started" }),
+        future,
+      ),
+    ).toBe(true);
+  });
+
+  it("starts a conversation on downloaded models, which the server loads", () => {
+    expect(isUsableVoiceModelStatus("ready")).toBe(true);
+    expect(isUsableVoiceModelStatus("downloaded")).toBe(true);
+    expect(isUsableVoiceModelStatus("loading")).toBe(true);
+    expect(isUsableVoiceModelStatus("not_downloaded")).toBe(false);
+    expect(isUsableVoiceModelStatus("downloading")).toBe(false);
+    expect(isUsableVoiceModelStatus("error")).toBe(false);
   });
 
   it("rejects unknown and malformed voice server events", () => {

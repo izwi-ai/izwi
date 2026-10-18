@@ -47,9 +47,10 @@ import {
   encodeWavPcm16,
   formatBytes,
   formatModelVariantLabel,
-  isRunnableModelStatus,
   isUnifiedAudioChatVariant,
+  isUsableVoiceModelStatus,
   isValidVoiceRealtimeV2Successor,
+  isVoiceRealtimeV2EnvelopeHeader,
   isVoiceRealtimeV2ServerEnvelope,
   isVoiceRealtimeServerEvent,
   makeTranscriptEntryId,
@@ -67,16 +68,13 @@ import {
   type VoiceRealtimeAssistantAudioBinaryChunk,
   type VoiceRealtimeClientMessage,
   type VoiceRealtimeServerEvent,
-  type VoiceRealtimeV2ServerEnvelope,
+  type VoiceRealtimeV2EnvelopeHeader,
 } from "@/features/voice/realtime/support";
 import { getSpeakerProfilesForVariant } from "@/types";
 
 const VOICE_OUTPUT_MUTED_STORAGE_KEY = "izwi.voice.output_muted";
-const VOICE_PLAYBACK_SPEED_STORAGE_KEY = "izwi.voice.playback_speed";
-
-function clampPlaybackSpeed(value: number) {
-  return Math.min(1.75, Math.max(0.75, value));
-}
+/** Kokoro's most natural English voice; other engines start on their first. */
+const PREFERRED_ASSISTANT_SPEAKER = "af_heart";
 
 type VoiceConfigTab = "setup" | "models" | "agent" | "memory";
 
@@ -109,7 +107,9 @@ export function VoicePage({
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [audioLevel, setAudioLevel] = useState(0);
 
-  const [selectedSpeaker, setSelectedSpeaker] = useState("Serena");
+  const [selectedSpeaker, setSelectedSpeaker] = useState(
+    PREFERRED_ASSISTANT_SPEAKER,
+  );
   const [voiceMode, setVoiceMode] = useState<VoiceRealtimeMode>("modular");
 
   const [isConfigOpen, setIsConfigOpen] = useState(false);
@@ -118,13 +118,6 @@ export function VoicePage({
   const [isOutputMuted, setIsOutputMuted] = useState(() => {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(VOICE_OUTPUT_MUTED_STORAGE_KEY) === "1";
-  });
-  const [playbackSpeed] = useState(() => {
-    if (typeof window === "undefined") return 1;
-    const raw = Number.parseFloat(
-      window.localStorage.getItem(VOICE_PLAYBACK_SPEED_STORAGE_KEY) ?? "1",
-    );
-    return Number.isFinite(raw) ? clampPlaybackSpeed(raw) : 1;
   });
   const [savedSystemPrompt, setSavedSystemPrompt] = useState(
     VOICE_AGENT_SYSTEM_PROMPT,
@@ -173,7 +166,6 @@ export function VoicePage({
   const ttsSampleRateRef = useRef(24000);
   const ttsSamplesRef = useRef<Float32Array[]>([]);
   const ttsStreamSessionRef = useRef(0);
-  const playbackSpeedRef = useRef(1);
   const isOutputMutedRef = useRef(false);
   /** Assistant playback is ducked while the user may be speaking over it. */
   const playbackDuckedRef = useRef(false);
@@ -191,7 +183,7 @@ export function VoicePage({
     ((error?: Error) => void) | null
   >(null);
   const voiceWsInputFrameSeqRef = useRef(0);
-  const voiceWsV2EventRef = useRef<VoiceRealtimeV2ServerEnvelope | null>(null);
+  const voiceWsV2EventRef = useRef<VoiceRealtimeV2EnvelopeHeader | null>(null);
   const voiceMinAcceptedAssistantSeqRef = useRef(0);
   const voiceLatestSpeechSeqRef = useRef(0);
   const setPlaybackDucked = useCallback(
@@ -297,7 +289,13 @@ export function VoicePage({
 
   useEffect(() => {
     if (!assistantSpeakers.some((speaker) => speaker.id === selectedSpeaker)) {
-      setSelectedSpeaker(assistantSpeakers[0]?.id ?? "Serena");
+      setSelectedSpeaker(
+        assistantSpeakers.find(
+          (speaker) => speaker.id === PREFERRED_ASSISTANT_SPEAKER,
+        )?.id ??
+          assistantSpeakers[0]?.id ??
+          PREFERRED_ASSISTANT_SPEAKER,
+      );
     }
   }, [assistantSpeakers, selectedSpeaker]);
 
@@ -368,22 +366,6 @@ export function VoicePage({
   }, [isConfigOpen, loadVoiceObservations]);
 
   useEffect(() => {
-    playbackSpeedRef.current = playbackSpeed;
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(
-        VOICE_PLAYBACK_SPEED_STORAGE_KEY,
-        playbackSpeed.toString(),
-      );
-    }
-
-    const audio = audioRef.current;
-    if (audio) {
-      audio.playbackRate = playbackSpeed;
-      audio.defaultPlaybackRate = playbackSpeed;
-    }
-  }, [playbackSpeed]);
-
-  useEffect(() => {
     isOutputMutedRef.current = isOutputMuted;
     if (typeof window !== "undefined") {
       window.localStorage.setItem(
@@ -406,23 +388,18 @@ export function VoicePage({
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcript, runtimeStatus]);
 
+  // The server loads downloaded models when a conversation starts, so the
+  // active engine only needs its models on disk.
   const hasRunnableConfig = useMemo(() => {
     if (voiceMode === "unified") {
       return (
         !!selectedUnifiedInfo &&
-        isRunnableModelStatus(selectedUnifiedInfo.status)
+        isUsableVoiceModelStatus(selectedUnifiedInfo.status)
       );
     }
 
-    if (!selectedAsrInfo || !isRunnableModelStatus(selectedAsrInfo.status)) {
-      return false;
-    }
-
-    return (
-      !!selectedTextInfo &&
-      !!selectedTtsInfo &&
-      isRunnableModelStatus(selectedTextInfo.status) &&
-      isRunnableModelStatus(selectedTtsInfo.status)
+    return [selectedAsrInfo, selectedTextInfo, selectedTtsInfo].every(
+      (model) => !!model && isUsableVoiceModelStatus(model.status),
     );
   }, [
     selectedAsrInfo,
@@ -857,7 +834,6 @@ export function VoicePage({
 
       const source = context.createBufferSource();
       source.buffer = buffer;
-      source.playbackRate.value = playbackSpeedRef.current;
       source.connect(ttsPlaybackGainRef.current ?? context.destination);
 
       const scheduledAt = Math.max(
@@ -866,7 +842,7 @@ export function VoicePage({
       );
       source.start(scheduledAt);
       ttsNextPlaybackTimeRef.current =
-        scheduledAt + buffer.duration / playbackSpeedRef.current;
+        scheduledAt + buffer.duration;
 
       const streamSession = playback.streamSession;
       const utteranceSeq = playback.utteranceSeq;
@@ -885,6 +861,59 @@ export function VoicePage({
       }
     },
     [finalizeVoiceWsPlaybackIfComplete],
+  );
+
+  /**
+   * The transcript line of one utterance, added on its first event. The
+   * typed protocol sends no start events, so any text event may be first.
+   */
+  const transcriptEntryId = useCallback(
+    (role: TranscriptEntry["role"], utteranceId: string) => {
+      const ids =
+        role === "user"
+          ? voiceUserEntryIdsRef.current
+          : voiceAssistantEntryIdsRef.current;
+      const existing = ids.get(utteranceId);
+      if (existing) return existing;
+      const entryId = makeTranscriptEntryId(role);
+      ids.set(utteranceId, entryId);
+      appendTranscriptEntry({
+        id: entryId,
+        role,
+        text: "",
+        timestamp: Date.now(),
+      });
+      return entryId;
+    },
+    [appendTranscriptEntry],
+  );
+
+  const appendTranscriptText = useCallback((entryId: string, delta: string) => {
+    setTranscript((prev) =>
+      prev.map((entry) =>
+        entry.id === entryId ? { ...entry, text: `${entry.text}${delta}` } : entry,
+      ),
+    );
+  }, []);
+
+  /** Settle an utterance's line on its final text; an empty one is removed. */
+  const finishTranscriptEntry = useCallback(
+    (role: TranscriptEntry["role"], utteranceId: string, finalText: string) => {
+      if (finalText) {
+        setTranscriptEntryText(transcriptEntryId(role, utteranceId), finalText);
+        return;
+      }
+      const ids =
+        role === "user"
+          ? voiceUserEntryIdsRef.current
+          : voiceAssistantEntryIdsRef.current;
+      const entryId = ids.get(utteranceId);
+      if (entryId) {
+        removeTranscriptEntry(entryId);
+        ids.delete(utteranceId);
+      }
+    },
+    [removeTranscriptEntry, setTranscriptEntryText, transcriptEntryId],
   );
 
   const handleVoiceRealtimeServerEvent = useCallback(
@@ -944,6 +973,28 @@ export function VoicePage({
           voiceWsInputStreamStartedRef.current = true;
           settleVoiceRealtimeInputStreamReady();
           return;
+        case "models_ready": {
+          const failed = event.models.filter((model) => !model.ready);
+          if (failed.length > 0) {
+            const message = `Couldn't load ${failed
+              .map(
+                (model) =>
+                  `${formatModelVariantLabel(model.model_id)}: ${model.error ?? "unknown error"}`,
+              )
+              .join("; ")}`;
+            stopSession();
+            setError(message);
+            onError?.(message);
+            return;
+          }
+          if (
+            isSessionActiveRef.current &&
+            runtimeStatusRef.current === "preparing"
+          ) {
+            setRuntimeStatus("listening");
+          }
+          return;
+        }
         case "input_stream_stopped":
           voiceWsInputStreamStartedRef.current = false;
           settleVoiceRealtimeInputStreamReady(
@@ -988,111 +1039,54 @@ export function VoicePage({
             setRuntimeStatus("processing");
           }
           return;
-        case "user_transcript_start": {
-          const existingId = voiceUserEntryIdsRef.current.get(
-            event.utterance_id,
-          );
-          if (!existingId) {
-            const entryId = makeTranscriptEntryId("user");
-            voiceUserEntryIdsRef.current.set(event.utterance_id, entryId);
-            appendTranscriptEntry({
-              id: entryId,
-              role: "user",
-              text: "",
-              timestamp: Date.now(),
-            });
+        case "user_transcript_start":
+          transcriptEntryId("user", event.utterance_id);
+          return;
+        case "user_transcript_delta":
+          if (event.delta) {
+            appendTranscriptText(
+              transcriptEntryId("user", event.utterance_id),
+              event.delta,
+            );
           }
           return;
-        }
-        case "user_transcript_delta": {
-          const entryId = voiceUserEntryIdsRef.current.get(event.utterance_id);
-          if (!entryId) return;
-          setTranscript((prev) => {
-            const index = prev.findIndex((entry) => entry.id === entryId);
-            if (index === -1) return prev;
-            const next = [...prev];
-            next[index] = {
-              ...next[index],
-              text: `${next[index].text}${event.delta}`,
-            };
-            return next;
-          });
+        case "user_transcript_snapshot":
+          setTranscriptEntryText(
+            transcriptEntryId("user", event.utterance_id),
+            event.text,
+          );
           return;
-        }
-        case "user_transcript_snapshot": {
-          const entryId = voiceUserEntryIdsRef.current.get(event.utterance_id);
-          if (!entryId) return;
-          setTranscriptEntryText(entryId, event.text);
+        case "user_transcript_final":
+          finishTranscriptEntry(
+            "user",
+            event.utterance_id,
+            (event.text ?? "").trim(),
+          );
           return;
-        }
-        case "user_transcript_final": {
-          const entryId = voiceUserEntryIdsRef.current.get(event.utterance_id);
-          if (!entryId) return;
-          const finalText = (event.text ?? "").trim();
-          if (finalText) {
-            setTranscriptEntryText(entryId, finalText);
-          } else {
-            removeTranscriptEntry(entryId);
-            voiceUserEntryIdsRef.current.delete(event.utterance_id);
+        case "assistant_text_start":
+          transcriptEntryId("assistant", event.utterance_id);
+          return;
+        case "assistant_text_delta":
+          if (event.delta) {
+            appendTranscriptText(
+              transcriptEntryId("assistant", event.utterance_id),
+              event.delta,
+            );
           }
           return;
-        }
-        case "assistant_text_start": {
-          const existingId = voiceAssistantEntryIdsRef.current.get(
-            event.utterance_id,
+        case "assistant_text_snapshot":
+          setTranscriptEntryText(
+            transcriptEntryId("assistant", event.utterance_id),
+            event.text,
           );
-          if (!existingId) {
-            const entryId = makeTranscriptEntryId("assistant");
-            voiceAssistantEntryIdsRef.current.set(event.utterance_id, entryId);
-            appendTranscriptEntry({
-              id: entryId,
-              role: "assistant",
-              text: "",
-              timestamp: Date.now(),
-            });
-          }
           return;
-        }
-        case "assistant_text_delta": {
-          const entryId = voiceAssistantEntryIdsRef.current.get(
+        case "assistant_text_final":
+          finishTranscriptEntry(
+            "assistant",
             event.utterance_id,
+            parseFinalAnswer((event.text ?? "").trim()),
           );
-          if (!entryId) return;
-          setTranscript((prev) => {
-            const index = prev.findIndex((entry) => entry.id === entryId);
-            if (index === -1) return prev;
-            const next = [...prev];
-            next[index] = {
-              ...next[index],
-              text: `${next[index].text}${event.delta}`,
-            };
-            return next;
-          });
           return;
-        }
-        case "assistant_text_snapshot": {
-          const entryId = voiceAssistantEntryIdsRef.current.get(
-            event.utterance_id,
-          );
-          if (!entryId) return;
-          setTranscriptEntryText(entryId, event.text);
-          return;
-        }
-        case "assistant_text_final": {
-          const entryId = voiceAssistantEntryIdsRef.current.get(
-            event.utterance_id,
-          );
-          const finalText = parseFinalAnswer((event.text ?? "").trim());
-          if (entryId) {
-            if (finalText) {
-              setTranscriptEntryText(entryId, finalText);
-            } else {
-              removeTranscriptEntry(entryId);
-              voiceAssistantEntryIdsRef.current.delete(event.utterance_id);
-            }
-          }
-          return;
-        }
         case "assistant_audio_start": {
           if (event.audio_format !== "pcm_i16") {
             const message = `Unsupported streamed audio format '${event.audio_format}'. Expected pcm_i16.`;
@@ -1196,15 +1190,17 @@ export function VoicePage({
       }
     },
     [
-      appendTranscriptEntry,
+      appendTranscriptText,
       clearAudioPlayback,
       finalizeVoiceWsPlaybackIfComplete,
+      finishTranscriptEntry,
       onError,
       playbackGainValue,
-      removeTranscriptEntry,
       setPlaybackDucked,
       settleVoiceRealtimeInputStreamReady,
       setTranscriptEntryText,
+      stopSession,
+      transcriptEntryId,
     ],
   );
 
@@ -1278,7 +1274,7 @@ export function VoicePage({
           if (typeof messageEvent.data !== "string") return;
           try {
             const parsed: unknown = JSON.parse(messageEvent.data);
-            if (isVoiceRealtimeV2ServerEnvelope(parsed)) {
+            if (isVoiceRealtimeV2EnvelopeHeader(parsed)) {
               if (
                 !isValidVoiceRealtimeV2Successor(
                   voiceWsV2EventRef.current,
@@ -1294,6 +1290,11 @@ export function VoicePage({
                 return;
               }
               voiceWsV2EventRef.current = parsed;
+              // An event type this client does not know still counts
+              // towards the sequence above.
+              if (!isVoiceRealtimeV2ServerEnvelope(parsed)) {
+                return;
+              }
               const normalized = normalizeVoiceRealtimeV2Event(parsed);
               if (normalized) {
                 handleVoiceRealtimeServerEvent(normalized);
@@ -1343,10 +1344,8 @@ export function VoicePage({
             new Error("Voice realtime connection closed"),
           );
           if (wasActive && wasCurrent) {
-            processingRef.current = false;
-            if (runtimeStatusRef.current !== "idle") {
-              setRuntimeStatus("idle");
-            }
+            // Turn the microphone off with the conversation.
+            stopSession();
             const message = "Voice realtime connection closed";
             setError(message);
             onError?.(message);
@@ -1368,6 +1367,7 @@ export function VoicePage({
       handleVoiceRealtimeServerEvent,
       onError,
       settleVoiceRealtimeInputStreamReady,
+      stopSession,
     ]);
 
   const ensureVoiceRealtimeInputStreamStarted = useCallback(
@@ -1560,17 +1560,11 @@ export function VoicePage({
   }, [isConfigOpen]);
 
   const startSession = useCallback(async () => {
-    if (!selectedAsrModel || !selectedTextModel || !selectedTtsModel) {
-      const message = "Required modular stack models are unavailable. Open Config.";
-      setError(message);
-      onError?.(message);
-      openConfig("models");
-      return;
-    }
-
     if (!hasRunnableConfig) {
       const message =
-        "Required models are not loaded. Open Config and load the stack.";
+        voiceMode === "unified"
+          ? "Download the LFM2.5 Audio model to start talking."
+          : "Download the voice models to start talking.";
       setError(message);
       onError?.(message);
       openConfig("models");
@@ -1643,7 +1637,7 @@ export function VoicePage({
 
       isSessionActiveRef.current = true;
       processingRef.current = false;
-      setRuntimeStatus("listening");
+      setRuntimeStatus("preparing");
 
       // Warm up realtime websocket + server-side VAD stream without blocking mic startup.
       void ensureVoiceRealtimeInputStreamStarted(audioContext.sampleRate).catch(
@@ -1653,6 +1647,7 @@ export function VoicePage({
           if (!isSessionActiveRef.current) {
             return;
           }
+          stopSession();
           setError(message);
           onError?.(message);
         },
@@ -1688,11 +1683,9 @@ export function VoicePage({
     hasRunnableConfig,
     onError,
     openConfig,
-    selectedAsrModel,
-    selectedTextModel,
-    selectedTtsModel,
     sendVoiceRealtimeBinary,
     stopSession,
+    voiceMode,
   ]);
 
   const toggleSession = useCallback(() => {
@@ -1750,6 +1743,7 @@ export function VoicePage({
 
   const statusLabel = {
     idle: "Idle",
+    preparing: "Getting ready",
     listening: "Listening",
     user_speaking: "User speaking",
     processing: "Thinking",
@@ -2361,10 +2355,10 @@ export function VoicePage({
   const readinessGuidance =
     voiceMode === "unified"
       ? selectedUnifiedModel
-        ? "Load the unified voice model before starting a conversation."
+        ? "Download the unified voice model before starting a conversation."
         : "Add a compatible unified voice model before starting a conversation."
       : hasRequiredModularModels
-        ? "Load the ASR, text, and TTS models before starting a conversation."
+        ? "Download the ASR, text, and TTS models before starting a conversation."
         : "Add the required ASR, text, and TTS models before starting a conversation.";
   const showTranscriptPanel = runtimeStatus !== "idle" || transcript.length > 0;
 
@@ -2470,7 +2464,8 @@ export function VoicePage({
                 "w-48 h-48 sm:w-64 sm:h-64 rounded-full flex items-center justify-center transition-all duration-500",
                 runtimeStatus === "idle"
                   ? "bg-[var(--bg-surface-1)] border-2 border-[var(--border-muted)]"
-                  : runtimeStatus === "listening"
+                  : runtimeStatus === "listening" ||
+                      runtimeStatus === "preparing"
                     ? "bg-[var(--bg-surface-2)] border-2 border-[var(--border-strong)] shadow-[0_0_40px_rgba(255,255,255,0.05)]"
                     : runtimeStatus === "user_speaking"
                       ? "bg-white shadow-[0_0_60px_rgba(255,255,255,0.2)]"
@@ -2520,7 +2515,8 @@ export function VoicePage({
                     </div>
                   ) : runtimeStatus === "user_speaking" ? (
                     <AudioLines className="w-16 h-16 text-black" />
-                  ) : runtimeStatus === "processing" ? (
+                  ) : runtimeStatus === "processing" ||
+                    runtimeStatus === "preparing" ? (
                     <Loader2 className="w-12 h-12 text-white animate-spin" />
                   ) : (
                     <Mic className="w-12 h-12 text-white" />
