@@ -339,7 +339,7 @@ export function VoiceLibraryTable({
                   onKeyDown={handleRowKeyDown}
                   data-testid={`voice-row-${item.id}`}
                   className={cn(
-                    "grid grid-cols-1 gap-x-5 gap-y-3 border-t border-[var(--border-muted)] px-4 py-4 align-top transition-colors hover:bg-[var(--bg-surface-1)]/60 sm:grid-cols-[minmax(0,1fr)_auto] 2xl:table-row 2xl:px-0 2xl:py-0",
+                    "grid grid-cols-1 gap-x-5 gap-y-3 border-t border-[var(--border-muted)] px-4 py-4 align-top transition-colors hover:bg-[color-mix(in_srgb,var(--bg-surface-1)_60%,transparent)] sm:grid-cols-[minmax(0,1fr)_auto] 2xl:table-row 2xl:px-0 2xl:py-0",
                     item.onSelect &&
                       "cursor-pointer focus-visible:bg-[var(--bg-surface-1)] focus-visible:outline-none",
                   )}

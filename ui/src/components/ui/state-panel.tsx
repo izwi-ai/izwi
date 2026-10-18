@@ -9,13 +9,13 @@ type StatePanelTone = "neutral" | "info" | "success" | "warning" | "danger";
 const toneClasses: Record<StatePanelTone, string> = {
   neutral: "border-border/80 bg-card/80 text-card-foreground",
   info:
-    "border-[var(--status-info-border)] bg-[var(--status-info-bg)]/70 text-[var(--status-info-text)]",
+    "border-[var(--status-info-border)] bg-[color-mix(in_srgb,var(--status-info-bg)_70%,transparent)] text-[var(--status-info-text)]",
   success:
-    "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)]/70 text-[var(--status-positive-text)]",
+    "border-[var(--status-positive-border)] bg-[color-mix(in_srgb,var(--status-positive-bg)_70%,transparent)] text-[var(--status-positive-text)]",
   warning:
-    "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)]/70 text-[var(--status-warning-text)]",
+    "border-[var(--status-warning-border)] bg-[color-mix(in_srgb,var(--status-warning-bg)_70%,transparent)] text-[var(--status-warning-text)]",
   danger:
-    "border-[var(--danger-border)] bg-[var(--danger-bg)]/75 text-[var(--danger-text)]",
+    "border-[var(--danger-border)] bg-[color-mix(in_srgb,var(--danger-bg)_75%,transparent)] text-[var(--danger-text)]",
 };
 
 interface StatePanelProps {

@@ -269,7 +269,7 @@ export function VoiceCreationModal({
                 <h3 className="text-sm font-semibold text-[var(--status-positive-text)]">
                   Voice saved successfully
                 </h3>
-                <p className="mt-1 text-sm text-[var(--status-positive-text)]/90">
+                <p className="mt-1 text-sm text-[color-mix(in_srgb,var(--status-positive-text)_90%,transparent)]">
                   {savedVoiceResult?.source === "design"
                     ? "Your designed voice is ready in the library and available for Text to Speech."
                     : "Your cloned voice is ready in the library and available for Text to Speech."}

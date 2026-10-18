@@ -45,7 +45,7 @@ export function WorkspaceHeader({
         <div className="flex items-start gap-3">
           {Icon ? (
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border/70 bg-background/55 shadow-[var(--shadow-soft)]">
-              <Icon className="h-4.5 w-4.5 text-muted-foreground" />
+              <Icon className="h-[18px] w-[18px] text-muted-foreground" />
             </div>
           ) : null}
           <div className="min-w-0 flex-1">

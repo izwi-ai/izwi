@@ -480,7 +480,7 @@ export function MyModelsPage({
                         </div>
                       </div>
 
-                      <div className="flex items-center justify-between mt-auto pt-3 border-t border-[var(--border-muted)]/50">
+                      <div className="flex items-center justify-between mt-auto pt-3 border-t border-[color-mix(in_srgb,var(--border-muted)_50%,transparent)]">
                         <div className="text-xs font-medium">
                           <span
                             className={getStatusTextClass(model.status)}

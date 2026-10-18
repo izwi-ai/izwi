@@ -542,7 +542,7 @@ export function SettingsPage() {
                         "group rounded-[18px] border px-4 py-3 text-left transition-all duration-150",
                         isActive
                           ? "border-[var(--border-strong)] bg-[var(--bg-surface-0)]"
-                          : "border-border/70 bg-transparent hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-0)]/60",
+                          : "border-border/70 bg-transparent hover:border-[var(--border-strong)] hover:bg-[color-mix(in_srgb,var(--bg-surface-0)_60%,transparent)]",
                       )}
                       aria-pressed={isActive}
                     >

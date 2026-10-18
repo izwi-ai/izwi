@@ -207,7 +207,7 @@ export function DiarizationSpeakerManager({
                             {summary.rawSpeaker}
                           </span>
                           {isMerged ? (
-                            <span className="rounded-full border border-[var(--accent-solid)]/35 bg-[var(--accent-soft)] px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-primary)]">
+                            <span className="rounded-full border border-[color-mix(in_srgb,var(--accent-solid)_35%,transparent)] bg-[var(--accent-soft)] px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-primary)]">
                               merged
                             </span>
                           ) : null}

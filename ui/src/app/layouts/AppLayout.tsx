@@ -336,7 +336,7 @@ export function AppLayout({
     <div className="h-dvh flex overflow-hidden bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
       <FirstRunOnboarding />
       {/* Mobile header */}
-      <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/78 backdrop-blur-xl">
+      <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/80 backdrop-blur-xl">
         <div className="flex items-center justify-between px-4 py-3.5">
           <div className="flex items-center gap-3">
             <div className="relative w-8 h-8 rounded-xl overflow-hidden border border-border/80 bg-card shadow-sm">
@@ -407,7 +407,7 @@ export function AppLayout({
             exit={{ opacity: 0 }}
             onClick={closeMobileMenu}
             aria-hidden="true"
-            className="lg:hidden fixed inset-0 bg-background/68 backdrop-blur-sm z-40"
+            className="lg:hidden fixed inset-0 bg-background/70 backdrop-blur-sm z-40"
           />
         )}
       </AnimatePresence>
@@ -843,7 +843,7 @@ export function AppLayout({
         </main>
       </div>
       {isPromptOpen && availableUpdate ? (
-        <div className="fixed bottom-4 right-4 z-[70] w-[min(30rem,calc(100vw-1.5rem))] rounded-2xl border border-border/80 bg-background/92 p-4 shadow-2xl backdrop-blur-xl">
+        <div className="fixed bottom-4 right-4 z-[70] w-[min(30rem,calc(100vw-1.5rem))] rounded-2xl border border-border/80 bg-background/90 p-4 shadow-2xl backdrop-blur-xl">
           <div className="flex items-start justify-between gap-3">
             <div>
               <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">

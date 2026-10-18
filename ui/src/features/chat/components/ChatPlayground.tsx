@@ -1720,7 +1720,7 @@ export function ChatPlayground({
                                       <div
                                         ref={streamingThinkingRef}
                                         onScroll={handleStreamingThinkingScroll}
-                                        className="h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[var(--border-muted)]/70 bg-background/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed scrollbar-thin sm:h-48"
+                                        className="h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[color-mix(in_srgb,var(--border-muted)_70%,transparent)] bg-background/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed scrollbar-thin sm:h-48"
                                       >
                                         {parsed.thinking}
                                       </div>
@@ -1922,7 +1922,7 @@ export function ChatPlayground({
           }
         }}
       >
-        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/98 border-[var(--border-muted)]">
+        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/95 border-[var(--border-muted)]">
           <DialogTitle className="sr-only">
             {imagePreview?.label || "Image preview"}
           </DialogTitle>

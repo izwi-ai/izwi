@@ -522,7 +522,7 @@ export function FirstRunOnboarding() {
                       return (
                         <div
                           key={feature.title}
-                          className="flex items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[var(--bg-surface-2)]/75 px-3.5 py-3"
+                          className="flex items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] px-3.5 py-3"
                         >
                           <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-3)]">
                             <Icon className="h-4 w-4 text-[var(--text-primary)]" />
@@ -617,7 +617,7 @@ export function FirstRunOnboarding() {
                     </div>
                   </div>
 
-                  <div className="inline-flex items-center gap-2 rounded-[var(--radius-pill)] border border-border/70 bg-[var(--bg-surface-2)]/70 p-1">
+                  <div className="inline-flex items-center gap-2 rounded-[var(--radius-pill)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] p-1">
                     <Button
                       type="button"
                       size="sm"
@@ -658,7 +658,7 @@ export function FirstRunOnboarding() {
                           return (
                             <div
                               key={model.variant}
-                              className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[var(--bg-surface-2)]/75 px-3.5 py-3"
+                              className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] px-3.5 py-3"
                             >
                               <div className="min-w-0">
                                 <div className="text-base font-semibold leading-5 text-[var(--text-primary)]">
@@ -677,7 +677,7 @@ export function FirstRunOnboarding() {
                       </div>
 
                       {quickModels.length === 0 ? (
-                        <div className="rounded-[var(--radius-md)] border border-dashed border-border/70 bg-[var(--bg-surface-2)]/60 px-3 py-4 text-sm text-[var(--text-muted)]">
+                        <div className="rounded-[var(--radius-md)] border border-dashed border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_60%,transparent)] px-3 py-4 text-sm text-[var(--text-muted)]">
                           No recommended models are available yet.
                         </div>
                       ) : null}
@@ -739,7 +739,7 @@ export function FirstRunOnboarding() {
                                       <label
                                         key={model.variant}
                                         className={cn(
-                                          "flex gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[var(--bg-surface-2)]/75 p-3",
+                                          "flex gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] p-3",
                                           isDisabled && "opacity-60",
                                         )}
                                       >
@@ -798,19 +798,19 @@ export function FirstRunOnboarding() {
                     </div>
 
                     <div className="grid gap-2">
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
                         <span className="text-[var(--text-muted)]">Mode</span>
                         <span className="font-semibold text-[var(--text-primary)]">
                           {setupMode === "quick" ? "Quick setup" : "Custom setup"}
                         </span>
                       </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
                         <span className="text-[var(--text-muted)]">Models</span>
                         <span className="font-semibold text-[var(--text-primary)]">
                           {activeModelCount}
                         </span>
                       </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
                         <span className="text-[var(--text-muted)]">
                           To download
                         </span>
@@ -818,7 +818,7 @@ export function FirstRunOnboarding() {
                           {activeDownloadCount}
                         </span>
                       </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
                         <span className="text-[var(--text-muted)]">
                           Estimated size
                         </span>
@@ -848,7 +848,7 @@ export function FirstRunOnboarding() {
                     </div>
 
                     {setupMode === "custom" && selectedVariants.size === 0 ? (
-                      <div className="rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm text-[var(--text-muted)]">
+                      <div className="rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm text-[var(--text-muted)]">
                         Select at least one model to queue downloads from custom
                         setup.
                       </div>

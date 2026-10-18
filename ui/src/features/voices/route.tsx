@@ -436,7 +436,7 @@ export function VoicesPage({
             size="sm"
             className={cn(
               tableActionButtonClass,
-              "border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72",
+              "border-[var(--border-strong)] bg-[color-mix(in_srgb,var(--bg-surface-1)_72%,transparent)]",
             )}
             onClick={(event) => {
               event.stopPropagation();
@@ -497,7 +497,7 @@ export function VoicesPage({
               disabled={isPreviewLoading}
               className={cn(
                 tableActionButtonClass,
-                "border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72",
+                "border-[var(--border-strong)] bg-[color-mix(in_srgb,var(--bg-surface-1)_72%,transparent)]",
               )}
             >
               {isPreviewLoading ? (
@@ -552,7 +552,7 @@ export function VoicesPage({
                   className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
                 >
                   <span>My Voices</span>
-                  <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                  <span className="rounded-full border border-[color-mix(in_srgb,currentColor_20%,transparent)] px-2 py-0.5 text-[10px] font-semibold">
                     {totalSavedVoices}
                   </span>
                 </TabsTrigger>
@@ -561,7 +561,7 @@ export function VoicesPage({
                   className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
                 >
                   <span>Built-in Voices</span>
-                  <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                  <span className="rounded-full border border-[color-mix(in_srgb,currentColor_20%,transparent)] px-2 py-0.5 text-[10px] font-semibold">
                     {totalBuiltInVoices}
                   </span>
                 </TabsTrigger>

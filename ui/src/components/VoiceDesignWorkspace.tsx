@@ -441,7 +441,7 @@ export function VoiceDesignWorkspace({
                         "rounded-xl border p-4 transition-colors",
                         isSelected
                           ? "border-[var(--border-strong)] bg-[var(--bg-surface-0)]"
-                          : "border-[var(--border-muted)] bg-[var(--bg-surface-0)]/70",
+                          : "border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_70%,transparent)]",
                       )}
                     >
                       <div className={clsx(VOICE_ROUTE_TITLE_ACCENT_CLASS, "text-sm")}>

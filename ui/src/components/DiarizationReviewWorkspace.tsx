@@ -446,10 +446,10 @@ export function DiarizationReviewWorkspace({
       ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr),248px]"
       : "grid gap-6 xl:grid-cols-[minmax(0,1fr),248px] pb-20";
   const playbackClassName = fixedPlaybackFooter
-    ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/96 shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
+    ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
     : stickyPlaybackFooter
-      ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
-      : "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3";
+      ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
+      : "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3";
   const playbackInnerClassName = fixedPlaybackFooter
     ? "mx-auto flex w-full max-w-[calc(100vw-var(--app-shell-left))] flex-col gap-2.5 px-4 py-3 sm:px-6"
     : "flex flex-col gap-2.5";
@@ -782,7 +782,7 @@ export function DiarizationReviewWorkspace({
               </div>
 
               <div className="group relative mx-1.5 flex h-9 flex-1 items-center">
-                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-7 -translate-y-1/2 overflow-hidden rounded bg-[var(--bg-surface-2)]/50">
+                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-7 -translate-y-1/2 overflow-hidden rounded bg-[color-mix(in_srgb,var(--bg-surface-2)_50%,transparent)]">
                   {viewerDuration > 0
                     ? transcriptEntries.map((entry, index) => {
                         const left = (entry.start / viewerDuration) * 100;

@@ -644,7 +644,7 @@ export function NewDiarizationModal({
                 }`}
               >
                 <div className="flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]">
-                  <Upload className="h-5.5 w-5.5 text-[var(--text-primary)]" />
+                  <Upload className="h-[22px] w-[22px] text-[var(--text-primary)]" />
                 </div>
 
                 <div className="mt-5 space-y-2">
@@ -695,9 +695,9 @@ export function NewDiarizationModal({
                   }`}
                 >
                   {isRecording ? (
-                    <Square className="h-5.5 w-5.5 fill-current" />
+                    <Square className="h-[22px] w-[22px] fill-current" />
                   ) : (
-                    <Mic className="h-5.5 w-5.5" />
+                    <Mic className="h-[22px] w-[22px]" />
                   )}
                 </div>
 
