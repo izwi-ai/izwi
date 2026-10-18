@@ -93,6 +93,9 @@ describe("SettingsPage capabilities", () => {
       if (command === "launch_at_login_enabled") {
         return false;
       }
+      if (command === "cli_install_status") {
+        return { available: true, installed: false, location: null };
+      }
       return undefined;
     });
     updateState.value = {
@@ -134,7 +137,7 @@ describe("SettingsPage capabilities", () => {
     expect(screen.getByText("Desktop Only")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check now" })).not.toBeInTheDocument();
     expect(screen.getByText(/Update checks and installation are available/i)).toBeVisible();
-    expect(screen.getByText(/Tray behavior and launch-at-login settings/i)).toBeVisible();
+    expect(screen.getByText(/Tray behavior, launch-at-login and command line tool settings/i)).toBeVisible();
     expect(
       screen.queryByRole("switch", { name: "Show tray icon" }),
     ).not.toBeInTheDocument();
@@ -142,6 +145,40 @@ describe("SettingsPage capabilities", () => {
       screen.queryByRole("switch", { name: "Launch Izwi when signing in" }),
     ).not.toBeInTheDocument();
     await screen.findByText("Disabled for this device.");
+  });
+
+  it("installs the command line tool on request", async () => {
+    const installed = {
+      available: true,
+      installed: true,
+      location: "/usr/local/bin/izwi",
+    };
+    const defaultInvoke = coreMocks.invoke.getMockImplementation();
+    coreMocks.invoke.mockImplementation(async (command: string) =>
+      command === "install_cli" ? installed : defaultInvoke?.(command),
+    );
+
+    render(<SettingsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+
+    await screen.findByText("/usr/local/bin/izwi");
+    expect(coreMocks.invoke).toHaveBeenCalledWith("install_cli");
+    expect(screen.getByRole("button", { name: "Reinstall" })).toBeEnabled();
+  });
+
+  it("hides the install button when the build has no command line tool", async () => {
+    const defaultInvoke = coreMocks.invoke.getMockImplementation();
+    coreMocks.invoke.mockImplementation(async (command: string) =>
+      command === "cli_install_status"
+        ? { available: false, installed: false, location: null }
+        : defaultInvoke?.(command),
+    );
+
+    render(<SettingsPage />);
+
+    await screen.findByText("This build does not include the izwi command.");
+    expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
   });
 
   it("keeps failed preference reads unknown until each retry succeeds", async () => {

@@ -11,10 +11,97 @@ struct BundledCliTargets {
     runtime_dir: Option<PathBuf>,
 }
 
-pub fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+/// What a CLI setup pass may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliSetupMode {
+    /// The user asked to install: create links or copies and add the
+    /// directory to PATH, prompting for an administrator password on macOS
+    /// when the link directory needs it.
+    Install,
+    /// App launch: only refresh copies a previous install created (Linux and
+    /// Windows copy binaries, which must follow app updates). Never installs
+    /// for the first time, edits PATH or prompts. macOS links point into the
+    /// app bundle, so there is nothing to refresh.
+    RefreshExisting,
+}
+
+/// Whether the `izwi` command can be installed from this app and whether a
+/// shell can already find it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliInstallStatus {
+    /// This build bundles the CLI (packaged app, not a dev build).
+    pub available: bool,
+    /// `izwi` is on PATH or in this app's install location.
+    pub installed: bool,
+    /// Where the command was found.
+    pub location: Option<String>,
+}
+
+#[tauri::command]
+pub fn cli_install_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> CliInstallStatus {
+    cli_status(&app)
+}
+
+/// Install the `izwi` command line tool on request. Runs on a blocking
+/// thread: on macOS it may wait on an administrator password prompt.
+#[tauri::command]
+pub async fn install_cli<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> std::result::Result<CliInstallStatus, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_cli_setup(&handle, CliSetupMode::Install))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(cli_status(&app))
+}
+
+fn cli_status<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> CliInstallStatus {
+    let available = matches!(resolve_bundled_cli_targets(app), Ok(Some(_)));
+    let binary = platform_binary_name("izwi");
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&binary))
+            .find(|candidate| candidate.is_file())
+    });
+    let location = on_path.or_else(|| {
+        cli_install_dir()
+            .map(|dir| dir.join(&binary))
+            .filter(|candidate| candidate.exists())
+    });
+    CliInstallStatus {
+        available,
+        installed: location.is_some(),
+        location: location.map(|path| path.display().to_string()),
+    }
+}
+
+/// Directory the installer puts `izwi` in on this platform.
+fn cli_install_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        if is_running_from_macos_app_bundle() {
+        return Some(preferred_path_bin_dir());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("bin"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_cli_bin_dir();
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+pub fn ensure_cli_setup<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    mode: CliSetupMode,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if mode == CliSetupMode::Install && is_running_from_macos_app_bundle() {
             ensure_macos_cli_links(app)?;
         }
         return Ok(());
@@ -22,18 +109,21 @@ pub fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<
 
     #[cfg(target_os = "linux")]
     {
-        ensure_linux_cli_links(app)?;
+        ensure_linux_cli_links(app, mode)?;
         return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        ensure_windows_cli_links(app)?;
+        ensure_windows_cli_links(app, mode)?;
         return Ok(());
     }
 
     #[allow(unreachable_code)]
-    Ok(())
+    {
+        let _ = (app, mode);
+        Ok(())
+    }
 }
 
 fn resolve_bundled_cli_targets<R: tauri::Runtime>(
@@ -173,7 +263,10 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<(
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+fn ensure_linux_cli_links<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    mode: CliSetupMode,
+) -> Result<()> {
     use std::io::Write;
 
     let Some(targets) = resolve_bundled_cli_targets(app)? else {
@@ -184,6 +277,9 @@ fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
         .map(PathBuf::from)
         .context("HOME is not set")?;
     let bin_dir = home.join(".local").join("bin");
+    if mode == CliSetupMode::RefreshExisting && !bin_dir.join("izwi").exists() {
+        return Ok(());
+    }
 
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed creating {}", bin_dir.display()))?;
@@ -196,7 +292,7 @@ fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
         install_dir_copy(runtime_dir, &bin_dir.join("runtime"))?;
     }
 
-    if !path_contains_dir(&bin_dir) {
+    if mode == CliSetupMode::Install && !path_contains_dir(&bin_dir) {
         let profile_path = home.join(".profile");
         let export_line = format!("export PATH=\"{}:$PATH\"", bin_dir.display());
         let existing = std::fs::read_to_string(&profile_path).unwrap_or_default();
@@ -222,16 +318,26 @@ fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
 }
 
 #[cfg(target_os = "windows")]
-fn ensure_windows_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+fn windows_cli_bin_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .map(|p| p.join("Izwi").join("bin"))
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cli_links<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    mode: CliSetupMode,
+) -> Result<()> {
     let Some(targets) = resolve_bundled_cli_targets(app)? else {
         return Ok(());
     };
 
-    let bin_dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .map(|p| p.join("Izwi").join("bin"))
-        .context("LOCALAPPDATA/USERPROFILE is not set")?;
+    let bin_dir = windows_cli_bin_dir().context("LOCALAPPDATA/USERPROFILE is not set")?;
+    if mode == CliSetupMode::RefreshExisting && !bin_dir.join("izwi.exe").exists() {
+        return Ok(());
+    }
 
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed creating {}", bin_dir.display()))?;
@@ -244,7 +350,7 @@ fn ensure_windows_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Res
         install_dir_copy(runtime_dir, &bin_dir.join("runtime"))?;
     }
 
-    if !path_contains_dir(&bin_dir) {
+    if mode == CliSetupMode::Install && !path_contains_dir(&bin_dir) {
         add_windows_user_path(&bin_dir)?;
         eprintln!(
             "info: added {} to user PATH (restart terminal to use `izwi`)",

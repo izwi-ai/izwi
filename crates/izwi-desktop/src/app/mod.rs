@@ -81,6 +81,8 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             updater::install_beta_update,
             updater::relaunch_after_update,
             updater::updater_health_snapshot,
+            install::cli_install_status,
+            install::install_cli,
         ])
         .manage(updater::UpdaterState::new())
         .manage(tray_visibility::TrayVisibilityState::new(true));
@@ -127,8 +129,12 @@ pub fn run(args: DesktopArgs) -> Result<()> {
                 );
             }
 
-            if let Err(err) = install::ensure_cli_setup(app.handle()) {
-                eprintln!("warning: could not configure terminal commands automatically: {err}");
+            // Installing the CLI is an explicit Settings action (it can need an
+            // administrator password); launch only refreshes existing copies.
+            if let Err(err) =
+                install::ensure_cli_setup(app.handle(), install::CliSetupMode::RefreshExisting)
+            {
+                eprintln!("warning: could not refresh terminal commands: {err}");
             }
 
             window::build_main_window(app, &window_config)?;

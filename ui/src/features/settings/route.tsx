@@ -1,6 +1,7 @@
 import {
   Loader2,
   Moon,
+  Terminal,
   Power,
   RefreshCw,
   ShieldCheck,
@@ -224,6 +225,112 @@ function SettingsRow({
         </div>
       ) : null}
     </div>
+  );
+}
+
+type CliInstallStatus = {
+  available: boolean;
+  installed: boolean;
+  location: string | null;
+};
+
+function CommandLineToolRow() {
+  const { notify } = useNotifications();
+  const [status, setStatus] = useState<CliInstallStatus | null>(null);
+  const [readStatus, setReadStatus] = useState<SettingReadStatus>("loading");
+  const [isInstalling, setIsInstalling] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<CliInstallStatus>("cli_install_status")
+      .then((next) => {
+        if (!cancelled) {
+          setStatus(next);
+          setReadStatus("ready");
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to read command line tool status:", error);
+        if (!cancelled) {
+          setReadStatus("error");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleInstall = async () => {
+    setIsInstalling(true);
+    try {
+      const next = await invoke<CliInstallStatus>("install_cli");
+      setStatus(next);
+      setReadStatus("ready");
+      notify({
+        title: "Command line tool installed",
+        description: next.installed
+          ? "Open a new terminal window to use izwi."
+          : "Add the install folder to your PATH to use izwi.",
+        tone: "success",
+      });
+    } catch (error) {
+      console.error("Failed to install the command line tool:", error);
+      notify({
+        title: "Could not install the command line tool",
+        description: error instanceof Error ? error.message : String(error),
+        tone: "warning",
+      });
+    } finally {
+      setIsInstalling(false);
+    }
+  };
+
+  const unavailable = readStatus === "ready" && status?.available === false;
+  const installed = status?.installed === true;
+
+  return (
+    <SettingsRow
+      title="Command line tool"
+      description={
+        readStatus === "loading" ? (
+          <span className="inline-flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Checking for izwi...
+          </span>
+        ) : readStatus === "error" ? (
+          "Izwi could not check whether the izwi command is installed."
+        ) : unavailable ? (
+          "This build does not include the izwi command."
+        ) : installed ? (
+          <>
+            Installed at{" "}
+            <code className="font-mono text-xs text-[var(--text-secondary)]">
+              {status?.location}
+            </code>
+          </>
+        ) : (
+          "Use Izwi from a terminal with the izwi command."
+        )
+      }
+      action={
+        unavailable ? null : (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={readStatus === "loading" || isInstalling}
+            onClick={() => void handleInstall()}
+          >
+            {isInstalling ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Terminal className="h-4 w-4" />
+            )}
+            {installed ? "Reinstall" : "Install"}
+          </Button>
+        )
+      }
+    />
   );
 }
 
@@ -720,12 +827,12 @@ export function SettingsPage() {
           <SettingsSection
             icon={<Power className="h-4 w-4" />}
             title="System"
-            description="Startup behavior for this device."
+            description="Startup behavior and tools for this device."
           >
             {!desktopRuntime ? (
               <SettingsRow
                 title="Desktop controls"
-                description="Tray behavior and launch-at-login settings are available in the packaged desktop app."
+                description="Tray behavior, launch-at-login and command line tool settings are available in the packaged desktop app."
               />
             ) : (
               <>
@@ -840,6 +947,8 @@ export function SettingsPage() {
                     </p>
                   ) : null}
                 </SettingsRow>
+
+                <CommandLineToolRow />
               </>
             )}
           </SettingsSection>
