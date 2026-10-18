@@ -135,19 +135,21 @@ function SettingsSection({
   return (
     <section
       className={cn(
-        "grid px-5 py-4 sm:px-6 sm:py-5 lg:grid-cols-[144px_minmax(0,1fr)]",
+        // The label column must fit a letter-spaced uppercase title plus its
+        // icon; at 144px "APPEARANCE" overflowed into the content column.
+        "grid px-5 py-4 sm:px-6 sm:py-5 lg:grid-cols-[200px_minmax(0,1fr)] lg:gap-x-8",
         hasIntro ? "gap-2" : "gap-1",
       )}
     >
       <div className="space-y-1.5">
         <div className="flex items-center gap-2 text-[var(--text-primary)]">
           {icon}
-          <h2 className="text-sm font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+          <h2 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-subtle)]">
             {title}
           </h2>
         </div>
         {description ? (
-          <p className="max-w-xs text-sm leading-6 text-[var(--text-muted)]">
+          <p className="text-sm leading-6 text-[var(--text-muted)]">
             {description}
           </p>
         ) : null}
@@ -206,7 +208,9 @@ function SettingsRow({
             </div>
           ) : null}
           {action ? (
-            <div className="shrink-0 md:pt-0.5">{action}</div>
+            // ml-auto keeps action-only rows right-aligned; justify-between
+            // has no effect with a single child.
+            <div className="shrink-0 md:ml-auto md:pt-0.5">{action}</div>
           ) : null}
         </div>
       ) : null}
