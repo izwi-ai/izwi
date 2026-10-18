@@ -314,6 +314,14 @@ impl FleetCoordinator {
     }
 }
 
+/// Claim timeout for tests that assert a claim lands. The production
+/// timeout (100 ms) deliberately gives up on a slow store, and a SQLite
+/// write can take that long on a loaded 2 vCPU CI runner, which turned
+/// "claim succeeds" assertions into a race with fsync. Tests of the timeout
+/// itself keep the production value. 5 s is the configured maximum.
+#[cfg(test)]
+pub(crate) const TEST_FLEET_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +336,7 @@ mod tests {
         (
             Arc::new(
                 FleetCoordinator::new(store, "gateway-test".to_string())
+                    .with_claim_timeout(TEST_FLEET_CLAIM_TIMEOUT)
                     .opened()
                     .await,
             ),
@@ -349,6 +358,7 @@ mod tests {
             Arc::new(
                 FleetCoordinator::new(store, "gateway-test".to_string())
                     .with_claim_ttl(claim_ttl)
+                    .with_claim_timeout(TEST_FLEET_CLAIM_TIMEOUT)
                     .opened()
                     .await,
             ),
@@ -412,6 +422,7 @@ mod tests {
                 FleetStore::new(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
             )
+            .with_claim_timeout(TEST_FLEET_CLAIM_TIMEOUT)
             .opened()
         };
         let old = Arc::new(build("gateway-old").await);
@@ -447,6 +458,7 @@ mod tests {
                 FleetStore::new(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
             )
+            .with_claim_timeout(TEST_FLEET_CLAIM_TIMEOUT)
             .opened()
         };
         let own = Arc::new(build("gateway-own").await);
