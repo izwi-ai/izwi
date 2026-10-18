@@ -48,6 +48,13 @@ interface ModelCatalogContextValue {
 
 const ModelCatalogContext = createContext<ModelCatalogContextValue | null>(null);
 
+/**
+ * Download progress arrives as a stream of SSE messages, and every state
+ * update re-renders the shell and the active page. Updates are batched to at
+ * most one flush per interval; terminal statuses flush immediately.
+ */
+const PROGRESS_FLUSH_INTERVAL_MS = 250;
+
 function modelActionError(err: unknown, fallback: string): string {
   return err instanceof Error && err.message.trim() ? err.message : fallback;
 }
@@ -208,7 +215,49 @@ export function ModelCatalogProvider({
     }
   }, []);
 
+  const pendingProgressRef = useRef<ModelDownloadProgressMap>({});
+  const progressFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const flushDownloadProgress = useCallback(() => {
+    if (progressFlushTimerRef.current) {
+      clearTimeout(progressFlushTimerRef.current);
+      progressFlushTimerRef.current = null;
+    }
+    const pending = pendingProgressRef.current;
+    if (Object.keys(pending).length === 0) {
+      return;
+    }
+    pendingProgressRef.current = {};
+    setDownloadProgress((prev) => ({ ...prev, ...pending }));
+  }, []);
+
+  const queueDownloadProgress = useCallback(
+    (
+      variant: string,
+      entry: ModelDownloadProgressMap[string],
+      flushNow: boolean,
+    ) => {
+      pendingProgressRef.current = {
+        ...pendingProgressRef.current,
+        [variant]: entry,
+      };
+      if (flushNow) {
+        flushDownloadProgress();
+      } else if (!progressFlushTimerRef.current) {
+        progressFlushTimerRef.current = setTimeout(
+          flushDownloadProgress,
+          PROGRESS_FLUSH_INTERVAL_MS,
+        );
+      }
+    },
+    [flushDownloadProgress],
+  );
+
   const clearDownloadProgress = useCallback((variant: string) => {
+    const { [variant]: _pending, ...remaining } = pendingProgressRef.current;
+    pendingProgressRef.current = remaining;
     setDownloadProgress((prev) => {
       const { [variant]: _removed, ...rest } = prev;
       return rest;
@@ -288,22 +337,23 @@ export function ModelCatalogProvider({
         try {
           const data = JSON.parse(event.data);
           lastProgressAtRef.current[variant] = Date.now();
-          setDownloadProgress((prev) => ({
-            ...prev,
-            [variant]: {
+          const isTerminal =
+            data.status === "completed" ||
+            data.status === "error" ||
+            data.status === "cancelled";
+          queueDownloadProgress(
+            variant,
+            {
               percent: data.percent,
               currentFile: data.current_file,
               status: data.status,
               downloadedBytes: data.downloaded_bytes,
               totalBytes: data.total_bytes,
             },
-          }));
+            isTerminal,
+          );
 
-          if (
-            data.status === "completed" ||
-            data.status === "error" ||
-            data.status === "cancelled"
-          ) {
+          if (isTerminal) {
             const previousTerminalState =
               lastDownloadTerminalStateRef.current[variant];
             if (previousTerminalState !== data.status) {
@@ -518,6 +568,10 @@ export function ModelCatalogProvider({
       );
       streamWatchdogTimersRef.current = {};
       lastProgressAtRef.current = {};
+      if (progressFlushTimerRef.current) {
+        clearTimeout(progressFlushTimerRef.current);
+        progressFlushTimerRef.current = null;
+      }
     };
   }, []);
 
