@@ -402,9 +402,10 @@ impl GraniteSaaPrefixMode {
 /// `IZWI_ASR_REALTIME_NOISE_GATE=0`. It delays transcripts by
 /// [`izwi_vad::DEFAULT_NOISE_GATE_LOOKAHEAD_MS`].
 fn realtime_noise_gate(variant: ModelVariant) -> Option<izwi_vad::NoiseGate> {
-    let disabled = std::env::var("IZWI_ASR_REALTIME_NOISE_GATE")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"));
-    (variant.family().hallucinates_on_non_speech() && !disabled).then(|| {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled =
+        *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_ASR_REALTIME_NOISE_GATE", true));
+    (variant.family().hallucinates_on_non_speech() && enabled).then(|| {
         izwi_vad::NoiseGate::new(izwi_vad::NoiseGateConfig {
             endpoint: izwi_vad::EndpointConfig {
                 snr_margin_db: izwi_vad::configured_snr_margin_db(),

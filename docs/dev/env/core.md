@@ -18,6 +18,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | duration | engine per-backend default | startup | Seconds a realtime ASR session may sit idle before it is closed (u64; invalid ignored). |
 | `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | duration | engine per-backend default | startup | Maximum lifetime in seconds of one realtime ASR session (u64; invalid ignored). |
 | `IZWI_ASR_REALTIME_MAX_SESSIONS` | integer | engine per-backend default | startup | Maximum concurrent realtime ASR sessions (positive integer; 0 or invalid ignored). |
+| `IZWI_ASR_REALTIME_NOISE_GATE` | flag | `true` | first use | Silences non-speech before it reaches a realtime ASR model that hallucinates on it (Voxtral), at a 500 ms transcript delay; false lets noise reach the model. |
 | `IZWI_ASR_STREAM_CHUNK_MAX_SECS` | number | 3.2 (audio <=12s) else min(long-form max, 8) | first use | Overrides the hard max of low-latency streaming ASR chunks; setting any STREAM_CHUNK var disables the single-chunk shortcut. |
 | `IZWI_ASR_STREAM_CHUNK_MIN_SECS` | number | 1.0 (audio <=12s) else 2.0 | first use | Overrides the minimum chunk length in seconds for low-latency streaming ASR chunk planning. |
 | `IZWI_ASR_STREAM_CHUNK_OVERLAP_SECS` | number | 0.45 (audio <=12s) else min(long-form overlap, 1.0) | first use | Overrides the overlap in seconds between low-latency streaming ASR chunks (capped at 45% of target). |
