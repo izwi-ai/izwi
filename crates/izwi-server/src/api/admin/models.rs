@@ -309,7 +309,10 @@ impl AdminModelRouteCapabilities {
             studio_projects: supports_tts,
             voice_realtime_text_model: variant.is_chat(),
             voice_realtime_modular_asr: variant.is_asr(),
-            voice_realtime_modular_tts: supports_tts,
+            voice_realtime_modular_tts: crate::app::voice_realtime::validate_realtime_tts_model(
+                variant,
+            )
+            .is_ok(),
             voice_realtime_unified: variant.is_audio_chat(),
             forced_alignment: variant.is_forced_aligner(),
             tokenizer: variant.is_tokenizer(),
@@ -996,6 +999,20 @@ fn model_precision_rank(dir_name: &str) -> u8 {
 mod tests {
     use super::*;
     use izwi_core::LoadedModelDiagnostics;
+
+    /// The realtime TTS flag matches what `/v1/voice/realtime/ws` accepts:
+    /// a speech model without built-in voices or streaming is not offered.
+    #[test]
+    fn realtime_tts_capability_matches_the_voice_socket() {
+        let realtime_tts =
+            |variant| AdminModelRouteCapabilities::from_variant(variant).voice_realtime_modular_tts;
+        assert!(realtime_tts(ModelVariant::Kokoro82M));
+        assert!(!realtime_tts(ModelVariant::Qwen3Tts12Hz06BBase));
+        assert!(
+            AdminModelRouteCapabilities::from_variant(ModelVariant::Qwen3Tts12Hz06BBase)
+                .openai_audio_speech
+        );
+    }
 
     /// P1.0: naming a removed variant (CLI `pull` reads it through this
     /// route) is a 400 that names the dense replacement.

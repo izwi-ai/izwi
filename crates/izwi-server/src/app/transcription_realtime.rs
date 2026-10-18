@@ -88,7 +88,7 @@ impl OutboundTx {
 
     fn send_class(&self, message: Message, class: OutboundClass) -> bool {
         match self.mailbox.enqueue(OutboundItem {
-            message,
+            message: message.into(),
             class,
             turn_generation: None,
         }) {

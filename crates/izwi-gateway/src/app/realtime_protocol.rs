@@ -201,6 +201,12 @@ pub enum RealtimeServerEvent {
         resume_window_ms: u64,
     },
     SessionStarted,
+    /// Whether each model the session needs is loaded, sent once after
+    /// `session_started` when loading settles. A model that failed to load
+    /// carries its error; that session's turns fail until it is fixed.
+    ModelsStatus {
+        models: Vec<RealtimeModelStatus>,
+    },
     AudioAccepted {
         frame_sequence: u64,
         buffer_depth_samples: usize,
@@ -295,6 +301,16 @@ pub enum RealtimeServerEvent {
         client_timestamp_ms: Option<u64>,
         server_timestamp_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeModelStatus {
+    /// The pipeline stage: `asr`, `text`, `tts` or `s2s`.
+    pub stage: String,
+    pub model_id: String,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl RealtimeServerEvent {

@@ -51,7 +51,7 @@ use crate::app::realtime_protocol::{
 use crate::app::realtime_transport::{
     now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, spawn_writer,
     wav_bytes_from_pcm16_mono, ClientPcm16Frame, OutboundClass, OutboundEnqueueError, OutboundItem,
-    OutboundLimits, OutboundMailbox,
+    OutboundLimits, OutboundMailbox, OutboundMessage,
 };
 use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
 use crate::chat_store::ChatStore;
@@ -134,9 +134,16 @@ fn negotiate_voice_protocol(
 struct TypedVoiceSession {
     session_id: String,
     owner_instance_id: String,
+    /// The epoch events queued from now on belong to; a turn cutoff
+    /// advances it.
     connection_epoch: u64,
+    /// The epoch of the last event sent. Events are numbered when the writer
+    /// sends them, so an event the mailbox drops never leaves a gap.
+    sent_epoch: u64,
     next_event_id: u64,
     next_sequence: u64,
+    last_sent_event_id: u64,
+    last_sent_sequence: u64,
     next_revision: u64,
     last_audio_chunk_sequence: u64,
 }
@@ -147,8 +154,11 @@ impl TypedVoiceSession {
             session_id,
             owner_instance_id,
             connection_epoch: 0,
+            sent_epoch: 0,
             next_event_id: 1,
             next_sequence: 0,
+            last_sent_event_id: 0,
+            last_sent_sequence: 0,
             next_revision: 1,
             last_audio_chunk_sequence: 0,
         }
@@ -160,25 +170,42 @@ impl TypedVoiceSession {
         revision
     }
 
+    /// Number `event`, queued in `epoch`, as the next event on the wire.
     fn envelope(
         &mut self,
-        event: RealtimeServerEvent,
+        mut event: RealtimeServerEvent,
+        epoch: u64,
         utterance_id: Option<String>,
         turn_id: Option<String>,
     ) -> RealtimeEventEnvelope<RealtimeServerEvent> {
+        if let RealtimeServerEvent::Interruption {
+            cutoff_event_id,
+            cutoff_sequence,
+            ..
+        } = &mut event
+        {
+            *cutoff_event_id = self.last_sent_event_id;
+            *cutoff_sequence = self.last_sent_sequence;
+        }
+        if epoch > self.sent_epoch {
+            self.sent_epoch = epoch;
+            self.next_sequence = 0;
+        }
         let envelope = RealtimeEventEnvelope {
             protocol: RealtimeProtocol::VoiceRealtime,
             version: VOICE_REALTIME_VERSION,
             event_id: self.next_event_id,
             sequence: self.next_sequence,
             session_id: self.session_id.clone(),
-            connection_epoch: self.connection_epoch,
+            connection_epoch: self.sent_epoch,
             timestamp_ms: now_unix_millis(),
             utterance_id,
             turn_id,
             segment_id: None,
             event,
         };
+        self.last_sent_event_id = self.next_event_id;
+        self.last_sent_sequence = self.next_sequence;
         self.next_event_id = self.next_event_id.saturating_add(1);
         self.next_sequence = self.next_sequence.saturating_add(1);
         envelope
@@ -208,16 +235,21 @@ impl OutboundTx {
         }
     }
 
-    fn send(&self, message: Message) -> bool {
+    fn send(&self, message: impl Into<OutboundMessage>) -> bool {
         self.enqueue(message, OutboundClass::Critical, None).is_ok()
     }
 
-    fn send_turn(&self, generation: u64, message: Message) -> bool {
+    fn send_turn(&self, generation: u64, message: impl Into<OutboundMessage>) -> bool {
         self.enqueue(message, OutboundClass::Critical, Some(generation))
             .is_ok()
     }
 
-    fn send_text_snapshot(&self, generation: u64, key: String, message: Message) -> bool {
+    fn send_text_snapshot(
+        &self,
+        generation: u64,
+        key: String,
+        message: impl Into<OutboundMessage>,
+    ) -> bool {
         self.enqueue(message, OutboundClass::Coalescible(key), Some(generation))
             .is_ok()
     }
@@ -235,7 +267,7 @@ impl OutboundTx {
         let result = self
             .mailbox
             .enqueue_audio(OutboundItem {
-                message,
+                message: message.into(),
                 class: OutboundClass::Audio { bytes, duration_ms },
                 turn_generation: Some(generation),
             })
@@ -269,19 +301,19 @@ impl OutboundTx {
         }
     }
 
-    fn send_diagnostic(&self, message: Message) -> bool {
+    fn send_diagnostic(&self, message: impl Into<OutboundMessage>) -> bool {
         self.enqueue(message, OutboundClass::Droppable, None)
             .is_ok()
     }
 
     fn enqueue(
         &self,
-        message: Message,
+        message: impl Into<OutboundMessage>,
         class: OutboundClass,
         turn_generation: Option<u64>,
     ) -> Result<(), OutboundEnqueueError> {
         let result = self.mailbox.enqueue(OutboundItem {
-            message,
+            message: message.into(),
             class,
             turn_generation,
         });
@@ -341,25 +373,41 @@ impl OutboundTx {
             .as_mut()
         {
             typed.connection_epoch = typed.connection_epoch.saturating_add(1);
-            typed.next_sequence = 0;
         }
     }
 
+    /// The wire message for one event: legacy JSON as is, or for the typed
+    /// protocol the mapped event, numbered when the writer sends it. `None`
+    /// when the typed protocol has no equivalent.
     fn encode_json_event(
         &self,
         value: &serde_json::Value,
-    ) -> Result<Option<String>, serde_json::Error> {
+    ) -> Result<Option<OutboundMessage>, serde_json::Error> {
         let mut wire = self
             .wire
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let Some(typed) = wire.typed.as_mut() else {
-            return serde_json::to_string(value).map(Some);
+            return serde_json::to_string(value)
+                .map(|text| Some(Message::Text(text.into()).into()));
         };
         let Some((event, utterance_id, turn_id)) = map_typed_voice_event(value, typed) else {
             return Ok(None);
         };
-        serde_json::to_string(&typed.envelope(event, utterance_id, turn_id)).map(Some)
+        let epoch = typed.connection_epoch;
+        let wire = Arc::clone(&self.wire);
+        Ok(Some(OutboundMessage::Deferred(Box::new(move || {
+            let mut wire = wire.lock().unwrap_or_else(|poison| poison.into_inner());
+            let typed = wire.typed.as_mut()?;
+            let envelope = typed.envelope(event, epoch, utterance_id, turn_id);
+            match serde_json::to_string(&envelope) {
+                Ok(text) => Some(Message::Text(text.into())),
+                Err(err) => {
+                    warn!("failed to serialize typed voice ws event: {err}");
+                    None
+                }
+            }
+        }))))
     }
 
     fn close(&self) {
@@ -2184,7 +2232,7 @@ fn spawn_turn_task(
                                 resolve_asr_model_variant(Some(&config.asr_model_id)),
                             )
                             .await
-                            .map_err(|err| format!("Failed to load ASR model: {err}"))?;
+                            .map_err(|err| model_load_error("ASR", err))?;
                         let tx = out_tx.clone();
                         let utt_id = commit.utterance_id.clone();
                         let utt_seq = commit.utterance_seq;
@@ -2307,7 +2355,7 @@ fn spawn_turn_task(
                             model_leases
                                 .hold(&state.runtime, text_variant)
                                 .await
-                                .map_err(|err| format!("Failed to load chat model: {err}"))?;
+                                .map_err(|err| model_load_error("chat", err))?;
                             run_agent_turn(
                                 &state,
                                 &agent_session_id,
@@ -2702,7 +2750,7 @@ impl SegmentSynthesis {
             model_leases
                 .hold(&state.runtime, variant)
                 .await
-                .map_err(|err| format!("Failed to load TTS model: {err}"))?;
+                .map_err(|err| model_load_error("TTS", err))?;
             let permit = acquire_stage_permit(&state).await?;
             request.runtime_context = permit.runtime_context();
             state
@@ -2958,8 +3006,9 @@ async fn speak_reply(
 /// Realtime voice speaks with a built-in voice and streams its audio: a
 /// reference-only model (Qwen Base, VibeVoice, Fish) has no voice to speak
 /// with here, and one that does not stream would delay the first audio to
-/// the end (TPIPE-21).
-fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
+/// the end (TPIPE-21). The admin `voice_realtime_modular_tts` flag uses the
+/// same check.
+pub(crate) fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
     let capabilities = variant
         .speech_capabilities()
         .ok_or_else(|| format!("Model `{variant}` is not a text-to-speech model."))?;
@@ -3072,7 +3121,7 @@ async fn stream_unified_s2s_to_socket(
     model_leases
         .hold(&state.runtime, variant)
         .await
-        .map_err(|err| format!("Failed to load unified audio model: {err}"))?;
+        .map_err(|err| model_load_error("unified audio", err))?;
 
     send_turn_json(
         out_tx,
@@ -3611,6 +3660,13 @@ fn map_typed_voice_event(
             resume_window_ms: 0,
         },
         "input_stream_ready" => RealtimeServerEvent::SessionStarted,
+        "models_ready" => RealtimeServerEvent::ModelsStatus {
+            models: value
+                .get("models")
+                .cloned()
+                .and_then(|models| serde_json::from_value(models).ok())
+                .unwrap_or_default(),
+        },
         "user_speech_start" => RealtimeServerEvent::SpeechStarted,
         "user_speech_end" => RealtimeServerEvent::SpeechEnded {
             reason: match value
@@ -3784,7 +3840,6 @@ fn map_typed_voice_event(
         // These legacy-only state markers either have no typed equivalent or would encode
         // append-only deltas. Typed clients reconstruct state from full snapshots/finals.
         "input_stream_stopped"
-        | "models_ready"
         | "conversation_item_truncated"
         | "turn_processing"
         | "user_transcript_start"
@@ -3797,7 +3852,7 @@ fn map_typed_voice_event(
 
 fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
     match out_tx.encode_json_event(&value) {
-        Ok(Some(text)) => out_tx.send(Message::Text(text.into())),
+        Ok(Some(message)) => out_tx.send(message),
         Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws event: {err}");
@@ -3811,7 +3866,7 @@ fn send_turn_json(out_tx: &OutboundTx, output_generation: u64, value: serde_json
         return false;
     }
     match out_tx.encode_json_event(&value) {
-        Ok(Some(text)) => out_tx.send_turn(output_generation, Message::Text(text.into())),
+        Ok(Some(message)) => out_tx.send_turn(output_generation, message),
         Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws turn event: {err}");
@@ -3830,12 +3885,10 @@ fn send_turn_text_snapshot(
         return false;
     }
     match out_tx.encode_json_event(&value) {
-        Ok(Some(text)) if out_tx.typed_protocol_enabled() => {
-            out_tx.send_turn(output_generation, Message::Text(text.into()))
+        Ok(Some(message)) if out_tx.typed_protocol_enabled() => {
+            out_tx.send_turn(output_generation, message)
         }
-        Ok(Some(text)) => {
-            out_tx.send_text_snapshot(output_generation, key, Message::Text(text.into()))
-        }
+        Ok(Some(message)) => out_tx.send_text_snapshot(output_generation, key, message),
         Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws text snapshot: {err}");
@@ -3846,16 +3899,29 @@ fn send_turn_text_snapshot(
 
 fn send_diagnostic_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
     match out_tx.encode_json_event(&value) {
-        Ok(Some(text)) if out_tx.typed_protocol_enabled() => {
-            out_tx.send(Message::Text(text.into()))
-        }
-        Ok(Some(text)) => out_tx.send_diagnostic(Message::Text(text.into())),
+        Ok(Some(message)) if out_tx.typed_protocol_enabled() => out_tx.send(message),
+        Ok(Some(message)) => out_tx.send_diagnostic(message),
         Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws diagnostic: {err}");
             false
         }
     }
+}
+
+const MODEL_LOAD_ERROR_PREFIX: &str = "Failed to load ";
+
+/// The error a turn reports when one of its models cannot be loaded.
+fn model_load_error(stage: &str, err: impl std::fmt::Display) -> String {
+    format!("{MODEL_LOAD_ERROR_PREFIX}{stage} model: {err}")
+}
+
+/// The machine-readable code of a voice error message, so clients can tell
+/// a missing model (fix it in settings) from a failed inference (retry).
+fn voice_error_code(message: &str) -> Option<&'static str> {
+    message
+        .starts_with(MODEL_LOAD_ERROR_PREFIX)
+        .then_some("model_unavailable")
 }
 
 fn send_error(
@@ -3871,6 +3937,7 @@ fn send_error(
             "type": "error",
             "utterance_id": utterance_id,
             "utterance_seq": utterance_seq,
+            "code": voice_error_code(&message),
             "message": message,
         }),
     );
@@ -3891,6 +3958,7 @@ fn send_turn_error(
             "type": "error",
             "utterance_id": utterance_id,
             "utterance_seq": utterance_seq,
+            "code": voice_error_code(&message),
             "message": message,
         }),
     );
@@ -4685,7 +4753,7 @@ mod tests {
             &mut typed,
         )
         .expect("typed session ready mapping");
-        let mut envelope = typed.envelope(event, utterance_id, turn_id);
+        let mut envelope = typed.envelope(event, 0, utterance_id, turn_id);
         envelope.timestamp_ms = 1_725_000_000_123;
 
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -4698,8 +4766,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_voice_output_cutoff_starts_a_contiguous_new_epoch() {
+    fn typed_outbound() -> OutboundTx {
         let runtime =
             Arc::new(RuntimeService::new(izwi_core::EngineConfig::default()).expect("runtime"));
         let outbound = OutboundTx::new(runtime, "voice typed test");
@@ -4708,34 +4775,144 @@ mod tests {
             "voice-session-1".to_string(),
             "process-42".to_string(),
         );
-        let first: RealtimeEventEnvelope<RealtimeServerEvent> = serde_json::from_str(
-            outbound
-                .encode_json_event(&json!({"type": "input_stream_ready"}))
-                .expect("encode first event")
-                .expect("mapped first event")
-                .as_str(),
-        )
-        .expect("first envelope");
-        outbound.advance_typed_output_epoch();
-        let next: RealtimeEventEnvelope<RealtimeServerEvent> = serde_json::from_str(
-            outbound
-                .encode_json_event(&json!({
-                    "type": "turn_interrupted",
-                    "utterance_id": "utterance-1",
-                    "utterance_seq": 1,
-                    "reason": "barge_in",
-                }))
-                .expect("encode cutoff event")
-                .expect("mapped cutoff event")
-                .as_str(),
-        )
-        .expect("cutoff envelope");
+        outbound
+    }
 
-        assert_eq!(first.connection_epoch, 0);
-        assert_eq!(first.sequence, 0);
-        assert_eq!(next.connection_epoch, 1);
-        assert_eq!(next.sequence, 0);
-        assert_eq!(next.validate_successor(&first), Ok(()));
+    async fn drain_envelopes(
+        outbound: &OutboundTx,
+    ) -> Vec<RealtimeEventEnvelope<RealtimeServerEvent>> {
+        drain_text(outbound)
+            .await
+            .into_iter()
+            .map(|value| serde_json::from_value(value).expect("typed envelope"))
+            .collect()
+    }
+
+    fn assert_contiguous(envelopes: &[RealtimeEventEnvelope<RealtimeServerEvent>]) {
+        assert_eq!(envelopes[0].sequence, 0);
+        assert_eq!(envelopes[0].connection_epoch, 0);
+        for pair in envelopes.windows(2) {
+            assert_eq!(pair[1].validate_successor(&pair[0]), Ok(()), "{pair:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_voice_output_cutoff_starts_a_contiguous_new_epoch() {
+        let outbound = typed_outbound();
+        assert!(send_json(&outbound, json!({"type": "input_stream_ready"})));
+        outbound.advance_typed_output_epoch();
+        assert!(send_json(
+            &outbound,
+            json!({
+                "type": "turn_interrupted",
+                "utterance_id": "utterance-1",
+                "utterance_seq": 1,
+                "reason": "barge_in",
+            }),
+        ));
+
+        let envelopes = drain_envelopes(&outbound).await;
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[1].connection_epoch, 1);
+        assert_eq!(envelopes[1].sequence, 0);
+        assert!(matches!(
+            envelopes[1].event,
+            RealtimeServerEvent::Interruption {
+                cutoff_event_id: 1,
+                cutoff_sequence: 0,
+                ..
+            }
+        ));
+        assert_contiguous(&envelopes);
+    }
+
+    /// Typed clients learn which models failed to load before anyone speaks,
+    /// and a model-load turn error is coded so they can tell it from a
+    /// failed inference.
+    #[tokio::test]
+    async fn typed_voice_reports_model_status_and_coded_model_errors() {
+        let outbound = typed_outbound();
+        assert!(send_json(
+            &outbound,
+            json!({
+                "type": "models_ready",
+                "models": [
+                    {"stage": "asr", "model_id": "VibeVoice-ASR", "ready": false,
+                     "error": "Model VibeVoice-ASR not downloaded. Please download it first."},
+                    {"stage": "text", "model_id": "Qwen3.5-4B", "ready": true},
+                ],
+                "elapsed_ms": 12,
+            }),
+        ));
+        send_error(
+            &outbound,
+            None,
+            None,
+            model_load_error("ASR", "not downloaded"),
+        );
+        send_error(&outbound, None, None, "Chat generation failed");
+
+        let envelopes = drain_envelopes(&outbound).await;
+        let RealtimeServerEvent::ModelsStatus { models } = &envelopes[0].event else {
+            panic!("expected models_status, got {:?}", envelopes[0].event);
+        };
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].stage, "asr");
+        assert!(!models[0].ready);
+        assert!(models[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not downloaded"));
+        assert!(models[1].ready && models[1].error.is_none());
+        assert!(matches!(
+            envelopes[1].event,
+            RealtimeServerEvent::RecoverableError {
+                code: RealtimeErrorCode::ModelUnavailable,
+                ..
+            }
+        ));
+        assert!(matches!(
+            envelopes[2].event,
+            RealtimeServerEvent::RecoverableError {
+                code: RealtimeErrorCode::InferenceFailed,
+                ..
+            }
+        ));
+    }
+
+    /// A cut-off turn's queued events are dropped before they are sent, so
+    /// they must not use up sequence numbers: the client closes the socket on
+    /// any gap. This is the finished-turn barge-in, where no new epoch starts.
+    #[tokio::test]
+    async fn typed_voice_events_dropped_by_a_cutoff_leave_no_sequence_gap() {
+        let outbound = typed_outbound();
+        assert!(send_json(&outbound, json!({"type": "input_stream_ready"})));
+        let turn_event = |event_type: &str| json!({"type": event_type, "utterance_id": "utterance-1", "utterance_seq": 1});
+        assert!(send_turn_json(
+            &outbound,
+            1,
+            turn_event("assistant_text_start")
+        ));
+        assert!(send_turn_json(
+            &outbound,
+            1,
+            turn_event("assistant_audio_done")
+        ));
+        outbound.cutoff_turn(1);
+        assert!(!send_turn_json(&outbound, 1, turn_event("turn_done")));
+        assert!(send_json(
+            &outbound,
+            json!({"type": "user_speech_start", "utterance_id": "utterance-2", "utterance_seq": 2}),
+        ));
+
+        let envelopes = drain_envelopes(&outbound).await;
+        assert_eq!(envelopes.len(), 2);
+        assert!(matches!(
+            envelopes[1].event,
+            RealtimeServerEvent::SpeechStarted
+        ));
+        assert_contiguous(&envelopes);
     }
 
     #[tokio::test]
