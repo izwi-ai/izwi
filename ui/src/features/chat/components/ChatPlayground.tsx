@@ -36,6 +36,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
+import { StatePanel } from "@/components/ui/state-panel";
 import { ChatThreadList } from "@/features/chat/components/ChatThreadList";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import {
@@ -138,6 +139,13 @@ export function ChatPlayground({
   const [threadsLoading, setThreadsLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A thread whose messages failed to load: shown as that thread's error
+  // state (with Retry), not as an empty new chat.
+  const [threadLoadError, setThreadLoadError] = useState<{
+    threadId: string;
+    message: string;
+  } | null>(null);
+  const [threadLoadAttempt, setThreadLoadAttempt] = useState(0);
   const [stats, setStats] = useState<ChatGenerationStats | null>(null);
   const statsSummary = stats ? summarizeChatStats(stats) : null;
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
@@ -259,9 +267,16 @@ export function ChatPlayground({
     return String(Math.max(0, threads.length));
   }, [threads.length]);
 
+  const activeThreadLoadError =
+    threadLoadError && threadLoadError.threadId === activeThreadId
+      ? threadLoadError.message
+      : null;
   const hasConversation =
     !!activeThreadId &&
-    (visibleMessages.length > 0 || isStreaming || messagesLoading);
+    (visibleMessages.length > 0 ||
+      isStreaming ||
+      messagesLoading ||
+      activeThreadLoadError !== null);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const supportedReasoningEfforts =
     chatCapabilities?.reasoning_efforts ?? [];
@@ -594,6 +609,7 @@ export function ChatPlayground({
 
     const loadThread = async () => {
       setMessagesLoading(true);
+      setThreadLoadError(null);
       try {
         const detail = await api.getChatThread(requestedThreadId);
         if (cancelled || activeThreadIdRef.current !== requestedThreadId) {
@@ -616,9 +632,14 @@ export function ChatPlayground({
         );
       } catch (loadError) {
         if (!cancelled) {
-          setError(
-            getErrorMessage(loadError, "Failed to load this conversation."),
-          );
+          setMessages([]);
+          setThreadLoadError({
+            threadId: requestedThreadId,
+            message: getErrorMessage(
+              loadError,
+              "Failed to load this conversation.",
+            ),
+          });
         }
       } finally {
         if (!cancelled) {
@@ -632,7 +653,7 @@ export function ChatPlayground({
     return () => {
       cancelled = true;
     };
-  }, [activeThreadId]);
+  }, [activeThreadId, threadLoadAttempt]);
 
   const stopStreaming = useCallback(() => {
     if (streamAbortRef.current) {
@@ -1479,7 +1500,7 @@ export function ChatPlayground({
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
-                    className="mt-3 mx-auto max-w-3xl p-2 rounded bg-red-950/50 border border-red-900/50 text-red-300 text-xs"
+                    className="mt-3 mx-auto max-w-3xl rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-xs text-[var(--danger-text)]"
                   >
                     {error}
                   </motion.div>
@@ -1496,7 +1517,28 @@ export function ChatPlayground({
                 onScroll={handleMessageViewportScroll}
                 className="h-full overflow-y-auto px-4 sm:px-6 pb-48 pt-3 scrollbar-thin"
               >
-                {messagesLoading ? (
+                {activeThreadLoadError && !messagesLoading ? (
+                  <div className="mx-auto mt-10 max-w-xl">
+                    <StatePanel
+                      tone="danger"
+                      icon={AlertTriangle}
+                      title="This chat could not be loaded"
+                      description={activeThreadLoadError}
+                      actions={
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setThreadLoadAttempt((attempt) => attempt + 1)
+                          }
+                        >
+                          Retry
+                        </Button>
+                      }
+                    />
+                  </div>
+                ) : messagesLoading ? (
                   <div
                     className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
                     role="status"

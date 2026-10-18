@@ -125,6 +125,81 @@ describe("ChatPlayground", () => {
     );
   });
 
+  it("shows a failed thread as that thread's error state and retries it", async () => {
+    const thread = {
+      id: "thread-1",
+      title: "Royal families in Europe",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "How many ruling royal families are there?",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread
+      .mockRejectedValueOnce(
+        new Error("Chat storage error: no such column: model_id"),
+      )
+      .mockResolvedValueOnce({
+        thread,
+        messages: [
+          {
+            id: "message-1",
+            thread_id: "thread-1",
+            role: "user",
+            content: "How many ruling royal families are there?",
+            created_at: 1,
+            tokens_generated: null,
+            generation_time_ms: null,
+          },
+        ],
+      });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-1"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText("This chat could not be loaded"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Chat storage error: no such column: model_id"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Royal families in Europe" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("What can I help with?")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByText("How many ruling royal families are there?", {
+        selector: "p, div, span",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("This chat could not be loaded"),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows the active thread title below the selector without the old conversation header", async () => {
     const thread = {
       id: "thread-1",
