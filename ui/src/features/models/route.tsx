@@ -1,18 +1,24 @@
-import { useState, useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   Download,
+  Loader2,
   Play,
+  RefreshCw,
   Square,
   Trash2,
-  HardDrive,
-  Search,
-  Loader2,
   X,
-  RefreshCw,
 } from "lucide-react";
-import clsx from "clsx";
 import type { ModelInfo, RemovedModelInfo } from "@/api";
+import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
+import {
+  HistoryToolbar,
+  SearchField,
+  SegmentedFilter,
+} from "@/components/history/HistoryToolbar";
+import { RowBadge } from "@/components/history/RowBadge";
+import { RowMenu, type RowMenuItem } from "@/components/history/RowMenu";
 import { PageHeader, PageShell } from "@/components/PageShell";
+import { Button } from "@/components/ui/button";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   compareQwenVersionRank,
@@ -22,7 +28,12 @@ import {
   resolveModelDetail,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
-import { withQwen3Prefix } from "@/utils/modelDisplay";
+import {
+  MODEL_TASK_GROUPS,
+  modelTaskGroupId,
+} from "@/features/models/taskGroups";
+import { useRuntimeHealth } from "@/shared/hooks/useRuntimeHealth";
+import { cn } from "@/lib/utils";
 
 interface MyModelsPageProps {
   models: ModelInfo[];
@@ -38,18 +49,14 @@ interface MyModelsPageProps {
   onRefresh: () => void;
 }
 
-type FilterType = "all" | "downloaded" | "loaded" | "not_downloaded";
-type CategoryType = "all" | "tts" | "asr" | "chat";
-type ProviderSection = { provider: string; models: ModelInfo[] };
-
-function matchesCategory(
-  details: (typeof MODEL_DETAILS)[string],
-  category: Exclude<CategoryType, "all">,
-): boolean {
-  if (details.categories && details.categories.length > 0) {
-    return details.categories.includes(category);
-  }
-  return details.category === category;
+type FilterType = "all" | "loaded" | "downloaded" | "available";
+type GroupBy = "task" | "provider";
+interface ModelSection {
+  id: string;
+  label: string;
+  icon?: React.ComponentType<{ className?: string }>;
+  usedBy?: string;
+  models: ModelInfo[];
 }
 
 function parseSize(sizeStr: string): number {
@@ -90,38 +97,6 @@ function getModelSizeLabel(model: ModelInfo): string {
   return bytes > 0 ? formatBytes(bytes) : "Size unknown";
 }
 
-function getStatusDotClass(status: ModelInfo["status"]): string {
-  switch (status) {
-    case "ready":
-      return "bg-[var(--status-positive-solid)] shadow-[0_0_8px_var(--status-positive-solid)]";
-    case "downloaded":
-      return "bg-[var(--text-secondary)]";
-    case "downloading":
-    case "loading":
-      return "bg-[var(--status-warning-text)]";
-    case "error":
-      return "bg-[var(--danger-text)]";
-    default:
-      return "bg-[var(--text-subtle)]";
-  }
-}
-
-function getStatusTextClass(status: ModelInfo["status"]): string {
-  switch (status) {
-    case "ready":
-      return "text-[var(--status-positive-solid)]";
-    case "downloaded":
-      return "text-[var(--text-secondary)]";
-    case "downloading":
-    case "loading":
-      return "text-[var(--status-warning-text)]";
-    case "error":
-      return "text-[var(--danger-text)]";
-    default:
-      return "text-[var(--text-subtle)]";
-  }
-}
-
 function getProviderLabel(variant: string): string {
   return getModelProviderLabel(variant);
 }
@@ -143,6 +118,112 @@ function compareProviders(left: string, right: string): number {
   return left.localeCompare(right);
 }
 
+function isOnDisk(model: ModelInfo): boolean {
+  return model.status === "downloaded" || model.status === "ready";
+}
+
+function StatusCell({
+  model,
+  progress,
+}: {
+  model: ModelInfo;
+  progress: number;
+}) {
+  const live = {
+    role: model.status === "error" ? "alert" : "status",
+    "aria-live": model.status === "error" ? "assertive" : "polite",
+    "aria-atomic": true,
+  } as const;
+  switch (model.status) {
+    case "ready":
+      return (
+        <span {...live}>
+          <RowBadge tone="positive" dot>
+            Loaded
+          </RowBadge>
+        </span>
+      );
+    case "downloading":
+      return (
+        <div {...live} className="flex flex-col gap-1.5">
+          <RowBadge tone="info" dot className="self-start">
+            Downloading {Math.round(progress)}%
+          </RowBadge>
+          <div className="h-[3px] w-28 overflow-hidden rounded-full bg-[var(--surface-raised)]">
+            <div
+              className="h-full bg-[var(--text-primary)] transition-[width]"
+              style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
+            />
+          </div>
+        </div>
+      );
+    case "loading":
+      return (
+        <span {...live}>
+          <RowBadge tone="info" icon={<Loader2 className="h-3 w-3 animate-spin" />}>
+            Loading
+          </RowBadge>
+        </span>
+      );
+    case "downloaded":
+      return (
+        <span {...live}>
+          <RowBadge>Downloaded</RowBadge>
+        </span>
+      );
+    case "error":
+      return (
+        <span {...live} title={model.error_message ?? undefined}>
+          <RowBadge tone="danger" dot>
+            Error
+          </RowBadge>
+        </span>
+      );
+    default:
+      return (
+        <span {...live} className="text-[13px] text-[var(--text-subtle)]">
+          Not downloaded
+        </span>
+      );
+  }
+}
+
+function SummaryCard({
+  label,
+  value,
+  detail,
+  meter,
+}: {
+  label: string;
+  value: React.ReactNode;
+  detail: React.ReactNode;
+  meter?: number | null;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1 rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4 py-3.5">
+      <div className="text-xs text-[var(--text-subtle)]">{label}</div>
+      <div className="truncate text-[15px] text-[var(--text-muted)]">{value}</div>
+      {meter != null ? (
+        <div
+          role="meter"
+          aria-label={label}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(meter * 100)}
+          className="mt-1.5 h-1 overflow-hidden rounded-full bg-[var(--surface-raised)]"
+        >
+          <div
+            className="h-full rounded-full bg-[var(--status-positive-solid)]"
+            style={{ width: `${Math.max(meter * 100, 2)}%` }}
+          />
+        </div>
+      ) : (
+        <div className="truncate text-xs text-[var(--text-subtle)]">{detail}</div>
+      )}
+    </div>
+  );
+}
+
 export function MyModelsPage({
   models,
   removedModels = [],
@@ -157,55 +238,60 @@ export function MyModelsPage({
 }: MyModelsPageProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<FilterType>("all");
-  const [categoryFilter, setCategoryFilter] = useState<CategoryType>("all");
+  const [groupBy, setGroupBy] = useState<GroupBy>("task");
   const [deleteModalVariant, setDeleteModalVariant] = useState<string | null>(
     null,
   );
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const filteredModels = useMemo(() => {
-    return models
-      .filter((m) => !m.variant.includes("Tokenizer"))
-      .filter((m) => {
-        const details = resolveModelDetail(m);
+  const visibleModels = useMemo(
+    () => models.filter((m) => !m.variant.includes("Tokenizer")),
+    [models],
+  );
+  const stats = useMemo(() => {
+    const loaded = visibleModels.filter((m) => m.status === "ready");
+    return {
+      total: visibleModels.length,
+      loaded,
+      downloaded: visibleModels.filter(isOnDisk).length,
+      available: visibleModels.filter((m) => m.status === "not_downloaded")
+        .length,
+      totalSize: visibleModels
+        .filter(isOnDisk)
+        .reduce((acc, m) => acc + getModelSizeBytes(m), 0),
+    };
+  }, [visibleModels]);
+  const health = useRuntimeHealth(stats.loaded.length);
 
-        // Search filter
-        if (searchQuery) {
-          const query = searchQuery.toLowerCase();
-          const providerLabel = getProviderLabel(m.variant).toLowerCase();
-          const matchesSearch =
-            details.shortName.toLowerCase().includes(query) ||
-            details.fullName.toLowerCase().includes(query) ||
-            details.description.toLowerCase().includes(query) ||
-            details.capabilities.some((c) => c.toLowerCase().includes(query)) ||
-            providerLabel.includes(query);
+  const filteredModels = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return visibleModels
+      .filter((m) => {
+        if (query) {
+          const details = resolveModelDetail(m);
+          const matchesSearch = [
+            details.shortName,
+            details.fullName,
+            details.description,
+            getModelDisplayName(m.variant, m.display_name),
+            getProviderLabel(m.variant),
+            ...details.capabilities,
+          ].some((value) => value.toLowerCase().includes(query));
           if (!matchesSearch) return false;
         }
-
-        // Status filter
-        if (statusFilter !== "all") {
-          if (statusFilter === "downloaded" && m.status !== "downloaded")
-            return false;
-          if (statusFilter === "loaded" && m.status !== "ready") return false;
-          if (
-            statusFilter === "not_downloaded" &&
-            m.status !== "not_downloaded"
-          )
-            return false;
+        switch (statusFilter) {
+          case "loaded":
+            return m.status === "ready";
+          case "downloaded":
+            return isOnDisk(m);
+          case "available":
+            return m.status === "not_downloaded";
+          default:
+            return true;
         }
-
-        // Category filter
-        if (
-          categoryFilter !== "all" &&
-          !matchesCategory(details, categoryFilter)
-        ) {
-          return false;
-        }
-
-        return true;
       })
       .sort((a, b) => {
-        // Stable sort independent of status so cards do not jump while
+        // Stable sort independent of status so rows do not jump while
         // downloading/loading. Qwen variants follow version number first
         // (Qwen3 → 3.5 → 3.6 → …) so a smaller newer release does not
         // leapfrog an older larger one; everything else stays size-ordered.
@@ -216,56 +302,45 @@ export function MyModelsPage({
         if (sizeA !== sizeB) return sizeA - sizeB;
         return a.variant.localeCompare(b.variant);
       });
-  }, [models, searchQuery, statusFilter, categoryFilter]);
+  }, [visibleModels, searchQuery, statusFilter]);
 
-  const providerSections = useMemo<ProviderSection[]>(() => {
+  const sections = useMemo<ModelSection[]>(() => {
+    if (groupBy === "task") {
+      return MODEL_TASK_GROUPS.map((group) => ({
+        id: group.id,
+        label: group.label,
+        icon: group.icon,
+        usedBy: group.usedBy,
+        models: filteredModels.filter((m) => modelTaskGroupId(m) === group.id),
+      })).filter((section) => section.models.length > 0);
+    }
     const grouped = new Map<string, ModelInfo[]>();
     for (const model of filteredModels) {
       const provider = getProviderLabel(model.variant);
-      const bucket = grouped.get(provider);
-      if (bucket) {
-        bucket.push(model);
-      } else {
-        grouped.set(provider, [model]);
-      }
+      grouped.set(provider, [...(grouped.get(provider) ?? []), model]);
     }
-
     return Array.from(grouped.entries())
       .sort(([left], [right]) => compareProviders(left, right))
       .map(([provider, groupedModels]) => ({
-        provider,
+        id: provider,
+        label: provider,
         models: groupedModels,
       }));
-  }, [filteredModels]);
-
-  const stats = useMemo(() => {
-    const visibleModels = models.filter(
-      (m) => !m.variant.includes("Tokenizer"),
-    );
-    return {
-      total: visibleModels.length,
-      loaded: visibleModels.filter((m) => m.status === "ready").length,
-      downloaded: visibleModels.filter(
-        (m) => m.status === "downloaded" || m.status === "ready",
-      ).length,
-      totalSize: visibleModels
-        .filter((m) => m.status === "downloaded" || m.status === "ready")
-        .reduce((acc, m) => acc + getModelSizeBytes(m), 0),
-    };
-  }, [models]);
+  }, [filteredModels, groupBy]);
 
   const deleteTargetDetails =
     deleteModalVariant && MODEL_DETAILS[deleteModalVariant]
       ? MODEL_DETAILS[deleteModalVariant]
       : null;
-  const deleteTargetName =
-    deleteTargetDetails && deleteModalVariant
-      ? withQwen3Prefix(deleteTargetDetails.shortName, deleteModalVariant)
+  const deleteTargetName = deleteModalVariant
+    ? deleteTargetDetails
+      ? getModelDisplayName(deleteModalVariant)
       : (removedModels.find((model) => model.variant === deleteModalVariant)
           ?.display_name ??
         models.find((model) => model.variant === deleteModalVariant)
           ?.display_name ??
-        deleteModalVariant);
+        deleteModalVariant)
+    : undefined;
 
   if (loading) {
     return (
@@ -278,318 +353,304 @@ export function MyModelsPage({
     );
   }
 
+  const memory =
+    health.status === "ready" ? health.health.runtime.memory : null;
+  const memoryFraction =
+    memory?.system_total_bytes && memory.system_total_bytes > 0
+      ? Math.min(memory.reserved_bytes / memory.system_total_bytes, 1)
+      : null;
   const hasActiveFilters =
-    searchQuery.trim().length > 0 ||
-    statusFilter !== "all" ||
-    categoryFilter !== "all";
+    searchQuery.trim().length > 0 || statusFilter !== "all";
+
+  const primaryAction = (model: ModelInfo, displayName: string) => {
+    const common = "h-8 gap-1.5 px-2.5 text-[13px]";
+    switch (model.status) {
+      case "not_downloaded":
+        return (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={common}
+            onClick={() => onDownload(model.variant)}
+            aria-label={`Download ${displayName}`}
+          >
+            <Download className="h-3.5 w-3.5" />
+            Download
+          </Button>
+        );
+      case "downloading":
+        return onCancelDownload ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className={common}
+            onClick={() => onCancelDownload(model.variant)}
+          >
+            <X className="h-3.5 w-3.5" />
+            Cancel
+          </Button>
+        ) : null;
+      case "downloaded":
+        return (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={common}
+            onClick={() => onLoad(model.variant)}
+            aria-label={`Load ${displayName}`}
+          >
+            <Play className="h-3.5 w-3.5" />
+            Load
+          </Button>
+        );
+      case "loading":
+        return (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className={common}
+            onClick={() => onUnload(model.variant)}
+          >
+            <X className="h-3.5 w-3.5" />
+            Cancel load
+          </Button>
+        );
+      case "ready":
+        return (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={common}
+            onClick={() => onUnload(model.variant)}
+            aria-label={`Unload ${displayName}`}
+          >
+            <Square className="h-3.5 w-3.5" />
+            Unload
+          </Button>
+        );
+      default:
+        return null;
+    }
+  };
+
+  const menuItems = (model: ModelInfo): RowMenuItem[] =>
+    isOnDisk(model) || (model.status === "error" && model.local_path)
+      ? [
+          {
+            id: "delete",
+            label: "Delete",
+            icon: Trash2,
+            danger: true,
+            onSelect: () => setDeleteModalVariant(model.variant),
+          },
+        ]
+      : [];
 
   return (
-    <PageShell className="space-y-4">
+    <PageShell>
       <PageHeader
         title="Models"
-        description="Download, load, and remove local models."
+        description="Download, load and manage local models. Loaded models use memory; downloaded models use disk."
         actions={
-          <div className="flex flex-wrap items-center gap-2">
-            {onRefresh && (
-              <button
-                onClick={async () => {
-                  setIsRefreshing(true);
-                  await onRefresh();
-                  setIsRefreshing(false);
-                }}
-                disabled={isRefreshing}
-                className="flex items-center gap-1.5 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-surface-2)] disabled:opacity-60"
-                title="Refresh models"
-              >
-                <RefreshCw
-                  className={clsx(
-                    "w-3.5 h-3.5",
-                    isRefreshing && "animate-spin",
-                  )}
-                />
-                Refresh
-              </button>
-            )}
-
-            <div className="flex items-center gap-2 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2">
-              <HardDrive className="w-4 h-4 text-[var(--text-subtle)]" />
-              <div className="text-sm">
-                <span className="font-medium text-[var(--text-primary)]">
-                  {formatBytes(stats.totalSize)}
-                </span>
-                <span className="ml-1 text-[var(--text-muted)]">used</span>
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-sm">
-              <span className="font-medium text-[var(--text-primary)]">
-                {stats.loaded}
-              </span>
-              <span className="ml-1 text-[var(--text-muted)]">loaded</span>
-              <span className="mx-1 text-[var(--text-subtle)]">/</span>
-              <span className="text-[var(--text-muted)]">
-                {stats.downloaded}
-              </span>
-              <span className="ml-1 text-[var(--text-subtle)]">downloaded</span>
-            </div>
-          </div>
+          onRefresh ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2"
+              onClick={async () => {
+                setIsRefreshing(true);
+                await onRefresh();
+                setIsRefreshing(false);
+              }}
+              disabled={isRefreshing}
+            >
+              <RefreshCw
+                className={cn("h-4 w-4", isRefreshing && "animate-spin")}
+              />
+              Refresh
+            </Button>
+          ) : null
         }
       />
 
-      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 sm:p-4">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
-          <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-subtle)]" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search models..."
-              className="w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] py-2.5 pl-10 pr-3 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)] focus:outline-none"
-            />
-          </div>
-
-          <div className="flex flex-wrap items-center gap-1.5">
-            {[
-              { id: "all" as FilterType, label: "All" },
-              { id: "loaded" as FilterType, label: "Loaded" },
-              { id: "downloaded" as FilterType, label: "Downloaded" },
-              { id: "not_downloaded" as FilterType, label: "Not downloaded" },
-            ].map((option) => (
-              <button
-                key={option.id}
-                onClick={() => setStatusFilter(option.id)}
-                className={clsx(
-                  "rounded-md border px-3 py-1.5 text-xs font-medium transition-colors",
-                  statusFilter === option.id
-                    ? "border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-primary)]"
-                    : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-[var(--text-muted)] hover:text-[var(--text-primary)]",
-                )}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="flex items-center gap-2">
-            <select
-              value={categoryFilter}
-              onChange={(event) =>
-                setCategoryFilter(event.target.value as CategoryType)
-              }
-              className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] focus:border-[var(--border-strong)] focus:outline-none"
-              aria-label="Filter models by category"
-            >
-              <option value="all">All categories</option>
-              <option value="tts">Text to Speech</option>
-              <option value="asr">Transcription</option>
-              <option value="chat">Chat</option>
-            </select>
-
-            {hasActiveFilters && (
-              <button
-                onClick={() => {
-                  setSearchQuery("");
-                  setStatusFilter("all");
-                  setCategoryFilter("all");
-                }}
-                className="flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1.5 text-xs text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
-              >
-                <X className="h-3.5 w-3.5" />
-                Clear
-              </button>
-            )}
-          </div>
-        </div>
+      <div className="mb-4 grid gap-3 md:grid-cols-3">
+        <SummaryCard
+          label="Memory in use by models"
+          value={
+            memory ? (
+              <>
+                <span className="text-xl font-semibold text-[var(--text-primary)]">
+                  {formatBytes(memory.reserved_bytes)}
+                </span>
+                {memory.system_total_bytes ? (
+                  <span className="text-[13px]">
+                    {" "}
+                    of {formatBytes(memory.system_total_bytes)}
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              <span className="text-xl font-semibold text-[var(--text-primary)]">
+                —
+              </span>
+            )
+          }
+          detail="Memory figures are unavailable."
+          meter={memoryFraction}
+        />
+        <SummaryCard
+          label="Disk used"
+          value={
+            <span className="text-xl font-semibold text-[var(--text-primary)]">
+              {formatBytes(stats.totalSize)}
+            </span>
+          }
+          detail={`${stats.downloaded} model${stats.downloaded === 1 ? "" : "s"} downloaded`}
+        />
+        <SummaryCard
+          label="Loaded"
+          value={
+            <>
+              <span className="text-xl font-semibold text-[var(--text-primary)]">
+                {stats.loaded.length}
+              </span>
+              {stats.loaded.length > 0 ? (
+                <span className="text-[13px]">
+                  {" · "}
+                  {stats.loaded
+                    .map((m) => getModelDisplayName(m.variant, m.display_name))
+                    .join(", ")}
+                </span>
+              ) : null}
+            </>
+          }
+          detail={
+            stats.loaded.some((m) => m.pinned)
+              ? "Pinned models stay loaded across pages."
+              : stats.loaded.length > 0
+                ? "Unloaded automatically under memory pressure."
+                : "No model loaded."
+          }
+        />
       </div>
 
+      <HistoryToolbar>
+        <SearchField
+          value={searchQuery}
+          onChange={setSearchQuery}
+          placeholder="Search models…"
+        />
+        <SegmentedFilter
+          label="Show"
+          options={[
+            { id: "all", label: "All", count: stats.total },
+            { id: "loaded", label: "Loaded", count: stats.loaded.length },
+            { id: "downloaded", label: "Downloaded", count: stats.downloaded },
+            { id: "available", label: "Available", count: stats.available },
+          ]}
+          value={statusFilter}
+          onChange={setStatusFilter}
+        />
+        <label className="ml-auto flex items-center gap-2 text-[12.5px] text-[var(--text-subtle)]">
+          Group by
+          <select
+            value={groupBy}
+            onChange={(event) => setGroupBy(event.target.value as GroupBy)}
+            className="h-[30px] rounded-[8px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-2 text-[12.5px] text-[var(--text-secondary)] outline-none"
+          >
+            <option value="task">Task</option>
+            <option value="provider">Provider</option>
+          </select>
+        </label>
+      </HistoryToolbar>
+
       {filteredModels.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] py-16 text-center">
-          <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)]">
-            <HardDrive className="h-5 w-5 text-[var(--text-subtle)]" />
-          </div>
-          <h3 className="text-base font-medium text-[var(--text-primary)]">
+        <div className="rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-6 py-12 text-center">
+          <h3 className="text-base font-semibold text-[var(--text-primary)]">
             No models found
           </h3>
-          <p className="mt-1 max-w-sm text-sm text-[var(--text-muted)]">
+          <p className="mt-1.5 text-sm text-[var(--text-muted)]">
             {hasActiveFilters
-              ? "Try adjusting your filters."
+              ? "Try a different search or filter."
               : "Download a model to get started."}
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
-          {providerSections.map((section) => (
-            <section key={section.provider} className="space-y-2">
-              <div className="flex items-center gap-2 px-1">
-                <h3 className="text-[11px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  {section.provider}
+        <div className="space-y-5">
+          {sections.map((section) => (
+            <section key={section.id} aria-label={section.label}>
+              <div className="mb-2 flex items-center gap-2 px-0.5">
+                {section.icon ? (
+                  <section.icon className="h-4 w-4 text-[var(--text-subtle)]" />
+                ) : null}
+                <h3 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
+                  {section.label}
                 </h3>
-                <span className="text-[10px] text-[var(--text-subtle)]">
+                <span className="text-xs text-[var(--text-subtle)]">
                   {section.models.length}
                 </span>
-                <div className="h-px flex-1 bg-[var(--border-muted)]" />
+                {section.usedBy ? (
+                  <span className="ml-auto text-xs text-[var(--text-subtle)]">
+                    Used by {section.usedBy}
+                  </span>
+                ) : null}
               </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              <ul className="overflow-hidden rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
                 {section.models.map((model) => {
                   const details = resolveModelDetail(model);
                   const displayName = getModelDisplayName(
                     model.variant,
                     model.display_name,
                   );
-                  const isDownloading = model.status === "downloading";
-                  const isLoading = model.status === "loading";
-                  const isReady = model.status === "ready";
-                  const isDownloaded = model.status === "downloaded";
-                  const progressValue = downloadProgress[model.variant];
                   const progress =
-                    progressValue?.percent ?? model.download_progress ?? 0;
-
+                    downloadProgress[model.variant]?.percent ??
+                    model.download_progress ??
+                    0;
+                  const items = menuItems(model);
                   return (
-                    <div
+                    <li
                       key={model.variant}
-                      className="group flex flex-col justify-between rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 transition-all duration-200 hover:border-[var(--border-strong)] hover:shadow-md"
+                      data-testid={`model-row-${model.variant}`}
+                      className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--border-subtle)] px-4 py-3 last:border-b-0"
                     >
-                      <div className="flex items-start justify-between gap-3 mb-3">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 mb-1">
-                            {isDownloading || isLoading ? (
-                              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--status-warning-text)]" />
-                            ) : (
-                              <span
-                                className={clsx(
-                                  "h-2 w-2 shrink-0 rounded-full",
-                                  getStatusDotClass(model.status),
-                                )}
-                              />
-                            )}
-                            <h3 className="truncate text-sm font-semibold text-[var(--text-primary)]">
-                              {displayName}
-                            </h3>
-                          </div>
-                          <p className="text-xs text-[var(--text-subtle)] line-clamp-1">
-                            {details.description}
-                          </p>
-                        </div>
-
-                        <div className="shrink-0 flex flex-col items-end gap-1">
-                          <span className="text-xs font-medium px-2 py-0.5 rounded-md bg-[var(--bg-surface-2)] text-[var(--text-secondary)] border border-[var(--border-muted)]">
-                            {getModelSizeLabel(model)}
-                          </span>
-                          {isDownloading && (
-                            <span className="text-[10px] font-bold tracking-wider text-[var(--status-warning-text)]">
-                              {Math.round(progress)}%
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between mt-auto pt-3 border-t border-[color-mix(in_srgb,var(--border-muted)_50%,transparent)]">
-                        <div className="text-xs font-medium">
-                          <span
-                            className={getStatusTextClass(model.status)}
-                            role={model.status === "error" ? "alert" : "status"}
-                            aria-live={
-                              model.status === "error" ? "assertive" : "polite"
-                            }
-                            aria-atomic="true"
-                          >
-                            {model.status === "not_downloaded"
-                              ? "Not downloaded"
-                              : model.status === "downloading"
-                                ? "Downloading..."
-                                : model.status === "downloaded"
-                                  ? "Downloaded"
-                                  : model.status === "loading"
-                                    ? "Loading..."
-                                    : model.status === "ready"
-                                      ? "Ready to use"
-                                      : model.status === "error"
-                                        ? "Error"
-                                        : model.status}
-                          </span>
-                        </div>
+                      <div className="min-w-0 flex-1 basis-64">
                         <div className="flex items-center gap-2">
-                          {model.status === "not_downloaded" && (
-                              <button
-                                onClick={() => onDownload(model.variant)}
-                                className="flex items-center gap-1.5 rounded-lg bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 shadow-sm"
-                              >
-                                <Download className="h-3.5 w-3.5" />
-                                Download
-                              </button>
-                            )}
-
-                          {isDownloading && onCancelDownload && (
-                            <button
-                              onClick={() => onCancelDownload(model.variant)}
-                              className="flex items-center gap-1 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                              Cancel
-                            </button>
-                          )}
-
-                          {isDownloaded && (
-                            <>
-                              <button
-                                onClick={() => onLoad(model.variant)}
-                                className="flex items-center gap-1.5 rounded-md bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
-                              >
-                                <Play className="h-3.5 w-3.5" />
-                                Load
-                              </button>
-                              <button
-                                onClick={() =>
-                                  setDeleteModalVariant(model.variant)
-                                }
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
-                                title="Delete model"
-                                aria-label={`Delete ${displayName}`}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          )}
-
-                          {isLoading && (
-                            <button
-                              onClick={() => onUnload(model.variant)}
-                              className="flex items-center gap-1 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                              Cancel load
-                            </button>
-                          )}
-
-                          {isReady && (
-                            <>
-                              <button
-                                onClick={() => onUnload(model.variant)}
-                                className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-3)]"
-                              >
-                                <Square className="h-3.5 w-3.5" />
-                                Unload
-                              </button>
-                              <button
-                                onClick={() =>
-                                  setDeleteModalVariant(model.variant)
-                                }
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
-                                title="Delete model"
-                                aria-label={`Delete ${displayName}`}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          )}
+                          <span className="truncate text-[14px] font-medium text-[var(--text-primary)]">
+                            {displayName}
+                          </span>
+                          {model.pinned ? <RowBadge>Pinned</RowBadge> : null}
+                        </div>
+                        <div className="mt-0.5 truncate text-[12.5px] text-[var(--text-subtle)]">
+                          {details.description ? (
+                            <span>{details.description} · </span>
+                          ) : null}
+                          <span>{getProviderLabel(model.variant)}</span>
                         </div>
                       </div>
-                    </div>
+                      <div className="w-36">
+                        <StatusCell model={model} progress={progress} />
+                      </div>
+                      <div className="w-20 text-right text-[13px] tabular-nums text-[var(--text-muted)]">
+                        {getModelSizeLabel(model)}
+                      </div>
+                      <div className="flex w-[7.5rem] justify-end">
+                        {primaryAction(model, displayName)}
+                      </div>
+                      <div className="flex w-7 justify-end">
+                        {items.length > 0 ? (
+                          <RowMenu label={displayName} items={items} />
+                        ) : null}
+                      </div>
+                    </li>
                   );
                 })}
-              </div>
+              </ul>
             </section>
           ))}
         </div>
@@ -598,7 +659,7 @@ export function MyModelsPage({
       {removedModels.length > 0 && (
         <section
           aria-label="Removed models"
-          className="space-y-2 rounded-xl border border-[var(--status-warning-border)] bg-[var(--bg-surface-1)] p-3 sm:p-4"
+          className="mt-5 space-y-2 rounded-[14px] border border-[var(--status-warning-border)] bg-[var(--surface-panel)] p-4"
         >
           <div>
             <h3 className="text-sm font-semibold text-[var(--text-primary)]">
@@ -609,7 +670,7 @@ export function MyModelsPage({
               you. Delete them to reclaim the space.
             </p>
           </div>
-          <ul className="divide-y divide-[var(--border-muted)]">
+          <ul className="divide-y divide-[var(--border-subtle)]">
             {removedModels.map((model) => (
               <li
                 key={model.variant}
@@ -627,60 +688,37 @@ export function MyModelsPage({
                     {model.reason}
                   </p>
                 </div>
-                <button
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
                   onClick={() => setDeleteModalVariant(model.variant)}
-                  className="inline-flex shrink-0 items-center gap-1.5 self-start rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)] sm:self-auto"
+                  className="h-8 shrink-0 gap-1.5 self-start text-[var(--danger-text)] sm:self-auto"
                   aria-label={`Delete ${model.display_name}`}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   Delete
-                </button>
+                </Button>
               </li>
             ))}
           </ul>
         </section>
       )}
 
-      {deleteModalVariant && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={() => setDeleteModalVariant(null)}
-        >
-          <div
-            className="w-full max-w-md rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
-              Delete model?
-            </h3>
-            <p className="mt-2 text-sm text-[var(--text-muted)]">
-              This will remove the downloaded model files from local storage.
-            </p>
-            <p className="mt-3 truncate text-xs text-[var(--text-subtle)]">
-              {deleteTargetName || deleteModalVariant}
-            </p>
-
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                onClick={() => setDeleteModalVariant(null)}
-                className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-surface-3)]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  onDelete(deleteModalVariant);
-                  setDeleteModalVariant(null);
-                }}
-                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                Delete model
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDeleteDialog
+        noun={deleteModalVariant ? "model" : null}
+        itemLabel={deleteTargetName}
+        description="This removes the downloaded model files from local storage."
+        pending={false}
+        error={null}
+        onConfirm={() => {
+          if (deleteModalVariant) {
+            onDelete(deleteModalVariant);
+          }
+          setDeleteModalVariant(null);
+        }}
+        onCancel={() => setDeleteModalVariant(null)}
+      />
     </PageShell>
   );
 }

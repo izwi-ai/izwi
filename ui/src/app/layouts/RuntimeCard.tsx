@@ -1,11 +1,7 @@
-import { useEffect, useState } from "react";
-
-import { api } from "@/api";
 import { cn } from "@/lib/utils";
-import type { HealthResponse } from "@/shared/api/health";
 import { APP_VERSION } from "@/shared/config/runtime";
+import { useRuntimeHealth } from "@/shared/hooks/useRuntimeHealth";
 
-const HEALTH_POLL_INTERVAL_MS = 15_000;
 const GIB = 1024 ** 3;
 
 const BACKEND_LABELS: Record<string, string> = {
@@ -19,11 +15,6 @@ function formatGigabytes(bytes: number): string {
   return `${gigabytes >= 10 ? gigabytes.toFixed(0) : gigabytes.toFixed(1)} GB`;
 }
 
-type HealthState =
-  | { status: "loading" }
-  | { status: "ready"; health: HealthResponse }
-  | { status: "error" };
-
 interface RuntimeCardProps {
   readyModelsCount: number;
   catalogError: string | null;
@@ -36,38 +27,8 @@ export function RuntimeCard({
   catalogError,
   collapsed,
 }: RuntimeCardProps) {
-  const [state, setState] = useState<HealthState>({ status: "loading" });
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () => {
-      if (document.visibilityState === "hidden") {
-        return;
-      }
-      api
-        .getHealth()
-        .then((health) => {
-          if (!cancelled) {
-            setState({ status: "ready", health });
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setState({ status: "error" });
-          }
-        });
-    };
-
-    load();
-    const interval = window.setInterval(load, HEALTH_POLL_INTERVAL_MS);
-    document.addEventListener("visibilitychange", load);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", load);
-    };
-    // Loading or unloading a model changes reservations: refresh at once.
-  }, [readyModelsCount]);
+  // Loading or unloading a model changes reservations: refresh at once.
+  const state = useRuntimeHealth(readyModelsCount);
 
   const offline = state.status === "error" || catalogError !== null;
   const health = state.status === "ready" ? state.health : null;

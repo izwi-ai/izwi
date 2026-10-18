@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ModelInfo } from "@/api";
@@ -113,8 +113,11 @@ describe("MyModelsPage", () => {
       />,
     );
 
-    expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
-    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Group by" }), {
+      target: { value: "provider" },
+    });
+    expect(screen.getByRole("region", { name: "Qwen" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Other" })).not.toBeInTheDocument();
     expect(screen.getByText("Qwen3.5 0.8B")).toBeInTheDocument();
     expect(screen.getByText("Qwen3.8 27B")).toBeInTheDocument();
     expect(screen.queryByText(/Qwen3 Chat 27B/i)).not.toBeInTheDocument();
@@ -142,8 +145,11 @@ describe("MyModelsPage", () => {
       />,
     );
 
-    expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
-    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Group by" }), {
+      target: { value: "provider" },
+    });
+    expect(screen.getByRole("region", { name: "Qwen" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Other" })).not.toBeInTheDocument();
 
     // Version order wins over size order: the 27B Qwen3.8 renders after the
     // 35B Qwen3.6, and the Qwen3.5 family stays before both.
@@ -159,6 +165,30 @@ describe("MyModelsPage", () => {
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
     }
+  });
+
+  it("groups models by task by default", () => {
+    render(
+      <MyModelsPage
+        models={[
+          buildModel({ variant: "VibeVoice-ASR", size_bytes: 17_348_198_410 }),
+          buildModel({ variant: "VibeVoice-1.5B", size_bytes: 5_408_043_974 }),
+        ]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    const asr = screen.getByRole("region", { name: "Speech to text" });
+    const tts = screen.getByRole("region", { name: "Text to speech" });
+    expect(within(asr).getByText("VibeVoice ASR")).toBeInTheDocument();
+    expect(within(tts).getByText("VibeVoice 1.5B TTS")).toBeInTheDocument();
+    expect(within(tts).getByText("Used by Text to Speech, Studio, Voices")).toBeInTheDocument();
   });
 
   it("renders VibeVoice models from the backend catalog under Microsoft", () => {
@@ -178,9 +208,12 @@ describe("MyModelsPage", () => {
       />,
     );
 
-    expect(screen.getByText(/^Microsoft$/)).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Group by" }), {
+      target: { value: "provider" },
+    });
+    expect(screen.getByRole("region", { name: "Microsoft" })).toBeInTheDocument();
     expect(screen.getByText("VibeVoice ASR")).toBeInTheDocument();
     expect(screen.getByText("VibeVoice 1.5B TTS")).toBeInTheDocument();
-    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Other" })).not.toBeInTheDocument();
   });
 });
