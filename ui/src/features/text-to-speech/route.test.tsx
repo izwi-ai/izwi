@@ -726,6 +726,14 @@ describe("TextToSpeechPage", () => {
     expect(screen.queryByText("bf_alice")).not.toBeInTheDocument();
   });
 
+  it("opens the creation modal from a create intent", async () => {
+    renderRoute("/text-to-speech?create=speech");
+
+    expect(
+      await screen.findByRole("heading", { name: "New text-to-speech job" }),
+    ).toBeInTheDocument();
+  });
+
   it("uses voxtral tts built-in voices instead of qwen defaults", async () => {
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],

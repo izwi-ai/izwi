@@ -52,7 +52,7 @@ export function TextToSpeechPage({
 }: TextToSpeechPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const appliedQueryModelRef = useRef(false);
   const autoOpenCreateRef = useRef(false);
   const [isNewTextToSpeechModalOpen, setIsNewTextToSpeechModalOpen] =
@@ -256,6 +256,18 @@ export function TextToSpeechPage({
       setStreamingRecord(null);
     }
   }, [record, streamingRecord]);
+
+  // ?create=speech (the command palette) opens the creation modal, then
+  // drops the parameter so a refresh or Back does not reopen it.
+  useEffect(() => {
+    if (recordId || searchParams.get("create") !== "speech") {
+      return;
+    }
+    setIsNewTextToSpeechModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("create");
+    setSearchParams(next, { replace: true });
+  }, [recordId, searchParams, setSearchParams]);
 
   useEffect(() => {
     if (recordId || autoOpenCreateRef.current) {

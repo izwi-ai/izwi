@@ -122,10 +122,16 @@ describe("AppLayout compact navigation accessibility", () => {
     expect(menuTrigger).toHaveAttribute("aria-expanded", "true");
     expect(drawer).not.toHaveAttribute("inert");
 
-    fireEvent.keyDown(firstLink, { key: "Tab", shiftKey: true });
+    // The search button opens the drawer's Tab order; focus starts on the
+    // first page link.
+    const search = within(drawer).getByRole("button", {
+      name: "Search or jump to",
+    });
+    search.focus();
+    fireEvent.keyDown(search, { key: "Tab", shiftKey: true });
     expect(lastLink).toHaveFocus();
     fireEvent.keyDown(lastLink, { key: "Tab" });
-    expect(firstLink).toHaveFocus();
+    expect(search).toHaveFocus();
 
     fireEvent.keyDown(firstLink, { key: "Escape" });
     expect(menuTrigger).toHaveFocus();

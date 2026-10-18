@@ -488,12 +488,18 @@ export function TranscriptionPage({
     }
   }, [searchParams, setSearchParams]);
 
+  // ?create=transcription|diarization (the command palette, legacy
+  // /diarization links) opens the creation modal in that mode.
   useEffect(() => {
-    if (recordId || searchParams.get("create") !== "diarization") {
+    const requestedMode = searchParams.get("create");
+    if (
+      recordId ||
+      (requestedMode !== "transcription" && requestedMode !== "diarization")
+    ) {
       return;
     }
 
-    setNewSpeechTextMode("diarization");
+    setNewSpeechTextMode(requestedMode);
     setIsNewTranscriptionModalOpen(true);
   }, [recordId, searchParams]);
   const handleUnloadAllDiarizationManagedModels = useCallback(() => {

@@ -7,6 +7,7 @@ import {
   Menu,
   PanelLeft,
   RotateCcw,
+  Search,
   TriangleAlert,
   X,
 } from "lucide-react";
@@ -23,6 +24,7 @@ import {
   type NavItem,
 } from "@/app/layouts/navigation";
 import { RuntimeCard } from "@/app/layouts/RuntimeCard";
+import { CommandPalette, isMacPlatform } from "@/app/command/CommandPalette";
 
 const appIconUrl = APP_ICON_URL;
 const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";
@@ -125,6 +127,7 @@ export function AppLayout({
     isDesktopNavigationLayout,
   );
   const [isRetryingModelCatalog, setIsRetryingModelCatalog] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const mobileMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
@@ -140,6 +143,22 @@ export function AppLayout({
       isSidebarCollapsed ? "1" : "0",
     );
   }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key.toLowerCase() === "k" &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        !event.shiftKey
+      ) {
+        event.preventDefault();
+        setIsCommandPaletteOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") {
@@ -270,6 +289,10 @@ export function AppLayout({
   return (
     <div className="h-dvh flex overflow-hidden bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
       <FirstRunOnboarding />
+      <CommandPalette
+        open={isCommandPaletteOpen}
+        onOpenChange={setIsCommandPaletteOpen}
+      />
       {/* Mobile header */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/80 backdrop-blur-xl">
         <div className="flex items-center justify-between px-4 py-3.5">
@@ -381,11 +404,36 @@ export function AppLayout({
           </Button>
         </div>
 
+        <div className={cn("shrink-0 px-3 pt-3", isSidebarCollapsed && "flex justify-center")}>
+          <button
+            type="button"
+            onClick={() => setIsCommandPaletteOpen(true)}
+            tabIndex={sidebarInteractive ? undefined : -1}
+            aria-label="Search or jump to"
+            aria-keyshortcuts={isMacPlatform() ? "Meta+K" : "Control+K"}
+            title={isSidebarCollapsed ? "Search or jump to" : undefined}
+            className={cn(
+              "flex items-center gap-2 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] text-[13px] text-[var(--text-subtle)] transition-colors hover:text-[var(--text-primary)]",
+              isSidebarCollapsed ? "h-10 w-10 justify-center" : "h-[34px] w-full px-2.5",
+            )}
+          >
+            <Search className="h-4 w-4 shrink-0" />
+            {!isSidebarCollapsed ? (
+              <>
+                <span className="truncate">Search or jump to…</span>
+                <kbd className="ml-auto rounded-[5px] border border-[var(--border-default)] px-1.5 font-sans text-[11px] leading-[18px] text-[var(--text-subtle)]">
+                  {isMacPlatform() ? "⌘K" : "Ctrl K"}
+                </kbd>
+              </>
+            ) : null}
+          </button>
+        </div>
+
         {/* Navigation */}
         <nav
           id="app-sidebar-navigation"
           aria-label="Primary"
-          className="flex flex-1 flex-col overflow-y-auto px-3 py-3 scrollbar-thin"
+          className="flex flex-1 flex-col overflow-y-auto px-3 pb-3 pt-1 scrollbar-thin"
         >
           {NAV_GROUPS.map((group, index) => (
             <div

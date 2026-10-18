@@ -642,6 +642,15 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByText("Model readiness")).toBeInTheDocument();
   });
 
+  it("opens transcription creation from a create intent", async () => {
+    renderRoute("/transcription?create=transcription");
+
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
+  });
+
   it("opens diarization creation directly from a deep-link intent", async () => {
     renderRoute("/transcription?create=diarization");
 
