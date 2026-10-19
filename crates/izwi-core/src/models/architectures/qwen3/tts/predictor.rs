@@ -121,21 +121,66 @@ impl CodeSelection<'_> {
 
 /// Code Predictor model
 pub struct CodePredictor {
-    codec_embeddings: Vec<Embedding>,
+    codec_embeddings: Vec<CodecEmbedding>,
     small_to_mtp_projection: Option<Linear>,
     layers: Vec<Layer>,
     norm: RmsNorm,
-    lm_heads: Vec<Linear>,
+    lm_heads: Vec<ProjectionLinear>,
     device: Device,
     cfg: CodePredictorConfig,
     num_code_groups: usize,
 }
 
+/// One codebook's embedding table: dense, or (weight-only F16) stored in F16
+/// on the device with gathered rows widened to F32, exactly the F32 table's
+/// values for a BF16 checkpoint.
+#[derive(Debug, Clone)]
+enum CodecEmbedding {
+    Dense(Embedding),
+    F16(Tensor),
+}
+
+impl CodecEmbedding {
+    /// `embedding` was read on the host when `f16` is set.
+    fn new(embedding: Embedding, f16: Option<&Device>) -> Result<Self> {
+        let Some(device) = f16 else {
+            return Ok(Self::Dense(embedding));
+        };
+        Ok(Self::F16(
+            embedding
+                .embeddings()
+                .to_dtype(DType::F16)?
+                .to_device(device)?,
+        ))
+    }
+
+    fn forward(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(embedding) => embedding.forward(ids),
+            Self::F16(table) => {
+                let mut dims = ids.dims().to_vec();
+                dims.push(table.dim(1)?);
+                table
+                    .index_select(&ids.flatten_all()?, 0)?
+                    .to_dtype(DType::F32)?
+                    .reshape(dims)
+            }
+        }
+    }
+
+    /// Row `index` as F32, `[hidden]`.
+    fn row(&self, index: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(embedding) => embedding.embeddings().i(index),
+            Self::F16(table) => table.i(index)?.to_dtype(DType::F32),
+        }
+    }
+}
+
 impl CodePredictor {
-    /// Load the code predictor from VarBuilder
     /// Load the code predictor. With `f16`, its attention and MLP
-    /// projections are stored in F16 on that device (activations, norms and
-    /// the logits heads stay F32).
+    /// projections, its logits heads and its codec embedding tables are
+    /// stored in F16 on that device (activations and norms stay F32).
     pub fn load(
         cfg: CodePredictorConfig,
         vb: VarBuilder,
@@ -153,9 +198,9 @@ impl CodePredictor {
             let embed = mlx::load_embedding(
                 cfg.vocab_size,
                 codec_embed_dim,
-                vb.pp(format!("model.codec_embedding.{idx}")),
+                projection_var_builder(&vb, f16).pp(format!("model.codec_embedding.{idx}")),
             )?;
-            codec_embeddings.push(embed);
+            codec_embeddings.push(CodecEmbedding::new(embed, f16)?);
         }
 
         let small_to_mtp_projection = if codec_embed_dim != cfg.hidden_size {
@@ -183,9 +228,9 @@ impl CodePredictor {
             let head = mlx::load_linear_no_bias(
                 cfg.hidden_size,
                 cfg.vocab_size,
-                vb.pp(format!("lm_head.{idx}")),
+                projection_var_builder(&vb, f16).pp(format!("lm_head.{idx}")),
             )?;
-            lm_heads.push(head);
+            lm_heads.push(ProjectionLinear::new(head, f16)?);
         }
 
         Ok(Self {
@@ -798,8 +843,7 @@ impl CodePredictor {
     fn codec_embedding_row(&self, group_idx: usize, code: u32) -> Result<Tensor> {
         if self.device.is_cuda() {
             self.codec_embeddings[group_idx]
-                .embeddings()
-                .i(code as usize)?
+                .row(code as usize)?
                 .unsqueeze(0)
                 .map_err(Error::from)
         } else {
@@ -1450,7 +1494,10 @@ mod tests {
                         (value as f32 - 9.0) / 16.0
                     })
                     .collect::<Vec<_>>();
-                Embedding::new(Tensor::from_vec(values, (8, 4), device).unwrap(), 4)
+                CodecEmbedding::Dense(Embedding::new(
+                    Tensor::from_vec(values, (8, 4), device).unwrap(),
+                    4,
+                ))
             })
             .collect();
         CodePredictor {
@@ -1459,7 +1506,7 @@ mod tests {
             layers: vec![layer],
             norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
             lm_heads: (0..3)
-                .map(|head| test_linear(8, 4, 8 + head, device))
+                .map(|head| test_linear(8, 4, 8 + head, device).into())
                 .collect(),
             device: device.clone(),
             cfg,

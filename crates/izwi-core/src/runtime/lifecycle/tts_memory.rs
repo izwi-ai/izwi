@@ -106,11 +106,14 @@ fn qwen3_tts_plan(
 
 /// Whether a Qwen3-TTS tensor loads as weight-only F16 when the layout asks
 /// for it: the talker and predictor attention and MLP projections, the text
-/// projection, and the text embedding (F16 storage, F32 compute).
+/// projection, the predictor's codebook heads and codec embeddings, and the
+/// text embedding (F16 storage, F32 compute).
 fn qwen3_tts_weight_only_f16_tensor(name: &str) -> bool {
     name.starts_with("talker.")
         && (name.ends_with("_proj.weight")
             || name.starts_with("talker.text_projection.")
+            || name.starts_with("talker.code_predictor.lm_head.")
+            || name.starts_with("talker.code_predictor.model.codec_embedding.")
             || name == QWEN3_TTS_TEXT_EMBEDDING)
 }
 
@@ -376,8 +379,9 @@ mod tests {
     /// allocated, CUDA), with the load peak each must stay under:
     /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.04 GiB,
     ///   as the report measured. On Metal the talker and predictor
-    ///   projections and the text embedding load as weight-only F16 (F32
-    ///   compute), host-cast and uploaded at exact size: 2.48 GiB, against
+    ///   projections, the predictor's codebook heads and codec embeddings
+    ///   and the text embedding load as weight-only F16 (F32 compute),
+    ///   host-cast and uploaded at exact size: 2.37 GiB, against
     ///   the 5.29 GiB the report saw from device F32 casts into
     ///   power-of-two buffers. CUDA keeps the talker and
     ///   predictor BF16 beside an F32 speech tokenizer. CustomVoice skips the
@@ -402,17 +406,17 @@ mod tests {
             (
                 "Qwen3-TTS-0.6B-CustomVoice",
                 Box::new(|b| qwen(&qwen06_cv, false, b)),
-                [3.80, 2.24, 2.11],
+                [3.80, 2.12, 2.11],
             ),
             (
                 "Qwen3-TTS-0.6B-Base",
                 Box::new(|b| qwen(&qwen06_base, true, b)),
-                [4.04, 2.48, 2.36],
+                [4.04, 2.37, 2.36],
             ),
             (
                 "Qwen3-TTS-1.7B-CustomVoice",
                 Box::new(|b| qwen(&qwen17_cv, false, b)),
-                [7.57, 4.20, 4.00],
+                [7.57, 4.02, 4.00],
             ),
             ("Kokoro-82M", Box::new(kokoro), [0.30, 0.30, 0.30]),
             ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.41, 5.04]),
