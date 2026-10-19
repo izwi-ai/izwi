@@ -477,7 +477,14 @@ impl VibeVoiceTtsModel {
                     "VibeVoice TTS decoder config has no maximum context length".into(),
                 )
             })?;
-        vibevoice_physical_state_spec(stage_graphs, contract, max_context_tokens)
+        // A request's preparation and prefill cost its whole context, which
+        // their stages cap; a context fitted past the cap (on a Mac with the
+        // headroom for it) refused every request.
+        vibevoice_physical_state_spec(
+            stage_graphs,
+            contract,
+            max_context_tokens.min(super::VIBEVOICE_TTS_STAGE_MAX_TOKENS),
+        )
     }
 
     /// The reference demo's 10 steps. The config's `ddpm_num_inference_steps`

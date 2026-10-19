@@ -368,6 +368,11 @@ pub(crate) fn vibevoice_invocation_descriptor(
     Ok(descriptor)
 }
 
+/// The most tokens one VibeVoice TTS preparation or prefill stage takes, and
+/// so the most context a VibeVoice TTS load fits: a request's preparation
+/// costs its whole context.
+pub(crate) const VIBEVOICE_TTS_STAGE_MAX_TOKENS: usize = 16_384;
+
 pub(crate) fn vibevoice_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
     invocation: InferenceStateContract,
