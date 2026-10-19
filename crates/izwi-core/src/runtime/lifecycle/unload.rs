@@ -27,8 +27,22 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 impl ModelLifecycleController {
-    fn release_resident_slot_and_refresh_capacity(&self, variant: ModelVariant) {
+    async fn release_resident_slot_and_refresh_capacity(&self, variant: ModelVariant) {
         self.remove_resident_slot(variant);
+        // Candle frees a released Metal buffer only when the device next
+        // synchronizes. The slot was the last owner of the model's weights
+        // and state, so without one they stay allocated, and in the live
+        // sample the next load is admitted against, until some later request
+        // or load happens to synchronize (measured: Parakeet kept 1.3 GB,
+        // Granite Speech 6.5 GB). Only buffers nothing holds are freed, so
+        // other residents are untouched.
+        if let Err(error) = self.core_engine.synchronize_worker_device().await {
+            tracing::warn!(
+                model = %variant,
+                %error,
+                "Synchronizing the device to release an unloaded model's buffers failed"
+            );
+        }
         let physical = self
             .coordinator
             .resource_authority()
@@ -135,7 +149,8 @@ impl ModelLifecycleController {
         }
         self.model_manager.unload_model(variant).await?;
         self.remove_registry_and_auxiliary_state(variant).await;
-        self.release_resident_slot_and_refresh_capacity(variant);
+        self.release_resident_slot_and_refresh_capacity(variant)
+            .await;
         self.forget_model_usage(variant).await;
         self.maybe_recover_poisoned_authority().await;
         Ok(())
@@ -211,12 +226,12 @@ impl ModelLifecycleController {
         if !has_other_authoritative_models && !has_other_manager_models {
             self.clear_metal_pools_on_device();
         }
-
         // Dropping the slot is the final step: it releases physical resource
         // accounting only after every published handle has been removed. A
         // synchronous post-release observation replaces any cached device
         // sample taken while the model was still resident.
-        self.release_resident_slot_and_refresh_capacity(variant);
+        self.release_resident_slot_and_refresh_capacity(variant)
+            .await;
         self.forget_model_usage(variant).await;
         self.unpin_model(variant).await;
         self.maybe_recover_poisoned_authority().await;
