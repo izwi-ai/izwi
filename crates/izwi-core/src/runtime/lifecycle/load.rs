@@ -395,6 +395,13 @@ struct ModelResourcePlan {
     /// Resident capacity reserved for lazy model-owned allocations. It remains
     /// a pending claim while physical state is fitted before first inference.
     deferred_resident_authorization: ResourceVector,
+    /// Metal: host memory the load stages beside its unified authorization,
+    /// which then books only what the GPU allocates. It is not part of the
+    /// GPU working set; it gates the load only under
+    /// `IZWI_METAL_LOAD_ADMISSION=strict`, and is advisory otherwise, like
+    /// any host memory (Fish's staged transformer holds 1.6 GB of host copies
+    /// beside a 10.7 GB GPU peak).
+    host_staging_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,8 +728,12 @@ impl ModelLifecycleController {
             BackendKind::Cuda => ResourceAmount::Known(0),
         };
         if let ResourceAmount::Known(required_bytes) = portable_load_bytes {
-            self.ensure_portable_memory_before_load(variant, required_bytes)
-                .await?;
+            self.ensure_portable_memory_before_load(
+                variant,
+                required_bytes,
+                resource_plan.host_staging_bytes,
+            )
+            .await?;
         }
         let resource_lease = self
             .reserve_model_resources(variant, resource_plan.load_authorization)

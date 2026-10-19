@@ -442,6 +442,7 @@ pub(super) fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEst
         load_authorization,
         resident_authorization,
         deferred_resident_authorization: ResourceVector::zero(),
+        host_staging_bytes: 0,
     }
 }
 
@@ -474,13 +475,26 @@ pub(super) fn fish_s2_resource_plan(
     backend: BackendKind,
     memory: crate::models::architectures::fish_s2::weights::FishS2ModelMemory,
 ) -> Result<ModelResourcePlan> {
+    // On Metal the GPU allocates only the final tensors (staged transformer
+    // uploads, codec uploaded from the host); the rest of the load peak is
+    // host staging, which the GPU working set does not hold.
+    let device_load_peak_bytes = if backend == BackendKind::Metal {
+        memory.metal_device_load_peak_bytes
+    } else {
+        memory.load_peak_bytes
+    };
     let mut plan = model_resource_plan(
         backend,
         ModelMemoryEstimate {
-            load_peak_bytes: memory.load_peak_bytes,
+            load_peak_bytes: device_load_peak_bytes,
             resident_bytes: memory.resident_bytes,
         },
     );
+    if backend == BackendKind::Metal {
+        plan.host_staging_bytes = memory
+            .load_peak_bytes
+            .saturating_sub(device_load_peak_bytes);
+    }
     if backend == BackendKind::Cuda {
         plan.load_authorization.host_bytes =
             ResourceAmount::Known(memory.cuda_host_load_peak_bytes);

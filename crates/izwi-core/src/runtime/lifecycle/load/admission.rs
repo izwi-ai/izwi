@@ -166,6 +166,21 @@ pub(super) fn request_envelope_shortfall(
     )))
 }
 
+/// What a portable load must find free before it starts: `required_bytes`,
+/// plus its host staging under `IZWI_METAL_LOAD_ADMISSION=strict`, which
+/// gates on host memory too.
+pub(super) fn gated_load_bytes(
+    admission: crate::engine::MetalLoadAdmission,
+    required_bytes: u64,
+    host_staging_bytes: u64,
+) -> u64 {
+    if admission == crate::engine::MetalLoadAdmission::Strict {
+        required_bytes.saturating_add(host_staging_bytes)
+    } else {
+        required_bytes
+    }
+}
+
 /// Why a load cannot start once nothing more can be evicted for it, in the
 /// terms a client can act on: what it needs, what is free, and the one thing
 /// that would make room (unloading named models only when that would cover
@@ -566,15 +581,26 @@ impl ModelLifecycleController {
         self.set_load_warning(variant, warning);
     }
 
+    /// `host_staging_bytes` is host memory the load stages beside
+    /// `required_bytes` on Metal (`ModelResourcePlan::host_staging_bytes`):
+    /// required too under `IZWI_METAL_LOAD_ADMISSION=strict`, advisory
+    /// otherwise.
     pub(super) async fn ensure_portable_memory_before_load(
         &self,
         requested_variant: ModelVariant,
         required_bytes: u64,
+        host_staging_bytes: u64,
     ) -> Result<()> {
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        let with_staging = required_bytes.saturating_add(host_staging_bytes);
+        let required_bytes = gated_load_bytes(
+            self.coordinator.resource_authority().metal_load_admission(),
+            required_bytes,
+            host_staging_bytes,
+        );
         self.set_load_warning(requested_variant, None);
         let mut pooled_scratch_flushed = false;
         loop {
@@ -600,7 +626,7 @@ impl ModelLifecycleController {
                 .map(|live| planning_headroom.min(live))
                 .unwrap_or(planning_headroom);
             if required_bytes <= headroom {
-                self.note_advisory_host_shortfall(requested_variant, backend, required_bytes)
+                self.note_advisory_host_shortfall(requested_variant, backend, with_staging)
                     .await;
                 return Ok(());
             }
@@ -869,7 +895,7 @@ impl ModelLifecycleController {
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
-        self.ensure_portable_memory_before_load(variant, growth)
+        self.ensure_portable_memory_before_load(variant, growth, 0)
             .await
             .map_err(refused)?;
         self.grow_loading_slot_authorization(variant, reload.load_authorization)

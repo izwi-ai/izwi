@@ -1510,6 +1510,7 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
     let memory = FishS2ModelMemory {
         resident_bytes: 10_712_372_164,
         load_peak_bytes: 12_307_518_404,
+        metal_device_load_peak_bytes: 10_712_372_164,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
     let plan = fish_s2_resource_plan(BackendKind::Cuda, memory).unwrap();
@@ -1573,6 +1574,7 @@ fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
         FishS2ModelMemory {
             resident_bytes: 100,
             load_peak_bytes: 200,
+            metal_device_load_peak_bytes: 100,
             cuda_host_load_peak_bytes: 0,
         },
     )
@@ -1621,6 +1623,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     let cpu_memory = FishS2ModelMemory {
         resident_bytes: 19_836_076_996,
         load_peak_bytes: 22_228_796_356,
+        metal_device_load_peak_bytes: 19_836_076_996,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
     let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory).unwrap();
@@ -1645,13 +1648,21 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     let half_memory = FishS2ModelMemory {
         resident_bytes: 10_712_372_164,
         load_peak_bytes: 12_307_518_404,
+        metal_device_load_peak_bytes: 10_712_372_164,
         ..cpu_memory
     };
+    // On Metal the unified authorization books what the GPU allocates; the
+    // host staging (1.6 GB) is checked against host memory instead.
     let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory).unwrap();
     assert_eq!(
         metal.load_authorization.unified_bytes,
-        ResourceAmount::Known(half_memory.load_peak_bytes)
+        ResourceAmount::Known(half_memory.metal_device_load_peak_bytes)
     );
+    assert_eq!(
+        metal.host_staging_bytes,
+        half_memory.load_peak_bytes - half_memory.metal_device_load_peak_bytes
+    );
+    assert_eq!(cpu.host_staging_bytes, 0);
     assert_eq!(
         metal.resident_authorization.unified_bytes,
         ResourceAmount::Known(half_memory.resident_bytes)
@@ -3600,6 +3611,18 @@ fn load_refusals_name_their_cause() {
         message.ends_with("held by running requests and model state: retry when they finish"),
         "{message}"
     );
+}
+
+/// Host staging (Fish's staged copies beside its GPU peak) gates a Metal
+/// load only under strict admission; advisory and off admission check the
+/// GPU peak alone.
+#[test]
+fn host_staging_gates_only_strict_metal_loads() {
+    use crate::engine::MetalLoadAdmission;
+    let gated = |admission| super::admission::gated_load_bytes(admission, 10_712, 1_595);
+    assert_eq!(gated(MetalLoadAdmission::Strict), 12_307);
+    assert_eq!(gated(MetalLoadAdmission::Advisory), 10_712);
+    assert_eq!(gated(MetalLoadAdmission::Off), 10_712);
 }
 
 #[test]

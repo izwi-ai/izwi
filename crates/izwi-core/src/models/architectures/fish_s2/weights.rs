@@ -379,7 +379,10 @@ pub(crate) struct FishS2TensorMemory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FishS2ModelMemory {
     pub(crate) resident_bytes: u64,
+    /// The load's peak in one memory (CPU and Metal) or on the device (CUDA).
     pub(crate) load_peak_bytes: u64,
+    /// Metal: the part of `load_peak_bytes` the GPU allocates.
+    pub(crate) metal_device_load_peak_bytes: u64,
     pub(crate) cuda_host_load_peak_bytes: u64,
 }
 
@@ -475,6 +478,12 @@ fn fish_s2_memory_from_inventory(
     Ok(FishS2ModelMemory {
         resident_bytes,
         load_peak_bytes: transformer_peak.max(codec_peak),
+        // The staged transformer uploads each tensor at its exact size after
+        // casting it on the host, and the codec is normalized on the host
+        // and uploaded tensor by tensor: on Metal the GPU holds only the
+        // final tensors (measured: a 10.738 GB peak over a 10.737 GB
+        // residency); the rest of `load_peak_bytes` is host memory.
+        metal_device_load_peak_bytes: resident_bytes,
         cuda_host_load_peak_bytes,
     })
 }
