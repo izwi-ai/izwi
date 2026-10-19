@@ -12,8 +12,8 @@
 //! memory on Metal, device memory on CUDA):
 //! - Resident weights: every tensor the loader reads, in its resident form (kept
 //!   quantized, dequantized or cast), plus the copies it makes (Granite's F16 LM
-//!   head, LFM's second Q6_K token-embedding read, Qwen3-ASR's separate Q8_0
-//!   `lm_head` beside its dense embedding) and the tables it computes. Tensors it
+//!   head, Qwen3-ASR's separate Q8_0 `lm_head` beside its dense embedding) and
+//!   the tables it computes. Tensors it
 //!   never reads are left out. On Metal, a buffer a device kernel writes (a cast,
 //!   a concatenation, any op output) is sized the way Candle 0.11's pool
 //!   allocates it, rounded up to the next power of two (`candle-core`
@@ -1371,9 +1371,12 @@ fn whisper_plan(
     let Some(files) = census_of(&whisper_weight_files(model_path)?)? else {
         return Ok(None);
     };
-    // F16 on Metal by default. A failed load-time self-check reloads in F32
-    // after dropping the F16 model; that rare fallback is not priced here
-    // (as for Parakeet and Nemotron), and live-memory admission sees it.
+    // F16 on Metal by default. Its load-time self-check runs one full 30 s
+    // encoder pass, which the request floor admission folds into the load
+    // authorization prices (`admit_asr_request_floor`: one request envelope
+    // beside the residents), so the plan carries the weights alone. A failed
+    // self-check reloads in F32 after dropping the F16 model; that rare
+    // fallback is not priced here, and live-memory admission sees it.
     price_whisper(&files, backend, whisper_weight_dtype(device)?).map(Some)
 }
 
@@ -2568,11 +2571,11 @@ fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<As
 /// Metal; F32 tensors and every other loaded mmproj tensor are dequantized
 /// to F32, the dtype the loader hard-codes (there is no dtype resolver to
 /// call). The detokenizer backbone runs on vocoder embeddings
-/// and skips its `token_embd`.
-/// The main backbone has no `output.weight`, so its head reads `token_embd` a
-/// second time as a quantized projection, and keeps its first `token_embd`
-/// read alive until it finishes loading. Each backbone also
-/// precomputes F32 RoPE tables over its full context (`rope_tables`).
+/// and skips its `token_embd`. The main backbone has no `output.weight`, so
+/// its head is the quantized `token_embd` its rows are gathered from
+/// ([`price_lfm2_backbone`]). Each backbone also precomputes F32 RoPE tables
+/// over its context (`rope_tables`: the main backbone's is clamped to the
+/// model's native 32,768 tokens).
 fn price_lfm25_audio(
     census: &Lfm25AudioCensus,
     backend: BackendKind,
@@ -3319,9 +3322,14 @@ pub(super) mod tests {
         price_qwen3_aligner(files, backend, load).unwrap()
     }
 
-    /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
-    /// over 128,000 positions; head dims 2048 / 32 and 512 / 16.
-    const LFM_ROPE_TABLES: [(usize, usize); 2] = [(128_000, 64), (128_000, 32)];
+    /// The loader's RoPE geometry (`lfm25_audio_load_layout`): the main
+    /// backbone's context is clamped from the GGUF's 128,000 positions to the
+    /// model's native 32,768 (LFA-6), the detokenizer keeps 128,000; head
+    /// dims 2048 / 32 and 512 / 16.
+    const LFM_ROPE_TABLES: [(usize, usize); 2] = [
+        (ModelVariant::LFM25_AUDIO_NATIVE_CONTEXT_TOKENS, 64),
+        (128_000, 32),
+    ];
 
     /// LFM2.5-1.2B chat prices the quantized checkpoint once (its Q6_K
     /// `token_embd` serves the row gather and the tied LM head) plus RoPE
@@ -3519,11 +3527,12 @@ pub(super) mod tests {
                 [16.50, 8.25, 8.25, 8.25],
             ),
             // The main backbone gathers token rows from its quantized table
-            // (shared with its tied head) instead of a 0.5 GiB F32 copy.
+            // (shared with its tied head) instead of a 0.5 GiB F32 copy, and
+            // its RoPE tables span its clamped 32,768-token context.
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [1.27, 0.94, 0.95, 1.27],
+                [1.22, 0.90, 0.90, 1.22],
             ),
             // D8: the dense text runs at F16 on Metal (4.18 GiB allocated at
             // F32).

@@ -26,20 +26,9 @@ pub(super) fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimat
     const GIB: u64 = 1024 * 1024 * 1024;
 
     let inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
-    let base = match variant {
-        // The 5 GiB catalog value describes total inference memory, including
-        // request-scoped activations and audio workspace that the coordinator
-        // reserves separately. The GGUF loader retains about 2.25 GiB of
-        // quantized/dequantized tensors; 3 GiB covers model-owned load overlap,
-        // tokenizer metadata, allocator alignment, and steady residency.
-        ModelVariant::Lfm25Audio15BGguf => ModelMemoryEstimate {
-            load_peak_bytes: 3 * GIB,
-            resident_bytes: 3 * GIB,
-        },
-        _ => ModelMemoryEstimate {
-            load_peak_bytes: inference_bytes,
-            resident_bytes: inference_bytes,
-        },
+    let base = ModelMemoryEstimate {
+        load_peak_bytes: inference_bytes,
+        resident_bytes: inference_bytes,
     };
     let memo_bytes = match variant {
         ModelVariant::Nemotron35AsrStreaming06B => {

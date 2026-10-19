@@ -1676,20 +1676,6 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
 }
 
 #[test]
-fn lfm25_audio_model_memory_excludes_request_scoped_inference_workspace() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    assert_eq!(ModelVariant::Lfm25Audio15BGguf.memory_required_gb(), 5.0);
-    assert_eq!(
-        model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
-        ModelMemoryEstimate {
-            load_peak_bytes: 3 * GIB,
-            resident_bytes: 3 * GIB,
-        }
-    );
-}
-
-#[test]
 fn bounded_model_memos_are_part_of_resident_authorization() {
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -1744,13 +1730,9 @@ fn automatic_state_groups_share_remaining_headroom() {
 }
 
 #[test]
-fn lfm25_audio_context_fit_preserves_request_workspace_and_safety_headroom() {
+fn portable_context_reserve_is_the_configured_reserve_when_residency_is_the_catalog_figure() {
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    assert_eq!(
-        portable_context_reserve_bytes(ModelVariant::Lfm25Audio15BGguf, GIB),
-        3 * GIB
-    );
     assert_eq!(
         portable_context_reserve_bytes(ModelVariant::Kokoro82M, GIB),
         GIB
@@ -2136,36 +2118,6 @@ fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         portable_invocation_context_intent(explicit, Some(8_192), 65_536),
         PortableInvocationContextIntent::Explicit { selected: 32_768 }
     );
-}
-
-#[test]
-fn lfm25_audio_cold_load_fits_with_separately_reserved_request_workspace() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    let authority = vector_authority(ResourceVector {
-        unified_bytes: ResourceAmount::Known(5 * GIB),
-        ..ResourceVector::zero()
-    });
-    let _request = authority
-        .reserve(
-            ReservationOwner::new(ReservationClass::Request, "lfm-request"),
-            ResourceVector {
-                unified_bytes: ResourceAmount::Known(2 * GIB),
-                ..ResourceVector::zero()
-            },
-        )
-        .expect("request workspace should fit");
-    let plan = model_resource_plan(
-        BackendKind::Metal,
-        model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
-    );
-
-    let _model = authority
-        .reserve(
-            ReservationOwner::new(ReservationClass::Model, "lfm-model"),
-            plan.load_authorization,
-        )
-        .expect("model-owned memory should not include request workspace twice");
 }
 
 #[test]
