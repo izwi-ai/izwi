@@ -1221,35 +1221,46 @@ pub(crate) struct BiLstm1 {
 }
 
 impl BiLstm1 {
+    /// Joins both directions on the host and uploads each joined weight at
+    /// its exact size: joined on the device, they came from Candle's pool
+    /// rounded up to a power of two, and the per-direction uploads stayed
+    /// held until the next synchronization (the predictor's LSTMs held
+    /// 90 MiB beyond their 62 MiB of weights).
     pub(crate) fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
         let gates = 4 * hidden_dim;
+        let host = vb.clone().set_device(candle_core::Device::Cpu);
         let mut w_ih_t = Vec::with_capacity(2);
         let mut w_hh_t = Vec::with_capacity(2);
         let mut bias = Vec::with_capacity(2);
         for suffix in ["", "_reverse"] {
-            let w_ih = vb
+            let w_ih = host
                 .get((gates, input_dim), &format!("weight_ih_l0{suffix}"))
                 .map_err(Error::from)?;
-            let w_hh = vb
+            let w_hh = host
                 .get((gates, hidden_dim), &format!("weight_hh_l0{suffix}"))
                 .map_err(Error::from)?;
-            let b_ih = vb
+            let b_ih = host
                 .get(gates, &format!("bias_ih_l0{suffix}"))
                 .map_err(Error::from)?;
-            let b_hh = vb
+            let b_hh = host
                 .get(gates, &format!("bias_hh_l0{suffix}"))
                 .map_err(Error::from)?;
             w_ih_t.push(w_ih.t().map_err(Error::from)?);
             w_hh_t.push(w_hh.t().map_err(Error::from)?);
             bias.push((b_ih + b_hh).map_err(Error::from)?);
         }
+        let device = vb.device();
         Ok(Self {
             w_ih_t: Tensor::cat(&w_ih_t, 1)
                 .and_then(|w| w.contiguous())
+                .and_then(|w| w.to_device(device))
                 .map_err(Error::from)?,
-            bias: Tensor::cat(&bias, 0).map_err(Error::from)?,
+            bias: Tensor::cat(&bias, 0)
+                .and_then(|b| b.to_device(device))
+                .map_err(Error::from)?,
             w_hh_t: Tensor::stack(&w_hh_t, 0)
                 .and_then(|w| w.contiguous())
+                .and_then(|w| w.to_device(device))
                 .map_err(Error::from)?,
             hidden_dim,
         })
