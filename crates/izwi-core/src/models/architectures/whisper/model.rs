@@ -17,6 +17,7 @@ use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::deep_copy_tensor_storage;
+use crate::models::shared::memory::exact::exact_zeros;
 
 use super::physical::WHISPER_CROSS_STATE_DOMAIN;
 
@@ -45,6 +46,13 @@ fn to_add_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
         Ok(tensor.to_dtype(dtype)?)
     }
 }
+
+/// Query rows the dense attention scores at a time. A 30 s encoder window
+/// scored all 1,500 rows at once: `[20, 1500, 1500]` scores in the model
+/// dtype, their F32 copy, the F32 softmax and the weights back in the model
+/// dtype, held in 0.77 GB of Metal pool buffers. Each row's softmax reads
+/// only its own scores, so blocks of rows compute the same values.
+const DENSE_ATTENTION_QUERY_BLOCK: usize = 256;
 
 fn whisper_metal_sdpa_enabled() -> bool {
     static ENABLED: crate::env::ReadOnce<bool> =
@@ -215,9 +223,27 @@ impl MultiHeadAttention {
 
         let q = (q * scale)?;
         let k = (k.transpose(2, 3)? * scale)?;
+        let (batch, heads, rows, _) = q.dims4()?;
+        if rows <= DENSE_ATTENTION_QUERY_BLOCK {
+            return self.attend_rows(&q, &k, v);
+        }
+        // The blocks are written into an exact-size output and dropped, so
+        // no finished block pins a pooled buffer while the next one runs.
+        let output = exact_zeros((batch, rows, heads * v.dim(3)?), v.dtype(), v.device())?;
+        for first in (0..rows).step_by(DENSE_ATTENTION_QUERY_BLOCK) {
+            let block = DENSE_ATTENTION_QUERY_BLOCK.min(rows - first);
+            let wv = self.attend_rows(&q.narrow(2, first, block)?.contiguous()?, &k, v)?;
+            output.slice_set(&wv, 1, first)?;
+        }
+        Ok(output)
+    }
+
+    /// The scaled query rows `q` (`[B, H, rows, D]`) attending over every
+    /// key, token-major: `[B, rows, H·D]`.
+    fn attend_rows(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         let qk = {
             let _enter = self.matmul_span.enter();
-            q.matmul(&k)?
+            q.matmul(k)?
         };
         let w = {
             let _enter = self.softmax_span.enter();
@@ -228,7 +254,8 @@ impl MultiHeadAttention {
             w.matmul(v)?
         }
         .transpose(1, 2)?
-        .flatten_from(2)?;
+        .flatten_from(2)?
+        .contiguous()?;
         Ok(wv)
     }
 
@@ -1182,6 +1209,50 @@ mod tests {
             .unwrap();
         assert_eq!(logits.dtype(), DType::F32);
         assert_eq!(logits.dims(), &[1, 1, config.vocab_size]);
+    }
+
+    /// Dense attention scored by blocks of query rows returns what one pass
+    /// over every row does, including a short last block, within F32
+    /// rounding (the CPU matrix product blocks its sums by its row count).
+    #[test]
+    fn blocked_dense_attention_matches_one_pass() {
+        use super::{MultiHeadAttention, DENSE_ATTENTION_QUERY_BLOCK};
+        let device = Device::Cpu;
+        let (heads, head_dim) = (4, 16);
+        let attention = MultiHeadAttention::load_self(
+            heads * head_dim,
+            heads,
+            candle_nn::VarBuilder::zeros(DType::F32, &device),
+        )
+        .unwrap();
+        let rows = 2 * DENSE_ATTENTION_QUERY_BLOCK + 37;
+        let hashed = |seed: usize, rows: usize| {
+            let values = (0..heads * rows * head_dim)
+                .map(|i| (((i * 2_654_435_761 + seed) % 1_000) as f32 / 500.0) - 1.0)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (1, heads, rows, head_dim), &device).unwrap()
+        };
+        let (q, k, v) = (hashed(1, rows), hashed(2, rows), hashed(3, rows));
+        let blocked = attention.dense_attention(&q, &k, &v).unwrap();
+        let scale = (head_dim as f64).powf(-0.25);
+        let one_pass = attention
+            .attend_rows(
+                &(&q * scale).unwrap(),
+                &(k.transpose(2, 3).unwrap() * scale).unwrap(),
+                &v,
+            )
+            .unwrap();
+        assert_eq!(blocked.dims(), &[1, rows, heads * head_dim]);
+        assert_eq!(blocked.dims(), one_pass.dims());
+        let difference = (blocked - one_pass)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(difference <= 1e-6, "{difference}");
     }
 
     /// A softmax over 4096 equal F16 scores: an F16 running sum stops at
