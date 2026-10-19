@@ -77,13 +77,21 @@ pub(super) fn checkpoint_resource_plan(
         )?;
         return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
     }
-    // ASR, TTS and LFM2.5 chat price what their loader allocates on every
-    // backend; the catalog figure stays a display value for them.
+    // ASR, TTS, LFM2.5 chat and Qwen3.5 chat (CPU and Metal) price what
+    // their loader allocates; the catalog figure stays a display value for
+    // them.
     if let Some(plan) = asr_memory::resource_plan(variant, model_path, device, granite)? {
         return Ok(Some(plan));
     }
     if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
         return asr_memory::lfm2_chat_resource_plan(
+            variant,
+            model_path,
+            BackendKind::from(device.kind),
+        );
+    }
+    if variant.family() == crate::catalog::ModelFamily::Qwen35Chat {
+        return asr_memory::qwen35_chat_resource_plan(
             variant,
             model_path,
             BackendKind::from(device.kind),

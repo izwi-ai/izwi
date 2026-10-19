@@ -2349,6 +2349,87 @@ fn price_lfm2_chat(
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
+/// Qwen3.5 dense chat (`qwen35/chat.rs`) on CPU and Metal: the text GGUF
+/// kept quantized (its token table gathered from and shared with a tied head,
+/// `token_table.rs`), F32 tensors dense, and the F16 vision tower
+/// (`qwen35/vision.rs`) with its linear weights converted on the host to F16
+/// on Metal or F32 on CPU, and every other vision tensor F32. CUDA keeps the
+/// catalog figure. `None` when a file is missing.
+pub(super) fn qwen35_chat_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<ModelResourcePlan>> {
+    if backend == BackendKind::Cuda {
+        return Ok(None);
+    }
+    let Ok(text) = crate::models::architectures::qwen35::chat::qwen35_gguf_filename(variant) else {
+        return Ok(None);
+    };
+    let paths = [model_path.join(text), model_path.join("mmproj-F16.gguf")];
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    let plan = price_qwen35_chat(&files[0], &files[1], backend)?;
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        "Priced Qwen3.5 chat load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+/// Whether a Qwen3.5 projector layer (a tensor name without its `.weight` or
+/// `.bias`) is a linear layer: the attention and MLP projections of each
+/// block and the `mm.*` projector.
+fn qwen35_vision_linear_layer(layer: &str) -> bool {
+    layer.starts_with("mm.")
+        || [".attn_qkv", ".attn_out", ".ffn_up", ".ffn_down"]
+            .iter()
+            .any(|part| layer.ends_with(part))
+}
+
+fn price_qwen35_chat(
+    text: &CensusFile,
+    vision: &CensusFile,
+    backend: BackendKind,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    for tensor in &text.tensors {
+        if gguf_quantized(tensor) {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    let linear_dtype = if backend == BackendKind::Cpu {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    for tensor in &vision.tensors {
+        let name = tensor.name.as_str();
+        if name
+            .strip_suffix(".weight")
+            .is_some_and(qwen35_vision_linear_layer)
+        {
+            ledger.host_converted_through(tensor, Some(DType::F32), linear_dtype)?;
+        } else if name
+            .strip_suffix(".bias")
+            .is_some_and(qwen35_vision_linear_layer)
+        {
+            // Linear biases stay F32, converted on the host and uploaded.
+            ledger.host_converted(tensor, DType::F32)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -4144,6 +4225,85 @@ mod metal_residency_tests {
             );
             drop(model);
             device.device.synchronize().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen35_plan_tests {
+    use super::*;
+
+    fn tensor(name: &str, dtype: GgmlDType, shape: &[usize]) -> CensusTensor {
+        let elements = shape.iter().product::<usize>() as u64;
+        CensusTensor {
+            name: name.to_string(),
+            dtype: StoredDType::Ggml(dtype),
+            shape: shape.to_vec(),
+            stored_bytes: elements / dtype.block_size() as u64 * dtype.type_size() as u64,
+        }
+    }
+
+    fn file(tensors: Vec<CensusTensor>) -> CensusFile {
+        CensusFile {
+            path: PathBuf::from("fixture.gguf"),
+            tensors,
+        }
+    }
+
+    /// The plan prices what the loader keeps: the quantized text tensors at
+    /// their stored size (the token table once, shared with the tied head),
+    /// F32 text tensors dense, the vision linears at F16 on Metal and F32 on
+    /// CPU, and their F32 biases and every other vision tensor at F32.
+    #[test]
+    fn qwen35_plan_prices_the_stored_text_and_the_loaded_vision_dtype() {
+        let text = file(vec![
+            tensor("token_embd.weight", GgmlDType::Q6K, &[512, 256]),
+            tensor("blk.0.attn_q.weight", GgmlDType::Q4K, &[256, 256]),
+            tensor("output_norm.weight", GgmlDType::F32, &[256]),
+        ]);
+        let vision = file(vec![
+            tensor("v.blk.0.attn_qkv.weight", GgmlDType::F16, &[768, 256]),
+            tensor("v.blk.0.attn_qkv.bias", GgmlDType::F32, &[768]),
+            tensor("mm.0.weight", GgmlDType::F16, &[256, 256]),
+            tensor("v.blk.0.ln1.weight", GgmlDType::F32, &[256]),
+            tensor("v.position_embd.weight", GgmlDType::F32, &[64, 256]),
+        ]);
+        let text_stored: u64 = text.tensors.iter().map(|tensor| tensor.stored_bytes).sum();
+        let linear_elements = (768 * 256 + 256 * 256) as u64;
+        let f32_elements = (768 + 256 + 64 * 256) as u64;
+
+        let metal = price_qwen35_chat(&text, &vision, BackendKind::Metal).unwrap();
+        assert_eq!(
+            metal.logical_resident_bytes,
+            text_stored + linear_elements * 2 + f32_elements * 4
+        );
+        let cpu = price_qwen35_chat(&text, &vision, BackendKind::Cpu).unwrap();
+        assert_eq!(
+            cpu.logical_resident_bytes,
+            text_stored + linear_elements * 4 + f32_elements * 4
+        );
+        assert!(metal.load_peak_bytes >= metal.resident_bytes);
+    }
+
+    #[test]
+    fn qwen35_vision_linear_layers_are_the_projections() {
+        for layer in [
+            "v.blk.3.attn_qkv",
+            "v.blk.3.attn_out",
+            "v.blk.3.ffn_up",
+            "v.blk.3.ffn_down",
+            "mm.0",
+            "mm.2",
+        ] {
+            assert!(qwen35_vision_linear_layer(layer), "{layer}");
+        }
+        for layer in [
+            "v.blk.3.ln1",
+            "v.patch_embd",
+            "v.position_embd",
+            "v.post_ln",
+        ] {
+            assert!(!qwen35_vision_linear_layer(layer), "{layer}");
         }
     }
 }
