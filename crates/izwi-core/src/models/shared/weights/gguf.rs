@@ -285,6 +285,14 @@ impl GgufLoader {
         })
     }
 
+    /// Get a boolean metadata value.
+    pub fn get_metadata_bool(&self, key: &str) -> Option<bool> {
+        self.metadata.get(key).and_then(|value| match value {
+            GgufValue::Bool(value) => Some(*value),
+            _ => None,
+        })
+    }
+
     /// Read numeric GGUF metadata without requiring the checkpoint to encode
     /// the value with one particular integer or floating-point width.
     pub fn get_metadata_f64(&self, key: &str) -> Option<f64> {

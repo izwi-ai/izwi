@@ -1273,6 +1273,9 @@ struct Qwen3AsrLoad {
     qmatmul_text: bool,
     /// Q/K/V and gate/up are packed into one quantized projection each.
     packed_projections: bool,
+    /// The head is tied to the embedding: the `QMatMul` text path shares the
+    /// token table and does not read the stored head.
+    tied_head: bool,
 }
 
 fn qwen3_asr_plan(
@@ -1284,9 +1287,12 @@ fn qwen3_asr_plan(
     let Some(path) = resolve_qwen_asr_gguf_path(model_path, variant) else {
         return Ok(None);
     };
-    let Some(files) = census_of(&[path])? else {
+    let Some(files) = census_of(std::slice::from_ref(&path))? else {
         return Ok(None);
     };
+    let tied_head = crate::models::shared::weights::gguf::GgufLoader::from_path(&path)?
+        .get_metadata_bool("qwen3_asr.text.tie_word_embeddings")
+        .unwrap_or(false);
     let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
         device,
         ModelFamily::Qwen3Asr,
@@ -1308,6 +1314,7 @@ fn qwen3_asr_plan(
             &device.device,
             hidden_size as usize,
         ),
+        tied_head,
     };
     price_qwen3_asr(&files, backend, load).map(Some)
 }
@@ -1344,6 +1351,7 @@ fn price_qwen3_asr(
     let audio = format!("{prefix}audio_tower.");
     let text = format!("{prefix}model.");
     let lm_head = format!("{prefix}lm_head.weight");
+    let embed_tokens = format!("{text}embed_tokens.weight");
     let mut ledger = Ledger::new(backend);
     let mut packed = BTreeSet::new();
     if load.qmatmul_text && load.packed_projections {
@@ -1373,6 +1381,11 @@ fn price_qwen3_asr(
         }
         if name.starts_with(&audio) {
             ledger.gguf_dense(tensor, load.audio_dtype)?;
+        } else if load.qmatmul_text && *name == embed_tokens {
+            // The token table stays quantized; rows are gathered from it.
+            ledger.gguf_stored(tensor)?;
+        } else if load.qmatmul_text && load.tied_head && *name == lm_head {
+            // A tied head shares the token table; the stored copy is unread.
         } else if name.starts_with(&text) || *name == lm_head {
             let projection = *name == lm_head || PROJECTIONS.iter().any(|p| name.ends_with(p));
             if load.qmatmul_text && projection {
@@ -2588,6 +2601,8 @@ pub(super) mod tests {
                 hidden as usize,
                 None,
             ),
+            // The published checkpoints tie the head to the embedding.
+            tied_head: true,
         };
         price_qwen3_asr(files, backend, load).unwrap()
     }
@@ -2870,12 +2885,12 @@ pub(super) mod tests {
             (
                 "Qwen3-ASR-0.6B",
                 Box::new(|b| qwen3_asr(&qwen06, b)),
-                [1.86, 1.23, 1.55, 1.57],
+                [1.29, 0.94, 1.05, 1.29],
             ),
             (
                 "Qwen3-ASR-1.7B",
                 Box::new(|b| qwen3_asr(&qwen17, b)),
-                [4.05, 2.87, 3.30, 3.47],
+                [2.89, 2.30, 2.30, 2.89],
             ),
             (
                 "Granite-Speech-Plus",

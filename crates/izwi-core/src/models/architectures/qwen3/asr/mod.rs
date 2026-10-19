@@ -3311,7 +3311,11 @@ fn parse_qwen3_asr_config_from_gguf(
         rope_theta,
         vocab_size: required_usize_metadata(loader, "qwen3_asr.text.vocab_size")?,
         lm_head_size: None,
-        tie_word_embeddings: false,
+        // The published ASR checkpoints tie the head to the embedding (and
+        // store it twice, byte for byte); the loader keeps one copy.
+        tie_word_embeddings: loader
+            .get_metadata_bool("qwen3_asr.text.tie_word_embeddings")
+            .unwrap_or(false),
         rope_scaling: Some(RopeScalingConfig {
             rope_type: Some("mrope".to_string()),
             rope_theta: Some(rope_theta),
