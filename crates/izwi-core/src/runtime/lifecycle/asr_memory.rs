@@ -604,7 +604,48 @@ impl Ledger {
         source: Source,
         dtype: DType,
     ) -> Result<()> {
-        let mut step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.synced_after_join(step)?;
+        self.apply(step)
+    }
+
+    /// [`Self::fused`] for a join built at its exact size
+    /// (`memory::exact::exact_concat_rows`): the joined buffer is allocated
+    /// outside Candle's pool, so on Metal it is not rounded up.
+    fn fused_exact(&mut self, parts: &[&CensusTensor], source: Source, dtype: DType) -> Result<()> {
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.exact_join(step)?;
+        self.apply(step)
+    }
+
+    /// [`Self::fused_exact`] for a loader that then drops the parts and
+    /// synchronizes the device ([`Self::fused_then_synced`]): the Qwen3
+    /// dense projection fusion and Whisper's self-attention Q/K/V.
+    fn fused_exact_then_synced(
+        &mut self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+    ) -> Result<()> {
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.exact_join(step)?;
+        let step = self.synced_after_join(step)?;
+        self.apply(step)
+    }
+
+    /// A join's step with its result at its exact size (Metal).
+    fn exact_join(&self, mut step: Step) -> Result<Step> {
+        if self.metal() {
+            step.high = sum(&[step.high.saturating_sub(step.resident), step.logical])?;
+            step.resident = step.logical;
+        }
+        Ok(step)
+    }
+
+    /// A join's step whose loader synchronizes once it has dropped the parts
+    /// (Metal): the parts are alive at that synchronization, beside the
+    /// join, and none stays held or pooled after it.
+    fn synced_after_join(&self, mut step: Step) -> Result<Step> {
         if self.metal() {
             let parts = sum(&[step.held_until_sync, step.intermediates])?;
             step.high = sum(&[step.high, step.intermediates])?;
@@ -612,24 +653,7 @@ impl Ledger {
             step.held_until_sync = 0;
             step.intermediates = 0;
         }
-        self.apply(step)
-    }
-
-    /// [`Self::fused`] for a join built at its exact size
-    /// (`memory::exact::exact_concat_rows`): the joined buffer is allocated
-    /// outside Candle's pool, so on Metal it is not rounded up.
-    fn fused_exact(
-        &mut self,
-        parts: &[&CensusTensor],
-        source: Source,
-        dtype: DType,
-    ) -> Result<()> {
-        let mut step = self.fused_step(parts, source, dtype, 0)?;
-        if self.metal() {
-            step.high = sum(&[step.high.saturating_sub(step.resident), step.logical])?;
-            step.resident = step.logical;
-        }
-        self.apply(step)
+        Ok(step)
     }
 
     fn fused_step(
@@ -1325,7 +1349,7 @@ fn price_whisper(
             part("k_proj.weight")?,
             part("v_proj.weight")?,
         ];
-        ledger.fused(&weights, Source::Mapped, dtype, 0)?;
+        ledger.fused_exact_then_synced(&weights, Source::Mapped, dtype)?;
         let biases = [part("q_proj.bias")?, part("v_proj.bias")?];
         ledger.fused(&biases, Source::Mapped, dtype, biases[0].elements())?;
         fused.extend(weights.iter().chain(&biases).map(|t| t.name.as_str()));
@@ -1631,7 +1655,7 @@ fn price_qwen3_aligner(
                         .iter()
                         .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
                         .collect::<Result<Vec<_>>>()?;
-                    ledger.fused_then_synced(&parts, Source::Mapped, load.text_dtype)?;
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, load.text_dtype)?;
                     grouped.extend(parts.iter().map(|part| part.name.as_str()));
                 }
             }
@@ -2245,7 +2269,14 @@ pub(super) fn price_vibevoice(
                     .iter()
                     .map(|part| tensor(&tensors, &format!("{layer}.{part}")))
                     .collect::<Result<Vec<_>>>()?;
-                ledger.fused(&parts, Source::Mapped, dtype, 0)?;
+                // `Qwen3Model` joins the weights at their exact size and the
+                // biases with `Tensor::cat`, then synchronizes the device
+                // once it has dropped the parts (`release_fused_parts`).
+                if group[0].ends_with(".bias") {
+                    ledger.fused_then_synced(&parts, Source::Mapped, dtype)?;
+                } else {
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, dtype)?;
+                }
                 grouped.extend(parts.iter().map(|part| part.name.as_str()));
             }
         }
@@ -2650,7 +2681,7 @@ fn price_qwen3_chat_safetensors(
                         .iter()
                         .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
                         .collect::<Result<Vec<_>>>()?;
-                    ledger.fused_then_synced(&parts, Source::Mapped, load.dtype)?;
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, load.dtype)?;
                     grouped.extend(parts.iter().map(|part| part.name.as_str()));
                 }
             }
@@ -3263,7 +3294,7 @@ pub(super) mod tests {
             (
                 "Whisper-L-v3-Turbo",
                 Box::new(whisper),
-                [3.01, 1.51, 1.74, 1.51],
+                [3.01, 1.51, 1.51, 1.51],
             ),
             (
                 "Qwen3-ASR-0.6B",
@@ -3283,7 +3314,7 @@ pub(super) mod tests {
             (
                 "VibeVoice-ASR",
                 Box::new(vibevoice),
-                [31.03, 15.72, 28.35, 15.52],
+                [31.03, 15.72, 21.42, 15.52],
             ),
             (
                 "Voxtral-Mini-4B-RT",
@@ -3302,7 +3333,7 @@ pub(super) mod tests {
             (
                 "ForcedAligner-0.6B",
                 Box::new(|b| aligner(&aligner_dense, b)),
-                [3.42, 1.72, 2.10, 2.30],
+                [3.42, 1.72, 1.99, 2.30],
             ),
             // MLX weights dequantize on the host at the text dtype and upload
             // at their exact sizes (2.68 GiB with power-of-two device casts).
@@ -3621,8 +3652,9 @@ pub(super) mod tests {
     }
 
     /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
-    /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16.
-    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 2.14;
+    /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16, and
+    /// 2.14 GiB before its Q/K/V were joined at their exact size.
+    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 1.65;
     /// Granite's was 7.30 GiB before its encoder loaded weight-only F16, and
     /// 6.49 GiB before its tied table was stored once in F16 and its fused
     /// projections joined at their exact size.
@@ -4783,9 +4815,8 @@ mod qwen3_chat_plan_tests {
     }
 
     /// CPU loads every text tensor at F32, unfused. Metal loads them at F16,
-    /// cast on the host and uploaded at their exact size; only the fused
-    /// Q/K/V and gate/up, written by device kernels, round up to a power of
-    /// two.
+    /// cast on the host and uploaded at their exact size, and joins Q/K/V
+    /// and gate/up at their exact size too.
     #[test]
     fn safetensors_prices_the_load_dtype_and_the_fused_joins() {
         let files = census!("qwen3_0_6b.json");
@@ -4798,26 +4829,13 @@ mod qwen3_chat_plan_tests {
         .unwrap();
         assert_eq!(cpu.resident_bytes, elements(&files, text) * 4);
 
-        let fused = |name: &str| {
-            ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
-                .iter()
-                .any(|part| name.ends_with(&format!(".{part}.weight")))
-        };
-        let (qkv, gate_up) = (
-            (2_048 + 1_024 + 1_024) * 1_024 * 2u64,
-            2 * 3_072 * 1_024 * 2u64,
-        );
-        let joins = 28 * (qkv.next_power_of_two() + gate_up.next_power_of_two());
         let metal = price_qwen3_chat_safetensors(
             &files,
             BackendKind::Metal,
             load(DType::F16, true, true, None),
         )
         .unwrap();
-        assert_eq!(
-            metal.resident_bytes,
-            elements(&files, |name| text(name) && !fused(name)) * 2 + joins
-        );
+        assert_eq!(metal.resident_bytes, elements(&files, text) * 2);
     }
 
     /// The MLX 4-bit checkpoint keeps its packed weights as Q4_1 on Metal
@@ -4893,8 +4911,8 @@ mod qwen3_chat_plan_tests {
     #[test]
     fn plans_match_the_residency_table() {
         let rows: [(&str, Vec<CensusFile>, Option<u64>, [f64; 2]); 4] = [
-            ("Qwen3-0.6B", census!("qwen3_0_6b.json"), None, [2.22, 1.22]),
-            ("Qwen3-1.7B", census!("qwen3_1_7b.json"), None, [6.41, 3.64]),
+            ("Qwen3-0.6B", census!("qwen3_0_6b.json"), None, [2.22, 1.11]),
+            ("Qwen3-1.7B", census!("qwen3_1_7b.json"), None, [6.41, 3.20]),
             (
                 "Qwen3-0.6B-4bit",
                 census!("qwen3_0_6b_4bit.json"),

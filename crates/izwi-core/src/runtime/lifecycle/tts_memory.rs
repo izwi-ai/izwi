@@ -413,8 +413,8 @@ mod tests {
     /// - Kokoro is its 0.305 GiB F32 checkpoint read from the nested
     ///   `.pth`, not the 2 GiB catalog figure.
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
-    ///   CUDA (5.04 GiB exact); on Metal only its fused LM projections are
-    ///   device-written (5.41 GiB allocated, from 5.86).
+    ///   CUDA (5.04 GiB exact); on Metal its fused LM projections are joined
+    ///   at their exact size too (5.41 GiB allocated before, from 5.86).
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
@@ -443,7 +443,7 @@ mod tests {
                 [7.57, 4.02, 4.00],
             ),
             ("Kokoro-82M", Box::new(kokoro), [0.30, 0.30, 0.30]),
-            ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.41, 5.04]),
+            ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.04, 5.04]),
         ];
         for (label, plan, [cpu, metal, cuda]) in rows {
             let plans = BACKENDS.map(&plan);

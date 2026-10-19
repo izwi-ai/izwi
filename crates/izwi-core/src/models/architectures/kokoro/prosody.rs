@@ -1401,13 +1401,25 @@ pub(crate) fn load_plain_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Con
     Ok(Conv1d::new(w, b, cfg))
 }
 
-pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
-    let wv = vb
+/// A weight-normalized kernel, `g * v / ||v||`, fused on the host from the
+/// checkpoint's `weight_v` and `weight_g` and uploaded once at its exact size.
+/// Fused on the device, each kernel landed in a power-of-two buffer and its
+/// operands beside it (Kokoro held 0.2 GB over its plan on Metal).
+fn load_weight_norm(vb: &VarBuilder) -> Result<Tensor> {
+    let host = vb.clone().set_device(candle_core::Device::Cpu);
+    let wv = host
         .get_unchecked_dtype("weight_v", DType::F32)
         .map_err(Error::from)?;
-    let wg = vb
+    let wg = host
         .get_unchecked_dtype("weight_g", DType::F32)
         .map_err(Error::from)?;
+    fuse_weight_norm_dim0(&wv, &wg)?
+        .contiguous()?
+        .to_device(vb.device())
+        .map_err(Error::from)
+}
+
+pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
     let b = if vb.contains_tensor("bias") {
         Some(
             vb.get_unchecked_dtype("bias", DType::F32)
@@ -1416,31 +1428,17 @@ pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Resu
     } else {
         None
     };
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(Conv1d::new(w, b, cfg))
+    Ok(Conv1d::new(load_weight_norm(&vb)?, b, cfg))
 }
 
 pub(crate) fn load_weight_norm_conv1d_no_bias(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
-    let wv = vb
-        .get_unchecked_dtype("weight_v", DType::F32)
-        .map_err(Error::from)?;
-    let wg = vb
-        .get_unchecked_dtype("weight_g", DType::F32)
-        .map_err(Error::from)?;
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(Conv1d::new(w, None, cfg))
+    Ok(Conv1d::new(load_weight_norm(&vb)?, None, cfg))
 }
 
 pub(crate) fn load_weight_norm_conv_transpose1d(
     vb: VarBuilder,
     cfg: ConvTranspose1dConfig,
 ) -> Result<ConvTranspose1d> {
-    let wv = vb
-        .get_unchecked_dtype("weight_v", DType::F32)
-        .map_err(Error::from)?;
-    let wg = vb
-        .get_unchecked_dtype("weight_g", DType::F32)
-        .map_err(Error::from)?;
     let b = if vb.contains_tensor("bias") {
         Some(
             vb.get_unchecked_dtype("bias", DType::F32)
@@ -1449,8 +1447,7 @@ pub(crate) fn load_weight_norm_conv_transpose1d(
     } else {
         None
     };
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(ConvTranspose1d::new(w, b, cfg))
+    Ok(ConvTranspose1d::new(load_weight_norm(&vb)?, b, cfg))
 }
 
 pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Result<Tensor> {

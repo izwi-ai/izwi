@@ -4,6 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
+
+use crate::models::shared::memory::exact::exact_concat_rows;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
@@ -891,7 +893,9 @@ impl Qwen3FusedQkvProjection {
                 "Qwen3 fused QKV projection input dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
+        // Joined at its exact size: `Tensor::cat` rounds the joined weight up
+        // to a power of two on Metal.
+        let weight = exact_concat_rows(&[q_weight, k_weight, v_weight])?;
         let bias = concat_linear_biases(
             "Qwen3 fused QKV projection",
             &[&q_proj.linear, &k_proj.linear, &v_proj.linear],
@@ -1082,7 +1086,7 @@ impl Qwen3FusedGateUpProjection {
                 "Qwen3 fused MLP projection dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
+        let weight = exact_concat_rows(&[gate_weight, up_weight])?;
         let bias = concat_linear_biases(
             "Qwen3 fused MLP projection",
             &[&gate_proj.linear, &up_proj.linear],

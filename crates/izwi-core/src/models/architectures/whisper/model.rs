@@ -123,8 +123,16 @@ impl MultiHeadAttention {
         let q_bias = vb.pp("q_proj").get(n_state, "bias")?;
         let k_bias = Tensor::zeros(n_state, q_bias.dtype(), q_bias.device())?;
         let v_bias = vb.pp("v_proj").get(n_state, "bias")?;
-        let weight = Tensor::cat(&[&q_weight, &k_weight, &v_weight], 0)?;
+        // Joined at its exact size (`Tensor::cat` rounds the joined weight
+        // up to a power of two on Metal), then the parts are dropped and the
+        // device synchronized, so Candle frees their buffers before a later
+        // weight can inherit one.
+        let weight = crate::models::shared::memory::exact::exact_concat_rows(&[
+            &q_weight, &k_weight, &v_weight,
+        ])?;
         let bias = Tensor::cat(&[&q_bias, &k_bias, &v_bias], 0)?;
+        drop((q_weight, k_weight, v_weight));
+        weight.device().synchronize()?;
         Ok(Linear::from_weights(weight, Some(bias)))
     }
 
