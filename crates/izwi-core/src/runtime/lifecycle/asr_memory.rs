@@ -1002,20 +1002,39 @@ impl Ledger {
         self.host_staged(bytes, host)
     }
 
-    /// [`Self::host_converted`] for a weight converted straight from its
-    /// memory map (Qwen3-TTS's float text embedding): the converted copy is
-    /// the only host allocation, the mapped checkpoint pages being file
-    /// backed.
-    pub(super) fn host_converted_in_place(
+    /// A tensor read and converted on the host that stays there (Qwen3-TTS's
+    /// text table: only gathered rows reach the device). With `intermediate`
+    /// it passes through that dtype first; otherwise it is converted straight
+    /// from the memory map. On CPU and Metal it is resident in the one memory
+    /// and nothing is uploaded; on CUDA it costs host memory only.
+    pub(super) fn host_kept(
         &mut self,
         tensor: &CensusTensor,
+        intermediate: Option<DType>,
         dtype: DType,
     ) -> Result<()> {
         let bytes = dense_bytes(tensor.elements(), dtype)?;
-        self.host_staged(bytes, bytes)
+        let high = match intermediate {
+            Some(form) => {
+                let intermediate = dense_bytes(tensor.elements(), form)?;
+                sum(&[tensor.stored_bytes, intermediate])?.max(sum(&[intermediate, bytes])?)
+            }
+            None => bytes,
+        };
+        self.apply(match self.backend {
+            BackendKind::Cpu | BackendKind::Metal => Step {
+                logical: bytes,
+                resident: bytes,
+                high,
+                ..Step::default()
+            },
+            BackendKind::Cuda => Step {
+                host: high,
+                ..Step::default()
+            },
+        })
     }
 
-    /// A weight of `bytes` uploaded once from `host` bytes of host buffers.
     fn host_staged(&mut self, bytes: u64, host: u64) -> Result<()> {
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {

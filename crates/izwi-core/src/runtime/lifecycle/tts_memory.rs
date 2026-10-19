@@ -145,15 +145,16 @@ fn price_qwen3_tts(
         let name = tensor.name.as_str();
         if layout.weight_only_f16 && qwen3_tts_weight_only_f16_tensor(name) {
             // Read on the host, converted there and uploaded once at F16
-            // (biases stay F32). A float text embedding is converted
-            // straight from the memory map; a quantized one passes through
+            // (biases stay F32). The text embedding stays on the host at F16
+            // (only gathered rows are uploaded): a float one is converted
+            // straight from the memory map, a quantized one passes through
             // F32.
             if name == QWEN3_TTS_TEXT_EMBEDDING {
                 if matches!(tensor.dtype, StoredDType::Dense(dtype) if qwen3_tts_text_embedding_reads_in_place(dtype))
                 {
-                    ledger.host_converted_in_place(tensor, DType::F16)?;
+                    ledger.host_kept(tensor, None, DType::F16)?;
                 } else {
-                    ledger.host_converted_through(tensor, Some(DType::F32), DType::F16)?;
+                    ledger.host_kept(tensor, Some(DType::F32), DType::F16)?;
                 }
             } else if name.ends_with(".bias") {
                 ledger.host_converted(tensor, DType::F32)?;
@@ -441,16 +442,16 @@ mod tests {
     }
 
     /// Weight-only F16 on Metal prices what the staged loader holds: the F16
-    /// residency, plus the one host transient above it, the text embedding's
-    /// F16 table, read in place from the BF16 checkpoint (every other tensor
-    /// is converted and uploaded one at a time at its exact size). The
-    /// transient is tied to the loader: `read_f16_embedding` on a BF16 file
-    /// reports what it allocated per element. The final Metal run measured
-    /// 0.6B Base's whole process footprint peaking at 3,945 MiB over this
-    /// load when the embedding was still read through F32, which held 4
-    /// more bytes per element (1.24 GB); the price plus those bytes must
-    /// cover it, without the dense reload (6.21 GB) a failed self-check
-    /// falls back to, which refused 1.7B CustomVoice at 9.99 GB.
+    /// residency, with the text embedding's F16 table kept on the host where
+    /// it was read in place from the BF16 checkpoint (only gathered rows are
+    /// uploaded), so no table-sized transient sits above the residency
+    /// (every other tensor is converted and uploaded one at a time at its
+    /// exact size). `read_f16_embedding` on a BF16 file reports what it
+    /// allocated per element. Measured on a 16 GB M1 Pro
+    /// (`measure_metal_load_footprint`), 0.6B Base's Metal allocation peaked
+    /// at 2,117,189,632 bytes; the price must cover it, without the dense
+    /// reload (6.21 GB) a failed self-check falls back to, which refused 1.7B
+    /// CustomVoice at 9.99 GB.
     #[test]
     fn qwen_weight_only_f16_prices_the_staged_f16_load() {
         let _env = env_lock();
@@ -488,7 +489,7 @@ mod tests {
                 "0.6B Base",
                 census!("qwen3_tts_12hz_0_6b_base.json"),
                 true,
-                Some(3_945u64 << 20),
+                Some(2_117_189_632u64),
             ),
             (
                 "0.6B CustomVoice",
@@ -527,18 +528,18 @@ mod tests {
                 .find(|tensor| tensor.name == QWEN3_TTS_TEXT_EMBEDDING)
                 .unwrap()
                 .elements();
-            assert_eq!(
-                f16.load_peak_bytes - f16.resident_bytes,
-                embedding * host_bytes_per_element,
-                "{file}"
+            assert!(
+                f16.load_peak_bytes - f16.resident_bytes < embedding * host_bytes_per_element,
+                "{file}: a table-sized transient sits above the residency"
             );
             assert!(f16.load_peak_bytes < dense.load_peak_bytes, "{file}");
             if let Some(measured) = measured_peak {
-                assert!(f16.load_peak_bytes + embedding * 4 >= measured, "{file}");
+                assert!(f16.load_peak_bytes >= measured, "{file}");
             }
         }
-        // 1.7B CustomVoice now asks for 5.13 GB, not 9.99 (dense reload
-        // priced) or 6.38 (embedding read through F32).
+        // 1.7B CustomVoice now asks for 4.58 GB, not 9.99 (dense reload
+        // priced), 6.38 (embedding read through F32) or 5.13 (an F16 host
+        // copy beside the uploaded table).
         let files = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
         let layout = qwen_layout(false, BackendKind::Metal);
         let peak = price_qwen3_tts(&files, BackendKind::Metal, &layout)

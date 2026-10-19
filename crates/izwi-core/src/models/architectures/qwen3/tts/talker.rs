@@ -509,12 +509,15 @@ impl TextProjection {
 }
 
 /// The text embedding table (`text_vocab x text_hidden`, the talker's
-/// largest tensor): dense, or stored in F16 with gathered rows widened to
-/// F32 (weight-only F16, like the projections).
+/// largest tensor): dense, or stored in F16 on the host with gathered rows
+/// widened to F32 and uploaded (weight-only F16, like the projections). Only
+/// prompt text is embedded through it, a few hundred rows per request, so
+/// keeping the 0.62 GB table off the device costs one small upload.
 enum TextEmbeddingTable {
     Dense(Embedding),
-    /// The F16 table and the relative L2 of the conversion on sampled rows.
-    F16(Tensor, f64),
+    /// The host F16 table and the relative L2 of the conversion on sampled
+    /// rows.
+    HostF16(Tensor, f64),
 }
 
 impl TextEmbeddingTable {
@@ -528,12 +531,12 @@ impl TextEmbeddingTable {
         f16: Option<&Device>,
         checkpoint: &Path,
     ) -> Result<Self> {
-        let Some(device) = f16 else {
+        if f16.is_none() {
             return Ok(Self::Dense(mlx::load_embedding(vocab, hidden, vb)?));
-        };
+        }
         let name = format!("{}.weight", vb.prefix());
         if let Some(read) = read_f16_embedding(checkpoint, &name, vocab, hidden)? {
-            return Ok(Self::F16(read.table.to_device(device)?, read.relative_l2));
+            return Ok(Self::HostF16(read.table, read.relative_l2));
         }
         let host = mlx::load_embedding(vocab, hidden, projection_var_builder(&vb, f16))?;
         let table = host.embeddings().to_dtype(DType::F32)?;
@@ -552,16 +555,24 @@ impl TextEmbeddingTable {
             .flatten_all()?
             .to_vec1::<f32>()?;
         let relative = crate::kernels::numeric_check::relative_l2(&converted, &original);
-        Ok(Self::F16(f16_table.to_device(device)?, relative))
+        Ok(Self::HostF16(f16_table.to_device(&Device::Cpu)?, relative))
     }
 
-    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+    /// The F32 rows for `ids` on `device`, `[ids.len(), hidden]`.
+    fn embed(&self, ids: &[u32], device: &Device) -> Result<Tensor> {
         match self {
-            Self::Dense(embedding) => embedding.forward(ids).map_err(Error::from),
-            Self::F16(table, _) => table
-                .index_select(ids, 0)?
-                .to_dtype(DType::F32)
-                .map_err(Error::from),
+            Self::Dense(embedding) => {
+                let ids = Tensor::from_vec(ids.to_vec(), (ids.len(),), device)?;
+                embedding.forward(&ids).map_err(Error::from)
+            }
+            Self::HostF16(table, _) => {
+                let ids = Tensor::from_vec(ids.to_vec(), (ids.len(),), &Device::Cpu)?;
+                table
+                    .index_select(&ids, 0)?
+                    .to_dtype(DType::F32)?
+                    .to_device(device)
+                    .map_err(Error::from)
+            }
         }
     }
 
@@ -569,7 +580,7 @@ impl TextEmbeddingTable {
     fn f16_relative_l2(&self) -> Option<f64> {
         match self {
             Self::Dense(_) => None,
-            Self::F16(_, relative) => Some(*relative),
+            Self::HostF16(_, relative) => Some(*relative),
         }
     }
 }
@@ -1123,8 +1134,7 @@ impl TalkerModel {
                 &self.device,
             )?);
         }
-        let ids_tensor = Tensor::from_vec(token_ids.to_vec(), (token_ids.len(),), &self.device)?;
-        let embeds = self.text_embedding.forward(&ids_tensor)?;
+        let embeds = self.text_embedding.embed(token_ids, &self.device)?;
         let embeds = embeds.unsqueeze(0)?;
         self.text_projection.forward(&embeds)
     }
