@@ -166,6 +166,138 @@ pub(super) fn request_envelope_shortfall(
     )))
 }
 
+/// Why a load cannot start once nothing more can be evicted for it, in the
+/// terms a client can act on: what it needs, what is free, and the one thing
+/// that would make room (unloading named models only when that would cover
+/// the gap; otherwise what is actually short).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LoadShortfall {
+    pub(super) backend: BackendKind,
+    pub(super) admission: crate::engine::MetalLoadAdmission,
+    pub(super) required_bytes: u64,
+    /// Ledger headroom: the memory budget less every reservation.
+    pub(super) ledger_headroom: u64,
+    /// The memory budget the ledger is held to.
+    pub(super) ledger_ceiling: Option<u64>,
+    /// The live sample's headroom (the GPU working set; host memory too
+    /// under `strict`), when the backend has one.
+    pub(super) live_headroom: Option<u64>,
+    /// Bytes the resident models and their state hold.
+    pub(super) held_by_residents: u64,
+    /// Residents the load may not evict: loaded explicitly (pinned) or
+    /// serving a request.
+    pub(super) unevictable: Vec<ModelVariant>,
+}
+
+impl LoadShortfall {
+    fn available(&self) -> u64 {
+        self.live_headroom
+            .map_or(self.ledger_headroom, |live| live.min(self.ledger_headroom))
+    }
+
+    pub(super) fn message(&self, variant: ModelVariant) -> String {
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        let available = self.available();
+        let mut message = capacity_shortfall_reason(
+            format_args!("Cannot load {variant}"),
+            self.required_bytes,
+            available,
+        );
+        let freeable = available.saturating_add(self.held_by_residents);
+        let live_binds = self
+            .live_headroom
+            .is_some_and(|live| live < self.ledger_headroom);
+        if !self.unevictable.is_empty() && self.required_bytes <= freeable {
+            message.push_str("; ");
+            message.push_str(&unload_advice(
+                &self.unevictable,
+                Some(self.held_by_residents),
+            ));
+        } else if live_binds && self.backend == BackendKind::Metal {
+            if self.admission == crate::engine::MetalLoadAdmission::Strict {
+                message.push_str(
+                    "; macOS reports less memory available because other apps are using it \
+                     (IZWI_METAL_LOAD_ADMISSION=strict): close some, or set it to advisory to \
+                     let macOS page them out",
+                );
+            } else {
+                message.push_str(
+                    "; that is all the GPU working set (this Mac's limit for GPU memory) has \
+                     free",
+                );
+            }
+        } else if let Some(ceiling) = self
+            .ledger_ceiling
+            .filter(|ceiling| self.required_bytes > *ceiling)
+        {
+            message.push_str(&format!(
+                "; the model is larger than the {:.2} GB memory budget ({})",
+                gb(ceiling),
+                match self.backend {
+                    BackendKind::Cpu => "IZWI_CPU_MEMORY_BUDGET_BYTES",
+                    BackendKind::Metal => {
+                        "IZWI_METAL_MEMORY_BUDGET_BYTES, by default 90% of the GPU working set"
+                    }
+                    BackendKind::Cuda => "IZWI_CUDA_MEMORY_BUDGET_BYTES",
+                },
+            ));
+        } else {
+            message.push_str(
+                "; the memory budget is held by running requests and model state: retry when \
+                 they finish",
+            );
+        }
+        message
+    }
+}
+
+/// The residents a load of `requested` may not evict: loaded explicitly
+/// (pinned) or serving a request.
+pub(super) fn unevictable_residents(
+    residents: &[ModelVariant],
+    requested: ModelVariant,
+    active: &HashSet<ModelVariant>,
+    pinned: &HashSet<ModelVariant>,
+) -> Vec<ModelVariant> {
+    let mut unevictable: Vec<ModelVariant> = residents
+        .iter()
+        .copied()
+        .filter(|variant| {
+            *variant != requested && (active.contains(variant) || pinned.contains(variant))
+        })
+        .collect();
+    unevictable.sort_by_key(ToString::to_string);
+    unevictable
+}
+
+/// "X is loaded explicitly or serving requests (and holds N GB): unload it to
+/// make room", for the residents a load may not evict.
+fn unload_advice(unevictable: &[ModelVariant], held_bytes: Option<u64>) -> String {
+    let one = unevictable.len() == 1;
+    let held = held_bytes.map_or(String::new(), |bytes| {
+        format!(
+            " and {} {:.2} GB",
+            if one { "holds" } else { "hold" },
+            bytes as f64 / 1e9
+        )
+    });
+    format!(
+        "{} {} loaded explicitly or serving requests{held}: unload {} to make room",
+        join_variants(unevictable),
+        if one { "is" } else { "are" },
+        if one { "it" } else { "one of them" },
+    )
+}
+
+fn join_variants(variants: &[ModelVariant]) -> String {
+    let names: Vec<String> = variants.iter().map(ToString::to_string).collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Fixed part of the observed-materialization tolerance. Candle's Metal pool
 /// keeps a buffer per size class it has served even after a synchronization
 /// drops released ones, and the plan leaves out derived tensors under about
@@ -299,8 +431,19 @@ impl ModelLifecycleController {
                 &pinned_variants,
                 &last_used,
             ) else {
+                let unevictable = unevictable_residents(
+                    &resident_variants,
+                    requested_variant,
+                    &active_variants,
+                    &pinned_variants,
+                );
+                let advice = if unevictable.is_empty() {
+                    "the other models are still loading: retry when they finish".to_string()
+                } else {
+                    unload_advice(&unevictable, None)
+                };
                 return Err(Error::Overloaded(format!(
-                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and available for eviction; unload a model to make room"
+                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget (IZWI_MAX_LOADED_MODELS) is full and {advice}"
                 )));
             };
 
@@ -501,14 +644,26 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}"
                 );
-                return Err(Error::Overloaded(format!(
-                    "{}; no idle resident model is available for eviction; unload a model to make room",
-                    capacity_shortfall_reason(
-                        format_args!("Cannot load {requested_variant}"),
-                        required_bytes,
-                        headroom,
-                    )
-                )));
+                let authority = self.coordinator.resource_authority();
+                let shortfall = LoadShortfall {
+                    backend,
+                    admission: authority.metal_load_admission(),
+                    required_bytes,
+                    ledger_headroom: planning_headroom,
+                    ledger_ceiling: authority.planning_ceiling_bytes(backend),
+                    live_headroom,
+                    held_by_residents: authority.reserved_bytes_for_classes(
+                        backend,
+                        &[ReservationClass::Model, ReservationClass::Cache],
+                    ),
+                    unevictable: unevictable_residents(
+                        &resident_variants,
+                        requested_variant,
+                        &active_variants,
+                        &pinned_variants,
+                    ),
+                };
+                return Err(Error::Overloaded(shortfall.message(requested_variant)));
             };
             info!(
                 requested_variant = %requested_variant,
@@ -757,8 +912,19 @@ impl ModelLifecycleController {
                         &pinned_variants,
                         &last_used,
                     ) else {
+                        let unevictable = unevictable_residents(
+                            &resident_variants,
+                            requested_variant,
+                            &active_variants,
+                            &pinned_variants,
+                        );
+                        let advice = if unevictable.is_empty() {
+                            "retry when running requests finish".to_string()
+                        } else {
+                            unload_advice(&unevictable, None)
+                        };
                         return Err(Error::Overloaded(format!(
-                            "Cannot reserve memory for {requested_variant}: {resource_error}; no idle resident model is available for eviction; unload a model to make room"
+                            "Cannot reserve memory for {requested_variant}: {resource_error}; {advice}"
                         )));
                     };
                     info!(

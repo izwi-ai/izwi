@@ -857,6 +857,43 @@ impl ResourceAuthority {
         known_bytes(self.domain_amount(reserved, backend))
     }
 
+    /// Bytes the reservations of `classes` hold, in `backend`'s domain.
+    pub(crate) fn reserved_bytes_for_classes(
+        &self,
+        backend: BackendKind,
+        classes: &[ReservationClass],
+    ) -> u64 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state
+            .ledger
+            .reservations
+            .iter()
+            .filter(|(id, _)| {
+                state
+                    .owners
+                    .get(id)
+                    .is_some_and(|owner| classes.contains(&owner.class))
+            })
+            .map(|(_, resources)| known_bytes(self.domain_amount(*resources, backend)))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The ceiling planning headroom is measured against, in `backend`'s
+    /// domain: the operator's or derived budget, else physical capacity.
+    pub(crate) fn planning_ceiling_bytes(&self, backend: BackendKind) -> Option<u64> {
+        let ceiling = match self.provider.configured_budget() {
+            Some(budget) => normalize_resource_domains(budget, self.domain_policy).ok()?,
+            None => self.normalized_physical_snapshot().capacity,
+        };
+        match self.domain_amount(ceiling, backend) {
+            ResourceAmount::Known(bytes) => Some(bytes),
+            ResourceAmount::Unknown => None,
+        }
+    }
+
     /// Device memory the process holds outside every lease's materialized
     /// usage, in `backend`'s domain: observed device usage less what the
     /// ledger records as allocated (Candle pool slack, power-of-two rounding

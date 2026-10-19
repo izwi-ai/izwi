@@ -2782,8 +2782,10 @@ async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {  
         .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
         .await
         .expect_err("a pinned resident must not be silently evicted");
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("unload a model to make room"),
+        message.contains("Granite Speech 4.1 2B Plus is loaded explicitly or serving requests: unload it to make room")
+            && message.contains("IZWI_MAX_LOADED_MODELS"),
         "unexpected error: {error}"
     );
     assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExhausted);
@@ -2910,7 +2912,12 @@ async fn session_model_leases_protect_without_pinning() {
         .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
         .await
         .expect_err("a model held by a session is not evicted");
-    assert!(error.to_string().contains("no resident model is idle"));
+    assert!(
+        error
+            .to_string()
+            .contains("Kokoro 82M is loaded explicitly or serving requests: unload it"),
+        "{error}"
+    );
     assert_eq!(
         runtime.model_manager.resident_variants().await,
         vec![variant]
@@ -3400,4 +3407,95 @@ fn vibevoice_tts_effective_context_covers_prompt_and_frame_budget_under_low_live
             .unwrap();
     assert!(reach >= required, "effective context {reach} < {required}");
     assert!(reach < maximum as u64, "live memory must still cap growth");
+}
+
+fn shortfall(
+    required_gb: u64,
+    ledger_gb: u64,
+    live_gb: Option<u64>,
+    held_gb: u64,
+    unevictable: Vec<ModelVariant>,
+) -> super::admission::LoadShortfall {
+    const GB: u64 = 1_000_000_000;
+    super::admission::LoadShortfall {
+        backend: BackendKind::Metal,
+        admission: crate::engine::MetalLoadAdmission::Advisory,
+        required_bytes: required_gb * GB,
+        ledger_headroom: ledger_gb * GB,
+        ledger_ceiling: Some(11 * GB),
+        live_headroom: live_gb.map(|gb| gb * GB),
+        held_by_residents: held_gb * GB,
+        unevictable,
+    }
+}
+
+/// A refusal names the pinned or busy models only when unloading them
+/// could cover the gap, and otherwise says what is actually short.
+#[test]
+fn load_refusals_name_their_cause() {
+    let variant = ModelVariant::Qwen354BGguf;
+    let pinned = vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo];
+
+    let message = shortfall(6, 2, Some(3), 5, pinned.clone()).message(variant);
+    assert_eq!(
+        message,
+        "Cannot load Qwen3.5 4B GGUF: needs 6.00 GB, 2.00 GB available; Kokoro 82M and \
+         Whisper Large v3 Turbo are loaded explicitly or serving requests and hold 5.00 GB: \
+         unload one of them to make room"
+    );
+
+    // Unloading both would leave 2 + 1 GB: not enough, so the budget is named.
+    let message = shortfall(12, 2, None, 1, pinned).message(variant);
+    assert!(
+        message.ends_with(
+            "; the model is larger than the 11.00 GB memory budget \
+             (IZWI_METAL_MEMORY_BUDGET_BYTES, by default 90% of the GPU working set)"
+        ),
+        "{message}"
+    );
+
+    // The GPU working set binds below the ledger.
+    let message = shortfall(6, 9, Some(4), 0, Vec::new()).message(variant);
+    assert!(
+        message.starts_with("Cannot load Qwen3.5 4B GGUF: needs 6.00 GB, 4.00 GB available")
+            && message.ends_with("GPU working set (this Mac's limit for GPU memory) has free"),
+        "{message}"
+    );
+
+    // Strict host gating blames other apps and names the switch.
+    let mut strict = shortfall(6, 9, Some(4), 0, Vec::new());
+    strict.admission = crate::engine::MetalLoadAdmission::Strict;
+    let message = strict.message(variant);
+    assert!(
+        message.contains("other apps are using it (IZWI_METAL_LOAD_ADMISSION=strict)"),
+        "{message}"
+    );
+
+    // Requests and state hold the budget: nothing to unload.
+    let message = shortfall(6, 2, None, 0, Vec::new()).message(variant);
+    assert!(
+        message.ends_with("held by running requests and model state: retry when they finish"),
+        "{message}"
+    );
+}
+
+#[test]
+fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
+    let residents = [
+        ModelVariant::Kokoro82M,
+        ModelVariant::WhisperLargeV3Turbo,
+        ModelVariant::Qwen354BGguf,
+        ModelVariant::ParakeetTdt06BV3,
+    ];
+    let active = HashSet::from([ModelVariant::WhisperLargeV3Turbo]);
+    let pinned = HashSet::from([ModelVariant::Kokoro82M, ModelVariant::Qwen354BGguf]);
+    assert_eq!(
+        super::admission::unevictable_residents(
+            &residents,
+            ModelVariant::Qwen354BGguf,
+            &active,
+            &pinned,
+        ),
+        vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo]
+    );
 }
