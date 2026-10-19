@@ -376,6 +376,78 @@ pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
     fn observed_device_usage_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// How host memory gates Metal work, for a Metal provider; `None` for
+    /// every other provider.
+    fn metal_load_admission(&self) -> Option<MetalLoadAdmission> {
+        None
+    }
+
+    /// The host memory the operating system reports available right now,
+    /// sampled fresh, when this provider reads a host figure that does not
+    /// already bound its `available` vector (a Metal provider whose host
+    /// sample is advisory). `None` otherwise.
+    fn advisory_host_available_bytes(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// How the host's available memory gates Metal loads and requests
+/// (`IZWI_METAL_LOAD_ADMISSION`). The GPU working set
+/// (`recommendedMaxWorkingSetSize` less this process's allocations) always
+/// gates: past it a command buffer fails with an out-of-memory error. Host
+/// memory is a softer limit on Apple silicon: macOS compresses and swaps
+/// other processes to make room, which is what llama.cpp and Ollama rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetalLoadAdmission {
+    /// Loads and requests also need the host's available memory.
+    Strict,
+    /// Only the GPU working set gates; a load larger than the host's
+    /// available memory is logged and reported, not refused.
+    #[default]
+    Advisory,
+    /// No live-memory check before a load; the ledger budget still applies,
+    /// and requests still need the GPU working set.
+    Off,
+}
+
+impl MetalLoadAdmission {
+    pub const ENV: &'static str = "IZWI_METAL_LOAD_ADMISSION";
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "advisory" => Some(Self::Advisory),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The operator's setting; unset is [`Self::Advisory`], anything that
+    /// does not parse is a startup error.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(Self::ENV) {
+            Ok(raw) => Self::parse(&raw).ok_or_else(|| {
+                Error::ConfigError(format!(
+                    "{} must be strict, advisory or off, not {raw:?}",
+                    Self::ENV
+                ))
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(err) => Err(Error::ConfigError(format!(
+                "failed to read {}: {err}",
+                Self::ENV
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Advisory => "advisory",
+            Self::Off => "off",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,15 +933,43 @@ impl ResourceAuthority {
     /// sample: a Metal model load allocates its full physical working set at
     /// the load fence, so starting one while the device has less free memory
     /// than the new model's static estimate turns an admission question into
-    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
-    /// exists (probe unavailable); callers must treat that as "fall back to
-    /// planning headroom", never as unlimited. CPU keeps planning headroom
-    /// only: host availability is compressed/swapped and must not gate loads.
+    /// a command-buffer OOM. What the sample bounds follows
+    /// [`MetalLoadAdmission`]: the GPU working set by default, the host's
+    /// available memory too under `strict`, and nothing under `off` (`None`).
+    /// Returns `None` when no trustworthy live sample exists (probe
+    /// unavailable); callers must treat that as "fall back to planning
+    /// headroom", never as unlimited. CPU keeps planning headroom only: host
+    /// availability is compressed/swapped and must not gate loads.
     pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
-        if backend != BackendKind::Metal {
+        if backend != BackendKind::Metal || self.metal_load_admission() == MetalLoadAdmission::Off {
             return Ok(None);
         }
         self.live_headroom_in_domain(backend)
+    }
+
+    /// The provider's [`MetalLoadAdmission`] ([`MetalLoadAdmission::Advisory`]
+    /// when it has none).
+    pub(crate) fn metal_load_admission(&self) -> MetalLoadAdmission {
+        self.provider.metal_load_admission().unwrap_or_default()
+    }
+
+    /// The host's available memory when it is below `required_bytes` and
+    /// does not gate the load (Metal under [`MetalLoadAdmission::Advisory`]):
+    /// macOS will page other processes to make room. `None` when the host
+    /// has room, gates already, or reports nothing.
+    pub(crate) fn advisory_host_shortfall(
+        &self,
+        backend: BackendKind,
+        required_bytes: u64,
+    ) -> Option<u64> {
+        if backend != BackendKind::Metal
+            || self.metal_load_admission() != MetalLoadAdmission::Advisory
+        {
+            return None;
+        }
+        self.provider
+            .advisory_host_available_bytes()
+            .filter(|available| *available < required_bytes)
     }
 
     /// Publish a post-release physical observation before another guarded
@@ -2071,6 +2171,140 @@ mod tests {
                 source: self.source,
             }
         }
+    }
+
+    /// A Metal provider under one `IZWI_METAL_LOAD_ADMISSION` mode, with a
+    /// fixed working-set headroom and host-available sample.
+    #[derive(Debug)]
+    struct MetalModeProvider {
+        working_set_available: u64,
+        host_available: u64,
+        admission: MetalLoadAdmission,
+    }
+
+    impl PhysicalCapacityProvider for MetalModeProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            let available = match self.admission {
+                MetalLoadAdmission::Strict => self.working_set_available.min(self.host_available),
+                MetalLoadAdmission::Advisory | MetalLoadAdmission::Off => {
+                    self.working_set_available
+                }
+            };
+            PhysicalCapacitySnapshot {
+                capacity: unified_bytes(100),
+                available: unified_bytes(available),
+                source: CapacitySource::MetalWorkingSet,
+            }
+        }
+
+        fn metal_load_admission(&self) -> Option<MetalLoadAdmission> {
+            Some(self.admission)
+        }
+
+        fn advisory_host_available_bytes(&self) -> Option<u64> {
+            (self.admission != MetalLoadAdmission::Strict).then_some(self.host_available)
+        }
+    }
+
+    fn metal_mode_authority(admission: MetalLoadAdmission) -> Arc<ResourceAuthority> {
+        Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(MetalModeProvider {
+                working_set_available: 80,
+                host_available: 20,
+                admission,
+            }),
+        ))
+    }
+
+    #[test]
+    fn metal_load_admission_parses_its_three_modes_and_defaults_to_advisory() {
+        assert_eq!(MetalLoadAdmission::default(), MetalLoadAdmission::Advisory);
+        for mode in [
+            MetalLoadAdmission::Strict,
+            MetalLoadAdmission::Advisory,
+            MetalLoadAdmission::Off,
+        ] {
+            assert_eq!(MetalLoadAdmission::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(
+            MetalLoadAdmission::parse(" STRICT "),
+            Some(MetalLoadAdmission::Strict)
+        );
+        assert_eq!(MetalLoadAdmission::parse("permissive"), None);
+    }
+
+    #[test]
+    fn advisory_metal_preload_is_bounded_by_the_working_set_not_host_memory() {
+        let authority = metal_mode_authority(MetalLoadAdmission::Advisory);
+        // The host reports 20 available; the working set 80. A 60-byte load
+        // is admitted and its host shortfall reported, not refused.
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            Some(80)
+        );
+        assert_eq!(
+            authority.advisory_host_shortfall(BackendKind::Metal, 60),
+            Some(20)
+        );
+        assert_eq!(
+            authority.advisory_host_shortfall(BackendKind::Metal, 15),
+            None
+        );
+        assert_eq!(
+            authority.advisory_host_shortfall(BackendKind::Cpu, 60),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_metal_preload_is_bounded_by_host_memory_too() {
+        let authority = metal_mode_authority(MetalLoadAdmission::Strict);
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            Some(20)
+        );
+        // Host memory gates already, so there is nothing to warn about.
+        assert_eq!(
+            authority.advisory_host_shortfall(BackendKind::Metal, 60),
+            None
+        );
+    }
+
+    #[test]
+    fn off_skips_the_live_metal_preload_check() {
+        let authority = metal_mode_authority(MetalLoadAdmission::Off);
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            authority.advisory_host_shortfall(BackendKind::Metal, 60),
+            None
+        );
+    }
+
+    #[test]
+    fn advisory_metal_requests_are_not_refused_for_host_memory() {
+        // ADM-4 checks a request against the live sample, which under the
+        // advisory policy is the working set: 50 fits in 80 although the host
+        // reports 20.
+        let authority = metal_mode_authority(MetalLoadAdmission::Advisory);
+        let request = authority.reserve(
+            ReservationOwner::new(ReservationClass::Request, "request"),
+            unified_bytes(50),
+        );
+        assert!(request.is_ok(), "{request:?}");
+        let strict = metal_mode_authority(MetalLoadAdmission::Strict).reserve(
+            ReservationOwner::new(ReservationClass::Request, "request"),
+            unified_bytes(50),
+        );
+        assert!(matches!(strict, Err(Error::Overloaded(_))), "{strict:?}");
     }
 
     #[test]

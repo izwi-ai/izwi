@@ -177,8 +177,8 @@ pub use request::{
     RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
-    BatchWorkspaceLease, CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
-    ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
+    BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
+    PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
     ResourceAuthoritySnapshot, ResourceEstimate, ResourceLease, ResourceLedger,
     ResourceReservation, ResourceVector,
 };

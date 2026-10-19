@@ -1089,6 +1089,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables the Metal simdgroup GQA decode attention kernels; off restores scalar kernels.",
     ),
     CoreEnvVar::new(
+        "IZWI_METAL_LOAD_ADMISSION",
+        Choice,
+        "advisory",
+        Startup,
+        "How host memory gates Metal loads and requests: advisory (only the GPU working set gates; a load larger than macOS reports available is logged and reported), strict (host memory gates too) or off (no live check before a load); invalid = startup error.",
+    ),
+    CoreEnvVar::new(
         "IZWI_METAL_MEMORY_BUDGET_BYTES",
         Bytes,
         "derived from the Metal working set",

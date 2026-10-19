@@ -389,6 +389,40 @@ impl ModelLifecycleController {
         }))
     }
 
+    /// A Metal load the GPU working set admits but the host's available
+    /// memory does not cover goes ahead under the advisory host policy:
+    /// macOS compresses and swaps other processes to make room. Record why it
+    /// may be slow for the caller, and log it.
+    async fn note_advisory_host_shortfall(
+        &self,
+        variant: ModelVariant,
+        backend: BackendKind,
+        required_bytes: u64,
+    ) {
+        let authority = self.coordinator.resource_authority();
+        // The host sample runs `sysctl`; keep it off the async workers.
+        let available = tokio::task::spawn_blocking(move || {
+            authority.advisory_host_shortfall(backend, required_bytes)
+        })
+        .await
+        .ok()
+        .flatten();
+        let warning = available.map(|available_bytes| {
+            warn!(
+                model = %variant,
+                required_bytes,
+                available_bytes,
+                "Loading beyond the host memory macOS reports available; it will compress or swap other processes' memory"
+            );
+            format!(
+                "{variant} needs {:.2} GB and macOS reports {:.2} GB available, so it will compress or swap other apps' memory to make room; loads may be slow",
+                required_bytes as f64 / 1e9,
+                available_bytes as f64 / 1e9,
+            )
+        });
+        self.set_load_warning(variant, warning);
+    }
+
     pub(super) async fn ensure_portable_memory_before_load(
         &self,
         requested_variant: ModelVariant,
@@ -398,6 +432,7 @@ impl ModelLifecycleController {
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        self.set_load_warning(requested_variant, None);
         let mut pooled_scratch_flushed = false;
         loop {
             let ResourceAmount::Known(planning_headroom) = self
@@ -410,8 +445,10 @@ impl ModelLifecycleController {
             // Metal loads allocate the full working set at the load fence, so
             // the pre-load check must also respect probed live availability —
             // static ledger estimates alone under-count GGUF materialization
-            // and pooled scratch. An unavailable live probe never blocks a
-            // load; planning headroom remains the contract then.
+            // and pooled scratch. What the live sample bounds (the GPU working
+            // set, host memory too under `strict`) follows
+            // `IZWI_METAL_LOAD_ADMISSION`. An unavailable live probe never
+            // blocks a load; planning headroom remains the contract then.
             let live_headroom = self
                 .coordinator
                 .resource_authority()
@@ -420,6 +457,8 @@ impl ModelLifecycleController {
                 .map(|live| planning_headroom.min(live))
                 .unwrap_or(planning_headroom);
             if required_bytes <= headroom {
+                self.note_advisory_host_shortfall(requested_variant, backend, required_bytes)
+                    .await;
                 return Ok(());
             }
             let resident_variants = self.known_resident_variants().await;

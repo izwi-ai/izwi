@@ -172,6 +172,10 @@ pub struct AdminModelBatchCapabilities {
 pub struct AdminModelActionResponse {
     pub status: &'static str,
     pub message: String,
+    /// Why the action may be slow, when the runtime noted something (a Metal
+    /// load larger than the host memory macOS reports available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize, Clone, ToSchema)]
@@ -532,6 +536,7 @@ pub async fn download_model(
         return Ok(Json(DownloadResponse {
             status: "downloading",
             message: format!("Model {} is already being downloaded", variant),
+            warning: None,
         }));
     }
 
@@ -545,6 +550,7 @@ pub async fn download_model(
     Ok(Json(DownloadResponse {
         status: "started",
         message: format!("Download of {} started in background", variant),
+        warning: None,
     }))
 }
 
@@ -565,6 +571,7 @@ pub async fn load_model(
     Ok(Json(DownloadResponse {
         status: "loaded",
         message: format!("Model {} loaded successfully", variant),
+        warning: state.runtime.take_load_warning(variant),
     }))
 }
 
@@ -590,6 +597,7 @@ pub async fn unload_model(
                 variant, cancelled_jobs
             )
         },
+        warning: None,
     }))
 }
 
@@ -617,6 +625,7 @@ pub async fn delete_model(
         return Ok(Json(DownloadResponse {
             status: "deleted",
             message: format!("Removed model {} deleted successfully", removed.id),
+            warning: None,
         }));
     }
     let variant = parse_variant(&variant)?;
@@ -639,6 +648,7 @@ pub async fn delete_model(
     Ok(Json(DownloadResponse {
         status: "deleted",
         message: format!("Model {} deleted successfully", variant),
+        warning: None,
     }))
 }
 
@@ -913,6 +923,7 @@ pub async fn cancel_download(
         return Ok(Json(DownloadResponse {
             status: "not_active",
             message: format!("No active download for {}", variant),
+            warning: None,
         }));
     }
 
@@ -921,6 +932,7 @@ pub async fn cancel_download(
         Ok(_) => Ok(Json(DownloadResponse {
             status: "cancelled",
             message: format!("Download of {} cancelled", variant),
+            warning: None,
         })),
         Err(e) => {
             warn!("Failed to cancel download: {}", e);

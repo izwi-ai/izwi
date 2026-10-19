@@ -141,6 +141,10 @@ pub(crate) struct ModelLifecycleController {
     /// unloaded. Session-scoped.
     pub(super) pinned_variants: Mutex<HashSet<ModelVariant>>,
     pub(super) mutation_gate: Mutex<()>,
+    /// The latest load's admission warning per model (a Metal load larger
+    /// than the host memory macOS reports available), taken by the caller
+    /// that asked for the load.
+    pub(super) load_warnings: StdMutex<HashMap<ModelVariant, String>>,
     state: StdMutex<LifecycleState>,
     #[cfg(test)]
     load_test_panics: AtomicUsize,
@@ -184,6 +188,7 @@ impl ModelLifecycleController {
             model_last_used: Mutex::new(HashMap::new()),
             pinned_variants: Mutex::new(HashSet::new()),
             mutation_gate: Mutex::new(()),
+            load_warnings: StdMutex::new(HashMap::new()),
             state: StdMutex::new(LifecycleState::default()),
             #[cfg(test)]
             load_test_panics: AtomicUsize::new(0),
@@ -196,6 +201,26 @@ impl ModelLifecycleController {
             #[cfg(test)]
             unload_test_panics: AtomicUsize::new(0),
         }
+    }
+
+    /// The admission warning the latest load of `variant` recorded, if any;
+    /// taking it clears it.
+    pub(crate) fn take_load_warning(&self, variant: ModelVariant) -> Option<String> {
+        self.load_warnings
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant)
+    }
+
+    pub(super) fn set_load_warning(&self, variant: ModelVariant, warning: Option<String>) {
+        let mut warnings = self
+            .load_warnings
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match warning {
+            Some(warning) => warnings.insert(variant, warning),
+            None => warnings.remove(&variant),
+        };
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
