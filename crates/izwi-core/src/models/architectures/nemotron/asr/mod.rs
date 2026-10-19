@@ -39,13 +39,13 @@ use crate::tokenizer::Tokenizer;
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_complete};
-pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
     causal_subsampled_len, default_realtime_state_shape, resample_linear,
     resample_linear_output_len, NemotronEncodeProfile, NemotronNetwork, NemotronRealtimeStateShape,
     NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
     NemotronStreamingPreEncodeState,
 };
+pub(crate) use network::{nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES};
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
 
 const SAMPLE_RATE: u32 = 16_000;

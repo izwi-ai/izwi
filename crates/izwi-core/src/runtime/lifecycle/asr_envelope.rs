@@ -22,7 +22,8 @@
 //! precision), so the envelope is an upper bound for the half-precision
 //! paths. Parakeet keeps its own windowed-encoder pricing
 //! ([`parakeet_preparation_bytes`]), whose host part grows with the whole
-//! utterance because its decode spans all windows.
+//! utterance because its decode spans all windows. Nemotron adds its sliced
+//! convolution stem ([`nemotron_stem_bytes`]) to its encoder layer.
 //!
 //! The geometry is pinned per published checkpoint; a test checks the
 //! dimensions against the checkpoint census fixtures.
@@ -31,6 +32,7 @@ use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::nemotron::asr::nemotron_stem_bytes;
 use crate::models::architectures::parakeet::asr::parakeet_preparation_bytes;
 use crate::models::architectures::qwen3::asr::{
     qwen3_aligner_max_words, qwen3_audio_cnn_chunk_bytes, qwen3_audio_cnn_slice_chunks,
@@ -67,7 +69,8 @@ const HOST_BASE_BYTES: u64 = 16 * 1024 * 1024;
 /// free buffer only when it is at least as large (`buf_size`,
 /// `find_available_buffer` in `metal_backend/device.rs`), so a Metal working
 /// set can take up to twice its tensor bytes. A 175 s aligner window
-/// measured 1.6×; the aligner's Metal envelope is priced at the bound.
+/// measured 1.6×; the aligner's and Nemotron's Metal envelopes are priced at
+/// the bound.
 const METAL_POOL_ROUNDING: u64 = 2;
 
 /// What one ASR request holds while it runs, in bytes.
@@ -484,7 +487,31 @@ pub(crate) fn request_envelope(
     let words = geometry
         .forced_alignment
         .map(|_| qwen3_aligner_max_words(f64::from(audio_secs.min(geometry.max_chunk_secs))));
-    geometry_envelope(geometry, audio_secs, words, backend).map(Some)
+    let mut envelope = geometry_envelope(geometry, audio_secs, words, backend)?;
+    if variant == ModelVariant::Nemotron35AsrStreaming06B {
+        envelope.accelerator_bytes = nemotron_accelerator_bytes(
+            envelope.accelerator_bytes,
+            audio_secs.min(geometry.max_chunk_secs),
+            backend,
+        )?;
+    }
+    Ok(Some(envelope))
+}
+
+/// Nemotron's stem runs before its encoder layers, in time slices
+/// ([`nemotron_stem_bytes`]), and Candle's Metal pool keeps the stem's
+/// buffers while the layers run, so the stem adds to the encoder layer's
+/// live set. On Metal both are priced at the pool-rounding bound: a 30 s
+/// pass grew device memory by 211 MB, against 256 MB priced.
+fn nemotron_accelerator_bytes(encoder_bytes: u64, secs: f32, backend: BackendKind) -> Result<u64> {
+    let frames =
+        usize::try_from(positions(MEL_FRAMES_PER_SEC as f32, secs)).map_err(|_| overflow())?;
+    let bytes = sum(&[encoder_bytes, nemotron_stem_bytes(frames)?])?;
+    if backend == BackendKind::Metal {
+        product(&[bytes, METAL_POOL_ROUNDING])
+    } else {
+        Ok(bytes)
+    }
 }
 
 /// The working set of one forced-alignment window of `audio_secs` holding
@@ -738,6 +765,29 @@ mod tests {
         let logits = 2 * 1_800 * 5_000 * 4;
         assert!(stem > 300 * MIB, "{stem}");
         assert_eq!(bound.accelerator_bytes, prefill.max(stem) + logits);
+    }
+
+    /// Nemotron prices one stem slice beside its encoder layer, doubled on
+    /// Metal for pool rounding: a 30 s pass measured 201 MiB of device
+    /// growth (420 MiB of it was the stem before it was sliced).
+    #[test]
+    fn nemotron_envelope_prices_one_stem_slice_beside_the_encoder() {
+        const MIB: u64 = 1024 * 1024;
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let cpu = request_envelope(variant, 30.0, BackendKind::Cpu)
+            .unwrap()
+            .unwrap();
+        let metal = envelope(variant, 30.0);
+        let geometry = envelope_geometry(variant).unwrap();
+        let encoder = layer_bytes(geometry.encoder, 375, 375).unwrap();
+        // One slice of 120 frames and its 2-cell carry: 976 feature frames.
+        let stem = 3 * 256 * 489 * 65 * 4;
+        assert_eq!(nemotron_stem_bytes(3_000).unwrap(), stem);
+        assert_eq!(nemotron_stem_bytes(10_000).unwrap(), stem);
+        assert_eq!(cpu.accelerator_bytes, encoder + 13_088 * 4 + stem);
+        assert_eq!(metal.accelerator_bytes, 2 * cpu.accelerator_bytes);
+        assert!(metal.accelerator_bytes > 201 * MIB, "{metal:?}");
+        assert_eq!(metal.host_bytes, cpu.host_bytes);
     }
 
     /// One chunk per sequence: a default request's prompt and decode budget.
