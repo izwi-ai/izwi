@@ -2239,7 +2239,7 @@ fn vibevoice_plan(
             == DType::F16,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
         tts: false,
-        staged: false,
+        staged: true,
     };
     price_vibevoice(&files, backend, &load).map(Some)
 }
@@ -3140,7 +3140,7 @@ pub(super) mod tests {
                 None,
             ),
             tts: false,
-            staged: false,
+            staged: true,
         }
     }
 
@@ -3374,7 +3374,7 @@ pub(super) mod tests {
             (
                 "VibeVoice-ASR",
                 Box::new(vibevoice),
-                [31.03, 15.72, 21.42, 15.52],
+                [31.03, 15.72, 15.72, 15.52],
             ),
             (
                 "Voxtral-Mini-4B-RT",
