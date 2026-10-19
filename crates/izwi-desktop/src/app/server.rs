@@ -279,6 +279,9 @@ fn configure_local_server_command(cmd: &mut Command, bind_host: &str, port: u16)
         .env("IZWI_PORT", port.to_string())
         .env(DESKTOP_OWNER_PIPE_ENV, "1")
         .stdin(Stdio::piped());
+    // macOS: libmalloc's large cache off, so a model load's freed host
+    // buffers leave the server's footprint (izwi_env::allocator).
+    izwi_env::apply_serving_allocator_env(cmd);
 }
 
 fn open_server_log<R: tauri::Runtime>(
@@ -519,5 +522,20 @@ mod tests {
         );
         assert!(!environment.contains_key(std::ffi::OsStr::new("IZWI_LOADING_MODE")));
         assert!(command.get_args().next().is_none());
+    }
+
+    #[test]
+    fn local_server_starts_with_the_serving_allocator() {
+        let mut command = Command::new("unused-server");
+        configure_local_server_command(&mut command, "127.0.0.1", 8080);
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for (name, value) in izwi_env::serving_allocator_env() {
+            if std::env::var_os(name).is_none() {
+                assert_eq!(
+                    environment[std::ffi::OsStr::new(name)],
+                    Some(std::ffi::OsStr::new(value))
+                );
+            }
+        }
     }
 }

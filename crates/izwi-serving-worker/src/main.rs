@@ -52,6 +52,14 @@ fn init_tracing(env: &EnvSnapshot) -> anyhow::Result<()> {
 /// before any other thread exists: the Tokio runtime and the OTLP exporter
 /// start after it.
 fn main() -> anyhow::Result<()> {
+    // A worker started without the serving allocator settings (macOS: not
+    // by the supervisor) restarts itself with them; see izwi_env::allocator.
+    if let Err(error) = izwi_env::reexec_with_serving_allocator_env() {
+        eprintln!(
+            "izwi-serving-worker: could not restart with the serving allocator settings \
+             ({error}); continuing with the default allocator"
+        );
+    }
     // Every IZWI_* variable this worker reads, read once.
     let env = env_config::capture();
     let process = WorkerProcessConfig::from_env(&env)?;

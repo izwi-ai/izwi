@@ -23,6 +23,7 @@ clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 
 # Async runtime
 tokio = { workspace = true }
+izwi-env = { path = "../izwi-env" }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 

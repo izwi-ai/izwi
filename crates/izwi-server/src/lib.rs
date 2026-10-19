@@ -112,6 +112,7 @@ pub const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// [`PROCESS_EXIT_GRACE`], so SIGTERM exits after the cleanup budget instead
 /// of waiting on a stuck GPU drain.
 pub fn run_from_cli_blocking(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    start_with_serving_allocator();
     let (args, serve_config) = resolve_cli()?;
     if matches!(args.role, ServerRole::Local) {
         // SAFETY: no runtime or other thread has started yet.
@@ -152,6 +153,7 @@ fn run_with_bounded_exit<T>(
 /// race a concurrent read, as it always has on this path. New binaries
 /// should call [`run_from_cli_blocking`] from a synchronous `main`.
 pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    start_with_serving_allocator();
     let (args, serve_config) = resolve_cli()?;
     if matches!(args.role, ServerRole::Local) {
         // SAFETY: not guaranteed (see above); this path has always written
@@ -159,6 +161,19 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
         unsafe { izwi_core::env::configure_process_threads(serve_config.num_threads) };
     }
     run(args, serve_config, enterprise_hooks).await
+}
+
+/// A server started without the serving allocator settings (macOS: by hand,
+/// not by a launcher) restarts itself with them; see `izwi_env::allocator`.
+/// The exec keeps the process ID and descriptors. Logging is not up yet, so
+/// a failed exec is reported on stderr and the server carries on.
+fn start_with_serving_allocator() {
+    if let Err(error) = izwi_env::reexec_with_serving_allocator_env() {
+        eprintln!(
+            "izwi-server: could not restart with the serving allocator settings ({error}); \
+             continuing with the default allocator"
+        );
+    }
 }
 
 fn resolve_cli() -> anyhow::Result<(ServerArgs, ServeRuntimeConfig)> {

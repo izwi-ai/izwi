@@ -69,3 +69,6 @@ Inherited from the supervisor when set:
 - `TEMP`
 - `TMP`
 - `SYSTEMROOT`
+- `MallocLargeCache`
+
+On macOS a worker starts with `MallocLargeCache=0` (libmalloc's large-allocation cache off, so a model load's freed host buffers leave its footprint) unless the supervisor's own environment sets it.

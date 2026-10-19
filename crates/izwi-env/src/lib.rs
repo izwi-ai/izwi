@@ -12,6 +12,9 @@
 //! every `IZWI_*` name in its source is registered, so a new variable cannot
 //! go undocumented.
 //!
+//! The [`allocator`] module owns the one non-`IZWI_*` policy: the system
+//! allocator variables a model-serving process starts with.
+//!
 //! This crate has no dependencies beyond `thiserror`, so the engine
 //! (`izwi-core`) and the accelerator-free serving crates share it without
 //! either depending on the other.
@@ -21,6 +24,11 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
+
+pub mod allocator;
+pub use allocator::{
+    apply_serving_allocator_env, reexec_with_serving_allocator_env, serving_allocator_env,
+};
 
 /// One documented environment variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
