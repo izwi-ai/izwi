@@ -300,7 +300,7 @@ impl VisionAttention {
         }
 
         let attn_output = Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?;
-        self.proj.forward(&attn_output).map_err(Error::from)
+        self.proj.forward(&attn_output)
     }
 }
 
@@ -330,7 +330,7 @@ impl VisionMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.fc1.forward(xs)?;
         let xs = xs.gelu()?;
-        self.fc2.forward(&xs).map_err(Error::from)
+        self.fc2.forward(&xs)
     }
 }
 
@@ -450,7 +450,7 @@ impl PatchMerger {
         } else {
             candle_nn::ops::silu(&xs)?
         };
-        self.fc2.forward(&xs).map_err(Error::from)
+        self.fc2.forward(&xs)
     }
 }
 

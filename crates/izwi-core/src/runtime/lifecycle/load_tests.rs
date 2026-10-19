@@ -179,7 +179,7 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
     use crate::runtime::adapters::{
         LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
     };
-    assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL);
+    const { assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL) };
     // Serialize against OOM-ladder poison windows and load-transaction
     // reservations on the process-global resource authority.
     let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
