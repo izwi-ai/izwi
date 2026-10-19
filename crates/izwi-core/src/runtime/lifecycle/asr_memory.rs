@@ -3218,14 +3218,14 @@ pub(super) mod tests {
             (
                 "ForcedAligner-0.6B",
                 Box::new(|b| aligner(&aligner_dense, b)),
-                [3.42, 2.30, 2.69, 2.30],
+                [3.42, 1.72, 2.10, 2.30],
             ),
             // MLX weights dequantize on the host at the text dtype and upload
             // at their exact sizes (2.68 GiB with power-of-two device casts).
             (
                 "ForcedAligner-0.6B-4bit",
                 Box::new(|b| aligner(&aligner_4bit, b)),
-                [3.42, 2.30, 2.42, 2.30],
+                [3.42, 1.72, 1.83, 2.30],
             ),
             // ADM-4: F32 on every backend, in host memory on Metal (no
             // allocator rounding); the catalog held 3.0 / 2.0 GiB on CUDA.
@@ -4055,9 +4055,10 @@ pub(super) mod tests {
         }
     }
 
-    /// The aligner's Metal F16 text tier (4-bit, and dense per D8) runs a
-    /// load-time probe and reloads the text at F32 when it fails. Admission
-    /// prices the F16 load only; the F32 reload is priced separately, for
+    /// The aligner's Metal F16 tier (text and audio tower, 4-bit and dense,
+    /// per D8) runs a load-time probe per component and reloads a failing
+    /// one at F32. Admission prices the F16 load only; the F32 reload is
+    /// priced separately, for
     /// the lifecycle to grow the load's authorization to when a probe fails
     /// (a 6.37 GB worst case priced up front refused the dense aligner on a
     /// 16 GB Mac with 4.6 GB of live headroom). CPU and F32 loads have no
@@ -4070,9 +4071,9 @@ pub(super) mod tests {
             (census!("qwen3_forced_aligner_0_6b.json"), None),
         ] {
             let tiered = aligner(&fixture, BackendKind::Metal);
-            let load = |text_dtype| AlignerLoad {
-                text_dtype,
-                audio_dtype: DType::F32,
+            let load = |dtype| AlignerLoad {
+                text_dtype: dtype,
+                audio_dtype: dtype,
                 mlx_bits,
                 fused_projections: true,
             };
@@ -4429,14 +4430,15 @@ mod metal_residency_tests {
     /// Loads each published aligner on Metal and checks it against the plan
     /// admission prices: Metal allocations never pass the planned load peak,
     /// and after the load fence the weights occupy the planned residency.
-    /// Measured (2026-10-16, 16 GB M1 Pro; peak allocated / process footprint
-    /// with one checkpoint per process, resident; plan resident / peak):
-    /// - dense: 2.73 / 2.79, 2.69 GiB; plan 2.69 / 3.25 GiB. Before: 4.95 /
-    ///   5.03, 3.24 GiB, over a 2.69 GiB resident plan.
-    /// - dense, F32 text (the reload a failed F16 probe makes, admitted by
+    /// Measured (2026-10-19, 16 GB M1 Pro; peak allocated / process footprint
+    /// with one checkpoint per process, resident; plan resident / peak), with
+    /// the audio tower at F16 beside the F16 text:
+    /// - dense: 2.14 / 2.20, 2.10 GiB; plan 2.10 / 2.66 GiB. With an F32
+    ///   tower (2026-10-16): 2.73 / 2.79, 2.69 GiB.
+    /// - dense, F32 (the reload a failed F16 probe makes, admitted by
     ///   `precision_reload_plan`): 4.24 peak, 4.19 GiB; plan 4.19 / 4.77 GiB.
-    /// - 4-bit: 2.44 / 2.79, 2.42 GiB; plan 2.42 / 3.27 GiB. Before: 3.16 /
-    ///   3.83, 3.14 GiB over 2.69 GiB.
+    /// - 4-bit: 1.84 peak, 1.83 GiB; plan 1.83 / 2.67 GiB. With an F32
+    ///   tower: 2.44 / 2.79, 2.42 GiB.
     ///
     /// The excess over the plan was Candle's Metal pool, which keeps a
     /// released buffer until the next synchronization and hands it to the

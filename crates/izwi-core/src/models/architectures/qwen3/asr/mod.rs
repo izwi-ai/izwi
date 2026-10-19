@@ -3729,6 +3729,21 @@ fn qwen3_asr_weight_precisions(
                 reason: format!("audio dtype override {raw:?}").into(),
             }
         }
+        _ if device.kind.is_metal()
+            && model_family == ModelFamily::Qwen3ForcedAligner
+            && MetalDTypeOverride::from_env() != MetalDTypeOverride::F32 =>
+        {
+            // The aligner's audio tower only feeds boundary classes (D8):
+            // F16 moved no word boundary over 5,278 words (fox, test,
+            // diarization, a 5,128-word ceo.mp3; dense and 4-bit, Metal,
+            // 2026-10-19) and halves its residency. The load-time probe
+            // reloads the tower at F32 if F16 fails.
+            DTypeSelection {
+                dtype: DType::F16,
+                reason: "Metal runs the aligner's audio tower at F16 behind the load-time probe"
+                    .into(),
+            }
+        }
         _ => DTypeSelection {
             dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
             reason: if is_gguf && !device.kind.is_cuda() {
@@ -6937,8 +6952,9 @@ mod precision_tests {
         );
     }
 
-    /// D8: dense aligner text takes the F16 tier on Metal (probed at load)
-    /// unless `IZWI_METAL_DTYPE=f32`; dense Qwen3-ASR text stays F32.
+    /// D8: dense aligner text and every aligner's audio tower take F16 on
+    /// Metal (probed at load) unless `IZWI_METAL_DTYPE=f32`; dense Qwen3-ASR
+    /// stays F32.
     #[test]
     fn dense_aligner_text_takes_f16_on_metal_unless_f32_is_pinned() {
         let _env = crate::env_test_lock()
@@ -6953,20 +6969,29 @@ mod precision_tests {
             },
             memory_pool: None,
         };
-        let text = |family| {
-            qwen3_asr_weight_precisions(&metal, family, false, false, Some("bfloat16"))
-                .unwrap()
-                .0
+        let precisions = |family, quantized| {
+            qwen3_asr_weight_precisions(&metal, family, false, quantized, Some("bfloat16")).unwrap()
         };
+        let text = |family| precisions(family, false).0;
         std::env::remove_var("IZWI_METAL_DTYPE");
         let aligner = text(ModelFamily::Qwen3ForcedAligner);
         assert_eq!(aligner.dtype, DType::F16);
         assert!(aligner.reason.contains("probe"), "{}", aligner.reason);
         assert_eq!(text(ModelFamily::Qwen3Asr).dtype, DType::F32);
+        // The aligner's audio tower takes F16 too, dense or MLX 4-bit; dense
+        // Qwen3-ASR keeps an F32 tower.
+        for quantized in [false, true] {
+            let audio = precisions(ModelFamily::Qwen3ForcedAligner, quantized).1;
+            assert_eq!(audio.dtype, DType::F16, "quantized={quantized}");
+            assert!(audio.reason.contains("probe"), "{}", audio.reason);
+        }
+        assert_eq!(precisions(ModelFamily::Qwen3Asr, false).1.dtype, DType::F32);
         std::env::set_var("IZWI_METAL_DTYPE", "f32");
         let pinned = text(ModelFamily::Qwen3ForcedAligner);
+        let pinned_audio = precisions(ModelFamily::Qwen3ForcedAligner, false).1;
         std::env::remove_var("IZWI_METAL_DTYPE");
         assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(pinned_audio.dtype, DType::F32);
         assert_eq!(
             qwen3_asr_weight_precisions(
                 &DeviceProfile::cpu(),
