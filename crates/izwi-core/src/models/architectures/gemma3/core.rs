@@ -106,14 +106,20 @@ fn gemma_cuda_rms_norm_policy(is_cuda: bool, override_enabled: Option<bool>) -> 
     is_cuda && override_enabled.unwrap_or(true)
 }
 
+/// One RoPE table, `[max_positions, head_dim]` with the cosines then the
+/// sines of each position, shared by every layer of its kind (sliding
+/// window or global): one copy of each, where a table per layer (and
+/// separate sine and cosine copies) held 4.4 GB on Gemma 3 4B.
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
     cos_sin: Tensor,
+    half: usize,
 }
 
 impl RotaryEmbedding {
+    /// The table for layers with (`sliding_window`) or without a window,
+    /// computed in F32 and cast to `dtype` once: positions cast to F16 or
+    /// BF16 first are inexact past 2,048 or 256 (B3).
     fn load(
         dtype: DType,
         config: &Config,
@@ -125,27 +131,24 @@ impl RotaryEmbedding {
         } else {
             config.rope_theta
         };
+        let half = config.head_dim / 2;
         let inverse_frequency = (0..config.head_dim)
             .step_by(2)
             .map(|index| 1.0f32 / rope_frequency.powf(index as f64 / config.head_dim as f64) as f32)
             .collect::<Vec<_>>();
-        let inverse_frequency =
-            Tensor::from_vec(inverse_frequency, (1, config.head_dim / 2), device)?
-                .to_dtype(dtype)?;
+        let inverse_frequency = Tensor::from_vec(inverse_frequency, (1, half), device)?;
         let positions = Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((config.max_position_embeddings, 1))?;
         let frequencies = positions.matmul(&inverse_frequency)?;
-        let sin = frequencies.sin()?;
-        let cos = frequencies.cos()?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
-        Ok(Self { sin, cos, cos_sin })
+        let cos_sin = Tensor::cat(&[&frequencies.cos()?, &frequencies.sin()?], 1)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        Ok(Self { cos_sin, half })
     }
 
     fn apply(&self, query: &Tensor, key: &Tensor, position: usize) -> Result<(Tensor, Tensor)> {
         let sequence_len = query.dim(1)?;
-        let cos = self.cos.narrow(0, position, sequence_len)?;
-        let sin = self.sin.narrow(0, position, sequence_len)?;
         if query.device().is_metal() || query.device().is_cuda() {
             let packed = self
                 .cos_sin
@@ -161,6 +164,9 @@ impl RotaryEmbedding {
         }
         record_rope_manual();
         record_rope_manual();
+        let rows = self.cos_sin.narrow(0, position, sequence_len)?;
+        let cos = rows.narrow(1, 0, self.half)?.contiguous()?;
+        let sin = rows.narrow(1, self.half, self.half)?.contiguous()?;
         let query = query.transpose(1, 2)?.contiguous()?;
         let key = key.transpose(1, 2)?.contiguous()?;
         Ok((
@@ -228,7 +234,13 @@ struct GemmaAttention {
 }
 
 impl GemmaAttention {
-    fn load(config: &Config, vb: VarBuilder, sliding_window: Option<usize>) -> Result<Self> {
+    /// `rotary` is the model's shared table for this layer's kind.
+    fn load(
+        config: &Config,
+        vb: VarBuilder,
+        sliding_window: Option<usize>,
+        rotary: Arc<RotaryEmbedding>,
+    ) -> Result<Self> {
         let geometry = gemma_attention_geometry(config)?;
         let bias = config.attention_bias;
         Ok(Self {
@@ -258,12 +270,7 @@ impl GemmaAttention {
             )?,
             query_norm: GemmaRmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("q_norm"))?,
             key_norm: GemmaRmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("k_norm"))?,
-            rotary: Arc::new(RotaryEmbedding::load(
-                vb.dtype(),
-                config,
-                vb.device(),
-                sliding_window,
-            )?),
+            rotary,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
@@ -436,9 +443,14 @@ struct GemmaLayer {
 }
 
 impl GemmaLayer {
-    fn load(config: &Config, vb: VarBuilder, sliding_window: Option<usize>) -> Result<Self> {
+    fn load(
+        config: &Config,
+        vb: VarBuilder,
+        sliding_window: Option<usize>,
+        rotary: Arc<RotaryEmbedding>,
+    ) -> Result<Self> {
         Ok(Self {
-            attention: GemmaAttention::load(config, vb.pp("self_attn"), sliding_window)?,
+            attention: GemmaAttention::load(config, vb.pp("self_attn"), sliding_window, rotary)?,
             mlp: GemmaMlp::load(config, vb.pp("mlp"))?,
             input_norm: GemmaRmsNorm::load(
                 config.hidden_size,
@@ -547,14 +559,24 @@ impl Gemma3PhysicalModel {
             config.hidden_size,
             model.pp("embed_tokens"),
         )?;
+        let rotary = |sliding_window| {
+            RotaryEmbedding::load(vb.dtype(), &config, vb.device(), sliding_window).map(Arc::new)
+        };
+        let (local_rotary, global_rotary) = (rotary(Some(config.sliding_window))?, rotary(None)?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
             let sliding =
                 ((index + 1) % config.sliding_window_pattern != 0).then_some(config.sliding_window);
+            let rotary = if sliding.is_some() {
+                &local_rotary
+            } else {
+                &global_rotary
+            };
             layers.push(GemmaLayer::load(
                 &config,
                 model.pp("layers").pp(index),
                 sliding,
+                rotary.clone(),
             )?);
         }
         let norm = GemmaRmsNorm::load(config.hidden_size, config.rms_norm_eps, model.pp("norm"))?;
@@ -836,6 +858,61 @@ mod tests {
             sliding_window_pattern: 2,
             max_position_embeddings: 16,
         }
+    }
+
+    /// Every layer of a kind shares one RoPE table: two tables per model
+    /// however many layers it has.
+    #[test]
+    fn layers_share_one_rope_table_per_kind() {
+        let mut config = tiny_config();
+        config.num_hidden_layers = 6;
+        let model = Gemma3PhysicalModel::load(
+            config.clone(),
+            VarBuilder::from_tensors(tiny_weights(&config), DType::F32, &Device::Cpu),
+        )
+        .unwrap();
+        let tables = model
+            .layers
+            .iter()
+            .map(|layer| Arc::as_ptr(&layer.attention.rotary))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tables.len(), 2);
+        for layer in &model.layers {
+            let (sliding, rotary) = (layer.attention.sliding_window, &layer.attention.rotary);
+            let same_kind = model
+                .layers
+                .iter()
+                .filter(|other| other.attention.sliding_window == sliding)
+                .all(|other| Arc::ptr_eq(&other.attention.rotary, rotary));
+            assert!(same_kind);
+        }
+    }
+
+    /// B3: the table is computed in F32 and cast once. Position 3,001 has no
+    /// F16 form (F16 steps by 2 past 2,048), so a position cast to F16 first
+    /// read position 3,000's angles.
+    #[test]
+    fn rope_positions_stay_exact_past_f16_integers() {
+        let mut config = tiny_config();
+        config.max_position_embeddings = 4_096;
+        let table = RotaryEmbedding::load(DType::F16, &config, &Device::Cpu, None).unwrap();
+        let row = table
+            .cos_sin
+            .get(3_001)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // The first frequency is 1: angle = position.
+        let expected = [3_001f32.cos(), 3_001f32.sin()];
+        for (actual, expected) in [row[0], row[1]].into_iter().zip(expected) {
+            assert_eq!(actual, half::f16::from_f32(expected).to_f32());
+        }
+        assert_ne!(
+            half::f16::from_f32(3_001f32.cos()),
+            half::f16::from_f32(3_000f32.cos())
+        );
     }
 
     #[test]
