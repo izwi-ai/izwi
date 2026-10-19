@@ -2433,6 +2433,218 @@ pub(super) fn qwen35_chat_resource_plan(
     plan.resource_plan().map(Some)
 }
 
+/// The switches a Qwen3 chat loader (`qwen3/chat.rs`) resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen3ChatLoad {
+    /// Dense weights (and the MLX weights dequantized into them) on the
+    /// safetensors path; the norms on the GGUF path.
+    dtype: DType,
+    /// Bits per element of MLX-packed weights (the 4-bit checkpoints).
+    mlx_bits: Option<u64>,
+    /// Safetensors: each layer's Q/K/V and gate/up are concatenated into one
+    /// projection (dense projection fusion, `qwen3/core.rs`).
+    fused_projections: bool,
+    /// GGUF: each layer's Q/K/V and gate/up are packed into one quantized
+    /// projection.
+    packed_projections: bool,
+    /// The head is the token table: a stored `lm_head.weight` is unread.
+    tied_head: bool,
+}
+
+/// Qwen3 chat's residency plan on CPU and Metal (CUDA keeps the catalog
+/// estimate): the safetensors (dense or MLX 4-bit) or GGUF checkpoint priced
+/// as its loader keeps it.
+pub(super) fn qwen3_chat_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    use crate::models::architectures::qwen3::chat::{
+        parse_qwen3_config, qwen3_chat_dtype, qwen3_chat_gguf_path, qwen3_chat_mlx_bits,
+        qwen3_chat_safetensors_shards,
+    };
+    let backend = BackendKind::from(device.kind);
+    if backend == BackendKind::Cuda || variant.family() != ModelFamily::Qwen3Chat {
+        return Ok(None);
+    }
+    let plan = if variant.is_qwen_chat_gguf() {
+        let path = qwen3_chat_gguf_path(model_path, variant)?;
+        let Some(files) = census_of(std::slice::from_ref(&path))? else {
+            return Ok(None);
+        };
+        let tensors = by_name(&files);
+        let hidden_size = dim(tensor(&tensors, "token_embd.weight")?, 1)?;
+        let load = Qwen3ChatLoad {
+            dtype: qwen3_chat_dtype(device, None)?,
+            mlx_bits: None,
+            fused_projections: false,
+            packed_projections: qwen3_quantized_projection_grouping_for_hidden_size(
+                &device.device,
+                hidden_size as usize,
+            ),
+            // `parse_qwen3_gguf_config`: tied when no head is stored.
+            tied_head: !tensors.contains_key("output.weight"),
+        };
+        price_qwen3_chat_gguf(&files, backend, load)?
+    } else {
+        let Ok(config_str) = std::fs::read_to_string(model_path.join("config.json")) else {
+            return Ok(None);
+        };
+        let config = parse_qwen3_config(&config_str)?;
+        let Some(files) = census_of(&qwen3_chat_safetensors_shards(model_path)?)? else {
+            return Ok(None);
+        };
+        let load = Qwen3ChatLoad {
+            dtype: qwen3_chat_dtype(
+                device,
+                crate::models::shared::config::checkpoint_dtype_from_config_json(&config_str),
+            )?,
+            mlx_bits: qwen3_chat_mlx_bits(&config_str),
+            fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+            packed_projections: false,
+            tied_head: config.tie_word_embeddings
+                && config.lm_head_size.unwrap_or(config.vocab_size) == config.vocab_size,
+        };
+        price_qwen3_chat_safetensors(&files, backend, load)?
+    };
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        "Priced Qwen3 chat load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+/// Qwen3 chat safetensors (`Qwen3Model::load` over
+/// `staged::metal_staged_safetensors`): every tensor of the text model at
+/// the load dtype, cast on the host and uploaded at its exact size on Metal.
+/// MLX-packed weights are dequantized to dense ones; with fusion, each
+/// layer's Q/K/V and gate/up are concatenated on the device, which is then
+/// synchronized. A tied head shares the token table, so a stored
+/// `lm_head.weight` is not read. Per-layer concatenated Q/K norm gains are
+/// not priced (under 1 MiB).
+fn price_qwen3_chat_safetensors(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: Qwen3ChatLoad,
+) -> Result<AsrResidencyPlan> {
+    let tensors = by_name(files);
+    let mut ledger = Ledger::staged(backend);
+    let mut grouped = BTreeSet::new();
+    if load.fused_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
+                continue;
+            };
+            for group in [
+                ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"].as_slice(),
+                ["mlp.gate_proj", "mlp.up_proj"].as_slice(),
+            ] {
+                let stems = group
+                    .iter()
+                    .map(|part| format!("{layer}.{part}"))
+                    .collect::<Vec<_>>();
+                let packed = stems
+                    .iter()
+                    .map(|stem| MlxWeight::find(&tensors, stem, load.mlx_bits))
+                    .collect::<Result<Option<Vec<_>>>>()?;
+                if let Some(parts) = packed {
+                    ledger.mlx_dequantized(&parts, load.dtype)?;
+                    grouped.extend(parts.iter().flat_map(MlxWeight::names));
+                } else {
+                    let parts = stems
+                        .iter()
+                        .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
+                        .collect::<Result<Vec<_>>>()?;
+                    ledger.fused_then_synced(&parts, Source::Mapped, load.dtype)?;
+                    grouped.extend(parts.iter().map(|part| part.name.as_str()));
+                }
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if grouped.contains(name) || !(name.starts_with("model.") || name.starts_with("lm_head.")) {
+            continue;
+        }
+        if load.tied_head && name.starts_with("lm_head.") {
+            continue;
+        }
+        if let Some(stem) = name.strip_suffix(".weight") {
+            if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
+                ledger.mlx_dequantized(&[weight], load.dtype)?;
+                continue;
+            }
+        }
+        // MLX scales and biases load with their weight.
+        let packing = [".scales", ".biases"].iter().any(|suffix| {
+            name.strip_suffix(suffix)
+                .is_some_and(|stem| tensors.contains_key(format!("{stem}.scales").as_str()))
+        });
+        if !packing {
+            ledger.var(tensor, Source::Mapped, &[load.dtype])?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// Qwen3 chat GGUF (`Qwen3Model::load_gguf_text`): the token table, the
+/// projections and an untied `output.weight` stay quantized (rows are
+/// gathered from the table; a tied head shares it), packed per layer when the
+/// grouping policy holds; the norms are dequantized to the load dtype.
+fn price_qwen3_chat_gguf(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: Qwen3ChatLoad,
+) -> Result<AsrResidencyPlan> {
+    const PROJECTIONS: [&str; 7] = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let tensors = by_name(files);
+    let mut ledger = Ledger::new(backend);
+    let mut packed = BTreeSet::new();
+    if load.packed_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".attn_q.weight") else {
+                continue;
+            };
+            for group in [
+                ["attn_q", "attn_k", "attn_v"].as_slice(),
+                ["ffn_gate", "ffn_up"].as_slice(),
+            ] {
+                let parts = group
+                    .iter()
+                    .map(|part| tensor(&tensors, &format!("{layer}.{part}.weight")))
+                    .collect::<Result<Vec<_>>>()?;
+                ledger.gguf_packed(&parts)?;
+                packed.extend(parts.iter().map(|part| part.name.as_str()));
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if packed.contains(name) {
+            continue;
+        }
+        let quantized_form = *name == "token_embd.weight"
+            || *name == "output.weight"
+            || PROJECTIONS.iter().any(|suffix| name.ends_with(suffix));
+        if quantized_form {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, load.dtype)?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
 /// Whether a Qwen3.5 projector layer (a tensor name without its `.weight` or
 /// `.bias`) is a linear layer: the attention and MLP projections of each
 /// block and the `mm.*` projector.
@@ -4358,6 +4570,209 @@ mod qwen35_plan_tests {
             "v.post_ln",
         ] {
             assert!(!qwen35_vision_linear_layer(layer), "{layer}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen3_chat_plan_tests {
+    use super::tests::{fixture, gib};
+    use super::*;
+
+    /// Census fixtures from the published checkpoints' headers.
+    macro_rules! census {
+        ($file:literal) => {
+            fixture(include_str!(concat!(
+                "../../../tests/fixtures/chat_residency/",
+                $file
+            )))
+        };
+    }
+
+    fn load(dtype: DType, fused: bool, tied: bool, mlx_bits: Option<u64>) -> Qwen3ChatLoad {
+        Qwen3ChatLoad {
+            dtype,
+            mlx_bits,
+            fused_projections: fused,
+            packed_projections: false,
+            tied_head: tied,
+        }
+    }
+
+    fn elements(files: &[CensusFile], keep: impl Fn(&str) -> bool) -> u64 {
+        files
+            .iter()
+            .flat_map(|file| file.tensors.iter())
+            .filter(|tensor| keep(&tensor.name))
+            .map(CensusTensor::elements)
+            .sum()
+    }
+
+    /// Qwen/Qwen3-0.6B and -1.7B declare `tie_word_embeddings` yet store a
+    /// copy of the token table as `lm_head.weight` (equal bytes, checked by
+    /// range reads). The loader ties the head and never reads the copy: on
+    /// Metal that is 0.31 / 0.62 GB of F16 the plan no longer prices.
+    #[test]
+    fn a_tied_heads_stored_copy_is_not_priced() {
+        for (files, hidden) in [
+            (census!("qwen3_0_6b.json"), 1_024u64),
+            (census!("qwen3_1_7b.json"), 2_048),
+        ] {
+            let price = |tied| {
+                price_qwen3_chat_safetensors(
+                    &files,
+                    BackendKind::Metal,
+                    load(DType::F16, true, tied, None),
+                )
+                .unwrap()
+            };
+            let (tied, untied) = (price(true), price(false));
+            assert_eq!(
+                untied.resident_bytes - tied.resident_bytes,
+                151_936 * hidden * 2
+            );
+        }
+    }
+
+    /// CPU loads every text tensor at F32, unfused. Metal loads them at F16,
+    /// cast on the host and uploaded at their exact size; only the fused
+    /// Q/K/V and gate/up, written by device kernels, round up to a power of
+    /// two.
+    #[test]
+    fn safetensors_prices_the_load_dtype_and_the_fused_joins() {
+        let files = census!("qwen3_0_6b.json");
+        let text = |name: &str| name.starts_with("model.");
+        let cpu = price_qwen3_chat_safetensors(
+            &files,
+            BackendKind::Cpu,
+            load(DType::F32, false, true, None),
+        )
+        .unwrap();
+        assert_eq!(cpu.resident_bytes, elements(&files, text) * 4);
+
+        let fused = |name: &str| {
+            ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
+                .iter()
+                .any(|part| name.ends_with(&format!(".{part}.weight")))
+        };
+        let (qkv, gate_up) = (
+            (2_048 + 1_024 + 1_024) * 1_024 * 2u64,
+            2 * 3_072 * 1_024 * 2u64,
+        );
+        let joins = 28 * (qkv.next_power_of_two() + gate_up.next_power_of_two());
+        let metal = price_qwen3_chat_safetensors(
+            &files,
+            BackendKind::Metal,
+            load(DType::F16, true, true, None),
+        )
+        .unwrap();
+        assert_eq!(
+            metal.resident_bytes,
+            elements(&files, |name| text(name) && !fused(name)) * 2 + joins
+        );
+    }
+
+    /// The MLX 4-bit checkpoint is dequantized into dense weights at the
+    /// load dtype: the same residency as the BF16 checkpoint's F16 load.
+    #[test]
+    fn mlx_4bit_prices_its_dense_dequantization() {
+        let dense = census!("qwen3_0_6b.json");
+        let mlx = census!("qwen3_0_6b_4bit.json");
+        for (backend, dtype, fused) in [
+            (BackendKind::Metal, DType::F16, true),
+            (BackendKind::Cpu, DType::F32, false),
+        ] {
+            let mlx =
+                price_qwen3_chat_safetensors(&mlx, backend, load(dtype, fused, true, Some(4)))
+                    .unwrap();
+            let dense =
+                price_qwen3_chat_safetensors(&dense, backend, load(dtype, fused, true, None))
+                    .unwrap();
+            assert_eq!(mlx.resident_bytes, dense.resident_bytes, "{backend:?}");
+        }
+    }
+
+    /// Qwen3-14B Q4_K_M keeps its token table, projections and untied
+    /// Q6_K head quantized; only its F32 norms are dequantized (cast to F16
+    /// on the Metal device, so each rounds up to a power of two).
+    #[test]
+    fn gguf_keeps_the_table_projections_and_head_quantized() {
+        let files = census!("qwen3_14b_q4_k_m.json");
+        let norms = |name: &str| name.ends_with("norm.weight");
+        let stored = |keep: &dyn Fn(&str) -> bool| -> u64 {
+            files[0]
+                .tensors
+                .iter()
+                .filter(|tensor| keep(&tensor.name))
+                .map(|tensor| tensor.stored_bytes)
+                .sum()
+        };
+        let quantized = stored(&|name| !norms(name));
+        let metal = price_qwen3_chat_gguf(
+            &files,
+            BackendKind::Metal,
+            Qwen3ChatLoad {
+                dtype: DType::F16,
+                mlx_bits: None,
+                fused_projections: false,
+                packed_projections: false,
+                tied_head: false,
+            },
+        )
+        .unwrap();
+        let norms_f16: u64 = files[0]
+            .tensors
+            .iter()
+            .filter(|tensor| norms(&tensor.name))
+            .map(|tensor| (tensor.elements() * 2).next_power_of_two())
+            .sum();
+        assert_eq!(metal.resident_bytes, quantized + norms_f16);
+        assert!(stored(&|name| name == "output.weight") > 0);
+    }
+
+    /// Resident and load-peak GiB per checkpoint, CPU and Metal.
+    #[test]
+    fn plans_match_the_residency_table() {
+        let rows: [(&str, Vec<CensusFile>, Option<u64>, [f64; 2]); 4] = [
+            ("Qwen3-0.6B", census!("qwen3_0_6b.json"), None, [2.22, 1.22]),
+            ("Qwen3-1.7B", census!("qwen3_1_7b.json"), None, [6.41, 3.64]),
+            (
+                "Qwen3-0.6B-4bit",
+                census!("qwen3_0_6b_4bit.json"),
+                Some(4),
+                [2.22, 1.22],
+            ),
+            (
+                "Qwen3-14B-GGUF",
+                census!("qwen3_14b_q4_k_m.json"),
+                None,
+                [8.38, 8.38],
+            ),
+        ];
+        for (label, files, mlx_bits, [cpu, metal]) in rows {
+            let price = |backend, dtype, fused| {
+                if label.ends_with("GGUF") {
+                    price_qwen3_chat_gguf(&files, backend, load(dtype, false, false, None))
+                } else {
+                    price_qwen3_chat_safetensors(
+                        &files,
+                        backend,
+                        load(dtype, fused, true, mlx_bits),
+                    )
+                }
+                .unwrap()
+            };
+            let on_cpu = price(BackendKind::Cpu, DType::F32, false);
+            let on_metal = price(BackendKind::Metal, DType::F16, true);
+            eprintln!(
+                "{label:16} resident (load peak) GiB: CPU {:.2} ({:.2}), Metal {:.2} ({:.2})",
+                gib(on_cpu.resident_bytes),
+                gib(on_cpu.load_peak_bytes),
+                gib(on_metal.resident_bytes),
+                gib(on_metal.load_peak_bytes),
+            );
+            super::tests::assert_gib(&format!("{label} CPU"), on_cpu.resident_bytes, cpu);
+            super::tests::assert_gib(&format!("{label} Metal"), on_metal.resident_bytes, metal);
         }
     }
 }

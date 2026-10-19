@@ -2351,9 +2351,12 @@ impl Qwen3Model {
             cfg.hidden_size,
             vb.pp(qwen3_join_prefix(layout.model_prefix, "embed_tokens")),
         )?;
+        // A tied head is the token table, even where the checkpoint also
+        // stores a copy (Qwen/Qwen3-0.6B and -1.7B do): the copy is unread.
+        let tied = cfg.tie_word_embeddings && lm_head_size == cfg.vocab_size;
         let lm_head = if let Some(lm_head_prefix) = layout.lm_head_prefix {
             let lm_head_weight = qwen3_join_prefix(lm_head_prefix, "weight");
-            if vb.contains_tensor(&lm_head_weight) {
+            if vb.contains_tensor(&lm_head_weight) && !tied {
                 Qwen3Projection::dense(cfg.hidden_size, lm_head_size, vb.pp(lm_head_prefix))?
             } else {
                 if lm_head_size != cfg.vocab_size {
