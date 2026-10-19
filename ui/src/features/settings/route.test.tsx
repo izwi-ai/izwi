@@ -173,7 +173,11 @@ describe("SettingsPage capabilities", () => {
 
     render(<SettingsPage />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    // The button is there, disabled, until the install status is read;
+    // a click before then does nothing.
+    const install = await screen.findByRole("button", { name: "Install" });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
 
     await screen.findByText("/usr/local/bin/izwi");
     expect(coreMocks.invoke).toHaveBeenCalledWith("install_cli");
