@@ -82,6 +82,43 @@ pub(crate) fn exact_zeros_var<S: Into<Shape>>(
     Ok(Var::zeros(shape, dtype, device)?)
 }
 
+/// A private Metal buffer of exactly `count` elements of `dtype`, freed when
+/// its last reference drops.
+///
+/// Candle's `MetalDevice::new_private_buffer` adds its buffer to the device's
+/// `MTLResidencySet`, which retains it, and Candle removes only pooled
+/// buffers from that set (`drop_unused_buffers`), so a buffer from it is
+/// never freed: an unloaded LFM2.5 kept its 0.40 GB KV arena, Granite Speech
+/// 2.85 GB of state and fused weights, and every Qwen3.5 prefill its copied
+/// recurrent state. Taken from the raw device, the buffer lives exactly as
+/// long as its references: Metal makes a buffer bound to an encoder resident
+/// for the command buffer that uses it, and a command buffer retains the
+/// buffers it references until it completes.
+#[cfg(feature = "metal")]
+pub(crate) fn exact_private_buffer(
+    metal: &candle_core::MetalDevice,
+    count: usize,
+    dtype: DType,
+    label: &str,
+) -> candle_core::Result<std::sync::Arc<candle_metal_kernels::metal::Buffer>> {
+    use candle_metal_kernels::metal::MTLResourceOptions;
+
+    let bytes = count
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(|| candle_core::Error::Msg("exact Metal buffer size overflow".into()))?;
+    // Candle's `PRIVATE_RESOURCE_OPTIONS`, which it does not export.
+    let buffer = metal
+        .device()
+        .new_buffer(
+            bytes,
+            MTLResourceOptions::StorageModePrivate
+                | MTLResourceOptions::HazardTrackingModeUntracked,
+        )
+        .map_err(candle_core::MetalError::from)?;
+    buffer.set_label(label);
+    Ok(std::sync::Arc::new(buffer))
+}
+
 #[cfg(feature = "metal")]
 fn metal_exact_zeros(
     shape: &Shape,
@@ -102,7 +139,7 @@ fn metal_exact_zeros(
     let bytes = count.checked_mul(dtype.size_in_bytes()).ok_or_else(|| {
         crate::error::Error::Overloaded("exact state tensor size overflow".into())
     })?;
-    let buffer = metal.new_private_buffer(count, dtype, "izwi_state")?;
+    let buffer = exact_private_buffer(metal, count, dtype, "izwi_state")?;
     {
         let mut blit = metal.blit_command_encoder()?;
         blit.set_label("izwi_state_zeros");
@@ -187,5 +224,31 @@ mod tests {
             2 * ATTENTION_LAYERS * (exact.elem_count() * exact.dtype().size_in_bytes()) as u64,
             lease
         );
+    }
+
+    /// Exact state and its compact copies return their memory to the device
+    /// once the last reference drops; registered in Candle's residency set,
+    /// they stayed allocated after an unload for the life of the process.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn exact_metal_buffers_are_freed_when_their_last_reference_drops() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "exact_metal_buffers_are_freed_when_their_last_reference_drops",
+        ) else {
+            return;
+        };
+        let metal = device.as_metal_device().unwrap().clone();
+        device.synchronize().unwrap();
+        let before = metal.device().current_allocated_size();
+        let state = exact_zeros_var((16, 1024, 1024), DType::F32, &device).unwrap();
+        let compact = crate::models::shared::memory::accounting::deep_copy_tensor_storage(
+            &state.as_tensor().narrow(0, 0, 4).unwrap(),
+        )
+        .unwrap();
+        device.synchronize().unwrap();
+        assert!(metal.device().current_allocated_size() >= before + (80 << 20));
+        drop((state, compact));
+        device.synchronize().unwrap();
+        assert!(metal.device().current_allocated_size() <= before + (1 << 20));
     }
 }

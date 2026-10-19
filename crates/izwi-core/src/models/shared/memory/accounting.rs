@@ -30,7 +30,8 @@ pub(crate) fn deep_copy_tensor_storage(tensor: &Tensor) -> candle_core::Result<T
                     candle_core::Error::Msg("persistent Metal tensor offset overflowed".into())
                 })?;
             let device = contiguous.device().as_metal_device()?.clone();
-            let buffer = device.new_private_buffer(
+            let buffer = super::exact::exact_private_buffer(
+                &device,
                 element_count,
                 dtype,
                 "izwi retained tensor compact copy",
