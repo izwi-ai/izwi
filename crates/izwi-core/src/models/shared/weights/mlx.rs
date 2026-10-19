@@ -6,7 +6,9 @@
 //! - `biases`  (per-group bias)
 //!
 //! This module dequantizes those tensors into dense weights so existing Candle
-//! layers can be reused without model-specific branching.
+//! layers can be reused without model-specific branching, or repacks a 4-bit
+//! weight exactly into GGML Q4_1 blocks for a quantized matmul
+//! ([`read_q4_1_blocks`]).
 
 use candle_core::{DType, Device, Tensor, WithDType};
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Embedding, Linear, VarBuilder};
@@ -271,6 +273,74 @@ pub fn load_weight(vb: &VarBuilder, out_dim: usize, in_dim: usize) -> Result<Ten
             .to_dtype(dtype)
             .map_err(Error::from),
     }
+}
+
+/// Bytes of one GGML Q4_1 block: F16 `d` and `m`, then 32 nibbles.
+const Q4_1_BLOCK_BYTES: usize = 20;
+/// Elements per GGML Q4_1 block.
+const Q4_1_BLOCK_ELEMENTS: usize = 32;
+
+/// An MLX affine 4-bit `[out_dim, in_dim]` weight repacked, exactly, into
+/// GGML Q4_1 blocks (row-major, `in_dim / 32` blocks per row), for a
+/// quantized matmul or row gather. A group of `g` elements (a multiple of 32)
+/// becomes `g / 32` blocks sharing its scale as `d` and its bias as `m`, so
+/// each element still reads `scale * q + bias`. `None`, to load it dense
+/// instead, for any other weight: not MLX-quantized, not 4-bit U32 words,
+/// groups not a multiple of 32, or a scale or bias F16 cannot hold exactly.
+pub(crate) fn read_q4_1_blocks(
+    vb: &VarBuilder,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Option<Vec<u8>>> {
+    if !has_mlx_affine_quantized_weight(vb) || !in_dim.is_multiple_of(Q4_1_BLOCK_ELEMENTS) {
+        return Ok(None);
+    }
+    let Ok(words) = vb.get_unchecked_dtype("weight", DType::U32) else {
+        return Ok(None);
+    };
+    let words = words.to_vec2::<u32>()?;
+    if words.len() != out_dim || words.iter().any(|row| row.len() * 8 != in_dim) {
+        return Ok(None);
+    }
+    let scales = tensor2_f32(vb.get_unchecked_dtype("scales", DType::F32)?)?;
+    let biases = if vb.contains_tensor("biases") {
+        Some(tensor2_f32(vb.get_unchecked_dtype("biases", DType::F32)?)?)
+    } else {
+        None
+    };
+    let (scales, biases, groups) = normalize_affine_params(scales, biases, out_dim, in_dim)?;
+    let group_size = in_dim / groups;
+    if !group_size.is_multiple_of(Q4_1_BLOCK_ELEMENTS) {
+        return Ok(None);
+    }
+    let exact_f16 = |value: f32| {
+        let half = half::f16::from_f32(value);
+        (half.to_f32() == value).then_some(half)
+    };
+    let blocks_per_row = in_dim / Q4_1_BLOCK_ELEMENTS;
+    let mut out = Vec::with_capacity(out_dim * blocks_per_row * Q4_1_BLOCK_BYTES);
+    for (row, words) in words.iter().enumerate() {
+        for block in 0..blocks_per_row {
+            let group = block * Q4_1_BLOCK_ELEMENTS / group_size;
+            let (Some(d), Some(m)) = (exact_f16(scales[row][group]), exact_f16(biases[row][group]))
+            else {
+                return Ok(None);
+            };
+            out.extend_from_slice(&d.to_le_bytes());
+            out.extend_from_slice(&m.to_le_bytes());
+            // MLX packs element `k` into bits `4 * (k % 8)` of word `k / 8`;
+            // a Q4_1 block keeps element `j` in the low nibble of byte `j`
+            // and element `j + 16` in its high nibble.
+            let nibble = |k: usize| (words[k / 8] >> (4 * (k % 8))) & 0xF;
+            let first = block * Q4_1_BLOCK_ELEMENTS;
+            for j in 0..Q4_1_BLOCK_ELEMENTS / 2 {
+                let low = nibble(first + j);
+                let high = nibble(first + j + Q4_1_BLOCK_ELEMENTS / 2);
+                out.push((low | (high << 4)) as u8);
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// The packed words of an MLX affine-quantized weight.
@@ -589,6 +659,72 @@ mod tests {
             };
             assert_eq!(bits(&weight), bits(&expected), "{dtype:?}");
         }
+    }
+
+    /// MLX 4-bit weights of `out_dim x in_dim` in groups of `group`, with
+    /// F16-exact scales and biases.
+    fn mlx_4bit(
+        out_dim: usize,
+        in_dim: usize,
+        group: usize,
+        scale: f32,
+    ) -> std::collections::HashMap<String, Tensor> {
+        let device = Device::Cpu;
+        let groups = in_dim / group;
+        let words: Vec<u32> = (0..out_dim * in_dim / 8)
+            .map(|i| 0x9E37_79B9u32.wrapping_mul(i as u32 + 1))
+            .collect();
+        let scales: Vec<f32> = (0..out_dim * groups)
+            .map(|i| scale * (i as f32 + 1.0))
+            .collect();
+        let biases: Vec<f32> = (0..out_dim * groups).map(|i| -0.0625 * i as f32).collect();
+        std::collections::HashMap::from([
+            (
+                "weight".to_string(),
+                Tensor::from_vec(words, (out_dim, in_dim / 8), &device).unwrap(),
+            ),
+            (
+                "scales".to_string(),
+                Tensor::from_vec(scales, (out_dim, groups), &device).unwrap(),
+            ),
+            (
+                "biases".to_string(),
+                Tensor::from_vec(biases, (out_dim, groups), &device).unwrap(),
+            ),
+        ])
+    }
+
+    /// The Q4_1 repack holds exactly the MLX weight: it dequantizes to the
+    /// dense F32 load bit for bit. Weights it cannot hold exactly load dense.
+    #[test]
+    fn q4_1_repack_dequantizes_to_the_mlx_weight() {
+        use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType};
+        let device = Device::Cpu;
+        let (out_dim, in_dim) = (3, 128);
+        let weights = mlx_4bit(out_dim, in_dim, 64, 1.0 / 1024.0);
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let blocks = read_q4_1_blocks(&vb, out_dim, in_dim)
+            .unwrap()
+            .expect("q4_1");
+        assert_eq!(blocks.len(), out_dim * in_dim / 32 * 20);
+        let q4_1 = qtensor_from_ggml(GgmlDType::Q4_1, &blocks, vec![out_dim, in_dim], &device)
+            .unwrap()
+            .dequantize(&device)
+            .unwrap();
+        let dense = load_weight(&vb, out_dim, in_dim).unwrap();
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(values(&q4_1), values(&dense));
+
+        // Groups of 16, and scales F16 cannot hold, load dense.
+        let vb = VarBuilder::from_tensors(
+            mlx_4bit(out_dim, in_dim, 16, 1.0 / 1024.0),
+            DType::F32,
+            &device,
+        );
+        assert!(read_q4_1_blocks(&vb, out_dim, in_dim).unwrap().is_none());
+        let vb =
+            VarBuilder::from_tensors(mlx_4bit(out_dim, in_dim, 64, 0.013), DType::F32, &device);
+        assert!(read_q4_1_blocks(&vb, out_dim, in_dim).unwrap().is_none());
     }
 
     /// MLX OHWI / OKI conv weights for the loaders, with a bias.

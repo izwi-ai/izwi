@@ -24,9 +24,14 @@ pub(crate) struct QuantizedTokenTable {
 impl QuantizedTokenTable {
     /// `tensor` is `[vocab, hidden]`.
     pub(crate) fn new(tensor: QTensor) -> Result<Self> {
+        Self::from_arc(Arc::new(tensor))
+    }
+
+    /// A table over a tensor another owner may share (a quantized head).
+    pub(crate) fn from_arc(tensor: Arc<QTensor>) -> Result<Self> {
         let (vocab_size, hidden_size) = tensor.shape().dims2()?;
         Ok(Self {
-            tensor: Arc::new(tensor),
+            tensor,
             vocab_size,
             hidden_size,
         })

@@ -89,7 +89,8 @@ use crate::models::architectures::qwen3::asr::{
     resolve_qwen_asr_gguf_path, QWEN3_ASR_AUDIO_POSITIONS, QWEN3_ASR_GGUF_CHECKPOINT_DTYPE,
 };
 use crate::models::architectures::qwen3::core::{
-    qwen3_dense_projection_fusion_enabled, qwen3_quantized_projection_grouping_for_hidden_size,
+    qwen3_dense_projection_fusion_enabled, qwen3_mlx_q4_1_enabled,
+    qwen3_quantized_projection_grouping_for_hidden_size,
 };
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
@@ -800,6 +801,39 @@ impl Ledger {
         self.apply(step)
     }
 
+    /// MLX 4-bit weights repacked into Q4_1 blocks on the host and uploaded
+    /// once, stacked by rows when there are several (Metal,
+    /// `qwen3::core::qwen3_mlx_q4_1_projection`). Per weight the loader reads
+    /// the packed words back from their upload (held until the next
+    /// synchronization) and the scales and biases at F32; the group's blocks
+    /// accumulate on the host until the upload.
+    fn mlx_q4_1(&mut self, parts: &[MlxWeight]) -> Result<()> {
+        let mut logical = 0;
+        let mut held = 0;
+        let mut before_sync = 0;
+        let mut reading = 0;
+        for part in parts {
+            let packed = part.weight.stored_bytes;
+            let params = part.params_host_bytes()?;
+            let blocks = part.elements()? / 32 * 20;
+            let readback = self.kernel(packed)?;
+            held = held.max(sum(&[packed, readback])?);
+            before_sync = before_sync.max(sum(&[packed, readback, params])?);
+            // The packed copy, the parameters and this weight's blocks beside
+            // the blocks of the parts before it.
+            reading = reading.max(sum(&[logical, packed, params, blocks])?);
+            logical = sum(&[logical, blocks])?;
+        }
+        self.apply(Step {
+            logical,
+            resident: logical,
+            high: sum(&[logical, held, reading])?,
+            held_until_sync: held,
+            before_sync: Some(before_sync),
+            ..Step::default()
+        })
+    }
+
     /// A GGUF tensor kept quantized (`QTensor` / `QMatMul`), read through a
     /// host buffer.
     fn gguf_stored(&mut self, tensor: &CensusTensor) -> Result<()> {
@@ -1171,6 +1205,19 @@ impl<'a> MlxWeight<'a> {
             .ok_or_else(overflow)
     }
 
+    /// Whether `mlx::read_q4_1_blocks` repacks this weight into Q4_1: 4-bit
+    /// in U32 words, in groups of a multiple of 32 elements. (It also needs
+    /// F16 to hold every scale and bias exactly, which a census cannot see;
+    /// every published checkpoint checked does.)
+    fn repacks_to_q4_1(&self) -> Result<bool> {
+        let groups = dim(self.scales, 1)?;
+        Ok(self.weight.dtype == StoredDType::Dense(DType::U32)
+            && dim(self.weight, 1)? * 8 == self.in_dim
+            && groups > 0
+            && self.in_dim.is_multiple_of(groups)
+            && (self.in_dim / groups).is_multiple_of(32))
+    }
+
     /// The scales and biases as the loader copies them to the host, in F32.
     fn params_host_bytes(&self) -> Result<u64> {
         let biases = self.biases.map_or(0, CensusTensor::elements);
@@ -1450,6 +1497,8 @@ struct AlignerLoad {
     /// Each text layer's Q/K/V and gate/up are concatenated into one
     /// projection (dense projection fusion, `qwen3/core.rs`).
     fused_projections: bool,
+    /// MLX 4-bit text weights stay quantized as Q4_1 (Metal).
+    mlx_q4_1: bool,
 }
 
 fn aligner_plan(
@@ -1481,6 +1530,7 @@ fn aligner_load(
         audio_dtype: spec.audio_dtype,
         mlx_bits: spec.mlx_bits,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+        mlx_q4_1: qwen3_mlx_q4_1_enabled(&device.device),
     };
     Ok(Some((files, load)))
 }
@@ -1530,8 +1580,10 @@ pub(super) fn precision_reload_plan(
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
 /// `VarBuilder`s over the mapped checkpoint (`staged::metal_synced_safetensors`),
 /// the audio tower at the audio dtype and the text model (embedding, layers,
-/// norm, the classifier head) at the text dtype. MLX-packed weights are
-/// dequantized to dense ones; the audio tower's OHWI convolution kernels (MLX
+/// norm, the classifier head) at the text dtype. MLX 4-bit text weights stay
+/// quantized as Q4_1 on Metal (Q/K/V and gate/up stacked when the grouping
+/// policy holds); other MLX-packed weights are dequantized to dense ones,
+/// fused as above; the audio tower's OHWI convolution kernels (MLX
 /// layout) are permuted and made contiguous by a device copy; with fusion,
 /// each text layer's Q/K/V and gate/up are concatenated and the device
 /// synchronized. Plus the F32 audio position table built on the
@@ -1568,7 +1620,11 @@ fn price_qwen3_aligner(
                     .map(|stem| MlxWeight::find(&tensors, stem, load.mlx_bits))
                     .collect::<Result<Option<Vec<_>>>>()?;
                 if let Some(parts) = packed {
-                    ledger.mlx_dequantized(&parts, load.text_dtype)?;
+                    if load.mlx_q4_1 && repack_to_q4_1(&parts)? {
+                        ledger.mlx_q4_1(&parts)?;
+                    } else {
+                        ledger.mlx_dequantized(&parts, load.text_dtype)?;
+                    }
                     grouped.extend(parts.iter().flat_map(MlxWeight::names));
                 } else {
                     let parts = stems
@@ -1594,7 +1650,12 @@ fn price_qwen3_aligner(
         };
         if let Some(stem) = name.strip_suffix(".weight") {
             if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
-                ledger.mlx_dequantized(&[weight], dtype)?;
+                // The text model keeps MLX 4-bit weights as Q4_1 on Metal.
+                if load.mlx_q4_1 && dtype == load.text_dtype && repack_to_q4_1(&[weight])? {
+                    ledger.mlx_q4_1(&[weight])?;
+                } else {
+                    ledger.mlx_dequantized(&[weight], dtype)?;
+                }
                 continue;
             }
         }
@@ -1624,6 +1685,16 @@ fn price_qwen3_aligner(
         .ok_or_else(overflow)?;
     ledger.uploaded(positions, DType::F32)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// Whether the loader repacks every weight of `parts` into Q4_1.
+fn repack_to_q4_1(parts: &[MlxWeight]) -> Result<bool> {
+    for part in parts {
+        if !part.repacks_to_q4_1()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The NeMo ASR families.
@@ -2461,6 +2532,8 @@ struct Qwen3ChatLoad {
     packed_projections: bool,
     /// The head is the token table: a stored `lm_head.weight` is unread.
     tied_head: bool,
+    /// MLX 4-bit weights stay quantized as Q4_1 (Metal).
+    mlx_q4_1: bool,
 }
 
 /// Qwen3 chat's residency plan on CPU and Metal (CUDA keeps the catalog
@@ -2496,6 +2569,7 @@ pub(super) fn qwen3_chat_resource_plan(
             ),
             // `parse_qwen3_gguf_config`: tied when no head is stored.
             tied_head: !tensors.contains_key("output.weight"),
+            mlx_q4_1: false,
         };
         price_qwen3_chat_gguf(&files, backend, load)?
     } else {
@@ -2516,6 +2590,7 @@ pub(super) fn qwen3_chat_resource_plan(
             packed_projections: false,
             tied_head: config.tie_word_embeddings
                 && config.lm_head_size.unwrap_or(config.vocab_size) == config.vocab_size,
+            mlx_q4_1: qwen3_mlx_q4_1_enabled(&device.device),
         };
         price_qwen3_chat_safetensors(&files, backend, load)?
     };
@@ -2533,9 +2608,9 @@ pub(super) fn qwen3_chat_resource_plan(
 /// Qwen3 chat safetensors (`Qwen3Model::load` over
 /// `staged::metal_staged_safetensors`): every tensor of the text model at
 /// the load dtype, cast on the host and uploaded at its exact size on Metal.
-/// MLX-packed weights are dequantized to dense ones; with fusion, each
-/// layer's Q/K/V and gate/up are concatenated on the device, which is then
-/// synchronized. A tied head shares the token table, so a stored
+/// MLX 4-bit weights stay quantized as Q4_1 on Metal and are dequantized to
+/// dense ones elsewhere; with fusion, each layer's dense Q/K/V and gate/up
+/// are concatenated on the device, which is then synchronized. A tied head shares the token table, so a stored
 /// `lm_head.weight` is not read. Per-layer concatenated Q/K norm gains are
 /// not priced (under 1 MiB).
 fn price_qwen3_chat_safetensors(
@@ -2564,7 +2639,11 @@ fn price_qwen3_chat_safetensors(
                     .map(|stem| MlxWeight::find(&tensors, stem, load.mlx_bits))
                     .collect::<Result<Option<Vec<_>>>>()?;
                 if let Some(parts) = packed {
-                    ledger.mlx_dequantized(&parts, load.dtype)?;
+                    if load.mlx_q4_1 && repack_to_q4_1(&parts)? {
+                        ledger.mlx_q4_1(&parts)?;
+                    } else {
+                        ledger.mlx_dequantized(&parts, load.dtype)?;
+                    }
                     grouped.extend(parts.iter().flat_map(MlxWeight::names));
                 } else {
                     let parts = stems
@@ -2586,7 +2665,11 @@ fn price_qwen3_chat_safetensors(
         }
         if let Some(stem) = name.strip_suffix(".weight") {
             if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
-                ledger.mlx_dequantized(&[weight], load.dtype)?;
+                if load.mlx_q4_1 && repack_to_q4_1(&[weight])? {
+                    ledger.mlx_q4_1(&[weight])?;
+                } else {
+                    ledger.mlx_dequantized(&[weight], load.dtype)?;
+                }
                 continue;
             }
         }
@@ -3003,6 +3086,7 @@ pub(super) mod tests {
                 backend == BackendKind::Metal,
                 None,
             ),
+            mlx_q4_1: backend == BackendKind::Metal,
         };
         price_qwen3_aligner(files, backend, load).unwrap()
     }
@@ -3225,7 +3309,7 @@ pub(super) mod tests {
             (
                 "ForcedAligner-0.6B-4bit",
                 Box::new(|b| aligner(&aligner_4bit, b)),
-                [3.42, 1.72, 1.83, 2.30],
+                [3.42, 0.95, 0.95, 2.30],
             ),
             // ADM-4: F32 on every backend, in host memory on Metal (no
             // allocator rounding); the catalog held 3.0 / 2.0 GiB on CUDA.
@@ -3981,16 +4065,20 @@ pub(super) mod tests {
             observed,
             reserved: 0,
         };
-        for (variant, files, generic_peak) in [
+        // The generic estimate prices stored bytes: the dense aligner loads
+        // more than that, the 4-bit one (Q4_1 on Metal) about as much.
+        for (variant, files, generic_peak, generic_covers) in [
             (
                 ModelVariant::Qwen3ForcedAligner06B,
                 census!("qwen3_forced_aligner_0_6b.json"),
                 2_769_739_008,
+                false,
             ),
             (
                 ModelVariant::Qwen3ForcedAligner06B4Bit,
                 census!("qwen3_forced_aligner_0_6b_4bit.json"),
                 1_126_895_360,
+                true,
             ),
         ] {
             assert!(super::super::reconciles_device_usage(
@@ -4004,6 +4092,7 @@ pub(super) mod tests {
                     audio_dtype: DType::F32,
                     mlx_bits: None,
                     fused_projections: true,
+                    mlx_q4_1: true,
                 };
                 price_qwen3_aligner(&files, BackendKind::Metal, f32_text).unwrap()
             } else {
@@ -4030,7 +4119,11 @@ pub(super) mod tests {
             )
             .unwrap();
             assert_eq!(generic.load_peak_bytes, generic_peak, "{variant}");
-            assert!(reconcile(generic.load_peak_bytes).is_err(), "{variant}");
+            assert_eq!(
+                reconcile(generic.load_peak_bytes).is_ok(),
+                generic_covers,
+                "{variant}"
+            );
         }
         // The ASR and TTS families keep their reconciliation; families
         // without a plan are not reconciled.
@@ -4076,6 +4169,7 @@ pub(super) mod tests {
                 audio_dtype: dtype,
                 mlx_bits,
                 fused_projections: true,
+                mlx_q4_1: true,
             };
             let f16 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F16)).unwrap();
             let f32 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F32)).unwrap();
@@ -4640,6 +4734,8 @@ mod qwen3_chat_plan_tests {
         };
     }
 
+    /// A safetensors load at `dtype`: Metal (F16, fused, MLX 4-bit kept as
+    /// Q4_1) or CPU (F32, unfused, MLX dequantized).
     fn load(dtype: DType, fused: bool, tied: bool, mlx_bits: Option<u64>) -> Qwen3ChatLoad {
         Qwen3ChatLoad {
             dtype,
@@ -4647,6 +4743,7 @@ mod qwen3_chat_plan_tests {
             fused_projections: fused,
             packed_projections: false,
             tied_head: tied,
+            mlx_q4_1: dtype == DType::F16,
         }
     }
 
@@ -4723,24 +4820,34 @@ mod qwen3_chat_plan_tests {
         );
     }
 
-    /// The MLX 4-bit checkpoint is dequantized into dense weights at the
-    /// load dtype: the same residency as the BF16 checkpoint's F16 load.
+    /// The MLX 4-bit checkpoint keeps its packed weights as Q4_1 on Metal
+    /// (20 bytes per 32 elements) and its norms at F16; CPU dequantizes it
+    /// into the BF16 checkpoint's dense residency.
     #[test]
-    fn mlx_4bit_prices_its_dense_dequantization() {
+    fn mlx_4bit_prices_q4_1_on_metal_and_its_dequantization_on_cpu() {
         let dense = census!("qwen3_0_6b.json");
         let mlx = census!("qwen3_0_6b_4bit.json");
-        for (backend, dtype, fused) in [
-            (BackendKind::Metal, DType::F16, true),
-            (BackendKind::Cpu, DType::F32, false),
-        ] {
-            let mlx =
-                price_qwen3_chat_safetensors(&mlx, backend, load(dtype, fused, true, Some(4)))
-                    .unwrap();
-            let dense =
-                price_qwen3_chat_safetensors(&dense, backend, load(dtype, fused, true, None))
-                    .unwrap();
-            assert_eq!(mlx.resident_bytes, dense.resident_bytes, "{backend:?}");
-        }
+        let cpu = |files| {
+            let load = load(DType::F32, false, true, Some(4));
+            price_qwen3_chat_safetensors(files, BackendKind::Cpu, load)
+                .unwrap()
+                .resident_bytes
+        };
+        assert_eq!(cpu(&mlx), cpu(&dense));
+        let metal = price_qwen3_chat_safetensors(
+            &mlx,
+            BackendKind::Metal,
+            load(DType::F16, true, true, Some(4)),
+        )
+        .unwrap();
+        let packed_elements: u64 = mlx[0]
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.dtype == StoredDType::Dense(DType::U32))
+            .map(|tensor| tensor.elements() * 8)
+            .sum();
+        let norms = elements(&mlx, |name| name.ends_with("norm.weight"));
+        assert_eq!(metal.resident_bytes, packed_elements / 32 * 20 + norms * 2);
     }
 
     /// Qwen3-14B Q4_K_M keeps its token table, projections and untied
@@ -4768,6 +4875,7 @@ mod qwen3_chat_plan_tests {
                 fused_projections: false,
                 packed_projections: false,
                 tied_head: false,
+                mlx_q4_1: false,
             },
         )
         .unwrap();
@@ -4791,7 +4899,7 @@ mod qwen3_chat_plan_tests {
                 "Qwen3-0.6B-4bit",
                 census!("qwen3_0_6b_4bit.json"),
                 Some(4),
-                [2.22, 1.22],
+                [2.22, 0.35],
             ),
             (
                 "Qwen3-14B-GGUF",
