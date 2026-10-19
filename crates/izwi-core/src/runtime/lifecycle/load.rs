@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::config::ContextLengthPreference;
-use crate::engine::resources::capacity_shortfall_reason;
+use crate::engine::resources::{capacity_shortfall_reason, state_shortfall_reason};
 use crate::engine::{
     AdapterInstanceId, CacheMode, ModelInstanceId, ReservationClass, ReservationOwner,
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,

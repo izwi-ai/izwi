@@ -3464,7 +3464,7 @@ fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_hea
         Err(Error::Overloaded(message)) => {
             assert!(
                 message.starts_with("not enough memory for this model's minimum")
-                    && message.contains(" GB, ")
+                    && message.contains(" safety reserve, ")
                     && !message.contains("planning_headroom="),
                 "{message}"
             )

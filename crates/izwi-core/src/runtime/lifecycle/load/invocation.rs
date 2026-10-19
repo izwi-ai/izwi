@@ -466,10 +466,11 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!("not enough memory for {variant}'s working state"),
                     bytes,
-                    budget,
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             return Ok(());
@@ -487,10 +488,11 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!("not enough memory for {variant} at a {selected}-token context"),
                     bytes,
-                    budget,
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             selected
@@ -515,12 +517,13 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!(
                         "not enough memory for {variant}'s minimum {minimum}-token context"
                     ),
                     minimum_bytes,
-                    budget,
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             let (mut low, mut high) = (minimum, ceiling);
@@ -534,6 +537,14 @@ impl ModelLifecycleController {
             }
             low
         };
+        tracing::info!(
+            model = %variant,
+            selected_tokens = selected,
+            state_bytes = required(Some(selected))?,
+            planning_headroom = headroom_bytes,
+            safety_reserve = safety_reserve_bytes,
+            "Fitted invocation decoder context"
+        );
         descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, selected)?;
         let published = self
             .model_registry

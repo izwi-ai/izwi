@@ -814,12 +814,13 @@ impl ManagedKvCacheManager {
                 "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
                 minimum_bytes - floor_budget_bytes
             );
-            let message = crate::engine::resources::capacity_shortfall_reason(
+            let message = crate::engine::resources::state_shortfall_reason(
                 format_args!(
                     "not enough memory for this model's minimum {minimum_tokens}-token state"
                 ),
                 minimum_bytes,
-                floor_budget_bytes,
+                headroom_bytes,
+                safety_reserve_bytes,
             );
             // A model-authored floor (ASR, TTS, chat) that headroom cannot
             // hold is a capacity refusal (503), not a load defect.
@@ -831,20 +832,33 @@ impl ManagedKvCacheManager {
             });
         }
         let budget_bytes = growth_budget_bytes.max(minimum_bytes);
-        if required_bytes(maximum_tokens)? <= budget_bytes {
-            return Ok(maximum_tokens);
-        }
-
-        let (mut low, mut high) = (minimum_tokens, maximum_tokens);
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            if required_bytes(middle)? <= budget_bytes {
-                low = middle;
-            } else {
-                high = middle - 1;
+        let selected = if required_bytes(maximum_tokens)? <= budget_bytes {
+            maximum_tokens
+        } else {
+            let (mut low, mut high) = (minimum_tokens, maximum_tokens);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if required_bytes(middle)? <= budget_bytes {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
             }
-        }
-        Ok(low)
+            low
+        };
+        tracing::info!(
+            model_instance = ?model_instance,
+            selected_tokens = selected,
+            minimum_tokens,
+            maximum_tokens,
+            state_bytes = required_bytes(selected)?,
+            growth_budget_bytes = budget_bytes,
+            retained_sequence_rows,
+            staged_transaction_rows,
+            portable_state_copies,
+            "Fitted portable retained state"
+        );
+        Ok(selected)
     }
 
     /// Fit a CUDA logical reach whose complete paged backing is materialized

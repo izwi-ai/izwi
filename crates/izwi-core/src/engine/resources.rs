@@ -1420,6 +1420,35 @@ pub(crate) fn capacity_shortfall_reason(
     )
 }
 
+/// The short reason a client sees when load-time state does not fit beside
+/// the safety reserve its fit keeps free: "{subject}: needs X plus a Y
+/// safety reserve, Z available", where Z is the planning headroom the
+/// reserve comes out of. Without the reserve, a small state against a
+/// headroom below it read "needs 0.00 GB, 0.00 GB available".
+pub(crate) fn state_shortfall_reason(
+    subject: impl std::fmt::Display,
+    need_bytes: u64,
+    headroom_bytes: u64,
+    safety_reserve_bytes: u64,
+) -> String {
+    format!(
+        "{subject}: needs {} plus a {} safety reserve, {} available",
+        display_bytes(need_bytes),
+        display_bytes(safety_reserve_bytes),
+        display_bytes(headroom_bytes)
+    )
+}
+
+/// Bytes in GB to two places, or in MB below 0.1 GB so small figures do
+/// not round to zero.
+fn display_bytes(bytes: u64) -> String {
+    if bytes >= 100_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1e6)
+    }
+}
+
 /// Whether `error` refuses memory that admitted work holds now and gives
 /// back when it finishes: the live-memory check or the reservation ledger.
 /// A request too large for the machine, a full job queue or a draining
@@ -1920,6 +1949,20 @@ mod tests {
 
     /// The live Kokoro refusal sent the client every resource vector and the
     /// per-class pending table; it now reads like this.
+    #[test]
+    fn state_shortfall_reason_names_the_safety_reserve() {
+        // The refusal that used to read "needs 0.00 GB, 0.00 GB available".
+        const RESERVE: u64 = 1_073_741_824;
+        assert_eq!(
+            state_shortfall_reason("X's working state", 3_200_000, 900_000_000, RESERVE),
+            "X's working state: needs 3.2 MB plus a 1.07 GB safety reserve, 0.90 GB available"
+        );
+        assert_eq!(
+            state_shortfall_reason("minimum", 500_654_080, 1_342_615_072, RESERVE),
+            "minimum: needs 0.50 GB plus a 1.07 GB safety reserve, 1.34 GB available"
+        );
+    }
+
     #[test]
     fn live_capacity_reason_is_short_and_in_gb() {
         let unified = |bytes| ResourceVector {
