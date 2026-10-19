@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{ops, rotary_emb, Embedding};
+use candle_nn::{ops, rotary_emb};
 use candle_core::quantized::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
@@ -29,6 +29,7 @@ use crate::models::shared::telemetry::{
     record_prefill_sequence_span, record_rope_kernel, record_rope_manual,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
+use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
@@ -47,7 +48,9 @@ mod decode_graph;
 
 pub struct Qwen35TextModel {
     device: Device,
-    token_embeddings: Embedding,
+    /// The vocabulary table, kept quantized: embedding rows are gathered
+    /// from it, and a tied output head shares it.
+    token_table: QuantizedTokenTable,
     layers: Vec<Qwen35Layer>,
     output_norm: RmsNorm,
     output: Qwen35Linear,
@@ -414,8 +417,8 @@ pub(crate) trait Qwen35WeightSource {
     /// `Some(F32)`).
     fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor>;
 
-    /// Token embedding matrix `[vocab, hidden]`.
-    fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
+    /// Token table `[vocab, hidden]`, in its stored quantized form.
+    fn token_table(&self, device: &Device) -> Result<QuantizedTokenTable>;
 }
 
 /// GGUF-backed source for the dense Qwen3.5 family.
@@ -446,11 +449,8 @@ impl Qwen35WeightSource for GgufSource<'_> {
         load_dense(self.loader, device, name, dtype)
     }
 
-    fn token_embeddings(&self, device: &Device) -> Result<Tensor> {
-        self.loader
-            .load_qtensor("token_embd.weight", device)?
-            .dequantize(device)
-            .map_err(Error::from)
+    fn token_table(&self, device: &Device) -> Result<QuantizedTokenTable> {
+        QuantizedTokenTable::new(self.loader.load_qtensor("token_embd.weight", device)?)
     }
 }
 
@@ -478,22 +478,22 @@ impl Qwen35TextModel {
             )));
         }
 
-        let embedding_weights = source.token_embeddings(device)?;
-        let (vocab_size, hidden_size) = embedding_weights.dims2()?;
+        let token_table = source.token_table(device)?;
+        let hidden_size = token_table.hidden_size();
         if hidden_size != cfg.embedding_length {
             return Err(Error::ModelLoadError(format!(
                 "Qwen3.5 token embedding width mismatch: checkpoint has {hidden_size}, metadata says {}",
                 cfg.embedding_length
             )));
         }
-        let _ = vocab_size;
 
-        let token_embeddings = Embedding::new(embedding_weights, hidden_size);
         let output_norm = source.rms_norm("output_norm.weight", cfg.attention_layer_norm_rms_epsilon, device)?;
+        // A tied head (no `output.weight`, as in the 0.8B/2B/4B checkpoints)
+        // shares the token table instead of reading it a second time.
         let output = Qwen35Linear::new(if source.has("output.weight") {
             source.qmatmul("output.weight", device)?
         } else {
-            source.qmatmul("token_embd.weight", device)?
+            token_table.tied_head()?
         });
         let finite_diagnostics_enabled =
             crate::env::flag_or("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
@@ -527,7 +527,7 @@ impl Qwen35TextModel {
         }
         Ok(Self {
             device: device.clone(),
-            token_embeddings,
+            token_table,
             layers,
             output_norm,
             output,
@@ -733,7 +733,7 @@ impl Qwen35TextModel {
     }
 
     pub fn hidden_size(&self) -> usize {
-        self.token_embeddings.hidden_size()
+        self.token_table.hidden_size()
     }
 
     pub(crate) fn forward_token_id_at_physical(
@@ -756,7 +756,7 @@ impl Qwen35TextModel {
                 .map_err(Error::from);
         }
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
-        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden = self.token_table.embed(&input)?;
         self.forward_hidden_to_logits_physical(&hidden, position_ids, state, cache)
     }
 
@@ -948,7 +948,7 @@ impl Qwen35TextModel {
     ) -> Result<Tensor> {
         let batch_size = token_ids.len();
         let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-        let mut hidden = self.token_embeddings.forward(&input)?;
+        let mut hidden = self.token_table.embed(&input)?;
         let rope = self.rope_table(first_full, position_ids, (batch_size, 1), hidden.dtype())?;
         let mut physical_layer = 0usize;
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -1005,7 +1005,7 @@ impl Qwen35TextModel {
         }
         record_prefill_sequence_span(token_ids.len());
         let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
-        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden = self.token_table.embed(&input)?;
         let hidden = self.forward_hidden_physical(&hidden, position_ids, state, cache)?;
         if !compute_logits {
             return Ok(None);

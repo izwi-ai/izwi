@@ -867,7 +867,7 @@ fn body(
     attention: &mut Attention<'_>,
 ) -> Result<Tensor> {
     let ids = step.narrow(0, TOKEN, 1)?.reshape((1, 1))?;
-    let mut hidden = model.token_embeddings.forward(&ids)?;
+    let mut hidden = model.token_table.embed(&ids)?;
     let mut physical = 0usize;
     for (index, layer) in model.layers.iter().enumerate() {
         let residual = hidden.clone();
