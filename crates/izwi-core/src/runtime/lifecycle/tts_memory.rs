@@ -29,6 +29,9 @@ use crate::models::architectures::kokoro::{
     KOKORO_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
+use crate::models::architectures::qwen3::tts::speech_tokenizer::{
+    encoder_reads_tensor, read_encoder_acoustic_codebooks,
+};
 use crate::models::architectures::qwen3::tts::{
     qwen3_tts_load_layout, qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
 };
@@ -101,7 +104,12 @@ fn qwen3_tts_plan(
     let Some(files) = census_of(&paths)? else {
         return Ok(None);
     };
-    price_qwen3_tts(&files, backend, &layout).map(Some)
+    let encoder_acoustic_codebooks = if layout.tokenizer_encoder {
+        read_encoder_acoustic_codebooks(&model_path.join("speech_tokenizer"))?.unwrap_or(0)
+    } else {
+        0
+    };
+    price_qwen3_tts(&files, backend, &layout, encoder_acoustic_codebooks).map(Some)
 }
 
 /// Whether a Qwen3-TTS tensor loads as weight-only F16 when the layout asks
@@ -123,8 +131,9 @@ const QWEN3_TTS_TEXT_EMBEDDING: &str = "talker.model.text_embedding.weight";
 /// `staged::metal_staged_safetensors`, the talker and code predictor at
 /// their dtypes, the ECAPA speaker encoder at F32 (voice clone only) and the
 /// speech tokenizer at its dtype, its reference encoder for voice clone
-/// only. On Metal the BF16 checkpoint is cast to F32 on the host and
-/// uploaded at its exact size.
+/// only, without the acoustic codebooks past the `encoder_acoustic_codebooks`
+/// its encode reads. On Metal the BF16 checkpoint is cast to F32 on the host
+/// and uploaded at its exact size.
 ///
 /// With weight-only F16 this is the F16 residency and the staged loader's
 /// peak for that form. A failed load-time self-check drops the F16 model
@@ -137,6 +146,7 @@ fn price_qwen3_tts(
     files: &[CensusFile],
     backend: BackendKind,
     layout: &Qwen3TtsLoadLayout,
+    encoder_acoustic_codebooks: usize,
 ) -> Result<AsrResidencyPlan> {
     let [model, tokenizer] = files else {
         return Err(Error::ModelLoadError(
@@ -178,7 +188,10 @@ fn price_qwen3_tts(
         ledger.var(tensor, Source::Mapped, &[dtype])?;
     }
     for tensor in &tokenizer.tensors {
-        if tensor.name.starts_with("encoder.") && !layout.tokenizer_encoder {
+        if tensor.name.starts_with("encoder.")
+            && !(layout.tokenizer_encoder
+                && encoder_reads_tensor(&tensor.name, encoder_acoustic_codebooks))
+        {
             continue;
         }
         ledger.var(tensor, Source::Mapped, &[layout.dtypes.speech_tokenizer])?;
@@ -356,8 +369,18 @@ mod tests {
         Qwen3TtsLoadLayout::resolve(&config, &profile(backend)).unwrap()
     }
 
+    /// Qwen3-TTS-12Hz encodes references with 16 of its 32 quantizers, one
+    /// of them semantic (`speech_tokenizer/config.json`).
+    const QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS: usize = 15;
+
     fn qwen(files: &[CensusFile], voice_clone: bool, backend: BackendKind) -> AsrResidencyPlan {
-        price_qwen3_tts(files, backend, &qwen_layout(voice_clone, backend)).unwrap()
+        price_qwen3_tts(
+            files,
+            backend,
+            &qwen_layout(voice_clone, backend),
+            QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
+        )
+        .unwrap()
     }
 
     fn kokoro(backend: BackendKind) -> AsrResidencyPlan {
@@ -377,11 +400,12 @@ mod tests {
 
     /// Report 08 table B, resident weights per backend (CPU, Metal as
     /// allocated, CUDA), with the load peak each must stay under:
-    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.04 GiB,
-    ///   as the report measured. On Metal the talker and predictor
+    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.01 GiB,
+    ///   the report's 4.04 less the 16 encoder codebooks its reference
+    ///   encode never reads. On Metal the talker and predictor
     ///   projections, the predictor's codebook heads and codec embeddings
     ///   and the text embedding load as weight-only F16 (F32 compute),
-    ///   host-cast and uploaded at exact size: 2.37 GiB, against
+    ///   host-cast and uploaded at exact size: 2.34 GiB, against
     ///   the 5.29 GiB the report saw from device F32 casts into
     ///   power-of-two buffers. CUDA keeps the talker and
     ///   predictor BF16 beside an F32 speech tokenizer. CustomVoice skips the
@@ -411,7 +435,7 @@ mod tests {
             (
                 "Qwen3-TTS-0.6B-Base",
                 Box::new(|b| qwen(&qwen06_base, true, b)),
-                [4.04, 2.37, 2.36],
+                [4.01, 2.34, 2.33],
             ),
             (
                 "Qwen3-TTS-1.7B-CustomVoice",
@@ -510,10 +534,15 @@ mod tests {
         ] {
             let layout = qwen_layout(voice_clone, BackendKind::Metal);
             assert!(layout.weight_only_f16);
-            let f16 = price_qwen3_tts(&files, BackendKind::Metal, &layout)
-                .unwrap()
-                .estimate()
-                .unwrap();
+            let f16 = price_qwen3_tts(
+                &files,
+                BackendKind::Metal,
+                &layout,
+                QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
+            )
+            .unwrap()
+            .estimate()
+            .unwrap();
             let dense = price_qwen3_tts(
                 &files,
                 BackendKind::Metal,
@@ -521,6 +550,7 @@ mod tests {
                     weight_only_f16: false,
                     ..layout
                 },
+                QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
             )
             .unwrap()
             .estimate()
@@ -546,30 +576,46 @@ mod tests {
         // copy beside the uploaded table).
         let files = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
         let layout = qwen_layout(false, BackendKind::Metal);
-        let peak = price_qwen3_tts(&files, BackendKind::Metal, &layout)
-            .unwrap()
-            .estimate()
-            .unwrap()
-            .load_peak_bytes;
+        let peak = price_qwen3_tts(
+            &files,
+            BackendKind::Metal,
+            &layout,
+            QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
+        )
+        .unwrap()
+        .estimate()
+        .unwrap()
+        .load_peak_bytes;
         assert!(peak <= 5_800_000_000, "{peak}");
     }
 
     /// The reference-audio components load only for voice cloning: a
     /// CustomVoice layout over the Base checkpoint drops exactly the
     /// speech-tokenizer encoder (stored F32) and the ECAPA speaker encoder,
-    /// which Base prices at F32 (35 MB from its BF16 checkpoint).
+    /// which Base prices at F32 (35 MB from its BF16 checkpoint). The
+    /// encoder leaves out the 16 acoustic codebooks its 16-quantizer encode
+    /// never reads (33.7 MB).
     #[test]
     fn qwen_tts_prices_the_reference_encoders_only_for_voice_clone() {
         let _env = env_lock();
         let base = census!("qwen3_tts_12hz_0_6b_base.json");
         let speaker_encoder = stored(&base, |tensor| tensor.name.starts_with("speaker_encoder."));
-        let tokenizer_encoder = stored(&base[1..], |tensor| tensor.name.starts_with("encoder."));
+        let tokenizer_encoder = stored(&base[1..], |tensor| {
+            tensor.name.starts_with("encoder.")
+                && encoder_reads_tensor(&tensor.name, QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS)
+        });
+        let unused_codebooks = stored(&base[1..], |tensor| {
+            tensor.name.starts_with("encoder.")
+                && !encoder_reads_tensor(&tensor.name, QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS)
+        });
         assert_eq!(speaker_encoder, 8_854_336 * 2);
+        assert_eq!(unused_codebooks, 16 * (2_048 + 2_048 * 256 + 1) * 4);
         let clone = qwen(&base, true, BackendKind::Cpu).estimate().unwrap();
         let preset = price_qwen3_tts(
             &base,
             BackendKind::Cpu,
             &qwen_layout(false, BackendKind::Cpu),
+            QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
         )
         .unwrap()
         .estimate()
@@ -669,6 +715,7 @@ mod tests {
                         weight_only_f16,
                         ..layout
                     },
+                    QWEN3_TTS_12HZ_ACOUSTIC_CODEBOOKS,
                 )
                 .unwrap()
                 .estimate()

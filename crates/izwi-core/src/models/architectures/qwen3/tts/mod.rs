@@ -1499,18 +1499,21 @@ pub(crate) fn qwen3_tts_load_layout(
 }
 
 /// `(custom_voice, voice_clone)`: which kind of checkpoint `config` is.
+/// VoiceDesign is neither: it ships no speakers (`spk_id: {}`) but designs
+/// its voice from an instruction, not reference audio. Only a checkpoint of
+/// an unrecognized type is taken to clone when it has no speakers.
 fn qwen3_tts_model_kind(config: &Qwen3TtsConfig) -> (bool, bool) {
     let model_type = config
         .tts_model_type
         .trim()
         .to_ascii_lowercase()
         .replace(['-', '_'], "");
-    let custom_voice = model_type == "customvoice";
-    let voice_clone = model_type == "base"
-        || model_type == "voiceclone"
-        || model_type == "voicecloning"
-        || config.talker_config.spk_id.is_empty();
-    (custom_voice, voice_clone)
+    match model_type.as_str() {
+        "customvoice" => (true, false),
+        "base" | "voiceclone" | "voicecloning" => (false, true),
+        "voicedesign" => (false, false),
+        _ => (false, config.talker_config.spk_id.is_empty()),
+    }
 }
 
 /// The operator's Qwen3-TTS precision override. Only
@@ -1699,32 +1702,29 @@ fn select_qwen3_tts_dtypes(
         });
     }
 
-    let legacy_dtype = if is_custom_voice_model || is_voice_clone_model {
-        // CustomVoice and Base/voice-clone checkpoints require F32 for
-        // intelligible audio. In particular, selecting F16 for every Metal
-        // component produces structurally valid but corrupted speech.
-        DType::F32
-    } else if device.kind.is_metal() {
-        // VoiceDesign computes in F32 too; its residency comes from the
-        // weight-only F16 tier (QTTS-10), not from all-F16 compute.
-        DType::F32
-    } else {
-        device.select_model_dtype(ModelFamily::Qwen3Tts, None)
-    };
-
     if device.kind.is_cuda() {
         let transformer_dtype = device.select_model_dtype(ModelFamily::Qwen3Tts, None);
-        let speech_tokenizer_dtype = if is_custom_voice_model || is_voice_clone_model {
-            DType::F32
-        } else {
-            legacy_dtype
-        };
+        // Every checkpoint decodes its codec at F32. VoiceDesign did too
+        // while it was taken for a voice-clone checkpoint; a half-precision
+        // codec is not validated for it.
         Ok(Qwen3TtsDTypePlan {
             talker: transformer_dtype,
             code_predictor: transformer_dtype,
-            speech_tokenizer: speech_tokenizer_dtype,
+            speech_tokenizer: DType::F32,
         })
     } else {
+        let legacy_dtype = if is_custom_voice_model || is_voice_clone_model {
+            // CustomVoice and Base/voice-clone checkpoints require F32 for
+            // intelligible audio. In particular, selecting F16 for every Metal
+            // component produces structurally valid but corrupted speech.
+            DType::F32
+        } else if device.kind.is_metal() {
+            // VoiceDesign computes in F32 too; its residency comes from the
+            // weight-only F16 tier (QTTS-10), not from all-F16 compute.
+            DType::F32
+        } else {
+            device.select_model_dtype(ModelFamily::Qwen3Tts, None)
+        };
         Ok(Qwen3TtsDTypePlan {
             talker: legacy_dtype,
             code_predictor: legacy_dtype,
@@ -5588,6 +5588,39 @@ pub(crate) mod tests {
 
         assert_eq!(plan.talker, DType::F16);
         assert_eq!(plan.code_predictor, DType::F16);
+        assert_eq!(plan.speech_tokenizer, DType::F32);
+    }
+
+    /// VoiceDesign ships no speakers (`spk_id: {}`) but is not a voice-clone
+    /// checkpoint: it loads no reference encoders (B1).
+    #[test]
+    fn voice_design_is_neither_custom_voice_nor_voice_clone() {
+        let kind = |model_type: &str, speakers: bool| {
+            let mut config = cache_test_config();
+            config.tts_model_type = model_type.into();
+            config.talker_config.spk_id.clear();
+            if speakers {
+                config.talker_config.spk_id.insert("vivian".into(), 3_000);
+            }
+            qwen3_tts_model_kind(&config)
+        };
+        assert_eq!(kind("custom_voice", true), (true, false));
+        assert_eq!(kind("base", false), (false, true));
+        assert_eq!(kind("voice_design", false), (false, false));
+        assert_eq!(kind("VoiceDesign", false), (false, false));
+        // An unrecognized type without speakers is still taken to clone.
+        assert_eq!(kind("unknown", false), (false, true));
+        assert_eq!(kind("unknown", true), (false, false));
+
+        let mut config = cache_test_config();
+        config.tts_model_type = "voice_design".into();
+        config.talker_config.spk_id.clear();
+        let metal = dtype_test_profile(DeviceKind::Metal, false, false);
+        let layout = Qwen3TtsLoadLayout::resolve(&config, &metal).unwrap();
+        assert!(!layout.tokenizer_encoder && !layout.speaker_encoder);
+        // CUDA keeps every codec at F32, VoiceDesign's included.
+        let cuda = dtype_test_profile(DeviceKind::Cuda, true, true);
+        let plan = select_qwen3_tts_dtypes(&cuda, None, false, false).unwrap();
         assert_eq!(plan.speech_tokenizer, DType::F32);
     }
 

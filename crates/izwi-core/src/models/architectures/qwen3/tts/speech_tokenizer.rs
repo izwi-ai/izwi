@@ -35,6 +35,43 @@ pub struct SpeechTokenizerConfig {
     pub encoder_config: Option<serde_json::Value>,
 }
 
+/// The acoustic codebooks a reference encode reads. It encodes with
+/// `quantizers` quantizers, the semantic ones first, so the codebooks a
+/// checkpoint ships past those are never read: Qwen3-TTS-12Hz has 32 and
+/// encodes with 16.
+pub(crate) fn encoder_acoustic_codebooks(quantizers: usize, cfg: &EncoderConfig) -> Result<usize> {
+    if quantizers < cfg.num_semantic_quantizers || quantizers > cfg.num_quantizers {
+        return Err(Error::ModelError(format!(
+            "speech-tokenizer encoder_valid_num_quantizers {quantizers} is outside {}..={}",
+            cfg.num_semantic_quantizers, cfg.num_quantizers
+        )));
+    }
+    Ok(quantizers - cfg.num_semantic_quantizers)
+}
+
+/// The acoustic codebooks the reference encoder of the speech tokenizer in
+/// `tokenizer_dir` loads, or `None` when it ships no encoder.
+pub(crate) fn read_encoder_acoustic_codebooks(
+    tokenizer_dir: &std::path::Path,
+) -> Result<Option<usize>> {
+    let speech_cfg: SpeechTokenizerConfig =
+        serde_json::from_str(&std::fs::read_to_string(tokenizer_dir.join("config.json"))?)?;
+    let Some(encoder) = speech_cfg.encoder_config else {
+        return Ok(None);
+    };
+    let encoder: EncoderConfig = serde_json::from_value(encoder)?;
+    encoder_acoustic_codebooks(speech_cfg.encoder_valid_num_quantizers.max(1), &encoder).map(Some)
+}
+
+/// Whether the reference encoder reads speech-tokenizer tensor `name` (an
+/// `encoder.*` name) when it loads `acoustic_codebooks` acoustic codebooks.
+pub(crate) fn encoder_reads_tensor(name: &str, acoustic_codebooks: usize) -> bool {
+    name.strip_prefix("encoder.quantizer.acoustic_residual_vector_quantizer.layers.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|layer| layer.parse::<usize>().ok())
+        .is_none_or(|layer| layer < acoustic_codebooks)
+}
+
 /// Encoder configuration used for reference-audio tokenization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EncoderConfig {
@@ -1336,9 +1373,11 @@ struct EncoderSplitResidualVectorQuantizer {
 }
 
 impl EncoderSplitResidualVectorQuantizer {
-    fn load(cfg: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+    /// Load the codebooks of the first `quantizers` quantizers (semantic
+    /// first): the encode never reads the rest.
+    fn load(cfg: &EncoderConfig, quantizers: usize, vb: VarBuilder) -> Result<Self> {
         let num_semantic = cfg.num_semantic_quantizers;
-        let num_acoustic = cfg.num_quantizers.saturating_sub(num_semantic);
+        let num_acoustic = encoder_acoustic_codebooks(quantizers, cfg)?;
         Ok(Self {
             semantic: EncoderResidualVectorQuantizer::load(
                 cfg,
@@ -1351,7 +1390,7 @@ impl EncoderSplitResidualVectorQuantizer {
                 vb.pp("acoustic_residual_vector_quantizer"),
             )?,
             num_semantic_quantizers: num_semantic,
-            max_num_quantizers: cfg.num_quantizers,
+            max_num_quantizers: quantizers,
         })
     }
 
@@ -1388,7 +1427,13 @@ struct SpeechTokenizerEncoder {
 }
 
 impl SpeechTokenizerEncoder {
-    fn load(config: EncoderConfig, vb: VarBuilder, device: Device) -> Result<Self> {
+    /// Load the encoder for reference encodes with `quantizers` quantizers.
+    fn load(
+        config: EncoderConfig,
+        quantizers: usize,
+        vb: VarBuilder,
+        device: Device,
+    ) -> Result<Self> {
         let encoder_net = SpeechTokenizerEncoderNet::load(&config, vb.clone())?;
         let encoder_transformer = EncoderTransformer::load(&config, vb.clone())?;
 
@@ -1412,7 +1457,8 @@ impl SpeechTokenizerEncoder {
             None
         };
 
-        let quantizer = EncoderSplitResidualVectorQuantizer::load(&config, vb.pp("quantizer"))?;
+        let quantizer =
+            EncoderSplitResidualVectorQuantizer::load(&config, quantizers, vb.pp("quantizer"))?;
         Ok(Self {
             encoder_net,
             encoder_transformer,
@@ -1810,6 +1856,7 @@ impl SpeechTokenizerDecoder {
             info!("Loading speech tokenizer encoder...");
             Some(SpeechTokenizerEncoder::load(
                 cfg,
+                encoder_valid_num_quantizers.max(1),
                 root_vb.pp("encoder"),
                 device.clone(),
             )?)
@@ -2547,6 +2594,24 @@ mod tests {
             quantized.to_vec2::<f32>().expect("quantized"),
             vec![vec![1.0, 0.0], vec![0.0, 1.0]]
         );
+    }
+
+    #[test]
+    fn encoder_loads_only_the_codebooks_its_encode_reads() {
+        let cfg: EncoderConfig = serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        // 16 of 32 quantizers, one semantic: 15 acoustic codebooks.
+        assert_eq!(encoder_acoustic_codebooks(16, &cfg).unwrap(), 15);
+        assert!(encoder_acoustic_codebooks(0, &cfg).is_err());
+        assert!(encoder_acoustic_codebooks(33, &cfg).is_err());
+        let acoustic = "encoder.quantizer.acoustic_residual_vector_quantizer.layers";
+        assert!(encoder_reads_tensor(&format!("{acoustic}.14.codebook.embed_sum"), 15));
+        assert!(!encoder_reads_tensor(&format!("{acoustic}.15.codebook.embed_sum"), 15));
+        assert!(!encoder_reads_tensor(&format!("{acoustic}.31.codebook.initialized"), 15));
+        assert!(encoder_reads_tensor(
+            "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.embed_sum",
+            15
+        ));
+        assert!(encoder_reads_tensor("encoder.encoder.layers.0.conv.weight", 15));
     }
 
     #[test]
