@@ -237,8 +237,17 @@ impl FishS2Weights {
             .iter()
             .map(|(source, remapped)| (remapped.clone(), source.clone()))
             .collect::<BTreeMap<_, _>>();
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)? };
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`): Candle's own reads cast every BF16 tensor on the
+        // device into a power-of-two buffer (9.12 GB held in 12.15 GB at F16)
+        // and kept every upload until the load fence.
+        let vb = unsafe {
+            crate::models::shared::weights::staged::metal_staged_safetensors(
+                &shard_paths,
+                dtype,
+                &device.device,
+            )?
+        };
         let vb = vb.rename_f(move |name| {
             remapped_to_source
                 .get(name)
@@ -748,7 +757,8 @@ mod tests {
         const LARGEST_SOURCE_TENSOR: u64 = 797_573_120;
         let codec = FishS2CodecMemory {
             resident_parameter_bytes: 1_565_593_540,
-            raw_load_bytes: 1_572_013_576,
+            // The F32 weights; the 6,291,456 bytes of `freqs_cis` are not read.
+            raw_load_bytes: 1_565_722_120,
             fused_load_bytes: 306_057_600,
             largest_source_tensor_bytes: 75_497_472,
             largest_target_tensor_bytes: 75_497_472,

@@ -173,7 +173,13 @@ impl FishS2SlowTransformer {
             (self.cfg.semantic_end_token_id - self.cfg.semantic_start_token_id + 1) as usize,
         )?;
         self.semantic_head = Some((
-            Linear::new(Tensor::cat(&[&eos_weight, &semantic_weight], 0)?, None),
+            Linear::new(
+                crate::models::shared::memory::exact::exact_concat_rows(&[
+                    &eos_weight,
+                    &semantic_weight,
+                ])?,
+                None,
+            ),
             eos,
         ));
         Ok(())

@@ -483,7 +483,12 @@ fn asr_state_rows(
 fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
     (asr_memory::has_plan(variant)
         || tts_memory::has_plan(variant)
-        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat)
+        || matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::Lfm2Chat
+                | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::FishS2Tts
+        ))
         && asr_memory::weights_on_backend_device(variant, backend)
 }
 

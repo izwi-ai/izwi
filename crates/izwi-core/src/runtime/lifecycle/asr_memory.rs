@@ -4157,12 +4157,16 @@ pub(super) mod tests {
                 "{variant}"
             );
         }
-        // The ASR and TTS families keep their reconciliation; families
-        // without a plan are not reconciled.
+        // The ASR and TTS families keep their reconciliation, as do Qwen3.5
+        // chat and Fish, whose plans match their measured Metal loads;
+        // families without a plan (or one not yet measured) are not
+        // reconciled.
         for variant in [
             ModelVariant::Qwen3Asr06BGguf,
             ModelVariant::ParakeetTdt06BV3,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ModelVariant::Qwen354BGguf,
+            ModelVariant::FishAudioS2Pro,
         ] {
             assert!(
                 super::super::reconciles_device_usage(variant, BackendKind::Metal),
