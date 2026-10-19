@@ -521,3 +521,35 @@ stages) as p50/p95 of their bucket deltas over the run. Run one warm-up
 session first so model loads are not measured. It is standard-library Python
 (a minimal RFC 6455 client); its tests are `test-voice-realtime-load.py`, run
 in the hygiene lane.
+
+## Metal load footprints
+
+`measure-metal-load-footprints.sh` loads each model on Metal in its own process
+and reports what the load actually allocated next to what load admission
+prices for it. It loads through the lifecycle's registry dispatch, without
+admission, so it can measure a model the server would refuse. It records:
+
+- stored checkpoint bytes;
+- the bytes the Metal pre-load check compares;
+- the plan's peak and resident figures;
+- Metal `currentAllocatedSize` growth (peak, at the load fence, and after a pool
+  flush);
+- process `phys_footprint` growth.
+
+```bash
+scripts/bench/measure-metal-load-footprints.sh --output target/metal-load-footprints.jsonl
+scripts/bench/measure-metal-load-footprints.sh Qwen3.5-4B Granite-Speech-4.1-2B-Plus
+```
+
+Models are named by catalog name or model directory. Without names it measures
+one or more models per family, leaving out Fish S2 Pro. The harness is the
+ignored test `measure_metal_load_footprint` in
+`crates/izwi-core/src/runtime/lifecycle/load/footprint_tests.rs`. It measures
+weight loading only; per-request state is admitted and allocated later.
+
+Set `IZWI_MEASURE_DIAG_DIR=<dir>` to also write `footprint` and `vmmap --summary`
+reports from before the load and after it settles. Add `MallocStackLogging=1`
+to get the live heap by allocation stack (`malloc_history -allBySize`) as well.
+
+Process footprint on macOS includes freed large blocks that libmalloc keeps
+cached. Run with `MallocLargeCache=0` to measure only live host memory.

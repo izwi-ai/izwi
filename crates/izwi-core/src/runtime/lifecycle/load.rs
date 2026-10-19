@@ -50,11 +50,13 @@ mod qwen38_memory;
 mod state;
 #[path = "tts_memory.rs"]
 mod tts_memory;
-use admission::{admit_asr_request_floor, admit_cuda_state_floor, reconcile_observed_growth};
+use admission::{
+    admit_cuda_state_floor, load_authorization_with_request_floor, reconcile_observed_growth,
+};
 #[cfg(test)]
 use admission::{
-    materialization_tolerance_bytes, request_envelope_resources, request_envelope_shortfall,
-    CudaStateFloor,
+    admit_asr_request_floor, materialization_tolerance_bytes, request_envelope_resources,
+    request_envelope_shortfall, CudaStateFloor,
 };
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
@@ -700,20 +702,12 @@ impl ModelLifecycleController {
                 device_capacity,
             )?;
         }
-        if asr_memory::is_asr_variant(variant) {
-            let backend = self.backend_router.context().backend_kind;
-            let slots = self.coordinator.physical_execution_admission().capacity();
-            if let Some(envelope) =
-                super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
-            {
-                let floor_bytes = match backend {
-                    BackendKind::Cuda => envelope.accelerator_bytes,
-                    BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
-                };
-                resource_plan.load_authorization =
-                    admit_asr_request_floor(&resource_plan, backend, floor_bytes)?;
-            }
-        }
+        resource_plan.load_authorization = load_authorization_with_request_floor(
+            variant,
+            &resource_plan,
+            self.backend_router.context().backend_kind,
+            self.coordinator.physical_execution_admission().capacity(),
+        )?;
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
         let portable_load_bytes = match self.backend_router.context().backend_kind {
@@ -1279,3 +1273,6 @@ impl SessionModelLeases {
 #[cfg(test)]
 #[path = "load_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod footprint_tests;

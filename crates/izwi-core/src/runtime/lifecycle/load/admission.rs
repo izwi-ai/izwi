@@ -101,6 +101,29 @@ pub(super) fn admit_asr_request_floor(
     Ok(authorization)
 }
 
+/// The load authorization admission checks for `variant`: the plan's, with
+/// an ASR model's per-slot request floor folded in ([`admit_asr_request_floor`]).
+pub(super) fn load_authorization_with_request_floor(
+    variant: ModelVariant,
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    request_slots: usize,
+) -> Result<ResourceVector> {
+    if !asr_memory::is_asr_variant(variant) {
+        return Ok(plan.load_authorization);
+    }
+    let Some(envelope) =
+        super::super::asr_envelope::deferred_request_envelope(variant, backend, request_slots)?
+    else {
+        return Ok(plan.load_authorization);
+    };
+    let floor_bytes = match backend {
+        BackendKind::Cuda => envelope.accelerator_bytes,
+        BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+    };
+    admit_asr_request_floor(plan, backend, floor_bytes)
+}
+
 /// A request envelope in `backend`'s ledger domains: host and accelerator
 /// share one memory on CPU and Metal; CUDA splits them.
 pub(super) fn request_envelope_resources(
@@ -187,6 +210,50 @@ pub(super) fn reconcile_observed_growth(
     Ok(observed_growth)
 }
 
+/// The resource plan load admission prices for `variant` at `model_path` on
+/// `backend` (`device` is that backend's device). The lifecycle and the Metal
+/// footprint harness both price through this one function.
+pub(super) fn admission_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+    device: &crate::backends::DeviceProfile,
+    performance: &crate::performance::PerformanceConfig,
+    granite_speech: &crate::config::GraniteSpeechOptions,
+) -> Result<ModelResourcePlan> {
+    if variant == ModelVariant::Qwen3827BFp8 {
+        if backend != BackendKind::Cuda
+            && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+        {
+            // Fixture load (benchmark/CI): price the actual checkpoint
+            // instead of the pinned 27B constants.
+            let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
+            return Ok(model_resource_plan(backend, estimate));
+        }
+        // Every backend prices the checkpoint under the residency policy
+        // the loader resolves (CUDA runs its cached device gates here).
+        return qwen38_memory::resource_plan(model_path, &device.device, performance);
+    }
+    if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
+        if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
+            // Fixture load (benchmark/CI): price the actual checkpoint
+            // instead of the pinned 35B constants.
+            let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
+            return Ok(model_resource_plan(backend, estimate));
+        }
+        return qwen36moe_memory::resource_plan(backend, performance);
+    }
+    if let Some(plan) = checkpoint_resource_plan(variant, model_path, device, granite_speech)? {
+        return Ok(plan);
+    }
+    let estimate = if backend == BackendKind::Cuda {
+        model_memory_estimate(variant)
+    } else {
+        portable_model_memory_estimate(backend, variant, model_path)?
+    };
+    Ok(model_resource_plan(backend, estimate))
+}
+
 impl ModelLifecycleController {
     pub(in crate::runtime::lifecycle) async fn ensure_model_budget_before_load(
         &self,
@@ -252,47 +319,15 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         model_path: &Path,
     ) -> Result<ModelResourcePlan> {
-        let backend = self.backend_router.context().backend_kind;
-        if variant == ModelVariant::Qwen3827BFp8 {
-            if backend != BackendKind::Cuda
-                && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
-            {
-                // Fixture load (benchmark/CI): price the actual checkpoint
-                // instead of the pinned 27B constants.
-                let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
-                return Ok(model_resource_plan(backend, estimate));
-            }
-            // Every backend prices the checkpoint under the residency policy
-            // the loader resolves (CUDA runs its cached device gates here).
-            return qwen38_memory::resource_plan(
-                model_path,
-                &self.backend_router.context().device.device,
-                &self.config.performance,
-            );
-        }
-        if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
-            if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
-                // Fixture load (benchmark/CI): price the actual checkpoint
-                // instead of the pinned 35B constants.
-                let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
-                return Ok(model_resource_plan(backend, estimate));
-            }
-            return qwen36moe_memory::resource_plan(backend, &self.config.performance);
-        }
-        if let Some(plan) = checkpoint_resource_plan(
+        let context = self.backend_router.context();
+        admission_resource_plan(
             variant,
             model_path,
-            &self.backend_router.context().device,
+            context.backend_kind,
+            &context.device,
+            &self.config.performance,
             &self.config.granite_speech,
-        )? {
-            return Ok(plan);
-        }
-        let estimate = if backend == BackendKind::Cuda {
-            model_memory_estimate(variant)
-        } else {
-            portable_model_memory_estimate(backend, variant, model_path)?
-        };
-        Ok(model_resource_plan(backend, estimate))
+        )
     }
 
     /// The recurrent state floor of a model whose CUDA context is fitted
