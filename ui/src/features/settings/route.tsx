@@ -1,6 +1,11 @@
 import {
+  Cpu,
+  ExternalLink,
+  Info,
+  Keyboard,
   Loader2,
   Moon,
+  Terminal,
   Power,
   RefreshCw,
   ShieldCheck,
@@ -31,7 +36,9 @@ import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { isMacPlatform } from "@/lib/platform";
 import { APP_VERSION } from "@/shared/config/runtime";
+import { useRuntimeHealth } from "@/shared/hooks/useRuntimeHealth";
 
 type SettingReadStatus = "loading" | "ready" | "error" | "unsupported";
 
@@ -119,40 +126,156 @@ function getUpdateBadge(
   return { label: "Current", tone: "success" };
 }
 
+const SETTINGS_SECTIONS: Array<{ id: string; label: string; icon: typeof SunMoon }> = [
+  { id: "settings-appearance", label: "Appearance", icon: SunMoon },
+  { id: "settings-system", label: "System", icon: Power },
+  { id: "settings-runtime", label: "Runtime", icon: Cpu },
+  { id: "settings-shortcuts", label: "Shortcuts", icon: Keyboard },
+  { id: "settings-privacy", label: "Privacy", icon: ShieldCheck },
+  { id: "settings-updates", label: "Updates", icon: RefreshCw },
+  { id: "settings-about", label: "About", icon: Info },
+];
+
+const SHORTCUTS = [
+  {
+    label: "Search or jump to",
+    detail: "Pages, new items and theme from anywhere.",
+    mac: "⌘K",
+    other: "Ctrl K",
+  },
+  {
+    label: "New item",
+    detail: "On Transcription, Text to Speech and Voices.",
+    mac: "⌘N",
+    other: "Ctrl N",
+  },
+  {
+    label: "Create",
+    detail: "Submits a New … dialog.",
+    mac: "⌘↵",
+    other: "Ctrl ↵",
+  },
+  { label: "Close", detail: "Closes the open dialog or menu.", mac: "Esc", other: "Esc" },
+];
+
+const BACKEND_LABELS: Record<string, string> = {
+  cpu: "CPU",
+  cuda: "CUDA",
+  metal: "Metal",
+};
+
+function formatGibibytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes)) {
+    return "Unknown";
+  }
+  const gigabytes = bytes / 1024 ** 3;
+  return `${gigabytes >= 10 ? gigabytes.toFixed(0) : gigabytes.toFixed(1)} GB`;
+}
+
+/** Backend and memory from /v1/health. */
+function RuntimeRows() {
+  const health = useRuntimeHealth();
+  if (health.status !== "ready") {
+    return (
+      <SettingsRow
+        title="Local server"
+        description={
+          health.status === "loading" ? (
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Connecting…
+            </span>
+          ) : (
+            "Izwi could not reach its local server."
+          )
+        }
+      />
+    );
+  }
+  const { runtime, version } = health.health;
+  const value = (text: string) => (
+    <span className="text-[13px] text-[var(--text-secondary)]">{text}</span>
+  );
+  return (
+    <>
+      <SettingsRow
+        title="Backend"
+        action={value(
+          BACKEND_LABELS[runtime.selected_backend] ?? runtime.selected_backend,
+        )}
+      />
+      <SettingsRow
+        title="Memory"
+        description="Reserved by loaded models and running work."
+        action={value(
+          runtime.memory
+            ? `${formatGibibytes(runtime.memory.reserved_bytes)} of ${formatGibibytes(runtime.memory.system_total_bytes)}`
+            : "Unknown",
+        )}
+      />
+      <SettingsRow title="Server version" action={value(version)} />
+    </>
+  );
+}
+
+const SWATCH = {
+  light: { bg: "#fafaf9", panel: "#ffffff", bar: "#e7e5e4" },
+  dark: { bg: "#09090b", panel: "#17181d", bar: "#2a2c33" },
+};
+
+/** A tiny window preview for the theme picker. */
+function ThemeSwatch({ theme }: { theme: "system" | "light" | "dark" }) {
+  const half = (palette: (typeof SWATCH)["light"]) => (
+    <div className="flex h-full flex-1 gap-1 p-1" style={{ background: palette.bg }}>
+      <div className="w-1/4 rounded-[3px]" style={{ background: palette.bar }} />
+      <div className="flex-1 rounded-[3px]" style={{ background: palette.panel }} />
+    </div>
+  );
+  return (
+    <div
+      aria-hidden="true"
+      className="flex h-12 overflow-hidden rounded-[8px] border border-[var(--border-subtle)]"
+    >
+      {theme === "system" ? (
+        <>
+          {half(SWATCH.dark)}
+          {half(SWATCH.light)}
+        </>
+      ) : (
+        half(SWATCH[theme])
+      )}
+    </div>
+  );
+}
+
 function SettingsSection({
-  icon,
+  id,
   title,
   description,
   children,
 }: {
-  icon: ReactNode;
+  id: string;
   title: string;
   description?: ReactNode;
   children: ReactNode;
 }) {
-  const hasIntro = Boolean(description);
-
+  const headingId = `${id}-heading`;
   return (
-    <section
-      className={cn(
-        "grid px-5 py-4 sm:px-6 sm:py-5 lg:grid-cols-[144px_minmax(0,1fr)]",
-        hasIntro ? "gap-2" : "gap-1",
-      )}
-    >
-      <div className="space-y-1.5">
-        <div className="flex items-center gap-2 text-[var(--text-primary)]">
-          {icon}
-          <h2 className="text-sm font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
-            {title}
-          </h2>
-        </div>
-        {description ? (
-          <p className="max-w-xs text-sm leading-6 text-[var(--text-muted)]">
-            {description}
-          </p>
-        ) : null}
+    <section id={id} aria-labelledby={headingId} className="scroll-mt-6">
+      <h2
+        id={headingId}
+        className="text-[15px] font-semibold text-[var(--text-primary)]"
+      >
+        {title}
+      </h2>
+      {description ? (
+        <p className="mt-0.5 text-[13px] text-[var(--text-muted)]">
+          {description}
+        </p>
+      ) : null}
+      <div className="mt-3 rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4">
+        {children}
       </div>
-      <div className="min-w-0">{children}</div>
     </section>
   );
 }
@@ -175,29 +298,29 @@ function SettingsRow({
   return (
     <div
       className={cn(
-        "border-b border-border/70 py-3 last:border-b-0 last:pb-0 first:pt-0",
+        "border-b border-[var(--border-subtle)] py-3.5 last:border-b-0",
         className,
       )}
     >
       {hasHeaderCopy || action ? (
         <div
           className={cn(
-            "flex flex-col md:flex-row md:items-start md:justify-between",
+            "flex flex-col md:flex-row md:items-center md:justify-between",
             hasHeaderCopy && action ? "gap-3" : "gap-0",
           )}
         >
           {hasHeaderCopy ? (
             <div className="min-w-0 max-w-2xl">
               {title ? (
-                <div className="text-sm font-semibold text-[var(--text-primary)]">
+                <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
                   {title}
                 </div>
               ) : null}
               {description ? (
                 <div
                   className={cn(
-                    "text-sm leading-6 text-[var(--text-muted)]",
-                    title ? "mt-1" : undefined,
+                    "text-[12.5px] leading-5 text-[var(--text-subtle)]",
+                    title ? "mt-0.5" : undefined,
                   )}
                 >
                   {description}
@@ -206,7 +329,9 @@ function SettingsRow({
             </div>
           ) : null}
           {action ? (
-            <div className="shrink-0 md:pt-0.5">{action}</div>
+            // ml-auto keeps action-only rows right-aligned; justify-between
+            // has no effect with a single child.
+            <div className="shrink-0 md:ml-auto">{action}</div>
           ) : null}
         </div>
       ) : null}
@@ -220,6 +345,112 @@ function SettingsRow({
         </div>
       ) : null}
     </div>
+  );
+}
+
+type CliInstallStatus = {
+  available: boolean;
+  installed: boolean;
+  location: string | null;
+};
+
+function CommandLineToolRow() {
+  const { notify } = useNotifications();
+  const [status, setStatus] = useState<CliInstallStatus | null>(null);
+  const [readStatus, setReadStatus] = useState<SettingReadStatus>("loading");
+  const [isInstalling, setIsInstalling] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<CliInstallStatus>("cli_install_status")
+      .then((next) => {
+        if (!cancelled) {
+          setStatus(next);
+          setReadStatus("ready");
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to read command line tool status:", error);
+        if (!cancelled) {
+          setReadStatus("error");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleInstall = async () => {
+    setIsInstalling(true);
+    try {
+      const next = await invoke<CliInstallStatus>("install_cli");
+      setStatus(next);
+      setReadStatus("ready");
+      notify({
+        title: "Command line tool installed",
+        description: next.installed
+          ? "Open a new terminal window to use izwi."
+          : "Add the install folder to your PATH to use izwi.",
+        tone: "success",
+      });
+    } catch (error) {
+      console.error("Failed to install the command line tool:", error);
+      notify({
+        title: "Could not install the command line tool",
+        description: error instanceof Error ? error.message : String(error),
+        tone: "warning",
+      });
+    } finally {
+      setIsInstalling(false);
+    }
+  };
+
+  const unavailable = readStatus === "ready" && status?.available === false;
+  const installed = status?.installed === true;
+
+  return (
+    <SettingsRow
+      title="Command line tool"
+      description={
+        readStatus === "loading" ? (
+          <span className="inline-flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Checking for izwi...
+          </span>
+        ) : readStatus === "error" ? (
+          "Izwi could not check whether the izwi command is installed."
+        ) : unavailable ? (
+          "This build does not include the izwi command."
+        ) : installed ? (
+          <>
+            Installed at{" "}
+            <code className="font-mono text-xs text-[var(--text-secondary)]">
+              {status?.location}
+            </code>
+          </>
+        ) : (
+          "Use Izwi from a terminal with the izwi command."
+        )
+      }
+      action={
+        unavailable ? null : (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={readStatus === "loading" || isInstalling}
+            onClick={() => void handleInstall()}
+          >
+            {isInstalling ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Terminal className="h-4 w-4" />
+            )}
+            {installed ? "Reinstall" : "Install"}
+          </Button>
+        )
+      }
+    />
   );
 }
 
@@ -509,57 +740,65 @@ export function SettingsPage() {
 
   return (
     <PageShell className="pb-10">
-      <PageHeader
-        title="Settings"
-        description="Appearance, updates, and privacy controls for this device."
-      />
+      <PageHeader title="Settings" description="Preferences for this device." />
 
-      <div className="overflow-hidden rounded-[24px] border border-border/70 bg-[var(--bg-surface-1)]">
-        <div className="divide-y divide-border/70">
+      <div className="grid gap-8 lg:grid-cols-[12rem_minmax(0,1fr)]">
+        <nav aria-label="Settings sections" className="hidden lg:block">
+          <ul className="sticky top-0 space-y-0.5">
+            {SETTINGS_SECTIONS.map((section) => (
+              <li key={section.id}>
+                <button
+                  type="button"
+                  onClick={() =>
+                    document
+                      .getElementById(section.id)
+                      ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                  className="flex h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-[13.5px] text-[var(--sidebar-link-title)] transition-colors hover:bg-[var(--sidebar-link-hover-bg)] hover:text-[var(--text-primary)]"
+                >
+                  <section.icon className="h-4 w-4 text-[var(--text-subtle)]" />
+                  {section.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+        <div className="min-w-0 space-y-8">
           <SettingsSection
-            icon={<SunMoon className="h-4 w-4" />}
+            id="settings-appearance"
             title="Appearance"
-            description="Choose how the app should render."
+            description="Choose how Izwi looks. Auto follows your system."
           >
-            <SettingsRow
-              action={
-                <div className="text-sm font-medium text-[var(--text-secondary)]">
-                  {resolvedTheme === "dark" ? "Dark" : "Light"}
-                </div>
-              }
-            >
-              <div className="grid gap-2 sm:grid-cols-3">
+            <SettingsRow>
+              <div
+                role="group"
+                aria-label="Theme"
+                className="flex flex-wrap gap-3"
+              >
                 {THEME_OPTIONS.map((option) => {
-                  const Icon = option.icon;
                   const isActive = themePreference === option.id;
-
                   return (
                     <button
                       key={option.id}
                       type="button"
                       onClick={() => handleThemePreferenceChange(option.id)}
-                      className={cn(
-                        "group rounded-[18px] border px-4 py-3 text-left transition-all duration-150",
-                        isActive
-                          ? "border-[var(--border-strong)] bg-[var(--bg-surface-0)]"
-                          : "border-border/70 bg-transparent hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-0)]/60",
-                      )}
                       aria-pressed={isActive}
+                      className={cn(
+                        "flex w-[7.5rem] flex-col gap-2 rounded-[12px] border p-1.5 pb-2 text-[13px] transition-colors",
+                        isActive
+                          ? "border-[var(--text-primary)] text-[var(--text-primary)]"
+                          : "border-[var(--border-default)] text-[var(--text-muted)] hover:border-[var(--border-strong)]",
+                      )}
                     >
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
-                          <Icon className="h-4 w-4" />
-                          {option.title}
-                        </span>
-                        <span
-                          className={cn(
-                            "h-2.5 w-2.5 rounded-full transition-colors",
-                            isActive
-                              ? "bg-[var(--text-primary)]"
-                              : "bg-[var(--border-strong)] group-hover:bg-[var(--text-muted)]",
-                          )}
-                        />
-                      </div>
+                      <ThemeSwatch theme={option.id} />
+                      <span className="flex items-center justify-center gap-1.5">
+                        {option.title}
+                        {option.id === "system" && isActive ? (
+                          <span className="text-[11px] text-[var(--text-subtle)]">
+                            ({resolvedTheme === "dark" ? "Dark" : "Light"})
+                          </span>
+                        ) : null}
+                      </span>
                     </button>
                   );
                 })}
@@ -568,160 +807,14 @@ export function SettingsPage() {
           </SettingsSection>
 
           <SettingsSection
-            icon={<RefreshCw className="h-4 w-4" />}
-            title="Updates"
-            description="Check for new releases and install updates."
-          >
-            <SettingsRow
-              description={
-                !updaterSupported ? (
-                  "Update checks and installation are available in the packaged desktop app."
-                ) : updaterCapabilityStatus === "loading" ? (
-                  "Checking update support for this installation..."
-                ) : updaterCapabilityStatus === "error" ? (
-                  "Izwi could not confirm whether updates are supported."
-                ) : availableUpdate ? (
-                  <>
-                    Version{" "}
-                    <span className="font-medium text-[var(--text-secondary)]">
-                      {availableUpdate.version}
-                    </span>{" "}
-                    is available.
-                  </>
-                ) : (
-                  `Last checked ${formatDateTime(lastCheckedAt)}.`
-                )
-              }
-              action={
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-[var(--bg-surface-0)] px-2.5 py-1 text-xs text-[var(--text-secondary)] whitespace-nowrap">
-                    <span>Version</span>
-                    <span className="font-mono font-semibold text-[var(--text-primary)]">
-                      v{APP_VERSION}
-                    </span>
-                  </span>
-                  <StatusBadge tone={updateBadge.tone}>{updateBadge.label}</StatusBadge>
-                  {updaterSupported &&
-                  updaterCapabilityStatus === "ready" &&
-                  updatesEnabled ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void checkForUpdates(true)}
-                      disabled={
-                        updateStatus === "checking" ||
-                        updateStatus === "downloading"
-                      }
-                    >
-                      {updateStatus === "checking" ? "Checking..." : "Check now"}
-                    </Button>
-                  ) : null}
-                  {updaterSupported && updaterCapabilityStatus === "error" ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void refreshUpdaterCapability()}
-                    >
-                      Retry update support
-                    </Button>
-                  ) : null}
-                  {updaterSupported && availableUpdate ? (
-                    <Button
-                      type="button"
-                      size="sm"
-                      onClick={openUpdatePrompt}
-                    >
-                      View {availableUpdate.version}
-                    </Button>
-                  ) : null}
-                </div>
-              }
-            >
-              {updaterSupported &&
-              updaterCapabilityStatus === "ready" &&
-              !updatesEnabled ? (
-                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
-                  {updaterHealth?.disableReason ?? "Updates are disabled."}
-                </p>
-              ) : null}
-              {updateErrorMessage ? (
-                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
-                  Last error: {updateErrorMessage}
-                </p>
-              ) : null}
-            </SettingsRow>
-          </SettingsSection>
-
-          <SettingsSection
-            icon={<ShieldCheck className="h-4 w-4" />}
-            title="Privacy"
-            description="Control anonymous usage telemetry."
-          >
-            <SettingsRow
-              title="Anonymous analytics"
-              description={
-                preferencesReadStatus === "loading" ? (
-                  <span className="inline-flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Loading saved preference...
-                  </span>
-                ) : preferencesReadStatus === "error" ? (
-                  "Izwi could not confirm your saved analytics preference."
-                ) : analyticsOptIn ? (
-                  "Enabled. Prompts, transcripts, audio, and personal identifiers are never sent."
-                ) : (
-                  "Disabled for this device."
-                )
-              }
-              action={
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-medium text-[var(--text-secondary)]">
-                    {preferencesReadStatus === "ready"
-                      ? analyticsOptIn
-                        ? "On"
-                        : "Off"
-                      : "Unknown"}
-                  </span>
-                  <Switch
-                    checked={analyticsOptIn ?? false}
-                    disabled={
-                      preferencesReadStatus !== "ready" || isSavingPreference
-                    }
-                    onCheckedChange={(checked) => void handleAnalyticsToggle(checked)}
-                    aria-label="Share anonymous usage data"
-                  />
-                </div>
-              }
-            >
-              {preferencesReadStatus === "error" ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void loadPreferences()}
-                >
-                  Retry analytics preference
-                </Button>
-              ) : null}
-              {isSavingPreference ? (
-                <p className="text-sm text-[var(--text-muted)]">
-                  Saving your preference...
-                </p>
-              ) : null}
-            </SettingsRow>
-          </SettingsSection>
-
-          <SettingsSection
-            icon={<Power className="h-4 w-4" />}
+            id="settings-system"
             title="System"
-            description="Startup behavior for this device."
+            description="How the desktop app behaves on this computer."
           >
             {!desktopRuntime ? (
               <SettingsRow
                 title="Desktop controls"
-                description="Tray behavior and launch-at-login settings are available in the packaged desktop app."
+                description="Tray behavior, launch-at-login and command line tool settings are available in the packaged desktop app."
               />
             ) : (
               <>
@@ -836,8 +929,209 @@ export function SettingsPage() {
                     </p>
                   ) : null}
                 </SettingsRow>
+
+                <CommandLineToolRow />
               </>
             )}
+          </SettingsSection>
+
+          <SettingsSection
+            id="settings-runtime"
+            title="Runtime"
+            description="The local inference server on this device."
+          >
+            <RuntimeRows />
+          </SettingsSection>
+
+          <SettingsSection
+            id="settings-shortcuts"
+            title="Shortcuts"
+            description="Keyboard shortcuts available across Izwi."
+          >
+            {SHORTCUTS.map((shortcut) => (
+              <SettingsRow
+                key={shortcut.label}
+                title={shortcut.label}
+                description={shortcut.detail}
+                action={
+                  <kbd className="rounded-[6px] border border-[var(--border-default)] px-1.5 py-0.5 font-sans text-xs text-[var(--text-secondary)]">
+                    {isMacPlatform() ? shortcut.mac : shortcut.other}
+                  </kbd>
+                }
+              />
+            ))}
+          </SettingsSection>
+
+          <SettingsSection
+            id="settings-privacy"
+            title="Privacy"
+            description="Audio, text and models never leave this device."
+          >
+            <SettingsRow
+              title="Anonymous analytics"
+              description={
+                preferencesReadStatus === "loading" ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading saved preference...
+                  </span>
+                ) : preferencesReadStatus === "error" ? (
+                  "Izwi could not confirm your saved analytics preference."
+                ) : analyticsOptIn ? (
+                  "Enabled. Prompts, transcripts, audio, and personal identifiers are never sent."
+                ) : (
+                  "Disabled for this device."
+                )
+              }
+              action={
+                <div className="flex items-center gap-3">
+                  <span className="text-sm font-medium text-[var(--text-secondary)]">
+                    {preferencesReadStatus === "ready"
+                      ? analyticsOptIn
+                        ? "On"
+                        : "Off"
+                      : "Unknown"}
+                  </span>
+                  <Switch
+                    checked={analyticsOptIn ?? false}
+                    disabled={
+                      preferencesReadStatus !== "ready" || isSavingPreference
+                    }
+                    onCheckedChange={(checked) => void handleAnalyticsToggle(checked)}
+                    aria-label="Share anonymous usage data"
+                  />
+                </div>
+              }
+            >
+              {preferencesReadStatus === "error" ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void loadPreferences()}
+                >
+                  Retry analytics preference
+                </Button>
+              ) : null}
+              {isSavingPreference ? (
+                <p className="text-sm text-[var(--text-muted)]">
+                  Saving your preference...
+                </p>
+              ) : null}
+            </SettingsRow>
+          </SettingsSection>
+
+          <SettingsSection
+            id="settings-updates"
+            title="Updates"
+            description="Check for new releases and install them."
+          >
+            <SettingsRow
+              description={
+                !updaterSupported ? (
+                  "Update checks and installation are available in the packaged desktop app."
+                ) : updaterCapabilityStatus === "loading" ? (
+                  "Checking update support for this installation..."
+                ) : updaterCapabilityStatus === "error" ? (
+                  "Izwi could not confirm whether updates are supported."
+                ) : availableUpdate ? (
+                  <>
+                    Version{" "}
+                    <span className="font-medium text-[var(--text-secondary)]">
+                      {availableUpdate.version}
+                    </span>{" "}
+                    is available.
+                  </>
+                ) : (
+                  `Last checked ${formatDateTime(lastCheckedAt)}.`
+                )
+              }
+              action={
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-[var(--bg-surface-0)] px-2.5 py-1 text-xs text-[var(--text-secondary)] whitespace-nowrap">
+                    <span>Version</span>
+                    <span className="font-mono font-semibold text-[var(--text-primary)]">
+                      v{APP_VERSION}
+                    </span>
+                  </span>
+                  <StatusBadge tone={updateBadge.tone}>{updateBadge.label}</StatusBadge>
+                  {updaterSupported &&
+                  updaterCapabilityStatus === "ready" &&
+                  updatesEnabled ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void checkForUpdates(true)}
+                      disabled={
+                        updateStatus === "checking" ||
+                        updateStatus === "downloading"
+                      }
+                    >
+                      {updateStatus === "checking" ? "Checking..." : "Check now"}
+                    </Button>
+                  ) : null}
+                  {updaterSupported && updaterCapabilityStatus === "error" ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refreshUpdaterCapability()}
+                    >
+                      Retry update support
+                    </Button>
+                  ) : null}
+                  {updaterSupported && availableUpdate ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={openUpdatePrompt}
+                    >
+                      View {availableUpdate.version}
+                    </Button>
+                  ) : null}
+                </div>
+              }
+            >
+              {updaterSupported &&
+              updaterCapabilityStatus === "ready" &&
+              !updatesEnabled ? (
+                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
+                  {updaterHealth?.disableReason ?? "Updates are disabled."}
+                </p>
+              ) : null}
+              {updateErrorMessage ? (
+                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
+                  Last error: {updateErrorMessage}
+                </p>
+              ) : null}
+            </SettingsRow>
+          </SettingsSection>
+
+          <SettingsSection id="settings-about" title="About">
+            <SettingsRow
+              title="Izwi"
+              description="Local speech, transcription and chat."
+              action={
+                <span className="font-mono text-[13px] text-[var(--text-secondary)]">
+                  v{APP_VERSION}
+                </span>
+              }
+            />
+            <SettingsRow
+              title="Source code"
+              action={
+                <a
+                  href="https://github.com/izwi-ai/izwi"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-[13px] text-[var(--text-secondary)] underline underline-offset-4 hover:text-[var(--text-primary)]"
+                >
+                  github.com/izwi-ai/izwi
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              }
+            />
           </SettingsSection>
         </div>
       </div>

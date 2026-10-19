@@ -533,4 +533,67 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
       window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
     ).toBe("Qwen3.5-9B");
   });
+
+  it("batches download progress updates instead of rendering every event", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      constructor(public url: string) {
+        FakeEventSource.instances.push(this);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "downloading", download_progress: 0 }],
+    });
+
+    const onRender = vi.fn();
+    function ProgressProbe() {
+      const { downloadProgress } = useModelCatalog();
+      onRender();
+      return (
+        <span data-testid="percent">
+          {downloadProgress[model.variant]?.percent ?? "none"}
+        </span>
+      );
+    }
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <ProgressProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const stream = FakeEventSource.instances[FakeEventSource.instances.length - 1];
+
+    const before = onRender.mock.calls.length;
+    act(() => {
+      for (const percent of [10, 20, 30, 40, 50]) {
+        stream.onmessage?.({
+          data: JSON.stringify({ percent, status: "downloading" }),
+        });
+      }
+    });
+    expect(screen.getByTestId("percent")).toHaveTextContent("none");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(screen.getByTestId("percent")).toHaveTextContent("50");
+    expect(onRender.mock.calls.length - before).toBeLessThanOrEqual(2);
+
+    // Terminal statuses are applied immediately.
+    act(() => {
+      stream.onmessage?.({
+        data: JSON.stringify({ percent: 100, status: "completed" }),
+      });
+    });
+    expect(screen.getByTestId("percent")).toHaveTextContent("100");
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 });

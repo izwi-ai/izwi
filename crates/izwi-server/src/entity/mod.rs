@@ -62,6 +62,9 @@ pub mod chat_messages {
         pub created_at: i64,
         pub tokens_generated: Option<i64>,
         pub generation_time_ms: Option<f64>,
+        pub model_id: Option<String>,
+        pub finish_reason: Option<String>,
+        pub reasoning_ms: Option<i64>,
     }
     empty_relation!();
 }

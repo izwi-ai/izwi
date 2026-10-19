@@ -6,6 +6,7 @@ import {
 import {
   buildCursorQueryString,
   normalizeCursorPaginationMeta,
+  readListTotal,
   type CursorPageResult,
   type CursorPaginationQuery,
 } from "@/shared/api/pagination";
@@ -262,6 +263,15 @@ export type StudioProjectRenderJobStatus =
   | "completed"
   | "failed"
   | "cancelled";
+/** Where a segment's audio stands; `stale` audio was rendered from other
+ * text, voice, speed or pronunciations. */
+export type StudioSegmentRenderState =
+  | "not_rendered"
+  | "rendered"
+  | "stale"
+  | "queued"
+  | "rendering"
+  | "failed";
 
 export interface StudioProjectSummary {
   id: string;
@@ -276,6 +286,10 @@ export interface StudioProjectSummary {
   speed: number | null;
   segment_count: number;
   rendered_segment_count: number;
+  stale_segment_count: number;
+  pending_segment_count: number;
+  failed_segment_count: number;
+  audio_duration_secs: number;
   total_chars: number;
 }
 
@@ -294,6 +308,9 @@ export interface StudioProjectSegmentRecord {
   generation_time_ms: number | null;
   audio_duration_secs: number | null;
   audio_filename: string | null;
+  render_fingerprint: string | null;
+  render_state: StudioSegmentRenderState;
+  render_error: string | null;
 }
 
 export interface StudioProjectRecord {
@@ -309,6 +326,7 @@ export interface StudioProjectRecord {
   saved_voice_id: string | null;
   speed: number | null;
   segments: StudioProjectSegmentRecord[];
+  active_render_job: StudioProjectRenderJobRecord | null;
 }
 
 export interface StudioProjectCreateRequest {
@@ -337,6 +355,8 @@ export interface StudioProjectSegmentUpdateRequest {
   voice_mode?: StudioProjectVoiceMode;
   speaker?: string;
   saved_voice_id?: string;
+  /** Drop the segment's own voice and use the project's. */
+  use_project_voice?: boolean;
 }
 
 export interface StudioProjectSegmentCreateRequest {
@@ -428,12 +448,8 @@ export interface StudioProjectRenderJobRecord {
 }
 
 export interface StudioProjectRenderJobCreateRequest {
-  queued_segment_ids?: string[];
-}
-
-export interface StudioProjectRenderJobUpdateRequest {
-  status?: StudioProjectRenderJobStatus;
-  error_message?: string;
+  /** Omit to queue every segment whose audio is missing, stale or failed. */
+  segment_ids?: string[];
 }
 
 export interface STTRequest {
@@ -1629,12 +1645,14 @@ export class AudioApiClient {
         has_more?: boolean;
         limit?: number;
       };
+      total?: number;
     }>(path);
     const items = payload.records ?? [];
     const fallbackLimit = query?.limit ?? Math.max(items.length, 1);
     return {
       items,
       pagination: normalizeCursorPaginationMeta(payload.pagination, fallbackLimit),
+      total: readListTotal(payload),
     };
   }
 
@@ -1829,7 +1847,14 @@ export class AudioApiClient {
       downloadUrl.searchParams.set("download", "true");
     } else {
       const response = await fetch(url);
-      if (!response.ok) throw new Error(`Audio download failed (${response.status})`);
+      if (!response.ok) {
+        // Prefer the server's reason ("Render these paragraphs…") to a status.
+        const reason = await response
+          .json()
+          .then((body: { error?: { message?: string } }) => body?.error?.message)
+          .catch(() => undefined);
+        throw new Error(reason || `Audio download failed (${response.status})`);
+      }
       objectUrl = URL.createObjectURL(await response.blob());
     }
     // Long speech goes directly to the browser's download manager, never a Blob.
@@ -2218,12 +2243,26 @@ export class AudioApiClient {
     );
   }
 
+  /** A segment's audio; `version` (its speech record id) busts caches when
+   * the segment is rendered again. */
+  studioProjectSegmentAudioUrl(
+    projectId: string,
+    segmentId: string,
+    version?: string | null,
+  ): string {
+    const base = this.http.url(
+      `${this.studioProjectSegmentPath(projectId, segmentId)}/audio`,
+    );
+    return version ? `${base}?v=${encodeURIComponent(version)}` : base;
+  }
+
   studioProjectAudioUrl(
     projectId: string,
     options?: {
       download?: boolean;
       format?: "wav" | "raw_i16" | "raw_f32";
       segment_ids?: string[];
+      pause_ms?: number;
     },
   ): string {
     const base = this.http.url(`${this.studioProjectPath(projectId)}/audio`);
@@ -2236,6 +2275,9 @@ export class AudioApiClient {
     }
     if (options?.segment_ids && options.segment_ids.length > 0) {
       params.set("segment_ids", options.segment_ids.join(","));
+    }
+    if (options?.pause_ms) {
+      params.set("pause_ms", String(options.pause_ms));
     }
     const query = params.toString();
     return query ? `${base}?${query}` : base;
@@ -2366,29 +2408,24 @@ export class AudioApiClient {
     return payload.jobs ?? [];
   }
 
+  /** Queue segments for the server's render worker. */
   async createStudioProjectRenderJob(
     projectId: string,
     request?: StudioProjectRenderJobCreateRequest,
   ): Promise<StudioProjectRenderJobRecord> {
     return this.http.request(this.studioProjectRenderJobsPath(projectId), {
       method: "POST",
-      body: JSON.stringify({
-        queued_segment_ids: request?.queued_segment_ids ?? [],
-      }),
+      body: JSON.stringify({ segment_ids: request?.segment_ids ?? [] }),
     });
   }
 
-  async updateStudioProjectRenderJob(
+  async cancelStudioProjectRenderJob(
     projectId: string,
     jobId: string,
-    request: StudioProjectRenderJobUpdateRequest,
   ): Promise<StudioProjectRenderJobRecord> {
     return this.http.request(this.studioProjectRenderJobPath(projectId, jobId), {
       method: "PATCH",
-      body: JSON.stringify({
-        status: request.status,
-        error_message: request.error_message,
-      }),
+      body: JSON.stringify({ status: "cancelled" }),
     });
   }
 
@@ -2405,6 +2442,7 @@ export class AudioApiClient {
     const cursorQuery = buildCursorQueryString({
       limit: query?.limit,
       cursor: query?.cursor,
+      filters: query?.filters,
     });
     const path = this.buildSpeechTextJobPath(
       `${this.speechTextJobsCollectionPath()}${cursorQuery}`,
@@ -2417,12 +2455,14 @@ export class AudioApiClient {
         has_more?: boolean;
         limit?: number;
       };
+      total?: number;
     }>(path);
     const items = payload.records ?? [];
     const fallbackLimit = query?.limit ?? Math.max(items.length, 1);
     return {
       items,
       pagination: normalizeCursorPaginationMeta(payload.pagination, fallbackLimit),
+      total: readListTotal(payload),
     };
   }
 

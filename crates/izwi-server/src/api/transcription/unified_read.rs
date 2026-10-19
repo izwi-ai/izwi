@@ -13,6 +13,7 @@ use crate::diarization_store::{
     DiarizationRecordListCursor, DiarizationRecordSummary, StoredDiarizationAudio,
 };
 use crate::error::ApiError;
+use crate::speech_text_list::{SpeechTextListFilter, PROCESSING_STATUSES};
 use crate::state::AppState;
 use crate::transcription_store::{
     StoredTranscriptionAudio, TranscriptionRecordListCursor, TranscriptionRecordMode,
@@ -37,6 +38,42 @@ pub struct UnifiedJobListQuery {
     cursor: Option<String>,
     #[serde(default)]
     job_kind: Option<String>,
+    /// Case-insensitive search over transcript text and audio filenames.
+    #[serde(default)]
+    q: Option<String>,
+    /// Comma-separated statuses: pending, processing, ready, failed.
+    #[serde(default)]
+    status: Option<String>,
+    /// Only jobs that identify speakers (speaker-attributed and diarization).
+    #[serde(default)]
+    with_speakers: Option<bool>,
+}
+
+impl UnifiedJobListQuery {
+    fn filter(&self) -> Result<SpeechTextListFilter, ApiError> {
+        let statuses = self
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+            .map(|status| {
+                if PROCESSING_STATUSES.contains(&status) {
+                    Ok(status.to_string())
+                } else {
+                    Err(ApiError::bad_request(format!(
+                        "Invalid `status` {status:?}. Supported values: pending, processing, ready, failed."
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SpeechTextListFilter {
+            search: self.q.clone(),
+            statuses,
+            with_speakers: self.with_speakers.unwrap_or(false),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +86,15 @@ pub struct UnifiedJobQuery {
 pub struct UnifiedJobListResponse {
     pub records: Vec<Value>,
     pub pagination: CursorPagination,
+    /// Jobs matching the filters, ignoring paging.
+    pub total: usize,
+}
+
+/// Position of the last row returned by a `job_kind=all` page.
+#[derive(Debug, Serialize, Deserialize)]
+struct MergedJobListCursor {
+    created_at: u64,
+    id: String,
 }
 
 struct CombinedSummaryItem {
@@ -67,95 +113,75 @@ pub async fn list_jobs(
     };
     let limit = pagination.resolved_limit(HISTORY_LIST_LIMIT, 500);
     let kind = parse_job_kind_filter(query.job_kind.as_deref(), true)?;
+    let filter = query.filter()?;
 
     let response = match kind {
         JobKindFilter::Transcription => {
-            let cursor = pagination.decode_cursor::<TranscriptionRecordListCursor>()?;
-            let (records, next_cursor) = state
-                .transcription_store
-                .list_records_page_for_mode(TranscriptionRecordMode::Transcription, limit, cursor)
-                .await
-                .map_err(map_store_error)?;
-            let values = records
-                .iter()
-                .map(map_transcription_summary)
-                .collect::<Vec<_>>();
-            let has_more = next_cursor.is_some();
-            let encoded_next_cursor = next_cursor.map(|value| encode_cursor(&value));
-            UnifiedJobListResponse {
-                records: values,
-                pagination: CursorPagination {
-                    next_cursor: encoded_next_cursor,
-                    has_more,
-                    limit,
-                },
-            }
+            transcription_page_response(
+                &state,
+                TranscriptionRecordMode::Transcription,
+                limit,
+                pagination.decode_cursor::<TranscriptionRecordListCursor>()?,
+                &filter,
+            )
+            .await?
         }
         JobKindFilter::SpeakerAttributedAsr => {
-            let cursor = pagination.decode_cursor::<TranscriptionRecordListCursor>()?;
-            let (records, next_cursor) = state
-                .transcription_store
-                .list_records_page_for_mode(
-                    TranscriptionRecordMode::SpeakerAttributedAsr,
-                    limit,
-                    cursor,
-                )
-                .await
-                .map_err(map_store_error)?;
-            let values = records
-                .iter()
-                .map(map_transcription_summary)
-                .collect::<Vec<_>>();
-            let has_more = next_cursor.is_some();
-            let encoded_next_cursor = next_cursor.map(|value| encode_cursor(&value));
-            UnifiedJobListResponse {
-                records: values,
-                pagination: CursorPagination {
-                    next_cursor: encoded_next_cursor,
-                    has_more,
-                    limit,
-                },
-            }
+            transcription_page_response(
+                &state,
+                TranscriptionRecordMode::SpeakerAttributedAsr,
+                limit,
+                pagination.decode_cursor::<TranscriptionRecordListCursor>()?,
+                &filter,
+            )
+            .await?
         }
         JobKindFilter::Diarization => {
             let cursor = pagination.decode_cursor::<DiarizationRecordListCursor>()?;
-            let (records, next_cursor) = state
+            let page = state
                 .diarization_store
-                .list_records_page(limit, cursor)
+                .list_records_filtered(limit, cursor, &filter)
                 .await
                 .map_err(map_store_error)?;
-            let values = records
-                .iter()
-                .map(map_diarization_summary)
-                .collect::<Vec<_>>();
-            let has_more = next_cursor.is_some();
-            let encoded_next_cursor = next_cursor.map(|value| encode_cursor(&value));
             UnifiedJobListResponse {
-                records: values,
+                records: page.records.iter().map(map_diarization_summary).collect(),
                 pagination: CursorPagination {
-                    next_cursor: encoded_next_cursor,
-                    has_more,
+                    has_more: page.next_cursor.is_some(),
+                    next_cursor: page.next_cursor.map(|value| encode_cursor(&value)),
                     limit,
                 },
+                total: page.total,
             }
         }
         JobKindFilter::All => {
-            if pagination.cursor.is_some() {
-                return Err(ApiError::bad_request(
-                    "Cursor pagination is not supported when `job_kind=all`.",
-                ));
-            }
+            // Both stores page by (created_at DESC, id DESC) and record ids
+            // are unique across them, so the merged position of the last
+            // returned row is a valid "after" cursor for each store.
+            let cursor = pagination.decode_cursor::<MergedJobListCursor>()?;
+            let transcription_cursor =
+                cursor.as_ref().map(|cursor| TranscriptionRecordListCursor {
+                    created_at: cursor.created_at,
+                    id: cursor.id.clone(),
+                });
+            let diarization_cursor = cursor.map(|cursor| DiarizationRecordListCursor {
+                created_at: cursor.created_at,
+                id: cursor.id,
+            });
 
-            let (transcription_records, transcription_next_cursor) = state
+            let transcriptions = state
                 .transcription_store
-                .list_records_page(limit, None)
+                .list_records_filtered(None, limit, transcription_cursor, &filter)
                 .await
                 .map_err(map_store_error)?;
-            let (diarization_records, diarization_next_cursor) = state
+            let diarizations = state
                 .diarization_store
-                .list_records_page(limit, None)
+                .list_records_filtered(limit, diarization_cursor, &filter)
                 .await
                 .map_err(map_store_error)?;
+            let (transcription_records, transcription_next_cursor) =
+                (transcriptions.records, transcriptions.next_cursor);
+            let (diarization_records, diarization_next_cursor) =
+                (diarizations.records, diarizations.next_cursor);
 
             let mut combined = Vec::with_capacity(
                 transcription_records
@@ -182,23 +208,53 @@ pub async fn list_jobs(
                     .cmp(&left.created_at)
                     .then_with(|| right.id.cmp(&left.id))
             });
-            let has_overflow = combined.len() > limit;
+            let has_more = combined.len() > limit
+                || transcription_next_cursor.is_some()
+                || diarization_next_cursor.is_some();
             combined.truncate(limit);
+            let next_cursor = has_more.then(|| combined.last()).flatten().map(|item| {
+                encode_cursor(&MergedJobListCursor {
+                    created_at: item.created_at,
+                    id: item.id.clone(),
+                })
+            });
 
             UnifiedJobListResponse {
                 records: combined.into_iter().map(|item| item.value).collect(),
                 pagination: CursorPagination {
-                    next_cursor: None,
-                    has_more: has_overflow
-                        || transcription_next_cursor.is_some()
-                        || diarization_next_cursor.is_some(),
+                    next_cursor,
+                    has_more,
                     limit,
                 },
+                total: transcriptions.total + diarizations.total,
             }
         }
     };
 
     Ok(Json(response))
+}
+
+async fn transcription_page_response(
+    state: &AppState,
+    mode: TranscriptionRecordMode,
+    limit: usize,
+    cursor: Option<TranscriptionRecordListCursor>,
+    filter: &SpeechTextListFilter,
+) -> Result<UnifiedJobListResponse, ApiError> {
+    let page = state
+        .transcription_store
+        .list_records_filtered(Some(mode), limit, cursor, filter)
+        .await
+        .map_err(map_store_error)?;
+    Ok(UnifiedJobListResponse {
+        records: page.records.iter().map(map_transcription_summary).collect(),
+        pagination: CursorPagination {
+            has_more: page.next_cursor.is_some(),
+            next_cursor: page.next_cursor.map(|value| encode_cursor(&value)),
+            limit,
+        },
+        total: page.total,
+    })
 }
 
 pub async fn get_job(

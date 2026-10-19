@@ -119,4 +119,39 @@ describe("RouteModelSelect", () => {
 
     expect(screen.getByRole("combobox", { name: "Voice model" })).toBeDisabled();
   });
+
+  it("distinguishes downloaded from not-downloaded models", async () => {
+    render(
+      <RouteModelSelect
+        aria-label="Chat model"
+        value="model-downloaded"
+        options={[
+          {
+            value: "model-downloaded",
+            label: "Downloaded Model",
+            statusLabel: "Downloaded",
+            isReady: false,
+            status: "downloaded",
+          },
+          {
+            value: "model-missing",
+            label: "Missing Model",
+            statusLabel: "Not downloaded",
+            isReady: false,
+          },
+        ]}
+      />,
+    );
+
+    const trigger = screen.getByRole("combobox", { name: "Chat model" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const downloaded = await screen.findByRole("option", { name: /Downloaded Model/ });
+    const missing = screen.getByRole("option", { name: /Missing Model/ });
+
+    expect(downloaded.querySelector(".lucide-arrow-down-to-line")).not.toBeNull();
+    // The label fallback must not read "Not downloaded" as "Downloaded".
+    expect(missing.querySelector(".lucide-arrow-down-to-line")).toBeNull();
+    expect(missing.querySelector(".lucide-circle-dashed")).not.toBeNull();
+  });
 });

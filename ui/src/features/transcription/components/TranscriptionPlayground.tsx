@@ -1121,54 +1121,36 @@ export function TranscriptionPlayground({
     setSummaryRefreshPendingId(null);
   };
 
-  const workspaceShortcuts = useMemo(
-    () => [
-      {
-        key: "Enter",
-        metaKey: true,
-        enabled:
-          !isHistoryModalOpen &&
-          !deleteTargetRecordId &&
-          selectedModelReady &&
-          !isProcessing,
-        action: () => {
-          if (isRecording) {
-            stopRecording();
-            return;
-          }
-          void startRecording();
-        },
+  const workspaceShortcuts = [
+    {
+      key: "Enter",
+      metaKey: true,
+      enabled:
+        !isHistoryModalOpen &&
+        !deleteTargetRecordId &&
+        selectedModelReady &&
+        !isProcessing,
+      action: () => {
+        if (isRecording) {
+          stopRecording();
+          return;
+        }
+        void startRecording();
       },
-      {
-        key: "Escape",
-        enabled: !isHistoryModalOpen && isRecording,
-        action: stopRecording,
-      },
-      {
-        key: "Escape",
-        shiftKey: true,
-        enabled:
-          !isHistoryModalOpen && isTranscriptSessionActive && !isRecording,
-        action: handleReset,
-      },
-    ],
-    [
-      audioUrl,
-      currentOutputRecord,
-      deleteTargetRecordId,
-      error,
-      handleReset,
-      isHistoryModalOpen,
-      isProcessing,
-      isRecording,
-      isTranscriptSessionActive,
-      isStreaming,
-      selectedModelReady,
-      startRecording,
-      stopRecording,
-      transcription,
-    ],
-  );
+    },
+    {
+      key: "Escape",
+      enabled: !isHistoryModalOpen && isRecording,
+      action: stopRecording,
+    },
+    {
+      key: "Escape",
+      shiftKey: true,
+      enabled:
+        !isHistoryModalOpen && isTranscriptSessionActive && !isRecording,
+      action: handleReset,
+    },
+  ];
 
   useWorkspaceShortcuts(workspaceShortcuts);
 

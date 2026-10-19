@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowLeft, AudioLines, Sparkles } from "lucide-react";
 import { VoiceCaptureWorkspace } from "@/components/VoiceCaptureWorkspace";
 import { VoiceDesignWorkspace } from "@/components/VoiceDesignWorkspace";
@@ -16,6 +16,8 @@ type CreationStep = "choice" | "clone" | "design" | "success";
 interface VoiceCreationModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Step to show each time the modal opens; defaults to the chooser. */
+  initialStep?: "choice" | "clone" | "design";
   onUseSavedVoiceInTts?: (voiceId: string) => void;
   onVoiceCreated?: (voiceId: string) => void;
   designModel: string | null;
@@ -60,6 +62,7 @@ function stepDescription(step: CreationStep): string {
 export function VoiceCreationModal({
   open,
   onOpenChange,
+  initialStep = "choice",
   onUseSavedVoiceInTts,
   onVoiceCreated,
   designModel,
@@ -76,6 +79,12 @@ export function VoiceCreationModal({
     voiceId: string;
     source: "clone" | "design";
   } | null>(null);
+  // Read on open only: initialStep changing while the modal is open must
+  // not yank the user out of the step they are on.
+  const initialStepRef = useRef(initialStep);
+  useLayoutEffect(() => {
+    initialStepRef.current = initialStep;
+  });
 
   useEffect(() => {
     if (!open) {
@@ -83,6 +92,14 @@ export function VoiceCreationModal({
       setHasDraftProgress(false);
       setShowDiscardPrompt(false);
       setSavedVoiceResult(null);
+      return;
+    }
+    // Opening straight into clone or design (from "New voice" menu entries or
+    // old /voice-cloning and /voice-design links) skips the chooser.
+    const openingStep = initialStepRef.current;
+    if (openingStep !== "choice") {
+      setStep(openingStep);
+      setHasDraftProgress(true);
     }
   }, [open]);
 
@@ -269,7 +286,7 @@ export function VoiceCreationModal({
                 <h3 className="text-sm font-semibold text-[var(--status-positive-text)]">
                   Voice saved successfully
                 </h3>
-                <p className="mt-1 text-sm text-[var(--status-positive-text)]/90">
+                <p className="mt-1 text-sm text-[color-mix(in_srgb,var(--status-positive-text)_90%,transparent)]">
                   {savedVoiceResult?.source === "design"
                     ? "Your designed voice is ready in the library and available for Text to Speech."
                     : "Your cloned voice is ready in the library and available for Text to Speech."}

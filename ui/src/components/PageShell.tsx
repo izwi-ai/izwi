@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface PageShellProps {
@@ -6,8 +8,16 @@ interface PageShellProps {
   className?: string;
 }
 
+export interface Breadcrumb {
+  label: ReactNode;
+  /** Omit for the current page (the last crumb). */
+  to?: string;
+}
+
 interface PageHeaderProps {
   title: ReactNode;
+  /** Trail above the title on nested pages, ending with the current page. */
+  breadcrumbs?: Breadcrumb[];
   description?: ReactNode;
   actions?: ReactNode;
   className?: string;
@@ -29,6 +39,7 @@ export function PageShell({ children, className }: PageShellProps) {
 
 export function PageHeader({
   title,
+  breadcrumbs,
   description,
   actions,
   className,
@@ -42,9 +53,40 @@ export function PageHeader({
       )}
     >
       <div className="min-w-0 flex-1">
+        {breadcrumbs && breadcrumbs.length > 0 ? (
+          <nav aria-label="Breadcrumb" className="mb-2.5">
+            <ol className="flex min-w-0 items-center gap-1.5 text-[13px] text-[var(--text-subtle)]">
+              {breadcrumbs.map((crumb, index) => (
+                <li
+                  key={index}
+                  className="flex min-w-0 items-center gap-1.5"
+                >
+                  {index > 0 ? (
+                    <ChevronRight
+                      aria-hidden="true"
+                      className="h-3.5 w-3.5 shrink-0"
+                    />
+                  ) : null}
+                  {crumb.to ? (
+                    <Link
+                      to={crumb.to}
+                      className="shrink-0 text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+                    >
+                      {crumb.label}
+                    </Link>
+                  ) : (
+                    <span aria-current="page" className="truncate">
+                      {crumb.label}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </nav>
+        ) : null}
         <h1
           className={cn(
-            "app-page-title text-[var(--text-primary)] tracking-tight",
+            "app-page-title truncate text-[var(--text-primary)] tracking-tight",
             titleClassName,
           )}
         >

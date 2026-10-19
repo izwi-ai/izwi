@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  CalendarDays,
   Check,
+  Clock,
   Copy,
+  Cpu,
   Download,
   Loader2,
+  OctagonX,
   RotateCcw,
   Trash2,
+  Users,
 } from "lucide-react";
 
 import { type DiarizationRecord, type DiarizationRecordRerunRequest } from "@/api";
@@ -23,42 +28,17 @@ import { DiarizationExportDialog } from "@/components/DiarizationExportDialog";
 import { DiarizationQualityPanel } from "@/components/DiarizationQualityPanel";
 import { DiarizationReviewWorkspace } from "@/components/DiarizationReviewWorkspace";
 import { DiarizationSpeakerManager } from "@/components/DiarizationSpeakerManager";
-import { SpeechTextRecordShell } from "@/features/speech-text/components/SpeechTextRecordShell";
+import {
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import type { RowMenuItem } from "@/components/history/RowMenu";
+import type { Breadcrumb } from "@/components/PageShell";
+import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeDiarizationSummaryStatus } from "@/utils/diarizationSummary";
 import { normalizeDiarizationProcessingStatus } from "@/utils/diarizationProcessing";
 import { formattedTranscriptFromRecord } from "@/utils/diarizationTranscript";
-
-function formatCreatedAt(timestampMs: number): string {
-  if (!Number.isFinite(timestampMs)) {
-    return "Unknown time";
-  }
-  const value = new Date(timestampMs);
-  if (Number.isNaN(value.getTime())) {
-    return "Unknown time";
-  }
-  return value.toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function formatAudioDuration(durationSecs: number | null): string {
-  if (
-    durationSecs === null ||
-    !Number.isFinite(durationSecs) ||
-    durationSecs < 0
-  ) {
-    return "Unknown length";
-  }
-  if (durationSecs < 60) {
-    return `${durationSecs.toFixed(1)}s`;
-  }
-  const minutes = Math.floor(durationSecs / 60);
-  const seconds = Math.floor(durationSecs % 60);
-  return `${minutes}m ${seconds}s`;
-}
 
 interface DiarizationRecordDetailProps {
   record: DiarizationRecord | null;
@@ -66,7 +46,6 @@ interface DiarizationRecordDetailProps {
   loading?: boolean;
   error?: string | null;
   summaryModelGuidance?: string | null;
-  onBack?: () => void;
   onDelete?: (recordId: string) => Promise<void> | void;
   onSaveSpeakerCorrections?: (
     recordId: string,
@@ -78,6 +57,10 @@ interface DiarizationRecordDetailProps {
   ) => Promise<void> | void;
   onCancelProcessing?: (recordId: string) => Promise<void> | void;
   onRegenerateSummary?: (recordId: string) => Promise<void> | void;
+  /** The list this record belongs to, for the breadcrumb trail. */
+  parentCrumb: Breadcrumb;
+  /** Route actions for the header menu (Models). */
+  extraMenuItems?: RowMenuItem[];
 }
 
 export function DiarizationRecordDetail({
@@ -86,12 +69,13 @@ export function DiarizationRecordDetail({
   loading = false,
   error = null,
   summaryModelGuidance = null,
-  onBack,
   onDelete,
   onSaveSpeakerCorrections,
   onRerun,
   onCancelProcessing,
   onRegenerateSummary,
+  parentCrumb,
+  extraMenuItems = [],
 }: DiarizationRecordDetailProps) {
   const [workspaceTab, setWorkspaceTab] = useState("transcript");
   const [copied, setCopied] = useState(false);
@@ -291,43 +275,101 @@ export function DiarizationRecordDetail({
     }
   }
 
+  const title =
+    record?.audio_filename || record?.id || "Diarization record";
+  const isReady = processingStatus === "ready";
+  // Summaries need a finished transcript; the hint only helps then.
+  const visibleSummaryGuidance = isReady ? summaryModelGuidance : null;
+  const emptyState =
+    processingStatus === "failed"
+      ? {
+          title: "No transcript",
+          message:
+            "This run failed before producing a transcript. Re-run it from the Quality tab, or delete it.",
+        }
+      : processingStatus === "pending" || processingStatus === "processing"
+        ? {
+            title: "Diarization in progress",
+            message: "The transcript will appear here when the run finishes.",
+          }
+        : {
+            title: "No transcript",
+            message: "This run did not find any speech.",
+          };
+  const speakerCount = record
+    ? (record.corrected_speaker_count ?? record.speaker_count)
+    : null;
+  const meta: RecordMetaItem[] = record
+    ? [
+        { icon: CalendarDays, label: formatHistoryDate(record.created_at) },
+        ...(record.duration_secs != null
+          ? [{ icon: Clock, label: formatClockDuration(record.duration_secs) }]
+          : []),
+        ...(speakerCount != null && (isReady || speakerCount > 0)
+          ? [
+              {
+                icon: Users,
+                label: `${speakerCount} speaker${speakerCount === 1 ? "" : "s"}`,
+              },
+            ]
+          : []),
+        ...(record.model_id
+          ? [
+              {
+                icon: Cpu,
+                label: getModelDisplayName(record.model_id),
+                title: "Model",
+              },
+            ]
+          : []),
+      ]
+    : [];
+  const menuItems: RowMenuItem[] = [
+    {
+      id: "summary",
+      label: summaryRefreshPending
+        ? "Regenerating summary…"
+        : "Regenerate summary",
+      icon: summaryRefreshPending ? Loader2 : RotateCcw,
+      disabled:
+        !record || summaryRefreshPending || !hasTranscript || cancelPending,
+      onSelect: () => void handleRegenerateSummary(),
+    },
+    ...(onCancelProcessing && canCancelProcessing
+      ? [
+          {
+            id: "cancel",
+            label: cancelPending ? "Cancelling…" : "Cancel run",
+            icon: OctagonX,
+            disabled: cancelPending,
+            onSelect: () => void handleCancelProcessing(),
+          },
+        ]
+      : []),
+    ...extraMenuItems,
+    ...(onDelete
+      ? [
+          {
+            id: "delete",
+            label: "Delete",
+            icon: Trash2,
+            danger: true,
+            separatorBefore: true,
+            disabled: deletePending,
+            onSelect: () => setDeleteConfirmOpen(true),
+          },
+        ]
+      : []),
+  ];
+
   return (
-    <SpeechTextRecordShell
-      title={record?.audio_filename || record?.id || "Diarization record"}
-      onBack={onBack}
-      backLabel="Back to transcription"
-      metadata={
-        <>
-          {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
-          {record?.duration_secs != null ? (
-            <span>{formatAudioDuration(record.duration_secs)}</span>
-          ) : null}
-          {record ? (
-            <span>
-              {record.corrected_speaker_count ?? record.speaker_count} speakers
-            </span>
-          ) : null}
-        </>
-      }
+    <RecordPage
+      title={title}
+      breadcrumbs={[parentCrumb, { label: title }]}
+      meta={meta}
+      menuItems={menuItems}
       actions={
         <>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-9 gap-2"
-            onClick={() => void handleRegenerateSummary()}
-            disabled={
-              !record || summaryRefreshPending || !hasTranscript || cancelPending
-            }
-          >
-            {summaryRefreshPending ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <RotateCcw className="h-4 w-4" />
-            )}
-            Regenerate summary
-          </Button>
           <Button
             type="button"
             variant="outline"
@@ -342,7 +384,6 @@ export function DiarizationRecordDetail({
           <DiarizationExportDialog record={record}>
             <Button
               type="button"
-              variant="outline"
               size="sm"
               className="h-9 gap-2"
               disabled={!hasTranscript}
@@ -351,38 +392,6 @@ export function DiarizationRecordDetail({
               Export
             </Button>
           </DiarizationExportDialog>
-          {onDelete ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--danger-border)] text-[var(--danger-text)] hover:bg-[var(--danger-bg)]"
-              onClick={() => setDeleteConfirmOpen(true)}
-              disabled={deletePending}
-            >
-              {deletePending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="h-4 w-4" />
-              )}
-              Delete
-            </Button>
-          ) : null}
-          {onCancelProcessing && canCancelProcessing ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
-              onClick={() => void handleCancelProcessing()}
-              disabled={cancelPending}
-            >
-              {cancelPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : null}
-              {cancelPending ? "Cancelling" : "Cancel run"}
-            </Button>
-          ) : null}
         </>
       }
       alerts={
@@ -443,9 +452,9 @@ export function DiarizationRecordDetail({
             </Card>
           ) : null}
 
-          {summaryModelGuidance ? (
+          {visibleSummaryGuidance ? (
             <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
-              {summaryModelGuidance}
+              {visibleSummaryGuidance}
             </Card>
           ) : null}
         </>
@@ -484,9 +493,9 @@ export function DiarizationRecordDetail({
             loading={loading}
             autoScrollActiveEntry={true}
             fixedPlaybackFooter={true}
-            summaryModelGuidance={summaryModelGuidance}
-            emptyTitle="Diarization record loading"
-            emptyMessage="The transcript will appear here once the diarization record is ready."
+            summaryModelGuidance={visibleSummaryGuidance}
+            emptyTitle={emptyState.title}
+            emptyMessage={emptyState.message}
           />
         </TabsContent>
 
@@ -580,6 +589,6 @@ export function DiarizationRecordDetail({
           </div>
         </DialogContent>
       </Dialog>
-    </SpeechTextRecordShell>
+    </RecordPage>
   );
 }

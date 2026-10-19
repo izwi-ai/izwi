@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   ChatThreadContentPart,
   ChatThreadMessageRecord,
+  ModelInfo,
 } from "@/api";
 import { API_BASE_URL } from "@/shared/config/runtime";
 
@@ -12,6 +13,7 @@ export interface ModelOption {
   label: string;
   statusLabel: string;
   isReady: boolean;
+  status?: ModelInfo["status"];
 }
 
 export interface ChatPlaygroundProps {
@@ -21,16 +23,21 @@ export interface ChatPlaygroundProps {
   chatCapabilities?: ChatModelCapabilities | null;
   modelLabel?: string | null;
   modelOptions: ModelOption[];
+  /**
+   * Catalog lookup for whether a model supports thinking; undefined when the
+   * model is not in the catalog. Used for threads written by another model.
+   */
+  modelSupportsThinking?: (variant: string) => boolean | undefined;
+  /** Catalog lookup for image input (`image_input` modality); undefined when unknown. */
+  modelSupportsImages?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
+  /** Loaded speech model and voice for Read aloud; null when none is ready. */
+  readAloudVoice?: { modelId: string; speaker: string } | null;
+  /** Opens the speech model manager when Read aloud has no model. */
+  onOpenSpeechModels?: () => void;
 }
-
-export const THINKING_SYSTEM_PROMPT: ChatMessage = {
-  role: "system",
-  content:
-    "You are a helpful assistant. Always reason inside <think>...</think> before giving the final answer. Keep thinking concise, always close </think>, then provide a clear final answer outside the tags.",
-};
 
 export const DEFAULT_SYSTEM_PROMPT: ChatMessage = {
   role: "system",
@@ -184,6 +191,46 @@ export function formatThreadTimestamp(timestamp: number): string {
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+/** Clock time shown beside a message, e.g. "13:42" or "1:42 PM". */
+export function formatMessageTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/** Full date and time for a message's tooltip. */
+export function formatMessageDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString([], {
+    dateStyle: "full",
+    timeStyle: "short",
+  });
+}
+
+export function isSameCalendarDay(a: number, b: number): boolean {
+  return new Date(a).toDateString() === new Date(b).toDateString();
+}
+
+/** Label for the separator above the first message of a day. */
+export function messageDayLabel(timestamp: number, now = Date.now()): string {
+  if (isSameCalendarDay(timestamp, now)) {
+    return "Today";
+  }
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (isSameCalendarDay(timestamp, yesterday.getTime())) {
+    return "Yesterday";
+  }
+  const date = new Date(timestamp);
+  const sameYear = date.getFullYear() === new Date(now).getFullYear();
+  return date.toLocaleDateString([], {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric",
+  });
+}
+
 /** Values for the stats row under a finished chat turn. */
 export interface ChatStatsSummary {
   tokens: number;
@@ -220,67 +267,6 @@ export function summarizeChatStats(stats: ChatGenerationStats): ChatStatsSummary
   };
 }
 
-/** Stats of the turn that just streamed, keyed by its persisted id. */
-export interface StreamedTurnStats {
-  messageId: string;
-  stats: ChatGenerationStats;
-}
-
-/** Stats to show after a history refresh. Persisted turns do not store the
- * engine timing, so the refresh that follows a stream keeps the streamed
- * stats while the latest assistant turn is still that streamed turn. */
-export function statsAfterHistoryRefresh(
-  messages: ChatThreadMessageRecord[],
-  streamed: StreamedTurnStats | null,
-): ChatGenerationStats | null {
-  const latest = latestAssistantWithStats(messages);
-  if (!latest) {
-    return null;
-  }
-  if (streamed && latest.id === streamed.messageId) {
-    return streamed.stats;
-  }
-  return {
-    tokens_generated: latest.tokens_generated as number,
-    generation_time_ms: latest.generation_time_ms as number,
-  };
-}
-
-function latestAssistantWithStats(
-  messages: ChatThreadMessageRecord[],
-): ChatThreadMessageRecord | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message.role === "assistant" &&
-      typeof message.tokens_generated === "number" &&
-      typeof message.generation_time_ms === "number"
-    ) {
-      return message;
-    }
-  }
-  return null;
-}
-
-export function extractLatestStats(
-  messages: ChatThreadMessageRecord[],
-): ChatGenerationStats | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message.role === "assistant" &&
-      typeof message.tokens_generated === "number" &&
-      typeof message.generation_time_ms === "number"
-    ) {
-      return {
-        tokens_generated: message.tokens_generated,
-        generation_time_ms: message.generation_time_ms,
-      };
-    }
-  }
-  return null;
-}
-
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
     return text;
@@ -313,17 +299,40 @@ export function stripThinkingArtifacts(text: string): string {
 export function displayThreadTitle(
   rawTitle: string | null | undefined,
 ): string {
-  const cleaned = normalizeWhitespace(stripThinkingArtifacts(rawTitle ?? ""));
+  const cleaned = normalizeWhitespace(
+    stripMarkdown(stripThinkingArtifacts(rawTitle ?? "")),
+  );
   if (!cleaned) {
     return DEFAULT_THREAD_TITLE;
   }
   return truncateText(cleaned, MAX_THREAD_TITLE_CHARS);
 }
 
+/**
+ * Reduce markdown to the text a reader sees, for one-line previews and
+ * titles: drops code fences, emphasis, heading/list/quote markers and link
+ * targets.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/```[^\n]*\n?([\s\S]*?)```/g, " $1 ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(^|[\s(])([*_])(?=\S)(.+?)(?<=\S)\2(?=[\s).,!?:;]|$)/g, "$1$3")
+    .replace(/~~(.+?)~~/g, "$1")
+    .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*$/gm, " ")
+    .replace(/\|/g, " ");
+}
+
 export function threadPreviewFromContent(
   content: string | null | undefined,
 ): string {
-  const normalized = normalizeWhitespace(stripThinkingArtifacts(content ?? ""));
+  const normalized = normalizeWhitespace(
+    stripMarkdown(stripThinkingArtifacts(content ?? "")),
+  );
   if (!normalized) {
     return "No messages yet";
   }
@@ -365,6 +374,13 @@ export function isQwen35ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+export function isQwen36ThinkingModel(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("qwen3.6-");
+}
+
 export function isQwen38ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -393,6 +409,18 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   return normalized.startsWith("qwen3-");
 }
 
+/** Whether any user turn in the thread carries an image attachment. */
+export function threadHasImageAttachments(
+  messages: ChatThreadMessageRecord[],
+): boolean {
+  return messages.some((message) =>
+    parseUserMessageDisplayFromContentParts(message)?.attachments.some(
+      (attachment) => attachment.kind === "image",
+    ),
+  );
+}
+
+/** Name-based fallback for models missing from the catalog. */
 export function supportsImageAttachmentsForModel(
   variant: string | null,
 ): boolean {
@@ -409,30 +437,30 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase() === "lfm2.5-1.2b-thinking-gguf";
 }
 
+/**
+ * Name-based fallback for models missing from the catalog: the Qwen3.5/3.6/
+ * 3.8 and LFM2.5 Thinking templates pre-open `<think>` in the generation
+ * prompt, so their output can start inside an unopened think block.
+ */
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
   return (
     isLfm25ThinkingModel(variant) ||
     isQwen35ThinkingModel(variant) ||
+    isQwen36ThinkingModel(variant) ||
     isQwen38ThinkingModel(variant)
   );
 }
 
-export function systemPromptForModel(
-  variant: string | null,
-  thinkingEnabled: boolean,
-): string {
-  if (isQwen35ThinkingModel(variant) || isQwen38ThinkingModel(variant)) {
-    return NEUTRAL_SYSTEM_PROMPT.content;
-  }
-  if (thinkingEnabled) {
-    if (isLfm25ThinkingModel(variant)) {
-      return NEUTRAL_SYSTEM_PROMPT.content;
-    }
-    return THINKING_SYSTEM_PROMPT.content;
-  }
-  return DEFAULT_SYSTEM_PROMPT.content;
+/**
+ * Models whose chat template controls thinking through `enable_thinking`
+ * get a neutral prompt; others are asked to answer without reasoning tags.
+ */
+export function systemPromptForModel(supportsThinking: boolean): string {
+  return supportsThinking
+    ? NEUTRAL_SYSTEM_PROMPT.content
+    : DEFAULT_SYSTEM_PROMPT.content;
 }
 
 export function buildChatThreadMessagePayload(options: {

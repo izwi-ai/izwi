@@ -114,6 +114,12 @@ pub fn content_part_is_video(part: &Value) -> bool {
         || map.get("input_video").is_some_and(|value| !value.is_null())
 }
 
+/// Whether the chat runtime accepts image inputs for this model. Single
+/// source of truth for image support until the model catalog exposes it.
+pub fn variant_accepts_image_input(variant: ModelVariant) -> bool {
+    variant.is_qwen35_chat_gguf()
+}
+
 pub fn validate_media_inputs_for_variant(
     variant: ModelVariant,
     media_inputs: &[ChatMediaInput],
@@ -127,7 +133,7 @@ pub fn validate_media_inputs_for_variant(
     {
         return Err("Qwen3.5 video inputs are not implemented yet".to_string());
     }
-    if variant.is_qwen35_chat_gguf() {
+    if variant_accepts_image_input(variant) {
         return Ok(());
     }
     Err(format!(

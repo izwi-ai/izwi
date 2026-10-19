@@ -7,6 +7,9 @@ use std::sync::{
 use url::Url;
 
 pub mod autostart;
+pub mod blocking;
+pub mod console;
+pub mod csp;
 pub mod downloads;
 pub mod install;
 pub mod server;
@@ -62,7 +65,12 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     let event_server_handle = Arc::clone(&managed_server);
     let event_shutdown_handle = Arc::clone(&server_shutdown);
 
+    // Must be the first plugin: a second launch hands its arguments to this
+    // instance and exits before it can spawn a second server, window or tray.
     let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = tray::show_main_window(app);
+        }))
         .invoke_handler(tauri::generate_handler![
             downloads::download_audio_file,
             autostart::launch_at_login_enabled,
@@ -73,6 +81,8 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             updater::install_beta_update,
             updater::relaunch_after_update,
             updater::updater_health_snapshot,
+            install::cli_install_status,
+            install::install_cli,
         ])
         .manage(updater::UpdaterState::new())
         .manage(tray_visibility::TrayVisibilityState::new(true));
@@ -81,7 +91,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
         builder = builder.plugin(tauri_plugin_aptabase::Builder::new(&app_key).build());
     }
 
-    if let Some(pubkey) = resolve_updater_pubkey() {
+    if let Some(pubkey) = updater::configured_pubkey() {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().pubkey(pubkey).build());
     } else {
         eprintln!("warning: updater pubkey is not configured; in-app update checks are disabled");
@@ -89,6 +99,9 @@ pub fn run(args: DesktopArgs) -> Result<()> {
 
     builder = builder.plugin(tauri_plugin_autostart::Builder::new().build());
     builder = builder.plugin(tauri_plugin_process::init());
+
+    let mut context = tauri::generate_context!();
+    csp::allow_server_origin(context.config_mut(), &server_url);
 
     let app = builder
         .setup(move |app| {
@@ -116,15 +129,20 @@ pub fn run(args: DesktopArgs) -> Result<()> {
                 );
             }
 
-            if let Err(err) = install::ensure_cli_setup(app.handle()) {
-                eprintln!("warning: could not configure terminal commands automatically: {err}");
+            // Installing the CLI is an explicit Settings action (it can need an
+            // administrator password); launch only refreshes existing copies.
+            if let Err(err) =
+                install::ensure_cli_setup(app.handle(), install::CliSetupMode::RefreshExisting)
+            {
+                eprintln!("warning: could not refresh terminal commands: {err}");
             }
 
             window::build_main_window(app, &window_config)?;
             tray::build_basic_tray(app.handle())?;
+            tray_visibility::restore_tray_visibility(app.handle());
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .map_err(|e| anyhow::anyhow!("failed to build desktop app: {}", e))?;
 
     let exit_code = app.run_return(move |app_handle, event| {
@@ -165,19 +183,6 @@ fn resolve_aptabase_app_key() -> Option<String> {
         .map(ToOwned::to_owned)
         .or_else(|| {
             std::env::var("APTABASE_APP_KEY")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-}
-
-fn resolve_updater_pubkey() -> Option<String> {
-    option_env!("IZWI_UPDATER_PUBKEY")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            std::env::var("IZWI_UPDATER_PUBKEY")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())

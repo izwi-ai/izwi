@@ -100,7 +100,7 @@ export function RouteHistoryDrawer({
 
       <SheetContent
         side="right"
-        className="w-[min(92vw,28rem)] max-w-[28rem] gap-0 border-l border-border/70 bg-background/98 p-0"
+        className="w-[min(92vw,28rem)] max-w-[28rem] gap-0 border-l border-border/70 bg-background/95 p-0"
       >
         <SheetHeader className="gap-0 border-b border-border/70 px-5 py-5 pr-14 sm:px-6">
           <div className="flex items-start justify-between gap-4">

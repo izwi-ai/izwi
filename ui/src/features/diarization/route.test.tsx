@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo } from "@/api";
@@ -355,10 +362,12 @@ describe("DiarizationPage routes", () => {
     expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "diar-cursor-2",
+      filters: {},
     });
   });
 
@@ -451,8 +460,8 @@ describe("DiarizationPage routes", () => {
     expect(
       await screen.findByRole("heading", { name: "New diarization" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Record audio/i })).toBeInTheDocument();
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
 
     const fileInput = document.querySelector(
       'input[type="file"]',
@@ -482,7 +491,7 @@ describe("DiarizationPage routes", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "New diarization" }),
@@ -495,7 +504,7 @@ describe("DiarizationPage routes", () => {
     });
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Back to transcription/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
     );
 
     expect(
@@ -570,7 +579,7 @@ describe("DiarizationPage routes", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -848,7 +857,7 @@ describe("DiarizationPage routes", () => {
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
 
     const openModelsButton = await screen.findByRole("button", {
-      name: "Open Models",
+      name: "Change diarization models",
     });
 
     fireEvent.click(openModelsButton);
@@ -888,7 +897,7 @@ describe("DiarizationPage routes", () => {
     expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
     expect(screen.getByText("Loaded")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change diarization models" }));
 
     const modelModal = await screen.findByTestId("route-model-modal");
     expect(modelModal.getAttribute("data-models")).not.toContain(
@@ -985,6 +994,32 @@ describe("DiarizationPage routes", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a failed run as failed, without a loading state or speaker count", async () => {
+    apiMocks.listDiarizationRecords.mockResolvedValue([]);
+    apiMocks.getDiarizationRecord.mockResolvedValue({
+      ...fullRecord,
+      processing_status: "failed",
+      processing_error: "invocation tensor input has incompatible device",
+      speaker_count: 0,
+      corrected_speaker_count: 0,
+      transcript: "",
+      raw_transcript: "",
+      asr_text: "",
+      utterances: [],
+      summary_status: "not_requested",
+    });
+
+    renderRoute("/diarization/diar-1");
+
+    expect(
+      await screen.findByText(
+        "This run failed before producing a transcript. Re-run it from the Quality tab, or delete it.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Diarization record loading/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 speakers/)).not.toBeInTheDocument();
+  });
+
   it("loads the selected diarization record on /diarization/:recordId", async () => {
     apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
     apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
@@ -995,8 +1030,9 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    expect(await screen.findByText("meeting.wav")).toBeInTheDocument();
-    expect(screen.getByText("Diarization Record")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "meeting.wav" }),
+    ).toBeInTheDocument();
     expect(screen.getByTestId("diarization-review-player")).toHaveClass("fixed");
   });
 
@@ -1015,7 +1051,7 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
     expect(
-      await screen.findByRole("heading", { name: "Diarization Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1029,7 +1065,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(
-      await screen.findByRole("button", { name: /Back to transcription/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
     );
 
     expect(
@@ -1050,7 +1086,12 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
     fireEvent.click(
       await screen.findByRole("button", { name: /Delete record/i }),
     );
@@ -1084,7 +1125,12 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /Cancel run/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Cancel run/i }));
 
     await waitFor(() =>
       expect(apiMocks.cancelDiarizationRecord).toHaveBeenCalledWith("diar-1"),

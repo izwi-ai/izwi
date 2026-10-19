@@ -20,6 +20,36 @@ function buildModel(overrides: Partial<ModelInfo>): ModelInfo {
 }
 
 describe("RouteModelModal", () => {
+  it("shows friendly model names instead of raw variant ids", () => {
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="Text-to-Speech Models"
+        description="Manage TTS models."
+        models={[
+          buildModel({ variant: "Qwen3-TTS-12Hz-0.6B-CustomVoice", status: "downloaded" }),
+          buildModel({ variant: "unlisted-model-x", status: "downloaded" }),
+        ]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Qwen3 0.6B CustomVoice")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+    ).not.toBeInTheDocument();
+    // Models the catalog does not list keep their id rather than vanishing.
+    expect(screen.getByText("unlisted-model-x")).toBeInTheDocument();
+  });
+
   it("allows a loading model to be cancelled", () => {
     const onUnload = vi.fn();
     render(

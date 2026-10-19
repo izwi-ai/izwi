@@ -38,6 +38,9 @@ impl Schema {
                 (4, "media reference indexes"),
                 (5, "diarization alignment and node ownership"),
                 (6, "byte-ordered artifact publication keys"),
+                (7, "chat message model and finish reason"),
+                (8, "chat message reasoning time"),
+                (9, "studio segment render state"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -177,6 +180,19 @@ async fn apply_migration<C: ConnectionTrait>(
         (Schema::App, 6) => {
             if backend == DbBackend::Postgres {
                 db.execute_unprepared(PUBLICATION_KEY_BYTE_ORDER).await?;
+            }
+        }
+        (Schema::App, 7) => {
+            for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+        }
+        (Schema::App, 8) => {
+            ensure_column(db, &CHAT_MESSAGE_REASONING_COLUMN).await?;
+        }
+        (Schema::App, 9) => {
+            for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+                ensure_column(db, column).await?;
             }
         }
         (Schema::Fleet, 1) => {
@@ -1018,6 +1034,50 @@ async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Migration 7: which model wrote each assistant reply and why it stopped.
+/// Migration 1's compatibility columns only run on databases that have not
+/// applied it, so columns added after a release must get their own version.
+const CHAT_MESSAGE_PROVENANCE_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "chat_messages",
+        column: "model_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "chat_messages",
+        column: "finish_reason",
+        definition: "TEXT NULL",
+    },
+];
+
+/// Migration 8: how long an assistant reply spent reasoning before its
+/// answer began, in milliseconds.
+const CHAT_MESSAGE_REASONING_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "chat_messages",
+    column: "reasoning_ms",
+    definition: "INTEGER NULL",
+};
+
+/// Migration 9: what each Studio segment's audio was rendered from, and
+/// where the server's render queue has it.
+const STUDIO_SEGMENT_RENDER_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_fingerprint",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_status",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_error",
+        definition: "TEXT NULL",
+    },
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1540,6 +1600,16 @@ pub(crate) fn postgres_schema_sql() -> String {
     }
     // Migration 6.
     push(PUBLICATION_KEY_BYTE_ORDER);
+    // Migration 7.
+    for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
+        push(&add_column(column));
+    }
+    // Migration 8.
+    push(&add_column(&CHAT_MESSAGE_REASONING_COLUMN));
+    // Migration 9.
+    for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+        push(&add_column(column));
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1688,6 +1758,97 @@ mod tests {
         db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
             .await
             .expect("the baseline recreated the index");
+    }
+
+    #[tokio::test]
+    async fn a_database_from_an_earlier_release_gains_the_chat_message_columns() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        // A database a release before migration 7 created: migration 1 had
+        // already run, so its compatibility columns never added these.
+        for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                column.table, column.column
+            ))
+            .await
+            .expect("column drops");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 7",
+        )
+        .await
+        .expect("version row deletes");
+        assert!(!table_has_column(db, "chat_messages", "model_id")
+            .await
+            .unwrap());
+
+        Migrator::up(db).await.expect("the database upgrades");
+        for column in CHAT_MESSAGE_PROVENANCE_COLUMNS {
+            assert!(
+                table_has_column(db, column.table, column.column)
+                    .await
+                    .unwrap(),
+                "{}.{} exists after the upgrade",
+                column.table,
+                column.column
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_7_gains_the_reasoning_time_column() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let column = &CHAT_MESSAGE_REASONING_COLUMN;
+        db.execute_unprepared(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            column.table, column.column
+        ))
+        .await
+        .expect("column drops");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 8",
+        )
+        .await
+        .expect("version row deletes");
+        assert!(!table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert!(table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_8_gains_the_studio_render_columns() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                column.table, column.column
+            ))
+            .await
+            .expect("column drops");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 9",
+        )
+        .await
+        .expect("version row deletes");
+
+        Migrator::up(db).await.expect("the database upgrades");
+        for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+            assert!(table_has_column(db, column.table, column.column)
+                .await
+                .unwrap());
+        }
     }
 
     fn shipped_postgres_schema_path() -> std::path::PathBuf {

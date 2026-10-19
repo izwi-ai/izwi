@@ -11,7 +11,7 @@ test("keeps canonical creation entry points reachable", async ({ page }) => {
     { path: "/text-to-speech", heading: "Text to Speech" },
     { path: "/transcription", heading: "Transcription" },
     { path: "/studio", heading: "Studio" },
-    { path: "/voice", text: "Start Conversation" },
+    { path: "/voice", text: "Start talking" },
   ] as const;
 
   for (const route of routes) {
@@ -27,28 +27,25 @@ test("keeps canonical creation entry points reachable", async ({ page }) => {
   }
 });
 
-test("no-model voice state opens the model setup surface and returns focus", async ({
+test("voice without its models offers setup and keeps settings reachable", async ({
   page,
 }) => {
   await page.unroute("**/v1/admin/models");
   await stubBootstrapRequests(page, { models: [] });
   await page.goto("/voice");
 
-  const start = page.getByRole("button", { name: "Start Conversation" });
-  const setup = page.getByRole("button", { name: "Set up voice models" });
-  await expect(start).toBeDisabled();
-  await expect(setup).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Set up voice", level: 1 })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Download and set up/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start talking" })).toHaveCount(0);
 
-  await setup.click();
-  const dialog = page.getByRole("dialog", { name: "Voice configuration" });
-  await expect(dialog).toBeVisible();
-  await expect(page.getByRole("tab", { name: /^Models/ })).toHaveAttribute(
-    "data-state",
-    "active",
-  );
+  const settings = page.getByRole("button", { name: "Voice settings" });
+  await settings.click();
+  const sheet = page.getByRole("dialog", { name: "Voice settings" });
+  await expect(sheet).toBeVisible();
 
-  await dialog.getByRole("button", { name: "Close" }).click();
-  await expect(setup).toBeFocused();
+  await sheet.getByRole("button", { name: "Close" }).click();
+  await expect(sheet).toHaveCount(0);
+  await expect(settings).toBeFocused();
 });
 
 test("completes quick onboarding without leaving the blocking dialog", async ({
@@ -130,20 +127,18 @@ test("recovers to an idle voice entry point when microphone permission fails", a
       configurable: true,
       value: {
         getUserMedia: async () => {
-          throw new Error("Microphone permission denied");
+          throw new DOMException("Permission denied", "NotAllowedError");
         },
       },
     });
   });
   await page.goto("/voice");
 
-  const start = page.getByRole("button", { name: "Start Conversation" });
+  const start = page.getByRole("button", { name: "Start talking" });
   await expect(start).toBeEnabled();
   await start.click();
   await expect(
-    page.getByRole("alert").getByText("Microphone permission denied", {
-      exact: true,
-    }),
+    page.getByRole("alert").getByRole("heading", { name: "Microphone is blocked" }),
   ).toBeVisible();
-  await expect(start).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Try again" })).toBeEnabled();
 });

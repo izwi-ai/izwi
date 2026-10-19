@@ -1,5 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+// Bundled locally so the UI renders in Inter on every OS and offline,
+// instead of falling back to each platform's system font.
+import "@fontsource-variable/inter";
 import { bootstrapDocumentIcons } from "@/app/bootstrap/icons";
 import { bootstrapDocumentTheme } from "@/app/bootstrap/theme";
 import { AppProviders } from "@/app/providers/AppProviders";

@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   compareQwenVersionRank,
+  getModelDisplayName,
   getModelProviderLabel,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
@@ -26,7 +27,6 @@ import type {
   ModelDownloadProgressEntry,
   ModelDownloadProgressMap,
 } from "@/features/models/downloadProgress";
-import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface RouteModelSection {
   key: string;
@@ -151,8 +151,8 @@ function groupModelsByProvider(models: ModelInfo[]): ProviderGroup[] {
     }));
 }
 
-function defaultModelLabel(variant: string): string {
-  return withQwen3Prefix(variant, variant);
+function defaultModelLabel(variant: string, displayName?: string): string {
+  return getModelDisplayName(variant, displayName);
 }
 
 function getModelSizeLabel(
@@ -226,7 +226,10 @@ export function RouteModelModal({
     if (getModelLabel) {
       return getModelLabel(variant);
     }
-    return defaultModelLabel(variant);
+    return defaultModelLabel(
+      variant,
+      orderedModels.find((model) => model.variant === variant)?.display_name,
+    );
   };
 
   const handleConfirmDelete = () => {

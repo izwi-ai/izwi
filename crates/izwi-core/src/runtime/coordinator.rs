@@ -3173,6 +3173,13 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
     }
 }
 
+/// Total and available system memory in bytes, as the operating system
+/// reports it (cgroup-limited on Linux). On macOS this runs `sysctl` and
+/// `vm_stat`, so call it off async threads and not on hot paths.
+pub fn system_memory_snapshot() -> Option<(u64, u64)> {
+    host_memory_snapshot()
+}
+
 fn host_memory_snapshot() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {

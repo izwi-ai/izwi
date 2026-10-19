@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Extension, Json, Path, Query, State},
+    extract::{Json, Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::Response,
 };
@@ -8,21 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
-use crate::api::request_context::RequestContext;
-use crate::api::speech_history::{synthesize_record, CreateSpeechHistoryRecordRequest};
 use crate::error::{ApiError, ApiJson};
 use crate::speech_history_store::{SpeechRouteKind, StoredSpeechAudio};
 use crate::state::AppState;
 use crate::studio_project_store::{
-    NewStudioProjectFolderRecord, NewStudioProjectPronunciationRecord, NewStudioProjectRecord,
-    NewStudioProjectRenderJobRecord, NewStudioProjectSegment, NewStudioProjectSnapshotRecord,
-    StudioProjectExportFormat, StudioProjectFolderRecord, StudioProjectListCursor,
-    StudioProjectMetaRecord, StudioProjectPronunciationRecord, StudioProjectRecord,
-    StudioProjectRenderJobRecord, StudioProjectRenderJobStatus, StudioProjectSegmentRecord,
-    StudioProjectSnapshotRecord, StudioProjectSummary, StudioProjectVoiceMode,
-    UpdateStudioProjectRecord, UpdateStudioProjectRenderJobRecord, UpsertStudioProjectMetaRecord,
+    segment_render_input, NewStudioProjectFolderRecord, NewStudioProjectPronunciationRecord,
+    NewStudioProjectRecord, NewStudioProjectSegment, NewStudioProjectSnapshotRecord,
+    StudioProjectChange, StudioProjectExportFormat, StudioProjectFolderRecord,
+    StudioProjectListCursor, StudioProjectMetaRecord, StudioProjectPronunciationRecord,
+    StudioProjectRecord, StudioProjectRenderJobRecord, StudioProjectRenderJobStatus,
+    StudioProjectSegmentRecord, StudioProjectSnapshotRecord, StudioProjectSummary,
+    StudioProjectVoiceMode, StudioSegmentVoiceOverride, UpdateStudioProjectRecord,
+    UpsertStudioProjectMetaRecord,
 };
-use izwi_core::audio::{AudioEncoder, AudioFormat};
+use izwi_core::audio::{resample_mono_high_quality, AudioEncoder, AudioFormat};
 use izwi_core::parse_tts_model_variant;
 
 const PROJECT_LIST_LIMIT: usize = 100;
@@ -35,7 +34,13 @@ pub(crate) struct ProjectAudioQuery {
     format: Option<String>,
     #[serde(default)]
     segment_ids: Option<String>,
+    /// Silence between paragraphs, in milliseconds.
+    #[serde(default)]
+    pause_ms: Option<u32>,
 }
+
+/// The longest pause export puts between paragraphs.
+const MAX_EXPORT_PAUSE_MS: u32 = 5_000;
 
 #[derive(Debug, Serialize)]
 pub struct StudioProjectListResponse {
@@ -95,6 +100,9 @@ pub struct UpdateStudioProjectSegmentRequest {
     pub speaker: Option<String>,
     #[serde(default)]
     pub saved_voice_id: Option<String>,
+    /// Drop the segment's own voice and render with the project's.
+    #[serde(default)]
+    pub use_project_voice: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,16 +193,15 @@ pub struct StudioProjectRenderJobListResponse {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CreateStudioProjectRenderJobRequest {
-    #[serde(default)]
-    pub queued_segment_ids: Vec<String>,
+    /// Segments to render; empty or absent renders every segment whose
+    /// audio is missing, stale or failed.
+    #[serde(default, alias = "queued_segment_ids")]
+    pub segment_ids: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct UpdateStudioProjectRenderJobRequest {
-    #[serde(default)]
-    pub status: Option<StudioProjectRenderJobStatus>,
-    #[serde(default)]
-    pub error_message: Option<String>,
+    pub status: StudioProjectRenderJobStatus,
 }
 
 pub async fn list_studio_projects(
@@ -259,13 +266,20 @@ pub async fn get_studio_project_meta(
     {
         return Ok(Json(meta));
     }
-    let meta = state
+    state
         .studio_store
-        .upsert_project_meta(project_id, UpsertStudioProjectMetaRecord::default())
+        .get_project(project_id.clone())
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
-    Ok(Json(meta))
+    Ok(Json(StudioProjectMetaRecord {
+        project_id,
+        folder_id: None,
+        tags: Vec::new(),
+        default_export_format: StudioProjectExportFormat::Wav,
+        last_render_job_id: None,
+        last_rendered_at: None,
+    }))
 }
 
 pub async fn upsert_studio_project_meta(
@@ -433,43 +447,31 @@ pub async fn create_studio_project_render_job(
     Path(project_id): Path<String>,
     ApiJson(req): ApiJson<CreateStudioProjectRenderJobRequest>,
 ) -> Result<Json<StudioProjectRenderJobRecord>, ApiError> {
+    let segment_ids = req.segment_ids.filter(|ids| !ids.is_empty());
     let job = state
         .studio_store
-        .create_project_render_job(
-            project_id,
-            NewStudioProjectRenderJobRecord {
-                queued_segment_ids: req.queued_segment_ids,
-            },
-        )
+        .enqueue_render(project_id, segment_ids)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
+    state.studio_render_wake.notify_one();
     Ok(Json(job))
 }
 
+/// The server runs render jobs; a client can only cancel one.
 pub async fn update_studio_project_render_job(
     State(state): State<AppState>,
     Path((project_id, job_id)): Path<(String, String)>,
     ApiJson(req): ApiJson<UpdateStudioProjectRenderJobRequest>,
 ) -> Result<Json<StudioProjectRenderJobRecord>, ApiError> {
-    let error_message_update = req.error_message.map(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
+    if req.status != StudioProjectRenderJobStatus::Cancelled {
+        return Err(ApiError::bad_request(
+            "Render jobs can only be cancelled; the server sets every other status.",
+        ));
+    }
     let job = state
         .studio_store
-        .update_project_render_job(
-            project_id,
-            job_id,
-            UpdateStudioProjectRenderJobRecord {
-                status: req.status,
-                error_message: error_message_update,
-            },
-        )
+        .cancel_render_job(project_id, job_id)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project render job not found"))?;
@@ -502,7 +504,7 @@ pub async fn create_studio_project(
 
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
-    let chunks = crate::api::tts_long_form::split_tts_text_for_long_form(variant, 0, &source_text);
+    let chunks = script_segments(variant, &source_text);
     if chunks.is_empty() {
         return Err(ApiError::bad_request(
             "Project script did not produce any renderable segments.",
@@ -641,109 +643,83 @@ pub async fn update_studio_project_segment(
     Path((project_id, segment_id)): Path<(String, String)>,
     ApiJson(req): ApiJson<UpdateStudioProjectSegmentRequest>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
+    let use_project_voice = req.use_project_voice.unwrap_or(false);
     let req = normalize_segment_update_request(req);
-    let text_update = match req.text {
-        Some(text) if text.trim().is_empty() => {
-            return Err(ApiError::bad_request("Segment text cannot be empty."));
-        }
-        Some(text) => Some(text.trim().to_string()),
-        None => None,
-    };
-    let has_settings_update = req.model_id.is_some()
+    let text_update = req.text.clone();
+    let has_voice_update = req.model_id.is_some()
         || req.voice_mode.is_some()
         || req.speaker.is_some()
         || req.saved_voice_id.is_some();
-
-    if text_update.is_none() && !has_settings_update {
+    if use_project_voice && has_voice_update {
         return Err(ApiError::bad_request(
-            "Segment update requires text or settings changes.",
+            "Choose a segment voice or `use_project_voice`, not both.",
+        ));
+    }
+    if text_update.is_none() && !has_voice_update && !use_project_voice {
+        return Err(ApiError::bad_request(
+            "Segment update requires text or voice changes.",
         ));
     }
 
-    let base_project = state
+    let project = state
         .studio_store
         .get_project(project_id.clone())
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
-    let segment = base_project
+    let segment = project
         .segments
         .iter()
         .find(|candidate| candidate.id == segment_id)
-        .cloned()
         .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
 
-    let mut updated_project: Option<StudioProjectRecord> = None;
-
-    if has_settings_update {
-        let next_model_id = req
-            .model_id
-            .clone()
-            .or_else(|| segment.model_id.clone())
-            .or_else(|| base_project.model_id.clone())
-            .ok_or_else(|| ApiError::bad_request("Studio project is missing a model selection."))?;
-        let next_voice_mode = req
+    let voice_update = if use_project_voice {
+        Some(None)
+    } else if has_voice_update {
+        // The override keeps what the segment already chose and changes
+        // what the request names; anything left unset follows the project.
+        let model_id = req.model_id.clone().or_else(|| segment.model_id.clone());
+        let voice_mode = req
             .voice_mode
             .or(segment.voice_mode)
-            .unwrap_or(base_project.voice_mode);
-        let next_speaker = req
-            .speaker
-            .clone()
-            .or_else(|| segment.speaker.clone())
-            .or_else(|| base_project.speaker.clone());
-        let next_saved_voice_id = req
+            .unwrap_or(project.voice_mode);
+        let speaker = req.speaker.clone().or_else(|| segment.speaker.clone());
+        let saved_voice_id = req
             .saved_voice_id
             .clone()
-            .or_else(|| segment.saved_voice_id.clone())
-            .or_else(|| base_project.saved_voice_id.clone());
-
+            .or_else(|| segment.saved_voice_id.clone());
+        let resolved_model_id = model_id
+            .clone()
+            .or_else(|| project.model_id.clone())
+            .ok_or_else(|| ApiError::bad_request("Studio project is missing a model selection."))?;
+        let resolved_speaker = speaker.clone().or_else(|| project.speaker.clone());
+        let resolved_saved_voice_id = saved_voice_id
+            .clone()
+            .or_else(|| project.saved_voice_id.clone());
         validate_project_voice_state(
             &state,
-            next_model_id.as_str(),
-            next_voice_mode,
-            next_speaker.as_deref(),
-            next_saved_voice_id.as_deref(),
+            resolved_model_id.as_str(),
+            voice_mode,
+            resolved_speaker.as_deref(),
+            resolved_saved_voice_id.as_deref(),
         )
         .await?;
+        Some(Some(StudioSegmentVoiceOverride {
+            model_id,
+            voice_mode,
+            speaker: voice_mode_speaker(voice_mode, speaker),
+            saved_voice_id: voice_mode_saved_voice_id(voice_mode, saved_voice_id),
+        }))
+    } else {
+        None
+    };
 
-        updated_project = if let Some(text) = text_update {
-            state
-                .studio_store
-                .update_segment_text_and_settings(
-                    project_id.clone(),
-                    segment_id.clone(),
-                    text,
-                    next_model_id,
-                    next_voice_mode,
-                    voice_mode_speaker(next_voice_mode, next_speaker),
-                    voice_mode_saved_voice_id(next_voice_mode, next_saved_voice_id),
-                )
-                .await
-                .map_err(map_store_error)?
-        } else {
-            state
-                .studio_store
-                .update_segment_settings(
-                    project_id.clone(),
-                    segment_id.clone(),
-                    next_model_id,
-                    next_voice_mode,
-                    voice_mode_speaker(next_voice_mode, next_speaker),
-                    voice_mode_saved_voice_id(next_voice_mode, next_saved_voice_id),
-                )
-                .await
-                .map_err(map_store_error)?
-        };
-    } else if let Some(text) = text_update {
-        updated_project = state
-            .studio_store
-            .update_segment_text(project_id.clone(), segment_id.clone(), text)
-            .await
-            .map_err(map_store_error)?;
-    }
-
-    let project =
-        updated_project.ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
+    let project = state
+        .studio_store
+        .update_segment(project_id, segment_id, text_update, voice_update)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
     Ok(Json(project))
 }
 
@@ -806,14 +782,14 @@ pub async fn merge_studio_project_segment_with_next(
     State(state): State<AppState>,
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
-    let project = state
+    let change = state
         .studio_store
         .merge_segment_with_next(project_id, segment_id)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project segment could not be merged"))?;
 
-    Ok(Json(project))
+    Ok(Json(apply_project_change(&state, change).await))
 }
 
 pub async fn reorder_studio_project_segments(
@@ -845,125 +821,53 @@ pub async fn bulk_delete_studio_project_segments(
             "Bulk delete requests require at least one segment id.",
         ));
     }
-    let project = state
+    let change = state
         .studio_store
         .delete_segments(project_id, req.segment_ids)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
-    Ok(Json(project))
+    Ok(Json(apply_project_change(&state, change).await))
 }
 
 pub async fn delete_studio_project_segment(
     State(state): State<AppState>,
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
-    let existing = state
-        .studio_store
-        .get_project(project_id.clone())
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
-
-    if existing.segments.len() <= 1 {
-        return Err(ApiError::bad_request(
-            "A project must keep at least one segment.",
-        ));
-    }
-
-    let project = state
+    let change = state
         .studio_store
         .delete_segment(project_id, segment_id)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
 
-    Ok(Json(project))
+    Ok(Json(apply_project_change(&state, change).await))
 }
 
+/// Queue one segment, rendered or not ("render again").
 pub async fn render_studio_project_segment(
     State(state): State<AppState>,
-    Extension(ctx): Extension<RequestContext>,
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<StudioProjectRecord>, ApiError> {
-    let project = state
+    state
         .studio_store
-        .get_project(project_id.clone())
+        .enqueue_render(project_id.clone(), Some(vec![segment_id]))
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
-
-    let segment = project
-        .segments
-        .iter()
-        .find(|candidate| candidate.id == segment_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
-
-    let project_model_id = project
-        .model_id
-        .clone()
-        .ok_or_else(|| ApiError::bad_request("Studio project is missing a model selection."))?;
-    let segment_model_id = segment.model_id.clone().unwrap_or(project_model_id);
-    let segment_voice_mode = segment.voice_mode.unwrap_or(project.voice_mode);
-    let segment_speaker = if segment_voice_mode == StudioProjectVoiceMode::BuiltIn {
-        segment.speaker.clone().or_else(|| project.speaker.clone())
-    } else {
-        None
-    };
-    let segment_saved_voice_id = if segment_voice_mode == StudioProjectVoiceMode::Saved {
-        segment
-            .saved_voice_id
-            .clone()
-            .or_else(|| project.saved_voice_id.clone())
-    } else {
-        None
-    };
-
-    validate_project_voice_state(
-        &state,
-        segment_model_id.as_str(),
-        segment_voice_mode,
-        segment_speaker.as_deref(),
-        segment_saved_voice_id.as_deref(),
-    )
-    .await?;
-
-    let rendered_text =
-        apply_project_pronunciations(&state, project.id.as_str(), segment.text.as_str()).await?;
-    let request = CreateSpeechHistoryRecordRequest {
-        model_id: Some(segment_model_id),
-        text: Some(rendered_text),
-        speaker: segment_speaker,
-        language: None,
-        voice_description: None,
-        reference_audio: None,
-        reference_text: None,
-        saved_voice_id: segment_saved_voice_id,
-        temperature: None,
-        speed: project.speed.map(|value| value as f32),
-        max_tokens: Some(0),
-        max_output_tokens: None,
-        top_k: None,
-        stream: Some(false),
-        sampling: Default::default(),
-    };
-
-    let record = synthesize_record(&state, &ctx, request, SpeechRouteKind::TextToSpeech).await?;
-    let updated_project = state
+    state.studio_render_wake.notify_one();
+    let project = state
         .studio_store
-        .attach_segment_record(project_id, segment_id, record.id)
+        .get_project(project_id)
         .await
         .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?;
-
-    Ok(Json(updated_project))
+        .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
+    Ok(Json(project))
 }
 
-pub async fn get_studio_project_audio(
+pub async fn get_studio_project_segment_audio(
     State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    Query(query): Query<ProjectAudioQuery>,
+    Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let project = state
         .studio_store
@@ -971,96 +875,261 @@ pub async fn get_studio_project_audio(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
+    let record_id = project
+        .segments
+        .iter()
+        .find(|segment| segment.id == segment_id)
+        .ok_or_else(|| ApiError::not_found("Studio project segment not found"))?
+        .speech_record_id
+        .clone()
+        .ok_or_else(|| ApiError::not_found("This paragraph has no audio yet."))?;
+    let audio = load_segment_audio(&state, &record_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("This paragraph has no audio yet."))?;
+    Ok(audio_response(audio, false))
+}
 
-    let segment_filter = parse_segment_filter(query.segment_ids.as_deref());
-    let segments_for_export = if let Some(filter) = segment_filter.as_ref() {
-        project
-            .segments
-            .iter()
-            .filter(|segment| filter.contains(segment.id.as_str()))
-            .collect::<Vec<_>>()
-    } else {
-        project.segments.iter().collect::<Vec<_>>()
+pub async fn get_studio_project_audio(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Query(query): Query<ProjectAudioQuery>,
+) -> Result<Response, ApiError> {
+    let export_format = parse_project_audio_format(query.format.as_deref())?;
+    let pause_ms = query.pause_ms.unwrap_or(0);
+    if pause_ms > MAX_EXPORT_PAUSE_MS {
+        return Err(ApiError::bad_request(format!(
+            "`pause_ms` can be at most {MAX_EXPORT_PAUSE_MS}."
+        )));
+    }
+    let project = state
+        .studio_store
+        .get_project(project_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
+    let pronunciations = state
+        .studio_store
+        .list_project_pronunciations(project_id)
+        .await
+        .map_err(map_store_error)?;
+
+    let segments_for_export = match parse_segment_filter(query.segment_ids.as_deref()) {
+        Some(filter) => {
+            let selected = project
+                .segments
+                .iter()
+                .filter(|segment| filter.contains(segment.id.as_str()))
+                .collect::<Vec<_>>();
+            if selected.len() != filter.len() {
+                return Err(ApiError::bad_request(
+                    "`segment_ids` names a paragraph that isn't in this project.",
+                ));
+            }
+            selected
+        }
+        None => project.segments.iter().collect::<Vec<_>>(),
     };
-
     if segments_for_export.is_empty() {
         return Err(ApiError::bad_request(
-            "Render at least one selected project segment before exporting audio.",
+            "This project has no paragraphs to export.",
         ));
     }
 
-    let missing_count = segments_for_export
-        .iter()
-        .filter(|segment| segment.speech_record_id.is_none())
-        .count();
-    if missing_count > 0 {
+    // Export only audio that matches what each paragraph says now.
+    let mut unrendered = Vec::new();
+    let mut changed = Vec::new();
+    for segment in &segments_for_export {
+        let paragraph = segment.position + 1;
+        match segment.speech_record_id {
+            None => unrendered.push(paragraph),
+            Some(_) => {
+                let current = segment_render_input(&project, segment, &pronunciations).2;
+                if segment
+                    .render_fingerprint
+                    .as_deref()
+                    .is_some_and(|rendered_from| rendered_from != current)
+                {
+                    changed.push(paragraph);
+                }
+            }
+        }
+    }
+    if !unrendered.is_empty() || !changed.is_empty() {
+        let mut problems = Vec::new();
+        if !unrendered.is_empty() {
+            problems.push(format!("not rendered: {}", paragraph_list(&unrendered)));
+        }
+        if !changed.is_empty() {
+            problems.push(format!(
+                "changed since they were rendered: {}",
+                paragraph_list(&changed)
+            ));
+        }
         return Err(ApiError::bad_request(format!(
-            "Render all project segments before exporting audio. {missing_count} segment(s) are still pending."
+            "Render these paragraphs before exporting ({}).",
+            problems.join("; ")
         )));
     }
 
-    let mut merged_samples = Vec::new();
-    let mut merged_sample_rate: Option<u32> = None;
-
-    for segment in segments_for_export {
-        let record_id = segment
-            .speech_record_id
-            .as_deref()
-            .ok_or_else(|| ApiError::bad_request("Project segment is missing rendered audio."))?;
-        let audio = state
-            .speech_history_store
-            .get_audio(SpeechRouteKind::TextToSpeech, record_id.to_string())
-            .await
-            .map_err(map_speech_store_error)?
-            .ok_or_else(|| ApiError::not_found("Rendered segment audio not found"))?;
-        let (samples, sample_rate) = decode_wav_audio(audio.audio_bytes.as_slice())?;
-
-        if let Some(existing_rate) = merged_sample_rate {
-            if existing_rate != sample_rate {
-                return Err(ApiError::internal(format!(
-                    "Project export sample-rate mismatch: {existing_rate} vs {sample_rate}"
-                )));
-            }
-        } else {
-            merged_sample_rate = Some(sample_rate);
-        }
-
-        merged_samples.extend_from_slice(samples.as_slice());
+    let mut takes = Vec::with_capacity(segments_for_export.len());
+    for segment in &segments_for_export {
+        let record_id = segment.speech_record_id.as_deref().unwrap_or_default();
+        let audio = load_segment_audio(&state, record_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "Paragraph {} lost its audio. Render it again before exporting.",
+                    segment.position + 1
+                ))
+            })?;
+        takes.push(audio.audio_bytes);
     }
 
-    let sample_rate = merged_sample_rate.ok_or_else(|| {
-        ApiError::bad_request("Project export did not contain any renderable segment audio.")
-    })?;
-    let export_format = parse_project_audio_format(query.format.as_deref())?;
-    let wav_bytes = AudioEncoder::new(sample_rate, 1)
-        .encode(merged_samples.as_slice(), export_format)
-        .map_err(|err| {
-            ApiError::internal(format!("Failed to encode merged project audio: {err}"))
-        })?;
+    let filename = project_audio_filename(project.name.as_str(), export_format);
+    let bytes = tokio::task::spawn_blocking(move || join_takes(&takes, pause_ms, export_format))
+        .await
+        .map_err(|err| ApiError::internal(format!("Project export failed: {err}")))??;
 
     Ok(audio_response(
         StoredSpeechAudio {
-            audio_bytes: wav_bytes,
+            audio_bytes: bytes,
             audio_mime_type: AudioEncoder::content_type(export_format).to_string(),
-            audio_filename: Some(project_audio_filename(project.name.as_str(), export_format)),
+            audio_filename: Some(filename),
         },
         query.download,
     ))
+}
+
+/// "3", "3 and 7", "3, 7 and 9".
+fn paragraph_list(paragraphs: &[usize]) -> String {
+    let names = paragraphs.iter().map(usize::to_string).collect::<Vec<_>>();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    }
+}
+
+/// Join WAV takes into one file at the highest sample rate among them,
+/// with `pause_ms` of silence between takes. Samples are kept as 16-bit
+/// PCM while joining, so a long project holds one copy of its audio.
+fn join_takes(takes: &[Vec<u8>], pause_ms: u32, format: AudioFormat) -> Result<Vec<u8>, ApiError> {
+    let mut target_rate = 0;
+    for take in takes {
+        target_rate = target_rate.max(wav_sample_rate(take)?);
+    }
+    if target_rate == 0 {
+        return Err(ApiError::bad_request(
+            "This project has no audio to export.",
+        ));
+    }
+    let pause_samples = (u64::from(target_rate) * u64::from(pause_ms) / 1000) as usize;
+
+    let mut pcm: Vec<i16> = Vec::new();
+    for (index, take) in takes.iter().enumerate() {
+        if index > 0 {
+            pcm.extend(std::iter::repeat_n(0, pause_samples));
+        }
+        let (samples, sample_rate) = decode_wav_audio(take)?;
+        let samples = if sample_rate == target_rate {
+            samples
+        } else {
+            resample_mono_high_quality(&samples, sample_rate, target_rate).map_err(|err| {
+                ApiError::internal(format!("Failed to resample project audio: {err}"))
+            })?
+        };
+        pcm.extend(
+            samples
+                .iter()
+                .map(|sample| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16),
+        );
+    }
+
+    Ok(match format {
+        AudioFormat::Wav => {
+            let data_len = (pcm.len() * 2) as u32;
+            let mut bytes = Vec::with_capacity(44 + pcm.len() * 2);
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&target_rate.to_le_bytes());
+            bytes.extend_from_slice(&(target_rate * 2).to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&data_len.to_le_bytes());
+            bytes.extend(pcm.iter().flat_map(|sample| sample.to_le_bytes()));
+            bytes
+        }
+        AudioFormat::RawI16 => pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect(),
+        AudioFormat::RawF32 => pcm
+            .iter()
+            .flat_map(|sample| (f32::from(*sample) / f32::from(i16::MAX)).to_le_bytes())
+            .collect(),
+    })
+}
+
+fn wav_sample_rate(bytes: &[u8]) -> Result<u32, ApiError> {
+    hound::WavReader::new(std::io::Cursor::new(bytes))
+        .map(|reader| reader.spec().sample_rate)
+        .map_err(|err| ApiError::internal(format!("Failed to read project WAV audio: {err}")))
+}
+
+/// A segment's audio: a Studio record, or a text-to-speech record for
+/// projects rendered before Studio had its own.
+async fn load_segment_audio(
+    state: &AppState,
+    record_id: &str,
+) -> Result<Option<StoredSpeechAudio>, ApiError> {
+    for route_kind in [SpeechRouteKind::Studio, SpeechRouteKind::TextToSpeech] {
+        if let Some(audio) = state
+            .speech_history_store
+            .get_audio(route_kind, record_id.to_string())
+            .await
+            .map_err(map_speech_store_error)?
+        {
+            return Ok(Some(audio));
+        }
+    }
+    Ok(None)
+}
+
+/// Delete the Studio audio a change released and return its project.
+async fn apply_project_change(
+    state: &AppState,
+    change: StudioProjectChange,
+) -> StudioProjectRecord {
+    release_studio_audio(state, change.released_speech_record_ids).await;
+    change.project
+}
+
+/// Delete Studio audio no segment references. Text-to-speech records from
+/// before Studio had its own stay in that history, where they're listed.
+pub(super) async fn release_studio_audio(state: &AppState, record_ids: Vec<String>) {
+    for record_id in record_ids {
+        if let Err(err) = state
+            .speech_history_store
+            .delete_record(SpeechRouteKind::Studio, record_id.clone())
+            .await
+        {
+            tracing::warn!(record_id = %record_id, error = %err, "Failed to delete released Studio audio");
+        }
+    }
 }
 
 pub async fn delete_studio_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<DeleteStudioProjectResponse>, ApiError> {
-    let deleted = state
+    let released = state
         .studio_store
         .delete_project(project_id.clone())
         .await
-        .map_err(map_store_error)?;
-
-    if !deleted {
-        return Err(ApiError::not_found("Studio project not found"));
-    }
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
+    release_studio_audio(&state, released).await;
 
     Ok(Json(DeleteStudioProjectResponse {
         id: project_id,
@@ -1096,7 +1165,7 @@ fn normalize_segment_update_request(
     req
 }
 
-async fn validate_project_voice_state(
+pub(super) async fn validate_project_voice_state(
     state: &AppState,
     model_id: &str,
     voice_mode: StudioProjectVoiceMode,
@@ -1193,6 +1262,33 @@ fn voice_mode_saved_voice_id(
         StudioProjectVoiceMode::BuiltIn => None,
         StudioProjectVoiceMode::Saved => saved_voice_id,
     }
+}
+
+/// A script's segments: its paragraphs (split at blank lines), with any
+/// paragraph too long for one render split further at sentence breaks.
+fn script_segments(variant: izwi_core::ModelVariant, script: &str) -> Vec<String> {
+    let normalized = script.replace("\r\n", "\n");
+    let mut paragraphs = Vec::new();
+    let mut current = Vec::new();
+    for line in normalized.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join("\n"));
+                current.clear();
+            }
+        } else {
+            current.push(line.trim());
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join("\n"));
+    }
+    paragraphs
+        .iter()
+        .flat_map(|paragraph| {
+            crate::api::tts_long_form::split_tts_text_for_long_form(variant, 0, paragraph)
+        })
+        .collect()
 }
 
 fn default_project_name(source_text: &str) -> String {
@@ -1329,41 +1425,8 @@ fn map_saved_voice_store_error(err: anyhow::Error) -> ApiError {
     crate::error::store_api_error(err, "Saved voice storage error")
 }
 
-fn map_speech_store_error(err: anyhow::Error) -> ApiError {
+pub(super) fn map_speech_store_error(err: anyhow::Error) -> ApiError {
     crate::error::store_api_error(err, "Speech history storage error")
-}
-
-async fn apply_project_pronunciations(
-    state: &AppState,
-    project_id: &str,
-    text: &str,
-) -> Result<String, ApiError> {
-    let entries = state
-        .studio_store
-        .list_project_pronunciations(project_id.to_string())
-        .await
-        .map_err(map_store_error)?;
-    if entries.is_empty() {
-        return Ok(text.to_string());
-    }
-
-    let mut ordered = entries;
-    ordered.sort_by(|left, right| {
-        right
-            .source_text
-            .len()
-            .cmp(&left.source_text.len())
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    let mut output = text.to_string();
-    for entry in ordered {
-        if entry.source_text.is_empty() {
-            continue;
-        }
-        output = output.replace(entry.source_text.as_str(), entry.replacement_text.as_str());
-    }
-    Ok(output)
 }
 
 fn parse_project_audio_format(raw: Option<&str>) -> Result<AudioFormat, ApiError> {
@@ -1388,4 +1451,68 @@ fn parse_segment_filter(raw: Option<&str>) -> Option<HashSet<String>> {
             .collect::<HashSet<_>>()
     })
     .filter(|entries| !entries.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_takes, paragraph_list};
+    use izwi_core::audio::AudioFormat;
+
+    fn wav(sample_rate: u32, samples: usize) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut bytes, spec).expect("writer");
+        for index in 0..samples {
+            writer
+                .write_sample(((index % 100) as i16 - 50) * 100)
+                .expect("sample");
+        }
+        writer.finalize().expect("finalize");
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn takes_join_at_the_highest_rate_with_a_pause_between_them() {
+        let joined = join_takes(
+            &[wav(16_000, 16_000), wav(24_000, 12_000)],
+            500,
+            AudioFormat::Wav,
+        )
+        .expect("takes join");
+        let reader = hound::WavReader::new(std::io::Cursor::new(joined)).expect("valid wav");
+        assert_eq!(reader.spec().sample_rate, 24_000);
+        assert_eq!(reader.spec().channels, 1);
+        // One second resampled to 24 kHz, half a second of silence, then
+        // half a second as recorded.
+        let expected = 24_000 + 12_000 + 12_000;
+        let length = reader.len() as i64;
+        assert!(
+            (length - expected).abs() <= 64,
+            "joined {length} samples, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn scripts_split_into_their_paragraphs() {
+        let variant = izwi_core::parse_tts_model_variant("Kokoro-82M").expect("variant");
+        assert_eq!(
+            super::script_segments(variant, "First line.\r\n\r\n  \nSecond line,\ncontinued.\n"),
+            vec![
+                "First line.".to_string(),
+                "Second line,\ncontinued.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn paragraph_lists_read_as_prose() {
+        assert_eq!(paragraph_list(&[3]), "3");
+        assert_eq!(paragraph_list(&[3, 7]), "3 and 7");
+        assert_eq!(paragraph_list(&[3, 7, 9]), "3, 7 and 9");
+    }
 }

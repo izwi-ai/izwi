@@ -78,6 +78,15 @@ pub struct AdminResidencySummary {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AdminModelInfo {
     pub variant: String,
+    /// Human-readable model name from the catalog.
+    pub display_name: String,
+    /// Primary task: tts, asr, diarization, chat, forced_align, audio_chat
+    /// or tokenizer.
+    pub task: String,
+    /// Expected download size from the catalog, for models not yet on disk.
+    pub estimated_size_bytes: u64,
+    /// Catalog estimate of memory needed to run the model, in GB.
+    pub memory_required_gb: f32,
     pub enabled: bool,
     pub license: Option<String>,
     pub status: String,
@@ -194,6 +203,10 @@ impl AdminModelInfo {
         let variant = info.variant;
         Self {
             variant: variant.dir_name().to_string(),
+            display_name: variant.display_name().to_string(),
+            task: variant.primary_task().as_str().to_string(),
+            estimated_size_bytes: variant.estimated_size(),
+            memory_required_gb: variant.memory_required_gb(),
             enabled: info.enabled,
             license: variant.license_label().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
@@ -296,7 +309,10 @@ impl AdminModelRouteCapabilities {
             studio_projects: supports_tts,
             voice_realtime_text_model: variant.is_chat(),
             voice_realtime_modular_asr: variant.is_asr(),
-            voice_realtime_modular_tts: supports_tts,
+            voice_realtime_modular_tts: crate::app::voice_realtime::validate_realtime_tts_model(
+                variant,
+            )
+            .is_ok(),
             voice_realtime_unified: variant.is_audio_chat(),
             forced_alignment: variant.is_forced_aligner(),
             tokenizer: variant.is_tokenizer(),
@@ -362,6 +378,9 @@ fn model_modalities(variant: ModelVariant) -> Vec<String> {
     if variant.is_chat() {
         push("text_input");
         push("text_output");
+    }
+    if crate::app::chat_content::variant_accepts_image_input(variant) {
+        push("image_input");
     }
     if variant.speech_capabilities().is_some() {
         push("text_input");
@@ -980,6 +999,20 @@ fn model_precision_rank(dir_name: &str) -> u8 {
 mod tests {
     use super::*;
     use izwi_core::LoadedModelDiagnostics;
+
+    /// The realtime TTS flag matches what `/v1/voice/realtime/ws` accepts:
+    /// a speech model without built-in voices or streaming is not offered.
+    #[test]
+    fn realtime_tts_capability_matches_the_voice_socket() {
+        let realtime_tts =
+            |variant| AdminModelRouteCapabilities::from_variant(variant).voice_realtime_modular_tts;
+        assert!(realtime_tts(ModelVariant::Kokoro82M));
+        assert!(!realtime_tts(ModelVariant::Qwen3Tts12Hz06BBase));
+        assert!(
+            AdminModelRouteCapabilities::from_variant(ModelVariant::Qwen3Tts12Hz06BBase)
+                .openai_audio_speech
+        );
+    }
 
     /// P1.0: naming a removed variant (CLI `pull` reads it through this
     /// route) is a 400 that names the dense replacement.

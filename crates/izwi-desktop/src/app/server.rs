@@ -274,7 +274,8 @@ fn configure_local_server_command(cmd: &mut Command, bind_host: &str, port: u16)
     // The standalone server reads the shared user config.toml and overlays its
     // inherited environment once. Do not synthesize default performance env
     // here: that would erase persisted opt-outs before the server can merge them.
-    cmd.env("IZWI_HOST", bind_host)
+    super::console::hide_console_window(cmd)
+        .env("IZWI_HOST", bind_host)
         .env("IZWI_PORT", port.to_string())
         .env(DESKTOP_OWNER_PIPE_ENV, "1")
         .stdin(Stdio::piped());
@@ -328,18 +329,19 @@ fn probe_server(server_url: &Url, timeout: Duration) -> Result<()> {
     let live_url = server_url
         .join("/livez")
         .context("failed to construct izwi-server liveness URL")?;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("failed to build izwi-server probe client")?
-        .get(live_url)
-        .send()
-        .context("liveness probe failed")?
-        .error_for_status()
-        .context("liveness probe returned an error status")?;
-    let body = response
-        .text()
-        .context("failed to read liveness response")?;
+    // Runs during Tauri setup on the main thread, inside the Tokio runtime.
+    let body = super::blocking::run_off_runtime(move || -> Result<String> {
+        let response = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("failed to build izwi-server probe client")?
+            .get(live_url)
+            .send()
+            .context("liveness probe failed")?
+            .error_for_status()
+            .context("liveness probe returned an error status")?;
+        response.text().context("failed to read liveness response")
+    })?;
     validate_liveness_body(&body, env!("CARGO_PKG_VERSION"))
 }
 

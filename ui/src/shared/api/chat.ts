@@ -78,6 +78,8 @@ export interface ChatThread {
   updated_at: number;
   last_message_preview: string | null;
   message_count: number;
+  /** Whether any message in the thread carries an image. */
+  has_images?: boolean;
 }
 
 export interface ChatThreadMessageRecord {
@@ -89,6 +91,12 @@ export interface ChatThreadMessageRecord {
   created_at: number;
   tokens_generated: number | null;
   generation_time_ms: number | null;
+  /** Model that wrote an assistant reply (absent for older messages). */
+  model_id?: string | null;
+  /** Why an assistant reply ended: stop, length, cancelled or error. */
+  finish_reason?: string | null;
+  /** How long the reply reasoned before its answer began, in ms. */
+  reasoning_ms?: number | null;
 }
 
 export interface ChatThreadDetail {
@@ -150,6 +158,12 @@ export interface ChatThreadSendMessageRequest {
    */
   truncation?: "auto" | "disabled";
 }
+
+/** Generation settings for a retried reply: the prompt is already stored. */
+export type ChatThreadRegenerateRequest = Omit<
+  ChatThreadSendMessageRequest,
+  "content" | "content_parts"
+>;
 
 export interface ChatThreadSendMessageResponse {
   thread_id: string;
@@ -462,6 +476,62 @@ export class ChatApiClient {
     request: ChatThreadSendMessageRequest,
     callbacks: ChatThreadStreamCallbacks,
   ): AbortController {
+    return this.streamThreadTurn(
+      `/chat/threads/${encodeURIComponent(threadId)}/messages`,
+      "POST",
+      request,
+      callbacks,
+    );
+  }
+
+  /** Replace one of your messages and everything after it, streaming the
+   * new reply. The thread is unchanged if generation fails. */
+  editChatThreadMessageStream(
+    threadId: string,
+    messageId: string,
+    request: ChatThreadSendMessageRequest,
+    callbacks: ChatThreadStreamCallbacks,
+  ): AbortController {
+    return this.streamThreadTurn(
+      `/chat/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}`,
+      "PATCH",
+      request,
+      callbacks,
+    );
+  }
+
+  /** Replace a reply with a new one, optionally from another model. */
+  regenerateChatThreadMessageStream(
+    threadId: string,
+    messageId: string,
+    request: ChatThreadRegenerateRequest,
+    callbacks: ChatThreadStreamCallbacks,
+  ): AbortController {
+    return this.streamThreadTurn(
+      `/chat/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}/regenerate`,
+      "POST",
+      request,
+      callbacks,
+    );
+  }
+
+  async deleteChatThreadMessage(
+    threadId: string,
+    messageId: string,
+  ): Promise<{ id: string; deleted: boolean }> {
+    return this.http.request(
+      `/chat/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  private streamThreadTurn(
+    path: string,
+    method: "POST" | "PATCH",
+    request: ChatThreadRegenerateRequest &
+      Partial<Pick<ChatThreadSendMessageRequest, "content" | "content_parts">>,
+    callbacks: ChatThreadStreamCallbacks,
+  ): AbortController {
     const abortController = new AbortController();
 
     const startStream = async () => {
@@ -469,11 +539,9 @@ export class ChatApiClient {
       let sawNonemptyDelta = false;
       try {
         const response = await fetch(
-          this.http.url(
-            `/chat/threads/${encodeURIComponent(threadId)}/messages`,
-          ),
+          this.http.url(path),
           {
-            method: "POST",
+            method,
             headers: {
               "Content-Type": "application/json",
             },

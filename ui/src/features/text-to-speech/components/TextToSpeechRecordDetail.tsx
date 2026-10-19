@@ -1,16 +1,20 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
-  ArrowLeft,
+  CalendarDays,
   Check,
+  Clock,
   Copy,
+  Cpu,
   Download,
   Loader2,
+  Mic,
   OctagonX,
   Trash2,
 } from "lucide-react";
 
 import { api, type SpeechHistoryRecord } from "@/api";
+import { RecordAudioPlayer } from "@/components/audio/RecordAudioPlayer";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -20,10 +24,28 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  formatSpeechCreatedAt,
-  formatSpeechDuration,
-  normalizeSpeechProcessingStatus,
-} from "@/features/text-to-speech/support";
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import type { RowMenuItem } from "@/components/history/RowMenu";
+import type { Breadcrumb } from "@/components/PageShell";
+import { FactsList, formatProcessingFact } from "@/components/FactsList";
+import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { normalizeSpeechProcessingStatus } from "@/features/text-to-speech/support";
+
+const TITLE_MAX_CHARS = 60;
+
+/** The opening of the spoken text, which names a take better than its model. */
+function speechRecordTitle(record: SpeechHistoryRecord | null): string {
+  const text = record?.input_text?.replace(/\s+/g, " ").trim() ?? "";
+  if (!text) {
+    return "Speech generation";
+  }
+  return text.length > TITLE_MAX_CHARS
+    ? `${text.slice(0, TITLE_MAX_CHARS).trimEnd()}…`
+    : text;
+}
 
 interface TextToSpeechRecordDetailProps {
   record: SpeechHistoryRecord | null;
@@ -34,9 +56,12 @@ interface TextToSpeechRecordDetailProps {
   deleteError?: string | null;
   deletePending?: boolean;
   cancelPending?: boolean;
-  onBack?: () => void;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
+  /** The list this record belongs to, for the breadcrumb trail. */
+  parentCrumb: Breadcrumb;
+  /** Route actions for the header menu (Models). */
+  extraMenuItems?: RowMenuItem[];
 }
 
 export function TextToSpeechRecordDetail({
@@ -48,9 +73,10 @@ export function TextToSpeechRecordDetail({
   deleteError = null,
   deletePending = false,
   cancelPending = false,
-  onBack,
   onCancel,
   onDelete,
+  parentCrumb,
+  extraMenuItems = [],
 }: TextToSpeechRecordDetailProps) {
   const [copied, setCopied] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -105,53 +131,66 @@ export function TextToSpeechRecordDetail({
     await onDelete();
   }
 
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          {onBack ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="mb-4 h-10 gap-2 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 text-sm font-medium text-[var(--text-secondary)] shadow-sm hover:bg-[var(--bg-surface-1)]"
-              onClick={onBack}
-            >
-              <ArrowLeft className="h-4 w-4" />
-              Back to history
-            </Button>
-          ) : null}
-          <h2 className="truncate text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
-            {record?.model_id || "Speech generation"}
-          </h2>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
-            {record ? <span>{formatSpeechCreatedAt(record.created_at)}</span> : null}
-            {record?.audio_duration_secs != null ? (
-              <span>{formatSpeechDuration(record.audio_duration_secs)}</span>
-            ) : null}
-            {record?.model_id ? <span>{record.model_id}</span> : null}
-            {voiceLabel ? <span>Voice: {voiceLabel}</span> : null}
-          </div>
-        </div>
+  const title = speechRecordTitle(record);
+  const meta: RecordMetaItem[] = record
+    ? [
+        { icon: CalendarDays, label: formatHistoryDate(record.created_at) },
+        ...(record.audio_duration_secs != null
+          ? [
+              {
+                icon: Clock,
+                label: formatClockDuration(record.audio_duration_secs),
+              },
+            ]
+          : []),
+        ...(voiceLabel ? [{ icon: Mic, label: voiceLabel, title: "Voice" }] : []),
+        ...(record.model_id
+          ? [
+              {
+                icon: Cpu,
+                label: getModelDisplayName(record.model_id),
+                title: "Model",
+              },
+            ]
+          : []),
+      ]
+    : [];
+  const menuItems: RowMenuItem[] = [
+    ...(onCancel && canCancel
+      ? [
+          {
+            id: "cancel",
+            label: cancelPending ? "Cancelling…" : "Cancel generation",
+            icon: OctagonX,
+            disabled: cancelPending,
+            onSelect: () => void onCancel(),
+          },
+        ]
+      : []),
+    ...extraMenuItems,
+    ...(onDelete
+      ? [
+          {
+            id: "delete",
+            label: "Delete",
+            icon: Trash2,
+            danger: true,
+            separatorBefore: true,
+            disabled: deletePending,
+            onSelect: () => setDeleteConfirmOpen(true),
+          },
+        ]
+      : []),
+  ];
 
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {onCancel && canCancel ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--status-warning-border)] text-[var(--status-warning-text)]"
-              onClick={() => void onCancel()}
-              disabled={cancelPending}
-            >
-              {cancelPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <OctagonX className="h-4 w-4" />
-              )}
-              Cancel generation
-            </Button>
-          ) : null}
+  return (
+    <RecordPage
+      title={title}
+      breadcrumbs={[parentCrumb, { label: title }]}
+      meta={meta}
+      menuItems={menuItems}
+      actions={
+        <>
           <Button
             type="button"
             variant="outline"
@@ -165,7 +204,6 @@ export function TextToSpeechRecordDetail({
           </Button>
           <Button
             type="button"
-            variant="outline"
             size="sm"
             className="h-9 gap-2"
             onClick={() => void handleDownloadAudio()}
@@ -174,26 +212,9 @@ export function TextToSpeechRecordDetail({
             <Download className="h-4 w-4" />
             Download
           </Button>
-          {onDelete ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--danger-border)] text-[var(--danger-text)] hover:bg-[var(--danger-bg)]"
-              onClick={() => setDeleteConfirmOpen(true)}
-              disabled={deletePending}
-            >
-              {deletePending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="h-4 w-4" />
-              )}
-              Delete
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
+        </>
+      }
+    >
       {error ? (
         <Card
           className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
@@ -226,67 +247,68 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Audio
-        </h3>
-        {loading ? (
-          <p
-            className="mt-3 text-sm text-[var(--text-muted)]"
-            role="status"
-            aria-live="polite"
-          >
-            Loading record...
-          </p>
-        ) : hasAudio ? (
-          <audio src={audioUrl || undefined} className="mt-3 h-11 w-full" controls />
-        ) : (
-          <p className="mt-3 text-sm text-[var(--text-muted)]">
-            Audio is not available yet.
-          </p>
-        )}
-      </Card>
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr),280px]">
+        <div className="space-y-5">
+    <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Audio
+            </h3>
+            {loading ? (
+              <p
+                className="mt-3 text-sm text-[var(--text-muted)]"
+                role="status"
+                aria-live="polite"
+              >
+                Loading record...
+              </p>
+            ) : hasAudio ? (
+              <RecordAudioPlayer
+                src={audioUrl ?? ""}
+                durationHint={record?.audio_duration_secs}
+                className="mt-3"
+              />
+            ) : (
+              <p className="mt-3 text-sm text-[var(--text-muted)]">
+                Audio is not available yet.
+              </p>
+            )}
+          </Card>
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Input text
-        </h3>
-        <p className="mt-3 whitespace-pre-wrap rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-sm leading-6 text-[var(--text-primary)]">
-          {record?.input_text || "No input text available."}
-        </p>
-      </Card>
+          <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Input text
+            </h3>
+            <p className="mt-3 whitespace-pre-wrap rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-sm leading-6 text-[var(--text-primary)]">
+              {record?.input_text || "No input text available."}
+            </p>
+          </Card>
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
-          Generation stats
-        </h3>
-        <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Generation time</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record ? `${record.generation_time_ms.toFixed(0)} ms` : "n/a"}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Audio duration</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {formatSpeechDuration(record?.audio_duration_secs ?? null)}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">RTF</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record?.rtf != null ? record.rtf.toFixed(2) : "n/a"}
-            </div>
-          </div>
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-            <div className="text-xs text-[var(--text-muted)]">Tokens generated</div>
-            <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {record?.tokens_generated ?? "n/a"}
-            </div>
-          </div>
+      
         </div>
-      </Card>
+        <FactsList
+          label="Generation"
+          className="self-start"
+          facts={[
+            {
+              label: "Generated in",
+              value:
+                formatProcessingFact(record?.generation_time_ms, record?.rtf) ??
+                "—",
+            },
+            {
+              label: "Length",
+              value: formatClockDuration(record?.audio_duration_secs ?? null),
+            },
+            { label: "Tokens", value: record?.tokens_generated ?? "—" },
+            ...(record?.speed != null && record.speed !== 1
+              ? [{ label: "Speed", value: `${record.speed}×` }]
+              : []),
+            ...(record?.language
+              ? [{ label: "Language", value: record.language }]
+              : []),
+          ]}
+        />
+      </div>
 
       <Dialog
         open={deleteConfirmOpen}
@@ -357,6 +379,6 @@ export function TextToSpeechRecordDetail({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </RecordPage>
   );
 }

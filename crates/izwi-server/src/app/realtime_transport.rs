@@ -40,8 +40,25 @@ pub(crate) enum OutboundClass {
     Droppable,
 }
 
+/// Builds a message when the writer takes it, or `None` to send nothing.
+pub(crate) type DeferredMessage = Box<dyn FnOnce() -> Option<Message> + Send>;
+
+/// A queued message: ready as is, or built when it is sent. Building at send
+/// time lets a protocol number its events in delivery order, so a message the
+/// mailbox drops (a cut-off turn, a replaced snapshot) never leaves a gap.
+pub(crate) enum OutboundMessage {
+    Ready(Message),
+    Deferred(DeferredMessage),
+}
+
+impl From<Message> for OutboundMessage {
+    fn from(message: Message) -> Self {
+        Self::Ready(message)
+    }
+}
+
 pub(crate) struct OutboundItem {
-    pub(crate) message: Message,
+    pub(crate) message: OutboundMessage,
     pub(crate) class: OutboundClass,
     /// The turn the message belongs to; [`OutboundMailbox::cutoff_turn`]
     /// drops a cancelled turn's queued and later messages.
@@ -243,7 +260,8 @@ impl OutboundMailbox {
     }
 
     /// The next message for the writer, a close the mailbox decided on, or
-    /// `None` once it is closed and drained.
+    /// `None` once it is closed and drained. Deferred messages are built
+    /// here, in queue order; there is one reader (the writer task).
     pub(crate) async fn next(&self) -> Option<MailboxOutput> {
         loop {
             let notified = self.notify.notified();
@@ -260,7 +278,14 @@ impl OutboundMailbox {
                     subtract_audio_depth(&mut state, &item.class);
                     drop(state);
                     self.credit.notify_waiters();
-                    return Some(MailboxOutput::Message(item.message));
+                    let message = match item.message {
+                        OutboundMessage::Ready(message) => Some(message),
+                        OutboundMessage::Deferred(build) => build(),
+                    };
+                    match message {
+                        Some(message) => return Some(MailboxOutput::Message(message)),
+                        None => continue,
+                    }
                 }
                 if state.closed {
                     return None;
@@ -363,7 +388,7 @@ mod tests {
 
     fn audio(byte: u8, bytes: usize, duration_ms: u64) -> OutboundItem {
         OutboundItem {
-            message: Message::Binary(vec![byte].into()),
+            message: Message::Binary(vec![byte].into()).into(),
             class: OutboundClass::Audio { bytes, duration_ms },
             turn_generation: Some(1),
         }
@@ -375,7 +400,7 @@ mod tests {
         for text in ["first", "latest"] {
             mailbox
                 .enqueue(OutboundItem {
-                    message: Message::Text(text.into()),
+                    message: Message::Text(text.into()).into(),
                     class: OutboundClass::Coalescible("transcript-1".to_string()),
                     turn_generation: Some(1),
                 })
@@ -502,7 +527,7 @@ mod tests {
     async fn mailbox_drops_diagnostics_and_cuts_off_cancelled_turns() {
         let mailbox = OutboundMailbox::new(OutboundLimits::items(2));
         let critical = |text: &'static str, generation| OutboundItem {
-            message: Message::Text(text.into()),
+            message: Message::Text(text.into()).into(),
             class: OutboundClass::Critical,
             turn_generation: Some(generation),
         };
@@ -510,7 +535,7 @@ mod tests {
         mailbox.enqueue(critical("next", 8)).expect("enqueue");
         assert_eq!(
             mailbox.enqueue(OutboundItem {
-                message: Message::Text("diagnostic".into()),
+                message: Message::Text("diagnostic".into()).into(),
                 class: OutboundClass::Droppable,
                 turn_generation: None,
             }),
@@ -532,7 +557,7 @@ mod tests {
     async fn mailbox_closes_when_a_critical_message_cannot_queue() {
         let mailbox = OutboundMailbox::new(OutboundLimits::items(1));
         let critical = |text: &'static str| OutboundItem {
-            message: Message::Text(text.into()),
+            message: Message::Text(text.into()).into(),
             class: OutboundClass::Critical,
             turn_generation: None,
         };

@@ -43,6 +43,14 @@ export interface ModelRouteCapabilities {
 
 export interface ModelInfo {
   variant: string;
+  /** Catalog display name, e.g. "Qwen3-TTS 0.6B CustomVoice". */
+  display_name?: string;
+  /** Primary task: tts, asr, diarization, chat, forced_align, audio_chat, tokenizer. */
+  task?: string;
+  /** Expected download size, for models not yet on disk. */
+  estimated_size_bytes?: number;
+  /** Catalog estimate of memory needed to run the model, in GB. */
+  memory_required_gb?: number;
   enabled?: boolean;
   status:
     | "not_downloaded"

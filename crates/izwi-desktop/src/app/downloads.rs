@@ -35,13 +35,17 @@ fn save_audio_from_url(url: &str, suggested_filename: Option<&str>) -> Result<Pa
         anyhow::bail!("audio download is allowed only from local Izwi server URLs");
     }
 
-    let response = reqwest::blocking::get(parsed_url.clone())
-        .with_context(|| format!("failed downloading audio from {parsed_url}"))?
-        .error_for_status()
-        .with_context(|| format!("audio download failed for {parsed_url}"))?;
-    let bytes = response
-        .bytes()
-        .context("failed reading downloaded audio bytes")?;
+    // Synchronous Tauri commands run on the main thread, inside the Tokio
+    // runtime, where reqwest's blocking client cannot be used directly.
+    let bytes = super::blocking::run_off_runtime(move || -> Result<_> {
+        let response = reqwest::blocking::get(parsed_url.clone())
+            .with_context(|| format!("failed downloading audio from {parsed_url}"))?
+            .error_for_status()
+            .with_context(|| format!("audio download failed for {parsed_url}"))?;
+        response
+            .bytes()
+            .context("failed reading downloaded audio bytes")
+    })?;
 
     let filename = sanitize_download_filename(suggested_filename.unwrap_or("speech.wav"));
     let downloads_dir = dirs::download_dir()

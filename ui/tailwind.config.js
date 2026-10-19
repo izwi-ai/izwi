@@ -1,6 +1,8 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-    darkMode: ["class"],
+    // The app toggles html.theme-dark / html.theme-light (see
+    // src/app/bootstrap/theme.ts), so `dark:` variants key off that class.
+    darkMode: ["class", ".theme-dark"],
     content: [
     "./index.html",
     "./src/**/*.{js,ts,jsx,tsx}",
@@ -9,18 +11,30 @@ export default {
   	extend: {
   		colors: {
   			primary: {
-  				'50': '#f0f9ff',
-  				'100': '#e0f2fe',
-  				'200': '#bae6fd',
-  				'300': '#7dd3fc',
-  				'400': '#38bdf8',
-  				'500': '#0ea5e9',
-  				'600': '#0284c7',
-  				'700': '#0369a1',
-  				'800': '#075985',
-  				'900': '#0c4a6e',
   				DEFAULT: 'hsl(var(--primary))',
   				foreground: 'hsl(var(--primary-foreground))'
+  			},
+  			// App surface and text tokens from index.css, so new code can write
+  			// bg-surface-1 / text-ink-muted instead of bg-[var(--bg-surface-1)].
+  			// They are plain colors: for transparency use color-mix(), since
+  			// opacity modifiers cannot apply to these hex variables.
+  			surface: {
+  				'0': 'var(--bg-surface-0)',
+  				'1': 'var(--bg-surface-1)',
+  				'2': 'var(--bg-surface-2)',
+  				'3': 'var(--bg-surface-3)',
+  				'4': 'var(--bg-surface-4)'
+  			},
+  			ink: {
+  				DEFAULT: 'var(--text-primary)',
+  				secondary: 'var(--text-secondary)',
+  				muted: 'var(--text-muted)',
+  				subtle: 'var(--text-subtle)'
+  			},
+  			line: {
+  				subtle: 'var(--border-subtle)',
+  				DEFAULT: 'var(--border-default)',
+  				strong: 'var(--border-strong)'
   			},
   			background: 'hsl(var(--background))',
   			foreground: 'hsl(var(--foreground))',

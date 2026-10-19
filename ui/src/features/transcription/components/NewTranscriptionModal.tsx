@@ -1,19 +1,24 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Loader2, Upload } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, Upload } from "lucide-react";
 
 import {
   api,
   type TranscriptionProcessingProgress,
   type TranscriptionRecord,
 } from "@/api";
-import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { StatusBadge } from "@/components/ui/status-badge";
+  CreationDialog,
+  CreationDialogFrame,
+} from "@/components/CreationDialog";
+import {
+  CreationBody,
+  CreationField,
+  CreationOption,
+  ModelRow,
+  ModelRowAction,
+} from "@/components/creation/CreationParts";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { cn } from "@/lib/utils";
 import { LANGUAGE_OPTIONS } from "@/features/transcription/playground/support";
 import {
   prepareSpeechTextUploadBlob,
@@ -487,11 +492,6 @@ export function NewTranscriptionModal({
     [handleSelectedFile],
   );
 
-  const alignerReadyForUse =
-    isSpeakerAttributedAsrMode ||
-    !includeTimestamps ||
-    (!!timestampAlignerModelId && timestampAlignerReady);
-  const transcriptionStackReady = selectedModelReady && alignerReadyForUse;
   const isSelectedModelLoading =
     selectedModelStatus === "loading" || selectedModelStatus === "downloading";
   const isAlignerModelLoading =
@@ -499,39 +499,7 @@ export function NewTranscriptionModal({
     includeTimestamps &&
     (timestampAlignerModelStatus === "loading" ||
       timestampAlignerModelStatus === "downloading");
-  const readinessStackLoading = isSelectedModelLoading || isAlignerModelLoading;
-  const readinessStatusLabel = transcriptionStackReady
-    ? "READY"
-    : readinessStackLoading
-      ? "LOADING"
-      : "NOT LOADED";
-  const readinessTone = transcriptionStackReady ? "success" : "warning";
-  const readinessActionLabel = !selectedModelReady
-    ? "Open ASR models"
-    : includeTimestamps && !alignerReadyForUse
-      ? "Open aligner models"
-      : "Open models";
-  const readinessActionVariant = "default";
   const readinessActionHandler = onOpenModelManager;
-  const loadedModels = useMemo(() => {
-    const models: string[] = [];
-    if (selectedModelReady && selectedModel) {
-      models.push(selectedModel);
-    }
-    if (!isSpeakerAttributedAsrMode && timestampAlignerReady && timestampAlignerModelId) {
-      const alreadyListed = models.includes(timestampAlignerModelId);
-      if (!alreadyListed) {
-        models.push(timestampAlignerModelId);
-      }
-    }
-    return models;
-  }, [
-    isSpeakerAttributedAsrMode,
-    selectedModel,
-    selectedModelReady,
-    timestampAlignerModelId,
-    timestampAlignerReady,
-  ]);
 
   useEffect(() => {
     setError((current) => {
@@ -570,345 +538,257 @@ export function NewTranscriptionModal({
           ? "Opening job"
           : "Creating job";
 
+  const modelRowStatus = (ready: boolean, loading: boolean, modelId: string | null) =>
+    !modelId ? "missing" : ready ? "ready" : loading ? "busy" : "not_ready";
+  const modelRowLabel = (ready: boolean, loading: boolean, modelId: string | null) =>
+    !modelId
+      ? "Choose one in Models"
+      : ready
+        ? "Loaded"
+        : loading
+          ? "Loading…"
+          : "Not loaded";
   const modalBody = (
-    <>
-      <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-          {modalTitle}
-        </DialogTitle>
-        <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-          Upload a recording, choose streaming, and open the job page once the
-          upload is accepted.
-        </DialogDescription>
-        <SpeechTextModeSwitch
-          selectedMode={selectedMode}
-          onSelectMode={onSelectMode}
-        />
-      </div>
+    <CreationBody
+      main={
+        <>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(event) => {
+              event.preventDefault();
+              if (!isSubmitting) {
+                setIsDraggingFile(true);
+              }
+            }}
+            onDragLeave={() => setIsDraggingFile(false)}
+            onDrop={(event) => void handleFileDrop(event)}
+            disabled={isSubmitting}
+            aria-label="Upload audio file"
+            className={cn(
+              "group flex min-h-[13rem] w-full flex-col items-center justify-center gap-3 rounded-[12px] border border-dashed p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+              isDraggingFile
+                ? "border-[var(--text-primary)] bg-[var(--surface-raised)]"
+                : "border-[var(--border-strong)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+            )}
+          >
+            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)]">
+              <Upload className="h-[18px] w-[18px] text-[var(--text-primary)]" />
+            </span>
+            <span className="text-[14px] font-medium text-[var(--text-primary)]">
+              {isDraggingFile
+                ? "Drop to start the transcript"
+                : "Drop a recording here or browse"}
+            </span>
+            <span className="text-xs text-[var(--text-subtle)]">
+              WAV, MP3, M4A, AAC, FLAC
+            </span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={AUDIO_FILE_ACCEPT}
+              className="hidden"
+              onChange={(event) => void handleFileUpload(event)}
+            />
+          </button>
 
-      <div className="grid lg:grid-cols-[minmax(0,1.08fr),minmax(18rem,0.84fr)]">
-        <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
-          <div className="mb-4 flex items-start justify-between gap-4">
-            <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                Audio source
-              </div>
-              <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-                Bring in a recording
-              </h3>
-              <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
-                Choose a saved clip from your device and move straight into the dedicated transcript workspace.
-              </p>
-            </div>
-            {isSubmitting ? (
-              <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {submissionStatusLabel}
-              </div>
-            ) : null}
-          </div>
-
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              onDragOver={(event) => {
-                event.preventDefault();
-                if (!isSubmitting) {
-                  setIsDraggingFile(true);
-                }
-              }}
-              onDragLeave={() => setIsDraggingFile(false)}
-              onDrop={(event) => void handleFileDrop(event)}
+          {uploadState ? (
+            <SpeechTextUploadProgress
+              {...uploadState}
+              canCancel={
+                isSubmitting &&
+                (uploadState.phase === "preparing" ||
+                  uploadState.phase === "uploading")
+              }
+              onCancel={handleCancelUpload}
+            />
+          ) : null}
+        </>
+      }
+      side={
+        <>
+          <CreationField label="Language">
+            <Select
+              value={selectedLanguage}
+              onValueChange={setSelectedLanguage}
               disabled={isSubmitting}
-              aria-label="Upload audio file"
-              className={`group flex min-h-[13.5rem] w-full flex-col items-center justify-center rounded-[24px] border border-dashed p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                isDraggingFile
-                  ? "border-[var(--status-info-text)] bg-[var(--bg-surface-2)]"
-                  : "border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-              }`}
             >
-              <div className="flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]">
-                <Upload className="h-5.5 w-5.5 text-[var(--text-primary)]" />
-              </div>
+              <SelectTrigger aria-label="Language" className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]">
+                <SelectValue placeholder="Language" />
+              </SelectTrigger>
+              <SelectContent>
+                {LANGUAGE_OPTIONS.map((language) => (
+                  <SelectItem key={language} value={language}>
+                    {language}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </CreationField>
 
-              <div className="mt-5 space-y-2">
-                <div>
-                  <div className="text-base font-semibold text-[var(--text-primary)]">
-                    Upload audio
-                  </div>
-                  <div className="mt-1.5 max-w-[18rem] text-[13px] leading-5 text-[var(--text-muted)]">
-                    {isDraggingFile
-                      ? "Drop the file here to create a transcript job."
-                      : "Click to choose a recording or drag it here to upload."}
-                  </div>
-                </div>
+          {isSpeakerAttributedAsrMode ? (
+            <CreationField label="Expected speakers">
+              <Select
+                value={speakerExpectation}
+                onValueChange={setSpeakerExpectation}
+                disabled={isSubmitting}
+              >
+                <SelectTrigger aria-label="Expected speakers" className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]">
+                  <SelectValue placeholder="Expected speakers" />
+                </SelectTrigger>
+                <SelectContent>
+                  {SPEAKER_EXPECTATION_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </CreationField>
+          ) : null}
 
-                <div className="text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  WAV, MP3, M4A, AAC
-                </div>
-              </div>
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept={AUDIO_FILE_ACCEPT}
-                className="hidden"
-                onChange={(event) => void handleFileUpload(event)}
-              />
-            </button>
-
-            {uploadState ? (
-              <div className="mt-3">
-                <SpeechTextUploadProgress
-                  {...uploadState}
-                  canCancel={
-                    isSubmitting &&
-                    (uploadState.phase === "preparing" ||
-                      uploadState.phase === "uploading")
-                  }
-                  onCancel={handleCancelUpload}
-                />
-              </div>
-            ) : null}
-
-            <div className="mt-3">
-              <div className="flex rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-[13px] leading-5 text-[var(--text-muted)]">
-                The job opens on its own page as soon as the upload is accepted.
-              </div>
-            </div>
-          </div>
-
-        <div className="px-6 py-5 sm:px-6">
-          <div className="space-y-2.5">
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Language
-                </div>
-                <Select
-                  value={selectedLanguage}
-                  onValueChange={setSelectedLanguage}
-                  disabled={isSubmitting}
-                >
-                  <SelectTrigger className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm">
-                    <SelectValue placeholder="Language" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {LANGUAGE_OPTIONS.map((language) => (
-                      <SelectItem key={language} value={language}>
-                        {language}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {isSpeakerAttributedAsrMode ? (
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                    Expected speakers
-                  </div>
-                  <Select
-                    value={speakerExpectation}
-                    onValueChange={setSpeakerExpectation}
-                    disabled={isSubmitting}
-                  >
-                    <SelectTrigger className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm">
-                      <SelectValue placeholder="Expected speakers" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SPEAKER_EXPECTATION_OPTIONS.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              ) : (
-                <>
-                  <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-[var(--text-primary)]">
-                        Include timestamps
-                      </div>
-                      <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                        {timestampsUnavailableReason ??
-                          "Add word and segment timing when the aligner path is ready."}
-                      </div>
-                    </div>
-                    <div className="relative mt-0.5 shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={includeTimestamps}
-                        onChange={(event) =>
-                          handleIncludeTimestampsChange(event.target.checked)
-                        }
-                        className="peer sr-only"
-                        disabled={isSubmitting || streamingEnabled}
-                        title={timestampsUnavailableReason ?? undefined}
-                      />
-                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                      </span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-[var(--text-primary)]">
-                        Stream results
-                      </div>
-                      <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                        {streamingUnavailableReason ??
-                          "Start the job with live transcript updates instead of waiting for a single final response."}
-                      </div>
-                    </div>
-                    <div className="relative mt-0.5 shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={streamingEnabled}
-                        onChange={(event) =>
-                          handleStreamingEnabledChange(event.target.checked)
-                        }
-                        className="peer sr-only"
-                        disabled={isSubmitting || includeTimestamps}
-                        title={streamingUnavailableReason ?? undefined}
-                      />
-                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                      </span>
-                    </div>
-                  </label>
-                </>
+          <CreationField
+            label={isSpeakerAttributedAsrMode ? "SAA model" : "Transcription model"}
+          >
+            <ModelRow
+              name={
+                selectedModel
+                  ? getModelDisplayName(selectedModel)
+                  : "No model selected"
+              }
+              status={modelRowStatus(
+                selectedModelReady,
+                isSelectedModelLoading,
+                selectedModel,
               )}
+              statusLabel={modelRowLabel(
+                selectedModelReady,
+                isSelectedModelLoading,
+                selectedModel,
+              )}
+              actions={
+                <ModelRowAction
+                  onClick={readinessActionHandler}
+                  disabled={isSubmitting}
+                  aria-label={
+                    isSpeakerAttributedAsrMode
+                      ? "Change SAA model"
+                      : "Change transcription model"
+                  }
+                >
+                  Change
+                </ModelRowAction>
+              }
+            />
+          </CreationField>
 
-              <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-[var(--text-primary)]">
-                    Generate summary
-                  </div>
-                  <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                    Create an AI summary after the transcript is ready.
-                  </div>
-                </div>
-                <div className="relative mt-0.5 shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={generateSummary}
-                    onChange={(event) =>
-                      setGenerateSummary(event.target.checked)
+          {!isSpeakerAttributedAsrMode ? (
+            <>
+              <CreationOption
+                title="Include timestamps"
+                description={
+                  timestampsUnavailableReason ??
+                  "Segment and word times for review and subtitles."
+                }
+                checked={includeTimestamps}
+                onCheckedChange={handleIncludeTimestampsChange}
+                disabled={isSubmitting || streamingEnabled}
+              />
+              {includeTimestamps ? (
+                <CreationField label="Timestamp aligner">
+                  <ModelRow
+                    name={
+                      timestampAlignerModelId
+                        ? getModelDisplayName(timestampAlignerModelId)
+                        : "No aligner selected"
                     }
-                    className="peer sr-only"
-                    disabled={isSubmitting}
+                    status={modelRowStatus(
+                      timestampAlignerReady,
+                      isAlignerModelLoading,
+                      timestampAlignerModelId,
+                    )}
+                    statusLabel={modelRowLabel(
+                      timestampAlignerReady,
+                      isAlignerModelLoading,
+                      timestampAlignerModelId,
+                    )}
+                    actions={
+                      <ModelRowAction
+                        onClick={readinessActionHandler}
+                        disabled={isSubmitting}
+                        aria-label="Change aligner model"
+                      >
+                        Change
+                      </ModelRowAction>
+                    }
                   />
-                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                  </span>
-                </div>
-              </label>
-
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                  Model readiness
-                </div>
-
-                <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs text-[var(--text-muted)]">
-                      {isSpeakerAttributedAsrMode ? "SAA model" : "Transcription model"}
-                    </span>
-                    <StatusBadge tone={readinessTone}>
-                      {readinessStatusLabel}
-                    </StatusBadge>
-                  </div>
-
-                  {loadedModels.length > 0 ? (
-                    <div className="mt-3 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-2">
-                      <div className="space-y-1">
-                        {loadedModels.map((model) => (
-                          <div
-                            key={model}
-                            className="truncate text-xs text-[var(--text-primary)]"
-                            title={model}
-                          >
-                            {model}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-
-                  <Button
-                    type="button"
-                    variant={readinessActionVariant}
-                    size="sm"
-                    className="mt-3 h-9 w-full gap-2"
-                    onClick={readinessActionHandler}
-                    disabled={isSubmitting}
-                  >
-                    {readinessActionLabel}
-                  </Button>
-                </div>
-              </div>
-
-              {error ? (
-                <div className="rounded-2xl border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3.5 py-2.5 text-[13px] leading-5 text-[var(--danger-text)]">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                    <p>{error}</p>
-                  </div>
-                </div>
+                </CreationField>
               ) : null}
-            </div>
+              <CreationOption
+                title="Stream results"
+                description={
+                  streamingUnavailableReason ?? "See text as it is recognised."
+                }
+                checked={streamingEnabled}
+                onCheckedChange={handleStreamingEnabledChange}
+                disabled={isSubmitting || includeTimestamps}
+              />
+            </>
+          ) : null}
 
-          <div className="mt-4 flex justify-end">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={onClose}
-              disabled={isSubmitting}
+          <CreationOption
+            title="Generate summary"
+            description="Create an AI summary after the transcript is ready."
+            checked={generateSummary}
+            onCheckedChange={setGenerateSummary}
+            disabled={isSubmitting}
+          />
+
+          {error ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
             >
-              Cancel
-            </Button>
-          </div>
-        </div>
-      </div>
-    </>
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>{error}</p>
+            </div>
+          ) : null}
+        </>
+      }
+    />
   );
+  const frameProps = {
+    title: modalTitle,
+    description:
+      "Upload a recording, choose streaming, and open the job page once the upload is accepted.",
+    header: (
+      <SpeechTextModeSwitch
+        selectedMode={selectedMode}
+        onSelectMode={onSelectMode}
+      />
+    ),
+    onClose,
+    footerStart: isSubmitting
+      ? `${submissionStatusLabel}…`
+      : "The job starts when you choose a file.",
+  };
 
   if (!renderInDialog) {
-    return modalBody;
+    return (
+      <CreationDialogFrame {...frameProps} cancelDisabled={isSubmitting}>
+        {modalBody}
+      </CreationDialogFrame>
+    );
   }
 
   return (
-    <Dialog
+    <CreationDialog
+      {...frameProps}
       open={isOpen}
-      onOpenChange={(open) => {
-        if (!open && !isSubmitting) {
-          onClose();
-        }
-      }}
+      blockDismiss={blockOutsideDismiss || isSubmitting}
+      className="max-w-[46rem]"
     >
-      <DialogContent
-        className="max-w-[46rem] border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
-        onEscapeKeyDown={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-        onPointerDownOutside={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-        onInteractOutside={(event) => {
-          if (blockOutsideDismiss || isSubmitting) {
-            event.preventDefault();
-          }
-        }}
-      >
-        {modalBody}
-      </DialogContent>
-    </Dialog>
+      {modalBody}
+    </CreationDialog>
   );
 }

@@ -198,6 +198,21 @@ fn validate_json_key(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `LIKE` pattern matching `search` as a literal substring. Use with
+/// `ESCAPE '\'`: the `%`, `_` and `\` characters in `search` are escaped.
+pub fn like_contains_pattern(search: &str) -> String {
+    let mut pattern = String::with_capacity(search.len() + 2);
+    pattern.push('%');
+    for character in search.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

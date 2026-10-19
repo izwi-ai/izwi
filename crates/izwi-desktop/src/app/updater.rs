@@ -8,7 +8,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use super::updater_contract::{
-    github_manifest_url, github_releases_api_url, install_behavior_for_platform,
+    github_manifest_url, github_releases_api_url, install_behavior_for_platform, is_newer_release,
     parse_beta_sequence, updater_target_for_platform, PlatformInstallBehavior, UpdaterContract,
 };
 
@@ -74,6 +74,9 @@ struct UpdaterRuntimeConfig {
 impl UpdaterRuntimeConfig {
     fn from_env() -> Self {
         let disable_flag = env_bool_true("IZWI_DISABLE_APP_UPDATES");
+        // Without a pubkey the updater plugin is never registered, and asking
+        // it for a builder would panic, so treat that build as update-less.
+        let has_pubkey = configured_pubkey().is_some();
         let request_timeout_ms = env_u64(
             "IZWI_UPDATER_REQUEST_TIMEOUT_MS",
             DEFAULT_REQUEST_TIMEOUT_SECONDS * 1000,
@@ -89,9 +92,17 @@ impl UpdaterRuntimeConfig {
             .filter(|value| !value.is_empty())
             .and_then(|value| Url::parse(&value).ok());
 
+        let disable_reason = if disable_flag {
+            Some("IZWI_DISABLE_APP_UPDATES is set".to_string())
+        } else if !has_pubkey {
+            Some("this build has no updater public key".to_string())
+        } else {
+            None
+        };
+
         Self {
-            enabled: !disable_flag,
-            disable_reason: disable_flag.then(|| "IZWI_DISABLE_APP_UPDATES is set".to_string()),
+            enabled: disable_reason.is_none(),
+            disable_reason,
             request_timeout: Duration::from_millis(request_timeout_ms),
             max_check_attempts: max_check_attempts.max(1),
             retry_backoff: Duration::from_millis(retry_backoff_ms.max(1)),
@@ -201,6 +212,7 @@ pub async fn check_for_beta_update(
                 .updater_builder()
                 .timeout(runtime.request_timeout)
                 .target(updater_target)
+                .version_comparator(|current, release| is_newer_release(&current, &release.version))
                 .endpoints(vec![release_manifest_url])?
                 .build()?;
             updater.check().await.map_err(UpdaterError::from)
@@ -240,12 +252,15 @@ pub async fn install_beta_update(
         return Err(UpdaterError::UpdatesDisabled);
     }
 
+    // Keep the pending update until it installs: taking it before the
+    // download meant a failed download could not be retried ("there is no
+    // pending update") until the next check.
     let update = {
-        let mut pending_slot = updater_state
+        let pending_slot = updater_state
             .pending_update
             .lock()
             .expect("poisoned updater state mutex");
-        pending_slot.take().ok_or(UpdaterError::NoPendingUpdate)?
+        pending_slot.clone().ok_or(UpdaterError::NoPendingUpdate)?
     };
 
     let _ = on_event.send(DownloadEvent::Started {
@@ -265,6 +280,12 @@ pub async fn install_beta_update(
             },
         )
         .await?;
+
+    updater_state
+        .pending_update
+        .lock()
+        .expect("poisoned updater state mutex")
+        .take();
 
     let behavior = install_behavior_for_platform(std::env::consts::OS);
 
@@ -342,6 +363,21 @@ where
     }
 
     Err(last_error.unwrap_or(UpdaterError::NoMatchingBetaRelease))
+}
+
+/// The minisign public key update signatures are checked against: baked in
+/// at compile time for release builds, or read from the environment.
+pub fn configured_pubkey() -> Option<String> {
+    option_env!("IZWI_UPDATER_PUBKEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("IZWI_UPDATER_PUBKEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn env_bool_true(name: &str) -> bool {

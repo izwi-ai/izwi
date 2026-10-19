@@ -1,8 +1,16 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import type { ComponentProps } from "react";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { TranscriptionPage } from "./route";
@@ -383,7 +391,7 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.getByRole("heading", { name: "No transcripts yet" }),
     ).toBeInTheDocument();
   });
 
@@ -457,10 +465,12 @@ describe("TranscriptionPage detail route", () => {
     expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "txr-cursor-2",
+      filters: {},
     });
   });
 
@@ -508,7 +518,7 @@ describe("TranscriptionPage detail route", () => {
 
     try {
       expect(
-        await screen.findByText("Transcription is in progress."),
+        await screen.findByText("Transcribing"),
       ).toBeInTheDocument();
 
       await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled());
@@ -523,10 +533,10 @@ describe("TranscriptionPage detail route", () => {
       );
 
       expect(
-        screen.getByText("Transcription is in progress."),
+        screen.getByText("Transcribing"),
       ).toBeInTheDocument();
       expect(
-        screen.queryByText("Loading speech-text history..."),
+        screen.queryByText("Loading transcripts…"),
       ).not.toBeInTheDocument();
 
       backgroundRefresh.resolve([
@@ -611,12 +621,13 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "Diarization" })).not.toBeChecked();
-    expect(screen.getByText("Bring in a recording")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Upload audio file" }),
+    ).toHaveTextContent("Drop a recording here or browse");
     expect(screen.getByText("Transcription model")).toBeInTheDocument();
-    expect(screen.getByText("Parakeet-TDT-0.6B-v3")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
-    expect(screen.getByText("Upload audio")).toBeInTheDocument();
+    expect(
+      screen.getByText(getModelDisplayName("Parakeet-TDT-0.6B-v3")),
+    ).toBeInTheDocument();
     expect(screen.getByText("Stream results")).toBeInTheDocument();
   });
 
@@ -638,8 +649,17 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New diarization" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
-    expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Record audio/i })).toBeInTheDocument();
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
+  });
+
+  it("opens transcription creation from a create intent", async () => {
+    renderRoute("/transcription?create=transcription");
+
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
   });
 
   it("opens diarization creation directly from a deep-link intent", async () => {
@@ -659,7 +679,7 @@ describe("TranscriptionPage detail route", () => {
     );
   });
 
-  it("shows NOT LOADED readiness state in transcription mode when required models are not ready", async () => {
+  it("shows the missing-model state in transcription mode when no model is selected", async () => {
     baseProps.selectedModel = null;
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],
@@ -685,8 +705,14 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByText("NOT LOADED")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
+    expect(screen.getByText("Choose one in Models")).toBeInTheDocument();
+    // The aligner row appears once timestamps are on (streaming off first).
+    fireEvent.click(screen.getByRole("switch", { name: /Stream results/i }));
+    fireEvent.click(screen.getByRole("switch", { name: /Include timestamps/i }));
+    expect(screen.getByText("Timestamp aligner")).toBeInTheDocument();
+    expect(
+      screen.getByText(getModelDisplayName("Qwen3-ForcedAligner-0.6B")),
+    ).toBeInTheDocument();
   });
 
   it("clears ASR requirement errors after a transcription model becomes ready", async () => {
@@ -812,7 +838,7 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByText("LOADING")).toBeInTheDocument();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
   });
 
   it("opens model manager from the modal readiness button without raising an error toast", async () => {
@@ -843,7 +869,7 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open ASR models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change transcription model" }));
 
     expect(openModelManager).toHaveBeenCalledTimes(1);
     expect(requestModel).not.toHaveBeenCalled();
@@ -988,7 +1014,7 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1086,7 +1112,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1353,7 +1379,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     await act(async () => {
@@ -1435,7 +1461,7 @@ describe("TranscriptionPage detail route", () => {
       },
     });
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     apiMocks.getTranscriptionRecord.mockResolvedValue({
@@ -1523,7 +1549,7 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
@@ -1595,16 +1621,16 @@ describe("TranscriptionPage detail route", () => {
       expect(apiMocks.listTranscriptionRecords).toHaveBeenCalledTimes(2),
     );
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Back to transcriptions/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     );
 
     expect(await screen.findByText("clip.wav")).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.queryByRole("heading", { name: "No transcripts yet" }),
     ).not.toBeInTheDocument();
   });
 
@@ -1675,14 +1701,14 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: "meeting.wav" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Hello there.")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Back to transcriptions/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/^Ready$/)).not.toBeInTheDocument();
     expect(screen.getByTestId("transcription-review-player")).toHaveClass(
@@ -1742,7 +1768,7 @@ describe("TranscriptionPage detail route", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Transcription Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
     expect(screen.getByText("31%")).toBeInTheDocument();
@@ -1750,7 +1776,7 @@ describe("TranscriptionPage detail route", () => {
       screen.getByRole("progressbar", { name: "ASR processing progress" }),
     ).toHaveAttribute("aria-valuenow", "31");
     expect(
-      screen.getByRole("button", { name: /Back to speech text/i }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     ).toBeInTheDocument();
   });
 
@@ -1872,7 +1898,12 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "meeting.wav" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
 
     expect(
       await screen.findByText(
@@ -1961,7 +1992,7 @@ describe("TranscriptionPage detail route", () => {
       screen.queryByLabelText("Open transcription meeting.wav"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
+      screen.getByRole("heading", { name: "No transcripts yet" }),
     ).toBeInTheDocument();
   });
 

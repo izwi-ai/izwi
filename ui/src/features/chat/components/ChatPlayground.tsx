@@ -1,5 +1,6 @@
 import {
   type ChangeEvent,
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,21 +10,16 @@ import {
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Bot,
+  ArrowDown,
   Brain,
   History,
   Send,
   Square,
-  User,
   Loader2,
-  ChevronDown,
-  ChevronRight,
   Settings2,
   Plus,
   Trash2,
   AlertTriangle,
-  ImageIcon,
-  Film,
 } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
@@ -36,6 +32,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
+import { StatePanel } from "@/components/ui/state-panel";
+import { ChatThreadList } from "@/features/chat/components/ChatThreadList";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import {
   Dialog,
   DialogContent,
@@ -51,24 +50,18 @@ import {
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
-  extractLatestStats,
   fallbackThreadTitleFromUserMessage,
-  formatThreadTimestamp,
   getErrorMessage,
-  isQwen35ThinkingModel,
-  isQwen38ThinkingModel,
-  normalizeGeneratedThreadTitle,
   parseAssistantContent,
-  parseUserMessageDisplayFromContentParts,
+  stripMarkdown,
+  isSameCalendarDay,
+  messageDayLabel,
+  normalizeGeneratedThreadTitle,
   readImageFileAsDataUrl,
-  statsAfterHistoryRefresh,
-  stripThinkingArtifacts,
-  summarizeChatStats,
-  type StreamedTurnStats,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
+  threadHasImageAttachments,
   supportsImplicitOpenThinkTagParsing,
-  threadPreviewFromContent,
 } from "@/features/chat/playground/support";
 import {
   api,
@@ -76,11 +69,32 @@ import {
   type ChatReasoningEffort,
   type ChatThread,
   type ChatThreadMessageRecord,
+  type ChatThreadStreamCallbacks,
 } from "@/api";
-import { MarkdownContent } from "@/components/ui/MarkdownContent";
+import { AssistantMessage } from "@/features/chat/components/messages/AssistantMessage";
+import { UserMessage } from "@/features/chat/components/messages/UserMessage";
+import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
+import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
+import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
+
+/** A turn the user stopped, kept on screen until the server's copy loads. */
+interface StoppedTurn {
+  /** The prompt and its partial reply, marked as stopped. */
+  messages: ChatThreadMessageRecord[];
+  /** Messages the thread had before the turn started. */
+  priorIds: Set<string>;
+  /** Messages the turn replaces (a retried reply, or replies after an edit). */
+  replacedIds: string[];
+}
+
+/** What a streaming turn started from, for keeping it if it is stopped. */
+interface TurnContext {
+  priorIds: Set<string>;
+  replacedIds: string[];
+}
 
 interface ChatComposerDraft {
   input: string;
@@ -89,6 +103,17 @@ interface ChatComposerDraft {
 
 function draftKeyForThread(threadId: string | null): string {
   return threadId ?? NEW_CHAT_DRAFT_KEY;
+}
+
+/** Text messages can be edited in place; ones with attachments cannot. */
+function isEditableUserMessage(message: ChatThreadMessageRecord): boolean {
+  return (
+    message.role === "user" &&
+    !message.id.startsWith("tmp-") &&
+    !(message.content_parts ?? []).some(
+      (part) => part.type !== "text" && part.type !== "input_text",
+    )
+  );
 }
 
 function isEmptyDraft(draft: ChatComposerDraft): boolean {
@@ -102,9 +127,13 @@ export function ChatPlayground({
   chatCapabilities,
   modelLabel,
   modelOptions,
+  modelSupportsThinking,
+  modelSupportsImages,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  readAloudVoice = null,
+  onOpenSpeechModels,
 }: ChatPlaygroundProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeThreadId = searchParams.get("threadId");
@@ -114,6 +143,23 @@ export function ChatPlayground({
   const [expandedThoughts, setExpandedThoughts] = useState<
     Record<string, boolean>
   >({});
+  // Reasoning time measured client-side while a reply streams, keyed by
+  // message id. Replies loaded from history have none.
+  const [reasoningDurations, setReasoningDurations] = useState<
+    Record<string, number>
+  >({});
+  const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(
+    null,
+  );
+  const [deleteReplyId, setDeleteReplyId] = useState<string | null>(null);
+  const [deleteReplyPending, setDeleteReplyPending] = useState(false);
+  const [deleteReplyError, setDeleteReplyError] = useState<string | null>(
+    null,
+  );
+  // Screen readers hear a finished reply once, not each streamed token.
+  const [replyAnnouncement, setReplyAnnouncement] = useState("");
   // Drafts intentionally live only for this mounted session. Durable persistence
   // is out of scope; the thread key prevents in-session cross-conversation leaks.
   const [composerDrafts, setComposerDrafts] = useState<
@@ -137,13 +183,26 @@ export function ChatPlayground({
   const [threadsLoading, setThreadsLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stats, setStats] = useState<ChatGenerationStats | null>(null);
-  const statsSummary = stats ? summarizeChatStats(stats) : null;
+  // A thread whose messages failed to load: shown as that thread's error
+  // state (with Retry), not as an empty new chat.
+  const [threadLoadError, setThreadLoadError] = useState<{
+    threadId: string;
+    message: string;
+  } | null>(null);
+  const [threadLoadAttempt, setThreadLoadAttempt] = useState(0);
+  // Engine stats of replies streamed in this session, keyed by message id.
+  // Stored replies keep only their token count and total time.
+  const [streamedStats, setStreamedStats] = useState<
+    Record<string, ChatGenerationStats>
+  >({});
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
   const [isReadingImages, setIsReadingImages] = useState(false);
   const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
+  // Desktop widths keep the thread list beside the conversation; narrower
+  // windows open it as a drawer.
+  const showThreadColumn = useMediaQuery("(min-width: 1024px)");
   const [deleteTargetThreadId, setDeleteTargetThreadId] = useState<
     string | null
   >(null);
@@ -159,14 +218,18 @@ export function ChatPlayground({
   const messageViewportRef = useRef<HTMLDivElement | null>(null);
   const followingOutputRef = useRef(true);
   const followingOutputThreadRef = useRef<string | null>(null);
-  const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
-  const followingStreamingThinkingRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
   const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
+  const messagesRef = useRef<ChatThreadMessageRecord[]>([]);
+  // The server stores a stopped turn once its stream has wound down, which
+  // can be after the history reload that follows Stop. Until then the turn
+  // lives here, per thread.
+  const stoppedTurnsRef = useRef<Map<string, StoppedTurn[]>>(new Map());
+  const turnContextRef = useRef<TurnContext | null>(null);
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -175,6 +238,48 @@ export function ChatPlayground({
   const pendingImages = activeDraft?.pendingImages ?? [];
 
   composerDraftsRef.current = composerDrafts;
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  /** History from the server plus this session's stopped turns that the
+   * server has not stored yet, each kept whole and placed by when it was
+   * sent. The server's copy is a new stopped reply right after the prompt. */
+  const withStoppedTurns = useCallback(
+    (threadId: string, history: ChatThreadMessageRecord[]) => {
+      let merged = history;
+      for (const turn of stoppedTurnsRef.current.get(threadId) ?? []) {
+        const [prompt] = turn.messages;
+        const stored = history.some(
+          (message, index) =>
+            message.role === "assistant" &&
+            message.finish_reason === "cancelled" &&
+            !turn.priorIds.has(message.id) &&
+            history[index - 1]?.role === "user" &&
+            history[index - 1].content === prompt.content,
+        );
+        if (stored) {
+          continue;
+        }
+        const hidden = new Set([prompt.id, ...turn.replacedIds]);
+        merged = merged.filter((message) => !hidden.has(message.id));
+        const insertAt = merged.findIndex(
+          (message) => message.created_at > prompt.created_at,
+        );
+        merged =
+          insertAt === -1
+            ? [...merged, ...turn.messages]
+            : [
+                ...merged.slice(0, insertAt),
+                ...turn.messages,
+                ...merged.slice(insertAt),
+              ];
+      }
+      return merged;
+    },
+    [],
+  );
 
   const revokeImagePreviews = useCallback(
     (images: PendingImageAttachment[]) => {
@@ -248,6 +353,17 @@ export function ChatPlayground({
     () => messages.filter((message) => message.role !== "system"),
     [messages],
   );
+  const busy = isStreaming || isPreparingThread;
+  // Retry with… offers the loaded chat models.
+  const retryModelOptions = modelOptions.filter((option) => option.isReady);
+  const lastAssistantIndex = useMemo(() => {
+    for (let index = visibleMessages.length - 1; index >= 0; index -= 1) {
+      if (visibleMessages[index].role === "assistant") {
+        return index;
+      }
+    }
+    return -1;
+  }, [visibleMessages]);
   const historyBadgeLabel = useMemo(() => {
     if (threads.length > 99) {
       return "99+";
@@ -255,22 +371,55 @@ export function ChatPlayground({
     return String(Math.max(0, threads.length));
   }, [threads.length]);
 
+  const activeThreadLoadError =
+    threadLoadError && threadLoadError.threadId === activeThreadId
+      ? threadLoadError.message
+      : null;
   const hasConversation =
     !!activeThreadId &&
-    (visibleMessages.length > 0 || isStreaming || messagesLoading);
-  const isEmptyChatWorkspace = !hasConversation;
+    (visibleMessages.length > 0 ||
+      isStreaming ||
+      messagesLoading ||
+      activeThreadLoadError !== null);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const supportedReasoningEfforts =
     chatCapabilities?.reasoning_efforts ?? [];
   const reasoningEffortOptionsKey = supportedReasoningEfforts.join(",");
   const firstSupportedReasoningEffort = supportedReasoningEfforts[0];
-  const supportsImageAttachments =
-    supportsImageAttachmentsForModel(selectedModel);
+  const acceptsImages = useCallback(
+    (variant: string | null) =>
+      variant
+        ? (modelSupportsImages?.(variant) ??
+          supportsImageAttachmentsForModel(variant))
+        : false,
+    [modelSupportsImages],
+  );
+  const supportsImageAttachments = acceptsImages(selectedModel);
   const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
   supportsImageAttachmentsRef.current = supportsImageAttachments;
+  // Attachments survive a switch to a text-only model so the user can switch
+  // back; sending is blocked until they are removed or the model changes.
+  const hasUnsupportedImages =
+    pendingImages.length > 0 && !supportsImageAttachments;
+  const unsupportedImagesMessage = `${modelLabel ?? "This model"} can't read images. Remove them or switch to a model that accepts images.`;
+  // Earlier image turns reach a text-only model as text (server side), so say
+  // so and offer a model that can see them.
+  const threadHasImages = useMemo(
+    () => threadHasImageAttachments(messages),
+    [messages],
+  );
+  const showHistoryImageNotice =
+    Boolean(activeThreadId) && threadHasImages && !supportsImageAttachments;
+  const imageModelOption = modelOptions.find((option) =>
+    acceptsImages(option.value),
+  );
   const renderModelId = activeThread?.model_id ?? selectedModel;
-  const implicitOpenThinkTagModel =
-    supportsImplicitOpenThinkTagParsing(renderModelId);
+  // Parse by the capabilities of the model that wrote the thread, not the
+  // model selected now.
+  const implicitOpenThinkTagModel = renderModelId
+    ? (modelSupportsThinking?.(renderModelId) ??
+      supportsImplicitOpenThinkTagParsing(renderModelId))
+    : false;
   const chatSecondaryButtonClass =
     "rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]";
   const chatSecondaryButtonActiveClass =
@@ -314,28 +463,6 @@ export function ChatPlayground({
     reasoningEffortOptionsKey,
     selectedModel,
     supportsThinking,
-  ]);
-
-  useEffect(() => {
-    if (supportsImageAttachments) {
-      return;
-    }
-    updateComposerDraft(activeDraftKey, (draft) => {
-      if (draft.pendingImages.length === 0) {
-        return draft;
-      }
-      revokeImagePreviews(draft.pendingImages);
-      return { ...draft, pendingImages: [] };
-    });
-    setImagePreview(null);
-    if (imageInputRef.current) {
-      imageInputRef.current.value = "";
-    }
-  }, [
-    activeDraftKey,
-    revokeImagePreviews,
-    supportsImageAttachments,
-    updateComposerDraft,
   ]);
 
   useEffect(() => {
@@ -477,18 +604,6 @@ export function ChatPlayground({
       messageViewportRef.current.scrollHeight;
   }, [visibleMessages, isStreaming, activeThreadId]);
 
-  useLayoutEffect(() => {
-    if (
-      !isStreaming ||
-      !followingStreamingThinkingRef.current ||
-      !streamingThinkingRef.current
-    ) {
-      return;
-    }
-    streamingThinkingRef.current.scrollTop =
-      streamingThinkingRef.current.scrollHeight;
-  }, [isStreaming, messages]);
-
   const handleMessageViewportScroll = useCallback(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) {
@@ -496,15 +611,27 @@ export function ChatPlayground({
     }
     followingOutputRef.current =
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
+    setShowJumpToLatest(!followingOutputRef.current);
   }, []);
 
-  const handleStreamingThinkingScroll = useCallback(() => {
-    const viewport = streamingThinkingRef.current;
+  const jumpToLatest = useCallback(() => {
+    const viewport = messageViewportRef.current;
     if (!viewport) {
       return;
     }
-    followingStreamingThinkingRef.current =
-      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
+    followingOutputRef.current = true;
+    setShowJumpToLatest(false);
+    const reduceMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (typeof viewport.scrollTo === "function") {
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
+    } else {
+      viewport.scrollTop = viewport.scrollHeight;
+    }
   }, []);
 
   useEffect(() => {
@@ -569,7 +696,6 @@ export function ChatPlayground({
     if (!activeThreadId) {
       setMessages([]);
       setExpandedThoughts({});
-      setStats(null);
       setMessagesLoading(false);
       return;
     }
@@ -586,6 +712,7 @@ export function ChatPlayground({
 
     const loadThread = async () => {
       setMessagesLoading(true);
+      setThreadLoadError(null);
       try {
         const detail = await api.getChatThread(requestedThreadId);
         if (cancelled || activeThreadIdRef.current !== requestedThreadId) {
@@ -598,9 +725,8 @@ export function ChatPlayground({
           return;
         }
 
-        setMessages(detail.messages);
+        setMessages(withStoppedTurns(requestedThreadId, detail.messages));
         setExpandedThoughts({});
-        setStats(extractLatestStats(detail.messages));
         setThreads((previous) =>
           previous.map((thread) =>
             thread.id === detail.thread.id ? detail.thread : thread,
@@ -608,9 +734,14 @@ export function ChatPlayground({
         );
       } catch (loadError) {
         if (!cancelled) {
-          setError(
-            getErrorMessage(loadError, "Failed to load this conversation."),
-          );
+          setMessages([]);
+          setThreadLoadError({
+            threadId: requestedThreadId,
+            message: getErrorMessage(
+              loadError,
+              "Failed to load this conversation.",
+            ),
+          });
         }
       } finally {
         if (!cancelled) {
@@ -624,7 +755,7 @@ export function ChatPlayground({
     return () => {
       cancelled = true;
     };
-  }, [activeThreadId]);
+  }, [activeThreadId, threadLoadAttempt, withStoppedTurns]);
 
   const stopStreaming = useCallback(() => {
     if (streamAbortRef.current) {
@@ -637,47 +768,92 @@ export function ChatPlayground({
 
     const activeId = activeThreadIdRef.current;
     if (activeId) {
+      // Keep the stopped prompt and partial reply, marked as stopped.
+      const current = messagesRef.current;
+      let lastUserIndex = -1;
+      for (let index = current.length - 1; index >= 0; index -= 1) {
+        if (current[index].role === "user") {
+          lastUserIndex = index;
+          break;
+        }
+      }
+      if (lastUserIndex >= 0) {
+        const stoppedTurn = current
+          .slice(lastUserIndex)
+          .map((message) =>
+            message.role === "assistant"
+              ? { ...message, finish_reason: "cancelled" }
+              : message,
+          );
+        stoppedTurnsRef.current.set(activeId, [
+          ...(stoppedTurnsRef.current.get(activeId) ?? []),
+          {
+            messages: stoppedTurn,
+            priorIds: turnContextRef.current?.priorIds ?? new Set(),
+            replacedIds: turnContextRef.current?.replacedIds ?? [],
+          },
+        ]);
+        setMessages([...current.slice(0, lastUserIndex), ...stoppedTurn]);
+      }
       void api
         .getChatThread(activeId)
         .then((detail) => {
           if (detail.thread.id !== activeThreadIdRef.current) {
             return;
           }
-          setMessages(detail.messages);
-          setStats(extractLatestStats(detail.messages));
+          setMessages(withStoppedTurns(activeId, detail.messages));
         })
         .catch(() => {
           // Ignore follow-up sync failures after cancel.
         });
       void refreshThreadList(activeId);
     }
-  }, [refreshThreadList]);
+  }, [refreshThreadList, withStoppedTurns]);
 
-  const handleCreateThread = useCallback(async () => {
-    if (isEmptyChatWorkspace || isStreaming || isPreparingThread) {
+  const {
+    state: readAloud,
+    start: startReadAloud,
+    stop: stopReadAloud,
+  } = useReadAloud(setError);
+
+  const toggleReadAloud = useCallback(
+    (messageId: string, text: string) => {
+      if (readAloud?.messageId === messageId) {
+        stopReadAloud();
+        return;
+      }
+      if (!readAloudVoice) {
+        onOpenSpeechModels?.();
+        return;
+      }
+      startReadAloud(messageId, stripMarkdown(text), readAloudVoice);
+    },
+    [
+      onOpenSpeechModels,
+      readAloud,
+      readAloudVoice,
+      startReadAloud,
+      stopReadAloud,
+    ],
+  );
+
+  // Audio belongs to the conversation on screen.
+  useEffect(() => stopReadAloud, [activeThreadId, stopReadAloud]);
+
+  // Starting a chat is local: the thread is created on the server by the
+  // first send, so abandoned "New chat" clicks no longer leave empty threads.
+  const handleStartNewChat = useCallback(() => {
+    if (isStreaming || isPreparingThread) {
       return;
     }
-
-    try {
-      const thread = await api.createChatThread({
-        model_id: selectedModel ?? undefined,
-      });
-      setThreads((previous) => [thread, ...previous]);
-      setActiveThreadInUrl(thread.id);
+    if (activeThreadId) {
+      setActiveThreadInUrl(null);
       setMessages([]);
       setExpandedThoughts({});
-      setStats(null);
-      setError(null);
-    } catch (createError) {
-      setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
-  }, [
-    isEmptyChatWorkspace,
-    isPreparingThread,
-    isStreaming,
-    selectedModel,
-    setActiveThreadInUrl,
-  ]);
+    setError(null);
+    textareaRef.current?.focus();
+  }, [activeThreadId, isPreparingThread, isStreaming, setActiveThreadInUrl]);
 
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
     setDeleteTargetThreadId(threadId);
@@ -711,7 +887,6 @@ export function ChatPlayground({
           setActiveThreadInUrl(null, true);
           setMessages([]);
           setExpandedThoughts({});
-          setStats(null);
         }
       } catch (deleteError) {
         setError(getErrorMessage(deleteError, "Failed to delete this chat."));
@@ -831,6 +1006,7 @@ export function ChatPlayground({
     const text = submittedDraft.input.trim();
     if (
       (text.length === 0 && submittedDraft.pendingImages.length === 0) ||
+      (submittedDraft.pendingImages.length > 0 && !supportsImageAttachments) ||
       isStreaming ||
       isPreparingThread
     ) {
@@ -854,7 +1030,6 @@ export function ChatPlayground({
         setActiveThreadInUrl(createdThread.id);
         setMessages([]);
         setExpandedThoughts({});
-        setStats(null);
         targetThreadId = createdThread.id;
         targetDraftKey = draftKeyForThread(createdThread.id);
         setComposerDrafts((previous) => {
@@ -875,7 +1050,6 @@ export function ChatPlayground({
     }
 
     setError(null);
-    setStats(null);
 
     const requestPayload = buildChatThreadMessagePayload({
       text,
@@ -889,8 +1063,6 @@ export function ChatPlayground({
 
     const timestamp = Date.now();
     const userTempId = `tmp-user-${timestamp}`;
-    const assistantTempId = `tmp-assistant-${timestamp}`;
-
     const optimisticUserMessage: ChatThreadMessageRecord = {
       id: userTempId,
       thread_id: targetThreadId,
@@ -901,190 +1073,377 @@ export function ChatPlayground({
       tokens_generated: null,
       generation_time_ms: null,
     };
+    const threadIdForTurn = targetThreadId;
+    const draftKeyForTurn = targetDraftKey;
 
+    startTurnStream({
+      threadId: threadIdForTurn,
+      startedAt: timestamp,
+      shown: (previous) => [...previous, optimisticUserMessage],
+      promptId: userTempId,
+      replacedIds: [],
+      titleFrom: isFirstTurn ? requestPayload.content : null,
+      restoreOnFailure: false,
+      failureMessage: "Failed to send this message.",
+      start: (callbacks) =>
+        api.sendChatThreadMessageStream(
+          threadIdForTurn,
+          {
+            ...generationOptions(selectedModel),
+            content: requestPayload.content,
+            content_parts: requestPayload.contentParts,
+          },
+          callbacks,
+        ),
+      onStarted: () => {
+        clearComposerDraft(draftKeyForTurn);
+        setImagePreview(null);
+      },
+    });
+  };
+
+  /** Settings every turn sends: the model, thinking and truncation. */
+  const generationOptions = (modelId: string) => {
+    const enableThinking =
+      // Every thinking-capable template reads enable_thinking; sending it
+      // only for some families left Qwen3.6 thinking regardless of the toggle.
+      supportsThinking ? thinkingEnabledForModel : undefined;
+    return {
+      model_id: modelId,
+      system_prompt: systemPromptForModel(supportsThinking),
+      enable_thinking: enableThinking,
+      reasoning_effort:
+        thinkingEnabledForModel &&
+        supportedReasoningEfforts.includes(reasoningEffort)
+          ? reasoningEffort
+          : undefined,
+      // Long threads keep working: the server drops the oldest turns once
+      // the history outgrows the model's context.
+      truncation: "auto" as const,
+    };
+  };
+
+  /**
+   * Streams one turn into the view: a new message, a retried reply or an
+   * edited prompt. `shown` lays out the messages the turn streams after.
+   * A retry or edit that fails reloads history, since the server left the
+   * thread as it was.
+   */
+  const startTurnStream = ({
+    threadId,
+    startedAt,
+    shown,
+    promptId,
+    replacedIds,
+    titleFrom,
+    restoreOnFailure,
+    failureMessage,
+    start,
+    onStarted,
+  }: {
+    threadId: string;
+    startedAt: number;
+    shown: (previous: ChatThreadMessageRecord[]) => ChatThreadMessageRecord[];
+    promptId: string;
+    replacedIds: string[];
+    titleFrom: string | null;
+    restoreOnFailure: boolean;
+    failureMessage: string;
+    start: (callbacks: ChatThreadStreamCallbacks) => AbortController;
+    onStarted?: () => void;
+  }) => {
+    const assistantTempId = `tmp-assistant-${startedAt}`;
     const optimisticAssistantMessage: ChatThreadMessageRecord = {
       id: assistantTempId,
-      thread_id: targetThreadId,
+      thread_id: threadId,
       role: "assistant",
       content: "",
-      created_at: timestamp + 1,
+      created_at: startedAt + 1,
       tokens_generated: null,
       generation_time_ms: null,
     };
+    turnContextRef.current = {
+      priorIds: new Set(
+        messagesRef.current
+          .filter((message) => !message.id.startsWith("tmp-"))
+          .map((message) => message.id),
+      ),
+      replacedIds,
+    };
+    const reloadHistory = () =>
+      void api
+        .getChatThread(threadId)
+        .then((detail) => {
+          if (activeThreadIdRef.current !== threadId) {
+            return;
+          }
+          setMessages(withStoppedTurns(threadId, detail.messages));
+        })
+        .catch(() => {
+          // Ignore follow-up sync failures after stream close.
+        });
 
-    const systemPrompt = systemPromptForModel(
-      selectedModel,
-      thinkingEnabledForModel,
-    );
-    const enableThinking =
-      (isQwen35ThinkingModel(selectedModel) ||
-        isQwen38ThinkingModel(selectedModel)) &&
-      supportsThinking
-        ? thinkingEnabledForModel
-        : undefined;
-    const selectedReasoningEffort =
-      thinkingEnabledForModel &&
-      supportedReasoningEfforts.includes(reasoningEffort)
-        ? reasoningEffort
-        : undefined;
-
-    setMessages((previous) => [
-      ...previous,
-      optimisticUserMessage,
-      optimisticAssistantMessage,
-    ]);
+    setError(null);
+    setMessages((previous) => [...shown(previous), optimisticAssistantMessage]);
     followingOutputRef.current = true;
-    followingStreamingThinkingRef.current = true;
     setIsStreaming(true);
-    setStreamingThreadId(targetThreadId);
+    setStreamStartedAt(startedAt);
+    setStreamingThreadId(threadId);
 
     let streamFailed = false;
-    let streamedTurn: StreamedTurnStats | null = null;
     try {
-      streamAbortRef.current = api.sendChatThreadMessageStream(
-        targetThreadId,
-        {
-          model_id: selectedModel,
-          content: requestPayload.content,
-          content_parts: requestPayload.contentParts,
-          system_prompt: systemPrompt,
-          enable_thinking: enableThinking,
-          reasoning_effort: selectedReasoningEffort,
-          // Long threads keep working: the server drops the oldest turns
-          // once the history outgrows the model's context.
-          truncation: "auto",
-        },
-        {
-          onStart: ({ userMessage }) => {
-            setMessages((previous) => {
-              let replaced = false;
-              const updated = previous.map((message) => {
-                if (message.id === userTempId) {
-                  replaced = true;
-                  return userMessage;
-                }
-                return message;
-              });
-
-              if (
-                replaced ||
-                updated.some((message) => message.id === userMessage.id)
-              ) {
-                return updated;
+      streamAbortRef.current = start({
+        onStart: ({ userMessage }) => {
+          setMessages((previous) => {
+            let replaced = false;
+            const updated = previous.map((message) => {
+              if (message.id === promptId) {
+                replaced = true;
+                return userMessage;
               }
-
-              return [...updated, userMessage];
+              return message;
             });
-          },
-          onDelta: (delta) => {
-            setMessages((previous) => {
-              let updatedAssistant = false;
-              const updated = previous.map((message) => {
-                if (message.id === assistantTempId) {
-                  updatedAssistant = true;
-                  return { ...message, content: `${message.content}${delta}` };
-                }
-                return message;
-              });
 
-              if (updatedAssistant) {
-                return updated;
-              }
-
-              if (
-                updated.some(
-                  (message) => message.id === optimisticAssistantMessage.id,
-                )
-              ) {
-                return updated;
-              }
-
-              return [
-                ...updated,
-                { ...optimisticAssistantMessage, content: delta },
-              ];
-            });
-          },
-          onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
-            setMessages((previous) => {
-              let replaced = false;
-              const updated = previous.map((message) => {
-                if (message.id === assistantTempId) {
-                  replaced = true;
-                  return assistantMessage;
-                }
-                return message;
-              });
-
-              if (
-                replaced ||
-                updated.some((message) => message.id === assistantMessage.id)
-              ) {
-                return updated;
-              }
-
-              return [...updated, assistantMessage];
-            });
-            setStats(streamStats);
-            streamedTurn = { messageId: assistantMessage.id, stats: streamStats };
-
-            if (isFirstTurn) {
-              void maybeGenerateThreadTitle({
-                threadId: targetThreadId,
-                userContent: requestPayload.content,
-                assistantContent: assistantMessage.content,
-                modelId,
-              });
+            if (
+              replaced ||
+              updated.some((message) => message.id === userMessage.id)
+            ) {
+              return updated;
             }
-          },
-          onError: (message) => {
-            streamFailed = true;
-            setError(message);
-            setMessages((previous) =>
-              previous.filter(
-                (entry) =>
-                  !(
-                    entry.id === assistantTempId &&
-                    entry.content.trim().length === 0
-                  ),
-              ),
-            );
-          },
-          onClose: () => {
-            setIsStreaming(false);
-            setStreamingThreadId(null);
-            streamAbortRef.current = null;
-            void refreshThreadList(targetThreadId);
-            // Failed partial text is useful feedback but is deliberately absent
-            // from persisted history. Keep it visible until the user navigates.
-            if (streamFailed) return;
-            void api
-              .getChatThread(targetThreadId)
-              .then((detail) => {
-                if (activeThreadIdRef.current !== targetThreadId) {
-                  return;
-                }
-                setMessages(detail.messages);
-                setStats(statsAfterHistoryRefresh(detail.messages, streamedTurn));
-              })
-              .catch(() => {
-                // Ignore follow-up sync failures after stream close.
-              });
-          },
+
+            return [...updated, userMessage];
+          });
         },
-      );
-      clearComposerDraft(targetDraftKey);
-      setImagePreview(null);
+        onDelta: (delta) => {
+          setMessages((previous) => {
+            let updatedAssistant = false;
+            const updated = previous.map((message) => {
+              if (message.id === assistantTempId) {
+                updatedAssistant = true;
+                return { ...message, content: `${message.content}${delta}` };
+              }
+              return message;
+            });
+
+            if (updatedAssistant) {
+              return updated;
+            }
+
+            return [
+              ...updated,
+              { ...optimisticAssistantMessage, content: delta },
+            ];
+          });
+        },
+        onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
+          const carryOver = <T,>(previous: Record<string, T>) =>
+            assistantTempId in previous
+              ? { ...previous, [assistantMessage.id]: previous[assistantTempId] }
+              : previous;
+          setReasoningDurations(carryOver);
+          setExpandedThoughts(carryOver);
+          setMessages((previous) => {
+            let replaced = false;
+            const updated = previous.map((message) => {
+              if (message.id === assistantTempId) {
+                replaced = true;
+                return assistantMessage;
+              }
+              return message;
+            });
+
+            if (
+              replaced ||
+              updated.some((message) => message.id === assistantMessage.id)
+            ) {
+              return updated;
+            }
+
+            return [...updated, assistantMessage];
+          });
+          setStreamedStats((previous) => ({
+            ...previous,
+            [assistantMessage.id]: streamStats,
+          }));
+          const spokenAnswer = stripMarkdown(
+            parseAssistantContent(assistantMessage.content, {
+              implicitOpenThinkTag: true,
+              treatNoTagAsThinking: false,
+            }).answer,
+          ).trim();
+          setReplyAnnouncement(
+            spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
+          );
+
+          if (titleFrom !== null) {
+            void maybeGenerateThreadTitle({
+              threadId,
+              userContent: titleFrom,
+              assistantContent: assistantMessage.content,
+              modelId,
+            });
+          }
+        },
+        onError: (message) => {
+          streamFailed = true;
+          setError(message);
+          setMessages((previous) =>
+            previous.filter(
+              (entry) =>
+                !(
+                  entry.id === assistantTempId &&
+                  entry.content.trim().length === 0
+                ),
+            ),
+          );
+        },
+        onClose: () => {
+          setIsStreaming(false);
+          setStreamingThreadId(null);
+          streamAbortRef.current = null;
+          void refreshThreadList(threadId);
+          // Failed partial text of a new message is useful feedback but is
+          // deliberately absent from persisted history. Keep it visible until
+          // the user navigates. A failed retry or edit changed nothing.
+          if (streamFailed && !restoreOnFailure) return;
+          reloadHistory();
+        },
+      });
+      onStarted?.();
     } catch (sendError) {
-      setMessages((previous) =>
-        previous.filter(
-          (message) =>
-            message.id !== userTempId && message.id !== assistantTempId,
-        ),
-      );
       setIsStreaming(false);
       setStreamingThreadId(null);
-      setError(getErrorMessage(sendError, "Failed to send this message."));
+      setError(getErrorMessage(sendError, failureMessage));
+      if (restoreOnFailure) {
+        reloadHistory();
+      } else {
+        setMessages((previous) =>
+          previous.filter(
+            (message) =>
+              message.id !== promptId && message.id !== assistantTempId,
+          ),
+        );
+      }
+    }
+  };
+
+  const canStartTurn = (modelId: string | null): modelId is string => {
+    if (!activeThreadId || isStreaming || isPreparingThread) {
+      return false;
+    }
+    if (!modelId || (modelId === selectedModel && !selectedModelReady)) {
+      onModelRequired();
+      return false;
+    }
+    return true;
+  };
+
+  /** Replaces the latest reply with a new one, optionally from another
+   * loaded model (which then stays selected for the chat). */
+  const retryReply = (replyId: string, modelId: string | null = selectedModel) => {
+    if (!canStartTurn(modelId) || !activeThreadId) {
+      return;
+    }
+    const current = messagesRef.current;
+    const replyIndex = current.findIndex((message) => message.id === replyId);
+    let promptIndex = -1;
+    for (let index = replyIndex - 1; index >= 0; index -= 1) {
+      if (current[index].role === "user") {
+        promptIndex = index;
+        break;
+      }
+    }
+    if (replyIndex === -1 || promptIndex === -1) {
+      return;
+    }
+    if (modelId !== selectedModel) {
+      onSelectModel(modelId);
+    }
+    const threadId = activeThreadId;
+    const prompt = current[promptIndex];
+    startTurnStream({
+      threadId,
+      startedAt: Date.now(),
+      shown: (previous) => {
+        const index = previous.findIndex((message) => message.id === prompt.id);
+        return index === -1 ? previous : previous.slice(0, index + 1);
+      },
+      promptId: prompt.id,
+      replacedIds: current.slice(promptIndex + 1).map((message) => message.id),
+      titleFrom: null,
+      restoreOnFailure: true,
+      failureMessage: "Failed to retry this reply.",
+      start: (callbacks) =>
+        api.regenerateChatThreadMessageStream(
+          threadId,
+          replyId,
+          generationOptions(modelId),
+          callbacks,
+        ),
+    });
+  };
+
+  /** Replaces one of your messages and the replies after it. */
+  const submitEdit = (messageId: string, text: string) => {
+    const content = text.trim();
+    if (!content || !canStartTurn(selectedModel) || !activeThreadId) {
+      return;
+    }
+    const current = messagesRef.current;
+    const index = current.findIndex((message) => message.id === messageId);
+    if (index === -1) {
+      return;
+    }
+    const threadId = activeThreadId;
+    const edited: ChatThreadMessageRecord = {
+      ...current[index],
+      content,
+      content_parts: null,
+    };
+    setEditingMessageId(null);
+    startTurnStream({
+      threadId,
+      startedAt: Date.now(),
+      shown: (previous) => {
+        const at = previous.findIndex((message) => message.id === messageId);
+        return at === -1 ? previous : [...previous.slice(0, at), edited];
+      },
+      promptId: messageId,
+      replacedIds: current.slice(index + 1).map((message) => message.id),
+      titleFrom: null,
+      restoreOnFailure: true,
+      failureMessage: "Failed to send your edit.",
+      start: (callbacks) =>
+        api.editChatThreadMessageStream(
+          threadId,
+          messageId,
+          { ...generationOptions(selectedModel), content },
+          callbacks,
+        ),
+    });
+  };
+
+  const confirmDeleteReply = async () => {
+    const replyId = deleteReplyId;
+    const threadId = activeThreadId;
+    if (!replyId || !threadId) {
+      return;
+    }
+    setDeleteReplyPending(true);
+    setDeleteReplyError(null);
+    try {
+      await api.deleteChatThreadMessage(threadId, replyId);
+      setMessages((previous) =>
+        previous.filter((message) => message.id !== replyId),
+      );
+      setDeleteReplyId(null);
+      void refreshThreadList(threadId);
+    } catch (deleteError) {
+      setDeleteReplyError(
+        getErrorMessage(deleteError, "Failed to delete this reply."),
+      );
+    } finally {
+      setDeleteReplyPending(false);
     }
   };
 
@@ -1092,18 +1451,15 @@ export function ChatPlayground({
     onOpenModelManager();
   };
 
-  const renderModelSelector = (
-    placement: "composer" | "header" = "composer",
-  ) => (
+  const renderModelSelector = (menuPlacement: "top" | "bottom") => (
     <RouteModelSelect
       value={selectedModel}
       options={modelOptions}
       onSelect={onSelectModel}
-      className={cn(
-        placement === "header"
-          ? "w-full max-w-[320px]"
-          : "w-[240px] max-w-[calc(100vw-9rem)] sm:w-[300px]",
-      )}
+      menuPlacement={menuPlacement}
+      aria-label="Chat model"
+      className="w-[180px] max-w-[calc(100vw-12rem)] sm:w-[220px]"
+      triggerClassName="h-8 text-xs"
     />
   );
 
@@ -1117,43 +1473,56 @@ export function ChatPlayground({
       )}
     >
       {pendingImages.length > 0 && (
-        <div className="flex flex-wrap gap-3 border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
-          {pendingImages.map((image) => (
-            <div
-              key={image.id}
-              className="group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]"
+        <div className="border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
+          {hasUnsupportedImages && (
+            <p
+              role="status"
+              className="mb-3 text-xs text-[var(--status-warning-text)]"
             >
-              <button
-                type="button"
-                onClick={() =>
-                  setImagePreview({
-                    source: image.previewUrl ?? image.source,
-                    label: image.label,
-                  })
-                }
-                className="h-full w-full"
-                title={`Preview ${image.label}`}
+              {unsupportedImagesMessage}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-3">
+            {pendingImages.map((image) => (
+              <div
+                key={image.id}
+                className={cn(
+                  "group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]",
+                  hasUnsupportedImages && "opacity-50",
+                )}
               >
-                <img
-                  src={image.source}
-                  alt={image.label}
-                  className="h-full w-full object-cover"
-                />
-              </button>
-              <button
-                type="button"
-                onClick={() => removePendingImage(image.id)}
-                className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-black/70 text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
-                title={`Remove ${image.label}`}
-                aria-label={`Remove ${image.label}`}
-              >
-                <Trash2 className="h-3 w-3" />
-              </button>
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
-                <span className="block truncate">{image.label}</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setImagePreview({
+                      source: image.previewUrl ?? image.source,
+                      label: image.label,
+                    })
+                  }
+                  className="h-full w-full"
+                  title={`Preview ${image.label}`}
+                >
+                  <img
+                    src={image.source}
+                    alt={image.label}
+                    className="h-full w-full object-cover"
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => removePendingImage(image.id)}
+                  className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-black/70 text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
+                  title={`Remove ${image.label}`}
+                  aria-label={`Remove ${image.label}`}
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
+                  <span className="block truncate">{image.label}</span>
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
 
@@ -1171,6 +1540,17 @@ export function ChatPlayground({
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             void sendMessage();
+            return;
+          }
+          // ↑ in an empty composer edits your last message.
+          if (event.key === "ArrowUp" && input.length === 0 && !isStreaming) {
+            const lastUser = [...visibleMessages]
+              .reverse()
+              .find((message) => message.role === "user");
+            if (lastUser && isEditableUserMessage(lastUser)) {
+              event.preventDefault();
+              setEditingMessageId(lastUser.id);
+            }
           }
         }}
         placeholder={
@@ -1224,6 +1604,7 @@ export function ChatPlayground({
               )}
             </Button>
           )}
+          {renderModelSelector(centered ? "bottom" : "top")}
           <Button
             variant="outline"
             size="sm"
@@ -1295,8 +1676,8 @@ export function ChatPlayground({
               isPreparingThread ||
               isReadingImages ||
               (!isStreaming &&
-                input.trim().length === 0 &&
-                pendingImages.length === 0)
+                (hasUnsupportedImages ||
+                  (input.trim().length === 0 && pendingImages.length === 0)))
             }
             variant="default"
             size="icon"
@@ -1305,7 +1686,9 @@ export function ChatPlayground({
                 ? "Cancel response"
                 : isPreparingThread
                   ? "Starting chat"
-                  : "Send message"
+                  : hasUnsupportedImages
+                    ? unsupportedImagesMessage
+                    : "Send message"
             }
             aria-label={
               isStreaming
@@ -1329,22 +1712,60 @@ export function ChatPlayground({
     </div>
   );
 
+  const selectThread = (threadId: string) => {
+    if (isStreaming || isPreparingThread) {
+      return;
+    }
+    setActiveThreadInUrl(threadId);
+    setError(null);
+  };
+  const renderThreadList = (onAfterSelect?: () => void) => (
+    <ChatThreadList
+      threads={threads}
+      activeThreadId={activeThreadId}
+      loading={threadsLoading}
+      busy={isStreaming || isPreparingThread}
+      onSelect={(threadId) => {
+        selectThread(threadId);
+        onAfterSelect?.();
+      }}
+      onDelete={openDeleteThreadConfirm}
+      onNewChat={() => {
+        handleStartNewChat();
+        onAfterSelect?.();
+      }}
+      className="h-full w-full"
+    />
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <div className="mb-0 flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-[220px] max-w-full flex-1 sm:max-w-[420px]">
-          {renderModelSelector("header")}
+    <div className="flex min-h-0 flex-1 gap-6">
+      {showThreadColumn ? (
+        <aside
+          aria-label="Chat history"
+          className="flex w-[15rem] shrink-0 border-r border-[var(--border-subtle)] pr-4"
+        >
+          {renderThreadList()}
+        </aside>
+      ) : null}
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
+      <div
+        className={cn(
+          "mb-0 flex flex-wrap items-center justify-between gap-3",
+          showThreadColumn && !hasConversation && "hidden",
+        )}
+      >
+        <div className="min-w-0 flex-1">
           {hasConversation && (
-            <div className="mt-2 min-w-0">
-              <h2 className="truncate text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-                {activeThread
-                  ? displayThreadTitle(activeThread.title)
-                  : "Conversation"}
-              </h2>
-            </div>
+            <h2 className="truncate text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+              {activeThread
+                ? displayThreadTitle(activeThread.title)
+                : "Conversation"}
+            </h2>
           )}
         </div>
 
+        {showThreadColumn ? null : (
         <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
           <RouteHistoryDrawer
             title="Chat History"
@@ -1366,122 +1787,21 @@ export function ChatPlayground({
               </Button>
             }
           >
-            {({ close }) => (
-              <div className="app-sidebar-list">
-                {threadsLoading ? (
-                  <div className="app-sidebar-loading">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Loading chats...
-                  </div>
-                ) : threads.length === 0 ? (
-                  <div className="app-sidebar-empty">
-                    No chats yet. Create one to begin.
-                  </div>
-                ) : (
-                  <div className="flex flex-col gap-2.5">
-                    {threads.map((thread) => {
-                      const isActive = thread.id === activeThreadId;
-                      const preview = threadPreviewFromContent(
-                        thread.last_message_preview,
-                      );
-
-                      return (
-                        <div
-                          key={thread.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => {
-                            if (isStreaming || isPreparingThread) {
-                              return;
-                            }
-                            setActiveThreadInUrl(thread.id);
-                            setError(null);
-                            close();
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              if (isStreaming || isPreparingThread) {
-                                return;
-                              }
-                              setActiveThreadInUrl(thread.id);
-                              setError(null);
-                              close();
-                            }
-                          }}
-                          className={cn(
-                            "group app-sidebar-row",
-                            isActive
-                              ? "app-sidebar-row-active"
-                              : "app-sidebar-row-idle",
-                            (isStreaming || isPreparingThread) && "opacity-70",
-                          )}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <p className="app-sidebar-row-label truncate">
-                              {displayThreadTitle(thread.title)}
-                            </p>
-                            <div className="inline-flex items-center gap-1.5 shrink-0">
-                              <span className="app-sidebar-row-meta">
-                                {formatThreadTimestamp(thread.updated_at)}
-                              </span>
-                              <button
-                                type="button"
-                                onPointerDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  if (isStreaming || isPreparingThread) {
-                                    return;
-                                  }
-                                  openDeleteThreadConfirm(thread.id);
-                                }}
-                                disabled={isStreaming || isPreparingThread}
-                                className={cn(
-                                  "app-sidebar-delete-btn relative z-10",
-                                  (isStreaming || isPreparingThread) &&
-                                    "opacity-50",
-                                )}
-                                title="Delete chat"
-                                aria-label={`Delete ${displayThreadTitle(thread.title)}`}
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                          <p
-                            className="app-sidebar-row-preview"
-                            style={{
-                              display: "-webkit-box",
-                              WebkitLineClamp: 3,
-                              WebkitBoxOrient: "vertical",
-                              overflow: "hidden",
-                            }}
-                          >
-                            {preview}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
+            {({ close }) => renderThreadList(close)}
           </RouteHistoryDrawer>
 
           <Button
             type="button"
             size="sm"
             className={cn("h-9 gap-2", chatAccentButtonClass)}
-            onClick={() => void handleCreateThread()}
-            disabled={isEmptyChatWorkspace || isStreaming || isPreparingThread}
+            onClick={handleStartNewChat}
+            disabled={isStreaming || isPreparingThread}
           >
             <Plus className="h-4 w-4" />
             New chat
           </Button>
         </div>
+        )}
       </div>
 
       <div className="relative flex min-h-0 flex-1 flex-col">
@@ -1493,6 +1813,9 @@ export function ChatPlayground({
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.22 }}
               >
+                <h2 className="mb-6 text-center text-[1.75rem] font-semibold tracking-tight text-[var(--text-primary)]">
+                  What can I help with?
+                </h2>
                 {renderComposer(true)}
               </motion.div>
 
@@ -1531,7 +1854,7 @@ export function ChatPlayground({
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
-                    className="mt-3 mx-auto max-w-3xl p-2 rounded bg-red-950/50 border border-red-900/50 text-red-300 text-xs"
+                    className="mt-3 mx-auto max-w-3xl rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-xs text-[var(--danger-text)]"
                   >
                     {error}
                   </motion.div>
@@ -1548,9 +1871,30 @@ export function ChatPlayground({
                 onScroll={handleMessageViewportScroll}
                 className="h-full overflow-y-auto px-4 sm:px-6 pb-48 pt-3 scrollbar-thin"
               >
-                {messagesLoading ? (
+                {activeThreadLoadError && !messagesLoading ? (
+                  <div className="mx-auto mt-10 max-w-xl">
+                    <StatePanel
+                      tone="danger"
+                      icon={AlertTriangle}
+                      title="This chat could not be loaded"
+                      description={activeThreadLoadError}
+                      actions={
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setThreadLoadAttempt((attempt) => attempt + 1)
+                          }
+                        >
+                          Retry
+                        </Button>
+                      }
+                    />
+                  </div>
+                ) : messagesLoading ? (
                   <div
-                    className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
+                    className="max-w-3xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2"
                     role="status"
                     aria-live="polite"
                   >
@@ -1558,240 +1902,120 @@ export function ChatPlayground({
                     Loading conversation...
                   </div>
                 ) : (
-                  <div className="max-w-4xl mx-auto space-y-6">
+                  <div className="mx-auto flex max-w-3xl flex-col gap-7">
                     {visibleMessages.map((message, index) => {
                       const isUser = message.role === "user";
-                      const parsedUserMessage = isUser
-                        ? parseUserMessageDisplayFromContentParts(message)
-                        : null;
-                      const isLastAssistant =
+                      const isStreamingReply =
                         !isUser &&
                         index === visibleMessages.length - 1 &&
                         isStreaming &&
                         streamingThreadId === activeThreadId;
-                      const assistantDisplayContent = isUser
-                        ? message.content
-                        : thinkingEnabledForModel
-                          ? message.content
-                          : stripThinkingArtifacts(message.content || "");
-                      const parsed = isUser
-                        ? null
-                        : thinkingEnabledForModel
-                          ? parseAssistantContent(message.content || "", {
-                              implicitOpenThinkTag:
-                                implicitOpenThinkTagModel &&
-                                thinkingEnabledForModel,
-                              treatNoTagAsThinking: isLastAssistant && isStreaming,
-                            })
-                          : null;
+                      // Parse each reply by the model that wrote it (stored
+                      // per message; the thread model for older replies), so
+                      // past reasoning does not depend on today's toggle.
+                      const writerImplicitThink = message.model_id
+                        ? (modelSupportsThinking?.(message.model_id) ??
+                          supportsImplicitOpenThinkTagParsing(message.model_id))
+                        : implicitOpenThinkTagModel;
                       const messageKey = message.id;
-                      const isThoughtExpanded = !!expandedThoughts[messageKey];
-                      const showStreamingThinking =
-                        !isUser &&
-                        !!parsed &&
-                        isLastAssistant &&
-                        parsed.thinking.length > 0 &&
-                        (parsed.hasIncompleteThink ||
-                          parsed.answer.length === 0);
-                      const showAnswerOnly =
-                        !isUser &&
-                        !!parsed &&
-                        parsed.answer.length > 0 &&
-                        parsed.hasThink &&
-                        !showStreamingThinking;
+                      const previous = visibleMessages[index - 1];
+                      const startsDay =
+                        !previous ||
+                        !isSameCalendarDay(previous.created_at, message.created_at);
 
                       return (
-                        <motion.div
-                          key={messageKey}
-                          initial={{ opacity: 0, y: 8 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          className={cn(
-                            "flex gap-4 sm:gap-6",
-                            isUser && "flex-row-reverse",
+                        <Fragment key={messageKey}>
+                          {startsDay && (
+                            <DaySeparator
+                              label={messageDayLabel(message.created_at)}
+                            />
                           )}
-                        >
-                          <div
-                            className={cn(
-                              "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1",
-                              isUser
-                                ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] border border-[var(--border-muted)]"
-                                : "bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-sm",
-                            )}
+                          <motion.div
+                            initial={{ opacity: 0, y: 8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="flex flex-col"
                           >
                             {isUser ? (
-                              <User className="w-4 h-4" />
+                              <UserMessage
+                                message={message}
+                                onOpenImage={setImagePreview}
+                                editable={
+                                  !busy && isEditableUserMessage(message)
+                                }
+                                editing={editingMessageId === messageKey}
+                                onEdit={() => setEditingMessageId(messageKey)}
+                                onCancelEdit={() => setEditingMessageId(null)}
+                                onSubmitEdit={(text) =>
+                                  submitEdit(messageKey, text)
+                                }
+                              />
                             ) : (
-                              <Bot className="w-4 h-4" />
-                            )}
-                          </div>
-
-                          <div
-                            className={cn(
-                              "max-w-[85%] text-[0.9375rem] leading-relaxed break-words flex flex-col",
-                              isUser ? "items-end" : "items-start",
-                            )}
-                          >
-                            <div
-                              className={cn(
-                                "rounded-2xl px-5 py-3 shadow-sm",
-                                isUser
-                                  ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] rounded-tr-sm border border-[var(--border-muted)]"
-                                  : "bg-transparent text-[var(--text-primary)]",
-                              )}
-                            >
-                              {isUser ? (
-                                <>
-                                  {(!parsedUserMessage ||
-                                    parsedUserMessage.text ||
-                                    parsedUserMessage.attachments.length ===
-                                      0) && (
-                                    <MarkdownContent
-                                      content={
-                                        parsedUserMessage &&
-                                        parsedUserMessage.attachments.length > 0
-                                          ? parsedUserMessage.text
-                                          : message.content
+                              <AssistantMessage
+                                message={message}
+                                isStreamingReply={isStreamingReply}
+                                isLatestReply={index === lastAssistantIndex}
+                                implicitThink={writerImplicitThink}
+                                thinkingEnabled={thinkingEnabledForModel}
+                                modelLabel={
+                                  message.model_id
+                                    ? (modelOptions.find(
+                                        (option) =>
+                                          option.value === message.model_id,
+                                      )?.label ?? message.model_id)
+                                    : null
+                                }
+                                stats={streamedStats[messageKey] ?? null}
+                                readAloudState={
+                                  readAloud?.messageId === messageKey
+                                    ? readAloud.status
+                                    : "idle"
+                                }
+                                onReadAloud={(text) =>
+                                  toggleReadAloud(messageKey, text)
+                                }
+                                isThoughtExpanded={!!expandedThoughts[messageKey]}
+                                onToggleThought={() =>
+                                  setExpandedThoughts((previous) => ({
+                                    ...previous,
+                                    [messageKey]: !previous[messageKey],
+                                  }))
+                                }
+                                turnStartedAt={
+                                  isStreamingReply ? streamStartedAt : null
+                                }
+                                reasoningMs={
+                                  reasoningDurations[messageKey] ??
+                                  message.reasoning_ms ??
+                                  null
+                                }
+                                canRetry={
+                                  !busy &&
+                                  index === lastAssistantIndex &&
+                                  index === visibleMessages.length - 1
+                                }
+                                retryModels={retryModelOptions}
+                                currentModelId={selectedModel}
+                                onRetry={(modelId) =>
+                                  retryReply(messageKey, modelId)
+                                }
+                                onDelete={
+                                  busy
+                                    ? undefined
+                                    : () => {
+                                        setDeleteReplyError(null);
+                                        setDeleteReplyId(messageKey);
                                       }
-                                      className="leading-relaxed [&_p]:m-0 [&_p]:bg-transparent [&_mark]:bg-transparent [&_code]:bg-transparent [&_code]:border-0 [&_code]:px-0 [&_code]:py-0 [&_code]:font-inherit"
-                                    />
-                                  )}
-                                  {parsedUserMessage &&
-                                    parsedUserMessage.attachments.length >
-                                      0 && (
-                                      <div
-                                        className={cn(
-                                          "flex flex-wrap gap-2",
-                                          parsedUserMessage.text && "mt-2",
-                                        )}
-                                      >
-                                        {parsedUserMessage.attachments.map(
-                                          (attachment, attachmentIndex) => (
-                                            <div
-                                              key={`${messageKey}-attachment-${attachmentIndex}`}
-                                            >
-                                              {attachment.kind === "image" &&
-                                              attachment.source ? (
-                                                <button
-                                                  type="button"
-                                                  onClick={() =>
-                                                    setImagePreview({
-                                                      source:
-                                                        attachment.source!,
-                                                      label: attachment.label,
-                                                    })
-                                                  }
-                                                  title={`Open ${attachment.label}`}
-                                                  className="block h-16 w-16 overflow-hidden rounded-md border border-primary-foreground/20 bg-primary-foreground/10 hover:bg-primary-foreground/15 transition-colors focus:outline-none focus:ring-2 focus:ring-primary-foreground/70"
-                                                >
-                                                  <img
-                                                    src={attachment.source}
-                                                    alt={attachment.label}
-                                                    loading="lazy"
-                                                    className="h-full w-full object-cover"
-                                                  />
-                                                </button>
-                                              ) : (
-                                                <div className="inline-flex max-w-[220px] items-center gap-1.5 rounded-md border border-primary-foreground/20 bg-primary-foreground/10 px-2 py-1 text-xs text-primary-foreground/90">
-                                                  {attachment.kind ===
-                                                  "image" ? (
-                                                    <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-                                                  ) : (
-                                                    <Film className="h-3.5 w-3.5 shrink-0" />
-                                                  )}
-                                                  <span className="truncate">
-                                                    {attachment.label}
-                                                  </span>
-                                                </div>
-                                              )}
-                                            </div>
-                                          ),
-                                        )}
-                                      </div>
-                                    )}
-                                </>
-                              ) : (
-                                <>
-                                  {showStreamingThinking && parsed && (
-                                    <div className="mb-3 rounded-lg bg-muted/50 border border-[var(--border-muted)] px-3 py-2 text-xs text-muted-foreground">
-                                      <div className="mb-2 flex items-center gap-1.5 uppercase tracking-wider text-[10px] font-semibold">
-                                        <Loader2 className="w-3 h-3 animate-spin text-primary" />
-                                        Thinking
-                                      </div>
-                                      <div
-                                        ref={streamingThinkingRef}
-                                        onScroll={handleStreamingThinkingScroll}
-                                        className="h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[var(--border-muted)]/70 bg-background/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed scrollbar-thin sm:h-48"
-                                      >
-                                        {parsed.thinking}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {parsed && parsed.answer.length > 0 ? (
-                                    <MarkdownContent content={parsed.answer} />
-                                  ) : parsed && parsed.hasThink ? (
-                                    <div className="italic text-muted-foreground opacity-70">
-                                      {isLastAssistant
-                                        ? "Thinking..."
-                                        : "No final answer was generated."}
-                                    </div>
-                                  ) : assistantDisplayContent.trim().length > 0 ? (
-                                    <MarkdownContent
-                                      content={assistantDisplayContent}
-                                    />
-                                  ) : !isLastAssistant ? (
-                                    <div className="italic text-muted-foreground opacity-70">
-                                      No visible answer was generated. Please retry the message.
-                                    </div>
-                                  ) : null}
-
-                                  {parsed &&
-                                    parsed.hasThink &&
-                                    !showStreamingThinking && (
-                                      <div className="mt-3 border-t pt-2">
-                                        <button
-                                          onClick={() =>
-                                            setExpandedThoughts((previous) => ({
-                                              ...previous,
-                                              [messageKey]:
-                                                !previous[messageKey],
-                                            }))
-                                          }
-                                          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground font-medium transition-colors"
-                                        >
-                                          {isThoughtExpanded ? (
-                                            <ChevronDown className="w-3 h-3" />
-                                          ) : (
-                                            <ChevronRight className="w-3 h-3" />
-                                          )}
-                                          {isThoughtExpanded
-                                            ? "Hide thought process"
-                                            : "Show thought process"}
-                                        </button>
-                                      </div>
-                                    )}
-
-                                  {parsed &&
-                                    parsed.hasThink &&
-                                    !showStreamingThinking &&
-                                    isThoughtExpanded && (
-                                      <div className="mt-2 h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-[var(--border-muted)] bg-muted/30 px-3 py-2 text-xs font-mono text-[11px] leading-relaxed text-muted-foreground scrollbar-thin sm:h-48">
-                                        {parsed.thinking}
-                                      </div>
-                                    )}
-
-                                  {isLastAssistant &&
-                                    ((parsed && parsed.answer.length > 0) ||
-                                      !showAnswerOnly) && (
-                                      <span className="inline-flex items-center ml-2 align-middle">
-                                        <span className="w-1.5 h-4 bg-primary animate-pulse inline-block" />
-                                      </span>
-                                    )}
-                                </>
-                              )}
-                            </div>
-                          </div>
-                        </motion.div>
+                                }
+                                onReasoningFinished={(durationMs) =>
+                                  setReasoningDurations((previous) => ({
+                                    ...previous,
+                                    [messageKey]: durationMs,
+                                  }))
+                                }
+                              />
+                            )}
+                          </motion.div>
+                        </Fragment>
                       );
                     })}
                   </div>
@@ -1799,7 +2023,17 @@ export function ChatPlayground({
               </div>
 
               <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 bg-[var(--bg-app)] px-4 pb-4 pt-4 sm:px-6">
-                <div className="max-w-4xl mx-auto pointer-events-auto">
+                <div className="relative max-w-3xl mx-auto pointer-events-auto">
+                  {showJumpToLatest && (
+                    <button
+                      type="button"
+                      onClick={jumpToLatest}
+                      className="absolute -top-12 left-1/2 inline-flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[12.5px] text-[var(--text-secondary)] shadow-[var(--shadow-soft)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                      Jump to latest
+                    </button>
+                  )}
                   <AnimatePresence>
                     {error && (
                       <motion.div
@@ -1816,44 +2050,49 @@ export function ChatPlayground({
                     )}
                   </AnimatePresence>
 
+                  {showHistoryImageNotice && (
+                    <div
+                      role="note"
+                      className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[var(--status-info-border)] bg-[var(--status-info-bg)] px-3 py-2 text-xs text-[var(--status-info-text)]"
+                    >
+                      <span>
+                        This chat has images. {modelLabel ?? "This model"} reads
+                        text only, so earlier images are left out.
+                      </span>
+                      {imageModelOption && (
+                        <button
+                          type="button"
+                          className="ml-auto font-medium underline underline-offset-2"
+                          onClick={() => onSelectModel(imageModelOption.value)}
+                        >
+                          Switch to {imageModelOption.label}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {renderComposer(false)}
+                  <p className="mt-2 text-center text-[11.5px] text-[var(--text-subtle)]">
+                    Runs on this device. Enter to send, Shift+Enter for a new
+                    line.
+                  </p>
                 </div>
               </div>
             </div>
-
-            {statsSummary && !isStreaming && (
-              <div className="px-4 pb-2 pt-3 sm:px-6">
-                <div className="mx-auto flex max-w-4xl items-center justify-center gap-3 text-[11px] font-medium text-muted-foreground">
-                  <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {statsSummary.tokens} tokens
-                  </span>
-                  <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {Math.round(statsSummary.totalMs)} ms
-                  </span>
-                  {statsSummary.ttftMs !== null && (
-                    <span
-                      className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
-                      title="Time to first token, including queue wait and prompt processing"
-                    >
-                      {Math.round(statsSummary.ttftMs)} ms TTFT
-                    </span>
-                  )}
-                  <span
-                    className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
-                    title={
-                      statsSummary.decodeOnly
-                        ? "Decode speed: generated tokens over decode time, excluding queue wait and prompt processing"
-                        : "Generated tokens over total time, including queue wait and prompt processing"
-                    }
-                  >
-                    {Math.round(statsSummary.tokensPerSecond)} t/s
-                    {statsSummary.decodeOnly ? " decode" : ""}
-                  </span>
-                </div>
-              </div>
-            )}
           </div>
         )}
+      </div>
+
+      <ConfirmDeleteDialog
+        noun={deleteReplyId ? "reply" : null}
+        description="The reply is removed from this chat, and the model no longer sees it in later turns."
+        pending={deleteReplyPending}
+        error={deleteReplyError}
+        onConfirm={() => void confirmDeleteReply()}
+        onCancel={() => setDeleteReplyId(null)}
+      />
+
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {replyAnnouncement}
       </div>
 
       <Dialog
@@ -1922,7 +2161,7 @@ export function ChatPlayground({
           }
         }}
       >
-        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/98 border-[var(--border-muted)]">
+        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/95 border-[var(--border-muted)]">
           <DialogTitle className="sr-only">
             {imagePreview?.label || "Image preview"}
           </DialogTitle>
@@ -1937,6 +2176,7 @@ export function ChatPlayground({
           )}
         </DialogContent>
       </Dialog>
+    </div>
     </div>
   );
 }

@@ -1,4 +1,3 @@
-import { Check } from "lucide-react";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 
 interface SpeechTextModeSwitchProps {
@@ -41,7 +40,7 @@ export function SpeechTextModeSwitch({
       {options.map((option) => (
         <label
           key={option.value}
-          className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5"
+          className="flex cursor-pointer items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5 transition-colors has-[:checked]:border-[var(--text-muted)]"
         >
           <div className="min-w-0">
             <div className="text-sm font-semibold text-[var(--text-primary)]">
@@ -57,8 +56,10 @@ export function SpeechTextModeSwitch({
               onChange={() => onSelectMode(option.value)}
               className="peer sr-only"
             />
-            <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background">
-              <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
+            {/* The dot is a child of the peer's sibling, so it is targeted
+                from the sibling: peer-checked:[&>span]. */}
+            <span className="flex h-5 w-5 items-center justify-center rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface-0)] transition peer-checked:border-[var(--accent-solid)] peer-checked:[&>span]:scale-100 peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background">
+              <span className="h-2.5 w-2.5 scale-0 rounded-full bg-[var(--accent-solid)] transition-transform" />
             </span>
           </div>
         </label>

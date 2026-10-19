@@ -123,6 +123,21 @@ pub enum ModelTask {
     Tokenizer,
 }
 
+impl ModelTask {
+    /// Stable wire name used by runtime diagnostics and the admin API.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tts => "tts",
+            Self::Asr => "asr",
+            Self::Diarization => "diarization",
+            Self::Chat => "chat",
+            Self::ForcedAlign => "forced_align",
+            Self::AudioChat => "audio_chat",
+            Self::Tokenizer => "tokenizer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceBackendHint {
     CandleNative,

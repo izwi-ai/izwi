@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use uuid::Uuid;
 
-pub use izwi_model_catalog::chat::ChatGeneration;
+pub use izwi_model_catalog::chat::{ChatGeneration, FinishReason as ChatFinishReason};
 
 /// Server-side scheduling and admission metadata carried with an inference request.
 ///

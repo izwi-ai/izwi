@@ -56,6 +56,9 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "created_at",
             "tokens_generated",
             "generation_time_ms",
+            "model_id",
+            "finish_reason",
+            "reasoning_ms",
         ],
     },
     RequiredSchemaTable {
@@ -288,6 +291,9 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "saved_voice_id",
             "speech_record_id",
             "updated_at",
+            "render_fingerprint",
+            "render_status",
+            "render_error",
         ],
     },
     RequiredSchemaTable {

@@ -1,12 +1,13 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
-  AlertTriangle,
+  AudioLines,
   Copy,
   Download,
   ExternalLink,
   Loader2,
-  MoreVertical,
+  Sparkles,
   Trash2,
+  Users,
 } from "lucide-react";
 
 import {
@@ -18,33 +19,26 @@ import {
 } from "@/api";
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import { DiarizationExportDialog } from "@/components/DiarizationExportDialog";
-import { Button } from "@/components/ui/button";
+import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import { HistoryTable, type HistoryColumn } from "@/components/history/HistoryTable";
+import { RowBadge } from "@/components/history/RowBadge";
+import { RowMenu } from "@/components/history/RowMenu";
 import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
 import { presentSpeechTextHistoryStatus } from "@/features/transcription/historyStatus";
-import {
-  formatAudioDuration,
-  formatCreatedAt,
-} from "@/features/transcription/playground/support";
 import { formatTranscriptionText } from "@/features/transcription/transcript";
-import { StatusBadge } from "@/components/ui/status-badge";
 import { formattedTranscriptFromRecord } from "@/utils/diarizationTranscript";
 import type { ExportableTranscriptionRecord } from "@/utils/transcriptionExport";
 
 interface TranscriptionHistoryTableProps {
   records: SpeechTextJobSummary[];
+  /** Records matching the filters, if the server reports it. */
+  total?: number | null;
+  /** Search or a filter narrows the list. */
+  filtered?: boolean;
   loading?: boolean;
   error?: string | null;
   loadMore?: {
@@ -102,35 +96,213 @@ function rowKindLabel(record: SpeechTextJobSummary): string {
   }
 }
 
+/** Diarized text is stored as "SPEAKER_00 [0.00s - 4.49s]: …"; previews
+ * keep the speaker and drop the timestamps. */
+export function formatDiarizationPreview(text: string): string {
+  return text
+    .replace(/\s*\[\d+(?:\.\d+)?s\s*-\s*\d+(?:\.\d+)?s\]\s*:/g, ":")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The row's transcript preview, or "" when the job produced no text (the
+ * server fills empty previews with a "No transcript" placeholder). */
 function rowPreview(record: SpeechTextJobSummary): string {
   if (isDiarizationSummary(record)) {
-    return record.transcript_preview;
+    return record.transcript_chars > 0
+      ? formatDiarizationPreview(record.transcript_preview)
+      : "";
   }
   if (isSpeakerAttributedAsrSummary(record)) {
-    return record.speaker_attributed_text_preview || record.transcription_preview;
+    if ((record.speaker_attributed_text_chars ?? 0) > 0) {
+      return record.speaker_attributed_text_preview ?? "";
+    }
+    return record.transcription_chars > 0 ? record.transcription_preview : "";
   }
-  return record.transcription_preview;
+  return record.transcription_chars > 0 ? record.transcription_preview : "";
 }
 
 function rowLabel(record: SpeechTextJobSummary): string {
   return record.audio_filename || record.model_id || record.id;
 }
 
-function rowSummaryLabel(record: SpeechTextJobSummary): string {
-  if (record.summary_preview) {
-    return `Summary: ${record.summary_preview}`;
+function speakerCount(record: SpeechTextJobSummary): number | null {
+  if (isDiarizationSummary(record)) {
+    return record.corrected_speaker_count ?? record.speaker_count;
   }
-  if (record.summary_status === "pending") {
-    return "Summary: Generating";
-  }
-  if (record.summary_status === "failed") {
-    return "Summary: Failed";
-  }
-  return "Summary: Not requested";
+  return null;
 }
+
+function StatusCell({ record }: { record: SpeechTextJobSummary }) {
+  const status = presentSpeechTextHistoryStatus(
+    record.processing_status,
+    record.processing_error,
+    record.kind,
+  ).status;
+  if (status === "processing") {
+    return (
+      <RowBadge tone="info" dot>
+        {record.kind === "diarization" ? "Diarizing" : "Transcribing"}
+      </RowBadge>
+    );
+  }
+  if (status === "queued") {
+    return <RowBadge dot>Queued</RowBadge>;
+  }
+  if (status === "failed") {
+    return (
+      <RowBadge tone="danger" dot>
+        Failed
+      </RowBadge>
+    );
+  }
+  if (status === "canceled") {
+    return <RowBadge>Cancelled</RowBadge>;
+  }
+  if (status === "unknown") {
+    return <RowBadge>Status unknown</RowBadge>;
+  }
+
+  const speakers = speakerCount(record);
+  const badges = [];
+  if (speakers != null) {
+    badges.push(
+      <RowBadge key="speakers" icon={<Users className="h-3 w-3" />}>
+        {speakers} speaker{speakers === 1 ? "" : "s"}
+      </RowBadge>,
+    );
+  } else if (
+    isSpeakerAttributedAsrSummary(record) &&
+    (record.speaker_turn_count ?? 0) > 0
+  ) {
+    badges.push(
+      <RowBadge key="speakers" icon={<Users className="h-3 w-3" />}>
+        Speakers
+      </RowBadge>,
+    );
+  }
+  if (record.summary_status === "ready") {
+    badges.push(
+      <RowBadge key="summary" icon={<Sparkles className="h-3 w-3" />}>
+        Summary
+      </RowBadge>,
+    );
+  } else if (record.summary_status === "pending") {
+    badges.push(
+      <RowBadge
+        key="summary"
+        tone="info"
+        icon={<Loader2 className="h-3 w-3 animate-spin" />}
+      >
+        Summarising
+      </RowBadge>
+    );
+  }
+  return badges.length > 0 ? (
+    <div className="flex flex-wrap gap-1">{badges}</div>
+  ) : null;
+}
+
+function PreviewCell({ record }: { record: SpeechTextJobSummary }) {
+  const presentation = presentSpeechTextHistoryStatus(
+    record.processing_status,
+    record.processing_error,
+    record.kind,
+  );
+  const preview = rowPreview(record);
+  if (presentation.status === "failed") {
+    return (
+      <span className="text-[13px] text-[var(--danger-text)]">
+        {record.processing_error?.trim() || presentation.description}
+      </span>
+    );
+  }
+  if (presentation.status === "queued" || presentation.status === "processing") {
+    return (
+      <span className="text-[13px] text-[var(--text-subtle)]">
+        {preview ||
+          (presentation.status === "queued"
+            ? "Waiting to start…"
+            : "Preparing transcript…")}
+      </span>
+    );
+  }
+  if (presentation.status !== "ready") {
+    // Never present output from an unknown or cancelled job as finished.
+    return (
+      <span className="text-[13px] text-[var(--text-subtle)]">
+        {presentation.description}
+      </span>
+    );
+  }
+  return (
+    <span className="text-[13px] text-[var(--text-muted)]">
+      {preview || "No speech recognised."}
+    </span>
+  );
+}
+
+const COLUMNS: HistoryColumn<SpeechTextJobSummary>[] = [
+  {
+    id: "file",
+    header: "File",
+    className: "w-[15rem] max-w-[15rem]",
+    cell: (record) => {
+      const active =
+        record.processing_status === "pending" ||
+        record.processing_status === "processing";
+      return (
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] border border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] text-[var(--text-muted)]">
+            {active ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <AudioLines className="h-4 w-4" />
+            )}
+          </span>
+          <span className="truncate font-medium text-[var(--text-primary)]">
+            {record.audio_filename || "Audio input"}
+          </span>
+        </div>
+      );
+    },
+  },
+  {
+    id: "transcript",
+    header: "Transcript",
+    className: "max-w-0",
+    cell: (record) => (
+      <div className="truncate">
+        <PreviewCell record={record} />
+      </div>
+    ),
+  },
+  {
+    id: "length",
+    header: "Length",
+    className: "hidden w-[5.5rem] lg:table-cell",
+    cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+    cell: (record) => formatClockDuration(record.duration_secs),
+  },
+  {
+    id: "status",
+    header: "Status",
+    className: "w-[10rem]",
+    cell: (record) => <StatusCell record={record} />,
+  },
+  {
+    id: "created",
+    header: "Created",
+    className: "hidden w-[8rem] lg:table-cell",
+    cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
+    cell: (record) => formatHistoryDate(record.created_at),
+  },
+];
 
 export function TranscriptionHistoryTable({
   records,
+  total = null,
+  filtered = false,
   loading = false,
   error = null,
   loadMore,
@@ -151,15 +323,10 @@ export function TranscriptionHistoryTable({
   const [exportDiarizationRecord, setExportDiarizationRecord] =
     useState<ExportableDiarizationRecord | null>(null);
 
-  const deleteTargetLabel = useMemo(
-    () => (deleteTarget ? rowLabel(deleteTarget) : "Speech-text job"),
-    [deleteTarget],
-  );
-
-  const deleteTargetKindLabel = useMemo(
-    () => (deleteTarget ? rowKindLabel(deleteTarget).toLowerCase() : "record"),
-    [deleteTarget],
-  );
+  const deleteTargetLabel = deleteTarget ? rowLabel(deleteTarget) : undefined;
+  const deleteTargetKindLabel = deleteTarget
+    ? rowKindLabel(deleteTarget).toLowerCase()
+    : "record";
 
   async function handleCopy(record: SpeechTextJobSummary): Promise<void> {
     if (busyRecordId || deletePending) {
@@ -267,238 +434,78 @@ export function TranscriptionHistoryTable({
     }
   }
 
-  const activeBusyRecordId = busyRecordId;
-
-  if (loading) {
-    return (
-      <div className="mb-6 flex min-h-[20rem] items-center justify-center rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm text-[var(--text-muted)]">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        Loading speech-text history...
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="mb-6 rounded-2xl border border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <p>{error}</p>
-          </div>
-          {onRefresh ? (
-            <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
-              Retry
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
-
-  if (records.length === 0) {
-    return (
-      <div className="mb-6 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-10 text-center">
-        <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-          No speech-text jobs yet
-        </h3>
-        <p className="mt-2 text-sm text-[var(--text-muted)]">
-          Queued, processing, and completed transcription and diarization jobs will appear here.
-        </p>
-      </div>
-    );
-  }
-
   return (
     <>
-      <div className="mb-6 overflow-hidden rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)]">
-        <div className="overflow-x-auto">
-          <table className="min-w-full border-collapse text-sm">
-            <thead className="bg-[var(--bg-surface-1)] text-left text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
-              <tr>
-                <th className="px-4 py-3 font-semibold sm:px-5">Created</th>
-                <th className="px-4 py-3 font-semibold">Type</th>
-                <th className="px-4 py-3 font-semibold">File</th>
-                <th className="px-4 py-3 font-semibold">Duration</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-                <th className="px-4 py-3 font-semibold">Preview</th>
-                <th className="w-[56px] px-3 py-3 text-right font-semibold sm:px-4">
-                  <span className="sr-only">Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {records.map((record) => {
-                const kind = rowKind(record);
-                const isBusy = activeBusyRecordId === record.id;
-                const speakerCount = isDiarizationSummary(record)
-                  ? (record.corrected_speaker_count ?? record.speaker_count)
-                  : null;
-                const statusPresentation = presentSpeechTextHistoryStatus(
-                  record.processing_status,
-                  record.processing_error,
-                  record.kind,
-                );
-                const outputReady = statusPresentation.status === "ready";
-                const statusMessage =
-                  statusPresentation.status === "failed"
-                    ? record.processing_error?.trim() ||
-                      statusPresentation.description
-                    : statusPresentation.description;
-
-                return (
-                  <tr
-                    key={record.id}
-                    aria-label={`Open ${kind} ${rowLabel(record)}`}
-                    className="cursor-pointer border-t border-[var(--border-muted)] transition-colors hover:bg-[var(--bg-surface-1)]"
-                    onClick={(event) => {
-                      if ((event.target as HTMLElement).closest("[data-row-action]")) {
-                        return;
-                      }
-                      onOpenRecord(record);
-                    }}
-                    onKeyDown={(event) => {
-                      if ((event.target as HTMLElement).closest("[data-row-action]")) {
-                        return;
-                      }
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        onOpenRecord(record);
-                      }
-                    }}
-                    tabIndex={0}
-                  >
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)] sm:px-5">
-                      {formatCreatedAt(record.created_at)}
-                    </td>
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                      {rowKindLabel(record)}
-                    </td>
-                    <td className="px-4 py-3 align-top">
-                      <div className="font-medium text-[var(--text-primary)]">
-                        {record.audio_filename || "Audio input"}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                      {formatAudioDuration(record.duration_secs)}
-                    </td>
-                    <td className="px-4 py-3 align-top">
-                      <StatusBadge tone={statusPresentation.tone}>
-                        {statusPresentation.label}
-                      </StatusBadge>
-                    </td>
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                      <div className="max-w-[34rem]">
-                        <div
-                          className={
-                            statusPresentation.status === "failed"
-                              ? "break-words whitespace-pre-wrap text-[var(--text-primary)]"
-                              : "line-clamp-2 text-[var(--text-primary)]"
-                          }
-                        >
-                          {outputReady
-                            ? rowPreview(record) || "No transcript preview available."
-                            : statusMessage}
-                        </div>
-                        {(statusPresentation.status === "queued" ||
-                          statusPresentation.status === "processing") &&
-                        rowPreview(record) ? (
-                          <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
-                            Latest output: <span>{rowPreview(record)}</span>
-                          </div>
-                        ) : null}
-                        {outputReady && speakerCount != null ? (
-                          <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
-                            Speakers: {speakerCount}
-                          </div>
-                        ) : null}
-                        {outputReady ? (
-                          <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
-                            {rowSummaryLabel(record)}
-                          </div>
-                        ) : null}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 align-top text-right sm:px-4">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            data-row-action
-                            className="h-8 w-8 rounded-full text-[var(--text-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
-                            aria-label={`More actions for ${rowLabel(record)}`}
-                            onClick={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => event.stopPropagation()}
-                          >
-                            {isBusy ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <MoreVertical className="h-4 w-4" />
-                            )}
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent
-                          align="end"
-                          className="w-48"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          <DropdownMenuItem onSelect={() => onOpenRecord(record)}>
-                            <ExternalLink className="mr-2 h-4 w-4" />
-                            Open record
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            disabled={isBusy || deletePending || !outputReady}
-                            onSelect={() => void handleCopy(record)}
-                          >
-                            <Copy className="mr-2 h-4 w-4" />
-                            Copy transcript
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            disabled={isBusy || deletePending || !outputReady}
-                            onSelect={() => void handleExport(record)}
-                          >
-                            <Download className="mr-2 h-4 w-4" />
-                            Export
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem
-                            disabled={!onDeleteRecord || deletePending}
-                            onSelect={() => {
-                              setDeleteError(null);
-                              setDeleteTarget(record);
-                            }}
-                            className="text-[var(--danger-text)] focus:text-[var(--danger-text)]"
-                          >
-                            <Trash2 className="mr-2 h-4 w-4" />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        {loadMore?.canLoadMore ? (
-          <div className="flex justify-center border-t border-[var(--border-muted)] px-4 py-3 sm:px-5">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2"
-              onClick={loadMore.onLoadMore}
-              disabled={loadMore.loading}
-            >
-              {loadMore.loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Load more
-            </Button>
-          </div>
-        ) : null}
-      </div>
+      <HistoryTable
+        rows={records}
+        columns={COLUMNS}
+        getRowId={(record) => record.id}
+        getRowLabel={(record) =>
+          `${rowKindLabel(record).toLowerCase()} ${rowLabel(record)}`
+        }
+        onOpenRow={onOpenRecord}
+        loading={loading}
+        error={error}
+        onRetry={onRefresh}
+        filtered={filtered}
+        total={total}
+        noun="transcripts"
+        empty={{
+          title: "No transcripts yet",
+          description:
+            "Transcribe a recording or file. Queued, running and finished jobs appear here.",
+        }}
+        loadMore={loadMore}
+        rowActions={(record) => {
+          const outputReady =
+            presentSpeechTextHistoryStatus(
+              record.processing_status,
+              record.processing_error,
+              record.kind,
+            ).status === "ready";
+          const isBusy = busyRecordId === record.id;
+          return (
+            <RowMenu
+              label={rowLabel(record)}
+              busy={isBusy}
+              items={[
+                {
+                  id: "open",
+                  label: "Open record",
+                  icon: ExternalLink,
+                  onSelect: () => onOpenRecord(record),
+                },
+                {
+                  id: "copy",
+                  label: "Copy transcript",
+                  icon: Copy,
+                  disabled: isBusy || deletePending || !outputReady,
+                  onSelect: () => void handleCopy(record),
+                },
+                {
+                  id: "export",
+                  label: "Export",
+                  icon: Download,
+                  disabled: isBusy || deletePending || !outputReady,
+                  onSelect: () => void handleExport(record),
+                },
+                {
+                  id: "delete",
+                  label: "Delete",
+                  icon: Trash2,
+                  danger: true,
+                  separatorBefore: true,
+                  disabled: !onDeleteRecord || deletePending,
+                  onSelect: () => {
+                    setDeleteError(null);
+                    setDeleteTarget(record);
+                  },
+                },
+              ]}
+            />
+          );
+        }}
+      />
 
       <TranscriptionExportDialog
         record={exportTranscriptionRecord}
@@ -522,81 +529,18 @@ export function TranscriptionHistoryTable({
         }}
       />
 
-      <Dialog
-        open={Boolean(deleteTarget)}
-        onOpenChange={(open) => {
-          if (!deletePending) {
-            setDeleteTarget(open ? deleteTarget : null);
-            if (!open) {
-              setDeleteError(null);
-            }
-          }
+      <ConfirmDeleteDialog
+        noun={deleteTarget ? deleteTargetKindLabel : null}
+        itemLabel={deleteTargetLabel}
+        description="This permanently removes the saved audio and transcript from history."
+        pending={deletePending}
+        error={deleteError}
+        onConfirm={() => void handleConfirmDelete()}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
         }}
-      >
-        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
-          <DialogTitle className="sr-only">Delete record?</DialogTitle>
-          {deleteTarget ? (
-            <>
-              <div className="flex items-start gap-3">
-                <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
-                  <AlertTriangle className="h-4 w-4" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">
-                    Delete {deleteTargetKindLabel}?
-                  </h3>
-                  <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
-                    This permanently removes the saved audio and transcript from
-                    history.
-                  </DialogDescription>
-                  <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
-                    {deleteTargetLabel}
-                  </p>
-                </div>
-              </div>
-
-              {deleteError ? (
-                <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
-                  {deleteError}
-                </div>
-              ) : null}
-
-              <div className="mt-5 flex items-center justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
-                  onClick={() => {
-                    setDeleteTarget(null);
-                    setDeleteError(null);
-                  }}
-                  disabled={deletePending}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="sm"
-                  className="h-8 gap-1.5"
-                  onClick={() => void handleConfirmDelete()}
-                  disabled={deletePending}
-                >
-                  {deletePending ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Deleting
-                    </>
-                  ) : (
-                    `Delete ${deleteTargetKindLabel}`
-                  )}
-                </Button>
-              </div>
-            </>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+      />
     </>
   );
 }

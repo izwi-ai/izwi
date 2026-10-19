@@ -1,40 +1,39 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
-  AlertTriangle,
   Copy,
   Download,
   ExternalLink,
-  Loader2,
-  MoreVertical,
   OctagonX,
+  Pause,
+  Play,
   Trash2,
 } from "lucide-react";
 
 import { api, type SpeechHistoryRecordSummary } from "@/api";
 import { useNotifications } from "@/app/providers/NotificationProvider";
+import { useAudioPreview } from "@/components/audio/useAudioPreview";
+import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
+import {
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import { HistoryTable, type HistoryColumn } from "@/components/history/HistoryTable";
+import { RowBadge } from "@/components/history/RowBadge";
+import { RowMenu } from "@/components/history/RowMenu";
 import { Button } from "@/components/ui/button";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  formatSpeechCreatedAt,
-  formatSpeechDuration,
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
 } from "@/features/text-to-speech/support";
+import { cn } from "@/lib/utils";
 
 interface TextToSpeechHistoryTableProps {
   records: SpeechHistoryRecordSummary[];
+  /** Records matching the filters, if the server reports it. */
+  total?: number | null;
+  /** Search or a filter narrows the list. */
+  filtered?: boolean;
   savedVoiceNameById?: Record<string, string>;
   loading?: boolean;
   error?: string | null;
@@ -49,15 +48,44 @@ interface TextToSpeechHistoryTableProps {
   onRefresh?: () => void;
 }
 
+const LABEL_MAX_CHARS = 48;
+
+/**
+ * How a take is named in labels and notices: the opening of its text (as
+ * its record page title is), not the generated audio filename.
+ */
 function rowLabel(
   record: SpeechHistoryRecordSummary,
   voiceLabel: string,
 ): string {
-  return record.audio_filename || voiceLabel || record.model_id || record.id;
+  const text = record.input_preview.replace(/\s+/g, " ").trim();
+  if (text) {
+    return text.length > LABEL_MAX_CHARS
+      ? `${text.slice(0, LABEL_MAX_CHARS).trimEnd()}…`
+      : text;
+  }
+  return voiceLabel || record.model_id || record.id;
 }
+
+function initials(label: string): string {
+  return (
+    label
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase() || "?"
+  );
+}
+
+const QUICK_ACTION_CLASS =
+  "h-7 w-7 rounded-lg text-[var(--text-subtle)] opacity-0 transition-opacity hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] focus-visible:opacity-100 disabled:opacity-0 group-hover:opacity-100 group-hover:disabled:opacity-40 group-focus-within:opacity-100";
 
 export function TextToSpeechHistoryTable({
   records,
+  total = null,
+  filtered = false,
   savedVoiceNameById = {},
   loading = false,
   error = null,
@@ -74,21 +102,20 @@ export function TextToSpeechHistoryTable({
   );
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const preview = useAudioPreview(() =>
+    notify({ title: "Could not play this generation", tone: "warning" }),
+  );
 
-  const deleteTargetLabel = useMemo(() => {
-    if (!deleteTarget) {
-      return "Speech generation";
-    }
-
-    const voiceLabel = resolveSpeechVoiceLabel({
-      savedVoiceId: deleteTarget.saved_voice_id,
-      speaker: deleteTarget.speaker,
-      modelId: deleteTarget.model_id,
+  const voiceLabelFor = (record: SpeechHistoryRecordSummary) =>
+    resolveSpeechVoiceLabel({
+      savedVoiceId: record.saved_voice_id,
+      speaker: record.speaker,
+      modelId: record.model_id,
       savedVoiceNameById,
     });
-
-    return rowLabel(deleteTarget, voiceLabel);
-  }, [deleteTarget, savedVoiceNameById]);
+  const deleteTargetLabel = deleteTarget
+    ? rowLabel(deleteTarget, voiceLabelFor(deleteTarget))
+    : "Speech generation";
 
   async function handleCopy(record: SpeechHistoryRecordSummary): Promise<void> {
     if (busyRecordId || deletePending) {
@@ -213,284 +240,234 @@ export function TextToSpeechHistoryTable({
     }
   }
 
-  const activeBusyRecordId = busyRecordId;
-
-  if (loading) {
-    return (
-      <div className="mb-6 flex min-h-[20rem] items-center justify-center rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm text-[var(--text-muted)]">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        Loading text-to-speech history...
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="mb-6 rounded-2xl border border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <p>{error}</p>
+  const columns: HistoryColumn<SpeechHistoryRecordSummary>[] = [
+    {
+      id: "play",
+      header: <span className="sr-only">Play</span>,
+      className: "w-[3.25rem] pr-0",
+      cell: (record) => {
+        const ready =
+          normalizeSpeechProcessingStatus(
+            record.processing_status,
+            record.processing_error,
+          ) === "ready";
+        const playing = preview.playingId === record.id;
+        return (
+          <button
+            type="button"
+            data-row-action
+            disabled={!ready}
+            onClick={() =>
+              preview.toggle(record.id, api.textToSpeechRecordAudioUrl(record.id))
+            }
+            aria-label={`${playing ? "Pause" : "Play"} ${rowLabel(record, voiceLabelFor(record))}`}
+            className={cn(
+              "inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[var(--text-primary)] transition-colors hover:border-[var(--border-strong)] disabled:cursor-not-allowed disabled:opacity-40",
+              playing && "border-[var(--text-primary)]",
+            )}
+          >
+            {playing ? (
+              <Pause className="h-3 w-3" fill="currentColor" />
+            ) : (
+              <Play className="ml-0.5 h-3 w-3" fill="currentColor" />
+            )}
+          </button>
+        );
+      },
+    },
+    {
+      id: "text",
+      header: "Text",
+      className: "max-w-0",
+      cell: (record) => {
+        const status = normalizeSpeechProcessingStatus(
+          record.processing_status,
+          record.processing_error,
+        );
+        return (
+          <div className="min-w-0">
+            <div className="truncate text-[var(--text-primary)]">
+              {record.input_preview || "Untitled generation"}
+            </div>
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--text-subtle)]">
+              {status === "failed" ? (
+                <RowBadge tone="danger" className="h-[18px] text-[11px]">
+                  Failed
+                </RowBadge>
+              ) : status === "pending" || status === "processing" ? (
+                <RowBadge tone="info" dot className="h-[18px] text-[11px]">
+                  {status === "pending" ? "Queued" : "Generating"}
+                </RowBadge>
+              ) : null}
+              <span className="truncate">
+                {record.model_id ? getModelDisplayName(record.model_id) : ""}
+              </span>
+            </div>
           </div>
-          {onRefresh ? (
-            <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
-              Retry
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
-
-  if (records.length === 0) {
-    return (
-      <div className="mb-6 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-10 text-center">
-        <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-          No text-to-speech jobs yet
-        </h3>
-        <p className="mt-2 text-sm text-[var(--text-muted)]">
-          Queued, processing, and completed generations will appear here.
-        </p>
-      </div>
-    );
-  }
+        );
+      },
+    },
+    {
+      id: "voice",
+      header: "Voice",
+      className: "hidden w-[10rem] md:table-cell",
+      cell: (record) => {
+        const label = voiceLabelFor(record);
+        return (
+          <span className="inline-flex max-w-full items-center gap-2 text-[13px] text-[var(--text-secondary)]">
+            <span
+              aria-hidden="true"
+              className="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-[var(--speaker-avatar-border)] bg-[var(--speaker-avatar-bg)] text-[10px] font-semibold text-[var(--speaker-avatar-text)]"
+            >
+              {initials(label)}
+            </span>
+            <span className="truncate">{label}</span>
+          </span>
+        );
+      },
+    },
+    {
+      id: "length",
+      header: "Length",
+      className: "hidden w-[5.5rem] lg:table-cell",
+      cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+      cell: (record) => formatClockDuration(record.audio_duration_secs),
+    },
+    {
+      id: "created",
+      header: "Created",
+      className: "hidden w-[8rem] lg:table-cell",
+      cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
+      cell: (record) => formatHistoryDate(record.created_at),
+    },
+  ];
 
   return (
     <>
-      <div className="mb-6 overflow-hidden rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)]">
-        <div className="overflow-x-auto">
-          <table className="min-w-full border-collapse text-sm">
-            <thead className="bg-[var(--bg-surface-1)] text-left text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
-              <tr>
-                <th className="px-4 py-3 font-semibold sm:px-5">Created</th>
-                <th className="px-4 py-3 font-semibold">Voice</th>
-                <th className="px-4 py-3 font-semibold">Duration</th>
-                <th className="px-4 py-3 font-semibold">Preview</th>
-                <th className="w-[56px] px-3 py-3 text-right font-semibold sm:px-4">
-                  <span className="sr-only">Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {records.map((record) => {
-                const voiceLabel = resolveSpeechVoiceLabel({
-                  savedVoiceId: record.saved_voice_id,
-                  speaker: record.speaker,
-                  modelId: record.model_id,
-                  savedVoiceNameById,
-                });
-                const isBusy = activeBusyRecordId === record.id;
-                const processingStatus = normalizeSpeechProcessingStatus(
-                  record.processing_status,
-                  record.processing_error,
-                );
-                const canDownload = processingStatus === "ready";
-                const canCancel =
-                  processingStatus === "pending" || processingStatus === "processing";
-
-                return (
-                  <tr
-                    key={record.id}
-                    aria-label={`Open text-to-speech ${rowLabel(record, voiceLabel)}`}
-                    className="cursor-pointer border-t border-[var(--border-muted)] transition-colors hover:bg-[var(--bg-surface-1)]"
-                    onClick={(event) => {
-                      if ((event.target as HTMLElement).closest("[data-row-action]")) {
-                        return;
-                      }
-                      onOpenRecord(record.id);
-                    }}
-                    onKeyDown={(event) => {
-                      if ((event.target as HTMLElement).closest("[data-row-action]")) {
-                        return;
-                      }
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        onOpenRecord(record.id);
-                      }
-                    }}
-                    tabIndex={0}
-                  >
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)] sm:px-5">
-                      {formatSpeechCreatedAt(record.created_at)}
-                    </td>
-                    <td className="px-4 py-3 align-top">
-                      <div className="font-medium text-[var(--text-primary)]">
-                        {voiceLabel}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                      {formatSpeechDuration(record.audio_duration_secs)}
-                    </td>
-                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                      <div className="max-w-[34rem] line-clamp-2 text-[var(--text-primary)]">
-                        {record.input_preview}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 align-top text-right sm:px-4">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            data-row-action
-                            className="h-8 w-8 rounded-full text-[var(--text-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
-                            aria-label={`More actions for ${rowLabel(record, voiceLabel)}`}
-                            onClick={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => event.stopPropagation()}
-                          >
-                            {isBusy ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <MoreVertical className="h-4 w-4" />
-                            )}
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent
-                          align="end"
-                          className="w-48"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          <DropdownMenuItem onSelect={() => onOpenRecord(record.id)}>
-                            <ExternalLink className="mr-2 h-4 w-4" />
-                            Open record
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            disabled={isBusy || deletePending}
-                            onSelect={() => void handleCopy(record)}
-                          >
-                            <Copy className="mr-2 h-4 w-4" />
-                            Copy text
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            disabled={isBusy || deletePending || !canDownload}
-                            onSelect={() => void handleDownload(record, voiceLabel)}
-                          >
-                            <Download className="mr-2 h-4 w-4" />
-                            Download
-                          </DropdownMenuItem>
-                          {canCancel ? (
-                            <DropdownMenuItem
-                              disabled={isBusy || deletePending || !onCancelRecord}
-                              onSelect={() => void handleCancel(record)}
-                            >
-                              <OctagonX className="mr-2 h-4 w-4" />
-                              Cancel generation
-                            </DropdownMenuItem>
-                          ) : null}
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem
-                            disabled={!onDeleteRecord || deletePending}
-                            onSelect={() => {
-                              setDeleteError(null);
-                              setDeleteTarget(record);
-                            }}
-                            className="text-[var(--danger-text)] focus:text-[var(--danger-text)]"
-                          >
-                            <Trash2 className="mr-2 h-4 w-4" />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        {loadMore?.canLoadMore ? (
-          <div className="flex justify-center border-t border-[var(--border-muted)] px-4 py-3 sm:px-5">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2"
-              onClick={loadMore.onLoadMore}
-              disabled={loadMore.loading}
-            >
-              {loadMore.loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Load more
-            </Button>
-          </div>
-        ) : null}
-      </div>
-
-      <Dialog
-        open={Boolean(deleteTarget)}
-        onOpenChange={(open) => {
-          if (!deletePending) {
-            setDeleteTarget(open ? deleteTarget : null);
-            if (!open) {
-              setDeleteError(null);
-            }
-          }
+      <HistoryTable
+        rows={records}
+        columns={columns}
+        getRowId={(record) => record.id}
+        getRowLabel={(record) =>
+          `speech "${rowLabel(record, voiceLabelFor(record))}"`
+        }
+        onOpenRow={(record) => onOpenRecord(record.id)}
+        loading={loading}
+        error={error}
+        onRetry={onRefresh}
+        filtered={filtered}
+        total={total}
+        noun="generations"
+        empty={{
+          title: "No speech yet",
+          description:
+            "Generate speech from text. Queued, running and finished takes appear here.",
         }}
-      >
-        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
-          <DialogTitle className="sr-only">Delete generation?</DialogTitle>
-          {deleteTarget ? (
+        loadMore={loadMore}
+        rowActions={(record) => {
+          const voiceLabel = voiceLabelFor(record);
+          const label = rowLabel(record, voiceLabel);
+          const status = normalizeSpeechProcessingStatus(
+            record.processing_status,
+            record.processing_error,
+          );
+          const isBusy = busyRecordId === record.id;
+          const canDownload = status === "ready";
+          const canCancel = status === "pending" || status === "processing";
+          return (
             <>
-              <div className="flex items-start gap-3">
-                <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
-                  <AlertTriangle className="h-4 w-4" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">
-                    Delete generation?
-                  </h3>
-                  <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
-                    This permanently removes the saved audio and prompt text from
-                    history.
-                  </DialogDescription>
-                  <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
-                    {deleteTargetLabel}
-                  </p>
-                </div>
-              </div>
-
-              {deleteError ? (
-                <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
-                  {deleteError}
-                </div>
+              {canDownload ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className={QUICK_ACTION_CLASS}
+                  disabled={isBusy || deletePending}
+                  onClick={() => void handleDownload(record, voiceLabel)}
+                  aria-label={`Download ${label}`}
+                  title="Download"
+                >
+                  <Download className="h-4 w-4" />
+                </Button>
               ) : null}
-
-              <div className="mt-5 flex items-center justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
-                  onClick={() => {
-                    setDeleteTarget(null);
-                    setDeleteError(null);
-                  }}
-                  disabled={deletePending}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="sm"
-                  className="h-8 gap-1.5"
-                  onClick={() => void handleConfirmDelete()}
-                  disabled={deletePending}
-                >
-                  {deletePending ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Deleting
-                    </>
-                  ) : (
-                    "Delete generation"
-                  )}
-                </Button>
-              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={QUICK_ACTION_CLASS}
+                disabled={isBusy || deletePending}
+                onClick={() => void handleCopy(record)}
+                aria-label={`Copy text of ${label}`}
+                title="Copy text"
+              >
+                <Copy className="h-4 w-4" />
+              </Button>
+              <RowMenu
+                label={label}
+                busy={isBusy}
+                items={[
+                  {
+                    id: "open",
+                    label: "Open record",
+                    icon: ExternalLink,
+                    onSelect: () => onOpenRecord(record.id),
+                  },
+                  {
+                    id: "copy",
+                    label: "Copy text",
+                    icon: Copy,
+                    disabled: isBusy || deletePending,
+                    onSelect: () => void handleCopy(record),
+                  },
+                  {
+                    id: "download",
+                    label: "Download",
+                    icon: Download,
+                    disabled: isBusy || deletePending || !canDownload,
+                    onSelect: () => void handleDownload(record, voiceLabel),
+                  },
+                  ...(canCancel
+                    ? [
+                        {
+                          id: "cancel",
+                          label: "Cancel generation",
+                          icon: OctagonX,
+                          disabled: isBusy || deletePending || !onCancelRecord,
+                          onSelect: () => void handleCancel(record),
+                        },
+                      ]
+                    : []),
+                  {
+                    id: "delete",
+                    label: "Delete",
+                    icon: Trash2,
+                    danger: true,
+                    separatorBefore: true,
+                    disabled: !onDeleteRecord || deletePending,
+                    onSelect: () => {
+                      setDeleteError(null);
+                      setDeleteTarget(record);
+                    },
+                  },
+                ]}
+              />
             </>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+          );
+        }}
+      />
+
+      <ConfirmDeleteDialog
+        noun={deleteTarget ? "generation" : null}
+        itemLabel={deleteTargetLabel}
+        description="This permanently removes the generated audio and its text from history."
+        pending={deletePending}
+        error={deleteError}
+        onConfirm={() => void handleConfirmDelete()}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+      />
     </>
   );
 }

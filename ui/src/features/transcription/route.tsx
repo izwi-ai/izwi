@@ -42,6 +42,20 @@ import {
 } from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
+import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
+import {
+  HistoryToolbar,
+  SearchField,
+  SegmentedFilter,
+} from "@/components/history/HistoryToolbar";
+import { NewItemButton } from "@/components/history/NewItemButton";
+import { CREATION_DIALOG_CONTENT_CLASS } from "@/components/CreationDialog";
+import { cn } from "@/lib/utils";
+import {
+  parseTranscriptionFilter,
+  TRANSCRIPTION_FILTER_OPTIONS,
+  transcriptionListFilters,
+} from "@/features/transcription/historyFilters";
 import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
 import { AnimatePresence, motion } from "framer-motion";
 import { Settings2 } from "lucide-react";
@@ -406,15 +420,33 @@ export function TranscriptionPage({
     ],
   );
   const diarizationModelSections = baseDiarizationModelSections;
+  // List search and filter live in the URL, so Back from a record keeps them.
+  const historySearch = searchParams.get("q") ?? "";
+  const historyFilter = parseTranscriptionFilter(searchParams.get("show"));
+  const setHistoryParam = useCallback(
+    (key: "q" | "show", value: string) => {
+      const next = new URLSearchParams(searchParams);
+      if (value && !(key === "show" && value === "all")) {
+        next.set(key, value);
+      } else {
+        next.delete(key);
+      }
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
   const {
     records,
+    total: historyTotal,
     loading: historyLoading,
     loadingMore: historyLoadingMore,
     error: historyError,
     hasMoreRecords,
     loadMoreRecords,
     refresh: refreshHistory,
-  } = useTranscriptionHistory();
+  } = useTranscriptionHistory(
+    transcriptionListFilters(historySearch, historyFilter),
+  );
   const {
     record,
     loading: recordLoading,
@@ -479,6 +511,7 @@ export function TranscriptionPage({
     setNewSpeechTextMode("transcription");
     setIsNewTranscriptionModalOpen(true);
   }, []);
+  useNewItemShortcut(handleOpenNewTranscriptionModal);
   const handleCloseNewTranscriptionModal = useCallback(() => {
     setIsNewTranscriptionModalOpen(false);
     if (searchParams.has("create")) {
@@ -488,12 +521,18 @@ export function TranscriptionPage({
     }
   }, [searchParams, setSearchParams]);
 
+  // ?create=transcription|diarization (the command palette, legacy
+  // /diarization links) opens the creation modal in that mode.
   useEffect(() => {
-    if (recordId || searchParams.get("create") !== "diarization") {
+    const requestedMode = searchParams.get("create");
+    if (
+      recordId ||
+      (requestedMode !== "transcription" && requestedMode !== "diarization")
+    ) {
       return;
     }
 
-    setNewSpeechTextMode("diarization");
+    setNewSpeechTextMode(requestedMode);
     setIsNewTranscriptionModalOpen(true);
   }, [recordId, searchParams]);
   const handleUnloadAllDiarizationManagedModels = useCallback(() => {
@@ -637,30 +676,6 @@ export function TranscriptionPage({
       )?.status ?? null,
     [resolvedAlignerModel, transcriptionAlignerModels],
   );
-  const detailDescription = useMemo(() => {
-    const visibleRecord =
-      streamingRecord && streamingRecord.id === recordId ? streamingRecord : record;
-
-    if (!visibleRecord) {
-      return "Inspect job status, transcript output, and summary state for this transcription record.";
-    }
-
-    const processingStatus = normalizeProcessingStatus(
-      visibleRecord.processing_status,
-      visibleRecord.processing_error,
-    );
-    switch (processingStatus) {
-      case "pending":
-        return "This transcription job is queued.";
-      case "processing":
-        return "This transcription job is actively processing.";
-      case "failed":
-        return "This transcription job failed during processing.";
-      case "ready":
-      default:
-        return "Inspect job status, transcript output, and summary state for this transcription record.";
-    }
-  }, [record, recordId, streamingRecord]);
   const visibleRecord = useMemo(() => {
     if (!recordId) {
       return null;
@@ -744,31 +759,22 @@ export function TranscriptionPage({
     <PageShell className={recordId ? "pb-32 sm:pb-36" : undefined}>
       {recordId ? (
         <>
-          <PageHeader
-            title="Transcription Record"
-            description={detailDescription}
-            actions={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={handleOpenModels}
-              >
-                <Settings2 className="h-4 w-4" />
-                Models
-              </Button>
-            }
-          />
-
           <TranscriptionRecordDetail
+            parentCrumb={{ label: "Transcription", to: "/transcription" }}
+            extraMenuItems={[
+              {
+                id: "models",
+                label: "Models",
+                icon: Settings2,
+                onSelect: handleOpenModels,
+              },
+            ]}
             record={visibleRecord}
             audioUrl={detailAudioUrl}
             loading={recordLoading}
             error={recordError}
             deleteError={recordActionError}
             summaryModelGuidance={summaryModelReady ? null : summaryModelRequirementMessage}
-            onBack={() => navigate("/transcription")}
             onDelete={handleDetailDelete}
             onRegenerateSummary={() => void handleDetailRegenerateSummary()}
             deletePending={recordDeletePending}
@@ -780,17 +786,9 @@ export function TranscriptionPage({
         <>
           <PageHeader
             title="Transcription"
-            description="Monitor queued, processing, and completed transcription jobs in one operational history table."
+            description="Transcribe recordings and files locally. Nothing leaves this device."
             actions={
               <>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-9 gap-2"
-                  onClick={handleOpenNewTranscriptionModal}
-                >
-                  New transcript
-                </Button>
                 <Button
                   type="button"
                   variant="outline"
@@ -801,12 +799,33 @@ export function TranscriptionPage({
                   <Settings2 className="h-4 w-4" />
                   Models
                 </Button>
+                <NewItemButton
+                  label="New transcript"
+                  onClick={handleOpenNewTranscriptionModal}
+                />
               </>
             }
           />
 
+          <HistoryToolbar>
+            <SearchField
+              value={historySearch}
+              onChange={(value) => setHistoryParam("q", value)}
+              placeholder="Search transcripts…"
+            />
+            <SegmentedFilter
+              label="Show"
+              options={TRANSCRIPTION_FILTER_OPTIONS}
+              value={historyFilter}
+              onChange={(value) => setHistoryParam("show", value)}
+              selectedCount={historyLoading ? null : historyTotal}
+            />
+          </HistoryToolbar>
+
           <TranscriptionHistoryTable
             records={records}
+            total={historyTotal}
+            filtered={Boolean(historySearch.trim()) || historyFilter !== "all"}
             loading={historyLoading}
             error={historyError}
             loadMore={{
@@ -843,7 +862,7 @@ export function TranscriptionPage({
             }}
           >
             <DialogContent
-              className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+              className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-[52rem]")}
               onEscapeKeyDown={(event) => {
                 if (isModelModalOpen) {
                   event.preventDefault();
@@ -863,6 +882,7 @@ export function TranscriptionPage({
               <AnimatePresence initial={false} mode="wait">
                 <motion.div
                   key={newSpeechTextMode}
+                  className="flex min-h-0 flex-1 flex-col"
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -6 }}

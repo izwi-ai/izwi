@@ -117,11 +117,11 @@ pub use runtime::{
 pub use runtime::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
     validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
-    ChatGeneration, ChatGenerationControls, ChatSamplingRequest, ChunkStats, DiarizationConfig,
-    DiarizationPipelineOptions, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
-    DiarizationUtterance, DiarizationWord, GenerationRequest, GenerationResult, JobCancellation,
-    ResolvedChatSampling, TtsStopReason, TtsStreamingMode, WindowedAlignment,
-    CHAT_MAX_TOKENS_UNSET,
+    ChatFinishReason, ChatGeneration, ChatGenerationControls, ChatSamplingRequest, ChunkStats,
+    DiarizationConfig, DiarizationPipelineOptions, DiarizationResult, DiarizationSegment,
+    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
+    GenerationResult, JobCancellation, ResolvedChatSampling, TtsStopReason, TtsStreamingMode,
+    WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,

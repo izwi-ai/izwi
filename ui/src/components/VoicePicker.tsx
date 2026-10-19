@@ -370,7 +370,7 @@ function VoiceCard({
                   key={`${item.id}-${meta}`}
                   className={cn(
                     VOICE_ROUTE_META_COPY_CLASS,
-                    "rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]/70 px-2 py-0.5 text-[10px] font-semibold",
+                    "rounded-full border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_70%,transparent)] px-2 py-0.5 text-[10px] font-semibold",
                   )}
                 >
                   {meta}

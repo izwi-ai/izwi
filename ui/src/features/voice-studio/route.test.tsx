@@ -79,16 +79,34 @@ describe("VoiceStudioPage", () => {
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
   });
 
-  it("ignores legacy tab query and keeps library-first layout", () => {
+  it("opens the design step for legacy ?tab=design links over the library", async () => {
     renderVoiceStudio("/voices?tab=design");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("dialog", { name: "Design Voice" }),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the clone step for legacy ?tab=clone links", async () => {
+    renderVoiceStudio("/voices?tab=clone");
+
+    expect(
+      await screen.findByRole("dialog", { name: "Clone Voice" }),
+    ).toBeInTheDocument();
+  });
+
+  it("ignores unknown tab values", () => {
+    renderVoiceStudio("/voices?tab=library");
+
+    expect(screen.getByTestId("studio-library")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("opens creation modal from the page header action", () => {
     renderVoiceStudio("/voices");
 
-    fireEvent.click(screen.getByRole("button", { name: "New Voice" }));
+    fireEvent.click(screen.getByRole("button", { name: "New voice" }));
 
     expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Clone Voice/i })).toBeInTheDocument();

@@ -267,7 +267,7 @@ export function VoiceSelect({
           compact ? "h-10 py-0" : "py-2.5",
           canOpen
             ? "hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)]"
-            : "cursor-not-allowed bg-[var(--bg-surface-1)]/60 text-[var(--text-muted)]",
+            : "cursor-not-allowed bg-[color-mix(in_srgb,var(--bg-surface-1)_60%,transparent)] text-[var(--text-muted)]",
           isOpen && "border-ring/50 ring-2 ring-ring/35",
         )}
       >

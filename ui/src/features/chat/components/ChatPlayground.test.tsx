@@ -18,6 +18,40 @@ const apiMocks = vi.hoisted(() => ({
   createChatThread: vi.fn(),
   deleteChatThread: vi.fn(),
   sendChatThreadMessageStream: vi.fn(),
+  generateTTSStream: vi.fn(),
+  regenerateChatThreadMessageStream: vi.fn(),
+  editChatThreadMessageStream: vi.fn(),
+  deleteChatThreadMessage: vi.fn(),
+}));
+
+const playerMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    unlock: ReturnType<typeof vi.fn>;
+    start: ReturnType<typeof vi.fn>;
+    push: ReturnType<typeof vi.fn>;
+    finish: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+    onDrained: () => void;
+  }>,
+}));
+
+vi.mock("@/features/text-to-speech/pcmPlayer", () => ({
+  SpeechPcmPlayer: vi.fn().mockImplementation(function (
+    this: Record<string, unknown>,
+    _context: unknown,
+    onDrained: () => void,
+  ) {
+    const instance = {
+      unlock: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn(),
+      push: vi.fn().mockResolvedValue(undefined),
+      finish: vi.fn(),
+      stop: vi.fn(),
+      onDrained,
+    };
+    playerMocks.instances.push(instance);
+    return instance;
+  }),
 }));
 
 const createObjectUrlMock = vi.fn<(file: File) => string>();
@@ -32,6 +66,10 @@ vi.mock("@/api", () => ({
     createChatThread: apiMocks.createChatThread,
     deleteChatThread: apiMocks.deleteChatThread,
     sendChatThreadMessageStream: apiMocks.sendChatThreadMessageStream,
+    generateTTSStream: apiMocks.generateTTSStream,
+    regenerateChatThreadMessageStream: apiMocks.regenerateChatThreadMessageStream,
+    editChatThreadMessageStream: apiMocks.editChatThreadMessageStream,
+    deleteChatThreadMessage: apiMocks.deleteChatThreadMessage,
   },
 }));
 
@@ -44,6 +82,11 @@ describe("ChatPlayground", () => {
     apiMocks.createChatThread.mockReset();
     apiMocks.deleteChatThread.mockReset();
     apiMocks.sendChatThreadMessageStream.mockReset();
+    apiMocks.generateTTSStream.mockReset();
+    apiMocks.regenerateChatThreadMessageStream.mockReset();
+    apiMocks.editChatThreadMessageStream.mockReset();
+    apiMocks.deleteChatThreadMessage.mockReset();
+    playerMocks.instances.length = 0;
     createObjectUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
     createObjectUrlMock.mockImplementation((file) => `blob:preview-${file.name}`);
@@ -61,7 +104,7 @@ describe("ChatPlayground", () => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
-  it("opens the header model dropdown and keeps the send action icon-only", async () => {
+  it("opens the composer model dropdown and keeps the send action icon-only", async () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
@@ -92,9 +135,14 @@ describe("ChatPlayground", () => {
 
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
-    fireEvent.click(
-      screen.getByRole("combobox", { name: "Qwen3.5 4B GGUF (Q4_K_M)" }),
-    );
+    const modelPicker = screen.getByRole("combobox", { name: "Chat model" });
+    expect(modelPicker).toHaveTextContent("Qwen3.5 4B GGUF (Q4_K_M)");
+    expect(
+      within(screen.getByTestId("chat-composer-actions")).getByRole("combobox", {
+        name: "Chat model",
+      }),
+    ).toBe(modelPicker);
+    fireEvent.click(modelPicker);
 
     const qwen38Option = await screen.findByRole("option", {
       name: /Qwen3.8 27B/,
@@ -118,6 +166,81 @@ describe("ChatPlayground", () => {
     await waitFor(() =>
       expect(screen.getByRole("textbox")).toHaveStyle({ height: "72px" }),
     );
+  });
+
+  it("shows a failed thread as that thread's error state and retries it", async () => {
+    const thread = {
+      id: "thread-1",
+      title: "Royal families in Europe",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "How many ruling royal families are there?",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread
+      .mockRejectedValueOnce(
+        new Error("Chat storage error: no such column: model_id"),
+      )
+      .mockResolvedValueOnce({
+        thread,
+        messages: [
+          {
+            id: "message-1",
+            thread_id: "thread-1",
+            role: "user",
+            content: "How many ruling royal families are there?",
+            created_at: 1,
+            tokens_generated: null,
+            generation_time_ms: null,
+          },
+        ],
+      });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-1"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText("This chat could not be loaded"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Chat storage error: no such column: model_id"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Royal families in Europe" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("What can I help with?")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByText("How many ruling royal families are there?", {
+        selector: "p, div, span",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("This chat could not be loaded"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the active thread title below the selector without the old conversation header", async () => {
@@ -188,10 +311,10 @@ describe("ChatPlayground", () => {
       screen.queryByText("Using Qwen3.5 4B GGUF (Q4_K_M)"),
     ).not.toBeInTheDocument();
 
-    const sendButton = screen.getByRole("button", { name: "Send message" });
-    const tokensStat = screen.getByText("12 tokens");
-    const position = sendButton.compareDocumentPosition(tokensStat);
-    expect(position & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    // Stats moved from under the composer into the reply's own footer.
+    const reply = screen.getByRole("article", { name: "Reply" });
+    expect(within(reply).getByText("12 tokens")).toBeInTheDocument();
+    expect(within(reply).getByText("100 tok/s")).toBeInTheDocument();
   });
 
   it("stops following streamed output while the user reads earlier messages", async () => {
@@ -276,18 +399,27 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(streamCallbacks).not.toBeNull());
     expect(viewport.scrollTop).toBe(scrollHeight);
 
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest" }),
+    ).not.toBeInTheDocument();
     viewport.scrollTop = 300;
     fireEvent.scroll(viewport);
     scrollHeight = 1_300;
     act(() => streamCallbacks?.onDelta("First token"));
     expect(viewport.scrollTop).toBe(300);
+    expect(
+      screen.getByRole("button", { name: "Jump to latest" }),
+    ).toBeInTheDocument();
 
     scrollHeight = 1_400;
     act(() => streamCallbacks?.onDelta(" second token"));
     expect(viewport.scrollTop).toBe(300);
 
-    viewport.scrollTop = 1_000;
-    fireEvent.scroll(viewport);
+    fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
+    expect(viewport.scrollTop).toBe(1_400);
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest" }),
+    ).not.toBeInTheDocument();
     scrollHeight = 1_500;
     act(() => streamCallbacks?.onDelta(" third token"));
     expect(viewport.scrollTop).toBe(scrollHeight);
@@ -611,6 +743,226 @@ describe("ChatPlayground", () => {
     );
   });
 
+  it("keeps pending images on a text-only model and blocks sending them", async () => {
+    const thread = {
+      id: "thread-switch",
+      title: "Switch models",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    const renderWith = (model: string, label: string) => (
+      <MemoryRouter initialEntries={["/chat?threadId=thread-switch"]}>
+        <ChatPlayground
+          selectedModel={model}
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel={label}
+          modelOptions={[
+            { value: model, label, statusLabel: "Ready", isReady: true },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>
+    );
+
+    const { rerender } = render(renderWith("Qwen3.5-4B", "Qwen3.5 4B"));
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-switch"),
+    );
+    fireEvent.change(screen.getByTestId("chat-image-input"), {
+      target: { files: [new File(["image"], "chart.png", { type: "image/png" })] },
+    });
+    expect(
+      await screen.findByRole("button", { name: "Remove chart.png" }),
+    ).toBeInTheDocument();
+
+    rerender(renderWith("LFM2.5-1.2B-Instruct-GGUF", "LFM2.5 1.2B Instruct"));
+
+    expect(
+      screen.getByRole("button", { name: "Remove chart.png" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/LFM2\.5 1\.2B Instruct can't read images/),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Describe this" },
+    });
+    const send = screen.getByRole("button", { name: "Send message" });
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    expect(apiMocks.sendChatThreadMessageStream).not.toHaveBeenCalled();
+
+    // Switching back makes the same attachment sendable again.
+    rerender(renderWith("Qwen3.5-4B", "Qwen3.5 4B"));
+    expect(screen.queryByText(/can't read images/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+  });
+
+  it("starts a new chat locally without creating an empty thread", async () => {
+    const thread = {
+      id: "thread-existing",
+      title: "Existing chat",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "Hello",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "m1",
+          thread_id: thread.id,
+          role: "user",
+          content: "Hello",
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-existing"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-existing"),
+    );
+    const newChat = screen.getByRole("button", { name: "New chat" });
+    expect(newChat).toBeEnabled();
+    fireEvent.click(newChat);
+
+    expect(
+      await screen.findByText(/No active chat selected/i),
+    ).toBeInTheDocument();
+    expect(apiMocks.createChatThread).not.toHaveBeenCalled();
+    // Still enabled on the empty state: clicking it just focuses the composer.
+    expect(screen.getByRole("button", { name: "New chat" })).toBeEnabled();
+  });
+
+  it("explains that a text-only model sees an image thread as text", async () => {
+    const thread = {
+      id: "thread-images",
+      title: "Chart questions",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "It is a bar chart",
+      message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "m1",
+          thread_id: thread.id,
+          role: "user",
+          content: "What is this?",
+          content_parts: [
+            { type: "text", text: "What is this?" },
+            {
+              type: "input_image",
+              input_image: { image_url: "data:image/png;base64,AAAA", detail: "auto" },
+            },
+          ],
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+        {
+          id: "m2",
+          thread_id: thread.id,
+          role: "assistant",
+          content: "It is a bar chart",
+          created_at: 2,
+          tokens_generated: 5,
+          generation_time_ms: 10,
+        },
+      ],
+    });
+    const onSelectModel = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-images"]}>
+        <ChatPlayground
+          selectedModel="LFM2.5-1.2B-Instruct-GGUF"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="LFM2.5 1.2B Instruct"
+          modelOptions={[
+            {
+              value: "LFM2.5-1.2B-Instruct-GGUF",
+              label: "LFM2.5 1.2B Instruct",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Downloaded", isReady: false },
+          ]}
+          onSelectModel={onSelectModel}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(/earlier images are left out/i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Qwen3.5 4B" }));
+    expect(onSelectModel).toHaveBeenCalledWith("Qwen3.5-4B");
+  });
+
+  it("follows the catalog image capability over the model name", async () => {
+    apiMocks.listChatThreads.mockResolvedValue([]);
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="Qwen3.5 4B"
+          modelOptions={[
+            { value: "Qwen3.5-4B", label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+          ]}
+          modelSupportsImages={() => false}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Attach image" })).not.toBeInTheDocument();
+  });
+
   it("isolates and restores text and image drafts when switching threads", async () => {
     const threads = [
       {
@@ -695,7 +1047,7 @@ describe("ChatPlayground", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
     let drawer = await screen.findByRole("dialog", { name: "Chat History" });
-    fireEvent.click(within(drawer).getByText("Thread B").closest('[role="button"]')!);
+    fireEvent.click(within(drawer).getByRole("button", { name: "Thread B" }));
 
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
     expect(
@@ -722,7 +1074,7 @@ describe("ChatPlayground", () => {
     act(() => streamCallbacks?.onClose());
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
     drawer = await screen.findByRole("dialog", { name: "Chat History" });
-    fireEvent.click(within(drawer).getByText("Thread A").closest('[role="button"]')!);
+    fireEvent.click(within(drawer).getByRole("button", { name: "Thread A" }));
 
     await waitFor(() =>
       expect(screen.getByRole("textbox")).toHaveValue(
@@ -1042,6 +1394,73 @@ describe("ChatPlayground", () => {
     expect(request).not.toHaveProperty("reasoning_effort", expect.anything());
   });
 
+  it("forwards enable_thinking for Qwen3.6, whose template reads it", async () => {
+    const thread = {
+      id: "thread-qwen36",
+      title: "Qwen3.6 direct answer",
+      model_id: "Qwen3.6-35B-A3B-FP8",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-qwen36"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.6-35B-A3B-FP8"
+          selectedModelReady={true}
+          supportsThinking={true}
+          chatCapabilities={{
+            supports_thinking: true,
+            default_thinking_enabled: true,
+            reasoning_efforts: [],
+            default_reasoning_effort: null,
+            supports_preserve_thinking: false,
+          }}
+          modelLabel="Qwen3.6 35B A3B (FP8)"
+          modelOptions={[
+            {
+              value: "Qwen3.6-35B-A3B-FP8",
+              label: "Qwen3.6 35B A3B (FP8)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-qwen36"),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Disable thinking mode" }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Answer directly." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+    const request = apiMocks.sendChatThreadMessageStream.mock.calls[0]?.[1];
+    expect(request).toEqual(
+      expect.objectContaining({
+        enable_thinking: false,
+        system_prompt: "You are a helpful assistant.",
+      }),
+    );
+  });
+
   it("renders Qwen3.5 close-only think output as reasoning plus final answer", async () => {
     const thread = {
       id: "thread-4",
@@ -1105,17 +1524,69 @@ describe("ChatPlayground", () => {
     );
 
     expect(screen.getByText("Final answer")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Show thought process" }),
-    ).toBeInTheDocument();
+    // History has no measured duration, so the row is not timed.
+    const reasoningToggle = screen.getByRole("button", {
+      name: "Thought process",
+    });
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("reasoning first")).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show thought process" }),
-    );
+    fireEvent.click(reasoningToggle);
 
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("reasoning first")).toBeInTheDocument();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
+    const reply = screen.getByRole("article", { name: "Reply" });
+    expect(await within(reply).findByRole("status")).toHaveTextContent(
+      "Copied",
+    );
+    expect(writeText).toHaveBeenCalledWith("Final answer");
+    fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
+    expect(writeText).toHaveBeenLastCalledWith("Solve this");
   });
+  it("shows live reasoning while it streams, then the time it took", async () => {
+    const model = "Qwen3.5-4B";
+    const thread = { id: "live-thread", title: "Live reasoning", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+    let now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
+    render(<MemoryRouter initialEntries={["/chat?threadId=live-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={true} modelLabel={model}
+        chatCapabilities={{ supports_thinking: true, default_thinking_enabled: true,
+          reasoning_efforts: [], default_reasoning_effort: null,
+          supports_preserve_thinking: false }}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        modelSupportsThinking={() => true}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Plan it" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+    const callbacks = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+
+    act(() => callbacks.onDelta("<think>Weighing the options"));
+    expect(screen.getByRole("button", { name: /^Thinking/ })).toBeInTheDocument();
+    expect(screen.getByText("Weighing the options")).toBeInTheDocument();
+
+    now += 6_000;
+    act(() => callbacks.onDelta("</think>Here is the plan."));
+    expect(await screen.findByRole("button", { name: "Thought for 6s" })).toBeInTheDocument();
+    expect(screen.getByText("Here is the plan.")).toBeInTheDocument();
+    expect(screen.queryByText("Weighing the options")).not.toBeInTheDocument();
+    dateNow.mockRestore();
+  });
+
   it.each([
     ["LFM2.5-1.2B-Instruct-GGUF", false, " \n", "No visible answer was generated. Please retry the message."],
     ["LFM2.5-1.2B-Instruct-GGUF", false, "<think>unfinished reasoning", "No visible answer was generated. Please retry the message."],
@@ -1141,6 +1612,33 @@ describe("ChatPlayground", () => {
     </MemoryRouter>);
     expect(await screen.findByText(expected)).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+  });
+
+  it("parses past replies by the model that wrote them", async () => {
+    const thread = {
+      id: "mixed-thread", title: "Mixed models", model_id: "LFM2.5-1.2B-Instruct-GGUF",
+      created_at: 1, updated_at: 3, last_message_preview: null, message_count: 2,
+    };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+      { id: "u1", thread_id: thread.id, role: "user", content: "Question", created_at: 1,
+        tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant",
+        content: "private planning</think>Visible answer", created_at: 2,
+        tokens_generated: 12, generation_time_ms: 50, model_id: "Qwen3.5-4B",
+        finish_reason: "stop" },
+    ] });
+    render(<MemoryRouter initialEntries={["/chat?threadId=mixed-thread"]}>
+      <ChatPlayground selectedModel="LFM2.5-1.2B-Instruct-GGUF" selectedModelReady={true}
+        supportsThinking={false} modelLabel="LFM2.5 1.2B Instruct"
+        modelOptions={[{ value: "LFM2.5-1.2B-Instruct-GGUF", label: "LFM2.5 1.2B Instruct",
+          statusLabel: "Ready", isReady: true }]}
+        modelSupportsThinking={(variant) => variant.startsWith("Qwen3.5")}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+
+    expect(await screen.findByText("Visible answer")).toBeInTheDocument();
+    expect(screen.queryByText(/private planning<\/think>/)).not.toBeInTheDocument();
   });
 
   it("shows decode speed and TTFT for a streamed turn after history refreshes", async () => {
@@ -1184,9 +1682,341 @@ describe("ChatPlayground", () => {
       callbacks.onClose();
     });
     await waitFor(() => expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(historyReads));
-    expect(await screen.findByText("100 t/s decode")).toBeInTheDocument();
-    expect(screen.getByText("1550 ms TTFT")).toBeInTheDocument();
+    const speed = await screen.findByText("100 tok/s");
+    expect(speed).toHaveAttribute(
+      "title",
+      expect.stringContaining("First token after 1550 ms"),
+    );
+    expect(speed.getAttribute("title")).toMatch(/^Decode speed/);
+    expect(
+      screen.getAllByRole("status").some(
+        (region) => region.textContent === "Reply: Final answer",
+      ),
+    ).toBe(true);
     expect(screen.getByText("41 tokens")).toBeInTheDocument();
+    expect(screen.getByText(model)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["cancelled", "Stopped"],
+    ["length", "This reply reached the length limit, so it may be cut off."],
+    ["error", "The model hit an error before finishing this reply."],
+  ])("says when a reply ended early (%s)", async (finishReason, expected) => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "ended-thread", title: "Ended", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 2 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+      { id: "u1", thread_id: thread.id, role: "user", content: "Write a story",
+        created_at: 1, tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant", content: "Once upon",
+        created_at: 2, tokens_generated: 3, generation_time_ms: 30, model_id: model,
+        finish_reason: finishReason },
+    ] });
+    render(<MemoryRouter initialEntries={["/chat?threadId=ended-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={false} modelLabel={model}
+        modelOptions={[{ value: model, label: "LFM2.5 1.2B", statusLabel: "Ready", isReady: true }]}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+
+    const reply = await screen.findByRole("article", { name: "Reply" });
+    expect(within(reply).getByText(expected)).toBeInTheDocument();
+    expect(within(reply).getByText("LFM2.5 1.2B")).toBeInTheDocument();
+  });
+
+  describe("read aloud", () => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "spoken-thread", title: "Spoken", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 2 };
+
+    const renderThread = (props: Partial<Parameters<typeof ChatPlayground>[0]>) => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+        { id: "u1", thread_id: thread.id, role: "user", content: "Say hi",
+          created_at: 1, tokens_generated: null, generation_time_ms: null },
+        { id: "a1", thread_id: thread.id, role: "assistant", content: "**Hi** there",
+          created_at: 2, tokens_generated: 2, generation_time_ms: 20 },
+      ] });
+      render(<MemoryRouter initialEntries={["/chat?threadId=spoken-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} modelLabel={model}
+          modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()}
+          {...props} />
+      </MemoryRouter>);
+    };
+
+    it("streams a reply through the loaded voice and stops on request", async () => {
+      vi.stubGlobal("AudioContext", class {});
+      const controller = new AbortController();
+      apiMocks.generateTTSStream.mockReturnValue(controller);
+      renderThread({ readAloudVoice: { modelId: "Kokoro-82M", speaker: "af_heart" } });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+
+      expect(apiMocks.generateTTSStream).toHaveBeenCalledWith(
+        { text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart", format: "pcm" },
+        expect.any(Object),
+      );
+      expect(
+        screen.getByRole("button", { name: "Preparing audio, select to cancel" }),
+      ).toBeInTheDocument();
+      const [player] = playerMocks.instances;
+      expect(player.unlock).toHaveBeenCalledOnce();
+
+      const callbacks = apiMocks.generateTTSStream.mock.calls[0][1];
+      act(() => callbacks.onStart({ requestId: "r1", sampleRate: 24000, audioFormat: "pcm_i16" }));
+      act(() => callbacks.onChunk({ requestId: "r1", sequence: 0, audioBase64: "AAAA",
+        sampleCount: 3, isFinal: false }));
+      expect(await screen.findByRole("button", { name: "Stop reading" })).toBeInTheDocument();
+      expect(player.start).toHaveBeenCalledWith("r1", 24000, "pcm_i16");
+      expect(player.push).toHaveBeenCalledOnce();
+
+      fireEvent.click(screen.getByRole("button", { name: "Stop reading" }));
+      expect(player.stop).toHaveBeenCalled();
+      expect(controller.signal.aborted).toBe(true);
+      expect(screen.getByRole("button", { name: "Read aloud" })).toBeInTheDocument();
+      vi.unstubAllGlobals();
+    });
+
+    it("returns to idle when playback drains after the stream finishes", async () => {
+      vi.stubGlobal("AudioContext", class {});
+      apiMocks.generateTTSStream.mockReturnValue(new AbortController());
+      renderThread({ readAloudVoice: { modelId: "Kokoro-82M", speaker: "af_heart" } });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+      const callbacks = apiMocks.generateTTSStream.mock.calls[0][1];
+      const [player] = playerMocks.instances;
+      act(() => callbacks.onStart({ requestId: "r1", sampleRate: 24000, audioFormat: "pcm_i16" }));
+      act(() => callbacks.onChunk({ requestId: "r1", sequence: 0, audioBase64: "AAAA",
+        sampleCount: 3, isFinal: true }));
+      act(() => callbacks.onFinal({}));
+      await waitFor(() => expect(player.finish).toHaveBeenCalledOnce());
+      act(() => player.onDrained());
+
+      expect(screen.getByRole("button", { name: "Read aloud" })).toBeInTheDocument();
+      vi.unstubAllGlobals();
+    });
+
+    it("opens the speech model manager when no voice is loaded", async () => {
+      const onOpenSpeechModels = vi.fn();
+      renderThread({ readAloudVoice: null, onOpenSpeechModels });
+
+      fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
+
+      expect(onOpenSpeechModels).toHaveBeenCalledOnce();
+      expect(apiMocks.generateTTSStream).not.toHaveBeenCalled();
+    });
+  });
+
+  it("keeps a stopped turn on screen, marked Stopped, when the server did not store it", async () => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "stop-thread", title: "Stop", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    const controller = new AbortController();
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(controller);
+    render(<MemoryRouter initialEntries={["/chat?threadId=stop-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={false} modelLabel={model}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Tell me a long story" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+    const callbacks = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+    act(() =>
+      callbacks.onStart({ threadId: thread.id, modelId: model, userMessage: {
+        id: "server-user", thread_id: thread.id, role: "user", content: "Tell me a long story",
+        created_at: Date.now() + 50, tokens_generated: null, generation_time_ms: null } }),
+    );
+    act(() => callbacks.onDelta("Once upon a time"));
+
+    const historyReads = apiMocks.getChatThread.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Cancel response" }));
+    act(() => callbacks.onClose());
+
+    expect(controller.signal.aborted).toBe(true);
+    await waitFor(() =>
+      expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(historyReads),
+    );
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText("Tell me a long story")).toBeInTheDocument();
+    expect(screen.getByText("Once upon a time")).toBeInTheDocument();
+    expect(screen.queryByText(/No visible answer/)).not.toBeInTheDocument();
+    // The prompt stays above its reply even when the server dated it later.
+    const prompt = screen.getByText("Tell me a long story");
+    const chip = screen.getByText("Stopped");
+    expect(
+      prompt.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
+  describe("retry, edit and delete", () => {
+    const model = "Qwen3.5-4B";
+    const otherModel = "LFM2.5-1.2B-Instruct-GGUF";
+    const thread = { id: "turns-thread", title: "Turns", model_id: model,
+      created_at: 1, updated_at: 5, last_message_preview: null, message_count: 4 };
+    const history = [
+      { id: "u1", thread_id: thread.id, role: "user", content: "First question",
+        created_at: 1, tokens_generated: null, generation_time_ms: null },
+      { id: "a1", thread_id: thread.id, role: "assistant", content: "First answer",
+        created_at: 2, tokens_generated: 2, generation_time_ms: 20, model_id: model },
+      { id: "u2", thread_id: thread.id, role: "user", content: "Second question",
+        created_at: 3, tokens_generated: null, generation_time_ms: null },
+      { id: "a2", thread_id: thread.id, role: "assistant", content: "Second answer",
+        created_at: 4, tokens_generated: 2, generation_time_ms: 20, model_id: model },
+    ];
+    const onSelectModel = vi.fn();
+
+    const renderTurns = async () => {
+      onSelectModel.mockReset();
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: history });
+      render(<MemoryRouter initialEntries={["/chat?threadId=turns-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} modelLabel={model}
+          modelOptions={[
+            { value: model, label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+            { value: otherModel, label: "LFM2.5 1.2B", statusLabel: "Ready", isReady: true },
+            { value: "Qwen3.5-2B", label: "Qwen3.5 2B", statusLabel: "Not loaded", isReady: false },
+          ]}
+          onSelectModel={onSelectModel} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+      </MemoryRouter>);
+      await screen.findByText("Second answer");
+    };
+
+    const openMoreMenu = async (replyText: string) => {
+      const reply = screen.getByText(replyText).closest("article") as HTMLElement;
+      const trigger = within(reply).getByRole("button", { name: "More reply actions" });
+      fireEvent.pointerDown(trigger);
+      fireEvent.click(trigger);
+      return screen.findByRole("menu");
+    };
+
+    it("retries only the latest reply, streaming a new one in its place", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      const firstReply = screen.getByText("First answer").closest("article") as HTMLElement;
+      expect(within(firstReply).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a2", expect.objectContaining({ model_id: model, truncation: "auto" }),
+        expect.any(Object),
+      );
+      expect(screen.queryByText("Second answer")).not.toBeInTheDocument();
+      expect(screen.getByText("Second question")).toBeInTheDocument();
+      const callbacks = apiMocks.regenerateChatThreadMessageStream.mock.calls[0][3];
+      act(() => callbacks.onDelta("A better answer"));
+      expect(screen.getByText("A better answer")).toBeInTheDocument();
+    });
+
+    it("retries with another loaded model and keeps it selected", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      await openMoreMenu("Second answer");
+      const retryWith = screen.getByRole("menuitem", { name: "Retry with…" });
+      fireEvent.keyDown(retryWith, { key: "ArrowRight" });
+      const menus = await screen.findAllByRole("menu");
+      const submenu = menus[menus.length - 1];
+      expect(within(submenu).queryByText("Qwen3.5 2B")).not.toBeInTheDocument();
+      fireEvent.click(within(submenu).getByRole("menuitem", { name: /LFM2.5 1.2B/ }));
+
+      expect(onSelectModel).toHaveBeenCalledWith(otherModel);
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a2", expect.objectContaining({ model_id: otherModel }), expect.any(Object),
+      );
+    });
+
+    it("reloads history when a retry fails, since the server kept the old reply", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      const callbacks = apiMocks.regenerateChatThreadMessageStream.mock.calls[0][3];
+      act(() => {
+        callbacks.onError("Model crashed");
+        callbacks.onClose();
+      });
+
+      expect(await screen.findByText("Second answer")).toBeInTheDocument();
+      expect(screen.getByText("Model crashed")).toBeInTheDocument();
+    });
+
+    it("edits a message in place and replaces the replies after it", async () => {
+      apiMocks.editChatThreadMessageStream.mockReturnValue(new AbortController());
+      await renderTurns();
+
+      const firstPrompt = screen.getByText("First question").closest("article") as HTMLElement;
+      fireEvent.click(within(firstPrompt).getByRole("button", { name: "Edit message" }));
+      const editor = screen.getByRole("textbox", { name: "Edit your message" });
+      expect(editor).toHaveValue("First question");
+      expect(screen.getByText("Sending replaces the replies below this message.")).toBeInTheDocument();
+      fireEvent.change(editor, { target: { value: "First question, reworded" } });
+      fireEvent.keyDown(editor, { key: "Enter" });
+
+      expect(apiMocks.editChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "u1",
+        expect.objectContaining({ content: "First question, reworded", model_id: model }),
+        expect.any(Object),
+      );
+      expect(screen.getByText("First question, reworded")).toBeInTheDocument();
+      for (const gone of ["First answer", "Second question", "Second answer"]) {
+        expect(screen.queryByText(gone)).not.toBeInTheDocument();
+      }
+    });
+
+    it("opens your last message for editing with up arrow, and Escape cancels", async () => {
+      await renderTurns();
+      const composer = screen.getByRole("textbox");
+      fireEvent.keyDown(composer, { key: "ArrowUp" });
+
+      const editor = screen.getByRole("textbox", { name: "Edit your message" });
+      expect(editor).toHaveValue("Second question");
+      fireEvent.keyDown(editor, { key: "Escape" });
+      expect(screen.queryByRole("textbox", { name: "Edit your message" })).not.toBeInTheDocument();
+      expect(apiMocks.editChatThreadMessageStream).not.toHaveBeenCalled();
+    });
+
+    it("deletes a reply after you confirm", async () => {
+      apiMocks.deleteChatThreadMessage.mockResolvedValue({ id: "a1", deleted: true });
+      await renderTurns();
+
+      await openMoreMenu("First answer");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete reply" }));
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText("Delete reply?")).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("button", { name: /Delete/ }));
+
+      await waitFor(() =>
+        expect(apiMocks.deleteChatThreadMessage).toHaveBeenCalledWith(thread.id, "a1"),
+      );
+      await waitFor(() => expect(screen.queryByText("First answer")).not.toBeInTheDocument());
+      expect(screen.getByText("Second answer")).toBeInTheDocument();
+    });
+
+    it("shows the stored reasoning time of a reply from history", async () => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+        history[0],
+        { ...history[1], content: "Weighing it</think>First answer", reasoning_ms: 6_200 },
+      ] });
+      render(<MemoryRouter initialEntries={["/chat?threadId=turns-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={true} modelLabel={model}
+          modelOptions={[{ value: model, label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true }]}
+          modelSupportsThinking={() => true}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+      </MemoryRouter>);
+
+      expect(await screen.findByRole("button", { name: "Thought for 6s" })).toBeInTheDocument();
+    });
   });
 
   it("keeps failed streamed text visible when history refreshes", async () => {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsPage } from "@/features/settings/route";
@@ -53,6 +53,19 @@ vi.mock("@/api", () => ({
   api: {
     getPreferences: apiMocks.getPreferences,
     updateAnalyticsPreference: apiMocks.updateAnalyticsPreference,
+    getHealth: () =>
+      Promise.resolve({
+        status: "ok",
+        version: "0.1.0",
+        runtime: {
+          selected_backend: "metal",
+          memory: {
+            system_total_bytes: 32 * 1024 ** 3,
+            system_available_bytes: 20 * 1024 ** 3,
+            reserved_bytes: 2 * 1024 ** 3,
+          },
+        },
+      }),
   },
 }));
 
@@ -92,6 +105,9 @@ describe("SettingsPage capabilities", () => {
       }
       if (command === "launch_at_login_enabled") {
         return false;
+      }
+      if (command === "cli_install_status") {
+        return { available: true, installed: false, location: null };
       }
       return undefined;
     });
@@ -134,7 +150,7 @@ describe("SettingsPage capabilities", () => {
     expect(screen.getByText("Desktop Only")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check now" })).not.toBeInTheDocument();
     expect(screen.getByText(/Update checks and installation are available/i)).toBeVisible();
-    expect(screen.getByText(/Tray behavior and launch-at-login settings/i)).toBeVisible();
+    expect(screen.getByText(/Tray behavior, launch-at-login and command line tool settings/i)).toBeVisible();
     expect(
       screen.queryByRole("switch", { name: "Show tray icon" }),
     ).not.toBeInTheDocument();
@@ -142,6 +158,57 @@ describe("SettingsPage capabilities", () => {
       screen.queryByRole("switch", { name: "Launch Izwi when signing in" }),
     ).not.toBeInTheDocument();
     await screen.findByText("Disabled for this device.");
+  });
+
+  it("installs the command line tool on request", async () => {
+    const installed = {
+      available: true,
+      installed: true,
+      location: "/usr/local/bin/izwi",
+    };
+    const defaultInvoke = coreMocks.invoke.getMockImplementation();
+    coreMocks.invoke.mockImplementation(async (command: string) =>
+      command === "install_cli" ? installed : defaultInvoke?.(command),
+    );
+
+    render(<SettingsPage />);
+
+    // The button is there, disabled, until the install status is read;
+    // a click before then does nothing.
+    const install = await screen.findByRole("button", { name: "Install" });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
+
+    await screen.findByText("/usr/local/bin/izwi");
+    expect(coreMocks.invoke).toHaveBeenCalledWith("install_cli");
+    expect(screen.getByRole("button", { name: "Reinstall" })).toBeEnabled();
+  });
+
+  it("hides the install button when the build has no command line tool", async () => {
+    const defaultInvoke = coreMocks.invoke.getMockImplementation();
+    coreMocks.invoke.mockImplementation(async (command: string) =>
+      command === "cli_install_status"
+        ? { available: false, installed: false, location: null }
+        : defaultInvoke?.(command),
+    );
+
+    render(<SettingsPage />);
+
+    await screen.findByText("This build does not include the izwi command.");
+    expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
+  });
+
+  it("shows the runtime and the keyboard shortcuts", async () => {
+    render(<SettingsPage />);
+
+    const runtime = screen.getByRole("region", { name: "Runtime" });
+    expect(await within(runtime).findByText("Metal")).toBeVisible();
+    expect(within(runtime).getByText("2.0 GB of 32 GB")).toBeVisible();
+    const shortcuts = screen.getByRole("region", { name: "Shortcuts" });
+    expect(within(shortcuts).getByText("Search or jump to")).toBeVisible();
+    expect(
+      screen.getByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps failed preference reads unknown until each retry succeeds", async () => {

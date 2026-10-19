@@ -800,6 +800,11 @@ Audio export query parameters:
 | `download=true` | Prefer attachment-style download headers. |
 | `format=wav|raw_i16|raw_f32` | Requested export format. |
 | `segment_ids=a,b,c` | Export selected segments in order. |
+| `pause_ms=500` | Silence between segments, up to 5000 ms. |
+
+Export refuses segments that aren't rendered or changed since they were
+rendered, and names them by paragraph number. Takes at different sample
+rates are resampled to the highest one.
 
 Pronunciations and snapshots:
 
@@ -817,6 +822,13 @@ Render jobs:
 | `GET`, `POST` | `/v1/studio/projects/{project_id}/render-jobs` |
 | `PATCH` | `/v1/studio/projects/{project_id}/render-jobs/{job_id}` |
 
+The server renders jobs in the background, one segment at a time, whether or
+not a client is connected, and resumes them after a restart. `POST` takes
+`{"segment_ids": [...]}`, or an empty body to queue every segment whose audio
+is missing, stale or failed. `PATCH` accepts only `{"status": "cancelled"}`:
+queued segments leave the queue and a segment already rendering finishes.
+A project's `active_render_job` is the job in progress.
+
 Segment editing:
 
 | Method | Path |
@@ -828,8 +840,16 @@ Segment editing:
 | `PATCH` | `/v1/studio/projects/{project_id}/segments/reorder` |
 | `POST` | `/v1/studio/projects/{project_id}/segments/bulk-delete` |
 | `POST` | `/v1/studio/projects/{project_id}/segments/{segment_id}/render` |
+| `GET` | `/v1/studio/projects/{project_id}/segments/{segment_id}/audio` |
 
-Render-job statuses are route-specific preview values such as queued, running, completed, failed, cancelled, or stale. Clients should preserve unknown statuses.
+Each segment has a `render_state`: `not_rendered`, `rendered`, `stale` (the
+audio was rendered from other text, voice, speed or pronunciations), `queued`,
+`rendering`, or `failed` (with `render_error`). Edits keep a segment's audio
+and make it stale. `PATCH .../segments/{segment_id}` with
+`"use_project_voice": true` drops the segment's own voice. Pronunciation rules
+match whole words in any letter case.
+
+Render-job statuses are queued, running, completed, failed and cancelled. Clients should preserve unknown statuses.
 
 ### Chat Threads
 

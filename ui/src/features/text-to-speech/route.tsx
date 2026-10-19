@@ -18,6 +18,18 @@ import { TextToSpeechRecordDetail } from "@/features/text-to-speech/components/T
 import { useTextToSpeechHistory } from "@/features/text-to-speech/hooks/useTextToSpeechHistory";
 import { useSpeechStreamPlayback } from "@/features/text-to-speech/hooks/useSpeechStreamPlayback";
 import { useTextToSpeechRecord } from "@/features/text-to-speech/hooks/useTextToSpeechRecord";
+import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
+import {
+  HistoryToolbar,
+  SearchField,
+  SegmentedFilter,
+} from "@/components/history/HistoryToolbar";
+import { NewItemButton } from "@/components/history/NewItemButton";
+import {
+  parseSpeechFilter,
+  SPEECH_FILTER_OPTIONS,
+  speechListFilters,
+} from "@/features/text-to-speech/historyFilters";
 import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
@@ -52,7 +64,7 @@ export function TextToSpeechPage({
 }: TextToSpeechPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const appliedQueryModelRef = useRef(false);
   const autoOpenCreateRef = useRef(false);
   const [isNewTextToSpeechModalOpen, setIsNewTextToSpeechModalOpen] =
@@ -100,15 +112,37 @@ export function TextToSpeechPage({
       }),
   });
 
+  // List search and filter live in the URL, so Back from a record keeps them.
+  const historySearch = searchParams.get("q") ?? "";
+  const historyFilter = parseSpeechFilter(searchParams.get("show"));
+  const setHistoryParam = useCallback(
+    (key: "q" | "show", value: string) => {
+      const next = new URLSearchParams(searchParams);
+      if (value && !(key === "show" && value === "all")) {
+        next.set(key, value);
+      } else {
+        next.delete(key);
+      }
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+  // "Today" starts at local midnight; fix it per filter choice so polling
+  // keeps the same query.
+  const historyFilters = useMemo(
+    () => speechListFilters(historySearch, historyFilter),
+    [historyFilter, historySearch],
+  );
   const {
     records,
+    total: historyTotal,
     loading: historyLoading,
     loadingMore: historyLoadingMore,
     error: historyError,
     hasMoreRecords,
     loadMoreRecords,
     refresh: refreshHistory,
-  } = useTextToSpeechHistory();
+  } = useTextToSpeechHistory(historyFilters);
   const {
     record,
     loading: recordLoading,
@@ -257,6 +291,20 @@ export function TextToSpeechPage({
     }
   }, [record, streamingRecord]);
 
+  useNewItemShortcut(() => setIsNewTextToSpeechModalOpen(true));
+
+  // ?create=speech (the command palette) opens the creation modal, then
+  // drops the parameter so a refresh or Back does not reopen it.
+  useEffect(() => {
+    if (recordId || searchParams.get("create") !== "speech") {
+      return;
+    }
+    setIsNewTextToSpeechModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("create");
+    setSearchParams(next, { replace: true });
+  }, [recordId, searchParams, setSearchParams]);
+
   useEffect(() => {
     if (recordId || autoOpenCreateRef.current) {
       return;
@@ -305,28 +353,6 @@ export function TextToSpeechPage({
     };
   }, [record, recordId, streamingRecord]);
 
-  const detailDescription = useMemo(() => {
-    if (!visibleRecord) {
-      return "Inspect status and generation details for this text-to-speech record.";
-    }
-
-    const processingStatus = normalizeSpeechProcessingStatus(
-      visibleRecord.processing_status,
-      visibleRecord.processing_error,
-    );
-
-    switch (processingStatus) {
-      case "pending":
-        return "This generation is queued.";
-      case "processing":
-        return "This generation is actively rendering audio.";
-      case "failed":
-        return "This generation failed. Any audio already played may be incomplete.";
-      case "ready":
-      default:
-        return "Inspect status and generation details for this text-to-speech record.";
-    }
-  }, [visibleRecord]);
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -436,24 +462,16 @@ export function TextToSpeechPage({
       )}
       {recordId ? (
         <>
-          <PageHeader
-            title="Text-to-Speech Record"
-            description={detailDescription}
-            actions={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={openModelManager}
-              >
-                <Settings2 className="h-4 w-4" />
-                Models
-              </Button>
-            }
-          />
-
           <TextToSpeechRecordDetail
+            parentCrumb={{ label: "Text to Speech", to: "/text-to-speech" }}
+            extraMenuItems={[
+              {
+                id: "models",
+                label: "Models",
+                icon: Settings2,
+                onSelect: openModelManager,
+              },
+            ]}
             record={visibleRecord}
             audioUrl={detailAudioUrl}
             voiceLabel={visibleVoiceLabel}
@@ -462,7 +480,6 @@ export function TextToSpeechPage({
             deleteError={recordActionError}
             deletePending={recordDeletePending}
             cancelPending={recordCancelPending}
-            onBack={() => navigate("/text-to-speech")}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
           />
@@ -471,17 +488,9 @@ export function TextToSpeechPage({
         <>
           <PageHeader
             title="Text to Speech"
-            description="Monitor queued, processing, and completed speech generations in one operational history table."
+            description="Your generated speech. Play, reuse or export any take."
             actions={
               <>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-9 gap-2"
-                  onClick={() => setIsNewTextToSpeechModalOpen(true)}
-                >
-                  New generation
-                </Button>
                 <Button
                   type="button"
                   variant="outline"
@@ -492,12 +501,33 @@ export function TextToSpeechPage({
                   <Settings2 className="h-4 w-4" />
                   Models
                 </Button>
+                <NewItemButton
+                  label="New generation"
+                  onClick={() => setIsNewTextToSpeechModalOpen(true)}
+                />
               </>
             }
           />
 
+          <HistoryToolbar>
+            <SearchField
+              value={historySearch}
+              onChange={(value) => setHistoryParam("q", value)}
+              placeholder="Search text or voice…"
+            />
+            <SegmentedFilter
+              label="Show"
+              options={SPEECH_FILTER_OPTIONS}
+              value={historyFilter}
+              onChange={(value) => setHistoryParam("show", value)}
+              selectedCount={historyLoading ? null : historyTotal}
+            />
+          </HistoryToolbar>
+
           <TextToSpeechHistoryTable
             records={records}
+            total={historyTotal}
+            filtered={Boolean(historySearch.trim()) || historyFilter !== "all"}
             savedVoiceNameById={savedVoiceNameById}
             loading={historyLoading}
             error={historyError}

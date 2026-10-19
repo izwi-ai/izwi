@@ -722,43 +722,31 @@ export function DiarizationPlayground({
       </motion.div>
     ) : null;
 
-  const workspaceShortcuts = useMemo(
-    () => [
-      {
-        key: "Enter",
-        metaKey: true,
-        enabled: selectedModelReady && pipelineModelsReady && !isProcessing,
-        action: () => {
-          if (isRecording) {
-            stopRecording();
-            return;
-          }
-          void startRecording();
-        },
+  const workspaceShortcuts = [
+    {
+      key: "Enter",
+      metaKey: true,
+      enabled: selectedModelReady && pipelineModelsReady && !isProcessing,
+      action: () => {
+        if (isRecording) {
+          stopRecording();
+          return;
+        }
+        void startRecording();
       },
-      {
-        key: "Escape",
-        enabled: isRecording,
-        action: stopRecording,
-      },
-      {
-        key: "Escape",
-        shiftKey: true,
-        enabled: isDiarizationSessionActive && !isRecording,
-        action: handleReset,
-      },
-    ],
-    [
-      handleReset,
-      isDiarizationSessionActive,
-      isProcessing,
-      isRecording,
-      pipelineModelsReady,
-      selectedModelReady,
-      startRecording,
-      stopRecording,
-    ],
-  );
+    },
+    {
+      key: "Escape",
+      enabled: isRecording,
+      action: stopRecording,
+    },
+    {
+      key: "Escape",
+      shiftKey: true,
+      enabled: isDiarizationSessionActive && !isRecording,
+      action: handleReset,
+    },
+  ];
 
   useWorkspaceShortcuts(workspaceShortcuts);
 

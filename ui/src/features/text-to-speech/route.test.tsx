@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -72,6 +79,7 @@ vi.mock("@/api", () => ({
     listSavedVoices: apiMocks.listSavedVoices,
     downloadAudioFile: apiMocks.downloadAudioFile,
     cancelTextToSpeechRecord: apiMocks.cancelTextToSpeechRecord,
+    getHealth: () => new Promise(() => {}),
   },
 }));
 
@@ -194,9 +202,6 @@ function renderRoute(
                 readyModelsCount={1}
                 selectedModelLabel="FishAudio-S2-Pro"
                 catalogError={null}
-                resolvedTheme="dark"
-                themePreference="dark"
-                onThemePreferenceChange={vi.fn()}
                 onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
               />
             ) : undefined}
@@ -317,7 +322,7 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No text-to-speech jobs yet" }),
+      screen.getByRole("heading", { name: "No speech yet" }),
     ).toBeInTheDocument();
   });
 
@@ -365,10 +370,12 @@ describe("TextToSpeechPage", () => {
     expect(apiMocks.listTextToSpeechRecordPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
+      filters: {},
     });
     expect(apiMocks.listTextToSpeechRecordPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "tts-cursor-2",
+      filters: {},
     });
   });
 
@@ -499,7 +506,7 @@ describe("TextToSpeechPage", () => {
     expect(await screen.findByText("Hello world")).toBeInTheDocument();
 
     fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for voice-note\.wav/i }),
+      screen.getByRole("button", { name: "More actions for Hello world" }),
       { button: 0, ctrlKey: false },
     );
 
@@ -521,15 +528,15 @@ describe("TextToSpeechPage", () => {
     expect(
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Enter text for generation")).toBeInTheDocument();
-    expect(screen.getByText("Review settings")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Script" })).toBeInTheDocument();
+    expect(screen.getByText("Model")).toBeInTheDocument();
     expect(screen.getByText("Built-in voice")).toBeInTheDocument();
     expect(screen.getByText("Vivian")).toBeInTheDocument();
     expect(screen.queryByText("Saved voice")).not.toBeInTheDocument();
-    expect(screen.queryByText("Voice direction")).not.toBeInTheDocument();
+    // This fixture also supports voice descriptions, offered as optional style.
     expect(
-      screen.queryByPlaceholderText("Optional style guidance"),
-    ).not.toBeInTheDocument();
+      screen.getByLabelText("Style direction (optional)"),
+    ).toBeInTheDocument();
   });
 
   it("resets modal state after close and reopen", async () => {
@@ -548,11 +555,11 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
     expect(screen.getByText("Enter text to generate speech.")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Temporary draft text" },
     });
 
-    const streamToggle = screen.getByRole("checkbox");
+    const streamToggle = screen.getByRole("switch", { name: /Stream results/ });
     expect(streamToggle).toBeChecked();
     fireEvent.click(streamToggle);
     expect(streamToggle).not.toBeChecked();
@@ -570,11 +577,83 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("heading", { name: "New text-to-speech job" }),
     ).toBeInTheDocument();
 
-    expect(screen.getByPlaceholderText("Write the text to speak...")).toHaveValue("");
-    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByRole("textbox", { name: "Script" })).toHaveValue("");
+    expect(screen.getByRole("switch", { name: /Stream results/ })).toBeChecked();
     expect(
       screen.queryByText("Enter text to generate speech."),
     ).not.toBeInTheDocument();
+  });
+
+  it("offers optional style direction next to built-in voices", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: false,
+        },
+      },
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+
+    expect(await screen.findByText("Built-in voice")).toBeInTheDocument();
+    const style = screen.getByLabelText("Style direction (optional)");
+    expect(style).not.toBeRequired();
+  });
+
+  it("requires a voice description for description-only models", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: false,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: false,
+        },
+      },
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+
+    const direction = await screen.findByLabelText("Voice direction");
+    expect(direction).toBeRequired();
+    expect(direction).toHaveAttribute(
+      "placeholder",
+      expect.stringMatching(/^Describe the voice/),
+    );
+    expect(screen.queryByText("Built-in voice")).not.toBeInTheDocument();
   });
 
   it("shows only saved voice controls for clone-capable models", async () => {
@@ -617,10 +696,7 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Select saved voice")).toBeInTheDocument();
     expect(screen.queryByText("Built-in voice")).not.toBeInTheDocument();
-    expect(screen.queryByText("Voice direction")).not.toBeInTheDocument();
-    expect(
-      screen.queryByPlaceholderText("Optional style guidance"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/direction/i)).not.toBeInTheDocument();
   });
 
   it("shows kokoro built-in voices with display names in the modal", async () => {
@@ -659,6 +735,14 @@ describe("TextToSpeechPage", () => {
     expect(screen.queryByText("bf_alice")).not.toBeInTheDocument();
   });
 
+  it("opens the creation modal from a create intent", async () => {
+    renderRoute("/text-to-speech?create=speech");
+
+    expect(
+      await screen.findByRole("heading", { name: "New text-to-speech job" }),
+    ).toBeInTheDocument();
+  });
+
   it("uses voxtral tts built-in voices instead of qwen defaults", async () => {
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],
@@ -688,7 +772,7 @@ describe("TextToSpeechPage", () => {
     expect(screen.getByText("Casual Female")).toBeInTheDocument();
     expect(screen.queryByText("Vivian")).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from Voxtral" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
@@ -737,7 +821,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Load model/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
     expect(onLoad).toHaveBeenCalledWith("Qwen3-TTS-12Hz-1.7B-Chat");
   });
 
@@ -775,7 +859,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Open models/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Change model" }));
     expect(openModelManager).toHaveBeenCalledTimes(1);
   });
 
@@ -839,7 +923,7 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
     await screen.findByRole("heading", { name: "New text-to-speech job" });
 
-    fireEvent.click(screen.getByRole("button", { name: /Unload model/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Unload" }));
     expect(onUnload).toHaveBeenCalledWith("Qwen3-TTS-12Hz-1.7B-Chat");
   });
 
@@ -977,7 +1061,7 @@ describe("TextToSpeechPage", () => {
       await events.onChunk?.({ requestId: "existing-fish", sequence: 0, sampleCount: 1, audioBase64: "AAA=" });
     });
     expect(screen.getByText("Playing generated speech")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Back to history" }));
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Text to Speech" }));
     expect(controller.signal.aborted).toBe(true);
     expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
   });
@@ -1019,7 +1103,7 @@ describe("TextToSpeechPage", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from modal" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
@@ -1032,7 +1116,7 @@ describe("TextToSpeechPage", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(controller.signal.aborted).toBe(false);
@@ -1042,16 +1126,18 @@ describe("TextToSpeechPage", () => {
       await streamEvents.onChunk?.({ requestId: "request", sequence: 0, sampleCount: 1, audioBase64: "AAA=" });
     });
     expect(screen.getByText("Playing generated speech")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", {
-      name: leave ? "Back to history" : "Stop generation and playback",
-    }));
+    fireEvent.click(
+      leave
+        ? within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Text to Speech" })
+        : screen.getByRole("button", { name: "Stop generation and playback" }),
+    );
     expect(controller.signal.aborted).toBe(true);
     if (durable && leave) {
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
       // Returning to the record must not revive stale transport callbacks or
       // send a cancellation while the durable worker continues independently.
       fireEvent.click(await screen.findByText("Durable narration"));
-      expect(await screen.findByRole("heading", { name: "Text-to-Speech Record" })).toBeInTheDocument();
+      expect(await screen.findByRole("navigation", { name: "Breadcrumb" })).toBeInTheDocument();
       expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalledOnce();
       await act(async () => { streamEvents.onError?.("late disconnected callback"); });
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
@@ -1099,7 +1185,7 @@ describe("TextToSpeechPage", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
 
-    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
       target: { value: "Hello from final event" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
@@ -1112,7 +1198,7 @@ describe("TextToSpeechPage", () => {
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
   });
 
@@ -1131,10 +1217,15 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
     fireEvent.click(screen.getByRole("button", { name: /Delete generation/i }));
 
     await waitFor(() =>
@@ -1166,7 +1257,7 @@ describe("TextToSpeechPage", () => {
     expect(await screen.findByText("Hello world")).toBeInTheDocument();
 
     fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for voice-note\.wav/i }),
+      screen.getByRole("button", { name: "More actions for Hello world" }),
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
@@ -1183,7 +1274,7 @@ describe("TextToSpeechPage", () => {
       expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalledTimes(2),
     );
     expect(
-      await screen.findByRole("heading", { name: "No text-to-speech jobs yet" }),
+      await screen.findByRole("heading", { name: "No speech yet" }),
     ).toBeInTheDocument();
   });
 
@@ -1206,10 +1297,10 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    expect(await screen.findByText("Voice: Narrator Prime")).toBeInTheDocument();
+    expect(await screen.findByTitle("Voice")).toHaveTextContent("Narrator Prime");
     expect(screen.queryByText(/^READY$/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Saved voice:\s*voice-1/i)).not.toBeInTheDocument();
   });
@@ -1227,10 +1318,10 @@ describe("TextToSpeechPage", () => {
     renderRoute("/text-to-speech/tts-1");
 
     expect(
-      await screen.findByRole("heading", { name: "Text-to-Speech Record" }),
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    expect(await screen.findByText("Voice: Anna")).toBeInTheDocument();
+    expect(await screen.findByTitle("Voice")).toHaveTextContent("Anna");
     expect(screen.queryByText("Voice: Ono_anna")).not.toBeInTheDocument();
   });
 });

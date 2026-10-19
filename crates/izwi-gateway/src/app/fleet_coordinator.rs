@@ -386,17 +386,24 @@ mod tests {
             .set_worker_claims("worker-a", "inc-a", 1);
         assert_eq!(coordinator.snapshot_view().cluster_claims(&key), 1);
         drop(guard);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            coordinator
+        // The drop releases from a spawned task: wait for it to land rather
+        // than for a fixed time, which a loaded runner can outlast.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let live = coordinator
                 .store
                 .count_live_fleet_claims("worker-a")
                 .await
-                .unwrap(),
-            0,
-            "dropped guard must release its claim"
-        );
+                .unwrap();
+            if live == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dropped guard must release its claim ({live} still live)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

@@ -678,7 +678,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Studio",
         "Studio render jobs",
         "Studio render job",
-        "List or create render jobs.",
+        "List render jobs, or queue segments for the render worker (all that need it by default).",
         &[("project_id", "Studio project identifier")],
     );
     add_operation_with_params(
@@ -686,8 +686,8 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/render-jobs/{job_id}",
         "patch",
         "Studio",
-        "Update Studio render job",
-        "Update render job state.",
+        "Cancel Studio render job",
+        "Cancel a queued or running render job; the server sets every other status.",
         &[
             ("project_id", "Studio project identifier"),
             ("job_id", "Render job identifier"),
@@ -767,12 +767,25 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "post",
         "Studio",
         "Render Studio segment",
-        "Render a Studio project segment.",
+        "Queue a Studio project segment for the render worker, rendered or not.",
         &[
             ("project_id", "Studio project identifier"),
             ("segment_id", "Segment identifier"),
         ],
         preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}/audio",
+        "get",
+        "Studio",
+        "Download Studio segment audio",
+        "Fetch the audio of one rendered Studio segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+        binary_response(),
     );
 
     add_collection(
@@ -799,6 +812,40 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "chat message",
         "List messages or send a new user message.",
         &[("thread_id", "Chat thread identifier")],
+    );
+    let chat_message_params = [
+        ("thread_id", "Chat thread identifier"),
+        ("message_id", "Chat message identifier"),
+    ];
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}",
+        "patch",
+        "Chat",
+        "Update chat message",
+        "Replace one of your messages and every message after it, then generate a new reply.",
+        &chat_message_params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}",
+        "delete",
+        "Chat",
+        "Delete chat message",
+        "Delete one message from a chat thread.",
+        &chat_message_params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages/{message_id}/regenerate",
+        "post",
+        "Chat",
+        "Regenerate chat reply",
+        "Replace a reply with a new one generated from the history before it, optionally with another model.",
+        &chat_message_params,
+        preview_response(),
     );
     add_operation(
         paths,

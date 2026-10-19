@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  isSameCalendarDay,
+  messageDayLabel,
   buildChatThreadMessagePayload,
   DEFAULT_THREAD_TITLE,
   defaultThinkingEnabledForModel,
@@ -10,8 +12,10 @@ import {
   parseUserMessageDisplayFromContentParts,
   summarizeChatStats,
   supportsImageAttachmentsForModel,
+  stripMarkdown,
   supportsImplicitOpenThinkTagParsing,
   systemPromptForModel,
+  threadPreviewFromContent,
 } from "./support";
 
 describe("chat playground support", () => {
@@ -32,6 +36,10 @@ describe("chat playground support", () => {
     );
     expect(supportsImplicitOpenThinkTagParsing("Qwen3.5-4B")).toBe(true);
     expect(supportsImplicitOpenThinkTagParsing("Qwen3.8-27B-FP8")).toBe(true);
+    expect(supportsImplicitOpenThinkTagParsing("Qwen3.6-35B-A3B-FP8")).toBe(true);
+    expect(supportsImplicitOpenThinkTagParsing("LFM2.5-1.2B-Instruct-GGUF")).toBe(
+      false,
+    );
     expect(
       parseAssistantContent("reasoning first</think>final answer", {
         implicitOpenThinkTag: true,
@@ -58,7 +66,7 @@ describe("chat playground support", () => {
 
   it("uses Qwen3.8 thinking behavior without enabling image input", () => {
     expect(isQwen38ThinkingModel("Qwen3.8-27B-FP8")).toBe(true);
-    expect(systemPromptForModel("Qwen3.8-27B-FP8", true)).toBe(
+    expect(systemPromptForModel(true)).toBe(
       "You are a helpful assistant.",
     );
     expect(supportsImageAttachmentsForModel("Qwen3.8-27B-FP8")).toBe(false);
@@ -66,11 +74,9 @@ describe("chat playground support", () => {
 
   it("uses the neutral system prompt for Qwen3.5 thinking control", () => {
     expect(isQwen35ThinkingModel("Qwen3.5-4B")).toBe(true);
-    expect(systemPromptForModel("Qwen3.5-4B", true)).toBe(
-      "You are a helpful assistant.",
-    );
-    expect(systemPromptForModel("Qwen3.5-2B", false)).toBe(
-      "You are a helpful assistant.",
+    expect(systemPromptForModel(true)).toBe("You are a helpful assistant.");
+    expect(systemPromptForModel(false)).toBe(
+      "You are a helpful assistant. Provide only the final answer and do not output <think> tags or internal reasoning.",
     );
   });
 
@@ -269,5 +275,56 @@ describe("chat playground support", () => {
         },
       }),
     ).toMatchObject({ tokensPerSecond: 0, decodeOnly: false, ttftMs: null });
+  });
+
+  it("strips markdown from thread previews", () => {
+    expect(
+      threadPreviewFromContent(
+        "**MLOps** stands for **Machine Learning Operations**. See [the docs](https://x.test).",
+      ),
+    ).toBe("MLOps stands for Machine Learning Operations. See the docs.");
+    expect(threadPreviewFromContent("## Steps\n- Use `npm ci`\n- Run *tests*")).toBe(
+      "Steps Use npm ci Run tests",
+    );
+    expect(threadPreviewFromContent("<think>plan</think>> Quoted _answer_")).toBe(
+      "Quoted answer",
+    );
+  });
+
+  it("leaves underscores and asterisks inside words alone", () => {
+    expect(stripMarkdown("snake_case_name and 2*3*4")).toBe(
+      "snake_case_name and 2*3*4",
+    );
+  });
+
+  it("labels message days relative to now", () => {
+    const now = new Date(2026, 9, 18, 9, 30).getTime();
+    expect(messageDayLabel(new Date(2026, 9, 18, 0, 5).getTime(), now)).toBe(
+      "Today",
+    );
+    expect(messageDayLabel(new Date(2026, 9, 17, 23, 59).getTime(), now)).toBe(
+      "Yesterday",
+    );
+    const lastWeek = messageDayLabel(new Date(2026, 9, 12, 12).getTime(), now);
+    expect(lastWeek).toMatch(/12/);
+    expect(lastWeek).not.toMatch(/2026/);
+    expect(messageDayLabel(new Date(2025, 11, 31, 12).getTime(), now)).toMatch(
+      /2025/,
+    );
+  });
+
+  it("compares calendar days, not 24-hour windows", () => {
+    expect(
+      isSameCalendarDay(
+        new Date(2026, 9, 18, 0, 1).getTime(),
+        new Date(2026, 9, 18, 23, 59).getTime(),
+      ),
+    ).toBe(true);
+    expect(
+      isSameCalendarDay(
+        new Date(2026, 9, 17, 23, 59).getTime(),
+        new Date(2026, 9, 18, 0, 1).getTime(),
+      ),
+    ).toBe(false);
   });
 });

@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Pause, Play, SkipBack, SkipForward } from "lucide-react";
+import { useEffect, useMemo, useRef } from "react";
+import { Loader2 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import {
+  AudioPlayer,
+  formatClockTime,
+} from "@/components/audio/AudioPlayer";
+import { useAudioPlayback } from "@/components/audio/useAudioPlayback";
+import { FactsList, formatProcessingFact } from "@/components/FactsList";
+import { formatClockDuration } from "@/components/history/format";
 import { Card, CardContent } from "@/components/ui/card";
 import { StatusBadge } from "@/components/ui/status-badge";
 import type { TranscriptionRecord } from "@/api";
@@ -15,6 +21,9 @@ import {
   transcriptionHasTimestamps,
   transcriptionWordCount,
 } from "@/features/transcription/transcript";
+
+const ACCENT_SOLID = "hsl(189 76% 42%)";
+const ACCENT_SOFT = "hsla(189 76% 42% / 0.16)";
 
 interface TranscriptionReviewWorkspaceProps {
   record: Pick<
@@ -34,7 +43,8 @@ interface TranscriptionReviewWorkspaceProps {
     | "summary_text"
     | "summary_error"
     | "summary_updated_at"
-  > | null;
+  > &
+    Partial<Pick<TranscriptionRecord, "processing_time_ms" | "rtf">> | null;
   audioUrl?: string | null;
   loading?: boolean;
   emptyTitle?: string;
@@ -44,31 +54,6 @@ interface TranscriptionReviewWorkspaceProps {
   stickyPlaybackFooter?: boolean;
   fixedPlaybackFooter?: boolean;
   summaryModelGuidance?: string | null;
-}
-
-const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 2];
-const ACCENT_SOLID = "hsl(189 76% 42%)";
-const ACCENT_SOFT = "hsla(189 76% 42% / 0.16)";
-
-function formatClockTime(totalSeconds: number): string {
-  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
-    return "0:00";
-  }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = Math.floor(totalSeconds % 60);
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
-
-function formatDurationLabel(seconds: number | null | undefined): string {
-  if (!Number.isFinite(seconds) || seconds === null || seconds === undefined) {
-    return "Unknown";
-  }
-  if (seconds < 60) {
-    return `${seconds.toFixed(1)}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60);
-  return `${minutes}m ${remainingSeconds}s`;
 }
 
 function isEntryActive(
@@ -99,14 +84,8 @@ export function TranscriptionReviewWorkspace({
   fixedPlaybackFooter = false,
   summaryModelGuidance = null,
 }: TranscriptionReviewWorkspaceProps) {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const transcriptEntryRefs = useRef(new Map<number, HTMLElement>());
   const lastAutoScrolledEntryRef = useRef<number | null>(null);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [playbackRate, setPlaybackRate] = useState(1);
-  const [audioError, setAudioError] = useState<string | null>(null);
 
   const transcriptEntries = useMemo(
     () => transcriptionEntriesFromRecord(record),
@@ -147,15 +126,22 @@ export function TranscriptionReviewWorkspace({
       })
     : null;
 
-  const viewerDuration = useMemo(() => {
+  const knownDuration = useMemo(() => {
     const transcriptDuration = transcriptEntries.reduce(
       (max, entry) => Math.max(max, entry.end),
       0,
     );
     const recordDuration =
       record?.duration_secs && record.duration_secs > 0 ? record.duration_secs : 0;
-    return Math.max(duration, recordDuration, transcriptDuration, 0);
-  }, [duration, record, transcriptEntries]);
+    return Math.max(recordDuration, transcriptDuration);
+  }, [record, transcriptEntries]);
+  const playback = useAudioPlayback(audioUrl, {
+    resetKey: record?.id,
+    durationHint: knownDuration,
+    loadErrorMessage: "Unable to load audio for this transcription record.",
+    playErrorMessage: "Unable to start playback for this transcription audio.",
+  });
+  const { currentTime, isPlaying, seek } = playback;
 
   const activeEntryIndex = transcriptEntries.findIndex(
     (entry) => entry.timed && isEntryActive(currentTime, entry.start, entry.end),
@@ -164,17 +150,6 @@ export function TranscriptionReviewWorkspace({
     activeEntryIndex >= 0 ? transcriptEntries[activeEntryIndex] ?? null : null;
 
   useEffect(() => {
-    const audio = audioRef.current;
-    if (audio) {
-      audio.pause();
-      audio.currentTime = 0;
-      audio.playbackRate = 1;
-    }
-    setCurrentTime(0);
-    setDuration(0);
-    setIsPlaying(false);
-    setPlaybackRate(1);
-    setAudioError(null);
     lastAutoScrolledEntryRef.current = null;
   }, [audioUrl, record?.id]);
 
@@ -200,44 +175,6 @@ export function TranscriptionReviewWorkspace({
     });
     lastAutoScrolledEntryRef.current = activeEntryIndex;
   }, [activeEntryIndex, autoScrollActiveEntry, isPlaying]);
-
-  async function togglePlayback(): Promise<void> {
-    const audio = audioRef.current;
-    if (!audio || !audioUrl) {
-      return;
-    }
-
-    try {
-      if (audio.paused) {
-        await audio.play();
-      } else {
-        audio.pause();
-      }
-    } catch {
-      setAudioError("Unable to start playback for this transcription audio.");
-    }
-  }
-
-  function seek(nextTime: number): void {
-    const audio = audioRef.current;
-    const clamped = Math.max(0, Math.min(nextTime, viewerDuration || 0));
-    if (audio) {
-      audio.currentTime = clamped;
-    }
-    setCurrentTime(clamped);
-  }
-
-  function skip(deltaSeconds: number): void {
-    seek(currentTime + deltaSeconds);
-  }
-
-  function updatePlaybackRate(nextRate: number): void {
-    const audio = audioRef.current;
-    if (audio) {
-      audio.playbackRate = nextRate;
-    }
-    setPlaybackRate(nextRate);
-  }
 
   if (loading) {
     return (
@@ -288,45 +225,22 @@ export function TranscriptionReviewWorkspace({
     ? "relative flex min-h-0 flex-col"
     : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
   const contentClassName = fixedPlaybackFooter
-    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr),220px]"
+    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr),260px]"
     : stickyPlaybackFooter
-    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr),220px]"
-    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),220px]";
+    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr),260px]"
+    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),260px]";
   const playbackClassName = fixedPlaybackFooter
-    ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/96 shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
+    ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
     : stickyPlaybackFooter
-    ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 px-4 py-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
-    : "border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 px-4 py-3 backdrop-blur sm:px-5";
+    ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] px-4 py-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
+    : "border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] px-4 py-3 backdrop-blur sm:px-5";
   const playbackInnerClassName = fixedPlaybackFooter
     ? "mx-auto flex w-full max-w-[calc(100vw-var(--app-shell-left))] flex-col gap-2.5 px-4 py-3 sm:px-6"
     : "flex flex-col gap-2.5";
 
   return (
     <div className={rootClassName}>
-      <audio
-        ref={audioRef}
-        src={audioUrl ?? undefined}
-        preload="metadata"
-        onLoadedMetadata={(event) => {
-          const nextDuration = Number.isFinite(event.currentTarget.duration)
-            ? event.currentTarget.duration
-            : 0;
-          setDuration(nextDuration);
-          setAudioError(null);
-        }}
-        onTimeUpdate={(event) => {
-          setCurrentTime(event.currentTarget.currentTime);
-        }}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-        onRateChange={(event) =>
-          setPlaybackRate(event.currentTarget.playbackRate)
-        }
-        onError={() =>
-          setAudioError("Unable to load audio for this transcription record.")
-        }
-        className="hidden"
-      />
+      <audio {...playback.audioProps} className="hidden" />
 
       <div className={contentClassName}>
         <div className="space-y-4">
@@ -454,60 +368,41 @@ export function TranscriptionReviewWorkspace({
           </div>
         </div>
 
-        <div className="space-y-3">
-          <div>
-            <h3 className="mb-2 text-[12px] font-semibold tracking-wide text-[var(--text-primary)]">
-              Overview
-            </h3>
-            <div className="space-y-2">
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Duration
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {formatDurationLabel(record.duration_secs)}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Words
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {wordCount}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Timestamps
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {timestamped ? "Enabled" : "Disabled"}
-                </div>
-                <div className="mt-0.5 text-[10px] leading-4 text-[var(--text-muted)]">
-                  {timestamped
-                    ? record.aligner_model_id || "Forced aligner"
-                    : "Plain transcript only"}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-subtle)]">
-                  Language
-                </div>
-                <div className="mt-0.5 text-[17px] font-semibold leading-tight text-[var(--text-primary)]">
-                  {record.language || "Unknown"}
-                </div>
-                {record.audio_filename ? (
-                  <div className="mt-0.5 truncate text-[10px] leading-4 text-[var(--text-muted)]">
-                    {record.audio_filename}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        </div>
+        <FactsList
+          label="Overview"
+          className="self-start"
+          facts={[
+            { label: "Duration", value: formatClockDuration(record.duration_secs) },
+            { label: "Words", value: wordCount },
+            { label: "Language", value: record.language || "Unknown" },
+            {
+              label: "Timestamps",
+              value: timestamped
+                ? record.words && record.words.length > 0
+                  ? "Word-level"
+                  : "Segment-level"
+                : "Off",
+            },
+            {
+              label: "Speakers",
+              value:
+                record.speaker_turns && record.speaker_turns.length > 0
+                  ? `${new Set(record.speaker_turns.map((turn) => turn.speaker)).size} identified`
+                  : "Not requested",
+            },
+            ...(formatProcessingFact(record.processing_time_ms, record.rtf)
+              ? [
+                  {
+                    label: "Processed in",
+                    value: formatProcessingFact(
+                      record.processing_time_ms,
+                      record.rtf,
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+        />
       </div>
 
       {showPlayback ? (
@@ -515,120 +410,16 @@ export function TranscriptionReviewWorkspace({
           data-testid="transcription-review-player"
           className={playbackClassName}
         >
-          <div className={playbackInnerClassName}>
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="h-8 w-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                  onClick={() => skip(-10)}
-                  disabled={!audioUrl}
-                  title="Rewind 10 seconds"
-                >
-                  <SkipBack className="h-4 w-4" />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  className="h-9 w-9 rounded-full bg-[var(--text-primary)] text-[var(--bg-surface-0)] hover:bg-[var(--text-secondary)] shadow-md"
-                  onClick={() => void togglePlayback()}
-                  disabled={!audioUrl}
-                >
-                  {isPlaying ? (
-                    <Pause className="h-4 w-4" fill="currentColor" />
-                  ) : (
-                    <Play className="ml-0.5 h-4 w-4" fill="currentColor" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="h-8 w-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                  onClick={() => skip(10)}
-                  disabled={!audioUrl}
-                  title="Forward 10 seconds"
-                >
-                  <SkipForward className="h-4 w-4" />
-                </Button>
-              </div>
-
-              <div className="font-mono text-[13px] font-medium tabular-nums tracking-tight text-[var(--text-primary)]">
-                {formatClockTime(currentTime)}{" "}
-                <span className="font-normal text-[var(--text-muted)]">
-                  / {formatClockTime(viewerDuration)}
-                </span>
-              </div>
-
-              <div className="group relative mx-1.5 flex h-9 flex-1 items-center">
-                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-7 -translate-y-1/2 overflow-hidden rounded bg-[var(--bg-surface-2)]/50">
-                  {viewerDuration > 0
-                    ? transcriptEntries.map((entry, index) => {
-                        const left = (entry.start / viewerDuration) * 100;
-                        const width =
-                          entry.end > entry.start
-                            ? ((entry.end - entry.start) / viewerDuration) * 100
-                            : 100;
-                        const active = index === activeEntryIndex;
-
-                        return (
-                          <div
-                            key={`timeline-${index}`}
-                            className="absolute bottom-0 top-0 border-r border-[var(--bg-surface-0)] transition-all duration-200"
-                            style={{
-                              left: `${Math.max(left, 0)}%`,
-                              width: `${Math.max(width, 0.75)}%`,
-                              backgroundColor: active ? ACCENT_SOLID : ACCENT_SOFT,
-                              opacity: active ? 1 : 0.8,
-                            }}
-                          />
-                        );
-                      })
-                    : null}
-                </div>
-
-                <input
-                  type="range"
-                  min={0}
-                  max={viewerDuration || 0}
-                  step={0.05}
-                  value={Math.min(currentTime, viewerDuration || 0)}
-                  onChange={(event) => seek(Number(event.target.value))}
-                  aria-label="Seek audio timeline"
-                  disabled={!audioUrl || viewerDuration <= 0}
-                  className="relative z-10 h-7 w-full cursor-pointer appearance-none bg-transparent accent-[var(--text-primary)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-45 [&::-moz-range-progress]:bg-transparent [&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-[var(--text-primary)] [&::-moz-range-thumb]:shadow-md [&::-moz-range-track]:h-1.5 [&::-moz-range-track]:rounded-full [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:h-1.5 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:-mt-1 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-none [&::-webkit-slider-thumb]:bg-[var(--text-primary)] [&::-webkit-slider-thumb]:shadow-md"
-                />
-              </div>
-
-              <div className="flex items-center gap-2">
-                <div className="min-w-[68px] truncate text-right text-[13px] font-semibold text-[var(--text-primary)]">
-                  {activeEntry?.timed ? formatClockTime(activeEntry.start) : ""}
-                </div>
-
-                <select
-                  className="h-7 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 text-[11px] font-medium text-[var(--text-primary)] outline-none"
-                  value={playbackRate}
-                  onChange={(event) =>
-                    updatePlaybackRate(Number(event.target.value))
-                  }
-                >
-                  {PLAYBACK_SPEEDS.map((rate) => (
-                    <option key={rate} value={rate}>
-                      {rate}x
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            {audioError ? (
-              <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
-                {audioError}
-              </div>
-            ) : null}
-          </div>
+          <AudioPlayer
+            playback={playback}
+            className={playbackInnerClassName}
+            segments={transcriptEntries.map((entry, index) => ({
+              start: entry.start,
+              end: entry.end,
+              active: index === activeEntryIndex,
+            }))}
+            trailing={activeEntry?.timed ? formatClockTime(activeEntry.start) : ""}
+          />
         </div>
       ) : null}
     </div>

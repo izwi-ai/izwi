@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
-import { Plus, Settings2 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Settings2 } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,8 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
+import { NewItemButton } from "@/components/history/NewItemButton";
 import { VoicesPage } from "@/features/voices/route";
 import { VIEW_CONFIGS } from "@/types";
 
@@ -44,7 +46,32 @@ export function VoiceStudioPage({
   onError,
 }: VoiceStudioPageProps) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [isCreationModalOpen, setIsCreationModalOpen] = useState(false);
+  const [creationStep, setCreationStep] = useState<
+    "choice" | "clone" | "design"
+  >("choice");
+
+  // /voice-cloning and /voice-design redirect here with ?tab=clone|design:
+  // open the creation modal on that step, then drop the parameter so a
+  // refresh or Back does not reopen it.
+  const openNewVoice = () => {
+    setCreationStep("choice");
+    setIsCreationModalOpen(true);
+  };
+  useNewItemShortcut(openNewVoice);
+
+  const requestedTab = searchParams.get("tab");
+  useEffect(() => {
+    if (requestedTab !== "clone" && requestedTab !== "design") {
+      return;
+    }
+    setCreationStep(requestedTab);
+    setIsCreationModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("tab");
+    setSearchParams(next, { replace: true });
+  }, [requestedTab, searchParams, setSearchParams]);
   const [voicesRefreshKey, setVoicesRefreshKey] = useState(0);
   const [voicesModelManagerRequestKey, setVoicesModelManagerRequestKey] =
     useState(0);
@@ -99,17 +126,10 @@ export function VoiceStudioPage({
   return (
     <PageShell>
       <PageHeader
-        title="Voice Studio"
-        description="Manage saved and built-in voices, then create new cloned or designed voices from one place."
+        title="Voices"
+        description="Saved and built-in voices you can use across Text to Speech, Studio and Voice."
         actions={
           <>
-            <Button
-              onClick={() => setIsCreationModalOpen(true)}
-              className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
-            >
-              <Plus className="h-4 w-4" />
-              New Voice
-            </Button>
             <Button
               type="button"
               variant="outline"
@@ -122,11 +142,12 @@ export function VoiceStudioPage({
               <Settings2 className="h-4 w-4" />
               Models
             </Button>
+            <NewItemButton label="New voice" onClick={openNewVoice} />
           </>
         }
       />
 
-      <div className="mt-5 pb-4 sm:pb-5">
+      <div className="pb-4 sm:pb-5">
         <VoicesPage
           models={models}
           selectedModel={selectedModel}
@@ -148,6 +169,7 @@ export function VoiceStudioPage({
       <VoiceCreationModal
         open={isCreationModalOpen}
         onOpenChange={setIsCreationModalOpen}
+        initialStep={creationStep}
         onVoiceCreated={() => {
           setVoicesRefreshKey((current) => current + 1);
         }}

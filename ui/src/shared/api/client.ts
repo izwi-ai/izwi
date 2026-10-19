@@ -1,5 +1,6 @@
 import { AudioApiClient } from "@/shared/api/audio";
 import { ChatApiClient } from "@/shared/api/chat";
+import { HealthApiClient } from "@/shared/api/health";
 import { ApiHttpClient, API_BASE } from "@/shared/api/http";
 import { ModelApiClient } from "@/shared/api/models";
 import { OnboardingApiClient } from "@/shared/api/onboarding";
@@ -69,6 +70,7 @@ const audioMethodNames = [
   "bulkDeleteStudioProjectSegments",
   "deleteStudioProjectSegment",
   "renderStudioProjectSegment",
+  "studioProjectSegmentAudioUrl",
   "studioProjectAudioUrl",
   "deleteStudioProject",
   "listStudioProjectFolders",
@@ -83,7 +85,7 @@ const audioMethodNames = [
   "restoreStudioProjectSnapshot",
   "listStudioProjectRenderJobs",
   "createStudioProjectRenderJob",
-  "updateStudioProjectRenderJob",
+  "cancelStudioProjectRenderJob",
   "listSpeechTextJobs",
   "listSpeechTextJobPage",
   "getSpeechTextJob",
@@ -135,6 +137,9 @@ const chatMethodNames = [
   "deleteChatThread",
   "sendChatThreadMessage",
   "sendChatThreadMessageStream",
+  "editChatThreadMessageStream",
+  "regenerateChatThreadMessageStream",
+  "deleteChatThreadMessage",
   "createAgentSession",
   "getAgentSession",
   "createAgentTurn",
@@ -159,6 +164,8 @@ const onboardingMethodNames = [
   "getOnboardingState",
   "completeOnboarding",
 ] as const;
+
+const healthMethodNames = ["getHealth"] as const;
 
 const preferencesMethodNames = [
   "getPreferences",
@@ -189,6 +196,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
   const voiceApi = new VoiceApiClient(http);
   const onboardingApi = new OnboardingApiClient(http);
   const preferencesApi = new PreferencesApiClient(http);
+  const healthApi = new HealthApiClient(http);
 
   return {
     baseUrl: http.baseUrl,
@@ -198,6 +206,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
     ...bindMethods(voiceApi, voiceMethodNames),
     ...bindMethods(onboardingApi, onboardingMethodNames),
     ...bindMethods(preferencesApi, preferencesMethodNames),
+    ...bindMethods(healthApi, healthMethodNames),
   };
 }
 

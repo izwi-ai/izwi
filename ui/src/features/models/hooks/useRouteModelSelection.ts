@@ -67,6 +67,7 @@ export function useRouteModelSelection({
         label: getModelLabel(model.variant),
         statusLabel: getModelStatusLabel(model.status),
         isReady: model.status === "ready",
+        status: model.status,
       })),
     [getModelLabel, routeModels],
   );

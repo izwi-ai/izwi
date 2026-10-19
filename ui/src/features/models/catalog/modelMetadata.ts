@@ -1,3 +1,6 @@
+import type { ModelInfo } from "@/api";
+import { withQwen3Prefix } from "@/utils/modelDisplay";
+
 export const PROVIDER_ORDER = [
   "Qwen",
   "OpenAI",
@@ -440,3 +443,50 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     size: "8.0 GB",
   },
 };
+
+const TASK_CATEGORY: Record<string, ModelDetail["category"]> = {
+  tts: "tts",
+  chat: "chat",
+  asr: "asr",
+  diarization: "asr",
+  forced_align: "asr",
+  audio_chat: "asr",
+};
+
+/**
+ * UI metadata for a model: the curated entry when there is one, otherwise a
+ * minimal entry built from the API's display name and task, so models added
+ * to the server catalog still appear before the UI table lists them.
+ */
+export function resolveModelDetail(
+  model: Pick<ModelInfo, "variant" | "display_name" | "task">,
+): ModelDetail {
+  const curated = MODEL_DETAILS[model.variant];
+  if (curated) {
+    return curated;
+  }
+  const name = model.display_name?.trim() || model.variant;
+  return {
+    shortName: name,
+    fullName: name,
+    description: "",
+    category: TASK_CATEGORY[model.task ?? ""] ?? "asr",
+    capabilities: [],
+    size: "",
+  };
+}
+
+/**
+ * Friendly display name for a model variant ("Qwen3 0.6B CustomVoice"):
+ * the curated short name, then the API display name, then the raw id.
+ */
+export function getModelDisplayName(
+  variant: string,
+  apiDisplayName?: string | null,
+): string {
+  const details = MODEL_DETAILS[variant];
+  if (details) {
+    return withQwen3Prefix(details.shortName, variant);
+  }
+  return apiDisplayName?.trim() || variant;
+}

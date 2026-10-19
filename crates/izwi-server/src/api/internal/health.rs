@@ -22,6 +22,7 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct RuntimeBackendResponse {
     pub build_git_sha: Option<&'static str>,
+    pub memory: RuntimeMemoryResponse,
     pub chat_concurrency_policy: EngineChatConcurrencyPolicySnapshot,
     pub requested_backend: String,
     pub requested_backend_available: bool,
@@ -37,6 +38,17 @@ pub struct RuntimeBackendResponse {
     pub loaded_models: Vec<LoadedModelDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loaded_tts_model: Option<serde_json::Value>,
+}
+
+/// System memory and what loaded models have reserved, for the desktop
+/// runtime summary. Totals are `None` when the OS probe is unavailable.
+#[derive(Serialize)]
+pub struct RuntimeMemoryResponse {
+    pub system_total_bytes: Option<u64>,
+    pub system_available_bytes: Option<u64>,
+    /// Memory the inference coordinator has reserved for loaded models and
+    /// running work, across host and device domains.
+    pub reserved_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -94,12 +106,22 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     let cuda_runtime = CudaRuntimeDiagnostics::detect(&current_server_binary_name());
     let loaded_models = state.runtime.loaded_model_diagnostics().await;
     let loaded_tts_model = state.runtime.loaded_tts_model_diagnostics().await;
+    let system_memory = tokio::task::spawn_blocking(izwi_core::runtime::system_memory_snapshot)
+        .await
+        .ok()
+        .flatten();
+    let memory = RuntimeMemoryResponse {
+        system_total_bytes: system_memory.map(|(total, _)| total),
+        system_available_bytes: system_memory.map(|(_, available)| available),
+        reserved_bytes: state.runtime.coordinator_snapshot().reserved_memory_bytes,
+    };
 
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         runtime: RuntimeBackendResponse {
             build_git_sha: option_env!("IZWI_BUILD_GIT_SHA"),
+            memory,
             chat_concurrency_policy: state.runtime.chat_concurrency_policy(),
             requested_backend: context.preference.as_str().to_string(),
             requested_backend_available,
@@ -210,6 +232,11 @@ mod tests {
     fn runtime_backend_health_serializes_loaded_tts_model_diagnostics() {
         let response = RuntimeBackendResponse {
             build_git_sha: Some("test-sha"),
+            memory: RuntimeMemoryResponse {
+                system_total_bytes: Some(32 * 1024 * 1024 * 1024),
+                system_available_bytes: Some(16 * 1024 * 1024 * 1024),
+                reserved_bytes: 2 * 1024 * 1024 * 1024,
+            },
             chat_concurrency_policy: EngineChatConcurrencyPolicySnapshot {
                 cuda_incremental_chat_requested: true,
                 cuda_incremental_chat_effective: true,

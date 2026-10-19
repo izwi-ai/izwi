@@ -4,6 +4,8 @@ import { isKokoroVariant } from "@/types";
 
 export type RuntimeStatus =
   | "idle"
+  /** Connected, waiting for the server to load the session's models. */
+  | "preparing"
   | "listening"
   | "user_speaking"
   | "processing"
@@ -12,6 +14,14 @@ export type RuntimeStatus =
 export type VoiceRealtimeMode = "modular" | "unified";
 export const VOICE_REALTIME_PROTOCOL = "voice_realtime" as const;
 export const VOICE_REALTIME_VERSION = 2 as const;
+
+/** Whether one model of the session's pipeline loaded (`error` when not). */
+export type VoiceRealtimeModelStatus = {
+  stage: "asr" | "text" | "tts" | "s2s" | string;
+  model_id: string;
+  ready: boolean;
+  error?: string | null;
+};
 
 export type VoiceRealtimeServerEvent =
   | { type: "connected"; protocol: string; server_time_ms?: number }
@@ -36,6 +46,7 @@ export type VoiceRealtimeServerEvent =
       };
     }
   | { type: "input_stream_stopped" }
+  | { type: "models_ready"; models: VoiceRealtimeModelStatus[] }
   | { type: "user_speech_start"; utterance_id: string; utterance_seq: number }
   | { type: "user_speech_rejected"; utterance_id: string; utterance_seq: number }
   | {
@@ -144,6 +155,7 @@ type VoiceRealtimeV2Payload =
       };
     }
   | { type: "session_started" }
+  | { type: "models_status"; data: { models: VoiceRealtimeModelStatus[] } }
   | {
       type: "audio_accepted";
       data: {
@@ -315,8 +327,6 @@ export interface VoicePageProps {
 
 export const VOICE_AGENT_SYSTEM_PROMPT =
   "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
-export const VOICE_PIPELINE_LABEL = "Modular Voice Stack";
-export const UNIFIED_VOICE_PIPELINE_LABEL = "Unified LFM2.5 Audio";
 
 export const MODULAR_STACK_VARIANTS = {
   asr: "Parakeet-TDT-0.6B-v3",
@@ -359,10 +369,6 @@ export function isAsrVariant(variant: string): boolean {
   );
 }
 
-export function isUnifiedAudioChatVariant(variant: string): boolean {
-  return variant.trim() === "LFM2.5-Audio-1.5B-GGUF";
-}
-
 export function formatModelVariantLabel(variant: string): string {
   const normalized = variant
     .replace(/-4bit\b/g, "-4-bit")
@@ -403,8 +409,12 @@ export function formatModelVariantLabel(variant: string): string {
   return normalized.replace(/-/g, " ");
 }
 
-export function isRunnableModelStatus(status: ModelInfo["status"]): boolean {
-  return status === "ready";
+/**
+ * Whether a voice conversation can start on a model in this state: the
+ * server loads a downloaded model itself when the conversation starts.
+ */
+export function isUsableVoiceModelStatus(status: ModelInfo["status"]): boolean {
+  return status === "ready" || status === "downloaded" || status === "loading";
 }
 
 export function encodeWavPcm16(
@@ -465,17 +475,6 @@ export function decodePcmI16Base64(base64Data: string): Float32Array {
   }
 
   return out;
-}
-
-export function mergeSampleChunks(chunks: Float32Array[]): Float32Array {
-  const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const merged = new Float32Array(totalSamples);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
 }
 
 function encodeFloat32ToPcm16Bytes(samples: Float32Array): Uint8Array {
@@ -586,6 +585,34 @@ export function buildVoiceRealtimeV2SessionStart(
   };
 }
 
+/** The envelope fields every typed event carries, whatever its type. */
+export type VoiceRealtimeV2EnvelopeHeader = Pick<
+  VoiceRealtimeV2ServerEnvelope,
+  "protocol" | "version" | "event_id" | "sequence" | "session_id" | "connection_epoch"
+> & { type: string };
+
+/**
+ * Whether `value` is a typed event envelope. Its sequence counts even when
+ * this client does not know the event type, so a newer server's events
+ * never look like a gap.
+ */
+export function isVoiceRealtimeV2EnvelopeHeader(
+  value: unknown,
+): value is VoiceRealtimeV2EnvelopeHeader {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  return (
+    event.protocol === VOICE_REALTIME_PROTOCOL &&
+    event.version === VOICE_REALTIME_VERSION &&
+    isNonNegativeSafeInteger(event.event_id) &&
+    isNonNegativeSafeInteger(event.sequence) &&
+    typeof event.session_id === "string" &&
+    !!event.session_id &&
+    isNonNegativeSafeInteger(event.connection_epoch) &&
+    typeof event.type === "string"
+  );
+}
+
 export function isVoiceRealtimeV2ServerEnvelope(
   value: unknown,
 ): value is VoiceRealtimeV2ServerEnvelope {
@@ -627,6 +654,12 @@ export function isVoiceRealtimeV2ServerEnvelope(
     case "speech_started":
     case "assistant_text_started":
       return data === undefined;
+    case "models_status":
+      return (
+        record !== null &&
+        Array.isArray(record.models) &&
+        record.models.every(isVoiceRealtimeModelStatus)
+      );
     case "audio_accepted":
       return (
         record !== null &&
@@ -712,8 +745,8 @@ export function isVoiceRealtimeV2ServerEnvelope(
 }
 
 export function isValidVoiceRealtimeV2Successor(
-  previous: VoiceRealtimeV2ServerEnvelope | null,
-  current: VoiceRealtimeV2ServerEnvelope,
+  previous: VoiceRealtimeV2EnvelopeHeader | null,
+  current: VoiceRealtimeV2EnvelopeHeader,
 ): boolean {
   if (previous === null) {
     return current.sequence === 0 && current.connection_epoch === 0;
@@ -751,6 +784,8 @@ export function normalizeVoiceRealtimeV2Event(
       };
     case "session_started":
       return { type: "input_stream_ready" };
+    case "models_status":
+      return { type: "models_ready", models: envelope.data.models };
     case "audio_accepted":
     case "audio_gap":
       return null;
@@ -840,6 +875,17 @@ function typedVoiceIdentity(
   return { utterance_id: envelope.utterance_id, utterance_seq: utteranceSeq };
 }
 
+function isVoiceRealtimeModelStatus(value: unknown): value is VoiceRealtimeModelStatus {
+  if (!value || typeof value !== "object") return false;
+  const status = value as Record<string, unknown>;
+  return (
+    typeof status.stage === "string" &&
+    typeof status.model_id === "string" &&
+    typeof status.ready === "boolean" &&
+    (status.error == null || typeof status.error === "string")
+  );
+}
+
 function isRealtimeVoiceClose(value: unknown): value is RealtimeVoiceClose {
   if (!value || typeof value !== "object") return false;
   const close = value as Record<string, unknown>;
@@ -889,6 +935,10 @@ export function isVoiceRealtimeServerEvent(
     case "input_stream_stopped":
     case "pong":
       return true;
+    case "models_ready":
+      return (
+        Array.isArray(event.models) && event.models.every(isVoiceRealtimeModelStatus)
+      );
     case "user_speech_start":
     case "user_speech_rejected":
     case "user_speech_end":

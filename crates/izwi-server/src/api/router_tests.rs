@@ -368,6 +368,216 @@ async fn canonical_history_routes_still_resolve() {
 }
 
 #[tokio::test]
+async fn unified_transcription_job_list_pages_across_job_kinds() {
+    let (app, _temp_dir) = test_api_app(
+        "unified_transcription_job_list_pages_across_job_kinds",
+        true,
+    );
+    let audio_body = tiny_audio_json_body();
+    let saa_body = tiny_audio_json_body_with_fields(
+        r#""model_id":"Granite-Speech-4.1-2B-Plus","min_speakers":2"#,
+    );
+    let mut created_ids = Vec::new();
+    for (uri, body) in [
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+        (
+            "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+            saa_body.as_str(),
+        ),
+        ("/v1/diarizations", audio_body.as_str()),
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+    ] {
+        let response =
+            send_request(app.clone(), build_request(Method::POST, uri, Some(body))).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload = read_json(response).await;
+        created_ids.push(
+            payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .expect("created job id")
+                .to_string(),
+        );
+    }
+
+    // Walk the merged list one row at a time. Before the merged cursor this
+    // returned `has_more: true` with `next_cursor: null` after the first page.
+    let mut seen_ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            Some(cursor) => format!("/v1/speech-to-text/jobs?job_kind=all&limit=1&cursor={cursor}"),
+            None => "/v1/speech-to-text/jobs?job_kind=all&limit=1".to_string(),
+        };
+        let response = send_request(app.clone(), build_request(Method::GET, &uri, None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        let records = payload["records"].as_array().expect("records array");
+        assert!(records.len() <= 1);
+        seen_ids.extend(
+            records
+                .iter()
+                .filter_map(|record| record["id"].as_str().map(str::to_string)),
+        );
+        let has_more = payload["pagination"]["has_more"].as_bool().unwrap();
+        let next_cursor = payload["pagination"]["next_cursor"]
+            .as_str()
+            .map(str::to_string);
+        assert_eq!(
+            has_more,
+            next_cursor.is_some(),
+            "has_more must come with a cursor"
+        );
+        if !has_more {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    let mut expected = created_ids.clone();
+    expected.sort();
+    let mut actual = seen_ids.clone();
+    actual.sort();
+    assert_eq!(
+        actual, expected,
+        "every job appears exactly once across pages"
+    );
+}
+
+#[tokio::test]
+async fn unified_transcription_list_filters_and_totals() {
+    let (app, _temp_dir) = test_api_app("unified_transcription_list_filters_and_totals", true);
+    let audio_body = tiny_audio_json_body();
+    let saa_body = tiny_audio_json_body_with_fields(
+        r#""model_id":"Granite-Speech-4.1-2B-Plus","min_speakers":2"#,
+    );
+    for (uri, body) in [
+        (
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            audio_body.as_str(),
+        ),
+        (
+            "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+            saa_body.as_str(),
+        ),
+        ("/v1/diarizations", audio_body.as_str()),
+    ] {
+        let response =
+            send_request(app.clone(), build_request(Method::POST, uri, Some(body))).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+    let total = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = send_request(app, build_request(Method::GET, uri, None)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = read_json(response).await;
+            let records = body["records"].as_array().map(Vec::len).unwrap_or(0);
+            (body["total"].as_u64().unwrap_or(u64::MAX), records)
+        }
+    };
+
+    assert_eq!(total("/v1/speech-to-text/jobs").await, (3, 3));
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?with_speakers=true").await,
+        (2, 2)
+    );
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?job_kind=transcription&with_speakers=true").await,
+        (0, 0)
+    );
+    // Jobs can fail in the background here (no model is installed), so check
+    // that every job matches exactly one status rather than which one.
+    let mut by_status = 0;
+    for uri in [
+        "/v1/speech-to-text/jobs?status=pending",
+        "/v1/speech-to-text/jobs?status=processing",
+        "/v1/speech-to-text/jobs?status=ready",
+        "/v1/speech-to-text/jobs?status=failed",
+    ] {
+        by_status += total(uri).await.0;
+    }
+    assert_eq!(by_status, 3);
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?status=pending,processing,ready,failed").await,
+        (3, 3)
+    );
+    assert_eq!(
+        total("/v1/speech-to-text/jobs?q=no-such-text").await,
+        (0, 0)
+    );
+    let bad = send_request(
+        app.clone(),
+        build_request(Method::GET, "/v1/speech-to-text/jobs?status=done", None),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deleting_a_transcription_cancels_its_durable_job() {
+    let (state, _temp_dir) = test_state("deleting_a_transcription_cancels_its_durable_job", false);
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let audio_body = tiny_audio_json_body();
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+
+    let deleted = send_request(
+        app.clone(),
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{record_id}?job_kind=transcription"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    let job = state
+        .batch_runtime_store
+        .get_job(&job.id)
+        .await
+        .expect("job read")
+        .expect("job row is kept");
+    assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+}
+
+#[tokio::test]
 async fn unified_transcription_job_read_routes_support_both_job_kinds() {
     let (app, temp_dir) = test_api_app(
         "unified_transcription_job_read_routes_support_both_job_kinds",
@@ -2528,6 +2738,247 @@ async fn root_and_v1_probe_routes_are_available() {
 }
 
 #[tokio::test]
+async fn text_to_speech_list_reports_total_and_validates_filters() {
+    let (app, _temp_dir) = test_api_app(
+        "text_to_speech_list_reports_total_and_validates_filters",
+        false,
+    );
+    let ok = send_request(
+        app.clone(),
+        build_request(
+            Method::GET,
+            "/v1/text-to-speech?q=hello&voice_kind=saved&status=ready,failed&created_after=0",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let body = read_json(ok).await;
+    assert_eq!(body["total"].as_u64(), Some(0));
+    assert_eq!(body["records"].as_array().map(Vec::len), Some(0));
+
+    for bad in [
+        "/v1/text-to-speech?voice_kind=robot",
+        "/v1/text-to-speech?status=done",
+    ] {
+        let response = send_request(app.clone(), build_request(Method::GET, bad, None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn chat_message_routes_delete_and_refuse_the_wrong_targets() {
+    let (state, _root) = test_state("chat_message_routes", false);
+    state.lifecycle.mark_ready();
+    let thread = state.chat_store.create_thread(None, None).await.unwrap();
+    let pending = state
+        .chat_store
+        .prepare_user_message(thread.id.clone(), "Hi".into(), None)
+        .await
+        .unwrap();
+    let (user, reply) = state
+        .chat_store
+        .append_turn_with_system_prompt(
+            pending,
+            "Hello".into(),
+            "Qwen3.5-0.8B".into(),
+            1,
+            1.0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let message_path = |id: &str| format!("/v1/chat/threads/{}/messages/{id}", thread.id);
+
+    let cases = [
+        (
+            Method::POST,
+            format!("{}/regenerate", message_path(&user.id)),
+            r#"{"model":"Qwen3.5-0.8B"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            format!("{}/regenerate", message_path("missing")),
+            r#"{"model":"Qwen3.5-0.8B"}"#,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PATCH,
+            message_path(&reply.id),
+            r#"{"model":"Qwen3.5-0.8B","content":"Edited"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PATCH,
+            message_path(&user.id),
+            r#"{"model":"Qwen3.5-0.8B","content":"  "}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (method, path, body, status) in cases {
+        let response = send_request(app.clone(), build_request(method, &path, Some(body))).await;
+        assert_eq!(response.status(), status, "{path}");
+    }
+
+    let response = send_request(
+        app.clone(),
+        build_request(Method::DELETE, &message_path(&reply.id), None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["deleted"], true);
+    let response = send_request(
+        app.clone(),
+        build_request(Method::DELETE, &message_path(&reply.id), None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let messages = state
+        .chat_store
+        .list_messages(thread.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, user.id);
+}
+
+#[tokio::test]
+async fn chat_thread_list_supports_paging_and_search() {
+    let (app, _temp_dir) = test_api_app("chat_thread_list_supports_paging_and_search", false);
+    for title in ["First topic", "Second topic", "Unrelated"] {
+        let body = format!(r#"{{"title":"{title}"}}"#);
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/chat/threads", Some(body.as_str())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let unpaged = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/chat/threads", None),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unpaged["threads"].as_array().map(Vec::len), Some(3));
+    assert!(unpaged.get("pagination").is_none());
+    assert_eq!(unpaged["total_count"].as_u64(), Some(3));
+
+    let page = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/chat/threads?limit=2", None),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page["threads"].as_array().map(Vec::len), Some(2));
+    assert_eq!(page["pagination"]["has_more"].as_bool(), Some(true));
+    let cursor = page["pagination"]["next_cursor"].as_str().expect("cursor");
+    let rest = read_json(
+        send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/chat/threads?limit=2&cursor={cursor}"),
+                None,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(rest["threads"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rest["pagination"]["has_more"].as_bool(), Some(false));
+
+    let searched = read_json(
+        send_request(app, build_request(Method::GET, "/v1/chat/threads?q=topic", None)).await,
+    )
+    .await;
+    assert_eq!(searched["total_count"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn health_reports_system_memory_and_reserved_bytes() {
+    let (app, _temp_dir) = test_api_app("health_reports_system_memory_and_reserved_bytes", false);
+    let response = send_request(app, build_request(Method::GET, "/v1/health", None)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    let memory = &body["runtime"]["memory"];
+
+    assert!(memory["reserved_bytes"].as_u64().is_some());
+    match (
+        memory["system_total_bytes"].as_u64(),
+        memory["system_available_bytes"].as_u64(),
+    ) {
+        (Some(total), Some(available)) => {
+            assert!(total > 0);
+            assert!(available <= total);
+        }
+        (None, None) => {
+            // The OS probe is unavailable on this platform; both stay null.
+            assert!(memory["system_total_bytes"].is_null());
+        }
+        other => panic!("memory totals must be reported together: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn admin_models_expose_names_tasks_sizes_and_image_input() {
+    let (app, _temp_dir) = test_api_app(
+        "admin_models_expose_names_tasks_sizes_and_image_input",
+        false,
+    );
+    let response = send_request(app, build_request(Method::GET, "/v1/admin/models", None)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    let models = body["models"].as_array().expect("models array");
+    let find = |variant: &str| {
+        models
+            .iter()
+            .find(|model| model["variant"].as_str() == Some(variant))
+            .unwrap_or_else(|| panic!("{variant} should be listed"))
+    };
+    let modalities = |model: &serde_json::Value| -> Vec<String> {
+        model["modalities"]
+            .as_array()
+            .expect("modalities array")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+
+    let vision_chat = find("Qwen3.5-4B");
+    assert_eq!(vision_chat["task"].as_str(), Some("chat"));
+    assert!(modalities(vision_chat).contains(&"image_input".to_string()));
+    assert!(vision_chat["display_name"]
+        .as_str()
+        .is_some_and(|name| !name.is_empty() && name != "Qwen3.5-4B"));
+
+    let text_chat = find("LFM2.5-1.2B-Instruct-GGUF");
+    assert!(!modalities(text_chat).contains(&"image_input".to_string()));
+
+    let tts = find("Kokoro-82M");
+    assert_eq!(tts["task"].as_str(), Some("tts"));
+    assert!(tts["estimated_size_bytes"]
+        .as_u64()
+        .is_some_and(|size| size > 0));
+    assert!(tts["memory_required_gb"]
+        .as_f64()
+        .is_some_and(|gb| gb > 0.0));
+}
+
+#[tokio::test]
 async fn admin_models_expose_voice_app_capabilities() {
     let (app, temp_dir) = test_api_app("admin_models_expose_voice_app_capabilities", false);
 
@@ -2926,7 +3377,13 @@ async fn dynamic_routes_cover_axum_upgrade_surface() {
         (
             Method::PATCH,
             "/v1/studio/projects/missing-project/render-jobs/missing-job",
-            Some("{}"),
+            Some(r#"{"status":"cancelled"}"#),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/v1/studio/projects/missing-project/segments/missing-segment/audio",
+            None,
             StatusCode::NOT_FOUND,
         ),
         (
@@ -3241,6 +3698,142 @@ async fn studio_segment_refusals_are_bad_requests() {
         .as_str()
         .unwrap()
         .contains("at least one segment"));
+}
+
+/// The server owns Studio rendering: clients queue and cancel, the
+/// worker sets every other status, and export refuses audio that doesn't
+/// match the script.
+#[tokio::test]
+async fn studio_render_jobs_are_server_owned_and_export_refuses_unrendered_audio() {
+    let (state, _root) = test_state("studio_render_contract", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let request = |method: Method, path: String, body: Option<String>| {
+        let app = app.clone();
+        async move { send_request(app, build_request(method, &path, body.as_deref())).await }
+    };
+
+    let created = request(
+        Method::POST,
+        "/v1/studio/projects".to_string(),
+        Some(
+            serde_json::json!({
+                "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "speaker": "Vivian",
+                "source_text": "One sentence. Another sentence."
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let project = read_json(created).await;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let segment_id = project["segments"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(project["segments"][0]["render_state"], "not_rendered");
+
+    // Reading metadata doesn't create it.
+    let meta = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/meta"),
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
+    assert_eq!(read_json(meta).await["default_export_format"], "wav");
+    assert!(state
+        .studio_store
+        .get_project_meta(project_id.clone())
+        .await
+        .unwrap()
+        .is_none());
+
+    let queued = request(
+        Method::POST,
+        format!("/v1/studio/projects/{project_id}/render-jobs"),
+        Some("{}".to_string()),
+    )
+    .await;
+    assert_eq!(queued.status(), StatusCode::OK);
+    let job = read_json(queued).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    assert_eq!(job["status"], "queued");
+
+    let project = read_json(
+        request(
+            Method::GET,
+            format!("/v1/studio/projects/{project_id}"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(project["segments"][0]["render_state"], "queued");
+    assert_eq!(project["active_render_job"]["id"], job_id.as_str());
+
+    let again = request(
+        Method::POST,
+        format!("/v1/studio/projects/{project_id}/render-jobs"),
+        Some("{}".to_string()),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+
+    let completed = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/render-jobs/{job_id}"),
+        Some(r#"{"status":"completed"}"#.to_string()),
+    )
+    .await;
+    assert_eq!(completed.status(), StatusCode::BAD_REQUEST);
+    let cancelled = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/render-jobs/{job_id}"),
+        Some(r#"{"status":"cancelled"}"#.to_string()),
+    )
+    .await;
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(read_json(cancelled).await["status"], "cancelled");
+
+    let audio = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/segments/{segment_id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(audio.status(), StatusCode::NOT_FOUND);
+
+    let export = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(export.status(), StatusCode::BAD_REQUEST);
+    assert!(read_json(export).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not rendered: 1"));
+    let long_pause = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/audio?pause_ms=9000"),
+        None,
+    )
+    .await;
+    assert_eq!(long_pause.status(), StatusCode::BAD_REQUEST);
+
+    let both = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/segments/{segment_id}"),
+        Some(r#"{"speaker":"Ryan","use_project_voice":true}"#.to_string()),
+    )
+    .await;
+    assert_eq!(both.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn send_request(mut app: Router, request: Request<Body>) -> Response {

@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Users,
@@ -219,44 +219,32 @@ export function VoiceClonePlayground({
     textareaRef.current?.focus();
   };
 
-  const workspaceShortcuts = useMemo(
-    () => [
-      {
-        key: "Enter",
-        metaKey: true,
-        allowInInputs: true,
-        enabled:
-          !generating &&
-          selectedModelReady &&
-          isVoiceReady &&
-          consentConfirmed,
-        action: () => {
-          void handleGenerate();
-        },
+  const workspaceShortcuts = [
+    {
+      key: "Enter",
+      metaKey: true,
+      allowInInputs: true,
+      enabled:
+        !generating &&
+        selectedModelReady &&
+        isVoiceReady &&
+        consentConfirmed,
+      action: () => {
+        void handleGenerate();
       },
-      {
-        key: "Escape",
-        enabled: Boolean(audioUrl),
-        action: handleStop,
-      },
-      {
-        key: "Escape",
-        shiftKey: true,
-        enabled: true,
-        action: handleReset,
-      },
-    ],
-    [
-      audioUrl,
-      consentConfirmed,
-      generating,
-      handleGenerate,
-      handleReset,
-      handleStop,
-      isVoiceReady,
-      selectedModelReady,
-    ],
-  );
+    },
+    {
+      key: "Escape",
+      enabled: Boolean(audioUrl),
+      action: handleStop,
+    },
+    {
+      key: "Escape",
+      shiftKey: true,
+      enabled: true,
+      action: handleReset,
+    },
+  ];
 
   useWorkspaceShortcuts(workspaceShortcuts);
 

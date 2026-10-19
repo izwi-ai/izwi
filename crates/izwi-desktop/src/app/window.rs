@@ -35,6 +35,17 @@ pub fn build_main_window<R: tauri::Runtime>(
 }
 
 pub fn handle_run_event<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>, event: &RunEvent) {
+    // Clicking the Dock icon while the window is hidden in the tray should
+    // bring it back, as it does for native macOS apps.
+    #[cfg(target_os = "macos")]
+    if let RunEvent::Reopen {
+        has_visible_windows: false,
+        ..
+    } = event
+    {
+        let _ = super::tray::show_main_window(app_handle);
+    }
+
     if let RunEvent::WindowEvent { label, event, .. } = event {
         if label == "main" {
             if let WindowEvent::CloseRequested { api, .. } = event {

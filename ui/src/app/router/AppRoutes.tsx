@@ -9,7 +9,6 @@ import {
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
 import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
-import { useTheme } from "@/app/providers/ThemeProvider";
 import { DocumentTitle } from "@/app/router/DocumentTitle";
 import { NotFoundPage } from "@/app/router/NotFoundPage";
 import { legacyDiarizationTarget } from "@/app/router/routePresentation";
@@ -18,62 +17,75 @@ import type {
   SharedPageProps,
   VoiceRouteProps,
 } from "@/app/router/types";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 
-const TextToSpeechPage = lazy(async () => {
-  const module = await import("@/features/text-to-speech/route");
-  return { default: module.TextToSpeechPage };
-});
+// Route code loads lazily, then preloads once the app is idle so later
+// navigation does not wait on a chunk (react-router keeps the previous page
+// on screen while a lazy route suspends inside a transition).
+const ROUTE_MODULES = {
+  TextToSpeechPage: () => import("@/features/text-to-speech/route"),
+  StudioPage: () => import("@/features/studio/route"),
+  VoiceCloningPage: () => import("@/features/voice-cloning/route"),
+  VoiceDesignPage: () => import("@/features/voice-design/route"),
+  VoicesPage: () => import("@/features/voices/route"),
+  VoiceStudioPage: () => import("@/features/voice-studio/route"),
+  SpeechTextPage: () => import("@/features/speech-text/route"),
+  ChatPage: () => import("@/features/chat/route"),
+  VoicePage: () => import("@/features/voice/route"),
+  MyModelsPage: () => import("@/features/models/route"),
+  SettingsPage: () => import("@/features/settings/route"),
+};
 
-const StudioPage = lazy(async () => {
-  const module = await import("@/features/studio/route");
-  return { default: module.StudioPage };
-});
+function preloadRouteModules() {
+  for (const load of Object.values(ROUTE_MODULES)) {
+    void load().catch(() => undefined);
+  }
+}
 
-const VoiceCloningPage = lazy(async () => {
-  const module = await import("@/features/voice-cloning/route");
-  return { default: module.VoiceCloningPage };
-});
+const TextToSpeechPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.TextToSpeechPage()).TextToSpeechPage,
+}));
 
-const VoiceDesignPage = lazy(async () => {
-  const module = await import("@/features/voice-design/route");
-  return { default: module.VoiceDesignPage };
-});
+const StudioPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.StudioPage()).StudioPage,
+}));
 
-const VoicesPage = lazy(async () => {
-  const module = await import("@/features/voices/route");
-  return { default: module.VoicesPage };
-});
+const VoiceCloningPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.VoiceCloningPage()).VoiceCloningPage,
+}));
 
-const VoiceStudioPage = lazy(async () => {
-  const module = await import("@/features/voice-studio/route");
-  return { default: module.VoiceStudioPage };
-});
+const VoiceDesignPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.VoiceDesignPage()).VoiceDesignPage,
+}));
 
-const SpeechTextPage = lazy(async () => {
-  const module = await import("@/features/speech-text/route");
-  return { default: module.SpeechTextPage };
-});
+const VoicesPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.VoicesPage()).VoicesPage,
+}));
 
-const ChatPage = lazy(async () => {
-  const module = await import("@/features/chat/route");
-  return { default: module.ChatPage };
-});
+const VoiceStudioPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.VoiceStudioPage()).VoiceStudioPage,
+}));
 
-const VoicePage = lazy(async () => {
-  const module = await import("@/features/voice/route");
-  return { default: module.VoicePage };
-});
+const SpeechTextPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.SpeechTextPage()).SpeechTextPage,
+}));
 
-const MyModelsPage = lazy(async () => {
-  const module = await import("@/features/models/route");
-  return { default: module.MyModelsPage };
-});
+const ChatPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.ChatPage()).ChatPage,
+}));
 
-const SettingsPage = lazy(async () => {
-  const module = await import("@/features/settings/route");
-  return { default: module.SettingsPage };
-});
+const VoicePage = lazy(async () => ({
+  default: (await ROUTE_MODULES.VoicePage()).VoicePage,
+}));
+
+const MyModelsPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.MyModelsPage()).MyModelsPage,
+}));
+
+const SettingsPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.SettingsPage()).SettingsPage,
+}));
 
 function RouteLoadingFallback() {
   return (
@@ -102,7 +114,20 @@ function LegacyDiarizationRedirect() {
 export function AppRoutes() {
   const location = useLocation();
   const hasTrackedInitialRouteRef = useRef(false);
-  const { resolvedTheme, themePreference, setThemePreference } = useTheme();
+
+  useEffect(() => {
+    const idle =
+      typeof window.requestIdleCallback === "function"
+        ? window.requestIdleCallback(preloadRouteModules, { timeout: 4000 })
+        : window.setTimeout(preloadRouteModules, 1500);
+    return () => {
+      if (typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idle);
+      } else {
+        window.clearTimeout(idle);
+      }
+    };
+  }, []);
   const {
     models,
     selectedModel,
@@ -162,9 +187,12 @@ export function AppRoutes() {
     onDelete: deleteModel,
     onRefresh: refreshModels,
   };
-  const selectedModelLabel =
-    models.find((model) => model.variant === selectedModel)?.variant ??
-    selectedModel;
+  const selectedModelInfo = models.find(
+    (model) => model.variant === selectedModel,
+  );
+  const selectedModelLabel = selectedModel
+    ? getModelDisplayName(selectedModel, selectedModelInfo?.display_name)
+    : null;
   useEffect(() => {
     if (!hasTrackedInitialRouteRef.current) {
       hasTrackedInitialRouteRef.current = true;
@@ -187,9 +215,6 @@ export function AppRoutes() {
               readyModelsCount={readyModelsCount}
               selectedModelLabel={selectedModelLabel}
               catalogError={catalogError}
-              resolvedTheme={resolvedTheme}
-              themePreference={themePreference}
-              onThemePreferenceChange={setThemePreference}
               onRetryModelCatalog={refreshModels}
             />
           }
