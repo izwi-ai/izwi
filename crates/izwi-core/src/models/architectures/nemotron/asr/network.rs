@@ -28,6 +28,7 @@ use crate::kv::v2::{
     StateComponentId, StateUpdateKind,
 };
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::exact::exact_zeros;
 use crate::models::shared::weights::mlx;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -2450,13 +2451,15 @@ impl ConvSubsamplingDw {
     /// `SUBSAMPLING_CARRY_CELLS` stride cells early computes its own frames
     /// exactly as the whole sequence does (the streaming subsampler relies
     /// on the same carry); the zero padding at a slice's inner edges reaches
-    /// no kept frame.
+    /// no kept frame. Each slice's frames are copied into an exact-size
+    /// output and the slice dropped, so no finished slice pins a pooled
+    /// buffer while the next one runs.
     fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
         let outputs = subsampled_len_3x(feature_frames);
         if outputs <= SUBSAMPLING_SLICE_FRAMES {
             return self.forward_whole(features, feature_frames);
         }
-        let mut slices = Vec::with_capacity(outputs.div_ceil(SUBSAMPLING_SLICE_FRAMES));
+        let mut stitched: Option<Tensor> = None;
         let mut first = 0;
         while first < outputs {
             let last = (first + SUBSAMPLING_SLICE_FRAMES).min(outputs);
@@ -2466,10 +2469,24 @@ impl ConvSubsamplingDw {
             let frames = input_last - input_first;
             let (slice, _) =
                 self.forward_whole(&features.narrow(2, input_first, frames)?, frames)?;
-            slices.push(slice.narrow(1, first - read_first, last - first)?);
+            let kept = slice
+                .narrow(1, first - read_first, last - first)?
+                .contiguous()?;
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => exact_zeros(
+                    (kept.dim(0)?, outputs, kept.dim(2)?),
+                    kept.dtype(),
+                    kept.device(),
+                )?,
+            };
+            output.slice_set(&kept, 1, first)?;
+            stitched = Some(output);
             first = last;
         }
-        Ok((Tensor::cat(&slices, 1)?, outputs))
+        let stitched = stitched
+            .ok_or_else(|| Error::InferenceError("Nemotron stem produced no slices".into()))?;
+        Ok((stitched, outputs))
     }
 
     /// NeMo `ConvSubsampling(dw_striding, is_causal=True)`: every stride-2

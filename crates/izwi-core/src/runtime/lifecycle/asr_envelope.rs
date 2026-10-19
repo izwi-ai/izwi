@@ -502,7 +502,7 @@ pub(crate) fn request_envelope(
 /// ([`nemotron_stem_bytes`]), and Candle's Metal pool keeps the stem's
 /// buffers while the layers run, so the stem adds to the encoder layer's
 /// live set. On Metal both are priced at the pool-rounding bound: a 30 s
-/// pass grew device memory by 211 MB, against 256 MB priced.
+/// request grew device memory by 0.17 GB, against 0.26 GB priced.
 fn nemotron_accelerator_bytes(encoder_bytes: u64, secs: f32, backend: BackendKind) -> Result<u64> {
     let frames =
         usize::try_from(positions(MEL_FRAMES_PER_SEC as f32, secs)).map_err(|_| overflow())?;
@@ -768,11 +768,10 @@ mod tests {
     }
 
     /// Nemotron prices one stem slice beside its encoder layer, doubled on
-    /// Metal for pool rounding: a 30 s pass measured 201 MiB of device
-    /// growth (420 MiB of it was the stem before it was sliced).
+    /// Metal for pool rounding: a 30 s request measured 0.17 GB of device
+    /// growth (0.50 GB before the stem was sliced).
     #[test]
     fn nemotron_envelope_prices_one_stem_slice_beside_the_encoder() {
-        const MIB: u64 = 1024 * 1024;
         let variant = ModelVariant::Nemotron35AsrStreaming06B;
         let cpu = request_envelope(variant, 30.0, BackendKind::Cpu)
             .unwrap()
@@ -786,7 +785,7 @@ mod tests {
         assert_eq!(nemotron_stem_bytes(10_000).unwrap(), stem);
         assert_eq!(cpu.accelerator_bytes, encoder + 13_088 * 4 + stem);
         assert_eq!(metal.accelerator_bytes, 2 * cpu.accelerator_bytes);
-        assert!(metal.accelerator_bytes > 201 * MIB, "{metal:?}");
+        assert!(metal.accelerator_bytes > 170_000_000, "{metal:?}");
         assert_eq!(metal.host_bytes, cpu.host_bytes);
     }
 
