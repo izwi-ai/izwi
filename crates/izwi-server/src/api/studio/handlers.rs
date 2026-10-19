@@ -504,7 +504,7 @@ pub async fn create_studio_project(
 
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
-    let chunks = crate::api::tts_long_form::split_tts_text_for_long_form(variant, 0, &source_text);
+    let chunks = script_segments(variant, &source_text);
     if chunks.is_empty() {
         return Err(ApiError::bad_request(
             "Project script did not produce any renderable segments.",
@@ -1264,6 +1264,33 @@ fn voice_mode_saved_voice_id(
     }
 }
 
+/// A script's segments: its paragraphs (split at blank lines), with any
+/// paragraph too long for one render split further at sentence breaks.
+fn script_segments(variant: izwi_core::ModelVariant, script: &str) -> Vec<String> {
+    let normalized = script.replace("\r\n", "\n");
+    let mut paragraphs = Vec::new();
+    let mut current = Vec::new();
+    for line in normalized.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join("\n"));
+                current.clear();
+            }
+        } else {
+            current.push(line.trim());
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join("\n"));
+    }
+    paragraphs
+        .iter()
+        .flat_map(|paragraph| {
+            crate::api::tts_long_form::split_tts_text_for_long_form(variant, 0, paragraph)
+        })
+        .collect()
+}
+
 fn default_project_name(source_text: &str) -> String {
     let snippet = source_text
         .split_whitespace()
@@ -1467,6 +1494,18 @@ mod tests {
         assert!(
             (length - expected).abs() <= 64,
             "joined {length} samples, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn scripts_split_into_their_paragraphs() {
+        let variant = izwi_core::parse_tts_model_variant("Kokoro-82M").expect("variant");
+        assert_eq!(
+            super::script_segments(variant, "First line.\r\n\r\n  \nSecond line,\ncontinued.\n"),
+            vec![
+                "First line.".to_string(),
+                "Second line,\ncontinued.".to_string()
+            ]
         );
     }
 

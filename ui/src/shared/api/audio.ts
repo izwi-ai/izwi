@@ -1847,7 +1847,14 @@ export class AudioApiClient {
       downloadUrl.searchParams.set("download", "true");
     } else {
       const response = await fetch(url);
-      if (!response.ok) throw new Error(`Audio download failed (${response.status})`);
+      if (!response.ok) {
+        // Prefer the server's reason ("Render these paragraphs…") to a status.
+        const reason = await response
+          .json()
+          .then((body: { error?: { message?: string } }) => body?.error?.message)
+          .catch(() => undefined);
+        throw new Error(reason || `Audio download failed (${response.status})`);
+      }
       objectUrl = URL.createObjectURL(await response.blob());
     }
     // Long speech goes directly to the browser's download manager, never a Blob.

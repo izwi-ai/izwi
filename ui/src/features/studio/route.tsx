@@ -1,151 +1,112 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { StudioWorkspace } from "@/components/StudioWorkspace";
-import { usePageTitle } from "@/app/router/DocumentTitle";
-import { PageHeader, PageShell } from "@/components/PageShell";
-import {
-  TEXT_TO_SPEECH_PREFERRED_MODELS,
-  resolvePreferredRouteModel,
-} from "@/features/models/catalog/routeModelCatalog";
-import { RouteModelModal } from "@/features/models/components/RouteModelModal";
-import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
-import type { SharedPageProps } from "@/app/router/types";
-import { isStudioRenderableModel } from "@/features/studio/modelFilter";
+import { useMemo } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { AlertTriangle, Loader2 } from "lucide-react";
 
-export function StudioPage({
-  models,
-  selectedModel,
-  loading,
-  downloadProgress,
-  onDownload,
-  onCancelDownload,
-  onLoad,
-  onUnload,
-  onDelete,
-  onSelect,
-  onError,
-}: SharedPageProps) {
+import type { SharedPageProps } from "@/app/router/types";
+import { usePageTitle } from "@/app/router/DocumentTitle";
+import { PageShell } from "@/components/PageShell";
+import { Button } from "@/components/ui/button";
+import { StudioEditor } from "@/features/studio/components/StudioEditor";
+import { StudioProjectsPage } from "@/features/studio/components/StudioProjectsPage";
+import type { StudioModelDownloads } from "@/features/studio/components/StudioVoicePicker";
+import { useSavedVoices } from "@/features/studio/hooks/useSavedVoices";
+import { useStudioProject } from "@/features/studio/hooks/useStudioProject";
+import { studioModels } from "@/features/studio/studio";
+
+/** `/studio` lists projects; `/studio/:projectId` edits one. */
+export function StudioPage({ models, downloadProgress, onDownload, onError }: SharedPageProps) {
   const navigate = useNavigate();
   const { projectId } = useParams<{ projectId?: string }>();
-  const [searchParams] = useSearchParams();
-  const modelQuery = searchParams.get("model");
-  const [headerActionContainer, setHeaderActionContainer] =
-    useState<HTMLDivElement | null>(null);
-  const appliedQueryModelRef = useRef(false);
-  const [projectTitle, setProjectTitle] = useState<string | null>(null);
-  usePageTitle(projectId ? projectTitle : null);
-  const handleNavigateProject = useCallback(
-    (nextProjectId: string | null) => {
-      const query = modelQuery ? `?model=${encodeURIComponent(modelQuery)}` : "";
-      navigate(nextProjectId ? `/studio/${nextProjectId}${query}` : `/studio${query}`);
-    },
-    [modelQuery, navigate],
-  );
-  const {
-    routeModels,
-    resolvedSelectedModel,
-    selectedModelInfo,
-    isModelModalOpen,
-    intentVariant,
-    closeModelModal,
-    openModelManager,
-    requestModel,
-    handleModelSelect,
-    modelOptions,
-  } = useRouteModelSelection({
-    models,
-    selectedModel,
-    onSelect,
-    modelFilter: (variant) =>
-      isStudioRenderableModel(models.find((model) => model.variant === variant)),
-    resolveSelectedModel: (availableRouteModels, currentModel) =>
-      resolvePreferredRouteModel({
-        models: availableRouteModels,
-        selectedModel: currentModel,
-        preferredVariants: TEXT_TO_SPEECH_PREFERRED_MODELS,
-      }),
-  });
-
-  useEffect(() => {
-    if (appliedQueryModelRef.current || routeModels.length === 0) {
-      return;
-    }
-
-    const requestedModel = searchParams.get("model");
-    if (
-      requestedModel &&
-      routeModels.some((model) => model.variant === requestedModel)
-    ) {
-      onSelect(requestedModel);
-    }
-
-    appliedQueryModelRef.current = true;
-  }, [onSelect, routeModels, searchParams]);
+  const savedVoices = useSavedVoices();
+  const renderable = useMemo(() => studioModels(models), [models]);
+  const downloads: StudioModelDownloads = { downloadProgress, onDownload };
 
   return (
-    <PageShell>
-      <PageHeader
-        title={projectId ? (projectTitle ?? "Studio project") : "Studio"}
-        breadcrumbs={
-          projectId
-            ? [
-                { label: "Studio", to: "/studio" },
-                { label: projectTitle ?? "Project" },
-              ]
-            : undefined
-        }
-        description={
-          projectId
-            ? undefined
-            : "Turn long scripts into narrated audio, segment by segment."
-        }
-        actions={
-          <div
-            ref={setHeaderActionContainer}
-            data-testid="page-header-history-slot"
-            className="flex min-h-9 items-center"
-          />
-        }
-      />
-
-      <StudioWorkspace
-        activeProjectId={projectId ?? null}
-        selectedModel={resolvedSelectedModel}
-        selectedModelInfo={selectedModelInfo}
-        availableModels={routeModels}
-        modelOptions={modelOptions}
-        headerActionContainer={headerActionContainer}
-        onNavigateProject={handleNavigateProject}
-        onProjectTitleChange={setProjectTitle}
-        onSelectModel={handleModelSelect}
-        onOpenModelManager={openModelManager}
-        onModelRequired={() => {
-          requestModel();
-          onError(
-            "Select and load a compatible TTS model with built-in or saved-voice support to use Studio.",
-          );
-        }}
-        onError={onError}
-      />
-
-      <RouteModelModal
-        isOpen={isModelModalOpen}
-        onClose={closeModelModal}
-        title="Text-to-Speech Models"
-        description="Manage built-in voice, saved-voice, and voice-direction TTS models for this route."
-        models={routeModels}
-        loading={loading}
-        selectedVariant={resolvedSelectedModel}
-        intentVariant={intentVariant}
-        downloadProgress={downloadProgress}
-        onDownload={onDownload}
-        onCancelDownload={onCancelDownload}
-        onLoad={onLoad}
-        onUnload={onUnload}
-        onDelete={onDelete}
-        onUseModel={onSelect}
-        emptyMessage="Load a compatible TTS model with built-in voices, saved voices, or voice-direction prompts to generate speech."
-      />
+    <PageShell className="pb-0">
+      {projectId ? (
+        <StudioProjectRoute
+          key={projectId}
+          projectId={projectId}
+          models={renderable}
+          savedVoices={savedVoices}
+          downloads={downloads}
+          onError={onError}
+          onDeleted={() => navigate("/studio")}
+        />
+      ) : (
+        <StudioProjectsPage
+          models={renderable}
+          savedVoices={savedVoices}
+          downloads={downloads}
+          onError={onError}
+          onOpenProject={(id) => navigate(`/studio/${id}`)}
+        />
+      )}
     </PageShell>
+  );
+}
+
+function StudioProjectRoute({
+  projectId,
+  models,
+  savedVoices,
+  downloads,
+  onError,
+  onDeleted,
+}: {
+  projectId: string;
+  models: SharedPageProps["models"];
+  savedVoices: ReturnType<typeof useSavedVoices>;
+  downloads: StudioModelDownloads;
+  onError: (message: string) => void;
+  onDeleted: () => void;
+}) {
+  const state = useStudioProject(projectId, onError);
+  usePageTitle(state.project?.name ?? null);
+
+  if (state.project) {
+    return (
+      <StudioEditor
+        state={{ ...state, project: state.project }}
+        models={models}
+        savedVoices={savedVoices}
+        downloads={downloads}
+        onError={onError}
+        onDeleted={onDeleted}
+      />
+    );
+  }
+  if (state.load === "loading") {
+    return (
+      <div className="flex min-h-[50vh] items-center justify-center text-sm text-[var(--text-muted)]">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        Opening project…
+      </div>
+    );
+  }
+  return (
+    <div className="mx-auto flex min-h-[50vh] max-w-md flex-col items-center justify-center gap-4 text-center">
+      <AlertTriangle className="h-5 w-5 text-[var(--text-muted)]" />
+      <div className="flex flex-col gap-1.5">
+        <h1 className="text-base font-semibold text-[var(--text-primary)]">
+          {state.load === "missing" ? "This project doesn't exist" : "Couldn't open this project"}
+        </h1>
+        <p className="text-sm text-[var(--text-muted)]">
+          {state.load === "missing"
+            ? "It may have been deleted."
+            : (state.loadError ?? "Try again in a moment.")}
+        </p>
+      </div>
+      <div className="flex gap-2">
+        {state.load === "error" ? (
+          <Button type="button" variant="outline" size="sm" onClick={state.reload}>
+            Try again
+          </Button>
+        ) : null}
+        <Button asChild size="sm">
+          <Link to="/studio">Back to Studio</Link>
+        </Button>
+      </div>
+    </div>
   );
 }

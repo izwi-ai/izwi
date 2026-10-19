@@ -191,7 +191,7 @@ describe("Page header history buttons", () => {
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
   });
 
-  it("StudioPage renders project actions in the page header slot", async () => {
+  it("StudioPage offers New project from the empty project list", async () => {
     render(
       <NotificationProvider>
         <MemoryRouter>
@@ -200,15 +200,11 @@ describe("Page header history buttons", () => {
       </NotificationProvider>,
     );
 
-    const slot = screen.getByTestId("page-header-history-slot");
-
-    await waitFor(() =>
-      expect(
-        within(slot).getByRole("button", { name: /New project/i }),
-      ).toBeInTheDocument(),
-    );
     expect(
-      within(slot).queryByRole("button", { name: /Project Library/i }),
+      await screen.findByRole("button", { name: /New project/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Project Library/i }),
     ).not.toBeInTheDocument();
   });
 
