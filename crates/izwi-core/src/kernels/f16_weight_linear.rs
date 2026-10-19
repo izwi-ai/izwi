@@ -251,7 +251,7 @@ impl WeightOnlyF16Load {
 /// dense with `None`. The F16 model is kept only if `self_check` passes;
 /// otherwise it is dropped, the model reloads dense, and the reason is
 /// recorded.
-pub fn load_weight_only_f16<T, E>(
+pub fn load_weight_only_f16<T, E: From<crate::error::Error>>(
     label: &str,
     precision: &DTypeSelection,
     device: &Device,
@@ -281,6 +281,9 @@ pub fn load_weight_only_f16<T, E>(
         report.reason
     );
     drop(model);
+    // The load's gate frees the dropped model and admits the dense reload's
+    // memory (each family's `precision_reload_plan`).
+    crate::kernels::numeric_check::admit_precision_reload(label, DType::F32).map_err(E::from)?;
     let model = load(None)?;
     Ok((
         model,
@@ -513,7 +516,9 @@ mod tests {
             dtype,
             reason: "test policy".into(),
         };
-        let load = |f16: Option<&Device>| ProjectionLinear::new(dense.clone(), f16);
+        let load = |f16: Option<&Device>| {
+            ProjectionLinear::new(dense.clone(), f16).map_err(crate::error::Error::from)
+        };
         let check = |scale: f32| {
             move |layer: &ProjectionLinear| {
                 run_numeric_self_check("probe", F16_SAFE_MAX_ABS, || {

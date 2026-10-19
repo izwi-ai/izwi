@@ -1996,7 +1996,7 @@ fn state_fits_leave_one_request_envelope_on_a_16_gb_metal_budget() {
 /// task answers, and sees the task's refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
-    let (mut gate, mut requests) = precision_reload_gate();
+    let (mut gate, mut requests) = precision_reload_gate(candle_core::Device::Cpu);
     let loader = tokio::task::spawn_blocking(move || {
         let admitted = gate("text", candle_core::DType::F32);
         let refused = gate("text", candle_core::DType::F32);
@@ -2014,7 +2014,7 @@ async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
     admitted.unwrap();
     assert!(refused.unwrap_err().to_string().contains("no room"));
     // A gate whose load task is gone refuses instead of blocking.
-    let (mut gate, requests) = precision_reload_gate();
+    let (mut gate, requests) = precision_reload_gate(candle_core::Device::Cpu);
     drop(requests);
     let orphaned = tokio::task::spawn_blocking(move || gate("text", candle_core::DType::F32));
     assert!(orphaned.await.unwrap().is_err());

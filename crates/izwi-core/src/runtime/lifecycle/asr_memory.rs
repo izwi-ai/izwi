@@ -210,15 +210,21 @@ pub(super) fn residency_plan(
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             qwen3_asr_plan(variant, model_path, device, backend)
         }
-        ModelVariant::ParakeetTdt06BV3 => parakeet_plan(variant, model_path, device, backend),
+        ModelVariant::ParakeetTdt06BV3 => {
+            parakeet_plan(variant, model_path, device, backend, Precision::Selected)
+        }
         ModelVariant::Nemotron35AsrStreaming06B => {
-            nemotron_plan(variant, model_path, device, backend)
+            nemotron_plan(variant, model_path, device, backend, Precision::Selected)
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
-            granite_plan(model_path, device, backend, granite.speech_dtype.as_deref())
-        }
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => granite_plan(
+            model_path,
+            device,
+            backend,
+            granite.speech_dtype.as_deref(),
+            Precision::Selected,
+        ),
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
@@ -1580,18 +1586,52 @@ pub(super) fn precision_reload_plan(
     variant: ModelVariant,
     model_path: &Path,
     device: &DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<Option<ModelResourcePlan>> {
-    if variant.family() != ModelFamily::Qwen3ForcedAligner {
-        return Ok(None);
-    }
     let backend = BackendKind::from(device.kind);
-    let Some((files, load)) = aligner_load(variant, model_path, device)? else {
-        return Ok(None);
+    let plan = match variant.family() {
+        ModelFamily::Qwen3ForcedAligner => {
+            let Some((files, load)) = aligner_load(variant, model_path, device)? else {
+                return Ok(None);
+            };
+            let Some(reload) = aligner_precision_reload(backend, load) else {
+                return Ok(None);
+            };
+            price_qwen3_aligner(&files, backend, reload)?
+        }
+        // Weight-only F16 encoder projections that fail their probe reload
+        // dense (`load_weight_only_f16`).
+        ModelFamily::ParakeetAsr => {
+            let Some(plan) =
+                parakeet_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        ModelFamily::NemotronAsr => {
+            let Some(plan) =
+                nemotron_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        ModelFamily::GraniteSpeechAsr => {
+            let Some(plan) = granite_plan(
+                model_path,
+                device,
+                backend,
+                granite.speech_dtype.as_deref(),
+                Precision::F32Reload,
+            )?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        _ => return super::tts_memory::precision_reload_plan(variant, model_path, device),
     };
-    let Some(reload) = aligner_precision_reload(backend, load) else {
-        return Ok(None);
-    };
-    let plan = price_qwen3_aligner(&files, backend, reload)?;
     tracing::info!(
         model = %variant,
         resident_bytes = plan.resident_bytes,
@@ -1721,6 +1761,14 @@ fn repack_to_q4_1(parts: &[MlxWeight]) -> Result<bool> {
     Ok(true)
 }
 
+/// Which precision a plan prices: the one the loader selects, or the F32
+/// form a load-time probe failure reloads (`precision_reload_plan`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Precision {
+    Selected,
+    F32Reload,
+}
+
 /// The NeMo ASR families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NemoFamily {
@@ -1749,9 +1797,11 @@ fn parakeet_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = parakeet_checkpoint_paths(model_path, variant)?;
-    let f16_projections = resolve_parakeet_projection_precision(device).dtype == DType::F16;
+    let f16_projections = precision == Precision::Selected
+        && resolve_parakeet_projection_precision(device).dtype == DType::F16;
     // The loader reads the extracted checkpoint, or its zip-repacked copy when
     // Candle cannot parse the original.
     for checkpoint in [&paths.checkpoint_path, &paths.repacked_checkpoint_path] {
@@ -1789,10 +1839,12 @@ fn nemotron_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = nemotron_checkpoint_paths(model_path, variant)?;
     let dtype = resolve_nemotron_asr_dtype(device)?.dtype;
-    let f16_projections = resolve_nemotron_projection_precision(device, dtype).dtype == DType::F16;
+    let f16_projections = precision == Precision::Selected
+        && resolve_nemotron_projection_precision(device, dtype).dtype == DType::F16;
     if paths.checkpoint_path.is_file() {
         if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
             return price_nemo(
@@ -2020,6 +2072,7 @@ fn granite_plan(
     device: &DeviceProfile,
     backend: BackendKind,
     speech_dtype: Option<&str>,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let Ok(shards) = ensure_granite_speech_artifacts(model_path) else {
         return Ok(None);
@@ -2028,9 +2081,16 @@ fn granite_plan(
         return Ok(None);
     };
     let config = GraniteSpeechConfig::load(model_path)?;
-    let dtype = select_granite_speech_dtype(device, config.target_dtype_hint(), speech_dtype)?;
-    let f16_encoder_projections =
-        resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
+    // The F32 reload bounds either fallback: the encoder's dense reload or
+    // the language model's F32 one.
+    let dtype = match precision {
+        Precision::Selected => {
+            select_granite_speech_dtype(device, config.target_dtype_hint(), speech_dtype)?
+        }
+        Precision::F32Reload => DType::F32,
+    };
+    let f16_encoder_projections = precision == Precision::Selected
+        && resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
     let load = GraniteLoad {
         dtype,
         audio_dtype: if f16_encoder_projections {

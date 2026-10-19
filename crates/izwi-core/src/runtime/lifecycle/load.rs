@@ -436,12 +436,19 @@ struct PrecisionReloadRequest {
 /// the reply, so the reload allocates only once it is authorized. Loads run
 /// on the device thread, which keeps serving control jobs while it waits:
 /// the admission may evict a model, and that model's drop runs there.
-fn precision_reload_gate() -> (
+/// The gate a loader asks before it reloads a component whose
+/// lowered-precision probe failed. It first synchronizes `device`: Candle frees
+/// the dropped component's buffers only then, so the admission that follows
+/// sees them free (and the reload does not stack on them).
+fn precision_reload_gate(
+    device: candle_core::Device,
+) -> (
     PrecisionReloadGate,
     tokio::sync::mpsc::UnboundedReceiver<PrecisionReloadRequest>,
 ) {
     let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
     let gate = Box::new(move |component: &str, dtype| {
+        device.synchronize().map_err(Error::from)?;
         let (reply, outcome) = tokio::sync::oneshot::channel();
         let ended = || {
             Error::ModelLoadError(format!(
@@ -770,7 +777,8 @@ impl ModelLifecycleController {
             // load-time probe fails reloads at F32 only once this task has
             // grown the authorization for it.
             let model_path = acquired.model_path.clone();
-            let (reload_gate, mut reload_requests) = precision_reload_gate();
+            let (reload_gate, mut reload_requests) =
+                precision_reload_gate(self.backend_router.context().device.device.clone());
             let instantiate = self.instantiate_model(acquired, reload_gate);
             tokio::pin!(instantiate);
             let instantiated = loop {

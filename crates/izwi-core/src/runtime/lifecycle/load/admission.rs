@@ -852,7 +852,13 @@ impl ModelLifecycleController {
         request: &PrecisionReloadRequest,
     ) -> Result<Option<ModelResourcePlan>> {
         let device = &self.backend_router.context().device;
-        let Some(reload) = asr_memory::precision_reload_plan(variant, model_path, device)? else {
+        let Some(reload) = asr_memory::precision_reload_plan(
+            variant,
+            model_path,
+            device,
+            &self.config.granite_speech,
+        )?
+        else {
             return Ok(None);
         };
         self.grow_load_authorization_for_reload(variant, current, reload, request)

@@ -31,8 +31,8 @@ use crate::engine::{StageDescriptor, StageWorkSelector, WorkCost};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kernels::numeric_check::{
-    admit_precision_reload, load_with_precision_fallback, run_numeric_self_check, xorshift_tensor,
-    NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
 };
 use crate::kv::v2::{
     stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
@@ -3510,9 +3510,10 @@ fn infer_downsample_hidden_size(loader: &GgufLoader) -> Result<usize> {
 /// `load_audio` / `load_text`. With `check` (Metal), a dtype below F32 must
 /// pass that component's load-time probe, or the component alone reloads in
 /// F32 (report 13), for GGUF and safetensors checkpoints alike. Admission
-/// prices the selected dtypes, so a reload first synchronizes the device
-/// (Candle frees the dropped component's buffers only then) and asks the
-/// load's [`admit_precision_reload`] gate for its memory.
+/// prices the selected dtypes, so a reload asks the load's
+/// [`admit_precision_reload`] gate for its memory
+/// (`load_with_precision_fallback` does), which first synchronizes the device
+/// so Candle frees the dropped component's buffers.
 fn load_qwen3_asr_components(
     audio_selection: &DTypeSelection,
     text_selection: &DTypeSelection,
@@ -3521,22 +3522,12 @@ fn load_qwen3_asr_components(
     mut load_audio: impl FnMut(DType) -> Result<AudioTower>,
     mut load_text: impl FnMut(DType) -> Result<Qwen3Model>,
 ) -> Result<(AudioTower, PrecisionLoad, Qwen3Model, PrecisionLoad)> {
-    let admit_reload = |label: &str, selected: DType, dtype: DType| -> Result<()> {
-        if dtype != selected {
-            device.synchronize()?;
-            admit_precision_reload(label, dtype)?;
-        }
-        Ok(())
-    };
     let (audio_tower, audio_precision) = load_with_precision_fallback(
         "Qwen3-ASR audio tower",
         audio_selection,
         check,
         DType::F32,
-        |dtype| {
-            admit_reload("audio tower", audio_selection.dtype, dtype)?;
-            load_audio(dtype)
-        },
+        &mut load_audio,
         |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, device),
     )?;
     let (text_model, text_precision) = load_with_precision_fallback(
@@ -3544,10 +3535,7 @@ fn load_qwen3_asr_components(
         text_selection,
         check,
         DType::F32,
-        |dtype| {
-            admit_reload("text", text_selection.dtype, dtype)?;
-            load_text(dtype)
-        },
+        &mut load_text,
         qwen3_asr_text_self_check,
     )?;
     Ok((audio_tower, audio_precision, text_model, text_precision))
@@ -6848,7 +6836,7 @@ mod precision_tests {
                     },
                 )
             });
-            let mut expected = vec!["load text F16", "admit text F32"];
+            let mut expected = vec!["load text F16", "admit Qwen3-ASR text F32"];
             match outcome {
                 Ok((_, audio, _, text)) => {
                     assert!(admit);

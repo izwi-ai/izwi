@@ -86,15 +86,54 @@ pub(super) fn residency_plan(
     }
 }
 
+/// What a TTS load reloads at when a lowered-precision component fails its
+/// load-time probe, priced for the lifecycle to grow the load's
+/// authorization to: Qwen3-TTS's talker and predictor dense, after their
+/// weight-only F16 self-check fails (`load_weight_only_f16`). `None` for
+/// every other TTS load.
+pub(super) fn precision_reload_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    if variant.family() != ModelFamily::Qwen3Tts {
+        return Ok(None);
+    }
+    let backend = BackendKind::from(device.kind);
+    let Some(plan) = qwen3_tts_plan_with(model_path, device, backend, false)? else {
+        return Ok(None);
+    };
+    let estimate = plan.estimate()?;
+    tracing::info!(
+        model = %variant,
+        resident_bytes = estimate.resident_bytes,
+        load_peak_bytes = estimate.load_peak_bytes,
+        "Priced the dense reload of a weight-only F16 load whose probe failed"
+    );
+    plan.resource_plan().map(Some)
+}
+
 fn qwen3_tts_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
+    qwen3_tts_plan_with(model_path, device, backend, true)
+}
+
+/// [`qwen3_tts_plan`], with weight-only F16 off when `allow_f16` is unset
+/// (the dense reload).
+fn qwen3_tts_plan_with(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+    allow_f16: bool,
+) -> Result<Option<AsrResidencyPlan>> {
     if !model_path.join("config.json").is_file() {
         return Ok(None);
     }
-    let layout = qwen3_tts_load_layout(model_path, device)?;
+    let mut layout = qwen3_tts_load_layout(model_path, device)?;
+    layout.weight_only_f16 &= allow_f16;
     let paths = [
         model_path.join("model.safetensors"),
         model_path
