@@ -777,13 +777,21 @@ async fn dropped_pending_guard_reclaims_admitted_session_and_job() {
     .await
     .expect("dropped pending guard kept the exact session fenced");
     assert_ne!(replacement_session.epoch, abandoned_session.epoch);
-    assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
-    assert_eq!(
-        runtime
-            .model_manager
-            .active_residency_leases(residency_variant),
-        0
-    );
+    // The cleanup task lifts the session fence first and releases the job
+    // and the residency lease just after, so a replacement can be admitted
+    // in between: wait for the release rather than race it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.coordinator_snapshot().active_jobs != 0
+            || runtime
+                .model_manager
+                .active_residency_leases(residency_variant)
+                != 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropped pending guard released its job and residency lease");
     runtime.core_engine.abort_all_requests().await;
 }
 
