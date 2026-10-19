@@ -121,107 +121,127 @@ impl ModelLifecycleController {
                         "loaded Granite Speech model {variant} is missing from the registry"
                     ))
                 })?;
-            for capability in [
-                CapabilityKind::Asr,
-                CapabilityKind::SpeakerAttributedAsr,
-            ] {
-                if self.adapter_registry.require(capability, variant).is_err() {
-                    continue;
-                }
-                let contracts = bundle_draft.execution_contracts(capability)?;
-                let stage_graphs = contracts
-                    .iter()
-                    .map(|contract| contract.stages.as_ref())
-                    .collect::<Vec<_>>();
-                let physical_spec =
-                    model.granite_speech_physical_state_spec(&stage_graphs)?;
-                // Without resumable prefill the model authors no retained
-                // route, and its state is not allocated (GRN-8).
-                let retained_route = capability == CapabilityKind::Asr
-                    && physical_spec.retained.is_some();
-                let (retained, retained_uses) = if retained_route {
-                    let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
-                        Error::ModelLoadError(
-                            "Granite Speech ASR graph did not author retained decoder state"
-                                .into(),
-                        )
-                    })?;
-                    let retained_max_tokens = physical_spec
-                        .retained_max_tokens
-                        .ok_or_else(|| {
-                            Error::ModelLoadError(
-                                "Granite Speech retained decoder has no context bound".into(),
-                            )
-                        })?;
-                    let retained = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
-                            model_instance_id,
-                            retained_contract,
-                            Some(retained_max_tokens),
-                            2,
-                            self.asr_state_rows(),
-                            asr_minimum_tokens(variant),
-                        )
-                        .await?;
-                    self.model_registry.publish_effective_context(
-                        variant,
-                        retained.logical_token_reach(),
-                    )?;
-                    self.model_registry.publish_kv_storage(variant, &retained);
-                    crate::runtime::rollout::validate_managed_state_plan_eligibility(
-                        variant,
-                        CapabilityKind::Asr,
-                        retained.state_plan_v2(),
-                    )?;
-                    let uses = contracts
-                        .iter()
-                        .map(|contract| {
-                            let graph = stage_graph_fingerprint(&contract.stages)?;
-                            let use_kind = match contract.execution_profile.mode {
-                                crate::engine::ExecutionMode::Sequence => {
-                                    RetainedStateUseV2::ExternalPaged
-                                }
-                                crate::engine::ExecutionMode::Atomic => {
-                                    RetainedStateUseV2::Inactive
-                                }
-                                _ => {
-                                    return Err(Error::ModelLoadError(
-                                        "Granite Speech ASR graph has an incompatible retained-state profile"
-                                            .into(),
-                                    ));
-                                }
-                            };
-                            Ok((graph, use_kind))
-                        })
-                        .collect::<Result<HashMap<_, _>>>()?;
-                    (Some(retained.into()), uses)
-                } else {
-                    if physical_spec.retained.is_some()
-                        || physical_spec.retained_max_tokens.is_some()
-                    {
-                        return Err(Error::ModelLoadError(
-                            "speaker-attributed Granite Speech graph unexpectedly requested retained state"
-                                .into(),
-                        ));
-                    }
-                    (None, HashMap::new())
-                };
-                let publication = self
-                    .load_invocation_workspace_publication_with_remaining_groups(
-                        model_instance_id,
-                        &contracts,
-                        physical_spec.descriptor,
-                        &physical_spec.invocation,
-                        retained,
-                        retained_uses,
-                        if capability == CapabilityKind::Asr { 2 } else { 1 },
-                    )
-                    .await?;
-                state_publications.insert(capability, publication);
-            }
+            state_publications.extend(
+                self.load_granite_speech_state_publications(
+                    variant,
+                    model_instance_id,
+                    bundle_draft,
+                    |graphs| model.granite_speech_physical_state_spec(graphs),
+                )
+                .await?,
+            );
         }
         Ok(())
+    }
+
+    /// Publish the state each Granite Speech capability's stage graphs need,
+    /// as `physical_state_spec` authors it for them.
+    pub(super) async fn load_granite_speech_state_publications(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        physical_state_spec: impl Fn(
+            &[&[StageDescriptor]],
+        ) -> Result<
+            crate::models::architectures::granite_speech::asr::GraniteSpeechPhysicalStateSpec,
+        >,
+    ) -> Result<HashMap<CapabilityKind, LoadedStatePublication>> {
+        let mut publications = HashMap::new();
+        for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
+            if self.adapter_registry.require(capability, variant).is_err() {
+                continue;
+            }
+            let contracts = bundle_draft.execution_contracts(capability)?;
+            let stage_graphs = contracts
+                .iter()
+                .map(|contract| contract.stages.as_ref())
+                .collect::<Vec<_>>();
+            let physical_spec = physical_state_spec(&stage_graphs)?;
+            // Without resumable prefill the ASR capability offers no
+            // retained graph, so the model authors no retained state and
+            // none is allocated (GRN-8).
+            let retained_route =
+                capability == CapabilityKind::Asr && physical_spec.retained.is_some();
+            let (retained, retained_uses) = if retained_route {
+                let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "Granite Speech ASR graph did not author retained decoder state".into(),
+                    )
+                })?;
+                let retained_max_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "Granite Speech retained decoder has no context bound".into(),
+                    )
+                })?;
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        retained_contract,
+                        Some(retained_max_tokens),
+                        2,
+                        self.asr_state_rows(),
+                        asr_minimum_tokens(variant),
+                    )
+                    .await?;
+                self.model_registry
+                    .publish_effective_context(variant, retained.logical_token_reach())?;
+                self.model_registry.publish_kv_storage(variant, &retained);
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Asr,
+                    retained.state_plan_v2(),
+                )?;
+                let uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => {
+                                RetainedStateUseV2::Inactive
+                            }
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Granite Speech ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                (Some(retained.into()), uses)
+            } else {
+                if physical_spec.retained.is_some() || physical_spec.retained_max_tokens.is_some() {
+                    return Err(Error::ModelLoadError(
+                        "speaker-attributed Granite Speech graph unexpectedly requested retained state"
+                            .into(),
+                    ));
+                }
+                (None, HashMap::new())
+            };
+            let publication = self
+                .load_invocation_workspace_publication_with_remaining_groups(
+                    model_instance_id,
+                    &contracts,
+                    physical_spec.descriptor,
+                    &physical_spec.invocation,
+                    retained,
+                    retained_uses,
+                    if capability == CapabilityKind::Asr {
+                        2
+                    } else {
+                        1
+                    },
+                )
+                .await?;
+            publications.insert(capability, publication);
+        }
+        Ok(publications)
     }
 
     /// Offline ASR (every family but Granite Speech): retained and invocation

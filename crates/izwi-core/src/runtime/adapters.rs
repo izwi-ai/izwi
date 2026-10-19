@@ -771,6 +771,9 @@ mod tests {
             .expect("granite speech asr adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        // The capability declares the most it may hold. A load without
+        // resumable prefill offers only its atomic graph and publishes
+        // invocation state alone (GRN-8).
         assert_eq!(
             adapter.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation

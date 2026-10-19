@@ -2599,19 +2599,90 @@ fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
         .is_ok());
 }
 
+/// A Granite Speech ASR adapter with its retained sequence route on. The
+/// route is dormant until Granite resumes prefill (GRN-8); these tests keep
+/// its graph honest for that day.
+fn granite_retained_route_adapter(
+    metadata: AdapterMetadata,
+    backend: BackendKind,
+    max_batch_size: usize,
+) -> GraniteSpeechAsrExecutionAdapter {
+    let mut adapter = GraniteSpeechAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        backend,
+        max_batch_size,
+    );
+    adapter.retained_route = true;
+    adapter
+}
+
+#[test]
+fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        ModelVariant::GraniteSpeech412BPlus,
+        BackendKind::Metal,
+    )
+    .unwrap();
+    // Every selectable graph is known when the bundle is drafted, before the
+    // weights load: none waits on the preparation seal.
+    let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
+    let atomic = draft.capabilities[&CapabilityKind::Asr]
+        .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+        .unwrap();
+    for contract in &contracts {
+        assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
+        assert!(contract.execution_profile.cache_namespace.is_none());
+        assert_eq!(contract.execution_profile.kv_dtype, "none");
+        assert_eq!(contract.stages.len(), 1);
+        assert_eq!(contract.stages[0].selector, StageWorkSelector::Atomic);
+        assert!(contract.stages.iter().all(|stage| !matches!(
+            stage.selector,
+            StageWorkSelector::SequencePrefill | StageWorkSelector::SequenceDecode
+        )));
+    }
+    // An ordinary requirement re-seals the long-form graph exactly.
+    let normal = draft.capabilities[&CapabilityKind::Asr]
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(
+        stage_graph_fingerprint(&normal.stages).unwrap(),
+        stage_graph_fingerprint(&atomic.stages).unwrap()
+    );
+    // The model's preparation seal still installs, and changes no graph.
+    install_test_preparation_seals(&draft, BackendKind::Metal, 8);
+    assert_eq!(
+        draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .len(),
+        contracts.len()
+    );
+    assert_eq!(
+        stage_graph_fingerprint(
+            &draft.capabilities[&CapabilityKind::Asr]
+                .contract(StreamingRequirements::NONE)
+                .unwrap()
+                .stages
+        )
+        .unwrap(),
+        stage_graph_fingerprint(&atomic.stages).unwrap()
+    );
+}
+
 #[test]
 fn granite_speech_normal_graph_has_static_preparation_continuous_decode_and_atomic_fallback() {
     let registry = RuntimeAdapterRegistry::built_in();
     let metadata = *registry
         .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
         .unwrap();
-    let adapter = GraniteSpeechAsrExecutionAdapter::new(
-        ExecutionGroupId::new(1),
-        ModelInstanceId::new(2),
-        metadata,
-        BackendKind::Cpu,
-        8,
-    );
+    let adapter = granite_retained_route_adapter(metadata, BackendKind::Cpu, 8);
     adapter
         .install_test_preparation_seal(BackendKind::Cpu, 8)
         .unwrap();
@@ -2683,13 +2754,7 @@ fn granite_speech_native_batch_contract_is_backend_truthful() {
         .unwrap();
 
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-        let adapter = GraniteSpeechAsrExecutionAdapter::new(
-            ExecutionGroupId::new(1),
-            ModelInstanceId::new(2),
-            metadata,
-            backend,
-            8,
-        );
+        let adapter = granite_retained_route_adapter(metadata, backend, 8);
         adapter.install_test_preparation_seal(backend, 8).unwrap();
         let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
 
@@ -2731,13 +2796,7 @@ fn granite_speech_width_one_keeps_scalar_preparation() {
     let metadata = *registry
         .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
         .unwrap();
-    let adapter = GraniteSpeechAsrExecutionAdapter::new(
-        ExecutionGroupId::new(1),
-        ModelInstanceId::new(2),
-        metadata,
-        BackendKind::Cpu,
-        1,
-    );
+    let adapter = granite_retained_route_adapter(metadata, BackendKind::Cpu, 1);
     adapter
         .install_test_preparation_seal(BackendKind::Cpu, 1)
         .unwrap();
@@ -2758,13 +2817,7 @@ fn granite_speech_normal_graph_fails_closed_before_preparation_is_sealed() {
     let metadata = *registry
         .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
         .unwrap();
-    let adapter = GraniteSpeechAsrExecutionAdapter::new(
-        ExecutionGroupId::new(1),
-        ModelInstanceId::new(2),
-        metadata,
-        BackendKind::Cpu,
-        8,
-    );
+    let adapter = granite_retained_route_adapter(metadata, BackendKind::Cpu, 8);
 
     let error = adapter.contract(StreamingRequirements::NONE).unwrap_err();
     assert!(error.to_string().contains("preparation is sealed"));

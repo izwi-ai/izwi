@@ -391,7 +391,14 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::Continuous
+        // Continuous decode batching lives on the retained sequence graph,
+        // which the adapter offers only with resumable prefill (GRN-8).
+        if crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL
+        {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        }
     }
 
     fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {

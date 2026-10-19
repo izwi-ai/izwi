@@ -166,6 +166,129 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+/// A Granite Speech load without resumable prefill publishes invocation
+/// state only, and the bundle seals it: its ASR capability offers no
+/// retained graph (GRN-8), so no graph declares retained cache state beside
+/// the stateless publication, and speaker attribution publishes as before.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_state() {
+    use crate::models::architectures::granite_speech::asr::{
+        granite_speech_test_physical_state_spec, GraniteSpeechAsrModel,
+    };
+    use crate::runtime::adapters::{
+        LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
+    };
+    assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL);
+    // Serialize against OOM-ladder poison windows and load-transaction
+    // reservations on the process-global resource authority.
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let directory =
+        std::env::temp_dir().join(format!("izwi-granite-state-publication-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: directory.clone(),
+        backend: BackendPreference::Cpu,
+        max_sequence_length: ContextLengthPreference::explicit(32).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let variant = ModelVariant::GraniteSpeech412BPlus;
+    let authority = vector_authority(all_memory_capacity(1024));
+    let lease = authority
+        .reserve(
+            ReservationOwner::new(ReservationClass::Model, "granite-load-publication"),
+            ResourceVector::zero(),
+        )
+        .unwrap();
+    let instance = runtime
+        .model_lifecycle
+        .install_loading_slot(variant, lease)
+        .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(992),
+        instance,
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let publications = runtime
+        .model_lifecycle
+        .load_granite_speech_state_publications(
+            variant,
+            instance,
+            &draft,
+            granite_speech_test_physical_state_spec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publications.len(), 2);
+    for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
+        let LoadedStatePublication::PhysicalV2 {
+            descriptor,
+            retained,
+            retained_uses,
+            ..
+        } = &publications[&capability]
+        else {
+            panic!("Granite Speech {capability:?} must publish physical state");
+        };
+        assert!(retained.is_none(), "{capability:?}");
+        assert!(retained_uses.is_empty(), "{capability:?}");
+        assert!(
+            matches!(descriptor.retained, RetainedStateCapability::Stateless),
+            "{capability:?}"
+        );
+    }
+    let bundle = draft
+        .seal(publications)
+        .expect("a Granite Speech load without resumable prefill must seal");
+
+    // Every ASR requirement, ordinary or long-form, with or without
+    // transport output, binds the atomic graph and its invocation state.
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+        StreamingRequirements::NONE.with_asr_long_form(true),
+        StreamingRequirements::transport_only().with_asr_long_form(true),
+    ] {
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(binding.execution, contract.adapter_binding().unwrap());
+        binding
+            .state
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+        assert!(binding.state.managed_kv_runtime().is_none());
+    }
+    let attributed = bundle
+        .capability_binding_for_streaming(
+            CapabilityKind::SpeakerAttributedAsr,
+            StreamingRequirements::NONE,
+        )
+        .unwrap();
+    attributed
+        .state
+        .validate_against(BackendKind::Cpu, &attributed.execution)
+        .unwrap();
+    assert_eq!(
+        attributed.execution.stages[0].selector,
+        StageWorkSelector::Pipeline { ordinal: None }
+    );
+    drop(attributed);
+    drop(bundle);
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn invocation_execution(max_batch_size: usize) -> LoadedExecutionContract {
     let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
     let metadata = *RuntimeAdapterRegistry::built_in()

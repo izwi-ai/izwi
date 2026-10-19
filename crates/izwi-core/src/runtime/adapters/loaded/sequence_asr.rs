@@ -20,6 +20,11 @@ pub(super) struct GraniteSpeechAsrExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Whether the capability offers its retained sequence graph. Request
+    /// preparation routes ASR there only for a model with resumable prefill,
+    /// so without it every requirement resolves to the atomic graph and the
+    /// load authors, fits and holds no retained decoder state (GRN-8).
+    pub(super) retained_route: bool,
     pub(super) seal: OnceLock<GraniteSpeechAsrExecutionSeal>,
 }
 
@@ -40,6 +45,8 @@ impl GraniteSpeechAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            retained_route:
+                crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL,
             seal: OnceLock::new(),
         }
     }
@@ -163,7 +170,9 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
                 metadata.model_variant
             )));
         }
-        if streaming.asr_long_form {
+        // Without its retained route the atomic graph is the capability's
+        // only graph, so every requirement re-seals it (identical identities).
+        if streaming.asr_long_form || !self.retained_route {
             let mut profile = scalar_execution_profile(metadata, self.backend_kind);
             profile.mode = ExecutionMode::Atomic;
             profile.prefill = PrefillMode::None;
