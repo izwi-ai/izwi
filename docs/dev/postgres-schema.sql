@@ -812,6 +812,12 @@ ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS finish_reason TEXT NULL;
 
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reasoning_ms BIGINT NULL;
 
+ALTER TABLE studio_project_segments ADD COLUMN IF NOT EXISTS render_fingerprint TEXT NULL;
+
+ALTER TABLE studio_project_segments ADD COLUMN IF NOT EXISTS render_status TEXT NULL;
+
+ALTER TABLE studio_project_segments ADD COLUMN IF NOT EXISTS render_error TEXT NULL;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     component TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -835,6 +841,8 @@ INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('ap
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 7, 'chat message model and finish reason', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 8, 'chat message reasoning time', 0) ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 9, 'studio segment render state', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ('voice_profile_default', 'Primary Voice Profile', 'You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.', 1, 0, 0) ON CONFLICT (id) DO NOTHING;
 

@@ -419,6 +419,8 @@ pub struct AppState {
     pub onboarding_store: Arc<OnboardingStore>,
     /// SQLite-backed Studio project store.
     pub studio_store: Arc<StudioProjectStore>,
+    /// Wakes the Studio render worker when a render is queued.
+    pub studio_render_wake: Arc<tokio::sync::Notify>,
     /// SQLite-backed voice profile/session store.
     pub voice_store: Arc<VoiceStore>,
     /// SQLite-backed voice observation store.
@@ -511,6 +513,7 @@ impl AppState {
             saved_voice_store,
             onboarding_store,
             studio_store,
+            studio_render_wake: Arc::new(tokio::sync::Notify::new()),
             voice_store,
             voice_observation_store,
             batch_runtime_store,
@@ -616,6 +619,7 @@ impl AppState {
             saved_voice_store,
             onboarding_store,
             studio_store,
+            studio_render_wake: Arc::new(tokio::sync::Notify::new()),
             voice_store,
             voice_observation_store,
             batch_runtime_store,

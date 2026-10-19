@@ -1456,7 +1456,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
-  it("posts render-job updates to the canonical studio route", async () => {
+  it("cancels render jobs on the canonical studio route", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -1480,19 +1480,13 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
-    await client.updateStudioProjectRenderJob("ttsp-1", "ttsj-1", {
-      status: "failed",
-      error_message: "boom",
-    });
+    await client.cancelStudioProjectRenderJob("ttsp-1", "ttsj-1");
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost/v1/studio/projects/ttsp-1/render-jobs/ttsj-1",
       expect.objectContaining({
         method: "PATCH",
-        body: JSON.stringify({
-          status: "failed",
-          error_message: "boom",
-        }),
+        body: JSON.stringify({ status: "cancelled" }),
       }),
     );
   });

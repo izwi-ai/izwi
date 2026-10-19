@@ -21,7 +21,6 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { createUuid } from "@/lib/ids";
 import { cn } from "@/lib/utils";
 import {
   api,
@@ -118,10 +117,20 @@ interface StudioRenderQueueItem {
   segmentLabel: string;
   status: "queued" | "running" | "failed";
   errorMessage?: string;
-  jobId?: string;
 }
 
-const STUDIO_RENDER_QUEUE_STORAGE_KEY = "izwi.studio.render.queue.v1";
+/** What a poll compares to decide whether render progress changed. */
+function renderSnapshot(project: StudioProjectRecord): string {
+  return [
+    project.active_render_job?.id ?? "",
+    ...project.segments.map(
+      (segment) =>
+        `${segment.id}:${segment.render_state}:${segment.speech_record_id ?? ""}`,
+    ),
+  ].join("|");
+}
+
+const RENDER_POLL_INTERVAL_MS = 1000;
 const STUDIO_SEGMENT_ADD_END_TARGET = "__end__";
 const STUDIO_PROJECT_LIBRARY_PAGE_LIMIT = 24;
 
@@ -225,16 +234,10 @@ export function StudioWorkspace({
   const [projectSpeed, setProjectSpeed] = useState(1);
   const [savingProject, setSavingProject] = useState(false);
   const [savingSegmentId, setSavingSegmentId] = useState<string | null>(null);
-  const [renderingSegmentId, setRenderingSegmentId] = useState<string | null>(
-    null,
-  );
   const [addingSegmentAfterSegmentId, setAddingSegmentAfterSegmentId] = useState<
     string | null
   >(null);
   const [focusSegmentId, setFocusSegmentId] = useState<string | null>(null);
-  const [renderQueue, setRenderQueue] = useState<StudioRenderQueueItem[]>([]);
-  const [renderQueueReady, setRenderQueueReady] = useState(false);
-  const [processingRenderQueue, setProcessingRenderQueue] = useState(false);
   const [exportFormat, setExportFormat] = useState<"wav" | "raw_i16" | "raw_f32">(
     "wav",
   );
@@ -681,47 +684,6 @@ export function StudioWorkspace({
     }
   }, [onSelectModel, projectModelId, selectedModel]);
 
-  useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      typeof window.localStorage?.getItem !== "function"
-    ) {
-      setRenderQueueReady(true);
-      return;
-    }
-    try {
-      const raw = window.localStorage.getItem(STUDIO_RENDER_QUEUE_STORAGE_KEY);
-      if (!raw) {
-        setRenderQueue([]);
-      } else {
-        const parsed = JSON.parse(raw) as StudioRenderQueueItem[];
-        setRenderQueue(
-          parsed.map((item) => ({
-            ...item,
-            status: item.status === "running" ? "queued" : item.status,
-          })),
-        );
-      }
-    } catch {
-      setRenderQueue([]);
-    } finally {
-      setRenderQueueReady(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (
-      !renderQueueReady ||
-      typeof window === "undefined" ||
-      typeof window.localStorage?.setItem !== "function"
-    ) {
-      return;
-    }
-    window.localStorage.setItem(
-      STUDIO_RENDER_QUEUE_STORAGE_KEY,
-      JSON.stringify(renderQueue),
-    );
-  }, [renderQueue, renderQueueReady]);
 
   const builtInVoiceItems: VoicePickerItem[] = availableSpeakers.map((voice) => ({
     id: voice.id,
@@ -1635,152 +1597,94 @@ export function StudioWorkspace({
       if (uniqueSegmentIds.length === 0) {
         return 0;
       }
-
-      let jobId: string | undefined;
-      try {
-        const job = await api.createStudioProjectRenderJob(project.id, {
-          queued_segment_ids: uniqueSegmentIds,
-        });
-        jobId = job.id;
-      } catch {
-        jobId = undefined;
-      }
-
-      let addedCount = 0;
-      setRenderQueue((current) => {
-        const existingKeySet = new Set(
-          current
-            .filter((item) => item.status === "queued" || item.status === "running")
-            .map((item) => `${item.projectId}:${item.segmentId}`),
-        );
-        const additions = uniqueSegmentIds
-          .filter((segmentId) => !existingKeySet.has(`${project.id}:${segmentId}`))
-          .map((segmentId) => {
-            const segment = project.segments.find((entry) => entry.id === segmentId);
-            return {
-              id: createUuid(),
-              projectId: project.id,
-              segmentId,
-              segmentLabel: segment
-                ? `Segment ${segment.position + 1}`
-                : "Segment",
-              status: "queued" as const,
-              jobId,
-            };
-          });
-        addedCount = additions.length;
-        return [...current, ...additions];
+      const job = await api.createStudioProjectRenderJob(project.id, {
+        segment_ids: uniqueSegmentIds,
       });
-
-      return addedCount;
+      setSelectedProject(await api.getStudioProject(project.id));
+      return job.queued_segment_ids.length;
     },
     [],
   );
 
+  // The server renders queued segments; while a job runs, follow it.
+  const activeRenderJobId = selectedProject?.active_render_job?.id ?? null;
   useEffect(() => {
-    if (!renderQueueReady || processingRenderQueue) {
+    if (!selectedProjectId || !activeRenderJobId) {
       return;
     }
-    const nextItem = renderQueue.find((item) => item.status === "queued");
-    if (!nextItem) {
-      return;
-    }
-
-    setProcessingRenderQueue(true);
-    setRenderingSegmentId(nextItem.segmentId);
-    setRenderQueue((current) =>
-      current.map((item) =>
-        item.id === nextItem.id
-          ? { ...item, status: "running", errorMessage: undefined }
-          : item,
-      ),
-    );
-
-    const process = async () => {
-      try {
-        const project = await api.renderStudioProjectSegment(
-          nextItem.projectId,
-          nextItem.segmentId,
-        );
-        if (selectedProjectId === nextItem.projectId) {
-          setSelectedProject(project);
-        }
-        await loadProjects();
-
-        setRenderQueue((current) =>
-          current.filter((item) => item.id !== nextItem.id),
-        );
-
-        if (nextItem.jobId) {
-          const hasPendingForJob = renderQueue.some(
-            (item) =>
-              item.jobId === nextItem.jobId &&
-              item.id !== nextItem.id &&
-              (item.status === "queued" || item.status === "running"),
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void api
+        .getStudioProject(selectedProjectId)
+        .then((project) => {
+          if (cancelled) {
+            return;
+          }
+          setSelectedProject((current) =>
+            current?.id === project.id &&
+            renderSnapshot(current) !== renderSnapshot(project)
+              ? project
+              : current,
           );
-          if (!hasPendingForJob) {
-            await api.updateStudioProjectRenderJob(nextItem.projectId, nextItem.jobId, {
-              status: "completed",
-            });
+          if (!project.active_render_job) {
+            void loadProjects();
           }
-        }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to render queued segment.";
-        setRenderQueue((current) =>
-          current.map((item) =>
-            item.id === nextItem.id
-              ? { ...item, status: "failed", errorMessage: message }
-              : item,
-          ),
-        );
-        if (nextItem.jobId) {
-          try {
-            await api.updateStudioProjectRenderJob(nextItem.projectId, nextItem.jobId, {
-              status: "failed",
-              error_message: message,
-            });
-          } catch {
-            // noop: queue failure state is already surfaced locally.
-          }
-        }
-      } finally {
-        setRenderingSegmentId(null);
-        setProcessingRenderQueue(false);
-      }
+        })
+        .catch(() => undefined);
+    }, RENDER_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
+  }, [activeRenderJobId, loadProjects, selectedProjectId]);
 
-    void process();
-  }, [
-    loadProjects,
-    processingRenderQueue,
-    renderQueue,
-    renderQueueReady,
-    selectedProjectId,
-  ]);
+  const renderQueue = useMemo<StudioRenderQueueItem[]>(
+    () =>
+      (selectedProject?.segments ?? []).flatMap((segment) => {
+        const status =
+          segment.render_state === "rendering"
+            ? "running"
+            : segment.render_state === "queued" || segment.render_state === "failed"
+              ? segment.render_state
+              : null;
+        return status
+          ? [
+              {
+                id: segment.id,
+                projectId: segment.project_id,
+                segmentId: segment.id,
+                segmentLabel: `Segment ${segment.position + 1}`,
+                status,
+                errorMessage: segment.render_error ?? undefined,
+              },
+            ]
+          : [];
+      }),
+    [selectedProject],
+  );
+  const renderingSegmentId =
+    selectedProject?.segments.find((segment) => segment.render_state === "rendering")
+      ?.id ?? null;
 
-  const retryRenderQueueItem = async (queueId: string) => {
-    setRenderQueue((current) =>
-      current.map((item) =>
-        item.id === queueId
-          ? { ...item, status: "queued", errorMessage: undefined }
-          : item,
-      ),
+  const retryRenderQueueItem = async (segmentId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+    await runProjectMutation(
+      () => queueSegmentsForRender(selectedProject, [segmentId]),
+      "Failed to queue the segment again.",
     );
   };
 
-  const cancelRenderQueueItem = async (queueId: string) => {
-    const item = renderQueue.find((entry) => entry.id === queueId);
-    setRenderQueue((current) => current.filter((entry) => entry.id !== queueId));
-    if (item?.jobId) {
-      try {
-        await api.updateStudioProjectRenderJob(item.projectId, item.jobId, {
-          status: "cancelled",
-        });
-      } catch {
-        // noop
-      }
+  const cancelRendering = async () => {
+    const job = selectedProject?.active_render_job;
+    if (!selectedProject || !job) {
+      return;
     }
+    await runProjectMutation(async () => {
+      await api.cancelStudioProjectRenderJob(selectedProject.id, job.id);
+      setSelectedProject(await api.getStudioProject(selectedProject.id));
+    }, "Failed to cancel rendering.");
   };
 
   const handleCreatePronunciation = async () => {
@@ -2142,7 +2046,7 @@ export function StudioWorkspace({
 
   const selectedProjectRenderedCount =
     selectedProjectSummary?.rendered_segment_count ??
-    selectedProject?.segments.filter((segment) => Boolean(segment.speech_record_id))
+    selectedProject?.segments.filter((segment) => segment.render_state === "rendered")
       .length ??
     0;
   const selectedProjectSegmentCount =
@@ -2160,7 +2064,7 @@ export function StudioWorkspace({
   const pendingRenderSegmentCount =
     selectedProject?.segments.filter((segment) => {
       const draft = segmentDrafts[segment.id] ?? segment.text;
-      return draft !== segment.text || !segment.speech_record_id;
+      return draft !== segment.text || segment.render_state !== "rendered";
     }).length ?? 0;
   const selectedSegmentCount = selectedSegmentIds.length;
   const selectedSegmentIdSet = useMemo(
@@ -2922,7 +2826,7 @@ export function StudioWorkspace({
                                 variant="ghost"
                                 size="sm"
                                 className="h-7 px-2 text-xs"
-                                onClick={() => void cancelRenderQueueItem(item.id)}
+                                onClick={() => void cancelRendering()}
                               >
                                 Cancel
                               </Button>
@@ -3048,7 +2952,13 @@ export function StudioWorkspace({
                     current === segmentId ? null : current,
                   )
                 }
-                audioUrlForRecordId={(recordId) => api.textToSpeechRecordAudioUrl(recordId)}
+                audioUrlForSegment={(segment) =>
+                  api.studioProjectSegmentAudioUrl(
+                    segment.project_id,
+                    segment.id,
+                    segment.speech_record_id,
+                  )
+                }
               />
             }
             actionRail={

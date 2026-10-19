@@ -17,6 +17,10 @@ function buildProject(overrides: Partial<StudioProjectSummary> = {}): StudioProj
     speed: 1,
     segment_count: 12,
     rendered_segment_count: 7,
+    stale_segment_count: 0,
+    pending_segment_count: 0,
+    failed_segment_count: 0,
+    audio_duration_secs: 84,
     total_chars: 3200,
     ...overrides,
   };

@@ -59,7 +59,7 @@ interface StudioSegmentEditorProps {
   onDiscardSegmentDraftConflict?: (segmentId: string) => void;
   onChangeSegmentCursor: (segmentId: string, cursor: number | null) => void;
   onFocusSegmentHandled: (segmentId: string) => void;
-  audioUrlForRecordId: (recordId: string) => string;
+  audioUrlForSegment: (segment: StudioProjectSegmentRecord) => string;
 }
 
 function SegmentActionsMenu({
@@ -243,7 +243,7 @@ export function StudioSegmentEditor({
   onDiscardSegmentDraftConflict,
   onChangeSegmentCursor,
   onFocusSegmentHandled,
-  audioUrlForRecordId,
+  audioUrlForSegment,
 }: StudioSegmentEditorProps) {
   const allSelected =
     project.segments.length > 0 && selectedSegmentCount === project.segments.length;
@@ -376,7 +376,7 @@ export function StudioSegmentEditor({
           const draft = segmentDrafts[segment.id] ?? segment.text;
           const draftConflict = segmentDraftConflicts[segment.id];
           const segmentDirty = draft !== segment.text;
-          const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
+          const segmentNeedsRender = segmentDirty || segment.render_state !== "rendered";
           const isSaving = savingSegmentId === segment.id;
           const isRendering = renderingSegmentId === segment.id;
           const segmentQueued = queuedSegmentIdSet.has(segment.id);
@@ -420,18 +420,24 @@ export function StudioSegmentEditor({
                       <span
                         className={cn(
                           "whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium",
-                          segmentDirty
+                          segmentDirty || segment.render_state === "stale"
                             ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
-                            : segment.speech_record_id
-                              ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
-                              : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-muted)]",
+                            : segment.render_state === "failed"
+                              ? "border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)]"
+                              : segment.render_state === "rendered"
+                                ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
+                                : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-muted)]",
                         )}
                       >
                         {segmentDirty
                           ? "Edited"
-                          : segment.speech_record_id
-                            ? "Rendered"
-                            : "Needs render"}
+                          : segment.render_state === "stale"
+                            ? "Changed"
+                            : segment.render_state === "failed"
+                              ? "Failed"
+                              : segment.render_state === "rendered"
+                                ? "Rendered"
+                                : "Needs render"}
                       </span>
                     </div>
                     <div className="text-sm text-[var(--text-secondary)]">
@@ -565,14 +571,14 @@ export function StudioSegmentEditor({
                 {segment.speech_record_id ? (
                   <div className="mt-4 space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
                     <RecordAudioPlayer
-                      src={audioUrlForRecordId(segment.speech_record_id)}
+                      src={audioUrlForSegment(segment)}
                       durationHint={segment.audio_duration_secs}
                       compact
                     />
                     <div className="text-xs text-[var(--text-muted)]">
-                      {segmentDirty
-                        ? "Preview reflects the last rendered audio until you render this edited block again."
-                        : `Linked generation: ${segment.speech_record_id}`}
+                      {segmentDirty || segment.render_state === "stale"
+                        ? "Preview reflects the last rendered audio until you render this block again."
+                        : null}
                     </div>
                   </div>
                 ) : null}

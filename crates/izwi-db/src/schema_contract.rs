@@ -291,6 +291,9 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "saved_voice_id",
             "speech_record_id",
             "updated_at",
+            "render_fingerprint",
+            "render_status",
+            "render_error",
         ],
     },
     RequiredSchemaTable {

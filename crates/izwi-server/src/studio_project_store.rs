@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context};
 use sea_orm::{ConnectionTrait, DatabaseConnection, QueryResult, TransactionTrait, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -98,6 +98,40 @@ impl StudioProjectRenderJobStatus {
     }
 }
 
+/// Where a segment's audio stands. `stale` audio was rendered from other
+/// text, voice, speed or pronunciations than the segment has now.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StudioSegmentRenderState {
+    #[default]
+    NotRendered,
+    Rendered,
+    Stale,
+    Queued,
+    Rendering,
+    Failed,
+}
+
+impl StudioSegmentRenderState {
+    /// Whether "render what's left" includes this segment.
+    pub const fn needs_render(self) -> bool {
+        matches!(self, Self::NotRendered | Self::Stale | Self::Failed)
+    }
+
+    pub const fn is_pending(self) -> bool {
+        matches!(self, Self::Queued | Self::Rendering)
+    }
+}
+
+/// Editing a segment that failed to render clears the failure: the next
+/// render is a new attempt.
+const CLEAR_RENDER_FAILURE: &str = "render_status = CASE WHEN render_status = 'failed' THEN NULL ELSE render_status END, render_error = NULL";
+
+/// The queue position stored on a segment (`render_status`).
+const RENDER_STATUS_QUEUED: &str = "queued";
+const RENDER_STATUS_RENDERING: &str = "rendering";
+const RENDER_STATUS_FAILED: &str = "failed";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StudioProjectFolderRecord {
     pub id: String,
@@ -138,7 +172,7 @@ pub struct StudioProjectSnapshotRecord {
     pub project_name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioProjectRenderJobRecord {
     pub id: String,
     pub project_id: String,
@@ -162,7 +196,14 @@ pub struct StudioProjectSummary {
     pub saved_voice_id: Option<String>,
     pub speed: Option<f64>,
     pub segment_count: usize,
+    /// Segments whose audio matches what they would render now.
     pub rendered_segment_count: usize,
+    pub stale_segment_count: usize,
+    /// Queued or rendering.
+    pub pending_segment_count: usize,
+    pub failed_segment_count: usize,
+    /// Length of the audio the project has, current or stale.
+    pub audio_duration_secs: f64,
     pub total_chars: usize,
 }
 
@@ -188,6 +229,53 @@ pub struct StudioProjectSegmentRecord {
     pub generation_time_ms: Option<f64>,
     pub audio_duration_secs: Option<f64>,
     pub audio_filename: Option<String>,
+    /// Opaque digest of what the current audio was rendered from.
+    #[serde(default)]
+    pub render_fingerprint: Option<String>,
+    #[serde(default)]
+    pub render_state: StudioSegmentRenderState,
+    #[serde(default)]
+    pub render_error: Option<String>,
+    /// The stored queue position; `render_state` is what clients read.
+    #[serde(skip)]
+    render_status: Option<String>,
+}
+
+/// The model, voice and speed a segment renders with: its own override,
+/// else the project's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioRenderSettings {
+    pub model_id: Option<String>,
+    pub voice_mode: StudioProjectVoiceMode,
+    pub speaker: Option<String>,
+    pub saved_voice_id: Option<String>,
+    pub speed: Option<f64>,
+}
+
+/// A segment's own voice override. Model and voice travel together: a
+/// speaker only means something for the model it was picked for.
+#[derive(Debug, Clone)]
+pub struct StudioSegmentVoiceOverride {
+    pub model_id: Option<String>,
+    pub voice_mode: StudioProjectVoiceMode,
+    pub speaker: Option<String>,
+    pub saved_voice_id: Option<String>,
+}
+
+/// A mutation's result plus the Studio audio it no longer references,
+/// which the caller deletes.
+#[derive(Debug, Clone)]
+pub struct StudioProjectChange {
+    pub project: StudioProjectRecord,
+    pub released_speech_record_ids: Vec<String>,
+}
+
+/// One segment the render worker owns until it completes or fails it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StudioRenderClaim {
+    pub job_id: String,
+    pub project_id: String,
+    pub segment_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +292,9 @@ pub struct StudioProjectRecord {
     pub saved_voice_id: Option<String>,
     pub speed: Option<f64>,
     pub segments: Vec<StudioProjectSegmentRecord>,
+    /// The oldest queued or running render job, if any.
+    #[serde(default)]
+    pub active_render_job: Option<StudioProjectRenderJobRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,17 +358,6 @@ pub struct NewStudioProjectSnapshotRecord {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct NewStudioProjectRenderJobRecord {
-    pub queued_segment_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct UpdateStudioProjectRenderJobRecord {
-    pub status: Option<StudioProjectRenderJobStatus>,
-    pub error_message: Option<Option<String>>,
-}
-
 #[derive(Clone)]
 pub struct StudioProjectStore {
     db: StoreDatabase,
@@ -337,14 +417,20 @@ impl StudioProjectStore {
             .await?
         };
 
-        let mut projects = rows
+        let mut project_rows = rows
             .iter()
-            .map(map_project_summary_row)
+            .map(map_project_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let has_more = projects.len() > page_size;
+        let has_more = project_rows.len() > page_size;
         if has_more {
-            projects.truncate(page_size);
+            project_rows.truncate(page_size);
+        }
+
+        let mut projects = Vec::with_capacity(project_rows.len());
+        for mut project in project_rows {
+            load_project_segments(db, &mut project).await?;
+            projects.push(project_summary(&project));
         }
 
         let next_cursor = if has_more {
@@ -542,161 +628,86 @@ impl StudioProjectStore {
         fetch_project(db, &project_id).await
     }
 
-    pub async fn update_segment_text(
+    /// Change a segment's text, its voice override (`Some(None)` returns it
+    /// to the project voice), or both. Its audio stays; the fingerprint
+    /// shows it as stale.
+    pub async fn update_segment(
         &self,
         project_id: String,
         segment_id: String,
-        text: String,
+        text: Option<String>,
+        voice: Option<Option<StudioSegmentVoiceOverride>>,
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
             .await
-            .context("Failed to start Studio segment text transaction")?;
+            .context("Failed to start Studio segment update transaction")?;
         let now = now_unix_millis_i64();
 
-        let updated = execute(
-            &tx,
-            r#"
-            UPDATE studio_project_segments
-            SET
-                text = ?3,
-                speech_record_id = NULL,
-                updated_at = ?4
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![
-                project_id.clone().into(),
-                segment_id.into(),
-                text.into(),
-                now.into(),
-            ],
-            "Failed to update Studio segment text",
-        )
-        .await?;
-
-        if updated == 0 {
+        if !segment_exists(&tx, &project_id, &segment_id).await? {
             return Ok(None);
         }
-
-        sync_project_source_text(&tx, &project_id).await?;
-        touch_project(&tx, &project_id, now).await?;
-        tx.commit()
-            .await
-            .context("Failed to commit Studio segment text transaction")?;
-        fetch_project(db, &project_id).await
-    }
-
-    pub async fn update_segment_settings(
-        &self,
-        project_id: String,
-        segment_id: String,
-        model_id: String,
-        voice_mode: StudioProjectVoiceMode,
-        speaker: Option<String>,
-        saved_voice_id: Option<String>,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
-        let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(write_transaction_options())
-            .await
-            .context("Failed to start Studio segment settings transaction")?;
-        let now = now_unix_millis_i64();
-
-        let updated = execute(
-            &tx,
-            r#"
-            UPDATE studio_project_segments
-            SET
-                model_id = ?3,
-                voice_mode = ?4,
-                speaker = ?5,
-                saved_voice_id = ?6,
-                speech_record_id = NULL,
-                updated_at = ?7
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![
-                project_id.clone().into(),
-                segment_id.into(),
-                model_id.into(),
-                voice_mode.as_db_value().into(),
-                speaker.into(),
-                saved_voice_id.into(),
-                now.into(),
-            ],
-            "Failed to update Studio segment settings",
-        )
-        .await?;
-
-        if updated == 0 {
-            return Ok(None);
+        if let Some(text) = text {
+            execute(
+                &tx,
+                format!(
+                    "UPDATE studio_project_segments SET text = ?3, updated_at = ?4, {CLEAR_RENDER_FAILURE} WHERE project_id = ?1 AND id = ?2"
+                ),
+                vec![
+                    project_id.clone().into(),
+                    segment_id.clone().into(),
+                    text.into(),
+                    now.into(),
+                ],
+                "Failed to update Studio segment text",
+            )
+            .await?;
+            sync_project_source_text(&tx, &project_id).await?;
+        }
+        if let Some(voice) = voice {
+            let (model_id, voice_mode, speaker, saved_voice_id) = match voice {
+                Some(voice) => (
+                    voice.model_id,
+                    Some(voice.voice_mode.as_db_value()),
+                    voice.speaker,
+                    voice.saved_voice_id,
+                ),
+                None => (None, None, None, None),
+            };
+            execute(
+                &tx,
+                format!(
+                    r#"
+                    UPDATE studio_project_segments
+                    SET model_id = ?3, voice_mode = ?4, speaker = ?5, saved_voice_id = ?6,
+                        updated_at = ?7, {CLEAR_RENDER_FAILURE}
+                    WHERE project_id = ?1 AND id = ?2
+                    "#
+                ),
+                vec![
+                    project_id.clone().into(),
+                    segment_id.into(),
+                    model_id.into(),
+                    voice_mode.into(),
+                    speaker.into(),
+                    saved_voice_id.into(),
+                    now.into(),
+                ],
+                "Failed to update Studio segment voice",
+            )
+            .await?;
         }
 
         touch_project(&tx, &project_id, now).await?;
         tx.commit()
             .await
-            .context("Failed to commit Studio segment settings transaction")?;
+            .context("Failed to commit Studio segment update transaction")?;
         fetch_project(db, &project_id).await
     }
 
-    pub async fn update_segment_text_and_settings(
-        &self,
-        project_id: String,
-        segment_id: String,
-        text: String,
-        model_id: String,
-        voice_mode: StudioProjectVoiceMode,
-        speaker: Option<String>,
-        saved_voice_id: Option<String>,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
-        let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(write_transaction_options())
-            .await
-            .context("Failed to start Studio segment text/settings transaction")?;
-        let now = now_unix_millis_i64();
-
-        let updated = execute(
-            &tx,
-            r#"
-            UPDATE studio_project_segments
-            SET
-                text = ?3,
-                model_id = ?4,
-                voice_mode = ?5,
-                speaker = ?6,
-                saved_voice_id = ?7,
-                speech_record_id = NULL,
-                updated_at = ?8
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![
-                project_id.clone().into(),
-                segment_id.into(),
-                text.into(),
-                model_id.into(),
-                voice_mode.as_db_value().into(),
-                speaker.into(),
-                saved_voice_id.into(),
-                now.into(),
-            ],
-            "Failed to update Studio segment text/settings",
-        )
-        .await?;
-
-        if updated == 0 {
-            return Ok(None);
-        }
-
-        sync_project_source_text(&tx, &project_id).await?;
-        touch_project(&tx, &project_id, now).await?;
-        tx.commit()
-            .await
-            .context("Failed to commit Studio segment text/settings transaction")?;
-        fetch_project(db, &project_id).await
-    }
-
+    /// Add a segment after `after_segment_id`, or at the end. It renders
+    /// with the project voice.
     pub async fn insert_segment(
         &self,
         project_id: String,
@@ -710,122 +721,27 @@ impl StudioProjectStore {
             .context("Failed to start Studio segment insert transaction")?;
         let now = now_unix_millis_i64();
 
-        let project_state = query_one(
-            &tx,
-            r#"
-            SELECT
-                model_id,
-                voice_mode,
-                speaker,
-                saved_voice_id
-            FROM studio_projects
-            WHERE id = ?1
-            "#,
-            vec![project_id.clone().into()],
-            "Failed to load Studio project segment defaults",
-        )
-        .await?
-        .map(|row| {
-            let voice_mode_raw: String = row.try_get_by_index(1)?;
-            Ok::<_, anyhow::Error>((
-                row.try_get_by_index::<Option<String>>(0)?,
-                StudioProjectVoiceMode::from_db_value(voice_mode_raw.as_str())
-                    .unwrap_or(StudioProjectVoiceMode::BuiltIn),
-                row.try_get_by_index::<Option<String>>(2)?,
-                row.try_get_by_index::<Option<String>>(3)?,
-            ))
-        })
-        .transpose()?;
-
-        let Some((project_model_id, project_voice_mode, project_speaker, project_saved_voice_id)) =
-            project_state
-        else {
+        if !project_exists(&tx, &project_id).await? {
             return Ok(None);
-        };
-
-        let (
-            insert_position,
-            inherited_model_id,
-            inherited_voice_mode,
-            inherited_speaker,
-            inherited_saved_voice_id,
-        ): (
-            i64,
-            Option<String>,
-            StudioProjectVoiceMode,
-            Option<String>,
-            Option<String>,
-        ) = if let Some(anchor_segment_id) = after_segment_id {
-            let anchor_state = query_one(
+        }
+        let insert_position: i64 = if let Some(anchor_segment_id) = after_segment_id {
+            let anchor_position = query_one(
                 &tx,
-                r#"
-                SELECT
-                    position,
-                    model_id,
-                    voice_mode,
-                    speaker,
-                    saved_voice_id
-                FROM studio_project_segments
-                WHERE project_id = ?1 AND id = ?2
-                "#,
+                "SELECT position FROM studio_project_segments WHERE project_id = ?1 AND id = ?2",
                 vec![project_id.clone().into(), anchor_segment_id.into()],
                 "Failed to load Studio segment insert anchor",
             )
             .await?
-            .map(|row| {
-                let voice_mode_raw: Option<String> = row.try_get_by_index(2)?;
-                Ok::<_, anyhow::Error>((
-                    row.try_get_by_index::<i64>(0)?,
-                    row.try_get_by_index::<Option<String>>(1)?,
-                    voice_mode_raw
-                        .as_deref()
-                        .and_then(StudioProjectVoiceMode::from_db_value),
-                    row.try_get_by_index::<Option<String>>(3)?,
-                    row.try_get_by_index::<Option<String>>(4)?,
-                ))
-            })
+            .map(|row| row.try_get_by_index::<i64>(0))
             .transpose()?;
-
-            let Some((
-                anchor_position,
-                anchor_model_id,
-                anchor_voice_mode,
-                anchor_speaker,
-                anchor_saved_voice_id,
-            )) = anchor_state
-            else {
+            let Some(anchor_position) = anchor_position else {
                 return Ok(None);
             };
-
-            let resolved_voice_mode = anchor_voice_mode.unwrap_or(project_voice_mode);
-            let resolved_speaker = match resolved_voice_mode {
-                StudioProjectVoiceMode::BuiltIn => {
-                    anchor_speaker.or_else(|| project_speaker.clone())
-                }
-                StudioProjectVoiceMode::Saved => None,
-            };
-            let resolved_saved_voice_id = match resolved_voice_mode {
-                StudioProjectVoiceMode::BuiltIn => None,
-                StudioProjectVoiceMode::Saved => {
-                    anchor_saved_voice_id.or_else(|| project_saved_voice_id.clone())
-                }
-            };
-
-            (
-                anchor_position + 1,
-                anchor_model_id.or_else(|| project_model_id.clone()),
-                resolved_voice_mode,
-                resolved_speaker,
-                resolved_saved_voice_id,
-            )
+            anchor_position + 1
         } else {
-            let tail_position: i64 = query_one(
+            query_one(
                 &tx,
-                r#"
-                SELECT MAX(position)
-                FROM studio_project_segments
-                WHERE project_id = ?1
-                "#,
+                "SELECT MAX(position) FROM studio_project_segments WHERE project_id = ?1",
                 vec![project_id.clone().into()],
                 "Failed to load Studio segment tail position",
             )
@@ -834,23 +750,7 @@ impl StudioProjectStore {
             .transpose()?
             .flatten()
             .map(|value| value + 1)
-            .unwrap_or(0);
-            let resolved_speaker = match project_voice_mode {
-                StudioProjectVoiceMode::BuiltIn => project_speaker.clone(),
-                StudioProjectVoiceMode::Saved => None,
-            };
-            let resolved_saved_voice_id = match project_voice_mode {
-                StudioProjectVoiceMode::BuiltIn => None,
-                StudioProjectVoiceMode::Saved => project_saved_voice_id.clone(),
-            };
-
-            (
-                tail_position,
-                project_model_id,
-                project_voice_mode,
-                resolved_speaker,
-                resolved_saved_voice_id,
-            )
+            .unwrap_or(0)
         };
 
         execute(
@@ -873,23 +773,14 @@ impl StudioProjectStore {
                 project_id,
                 position,
                 text,
-                model_id,
-                voice_mode,
-                speaker,
-                saved_voice_id,
-                speech_record_id,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
             vec![
                 new_uuid().into(),
                 project_id.clone().into(),
                 insert_position.into(),
                 text.into(),
-                inherited_model_id.into(),
-                inherited_voice_mode.as_db_value().into(),
-                inherited_speaker.into(),
-                inherited_saved_voice_id.into(),
                 now.into(),
             ],
             "Failed to insert Studio segment",
@@ -970,8 +861,9 @@ impl StudioProjectStore {
             UPDATE studio_project_segments
             SET
                 text = ?3,
-                speech_record_id = NULL,
-                updated_at = ?4
+                updated_at = ?4,
+                render_status = CASE WHEN render_status = 'failed' THEN NULL ELSE render_status END,
+                render_error = NULL
             WHERE project_id = ?1 AND id = ?2
             "#,
             vec![
@@ -1027,7 +919,7 @@ impl StudioProjectStore {
         &self,
         project_id: String,
         segment_id: String,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
+    ) -> anyhow::Result<Option<StudioProjectChange>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
@@ -1035,10 +927,10 @@ impl StudioProjectStore {
             .context("Failed to start Studio segment delete transaction")?;
         let now = now_unix_millis_i64();
 
-        let position = query_one(
+        let segment = query_one(
             &tx,
             r#"
-            SELECT position
+            SELECT position, speech_record_id
             FROM studio_project_segments
             WHERE project_id = ?1 AND id = ?2
             "#,
@@ -1046,12 +938,30 @@ impl StudioProjectStore {
             "Failed to load Studio segment position for delete",
         )
         .await?
-        .map(|row| row.try_get_by_index::<i64>(0))
+        .map(|row| {
+            Ok::<_, anyhow::Error>((
+                row.try_get_by_index::<i64>(0)?,
+                row.try_get_by_index::<Option<String>>(1)?,
+            ))
+        })
         .transpose()?;
 
-        let Some(position) = position else {
+        let Some((position, speech_record_id)) = segment else {
             return Ok(None);
         };
+        let remaining = query_one(
+            &tx,
+            "SELECT COUNT(*) FROM studio_project_segments WHERE project_id = ?1",
+            vec![project_id.clone().into()],
+            "Failed to count Studio segments for delete",
+        )
+        .await?
+        .map(|row| row.try_get_by_index::<i64>(0))
+        .transpose()?
+        .unwrap_or_default();
+        if remaining <= 1 {
+            return Err(StoreError::invalid("A project must keep at least one segment.").into());
+        }
 
         let deleted = execute(
             &tx,
@@ -1085,14 +995,14 @@ impl StudioProjectStore {
         tx.commit()
             .await
             .context("Failed to commit Studio segment delete transaction")?;
-        fetch_project(db, &project_id).await
+        project_change(db, &project_id, speech_record_id.into_iter().collect()).await
     }
 
     pub async fn merge_segment_with_next(
         &self,
         project_id: String,
         segment_id: String,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
+    ) -> anyhow::Result<Option<StudioProjectChange>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
@@ -1126,7 +1036,7 @@ impl StudioProjectStore {
         let next = query_one(
             &tx,
             r#"
-            SELECT id, position, text
+            SELECT id, position, text, speech_record_id
             FROM studio_project_segments
             WHERE project_id = ?1 AND position = ?2
             "#,
@@ -1139,10 +1049,11 @@ impl StudioProjectStore {
                 row.try_get_by_index::<String>(0)?,
                 row.try_get_by_index::<i64>(1)?,
                 row.try_get_by_index::<String>(2)?,
+                row.try_get_by_index::<Option<String>>(3)?,
             ))
         })
         .transpose()?;
-        let Some((next_id, next_position, next_text)) = next else {
+        let Some((next_id, next_position, next_text, next_record_id)) = next else {
             return Ok(None);
         };
 
@@ -1155,8 +1066,9 @@ impl StudioProjectStore {
             UPDATE studio_project_segments
             SET
                 text = ?3,
-                speech_record_id = NULL,
-                updated_at = ?4
+                updated_at = ?4,
+                render_status = CASE WHEN render_status = 'failed' THEN NULL ELSE render_status END,
+                render_error = NULL
             WHERE project_id = ?1 AND id = ?2
             "#,
             vec![
@@ -1197,7 +1109,7 @@ impl StudioProjectStore {
         tx.commit()
             .await
             .context("Failed to commit Studio segment merge transaction")?;
-        fetch_project(db, &project_id).await
+        project_change(db, &project_id, next_record_id.into_iter().collect()).await
     }
 
     pub async fn reorder_segments(
@@ -1253,7 +1165,7 @@ impl StudioProjectStore {
                 &tx,
                 r#"
                 UPDATE studio_project_segments
-                SET position = ?3, updated_at = ?4, speech_record_id = NULL
+                SET position = ?3, updated_at = ?4
                 WHERE project_id = ?1 AND id = ?2
                 "#,
                 vec![
@@ -1279,7 +1191,7 @@ impl StudioProjectStore {
         &self,
         project_id: String,
         segment_ids: Vec<String>,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
+    ) -> anyhow::Result<Option<StudioProjectChange>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
@@ -1288,7 +1200,7 @@ impl StudioProjectStore {
         let rows = query_all(
             &tx,
             r#"
-            SELECT id, position
+            SELECT id, speech_record_id
             FROM studio_project_segments
             WHERE project_id = ?1
             ORDER BY position ASC, id ASC
@@ -1302,7 +1214,7 @@ impl StudioProjectStore {
             .map(|row| {
                 Ok::<_, anyhow::Error>((
                     row.try_get_by_index::<String>(0)?,
-                    row.try_get_by_index::<i64>(1)?,
+                    row.try_get_by_index::<Option<String>>(1)?,
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1315,8 +1227,13 @@ impl StudioProjectStore {
             tx.rollback()
                 .await
                 .context("Failed to roll back empty Studio segment delete transaction")?;
-            return fetch_project(db, &project_id).await;
+            return project_change(db, &project_id, Vec::new()).await;
         }
+        let released = existing
+            .iter()
+            .filter(|(id, _)| remove_set.contains(id))
+            .filter_map(|(_, record_id)| record_id.clone())
+            .collect::<Vec<_>>();
 
         let remaining_count = existing
             .iter()
@@ -1370,58 +1287,27 @@ impl StudioProjectStore {
         tx.commit()
             .await
             .context("Failed to commit Studio segment batch delete transaction")?;
-        fetch_project(db, &project_id).await
+        project_change(db, &project_id, released).await
     }
 
-    pub async fn attach_segment_record(
-        &self,
-        project_id: String,
-        segment_id: String,
-        speech_record_id: String,
-    ) -> anyhow::Result<Option<StudioProjectRecord>> {
-        let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(write_transaction_options())
-            .await
-            .context("Failed to start Studio segment attach transaction")?;
-        let now = now_unix_millis_i64();
-
-        let updated = execute(
-            &tx,
-            r#"
-            UPDATE studio_project_segments
-            SET
-                speech_record_id = ?3,
-                updated_at = ?4
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![
-                project_id.clone().into(),
-                segment_id.into(),
-                speech_record_id.into(),
-                now.into(),
-            ],
-            "Failed to attach speech record to Studio segment",
-        )
-        .await?;
-
-        if updated == 0 {
-            return Ok(None);
-        }
-
-        touch_project(&tx, &project_id, now).await?;
-        tx.commit()
-            .await
-            .context("Failed to commit Studio segment attach transaction")?;
-        fetch_project(db, &project_id).await
-    }
-
-    pub async fn delete_project(&self, project_id: String) -> anyhow::Result<bool> {
+    /// Delete a project. Returns the Studio audio it referenced, or `None`
+    /// when there was no such project.
+    pub async fn delete_project(&self, project_id: String) -> anyhow::Result<Option<Vec<String>>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project delete transaction")?;
+        let released = query_all(
+            &tx,
+            "SELECT speech_record_id FROM studio_project_segments WHERE project_id = ?1 AND speech_record_id IS NOT NULL",
+            vec![project_id.clone().into()],
+            "Failed to list Studio project audio for delete",
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(0).map_err(Into::into))
+        .collect::<anyhow::Result<Vec<_>>>()?;
         execute(
             &tx,
             "DELETE FROM studio_project_segments WHERE project_id = ?1",
@@ -1439,7 +1325,7 @@ impl StudioProjectStore {
         tx.commit()
             .await
             .context("Failed to commit Studio project delete transaction")?;
-        Ok(deleted > 0)
+        Ok((deleted > 0).then_some(released))
     }
 
     pub async fn list_folders(&self) -> anyhow::Result<Vec<StudioProjectFolderRecord>> {
@@ -1633,19 +1519,7 @@ impl StudioProjectStore {
         project_id: String,
     ) -> anyhow::Result<Vec<StudioProjectPronunciationRecord>> {
         let db = self.db.connection().await?;
-        let rows = query_all(
-            db,
-            r#"
-            SELECT id, project_id, source_text, replacement_text, locale, created_at, updated_at
-            FROM studio_project_pronunciations
-            WHERE project_id = ?1
-            ORDER BY updated_at DESC, id DESC
-            "#,
-            vec![project_id.into()],
-            "Failed to list Studio project pronunciations",
-        )
-        .await?;
-        rows.iter().map(map_pronunciation_row).collect()
+        fetch_pronunciations(db, &project_id).await
     }
 
     pub async fn create_project_pronunciation(
@@ -1881,20 +1755,59 @@ impl StudioProjectStore {
         rows.iter().map(map_render_job_row).collect()
     }
 
-    pub async fn create_project_render_job(
+    /// Queue segments for the render worker: `segment_ids`, or every
+    /// segment whose audio is missing, stale or failed. Segments already
+    /// queued or rendering are left where they are.
+    pub async fn enqueue_render(
         &self,
         project_id: String,
-        record: NewStudioProjectRenderJobRecord,
+        segment_ids: Option<Vec<String>>,
     ) -> anyhow::Result<Option<StudioProjectRenderJobRecord>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
             .await
-            .context("Failed to start Studio project render job transaction")?;
-        let exists = project_exists(&tx, &project_id).await?;
-        if !exists {
+            .context("Failed to start Studio render enqueue transaction")?;
+        let Some(project) = fetch_project(&tx, &project_id).await? else {
             return Ok(None);
+        };
+
+        let queued = match segment_ids {
+            Some(requested) => {
+                let requested = requested.into_iter().collect::<HashSet<_>>();
+                let known = project
+                    .segments
+                    .iter()
+                    .filter(|segment| requested.contains(&segment.id))
+                    .count();
+                if known != requested.len() {
+                    return Err(StoreError::invalid(
+                        "Render requests can only name segments of this project.",
+                    )
+                    .into());
+                }
+                project
+                    .segments
+                    .iter()
+                    .filter(|segment| requested.contains(&segment.id))
+                    .filter(|segment| !segment.render_state.is_pending())
+                    .map(|segment| segment.id.clone())
+                    .collect::<Vec<_>>()
+            }
+            None => project
+                .segments
+                .iter()
+                .filter(|segment| segment.render_state.needs_render())
+                .map(|segment| segment.id.clone())
+                .collect::<Vec<_>>(),
+        };
+        if queued.is_empty() {
+            return Err(StoreError::invalid(
+                "Nothing to render: those paragraphs are current or already queued.",
+            )
+            .into());
         }
+
         let now = now_unix_millis_i64();
         let job_id = new_uuid();
         execute(
@@ -1916,150 +1829,547 @@ impl StudioProjectStore {
                 now.into(),
                 now.into(),
                 StudioProjectRenderJobStatus::Queued.as_db_value().into(),
-                encode_json_string_vec(record.queued_segment_ids.as_slice()).into(),
+                encode_json_string_vec(queued.as_slice()).into(),
             ],
             "Failed to create Studio project render job",
         )
         .await?;
-
+        for segment_id in &queued {
+            execute(
+                &tx,
+                "UPDATE studio_project_segments SET render_status = ?3, render_error = NULL WHERE project_id = ?1 AND id = ?2",
+                vec![
+                    project_id.clone().into(),
+                    segment_id.clone().into(),
+                    RENDER_STATUS_QUEUED.into(),
+                ],
+                "Failed to queue Studio segment",
+            )
+            .await?;
+        }
         upsert_last_render_job(&tx, &project_id, &job_id, None).await?;
 
         tx.commit()
             .await
-            .context("Failed to commit Studio project render job transaction")?;
+            .context("Failed to commit Studio render enqueue transaction")?;
         fetch_render_job(db, &project_id, &job_id).await
     }
 
-    pub async fn update_project_render_job(
+    /// Hand the oldest job's next queued segment to the render worker, and
+    /// finish jobs that have nothing left.
+    pub async fn claim_next_render(&self) -> anyhow::Result<Option<StudioRenderClaim>> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start Studio render claim transaction")?;
+        let jobs = query_all(
+            &tx,
+            r#"
+            SELECT id, project_id, queued_segment_ids_json
+            FROM studio_project_render_jobs
+            WHERE status IN ('queued', 'running')
+            ORDER BY created_at ASC, id ASC
+            "#,
+            vec![],
+            "Failed to list active Studio render jobs",
+        )
+        .await?;
+
+        let now = now_unix_millis_i64();
+        for row in jobs {
+            let job_id: String = row.try_get_by_index(0)?;
+            let project_id: String = row.try_get_by_index(1)?;
+            let job_segment_ids = parse_json_string_vec(row.try_get_by_index(2)?);
+            let statuses = segment_render_statuses(&tx, &project_id).await?;
+            let status_of = |id: &String| statuses.get(id).and_then(|status| status.as_deref());
+
+            if let Some(segment_id) = job_segment_ids
+                .iter()
+                .find(|id| status_of(id) == Some(RENDER_STATUS_QUEUED))
+            {
+                execute(
+                    &tx,
+                    "UPDATE studio_project_segments SET render_status = ?3 WHERE project_id = ?1 AND id = ?2",
+                    vec![
+                        project_id.clone().into(),
+                        segment_id.clone().into(),
+                        RENDER_STATUS_RENDERING.into(),
+                    ],
+                    "Failed to start Studio segment render",
+                )
+                .await?;
+                execute(
+                    &tx,
+                    "UPDATE studio_project_render_jobs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                    vec![
+                        job_id.clone().into(),
+                        StudioProjectRenderJobStatus::Running.as_db_value().into(),
+                        now.into(),
+                    ],
+                    "Failed to start Studio render job",
+                )
+                .await?;
+                tx.commit()
+                    .await
+                    .context("Failed to commit Studio render claim transaction")?;
+                return Ok(Some(StudioRenderClaim {
+                    job_id,
+                    project_id,
+                    segment_id: segment_id.clone(),
+                }));
+            }
+            if job_segment_ids
+                .iter()
+                .any(|id| status_of(id) == Some(RENDER_STATUS_RENDERING))
+            {
+                continue;
+            }
+            finish_render_job(&tx, &project_id, &job_id, &job_segment_ids, now).await?;
+        }
+
+        tx.commit()
+            .await
+            .context("Failed to commit Studio render claim transaction")?;
+        Ok(None)
+    }
+
+    /// Attach a finished render. Returns the Studio audio nothing references
+    /// any more: the segment's previous take, or this one when the segment
+    /// was deleted while it rendered.
+    pub async fn complete_render(
+        &self,
+        claim: &StudioRenderClaim,
+        speech_record_id: String,
+        render_fingerprint: String,
+    ) -> anyhow::Result<Vec<String>> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start Studio render completion transaction")?;
+        let previous = query_one(
+            &tx,
+            "SELECT speech_record_id FROM studio_project_segments WHERE project_id = ?1 AND id = ?2",
+            vec![
+                claim.project_id.clone().into(),
+                claim.segment_id.clone().into(),
+            ],
+            "Failed to load Studio segment for render completion",
+        )
+        .await?
+        .map(|row| row.try_get_by_index::<Option<String>>(0))
+        .transpose()?;
+        let Some(previous) = previous else {
+            tx.commit()
+                .await
+                .context("Failed to commit Studio render completion transaction")?;
+            return Ok(vec![speech_record_id]);
+        };
+
+        let now = now_unix_millis_i64();
+        execute(
+            &tx,
+            r#"
+            UPDATE studio_project_segments
+            SET
+                speech_record_id = ?3,
+                render_fingerprint = ?4,
+                render_status = NULL,
+                render_error = NULL,
+                updated_at = ?5
+            WHERE project_id = ?1 AND id = ?2
+            "#,
+            vec![
+                claim.project_id.clone().into(),
+                claim.segment_id.clone().into(),
+                speech_record_id.clone().into(),
+                render_fingerprint.into(),
+                now.into(),
+            ],
+            "Failed to attach Studio segment render",
+        )
+        .await?;
+        touch_project(&tx, &claim.project_id, now).await?;
+        tx.commit()
+            .await
+            .context("Failed to commit Studio render completion transaction")?;
+        Ok(previous
+            .filter(|previous| *previous != speech_record_id)
+            .into_iter()
+            .collect())
+    }
+
+    /// Record why a claimed segment did not render.
+    pub async fn fail_render(&self, claim: &StudioRenderClaim, error: &str) -> anyhow::Result<()> {
+        let db = self.db.connection().await?;
+        execute(
+            db,
+            "UPDATE studio_project_segments SET render_status = ?3, render_error = ?4 WHERE project_id = ?1 AND id = ?2 AND render_status = ?5",
+            vec![
+                claim.project_id.clone().into(),
+                claim.segment_id.clone().into(),
+                RENDER_STATUS_FAILED.into(),
+                error.into(),
+                RENDER_STATUS_RENDERING.into(),
+            ],
+            "Failed to record Studio segment render failure",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Fail every segment still queued in a job, for errors no retry inside
+    /// the job can fix (the model isn't on this device).
+    pub async fn fail_queued_in_job(
+        &self,
+        claim: &StudioRenderClaim,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let db = self.db.connection().await?;
+        let Some(job) = fetch_render_job(db, &claim.project_id, &claim.job_id).await? else {
+            return Ok(());
+        };
+        for segment_id in job.queued_segment_ids {
+            execute(
+                db,
+                "UPDATE studio_project_segments SET render_status = ?3, render_error = ?4 WHERE project_id = ?1 AND id = ?2 AND render_status = ?5",
+                vec![
+                    claim.project_id.clone().into(),
+                    segment_id.into(),
+                    RENDER_STATUS_FAILED.into(),
+                    error.into(),
+                    RENDER_STATUS_QUEUED.into(),
+                ],
+                "Failed to record Studio job render failure",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Stop a job: its queued segments leave the queue; a segment already
+    /// rendering finishes.
+    pub async fn cancel_render_job(
         &self,
         project_id: String,
         job_id: String,
-        update: UpdateStudioProjectRenderJobRecord,
     ) -> anyhow::Result<Option<StudioProjectRenderJobRecord>> {
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
             .await
-            .context("Failed to start Studio project render job update transaction")?;
-        let current = query_one(
-            &tx,
-            r#"
-            SELECT status, error_message
-            FROM studio_project_render_jobs
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![project_id.clone().into(), job_id.clone().into()],
-            "Failed to load Studio project render job for update",
-        )
-        .await?
-        .map(|row| {
-            Ok::<_, anyhow::Error>((
-                row.try_get_by_index::<String>(0)?,
-                row.try_get_by_index::<Option<String>>(1)?,
-            ))
-        })
-        .transpose()?;
-        let Some((current_status, current_error)) = current else {
+            .context("Failed to start Studio render cancel transaction")?;
+        let Some(job) = fetch_render_job(&tx, &project_id, &job_id).await? else {
             return Ok(None);
         };
+        if matches!(
+            job.status,
+            StudioProjectRenderJobStatus::Queued | StudioProjectRenderJobStatus::Running
+        ) {
+            for segment_id in &job.queued_segment_ids {
+                execute(
+                    &tx,
+                    "UPDATE studio_project_segments SET render_status = NULL WHERE project_id = ?1 AND id = ?2 AND render_status = ?3",
+                    vec![
+                        project_id.clone().into(),
+                        segment_id.clone().into(),
+                        RENDER_STATUS_QUEUED.into(),
+                    ],
+                    "Failed to unqueue Studio segment",
+                )
+                .await?;
+            }
+            execute(
+                &tx,
+                "UPDATE studio_project_render_jobs SET status = ?3, updated_at = ?4 WHERE project_id = ?1 AND id = ?2",
+                vec![
+                    project_id.clone().into(),
+                    job_id.clone().into(),
+                    StudioProjectRenderJobStatus::Cancelled.as_db_value().into(),
+                    now_unix_millis_i64().into(),
+                ],
+                "Failed to cancel Studio render job",
+            )
+            .await?;
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit Studio render cancel transaction")?;
+        fetch_render_job(db, &project_id, &job_id).await
+    }
 
-        let next_status = update
-            .status
-            .or_else(|| StudioProjectRenderJobStatus::from_db_value(current_status.as_str()))
-            .unwrap_or(StudioProjectRenderJobStatus::Queued);
-        let next_error = update.error_message.unwrap_or(current_error);
-        let now = now_unix_millis_i64();
-        execute(
+    /// A render interrupted by a restart goes back to the queue, if its
+    /// job is still active; otherwise (its job was cancelled meanwhile) it
+    /// leaves the queue.
+    pub async fn requeue_interrupted_renders(&self) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start Studio render recovery transaction")?;
+        let requeued = execute(
             &tx,
-            r#"
-            UPDATE studio_project_render_jobs
-            SET updated_at = ?3, status = ?4, error_message = ?5
-            WHERE project_id = ?1 AND id = ?2
-            "#,
-            vec![
-                project_id.clone().into(),
-                job_id.clone().into(),
-                now.into(),
-                next_status.as_db_value().into(),
-                next_error.into(),
-            ],
-            "Failed to update Studio project render job",
+            "UPDATE studio_project_segments SET render_status = ?1 WHERE render_status = ?2",
+            vec![RENDER_STATUS_QUEUED.into(), RENDER_STATUS_RENDERING.into()],
+            "Failed to requeue interrupted Studio renders",
         )
         .await?;
 
-        if next_status == StudioProjectRenderJobStatus::Completed {
-            upsert_last_render_job(&tx, &project_id, &job_id, Some(now)).await?;
+        let mut in_active_jobs = HashSet::new();
+        for row in query_all(
+            &tx,
+            "SELECT queued_segment_ids_json FROM studio_project_render_jobs WHERE status IN ('queued', 'running')",
+            vec![],
+            "Failed to list active Studio render jobs",
+        )
+        .await?
+        {
+            in_active_jobs.extend(parse_json_string_vec(row.try_get_by_index(0)?));
         }
-
+        let queued = query_all(
+            &tx,
+            "SELECT id FROM studio_project_segments WHERE render_status = ?1",
+            vec![RENDER_STATUS_QUEUED.into()],
+            "Failed to list queued Studio segments",
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(0).map_err(Into::into))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+        for segment_id in queued.into_iter().filter(|id| !in_active_jobs.contains(id)) {
+            execute(
+                &tx,
+                "UPDATE studio_project_segments SET render_status = NULL WHERE id = ?1",
+                vec![segment_id.into()],
+                "Failed to unqueue orphaned Studio segment",
+            )
+            .await?;
+        }
         tx.commit()
             .await
-            .context("Failed to commit Studio project render job update transaction")?;
-        fetch_render_job(db, &project_id, &job_id).await
+            .context("Failed to commit Studio render recovery transaction")?;
+        Ok(requeued)
+    }
+
+    /// Record what audio rendered before fingerprints existed was rendered
+    /// from, taking the project's current settings as the answer. Runs once
+    /// per database in practice: every render stamps its own.
+    pub async fn stamp_unfingerprinted_renders(&self) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let project_ids = query_all(
+            db,
+            "SELECT DISTINCT project_id FROM studio_project_segments WHERE speech_record_id IS NOT NULL AND render_fingerprint IS NULL",
+            vec![],
+            "Failed to list Studio projects without render fingerprints",
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(0).map_err(Into::into))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut stamped = 0;
+        for project_id in project_ids {
+            let tx = db
+                .begin_with_options(write_transaction_options())
+                .await
+                .context("Failed to start Studio fingerprint transaction")?;
+            let Some(project) = fetch_project(&tx, &project_id).await? else {
+                continue;
+            };
+            let pronunciations = fetch_pronunciations(&tx, &project_id).await?;
+            for segment in project.segments.iter().filter(|segment| {
+                segment.speech_record_id.is_some() && segment.render_fingerprint.is_none()
+            }) {
+                let fingerprint = segment_render_fingerprint(&project, segment, &pronunciations);
+                stamped += execute(
+                    &tx,
+                    "UPDATE studio_project_segments SET render_fingerprint = ?3 WHERE project_id = ?1 AND id = ?2",
+                    vec![
+                        project_id.clone().into(),
+                        segment.id.clone().into(),
+                        fingerprint.into(),
+                    ],
+                    "Failed to stamp Studio render fingerprint",
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("Failed to commit Studio fingerprint transaction")?;
+        }
+        Ok(stamped)
     }
 }
 
+/// The settings a segment renders with: its override, else the project's.
+pub fn resolve_segment_render_settings(
+    project: &StudioProjectRecord,
+    segment: &StudioProjectSegmentRecord,
+) -> StudioRenderSettings {
+    let voice_mode = segment.voice_mode.unwrap_or(project.voice_mode);
+    let speaker = match voice_mode {
+        StudioProjectVoiceMode::BuiltIn => {
+            segment.speaker.clone().or_else(|| project.speaker.clone())
+        }
+        StudioProjectVoiceMode::Saved => None,
+    };
+    let saved_voice_id = match voice_mode {
+        StudioProjectVoiceMode::BuiltIn => None,
+        StudioProjectVoiceMode::Saved => segment
+            .saved_voice_id
+            .clone()
+            .or_else(|| project.saved_voice_id.clone()),
+    };
+    StudioRenderSettings {
+        model_id: segment
+            .model_id
+            .clone()
+            .or_else(|| project.model_id.clone()),
+        voice_mode,
+        speaker,
+        saved_voice_id,
+        speed: project.speed,
+    }
+}
+
+/// Apply pronunciation rules in one pass: whole words, any letter case,
+/// longest rule first, and a replacement is never matched again.
+pub fn apply_pronunciations(text: &str, rules: &[StudioProjectPronunciationRecord]) -> String {
+    let mut rules = rules
+        .iter()
+        .filter(|rule| !rule.source_text.trim().is_empty())
+        .map(|rule| {
+            (
+                rule.source_text.trim().chars().collect::<Vec<_>>(),
+                rule.replacement_text.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return text.to_string();
+    }
+    rules.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    'scan: while index < chars.len() {
+        for (source, replacement) in &rules {
+            if matches_whole_word(&chars, index, source) {
+                output.push_str(replacement);
+                index += source.len();
+                continue 'scan;
+            }
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
+}
+
+fn matches_whole_word(text: &[char], start: usize, word: &[char]) -> bool {
+    let end = start + word.len();
+    if end > text.len() {
+        return false;
+    }
+    let same = text[start..end]
+        .iter()
+        .zip(word)
+        .all(|(left, right)| left.to_lowercase().eq(right.to_lowercase()));
+    if !same {
+        return false;
+    }
+    // A boundary only matters next to a word character of the rule itself,
+    // so rules such as "C++" or "e.g." still match.
+    let starts_clean =
+        !word[0].is_alphanumeric() || start == 0 || !text[start - 1].is_alphanumeric();
+    let ends_clean = !word[word.len() - 1].is_alphanumeric()
+        || end == text.len()
+        || !text[end].is_alphanumeric();
+    starts_clean && ends_clean
+}
+
+/// What a render of this text with these settings depends on.
+pub fn render_fingerprint(text: &str, settings: &StudioRenderSettings) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [
+        "studio-render-v1",
+        settings.model_id.as_deref().unwrap_or_default(),
+        settings.voice_mode.as_db_value(),
+        settings.speaker.as_deref().unwrap_or_default(),
+        settings.saved_voice_id.as_deref().unwrap_or_default(),
+        &format!("{:.3}", settings.speed.unwrap_or(1.0)),
+        text,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The text a segment sends to the model and the fingerprint of rendering
+/// it now.
+pub fn segment_render_input(
+    project: &StudioProjectRecord,
+    segment: &StudioProjectSegmentRecord,
+    pronunciations: &[StudioProjectPronunciationRecord],
+) -> (String, StudioRenderSettings, String) {
+    let settings = resolve_segment_render_settings(project, segment);
+    let text = apply_pronunciations(&segment.text, pronunciations);
+    let fingerprint = render_fingerprint(&text, &settings);
+    (text, settings, fingerprint)
+}
+
+fn segment_render_fingerprint(
+    project: &StudioProjectRecord,
+    segment: &StudioProjectSegmentRecord,
+    pronunciations: &[StudioProjectPronunciationRecord],
+) -> String {
+    segment_render_input(project, segment, pronunciations).2
+}
+
+// The list reads only the columns a summary needs: no source text.
 const STUDIO_PROJECT_PAGE_SQL: &str = r#"
     SELECT
-        p.id,
-        p.created_at,
-        p.updated_at,
-        p.name,
-        p.source_filename,
-        p.model_id,
-        p.voice_mode,
-        p.speaker,
-        p.saved_voice_id,
-        p.speed,
-        COUNT(s.id) AS segment_count,
-        COALESCE(SUM(CASE WHEN s.speech_record_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS rendered_segment_count,
-        COALESCE(SUM(LENGTH(s.text)), 0) AS total_chars
-    FROM studio_projects p
-    LEFT JOIN studio_project_segments s ON s.project_id = p.id
-    GROUP BY
-        p.id,
-        p.created_at,
-        p.updated_at,
-        p.name,
-        p.source_filename,
-        p.model_id,
-        p.voice_mode,
-        p.speaker,
-        p.saved_voice_id,
-        p.speed
-    ORDER BY p.updated_at DESC, p.id DESC
+        id,
+        created_at,
+        updated_at,
+        name,
+        source_filename,
+        '' AS source_text,
+        model_id,
+        voice_mode,
+        speaker,
+        saved_voice_id,
+        speed
+    FROM studio_projects
+    ORDER BY updated_at DESC, id DESC
     LIMIT ?1
 "#;
 
 const STUDIO_PROJECT_PAGE_AFTER_CURSOR_SQL: &str = r#"
     SELECT
-        p.id,
-        p.created_at,
-        p.updated_at,
-        p.name,
-        p.source_filename,
-        p.model_id,
-        p.voice_mode,
-        p.speaker,
-        p.saved_voice_id,
-        p.speed,
-        COUNT(s.id) AS segment_count,
-        COALESCE(SUM(CASE WHEN s.speech_record_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS rendered_segment_count,
-        COALESCE(SUM(LENGTH(s.text)), 0) AS total_chars
-    FROM studio_projects p
-    LEFT JOIN studio_project_segments s ON s.project_id = p.id
-    WHERE p.updated_at < ?1 OR (p.updated_at = ?1 AND p.id < ?2)
-    GROUP BY
-        p.id,
-        p.created_at,
-        p.updated_at,
-        p.name,
-        p.source_filename,
-        p.model_id,
-        p.voice_mode,
-        p.speaker,
-        p.saved_voice_id,
-        p.speed
-    ORDER BY p.updated_at DESC, p.id DESC
+        id,
+        created_at,
+        updated_at,
+        name,
+        source_filename,
+        '' AS source_text,
+        model_id,
+        voice_mode,
+        speaker,
+        saved_voice_id,
+        speed
+    FROM studio_projects
+    WHERE updated_at < ?1 OR (updated_at = ?1 AND id < ?2)
+    ORDER BY updated_at DESC, id DESC
     LIMIT ?3
 "#;
 
@@ -2080,6 +2390,8 @@ const STUDIO_PROJECT_BY_ID_SQL: &str = r#"
     WHERE id = ?1
 "#;
 
+// Segment audio is a Studio speech record; projects rendered before Studio
+// had its own route kind point at text-to-speech records.
 const STUDIO_PROJECT_SEGMENTS_SQL: &str = r#"
     SELECT
         s.id,
@@ -2090,17 +2402,27 @@ const STUDIO_PROJECT_SEGMENTS_SQL: &str = r#"
         s.voice_mode,
         s.speaker,
         s.saved_voice_id,
-        s.speech_record_id,
+        CASE WHEN h.id IS NULL THEN NULL ELSE s.speech_record_id END AS speech_record_id,
         s.updated_at,
         h.generation_time_ms,
         h.audio_duration_secs,
-        h.audio_filename
+        h.audio_filename,
+        s.render_fingerprint,
+        s.render_status,
+        s.render_error
     FROM studio_project_segments s
     LEFT JOIN speech_history_records h
         ON h.id = s.speech_record_id
-       AND h.route_kind = 'text_to_speech'
+       AND h.route_kind IN ('studio', 'text_to_speech')
     WHERE s.project_id = ?1
     ORDER BY s.position ASC, s.id ASC
+"#;
+
+const STUDIO_PROJECT_PRONUNCIATIONS_SQL: &str = r#"
+    SELECT id, project_id, source_text, replacement_text, locale, created_at, updated_at
+    FROM studio_project_pronunciations
+    WHERE project_id = ?1
+    ORDER BY updated_at DESC, id DESC
 "#;
 
 const STUDIO_PROJECT_META_SQL: &str = r#"
@@ -2166,6 +2488,21 @@ const STUDIO_PROJECT_RENDER_JOBS_SQL: &str = r#"
     ORDER BY created_at DESC, id DESC
 "#;
 
+const STUDIO_PROJECT_ACTIVE_RENDER_JOB_SQL: &str = r#"
+    SELECT
+        id,
+        project_id,
+        created_at,
+        updated_at,
+        status,
+        error_message,
+        queued_segment_ids_json
+    FROM studio_project_render_jobs
+    WHERE project_id = ?1 AND status IN ('queued', 'running')
+    ORDER BY created_at ASC, id ASC
+    LIMIT 1
+"#;
+
 const STUDIO_PROJECT_RENDER_JOB_BY_ID_SQL: &str = r#"
     SELECT
         id,
@@ -2197,20 +2534,243 @@ where
     let Some(mut project) = project else {
         return Ok(None);
     };
+    load_project_segments(db, &mut project).await?;
+    project.active_render_job = query_one(
+        db,
+        STUDIO_PROJECT_ACTIVE_RENDER_JOB_SQL,
+        vec![project_id.into()],
+        "Failed to load active Studio render job",
+    )
+    .await?
+    .as_ref()
+    .map(map_render_job_row)
+    .transpose()?;
+    Ok(Some(project))
+}
 
+async fn project_change<C>(
+    db: &C,
+    project_id: &str,
+    released_speech_record_ids: Vec<String>,
+) -> anyhow::Result<Option<StudioProjectChange>>
+where
+    C: ConnectionTrait,
+{
+    Ok(fetch_project(db, project_id)
+        .await?
+        .map(|project| StudioProjectChange {
+            project,
+            released_speech_record_ids,
+        }))
+}
+
+async fn segment_exists<C>(db: &C, project_id: &str, segment_id: &str) -> anyhow::Result<bool>
+where
+    C: ConnectionTrait,
+{
+    Ok(query_one(
+        db,
+        "SELECT 1 FROM studio_project_segments WHERE project_id = ?1 AND id = ?2",
+        vec![project_id.into(), segment_id.into()],
+        "Failed to check Studio segment existence",
+    )
+    .await?
+    .is_some())
+}
+
+async fn segment_render_statuses<C>(
+    db: &C,
+    project_id: &str,
+) -> anyhow::Result<HashMap<String, Option<String>>>
+where
+    C: ConnectionTrait,
+{
+    query_all(
+        db,
+        "SELECT id, render_status FROM studio_project_segments WHERE project_id = ?1",
+        vec![project_id.into()],
+        "Failed to load Studio segment render statuses",
+    )
+    .await?
+    .iter()
+    .map(|row| {
+        Ok((
+            row.try_get_by_index::<String>(0)?,
+            row.try_get_by_index::<Option<String>>(1)?,
+        ))
+    })
+    .collect()
+}
+
+/// Close a job whose segments have all left the queue: failed when any of
+/// them failed, with the first failure as its error.
+async fn finish_render_job<C>(
+    db: &C,
+    project_id: &str,
+    job_id: &str,
+    job_segment_ids: &[String],
+    now: i64,
+) -> anyhow::Result<()>
+where
+    C: ConnectionTrait,
+{
+    let mut failures = Vec::new();
+    for segment_id in job_segment_ids {
+        let failure = query_one(
+            db,
+            "SELECT render_error FROM studio_project_segments WHERE project_id = ?1 AND id = ?2 AND render_status = ?3",
+            vec![
+                project_id.into(),
+                segment_id.as_str().into(),
+                RENDER_STATUS_FAILED.into(),
+            ],
+            "Failed to load Studio segment render failure",
+        )
+        .await?
+        .map(|row| row.try_get_by_index::<Option<String>>(0))
+        .transpose()?;
+        if let Some(error) = failure {
+            failures.push(error.unwrap_or_default());
+        }
+    }
+    let (status, error_message) = match failures.first() {
+        None => (StudioProjectRenderJobStatus::Completed, None),
+        Some(first) => (
+            StudioProjectRenderJobStatus::Failed,
+            Some(match failures.len() {
+                1 => format!("1 paragraph failed: {first}"),
+                count => format!("{count} paragraphs failed: {first}"),
+            }),
+        ),
+    };
+    execute(
+        db,
+        "UPDATE studio_project_render_jobs SET status = ?2, error_message = ?3, updated_at = ?4 WHERE id = ?1",
+        vec![
+            job_id.into(),
+            status.as_db_value().into(),
+            error_message.into(),
+            now.into(),
+        ],
+        "Failed to finish Studio render job",
+    )
+    .await?;
+    upsert_last_render_job(db, project_id, job_id, Some(now)).await
+}
+
+/// Load a project's segments and work out where each one's audio stands.
+async fn load_project_segments<C>(db: &C, project: &mut StudioProjectRecord) -> anyhow::Result<()>
+where
+    C: ConnectionTrait,
+{
     let rows = query_all(
         db,
         STUDIO_PROJECT_SEGMENTS_SQL,
-        vec![project_id.into()],
+        vec![project.id.as_str().into()],
         "Failed to load Studio project segments",
     )
     .await?;
-    project.segments = rows
+    let segments = rows
         .iter()
         .map(map_segment_row)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let pronunciations = fetch_pronunciations(db, &project.id).await?;
+    project.segments = segments
+        .into_iter()
+        .map(|mut segment| {
+            segment.render_state = segment_render_state(project, &segment, &pronunciations);
+            if segment.render_state != StudioSegmentRenderState::Failed {
+                segment.render_error = None;
+            }
+            segment
+        })
+        .collect();
+    Ok(())
+}
 
-    Ok(Some(project))
+async fn fetch_pronunciations<C>(
+    db: &C,
+    project_id: &str,
+) -> anyhow::Result<Vec<StudioProjectPronunciationRecord>>
+where
+    C: ConnectionTrait,
+{
+    let rows = query_all(
+        db,
+        STUDIO_PROJECT_PRONUNCIATIONS_SQL,
+        vec![project_id.into()],
+        "Failed to list Studio project pronunciations",
+    )
+    .await?;
+    rows.iter().map(map_pronunciation_row).collect()
+}
+
+fn segment_render_state(
+    project: &StudioProjectRecord,
+    segment: &StudioProjectSegmentRecord,
+    pronunciations: &[StudioProjectPronunciationRecord],
+) -> StudioSegmentRenderState {
+    match segment.render_status.as_deref() {
+        Some(RENDER_STATUS_QUEUED) => return StudioSegmentRenderState::Queued,
+        Some(RENDER_STATUS_RENDERING) => return StudioSegmentRenderState::Rendering,
+        Some(RENDER_STATUS_FAILED) => return StudioSegmentRenderState::Failed,
+        _ => {}
+    }
+    if segment.speech_record_id.is_none() {
+        return StudioSegmentRenderState::NotRendered;
+    }
+    // Audio rendered before fingerprints existed is taken as current; the
+    // render worker stamps it once at start-up.
+    let Some(rendered_from) = segment.render_fingerprint.as_deref() else {
+        return StudioSegmentRenderState::Rendered;
+    };
+    if rendered_from == segment_render_fingerprint(project, segment, pronunciations) {
+        StudioSegmentRenderState::Rendered
+    } else {
+        StudioSegmentRenderState::Stale
+    }
+}
+
+fn project_summary(project: &StudioProjectRecord) -> StudioProjectSummary {
+    let count = |state: StudioSegmentRenderState| {
+        project
+            .segments
+            .iter()
+            .filter(|segment| segment.render_state == state)
+            .count()
+    };
+    StudioProjectSummary {
+        id: project.id.clone(),
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+        name: project.name.clone(),
+        source_filename: project.source_filename.clone(),
+        model_id: project.model_id.clone(),
+        voice_mode: project.voice_mode,
+        speaker: project.speaker.clone(),
+        saved_voice_id: project.saved_voice_id.clone(),
+        speed: project.speed,
+        segment_count: project.segments.len(),
+        rendered_segment_count: count(StudioSegmentRenderState::Rendered),
+        stale_segment_count: count(StudioSegmentRenderState::Stale),
+        pending_segment_count: project
+            .segments
+            .iter()
+            .filter(|segment| segment.render_state.is_pending())
+            .count(),
+        failed_segment_count: count(StudioSegmentRenderState::Failed),
+        // `sum` of no floats is -0.0; start from 0.0.
+        audio_duration_secs: project
+            .segments
+            .iter()
+            .filter_map(|segment| segment.audio_duration_secs)
+            .fold(0.0, |total, secs| total + secs),
+        total_chars: project
+            .segments
+            .iter()
+            .map(|segment| segment.input_chars)
+            .sum(),
+    }
 }
 
 async fn fetch_folder(
@@ -2504,30 +3064,6 @@ fn normalize_stored_model_id(model_id: Option<String>) -> Option<String> {
     model_id.map(|id| izwi_core::normalize_stored_model_id(&id).into_owned())
 }
 
-fn map_project_summary_row(row: &QueryResult) -> anyhow::Result<StudioProjectSummary> {
-    let voice_mode_raw: String = row.try_get_by_index(6)?;
-    let segment_count = row.try_get_by_index::<i64>(10)?;
-    let rendered_segment_count = row.try_get_by_index::<i64>(11)?;
-    let total_chars = row.try_get_by_index::<i64>(12)?;
-
-    Ok(StudioProjectSummary {
-        id: row.try_get_by_index(0)?,
-        created_at: i64_to_u64(row.try_get_by_index(1)?),
-        updated_at: i64_to_u64(row.try_get_by_index(2)?),
-        name: row.try_get_by_index(3)?,
-        source_filename: row.try_get_by_index(4)?,
-        model_id: normalize_stored_model_id(row.try_get_by_index(5)?),
-        voice_mode: StudioProjectVoiceMode::from_db_value(voice_mode_raw.as_str())
-            .unwrap_or(StudioProjectVoiceMode::BuiltIn),
-        speaker: row.try_get_by_index(7)?,
-        saved_voice_id: row.try_get_by_index(8)?,
-        speed: row.try_get_by_index(9)?,
-        segment_count: i64_to_usize(segment_count).unwrap_or_default(),
-        rendered_segment_count: i64_to_usize(rendered_segment_count).unwrap_or_default(),
-        total_chars: i64_to_usize(total_chars).unwrap_or_default(),
-    })
-}
-
 fn map_project_row(row: &QueryResult) -> anyhow::Result<StudioProjectRecord> {
     let voice_mode_raw: String = row.try_get_by_index(7)?;
     Ok(StudioProjectRecord {
@@ -2544,6 +3080,7 @@ fn map_project_row(row: &QueryResult) -> anyhow::Result<StudioProjectRecord> {
         saved_voice_id: row.try_get_by_index(9)?,
         speed: row.try_get_by_index(10)?,
         segments: Vec::new(),
+        active_render_job: None,
     })
 }
 
@@ -2567,6 +3104,10 @@ fn map_segment_row(row: &QueryResult) -> anyhow::Result<StudioProjectSegmentReco
         generation_time_ms: row.try_get_by_index(10)?,
         audio_duration_secs: row.try_get_by_index(11)?,
         audio_filename: row.try_get_by_index(12)?,
+        render_fingerprint: row.try_get_by_index(13)?,
+        render_status: row.try_get_by_index(14)?,
+        render_error: row.try_get_by_index(15)?,
+        render_state: StudioSegmentRenderState::NotRendered,
     })
 }
 
@@ -2667,9 +3208,13 @@ fn usize_to_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NewStudioProjectRecord, NewStudioProjectSegment, StudioProjectStore,
-        StudioProjectVoiceMode, UpdateStudioProjectRecord,
+        apply_pronunciations, segment_render_input, NewStudioProjectPronunciationRecord,
+        NewStudioProjectRecord, NewStudioProjectSegment, StudioProjectPronunciationRecord,
+        StudioProjectRecord, StudioProjectRenderJobStatus, StudioProjectStore,
+        StudioProjectVoiceMode, StudioRenderClaim, StudioSegmentRenderState,
+        StudioSegmentVoiceOverride, UpdateStudioProjectRecord,
     };
+    use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2799,10 +3344,11 @@ mod tests {
 
         let segment = updated.segments.first().expect("segment should exist");
         let refreshed = store
-            .update_segment_text(
+            .update_segment(
                 updated.id.clone(),
                 segment.id.clone(),
-                "Updated line.".to_string(),
+                Some("Updated line.".to_string()),
+                None,
             )
             .await
             .expect("segment update should succeed")
@@ -2880,7 +3426,8 @@ mod tests {
             .delete_segment(split.id.clone(), split.segments[1].id.clone())
             .await
             .expect("delete should succeed")
-            .expect("project should exist");
+            .expect("project should exist")
+            .project;
 
         assert_eq!(deleted.segments.len(), 2);
         assert_eq!(deleted.segments[0].position, 0);
@@ -2893,7 +3440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_segment_places_block_after_anchor_and_inherits_render_settings() {
+    async fn insert_segment_places_block_after_anchor_with_the_project_voice() {
         let root = test_env_root("studio-project-insert-segment");
         let db_path = root.join("test.sqlite3");
         let media_dir = root.join("media");
@@ -2950,12 +3497,11 @@ mod tests {
         assert_eq!(inserted.segments[2].text, "Closing block.");
         assert_eq!(inserted.segments[1].position, 1);
         assert_eq!(inserted.segments[2].position, 2);
-        assert_eq!(inserted.segments[1].model_id.as_deref(), Some("Qwen3-TTS"));
-        assert_eq!(
-            inserted.segments[1].voice_mode,
-            Some(StudioProjectVoiceMode::BuiltIn)
-        );
-        assert_eq!(inserted.segments[1].speaker.as_deref(), Some("Vivian"));
+        // The anchor's own voice stays with the anchor; a new paragraph
+        // follows the project, so project voice changes reach it.
+        assert_eq!(inserted.segments[1].model_id, None);
+        assert_eq!(inserted.segments[1].voice_mode, None);
+        assert_eq!(inserted.segments[1].speaker, None);
         assert_eq!(inserted.segments[1].saved_voice_id, None);
         assert_eq!(
             inserted.source_text,
@@ -2963,5 +3509,537 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn narration(name: &str) -> NewStudioProjectRecord {
+        let segment = |position, text: &str| NewStudioProjectSegment {
+            position,
+            text: text.to_string(),
+            model_id: None,
+            voice_mode: None,
+            speaker: None,
+            saved_voice_id: None,
+        };
+        NewStudioProjectRecord {
+            name: name.to_string(),
+            source_filename: None,
+            source_text: "The harbour woke. Mara walked the quay.".to_string(),
+            model_id: Some("Kokoro-82M".to_string()),
+            voice_mode: StudioProjectVoiceMode::BuiltIn,
+            speaker: Some("af_heart".to_string()),
+            saved_voice_id: None,
+            speed: None,
+            segments: vec![
+                segment(0, "The harbour woke."),
+                segment(1, "Mara walked the quay."),
+            ],
+        }
+    }
+
+    async fn new_store(prefix: &str) -> (StudioProjectStore, PathBuf) {
+        let root = test_env_root(prefix);
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let store = initialize_test_store(root.join("test.sqlite3"), root.join("media")).await;
+        (store, root)
+    }
+
+    async fn insert_speech_record(store: &StudioProjectStore, id: &str) {
+        let db = store.db.connection().await.expect("connection");
+        db.execute_unprepared(&format!(
+            "INSERT INTO speech_history_records (id, created_at, route_kind, input_text, generation_time_ms, audio_duration_secs, audio_mime_type, audio_storage_path) VALUES ('{id}', 0, 'studio', 'text', 1.0, 2.5, 'audio/wav', 'studio/{id}.wav')"
+        ))
+        .await
+        .expect("speech record inserts");
+    }
+
+    async fn project(store: &StudioProjectStore, id: &str) -> StudioProjectRecord {
+        store
+            .get_project(id.to_string())
+            .await
+            .expect("read should succeed")
+            .expect("project should exist")
+    }
+
+    fn state_of(project: &StudioProjectRecord, segment_id: &str) -> StudioSegmentRenderState {
+        project
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .expect("segment should exist")
+            .render_state
+    }
+
+    /// Finish the claimed render the way the worker does.
+    async fn complete(
+        store: &StudioProjectStore,
+        claim: &StudioRenderClaim,
+        record_id: &str,
+    ) -> Vec<String> {
+        let current = project(store, &claim.project_id).await;
+        let pronunciations = store
+            .list_project_pronunciations(claim.project_id.clone())
+            .await
+            .expect("pronunciations should list");
+        let fingerprint = current
+            .segments
+            .iter()
+            .find(|segment| segment.id == claim.segment_id)
+            .map(|segment| segment_render_input(&current, segment, &pronunciations).2)
+            .unwrap_or_default();
+        insert_speech_record(store, record_id).await;
+        store
+            .complete_render(claim, record_id.to_string(), fingerprint)
+            .await
+            .expect("render should complete")
+    }
+
+    async fn render_now(
+        store: &StudioProjectStore,
+        project_id: &str,
+        segment_id: &str,
+        record_id: &str,
+    ) {
+        store
+            .enqueue_render(project_id.to_string(), Some(vec![segment_id.to_string()]))
+            .await
+            .expect("enqueue should succeed")
+            .expect("project should exist");
+        let claim = store
+            .claim_next_render()
+            .await
+            .expect("claim should succeed")
+            .expect("a segment should be queued");
+        assert_eq!(claim.segment_id, segment_id);
+        complete(store, &claim, record_id).await;
+    }
+
+    #[tokio::test]
+    async fn audio_goes_stale_on_edits_and_survives_reorder() {
+        let (store, root) = new_store("studio-render-state").await;
+        let created = store
+            .create_project(narration("Harbour"))
+            .await
+            .expect("project should be created");
+        let (first, second) = (
+            created.segments[0].id.clone(),
+            created.segments[1].id.clone(),
+        );
+        render_now(&store, &created.id, &first, "take-1").await;
+
+        let current = project(&store, &created.id).await;
+        assert_eq!(
+            state_of(&current, &first),
+            StudioSegmentRenderState::Rendered
+        );
+        assert_eq!(
+            state_of(&current, &second),
+            StudioSegmentRenderState::NotRendered
+        );
+
+        let reordered = store
+            .reorder_segments(created.id.clone(), vec![second.clone(), first.clone()])
+            .await
+            .expect("reorder should succeed")
+            .expect("project should exist");
+        assert_eq!(
+            state_of(&reordered, &first),
+            StudioSegmentRenderState::Rendered
+        );
+        assert_eq!(
+            reordered.segments[1].speech_record_id.as_deref(),
+            Some("take-1")
+        );
+
+        let edit = |text: &str| {
+            store.update_segment(
+                created.id.clone(),
+                first.clone(),
+                Some(text.to_string()),
+                None,
+            )
+        };
+        let edited = edit("The harbour woke early.").await.unwrap().unwrap();
+        assert_eq!(state_of(&edited, &first), StudioSegmentRenderState::Stale);
+        assert_eq!(
+            edited.segments[1].speech_record_id.as_deref(),
+            Some("take-1")
+        );
+        let restored = edit("The harbour woke.").await.unwrap().unwrap();
+        assert_eq!(
+            state_of(&restored, &first),
+            StudioSegmentRenderState::Rendered
+        );
+
+        let set_speaker = |speaker: &str| {
+            store.update_project(
+                created.id.clone(),
+                UpdateStudioProjectRecord {
+                    speaker: Some(Some(speaker.to_string())),
+                    ..UpdateStudioProjectRecord::default()
+                },
+            )
+        };
+        let revoiced = set_speaker("am_adam").await.unwrap().unwrap();
+        assert_eq!(state_of(&revoiced, &first), StudioSegmentRenderState::Stale);
+        let restored = set_speaker("af_heart").await.unwrap().unwrap();
+        assert_eq!(
+            state_of(&restored, &first),
+            StudioSegmentRenderState::Rendered
+        );
+
+        let rule = store
+            .create_project_pronunciation(
+                created.id.clone(),
+                NewStudioProjectPronunciationRecord {
+                    source_text: "harbour".to_string(),
+                    replacement_text: "har-bur".to_string(),
+                    locale: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let current = project(&store, &created.id).await;
+        assert_eq!(state_of(&current, &first), StudioSegmentRenderState::Stale);
+        store
+            .delete_project_pronunciation(created.id.clone(), rule.id)
+            .await
+            .unwrap();
+        let current = project(&store, &created.id).await;
+        assert_eq!(
+            state_of(&current, &first),
+            StudioSegmentRenderState::Rendered
+        );
+
+        let override_voice = store
+            .update_segment(
+                created.id.clone(),
+                first.clone(),
+                None,
+                Some(Some(StudioSegmentVoiceOverride {
+                    model_id: None,
+                    voice_mode: StudioProjectVoiceMode::BuiltIn,
+                    speaker: Some("bm_george".to_string()),
+                    saved_voice_id: None,
+                })),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state_of(&override_voice, &first),
+            StudioSegmentRenderState::Stale
+        );
+        let project_voice = store
+            .update_segment(created.id.clone(), first.clone(), None, Some(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state_of(&project_voice, &first),
+            StudioSegmentRenderState::Rendered
+        );
+        assert_eq!(project_voice.segments[1].speaker, None);
+
+        let (summaries, _) = store.list_projects_page(10, None).await.unwrap();
+        let summary = &summaries[0];
+        assert_eq!(summary.segment_count, 2);
+        assert_eq!(summary.rendered_segment_count, 1);
+        assert_eq!(summary.stale_segment_count, 0);
+        assert_eq!(summary.audio_duration_secs, 2.5);
+        let created_empty = store.create_project(narration("Empty")).await.unwrap();
+        let (summaries, _) = store.list_projects_page(10, None).await.unwrap();
+        let empty = summaries
+            .iter()
+            .find(|summary| summary.id == created_empty.id)
+            .unwrap();
+        assert!(empty.audio_duration_secs.is_sign_positive());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn render_queue_runs_in_order_and_cancel_leaves_the_running_paragraph() {
+        let (store, root) = new_store("studio-render-queue").await;
+        let created = store.create_project(narration("Queue")).await.unwrap();
+        let (first, second) = (
+            created.segments[0].id.clone(),
+            created.segments[1].id.clone(),
+        );
+
+        let job = store
+            .enqueue_render(created.id.clone(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.queued_segment_ids, vec![first.clone(), second.clone()]);
+        let queued = project(&store, &created.id).await;
+        assert_eq!(state_of(&queued, &second), StudioSegmentRenderState::Queued);
+        assert_eq!(
+            queued.active_render_job.as_ref().map(|job| job.id.as_str()),
+            Some(job.id.as_str())
+        );
+        assert!(
+            store
+                .enqueue_render(created.id.clone(), None)
+                .await
+                .is_err(),
+            "nothing is left to queue"
+        );
+
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        assert_eq!(claim.segment_id, first);
+        let cancelled = store
+            .cancel_render_job(created.id.clone(), job.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, StudioProjectRenderJobStatus::Cancelled);
+        let current = project(&store, &created.id).await;
+        assert_eq!(
+            state_of(&current, &first),
+            StudioSegmentRenderState::Rendering
+        );
+        assert_eq!(
+            state_of(&current, &second),
+            StudioSegmentRenderState::NotRendered
+        );
+        assert!(current.active_render_job.is_none());
+
+        // A restart mid-render: the paragraph's job is gone, so it leaves
+        // the queue instead of waiting forever.
+        store.requeue_interrupted_renders().await.unwrap();
+        let current = project(&store, &created.id).await;
+        assert_eq!(
+            state_of(&current, &first),
+            StudioSegmentRenderState::NotRendered
+        );
+        assert!(store.claim_next_render().await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_restart_requeues_the_paragraph_of_an_active_job() {
+        let (store, root) = new_store("studio-render-restart").await;
+        let created = store.create_project(narration("Restart")).await.unwrap();
+        store
+            .enqueue_render(created.id.clone(), None)
+            .await
+            .unwrap();
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+
+        assert_eq!(store.requeue_interrupted_renders().await.unwrap(), 1);
+        let again = store.claim_next_render().await.unwrap().unwrap();
+        assert_eq!(again, claim);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failures_finish_the_job_as_failed_and_an_edit_clears_them() {
+        let (store, root) = new_store("studio-render-failure").await;
+        let created = store.create_project(narration("Failure")).await.unwrap();
+        let (first, second) = (
+            created.segments[0].id.clone(),
+            created.segments[1].id.clone(),
+        );
+        let job = store
+            .enqueue_render(created.id.clone(), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        store.fail_render(&claim, "voice not found").await.unwrap();
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        assert_eq!(claim.segment_id, second);
+        complete(&store, &claim, "take-2").await;
+        assert!(store.claim_next_render().await.unwrap().is_none());
+
+        let jobs = store
+            .list_project_render_jobs(created.id.clone())
+            .await
+            .unwrap();
+        let finished = jobs
+            .iter()
+            .find(|candidate| candidate.id == job.id)
+            .unwrap();
+        assert_eq!(finished.status, StudioProjectRenderJobStatus::Failed);
+        assert_eq!(
+            finished.error_message.as_deref(),
+            Some("1 paragraph failed: voice not found")
+        );
+        let current = project(&store, &created.id).await;
+        let failed = current
+            .segments
+            .iter()
+            .find(|segment| segment.id == first)
+            .unwrap();
+        assert_eq!(failed.render_state, StudioSegmentRenderState::Failed);
+        assert_eq!(failed.render_error.as_deref(), Some("voice not found"));
+
+        let edited = store
+            .update_segment(
+                created.id.clone(),
+                first.clone(),
+                Some("New words.".to_string()),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state_of(&edited, &first),
+            StudioSegmentRenderState::NotRendered
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_missing_model_fails_the_rest_of_the_job_at_once() {
+        let (store, root) = new_store("studio-render-job-failure").await;
+        let created = store
+            .create_project(narration("Missing model"))
+            .await
+            .unwrap();
+        let job = store
+            .enqueue_render(created.id.clone(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        store.fail_render(&claim, "not downloaded").await.unwrap();
+        store
+            .fail_queued_in_job(&claim, "not downloaded")
+            .await
+            .unwrap();
+
+        assert!(store.claim_next_render().await.unwrap().is_none());
+        let jobs = store
+            .list_project_render_jobs(created.id.clone())
+            .await
+            .unwrap();
+        let finished = jobs
+            .iter()
+            .find(|candidate| candidate.id == job.id)
+            .unwrap();
+        assert_eq!(
+            finished.error_message.as_deref(),
+            Some("2 paragraphs failed: not downloaded")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn replaced_and_orphaned_takes_are_released() {
+        let (store, root) = new_store("studio-render-release").await;
+        let created = store.create_project(narration("Takes")).await.unwrap();
+        let (first, second) = (
+            created.segments[0].id.clone(),
+            created.segments[1].id.clone(),
+        );
+        render_now(&store, &created.id, &first, "take-1").await;
+
+        store
+            .enqueue_render(created.id.clone(), Some(vec![first.clone()]))
+            .await
+            .unwrap();
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        assert_eq!(
+            complete(&store, &claim, "take-2").await,
+            vec!["take-1".to_string()]
+        );
+
+        store
+            .enqueue_render(created.id.clone(), Some(vec![second.clone()]))
+            .await
+            .unwrap();
+        let claim = store.claim_next_render().await.unwrap().unwrap();
+        let deleted = store
+            .delete_segment(created.id.clone(), second.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.released_speech_record_ids.is_empty());
+        assert_eq!(
+            complete(&store, &claim, "take-3").await,
+            vec!["take-3".to_string()]
+        );
+
+        let released = store.delete_project(created.id.clone()).await.unwrap();
+        assert_eq!(released, Some(vec!["take-2".to_string()]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn audio_from_before_fingerprints_is_stamped_once() {
+        let (store, root) = new_store("studio-render-stamp").await;
+        let created = store.create_project(narration("Legacy")).await.unwrap();
+        let first = created.segments[0].id.clone();
+        insert_speech_record(&store, "legacy-take").await;
+        let db = store.db.connection().await.unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE studio_project_segments SET speech_record_id = 'legacy-take' WHERE id = '{first}'"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            state_of(&project(&store, &created.id).await, &first),
+            StudioSegmentRenderState::Rendered
+        );
+
+        assert_eq!(store.stamp_unfingerprinted_renders().await.unwrap(), 1);
+        assert_eq!(store.stamp_unfingerprinted_renders().await.unwrap(), 0);
+        let revoiced = store
+            .update_project(
+                created.id.clone(),
+                UpdateStudioProjectRecord {
+                    speaker: Some(Some("am_adam".to_string())),
+                    ..UpdateStudioProjectRecord::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_of(&revoiced, &first), StudioSegmentRenderState::Stale);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn rule(source: &str, replacement: &str) -> StudioProjectPronunciationRecord {
+        StudioProjectPronunciationRecord {
+            id: source.to_string(),
+            project_id: "project".to_string(),
+            source_text: source.to_string(),
+            replacement_text: replacement.to_string(),
+            locale: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn pronunciations_match_whole_words_in_any_case_once() {
+        let rules = [
+            rule("SQL", "sequel"),
+            rule("sequel", "WRONG"),
+            rule("C++", "C plus plus"),
+        ];
+        assert_eq!(
+            apply_pronunciations("sql, SQL and MySQL; also C++.", &rules),
+            "sequel, sequel and MySQL; also C plus plus."
+        );
+        assert_eq!(apply_pronunciations("Izwi", &[]), "Izwi");
+        assert_eq!(
+            apply_pronunciations(
+                "New York and York",
+                &[rule("York", "Yawk"), rule("New York", "Noo Yawk")]
+            ),
+            "Noo Yawk and Yawk"
+        );
     }
 }

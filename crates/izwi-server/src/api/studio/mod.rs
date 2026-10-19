@@ -1,6 +1,9 @@
 //! First-party persisted Studio project routes.
 
 mod handlers;
+mod render;
+
+pub use render::spawn_render_worker;
 
 use axum::{routing::get, Router};
 
@@ -86,5 +89,9 @@ pub fn router() -> Router<AppState> {
         .route(
             "/studio/projects/{project_id}/segments/{segment_id}/render",
             axum::routing::post(handlers::render_studio_project_segment),
+        )
+        .route(
+            "/studio/projects/{project_id}/segments/{segment_id}/audio",
+            get(handlers::get_studio_project_segment_audio),
         )
 }

@@ -2703,7 +2703,7 @@ fn normalize_for_model_capabilities(
                 ));
             }
         }
-        SpeechRouteKind::TextToSpeech => {}
+        SpeechRouteKind::TextToSpeech | SpeechRouteKind::Studio => {}
     }
     // The voice contract every speech route shares (TPIPE-12).
     crate::api::tts_policy::validate_speech_voice(
@@ -2747,6 +2747,7 @@ fn default_audio_filename(route_kind: SpeechRouteKind, extension: &str) -> Strin
         SpeechRouteKind::TextToSpeech => "tts",
         SpeechRouteKind::VoiceDesign => "voice-design",
         SpeechRouteKind::VoiceCloning => "voice-cloning",
+        SpeechRouteKind::Studio => "studio",
     };
     format!("{prefix}-{}.{}", uuid::Uuid::new_v4().simple(), extension)
 }

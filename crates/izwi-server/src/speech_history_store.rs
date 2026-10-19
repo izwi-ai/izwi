@@ -247,6 +247,9 @@ pub enum SpeechRouteKind {
     TextToSpeech,
     VoiceDesign,
     VoiceCloning,
+    /// Studio paragraph renders. They belong to their project, so no
+    /// history route lists, serves or deletes them.
+    Studio,
 }
 
 impl SpeechRouteKind {
@@ -255,6 +258,7 @@ impl SpeechRouteKind {
             Self::TextToSpeech => "text_to_speech",
             Self::VoiceDesign => "voice_design",
             Self::VoiceCloning => "voice_cloning",
+            Self::Studio => "studio",
         }
     }
 
@@ -263,6 +267,7 @@ impl SpeechRouteKind {
             "text_to_speech" => Some(Self::TextToSpeech),
             "voice_design" => Some(Self::VoiceDesign),
             "voice_cloning" => Some(Self::VoiceCloning),
+            "studio" => Some(Self::Studio),
             _ => None,
         }
     }

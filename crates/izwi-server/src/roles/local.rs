@@ -329,6 +329,7 @@ where
     }
     state.lifecycle.mark_ready();
     info!("Runtime service initialized");
+    crate::api::studio::spawn_render_worker(state.clone());
     let supervisor = start_batch_runtime_worker(&state);
     let _ = batch_worker_drain.set(supervisor.drain_handle());
     // Shutdown marks the lifecycle draining before it reads the drain slot,

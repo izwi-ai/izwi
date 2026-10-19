@@ -40,6 +40,7 @@ impl Schema {
                 (6, "byte-ordered artifact publication keys"),
                 (7, "chat message model and finish reason"),
                 (8, "chat message reasoning time"),
+                (9, "studio segment render state"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -188,6 +189,11 @@ async fn apply_migration<C: ConnectionTrait>(
         }
         (Schema::App, 8) => {
             ensure_column(db, &CHAT_MESSAGE_REASONING_COLUMN).await?;
+        }
+        (Schema::App, 9) => {
+            for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+                ensure_column(db, column).await?;
+            }
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1052,6 +1058,26 @@ const CHAT_MESSAGE_REASONING_COLUMN: CompatibilityColumn = CompatibilityColumn {
     definition: "INTEGER NULL",
 };
 
+/// Migration 9: what each Studio segment's audio was rendered from, and
+/// where the server's render queue has it.
+const STUDIO_SEGMENT_RENDER_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_fingerprint",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_status",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "studio_project_segments",
+        column: "render_error",
+        definition: "TEXT NULL",
+    },
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1580,6 +1606,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     }
     // Migration 8.
     push(&add_column(&CHAT_MESSAGE_REASONING_COLUMN));
+    // Migration 9.
+    for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+        push(&add_column(column));
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1792,6 +1822,33 @@ mod tests {
         assert!(table_has_column(db, column.table, column.column)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_8_gains_the_studio_render_columns() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                column.table, column.column
+            ))
+            .await
+            .expect("column drops");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 9",
+        )
+        .await
+        .expect("version row deletes");
+
+        Migrator::up(db).await.expect("the database upgrades");
+        for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+            assert!(table_has_column(db, column.table, column.column)
+                .await
+                .unwrap());
+        }
     }
 
     fn shipped_postgres_schema_path() -> std::path::PathBuf {

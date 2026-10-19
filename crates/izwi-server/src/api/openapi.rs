@@ -678,7 +678,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Studio",
         "Studio render jobs",
         "Studio render job",
-        "List or create render jobs.",
+        "List render jobs, or queue segments for the render worker (all that need it by default).",
         &[("project_id", "Studio project identifier")],
     );
     add_operation_with_params(
@@ -686,8 +686,8 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/render-jobs/{job_id}",
         "patch",
         "Studio",
-        "Update Studio render job",
-        "Update render job state.",
+        "Cancel Studio render job",
+        "Cancel a queued or running render job; the server sets every other status.",
         &[
             ("project_id", "Studio project identifier"),
             ("job_id", "Render job identifier"),
@@ -767,12 +767,25 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "post",
         "Studio",
         "Render Studio segment",
-        "Render a Studio project segment.",
+        "Queue a Studio project segment for the render worker, rendered or not.",
         &[
             ("project_id", "Studio project identifier"),
             ("segment_id", "Segment identifier"),
         ],
         preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}/audio",
+        "get",
+        "Studio",
+        "Download Studio segment audio",
+        "Fetch the audio of one rendered Studio segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+        binary_response(),
     );
 
     add_collection(

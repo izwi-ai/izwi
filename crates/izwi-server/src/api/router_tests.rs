@@ -3377,7 +3377,13 @@ async fn dynamic_routes_cover_axum_upgrade_surface() {
         (
             Method::PATCH,
             "/v1/studio/projects/missing-project/render-jobs/missing-job",
-            Some("{}"),
+            Some(r#"{"status":"cancelled"}"#),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/v1/studio/projects/missing-project/segments/missing-segment/audio",
+            None,
             StatusCode::NOT_FOUND,
         ),
         (
@@ -3692,6 +3698,142 @@ async fn studio_segment_refusals_are_bad_requests() {
         .as_str()
         .unwrap()
         .contains("at least one segment"));
+}
+
+/// The server owns Studio rendering: clients queue and cancel, the
+/// worker sets every other status, and export refuses audio that doesn't
+/// match the script.
+#[tokio::test]
+async fn studio_render_jobs_are_server_owned_and_export_refuses_unrendered_audio() {
+    let (state, _root) = test_state("studio_render_contract", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let request = |method: Method, path: String, body: Option<String>| {
+        let app = app.clone();
+        async move { send_request(app, build_request(method, &path, body.as_deref())).await }
+    };
+
+    let created = request(
+        Method::POST,
+        "/v1/studio/projects".to_string(),
+        Some(
+            serde_json::json!({
+                "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "speaker": "Vivian",
+                "source_text": "One sentence. Another sentence."
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let project = read_json(created).await;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let segment_id = project["segments"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(project["segments"][0]["render_state"], "not_rendered");
+
+    // Reading metadata doesn't create it.
+    let meta = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/meta"),
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
+    assert_eq!(read_json(meta).await["default_export_format"], "wav");
+    assert!(state
+        .studio_store
+        .get_project_meta(project_id.clone())
+        .await
+        .unwrap()
+        .is_none());
+
+    let queued = request(
+        Method::POST,
+        format!("/v1/studio/projects/{project_id}/render-jobs"),
+        Some("{}".to_string()),
+    )
+    .await;
+    assert_eq!(queued.status(), StatusCode::OK);
+    let job = read_json(queued).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    assert_eq!(job["status"], "queued");
+
+    let project = read_json(
+        request(
+            Method::GET,
+            format!("/v1/studio/projects/{project_id}"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(project["segments"][0]["render_state"], "queued");
+    assert_eq!(project["active_render_job"]["id"], job_id.as_str());
+
+    let again = request(
+        Method::POST,
+        format!("/v1/studio/projects/{project_id}/render-jobs"),
+        Some("{}".to_string()),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+
+    let completed = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/render-jobs/{job_id}"),
+        Some(r#"{"status":"completed"}"#.to_string()),
+    )
+    .await;
+    assert_eq!(completed.status(), StatusCode::BAD_REQUEST);
+    let cancelled = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/render-jobs/{job_id}"),
+        Some(r#"{"status":"cancelled"}"#.to_string()),
+    )
+    .await;
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(read_json(cancelled).await["status"], "cancelled");
+
+    let audio = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/segments/{segment_id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(audio.status(), StatusCode::NOT_FOUND);
+
+    let export = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(export.status(), StatusCode::BAD_REQUEST);
+    assert!(read_json(export).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not rendered: 1"));
+    let long_pause = request(
+        Method::GET,
+        format!("/v1/studio/projects/{project_id}/audio?pause_ms=9000"),
+        None,
+    )
+    .await;
+    assert_eq!(long_pause.status(), StatusCode::BAD_REQUEST);
+
+    let both = request(
+        Method::PATCH,
+        format!("/v1/studio/projects/{project_id}/segments/{segment_id}"),
+        Some(r#"{"speaker":"Ryan","use_project_voice":true}"#.to_string()),
+    )
+    .await;
+    assert_eq!(both.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn send_request(mut app: Router, request: Request<Body>) -> Response {

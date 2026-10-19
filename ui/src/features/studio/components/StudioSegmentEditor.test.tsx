@@ -31,7 +31,11 @@ function buildProject(segmentCount = 6): StudioProjectRecord {
       generation_time_ms: null,
       audio_duration_secs: position % 2 === 0 ? 12.4 : null,
       audio_filename: null,
+      render_fingerprint: null,
+      render_state: position % 2 === 0 ? ("rendered" as const) : ("not_rendered" as const),
+      render_error: null,
     })),
+    active_render_job: null,
   };
 }
 
@@ -66,7 +70,7 @@ describe("StudioSegmentEditor responsive structure", () => {
         onChangeSegmentDraft={vi.fn()}
         onChangeSegmentCursor={vi.fn()}
         onFocusSegmentHandled={vi.fn()}
-        audioUrlForRecordId={(recordId) => `/audio/${recordId}`}
+        audioUrlForSegment={(segment) => `/audio/${segment.id}`}
       />,
     );
 
@@ -135,7 +139,7 @@ describe("StudioSegmentEditor responsive structure", () => {
         onDiscardSegmentDraftConflict={onDiscardSegmentDraftConflict}
         onChangeSegmentCursor={vi.fn()}
         onFocusSegmentHandled={vi.fn()}
-        audioUrlForRecordId={(recordId) => `/audio/${recordId}`}
+        audioUrlForSegment={(segment) => `/audio/${segment.id}`}
       />,
     );
 
@@ -183,7 +187,7 @@ describe("StudioSegmentEditor responsive structure", () => {
         onChangeSegmentDraft={vi.fn()}
         onChangeSegmentCursor={vi.fn()}
         onFocusSegmentHandled={vi.fn()}
-        audioUrlForRecordId={(recordId) => `/audio/${recordId}`}
+        audioUrlForSegment={(segment) => `/audio/${segment.id}`}
       />,
     );
 
