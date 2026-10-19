@@ -4,7 +4,7 @@ pub(crate) mod asr_retained;
 mod audio_output;
 mod bundle;
 mod config;
-mod conformer;
+pub(crate) mod conformer;
 mod detokenizer;
 pub(crate) mod model;
 pub(crate) mod physical;

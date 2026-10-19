@@ -74,6 +74,7 @@ use crate::models::architectures::granite_speech::asr::{
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
+use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
     nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
@@ -2264,9 +2265,10 @@ fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<As
 /// LFM2.5-Audio (`lfm25_audio/`, `lfm2/backbone.rs`): all four GGUFs load on
 /// every backend. Quantized projections and the vocoder's embedding tables
 /// (audio, depth and detokenizer `emb.emb`, whose rows are gathered on
-/// demand) stay quantized; F32 tensors and every loaded mmproj tensor are
-/// dequantized to F32, the dtype the loader hard-codes (there is no dtype
-/// resolver to call). The detokenizer backbone runs on vocoder embeddings
+/// demand) stay quantized, as do the encoder and adapter projections on
+/// Metal; F32 tensors and every other loaded mmproj tensor are dequantized
+/// to F32, the dtype the loader hard-codes (there is no dtype resolver to
+/// call). The detokenizer backbone runs on vocoder embeddings
 /// and skips its `token_embd`.
 /// The main backbone has no `output.weight`, so its head reads `token_embd` a
 /// second time as a quantized projection, and keeps its first `token_embd`
@@ -2290,7 +2292,17 @@ fn price_lfm25_audio(
     price_lfm2_backbone(&mut ledger, &census.main, true)?;
     price_lfm2_backbone(&mut ledger, &census.tokenizer, false)?;
     for tensor in &census.mmproj.tensors {
-        if !MMPROJ_UNREAD.contains(&tensor.name.as_str()) {
+        let name = tensor.name.as_str();
+        if MMPROJ_UNREAD.contains(&name) {
+            continue;
+        }
+        // On Metal the encoder and adapter keep quantized projections.
+        if backend == BackendKind::Metal
+            && gguf_quantized(tensor)
+            && lfm25_audio_conformer_projection(name)
+        {
+            ledger.gguf_stored(tensor)?;
+        } else {
             ledger.gguf_dense(tensor, DType::F32)?;
         }
     }
@@ -3048,6 +3060,43 @@ pub(super) mod tests {
         price_lfm25_audio(&census, backend, LFM_ROPE_TABLES).unwrap()
     }
 
+    /// The encoder and adapter projections the conformer may keep
+    /// quantized are exactly its `load_linear_any` weights: 9 per block over
+    /// 17 blocks, the subsampling output and the two adapter layers, all
+    /// Q4_0 in the published mmproj.
+    #[test]
+    fn lfm25_audio_conformer_projections_match_the_mmproj() {
+        let files = census!("lfm2_5_audio_1_5b_q4_0.json");
+        let mmproj = files
+            .iter()
+            .find(|file| file.path.to_string_lossy().starts_with("mmproj-"));
+        let projections = mmproj
+            .unwrap()
+            .tensors
+            .iter()
+            .filter(|tensor| lfm25_audio_conformer_projection(&tensor.name))
+            .collect::<Vec<_>>();
+        assert_eq!(projections.len(), 17 * 9 + 3);
+        assert!(projections.iter().all(|tensor| gguf_quantized(tensor)));
+        for name in [
+            "a.blk.16.ffn_down_1.weight",
+            "a.pre_encode.out.weight",
+            "mm.a.mlp.3.weight",
+        ] {
+            assert!(
+                projections.iter().any(|tensor| tensor.name == name),
+                "{name}"
+            );
+        }
+        for name in [
+            "a.blk.0.conv_pw1.weight",
+            "a.blk.0.ffn_up.bias",
+            "a.blk.x.attn_q.weight",
+        ] {
+            assert!(!lfm25_audio_conformer_projection(name), "{name}");
+        }
+    }
+
     /// The diarizers as loaded: F32 weights on CUDA's device, and in host
     /// memory on CPU and Metal (counted in Metal's unified domain).
     fn sortformer(files: &[CensusFile], backend: BackendKind) -> AsrResidencyPlan {
@@ -3162,7 +3211,7 @@ pub(super) mod tests {
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [1.27, 1.27, 1.27, 1.27],
+                [1.27, 0.94, 0.95, 1.27],
             ),
             // D8: the dense text runs at F16 on Metal (4.18 GiB allocated at
             // F32).
