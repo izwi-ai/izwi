@@ -32,7 +32,11 @@
 //!   Freed private-pool
 //!   intermediates, such as the parts of a fused projection, are reused by later
 //!   allocations, so only their high-water mark counts. CPU and CUDA release a
-//!   buffer when it drops.
+//!   buffer when it drops. The plans price components in loader order where a
+//!   synchronization separates them: a Metal load-time probe reads the audio
+//!   tower's (or encoder's) output back before the text model loads, and the
+//!   text models read their token table first, so what each segment leaves
+//!   held never runs beside the next segment's steps.
 //! - CUDA host staging, which is the whole CUDA host authorization: the largest
 //!   per-tensor host copy (NeMo archives stream to disk, so a first load adds
 //!   no extraction buffer).
@@ -337,9 +341,13 @@ struct Step {
 }
 
 /// Accumulates a load's steps into an upper bound of its peak that holds for
-/// any order of the steps (the loaders' order is theirs to change): every step
-/// may run last, beside every resident byte and whatever earlier steps left
-/// for Candle to release at the next synchronization.
+/// any order of the steps within a segment (the loaders' order is theirs to
+/// change): every step may run last, beside every resident byte and whatever
+/// earlier steps in its segment left for Candle to release at the next
+/// synchronization. A segment ends where the loader synchronizes whatever it
+/// uploaded, at a load-time probe's read-back ([`Ledger::barrier`]) or after
+/// a token table it reads first and that leaves nothing held
+/// ([`Ledger::settle`]); the segments' transients never stack.
 #[derive(Debug)]
 pub(super) struct Ledger {
     backend: BackendKind,
@@ -362,8 +370,6 @@ pub(super) struct Ledger {
     extra_max_synced: u64,
     /// Largest step high point beyond the step's own resident and held bytes.
     extra_beyond_held_max: u64,
-    /// Metal: the most a synchronizing step has alive at its synchronization.
-    before_sync_max: u64,
     /// Metal: the most held by a synchronizing step's predecessor (another
     /// step, or a release) beside its own synchronization.
     at_sync_max: u64,
@@ -381,6 +387,9 @@ pub(super) struct Ledger {
     /// Metal, staged: the most one step that does not synchronize itself
     /// leaves held.
     held_step_max: u64,
+    /// Metal: the most the segments closed by a [`Self::barrier`] add beside
+    /// the residents.
+    segments: u64,
 }
 
 impl Ledger {
@@ -396,7 +405,6 @@ impl Ledger {
             extra_max: 0,
             extra_max_synced: 0,
             extra_beyond_held_max: 0,
-            before_sync_max: 0,
             at_sync_max: 0,
             prelude: 0,
             host_peak: 0,
@@ -404,6 +412,7 @@ impl Ledger {
             sync_interval: None,
             host_cast: false,
             held_step_max: 0,
+            segments: 0,
         }
     }
 
@@ -449,20 +458,19 @@ impl Ledger {
         self.logical = sum(&[self.logical, step.logical])?;
         self.resident = sum(&[self.resident, step.resident])?;
         let extra = step.high.checked_sub(step.resident).ok_or_else(overflow)?;
-        self.extra_beyond_held_max = self
-            .extra_beyond_held_max
-            .max(extra.saturating_sub(step.held_until_sync));
         self.scratch = self.scratch.max(step.intermediates);
         self.host_peak = self.host_peak.max(step.host);
         match step.before_sync.filter(|_| self.metal()) {
             Some(before_sync) => {
                 self.extra_max_synced = self.extra_max_synced.max(extra);
-                self.before_sync_max = self.before_sync_max.max(before_sync);
                 self.held_max = self.held_max.max(step.held_until_sync);
                 self.synced.push((step.held_until_sync, before_sync));
             }
             None => {
                 self.extra_max = self.extra_max.max(extra);
+                self.extra_beyond_held_max = self
+                    .extra_beyond_held_max
+                    .max(extra.saturating_sub(step.held_until_sync));
                 self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
                 self.held_step_max = self.held_step_max.max(step.held_until_sync);
             }
@@ -538,12 +546,22 @@ impl Ledger {
                     earlier.saturating_sub(stored)
                 };
                 let host = if source == Source::Copied { stored } else { 0 };
+                // `staged::metal_synced_safetensors` drops a cast's upload
+                // before it counts it, and synchronizes once the count
+                // reaches the interval: an upload that reaches it alone is
+                // freed right after its own step.
+                let synced_alone = cast
+                    && rest.is_empty()
+                    && self
+                        .sync_interval
+                        .is_some_and(|interval| stored >= interval);
                 Step {
                     logical,
                     resident,
                     high: sum(&[resident, upload_released, host])?,
-                    held_until_sync: upload_released,
+                    held_until_sync: if synced_alone { 0 } else { upload_released },
                     intermediates: private_earlier,
+                    before_sync: synced_alone.then_some(sum(&[upload_released, host])?),
                     ..Step::default()
                 }
             }
@@ -563,7 +581,11 @@ impl Ledger {
     ) -> Result<()> {
         let stored = tensor.stored_bytes;
         let elements = tensor.elements();
-        let host = sum(&[stored, if cast { upload } else { 0 }])?;
+        // `HostCastSafetensors::load` drops the stored-dtype read once it is
+        // converted, before the upload, and the converted copy once it is
+        // uploaded, before the chain's device ops run.
+        let converting = sum(&[stored, if cast { upload } else { 0 }])?;
+        let uploading = sum(&[upload, upload])?;
         let mut logical = upload;
         let mut forms = vec![upload];
         for &dtype in rest {
@@ -575,10 +597,11 @@ impl Ledger {
         // between are private.
         let released = if rest.is_empty() { 0 } else { upload };
         let private = sum(&forms)?.saturating_sub(released);
+        let device_ops = sum(&[released, resident])?;
         self.apply(Step {
             logical,
             resident,
-            high: sum(&[resident, released, host])?,
+            high: converting.max(uploading).max(device_ops),
             held_until_sync: released,
             intermediates: private,
             ..Step::default()
@@ -653,9 +676,10 @@ impl Ledger {
     /// join, and none stays held or pooled after it.
     fn synced_after_join(&self, mut step: Step) -> Result<Step> {
         if self.metal() {
-            let parts = sum(&[step.held_until_sync, step.intermediates])?;
             step.high = sum(&[step.high, step.intermediates])?;
-            step.before_sync = Some(parts);
+            // Everything the step allocated beyond the join is alive until
+            // that synchronization: the parts, and any host copies.
+            step.before_sync = Some(step.high.saturating_sub(step.resident));
             step.held_until_sync = 0;
             step.intermediates = 0;
         }
@@ -840,7 +864,6 @@ impl Ledger {
     fn mlx_q4_1(&mut self, parts: &[MlxWeight]) -> Result<()> {
         let mut logical = 0;
         let mut held = 0;
-        let mut before_sync = 0;
         let mut reading = 0;
         for part in parts {
             let packed = part.weight.stored_bytes;
@@ -848,18 +871,21 @@ impl Ledger {
             let blocks = part.elements()? / 32 * 20;
             let readback = self.kernel(packed)?;
             held = held.max(sum(&[packed, readback])?);
-            before_sync = before_sync.max(sum(&[packed, readback, params])?);
             // The packed copy, the parameters and this weight's blocks beside
             // the blocks of the parts before it.
             reading = reading.max(sum(&[logical, packed, params, blocks])?);
             logical = sum(&[logical, blocks])?;
         }
+        // `qwen3_mlx_q4_1_projection` synchronizes once every part is read
+        // (`qwen3/core.rs`), which drops the packed uploads and read-back
+        // buffers, and only then uploads the blocks, beside their host copy.
+        // Its first synchronization is the first part's words read-back.
         self.apply(Step {
             logical,
             resident: logical,
-            high: sum(&[logical, held, reading])?,
-            held_until_sync: held,
-            before_sync: Some(before_sync),
+            high: sum(&[held, reading])?.max(sum(&[logical, logical])?),
+            held_until_sync: 0,
+            before_sync: Some(held),
             ..Step::default()
         })
     }
@@ -1141,35 +1167,58 @@ impl Ledger {
         Ok(most)
     }
 
+    /// Metal: the most the steps priced since the last barrier add beside
+    /// every resident byte. A step that does not synchronize runs beside
+    /// everything held; a synchronizing step beside it only until its first
+    /// synchronization (`before_sync`), and alone after it.
+    fn transient(&self) -> Result<u64> {
+        // Released uploads are held until the load fence, or, for a loader
+        // that synchronizes by uploaded bytes, less than an interval of them
+        // plus the step straddling the last synchronization.
+        let held = match self.sync_interval {
+            Some(interval) => self
+                .held_unsynced
+                .min(sum(&[interval, self.held_step_max])?),
+            None => self.held_unsynced,
+        };
+        let unsynced = sum(&[held, self.held_max, self.extra_beyond_held_max])?;
+        let at_sync = sum(&[held, self.at_sync_max()?])?;
+        Ok(unsynced.max(at_sync).max(self.extra_max_synced))
+    }
+
+    /// The loader synchronizes the device here whatever it uploaded (a
+    /// load-time probe reads a component's output back), and every step
+    /// priced after this runs after it: nothing released before it is still
+    /// held, so the segments' transients never stack.
+    fn barrier(&mut self) -> Result<()> {
+        if self.metal() {
+            self.segments = self.segments.max(self.transient()?);
+            self.held_unsynced = 0;
+            self.held_step_max = 0;
+            self.held_max = 0;
+            self.synced.clear();
+            self.extra_max = 0;
+            self.extra_max_synced = 0;
+            self.extra_beyond_held_max = 0;
+            self.at_sync_max = 0;
+        }
+        Ok(())
+    }
+
+    /// Closes the segment priced so far when it leaves nothing held: every
+    /// step priced after this runs after it (the loader's order), so their
+    /// transients never stack with this segment's.
+    fn settle(&mut self) -> Result<()> {
+        if self.held_unsynced == 0 && self.held_max == 0 {
+            self.barrier()?;
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> Result<Self> {
         let base = self.resident;
         self.peak = if self.metal() {
-            let base = sum(&[base, self.scratch])?;
-            if self.held_unsynced > 0 {
-                // Nothing synchronizes before the load fence: every released
-                // upload is still held when the last step runs. A staged
-                // loader synchronizes right after the upload that brings its
-                // uploads since the last synchronization to the interval, and
-                // a step releases only uploads it made before its release.
-                // So the steps released since the last synchronization made
-                // less than an interval of uploads after it, except the one
-                // step that straddles it.
-                let held_unsynced = match self.sync_interval {
-                    Some(interval) => self
-                        .held_unsynced
-                        .min(sum(&[interval, self.held_step_max])?),
-                    None => self.held_unsynced,
-                };
-                let held = sum(&[held_unsynced, self.held_max])?;
-                let extra = self.extra_beyond_held_max.max(self.before_sync_max);
-                sum(&[base, held, extra])?
-            } else {
-                // A synchronizing step drops what the previous one left held;
-                // the others run beside it.
-                let unsynced = sum(&[self.held_max, self.extra_max])?;
-                let extra = self.extra_max_synced.max(unsynced).max(self.at_sync_max()?);
-                sum(&[base, extra])?
-            }
+            sum(&[base, self.scratch, self.transient()?.max(self.segments)])?
         } else {
             sum(&[base, self.extra_max.max(self.extra_max_synced)])?
         }
@@ -1467,7 +1516,29 @@ fn price_qwen3_asr(
     let lm_head = format!("{prefix}lm_head.weight");
     let embed_tokens = format!("{text}embed_tokens.weight");
     let mut ledger = Ledger::new(backend);
+    // The audio tower loads first and, below F32 on Metal, its load-time
+    // probe reads its output back before the text model loads.
+    for (name, tensor) in &tensors {
+        if name.starts_with(&audio) {
+            ledger.gguf_dense(tensor, load.audio_dtype)?;
+        }
+    }
+    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
+    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    if load.audio_dtype != DType::F32 {
+        ledger.barrier()?;
+    }
     let mut packed = BTreeSet::new();
+    if load.qmatmul_text {
+        // `load_gguf_text` reads the token table first; its step releases
+        // nothing, so it never runs beside a later step's held buffers.
+        ledger.gguf_stored(tensor(&tensors, &embed_tokens)?)?;
+        packed.insert(embed_tokens.as_str());
+        ledger.settle()?;
+    }
     if load.qmatmul_text && load.packed_projections {
         for name in tensors.keys() {
             let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
@@ -1490,12 +1561,10 @@ fn price_qwen3_asr(
         }
     }
     for (name, tensor) in &tensors {
-        if packed.contains(name) {
+        if packed.contains(name) || name.starts_with(&audio) {
             continue;
         }
-        if name.starts_with(&audio) {
-            ledger.gguf_dense(tensor, load.audio_dtype)?;
-        } else if load.qmatmul_text && *name == embed_tokens {
+        if load.qmatmul_text && *name == embed_tokens {
             // The token table stays quantized; rows are gathered from it.
             ledger.gguf_stored(tensor)?;
         } else if load.qmatmul_text && load.tied_head && *name == lm_head {
@@ -1509,11 +1578,6 @@ fn price_qwen3_asr(
             }
         }
     }
-    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
-    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
-        .checked_mul(d_model)
-        .ok_or_else(overflow)?;
-    ledger.uploaded(positions, DType::F32)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -1663,6 +1727,35 @@ fn price_qwen3_aligner(
     let text = [format!("{prefix}model."), format!("{prefix}lm_head.")];
     let mut ledger = Ledger::synced(backend);
     let mut grouped = BTreeSet::new();
+    // The audio tower loads first and, below F32 on Metal, its load-time
+    // probe reads its output back before the text model loads.
+    let audio_tensors = tensors
+        .iter()
+        .filter(|(name, _)| name.starts_with(&audio))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &audio_tensors, &audio, &text, load)?;
+    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
+    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    if load.audio_dtype != DType::F32 {
+        ledger.barrier()?;
+    }
+    grouped.extend(audio_tensors.iter().map(|(name, _)| *name));
+    // `Qwen3Model::load_with_layout` reads the token table first. Its step
+    // leaves nothing held: Q4_1 synchronizes before its upload, and a dense
+    // table's upload reaches the sync interval, so the loader synchronizes
+    // right after it.
+    let table = tensors
+        .iter()
+        .filter(|(name, _)| name.starts_with(&format!("{}embed_tokens.", text[0])))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &table, &audio, &text, load)?;
+    grouped.extend(table.iter().map(|(name, _)| *name));
+    ledger.settle()?;
     if load.fused_projections {
         for name in tensors.keys() {
             let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
@@ -1701,11 +1794,27 @@ fn price_qwen3_aligner(
             }
         }
     }
-    for (name, tensor) in &tensors {
-        if grouped.contains(name) {
-            continue;
-        }
-        let dtype = if name.starts_with(&audio) {
+    let rest = tensors
+        .iter()
+        .filter(|(name, _)| !grouped.contains(*name))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &rest, &audio, &text, load)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// The aligner tensors `names` as `price_qwen3_aligner`'s loader reads them
+/// one by one (grouped projections aside).
+fn price_aligner_tensors(
+    ledger: &mut Ledger,
+    tensors: &BTreeMap<&str, &CensusTensor>,
+    names: &[(&str, &CensusTensor)],
+    audio: &str,
+    text: &[String; 2],
+    load: AlignerLoad,
+) -> Result<()> {
+    for &(name, tensor) in names {
+        let dtype = if name.starts_with(audio) {
             load.audio_dtype
         } else if text.iter().any(|text| name.starts_with(text)) {
             load.text_dtype
@@ -1713,7 +1822,7 @@ fn price_qwen3_aligner(
             continue;
         };
         if let Some(stem) = name.strip_suffix(".weight") {
-            if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
+            if let Some(weight) = MlxWeight::find(tensors, stem, load.mlx_bits)? {
                 // The text model keeps MLX 4-bit weights as Q4_1 on Metal.
                 if load.mlx_q4_1 && dtype == load.text_dtype && repack_to_q4_1(&[weight])? {
                     ledger.mlx_q4_1(&[weight])?;
@@ -1743,12 +1852,7 @@ fn price_qwen3_aligner(
             ledger.var(tensor, Source::Mapped, &[dtype])?;
         }
     }
-    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
-    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
-        .checked_mul(d_model)
-        .ok_or_else(overflow)?;
-    ledger.uploaded(positions, DType::F32)?;
-    AsrResidencyPlan::from_ledger(ledger, 0)
+    Ok(())
 }
 
 /// Whether the loader repacks every weight of `parts` into Q4_1.
@@ -2143,6 +2247,51 @@ fn price_granite(
     let tensors = by_name(files);
     let mut ledger = Ledger::staged(backend);
     let mut grouped = BTreeSet::new();
+    // The encoder loads first and, under weight-only F16, its load-time
+    // probe reads its output back before the projector and the LM load.
+    for (name, tensor) in &tensors {
+        if !name.starts_with("encoder.") || name.ends_with(".num_batches_tracked") {
+            continue;
+        }
+        if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
+            ledger.host_converted(tensor, DType::F16)?;
+        } else {
+            ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
+        }
+        grouped.insert(*name);
+    }
+    let (layers, context) = load.encoder_attention_dists;
+    let dists = (layers as u64)
+        .checked_mul(context as u64)
+        .and_then(|n| n.checked_mul(context as u64))
+        .ok_or_else(overflow)?;
+    ledger.uploaded(dists, DType::U32)?;
+    if load.f16_encoder_projections {
+        ledger.barrier()?;
+    }
+    for (name, tensor) in &tensors {
+        if name.starts_with("encoder.")
+            || name.starts_with("language_model.")
+            || name.ends_with(".num_batches_tracked")
+        {
+            continue;
+        }
+        ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
+        grouped.insert(*name);
+    }
+    // The LM reads its token table first; a table that loads alone (no
+    // pre-scale chain) releases nothing, and its upload reaches the sync
+    // interval, so the loader synchronizes right after it.
+    if let Some(table) = tensors.get(EMBEDDING) {
+        let dtype = if load.tied_lm_head && representation.f16_lm_head {
+            DType::F16
+        } else {
+            dtype
+        };
+        ledger.var(table, Source::Mapped, &[dtype])?;
+        grouped.insert(EMBEDDING);
+        ledger.settle()?;
+    }
     for name in tensors.keys() {
         if !name.starts_with("language_model.") {
             continue;
@@ -2182,13 +2331,7 @@ fn price_granite(
         if grouped.contains(name) || name.ends_with(".num_batches_tracked") {
             continue;
         }
-        if !name.starts_with("language_model.") {
-            if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
-                ledger.host_converted(tensor, DType::F16)?;
-            } else {
-                ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
-            }
-        } else if name.ends_with(".o_proj.weight") {
+        if name.ends_with(".o_proj.weight") {
             let chain = residual_chain(representation.f16_attention_output);
             ledger.var(tensor, Source::Mapped, &chain)?;
         } else if name.ends_with(".down_proj.weight") {
@@ -2211,12 +2354,6 @@ fn price_granite(
             ledger.var(tensor, Source::Mapped, &[dtype])?;
         }
     }
-    let (layers, context) = load.encoder_attention_dists;
-    let dists = (layers as u64)
-        .checked_mul(context as u64)
-        .and_then(|n| n.checked_mul(context as u64))
-        .ok_or_else(overflow)?;
-    ledger.uploaded(dists, DType::U32)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -3715,10 +3852,12 @@ pub(super) mod tests {
     /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16, and
     /// 2.14 GiB before its Q/K/V were joined at their exact size.
     const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 1.65;
-    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16, and
+    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16,
     /// 6.49 GiB before its tied table was stored once in F16 and its fused
-    /// projections joined at their exact size.
-    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 5.06;
+    /// projections joined at their exact size, and 5.06 GiB while the
+    /// table's stored-dtype host read was priced beside its upload and its
+    /// transient beside a held sync interval.
+    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 4.40;
 
     /// A staged Metal loader casts on the host, so its uploads keep their
     /// exact sizes, and it synchronizes every interval of uploads, so the
