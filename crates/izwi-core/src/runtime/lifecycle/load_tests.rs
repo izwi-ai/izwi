@@ -3285,18 +3285,15 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// What load admission charged Qwen3-TTS 0.6B's weights at 0adabf16.
 const TTS_CHARGED_WEIGHT_BYTES: u64 = 2_493_807_108;
 
-/// Load TTS retained state through the engine's real load path the way
-/// `load_model` does for an unobserved (non-ASR) load, beside weights the
-/// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
-/// observer reports `observed` bytes in use.
-fn load_tts_retained_state(
+/// An engine core beside weights the ledger charged at
+/// [`TTS_CHARGED_WEIGHT_BYTES`] while the device observer reports
+/// `observed` bytes in use, and the lease that holds those weights.
+fn tts_state_core(
     variant: ModelVariant,
-    contract: &crate::kv::v2::InferenceStateContract,
-    maximum_tokens: usize,
     capacity: u64,
     available: u64,
     observed: u64,
-) -> crate::error::Result<u64> {
+) -> crate::error::Result<(crate::engine::EngineCore, ResourceLease)> {
     let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
         Arc::new(ObservedUnifiedProvider {
             capacity,
@@ -3308,7 +3305,7 @@ fn load_tts_retained_state(
         unified_bytes: ResourceAmount::Known(TTS_CHARGED_WEIGHT_BYTES),
         ..ResourceVector::zero()
     };
-    let _weights = authority.reserve_with_initial_materialized(
+    let weights = authority.reserve_with_initial_materialized(
         ReservationOwner::new(ReservationClass::Model, variant.to_string()),
         weights,
         weights,
@@ -3324,14 +3321,30 @@ fn load_tts_retained_state(
         ..Default::default()
     };
     config.portable_context_auto = true;
-    let mut core =
-        crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+    let core = crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+    Ok((core, weights))
+}
+
+/// Load TTS retained state through the engine's real load path the way
+/// `load_model` does for an unobserved (non-ASR) load, beside weights the
+/// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
+/// observer reports `observed` bytes in use.
+fn load_tts_retained_state(
+    variant: ModelVariant,
+    contract: &crate::kv::v2::InferenceStateContract,
+    maximum_tokens: usize,
+    capacity: u64,
+    available: u64,
+    observed: u64,
+) -> crate::error::Result<u64> {
+    let (mut core, _weights) = tts_state_core(variant, capacity, available, observed)?;
     let runtime = core.load_managed_model_state(
         ModelInstanceId::new(4_101),
         contract,
         Some(maximum_tokens),
         super::tts_state_minimum_tokens(variant),
         crate::engine::StateFitReserve::for_observed_load(false),
+        0,
     )?;
     Ok(runtime.logical_token_reach())
 }
@@ -3434,6 +3447,57 @@ fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_hea
         }
         other => panic!("expected a capacity refusal, got {other:?}"),
     }
+}
+
+/// S2: Qwen3-TTS binds one retained arena for its Tts and StreamingTts
+/// capabilities. The second capability gets the runtime the first fit
+/// bound; refitting it against the headroom that arena had already taken
+/// refused its 2,524-token floor after the weights had loaded. The first
+/// fit leaves the predictor workspaces loaded after it free.
+#[test]
+fn a_second_capability_reuses_the_bound_retained_runtime() {
+    use crate::models::architectures::qwen3::tts::{
+        qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+        tests::cache_test_config,
+    };
+    let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+    let config = cache_test_config();
+    let full = qwen3_tts_inference_state_contract(
+        &config,
+        candle_core::DType::F32,
+        candle_core::DType::F32,
+        crate::models::shared::attention::paged::default_kv_page_size(),
+    )
+    .unwrap();
+    let contract =
+        qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32).unwrap();
+    let budget = 11 * GIB + 440 * 1024 * 1024;
+    let load = |core: &mut crate::engine::EngineCore, later_minimum_bytes| {
+        core.load_managed_model_state(
+            ModelInstanceId::new(4_102),
+            &contract,
+            Some(1 << 20),
+            super::tts_state_minimum_tokens(variant),
+            crate::engine::StateFitReserve::for_observed_load(false),
+            later_minimum_bytes,
+        )
+    };
+
+    // Live memory lets the first fit grow to the planning floor budget.
+    let (mut core, _weights) = tts_state_core(variant, budget, budget, 6_000_000_000).unwrap();
+    let first = load(&mut core, 0).unwrap();
+    let second = load(&mut core, 0).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+
+    // Holding back a later workspace makes the first fit smaller.
+    let (mut core, _weights) = tts_state_core(variant, budget, budget, 6_000_000_000).unwrap();
+    let held = load(&mut core, 2 * GIB).unwrap();
+    assert!(
+        held.logical_token_reach() < first.logical_token_reach(),
+        "{} !< {}",
+        held.logical_token_reach(),
+        first.logical_token_reach()
+    );
 }
 
 /// Phase 0 state-ceiling contract: every TTS family whose load fits

@@ -232,11 +232,11 @@ impl ModelLifecycleController {
                     &physical_spec.invocation,
                     retained,
                     retained_uses,
-                    if capability == CapabilityKind::Asr {
+                    LaterStateGroups::sharing(if capability == CapabilityKind::Asr {
                         2
                     } else {
                         1
-                    },
+                    }),
                 )
                 .await?;
             publications.insert(capability, publication);
@@ -669,6 +669,7 @@ impl ModelLifecycleController {
                         Some(physical_spec.retained_max_tokens),
                         asr_minimum_tokens(variant),
                         state_fit_reserve,
+                        0,
                     )
                     .await?;
                 let retained_uses = contracts
@@ -873,7 +874,7 @@ impl ModelLifecycleController {
                             main_invocation,
                             Some(retained.into()),
                             retained_uses,
-                            remaining_automatic_state_groups,
+                            LaterStateGroups::sharing(remaining_automatic_state_groups),
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -887,9 +888,9 @@ impl ModelLifecycleController {
                         .map_or(physical_spec.retained_max_tokens, |tokens| {
                             physical_spec.retained_max_tokens.min(tokens)
                         });
-                    // The ASR fit above already sized this model's
-                    // retained runtime (bound to the same contract), so
-                    // this fit asks for no floor of its own.
+                    // The ASR fit above already bound this model's
+                    // retained runtime for the same contract; this call
+                    // returns it without fitting again.
                     let retained = self
                         .core_engine
                         .load_managed_model_state(
@@ -898,6 +899,7 @@ impl ModelLifecycleController {
                             Some(retained_max_tokens),
                             0,
                             state_fit_reserve,
+                            0,
                         )
                         .await?;
                     self.model_registry.publish_effective_context(
@@ -935,7 +937,7 @@ impl ModelLifecycleController {
                             depthformer,
                             Some(retained.into()),
                             retained_uses,
-                            remaining_automatic_state_groups,
+                            LaterStateGroups::sharing(remaining_automatic_state_groups),
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -955,7 +957,7 @@ impl ModelLifecycleController {
                         &physical_spec.invocation,
                         None,
                         HashMap::new(),
-                        remaining_automatic_state_groups,
+                        LaterStateGroups::sharing(remaining_automatic_state_groups),
                     )
                     .await?;
                 state_publications.insert(capability, publication);
@@ -984,6 +986,10 @@ impl ModelLifecycleController {
                         "loaded Qwen3 TTS model {variant} is missing from the registry"
                     ))
                 })?;
+            // Plan both capabilities first: the retained fit and each
+            // predictor fit must leave room for the predictor workspaces
+            // loaded after them.
+            let mut planned = Vec::with_capacity(2);
             for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
                 if self.adapter_registry.require(capability, variant).is_err() {
                     continue;
@@ -994,6 +1000,27 @@ impl ModelLifecycleController {
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                // At its context floor, if it has a context axis.
+                let floor = physical_spec
+                    .descriptor
+                    .capacity_axis_bounds(StateCapacityAxis::DecoderContext)
+                    .map(|(minimum, _)| minimum);
+                let predictor_bytes = invocation_state_bytes(
+                    &physical_spec.descriptor,
+                    &physical_spec.predictor_contract,
+                    &contracts,
+                    floor,
+                )?;
+                planned.push((capability, contracts, physical_spec, predictor_bytes));
+            }
+            let mut later_predictor_bytes = planned
+                .iter()
+                .try_fold(0_u64, |total, (.., bytes)| total.checked_add(*bytes))
+                .ok_or_else(|| {
+                    Error::ModelLoadError("Qwen3-TTS state byte plan overflow".into())
+                })?;
+            let mut remaining_groups = u64::try_from(planned.len()).unwrap_or(u64::MAX);
+            for (capability, contracts, physical_spec, predictor_bytes) in planned {
                 if !managed_kv_backend_compiled(backend) {
                     return Err(Error::ModelLoadError(format!(
                         "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
@@ -1005,6 +1032,9 @@ impl ModelLifecycleController {
                     .map_or(physical_spec.retained_max_tokens, |tokens| {
                         physical_spec.retained_max_tokens.min(tokens)
                     });
+                // Both capabilities bind one retained arena: the first call
+                // fits it, leaving both predictor workspaces free; the second
+                // gets the bound runtime back.
                 let retained = self
                     .core_engine
                     .load_managed_model_state(
@@ -1013,8 +1043,12 @@ impl ModelLifecycleController {
                         Some(retained_max_tokens),
                         tts_state_minimum_tokens(variant),
                         state_fit_reserve,
+                        later_predictor_bytes,
                     )
                     .await?;
+                // This capability's predictor is fitted next; only the ones
+                // after it stay held back.
+                later_predictor_bytes = later_predictor_bytes.saturating_sub(predictor_bytes);
                 // Each request reserves the encoder memory it creates
                 // (prefill workspace), so the rows are not also pending.
                 self.core_engine
@@ -1065,18 +1099,13 @@ impl ModelLifecycleController {
                         &physical_spec.predictor_contract,
                         Some(retained.into()),
                         retained_uses,
-                        if capability == CapabilityKind::Tts
-                            && self
-                                .adapter_registry
-                                .require(CapabilityKind::StreamingTts, variant)
-                                .is_ok()
-                        {
-                            3
-                        } else {
-                            1
+                        LaterStateGroups {
+                            remaining: remaining_groups,
+                            minimum_bytes: later_predictor_bytes,
                         },
                     )
                     .await?;
+                remaining_groups = remaining_groups.saturating_sub(1);
                 state_publications.insert(capability, publication);
             }
         }
@@ -1128,6 +1157,7 @@ impl ModelLifecycleController {
                     retained_max_tokens,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
+                    0,
                 )
                 .await?;
             self.model_registry.publish_effective_context(
@@ -1264,6 +1294,7 @@ impl ModelLifecycleController {
                     Some(physical_spec.retained_max_tokens),
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
+                    0,
                 )
                 .await?;
             self.model_registry.publish_effective_context(

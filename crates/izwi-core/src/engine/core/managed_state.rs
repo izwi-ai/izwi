@@ -245,6 +245,7 @@ impl EngineCore {
         logical_context_tokens: Option<usize>,
         minimum_tokens: u64,
         reserve: StateFitReserve,
+        later_minimum_bytes: u64,
     ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
         let rows = (
             self.config.max_retained_sequences,
@@ -258,6 +259,7 @@ impl EngineCore {
             rows,
             minimum_tokens,
             reserve,
+            later_minimum_bytes,
         )
     }
 
@@ -277,6 +279,11 @@ impl EngineCore {
     /// concurrency. `minimum_tokens` is the floor every sequence must reach
     /// (one ASR chunk, one TTS prompt plus its output budget); a floor that
     /// planning headroom cannot hold refuses the load with `Overloaded`.
+    /// `later_minimum_bytes` is what the state the load fits after this one
+    /// needs at its minimums; the fit leaves it free. An instance that
+    /// already bound this contract (another capability of the same model)
+    /// gets that runtime back without a second fit: refitting against the
+    /// headroom the first fit took refused the floor the arena already met.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_managed_model_state_with_portable_copies_and_rows(
         &mut self,
@@ -287,6 +294,7 @@ impl EngineCore {
         (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
         reserve: StateFitReserve,
+        later_minimum_bytes: u64,
     ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
         if retained_rows == 0
             || staged_rows == 0
@@ -298,6 +306,12 @@ impl EngineCore {
             ));
         }
         let backend = self.managed_kv_cache.worker_backend();
+        if let Some(runtime) =
+            self.managed_kv_cache
+                .bound_runtime(model_instance, backend, retained_state)?
+        {
+            return Ok(runtime);
+        }
         // ASR and TTS retained state fit within live memory so the requests
         // they serve can run beside them; the floor is admitted against
         // planning headroom.
@@ -311,6 +325,7 @@ impl EngineCore {
             PortableFitHeadroom::Live {
                 minimum_tokens,
                 reserve,
+                later_minimum_bytes,
             },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
@@ -363,6 +378,12 @@ impl EngineCore {
             ));
         }
         let backend = self.managed_kv_cache.worker_backend();
+        if let Some(runtime) =
+            self.managed_kv_cache
+                .bound_runtime(model_instance, backend, retained_state)?
+        {
+            return Ok(runtime);
+        }
         let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
@@ -419,6 +440,7 @@ impl EngineCore {
             PortableFitHeadroom::Live {
                 minimum_tokens,
                 reserve: StateFitReserve::MeasuredUntracked,
+                later_minimum_bytes: 0,
             },
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)

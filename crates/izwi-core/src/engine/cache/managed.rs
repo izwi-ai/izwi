@@ -483,9 +483,13 @@ pub(crate) enum PortableFitHeadroom {
     /// `minimum_tokens` is the floor each sequence must reach (one ASR chunk,
     /// or one TTS prompt plus its output budget; `0`: the page minimum); it
     /// is admitted against planning headroom or the load is refused.
+    /// `later_minimum_bytes` is what the state groups the load fits after
+    /// this one need at their minimums: the fit leaves it free beside the
+    /// safety reserve, so it never takes the room a later floor needs.
     Live {
         minimum_tokens: u64,
         reserve: StateFitReserve,
+        later_minimum_bytes: u64,
     },
 }
 

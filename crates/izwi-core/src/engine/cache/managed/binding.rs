@@ -518,6 +518,29 @@ impl ManagedKvCacheManager {
         )
     }
 
+    /// The runtime `model_instance` already bound for `contract`, if any:
+    /// every capability of one model generation shares one retained arena.
+    /// An incompatible contract for a bound instance is an error.
+    pub(crate) fn bound_runtime(
+        &self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        contract: &InferenceStateContract,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        let Some(state) = self.models.get(&model_instance) else {
+            return Ok(None);
+        };
+        if &state.contract != contract
+            || state.runtime.plan.backend != backend
+            || state.runtime.state_plan_v2.contract_fingerprint != contract.fingerprint()?
+        {
+            return Err(Error::InvalidInput(
+                "one loaded model instance published incompatible managed KV contracts".to_string(),
+            ));
+        }
+        Ok(Some(state.runtime.clone()))
+    }
+
     pub(super) fn bind_model_state_with_capacity_policy(
         &mut self,
         model_instance: ModelInstanceId,
@@ -528,17 +551,8 @@ impl ManagedKvCacheManager {
         materialize_cuda_paged_at_load: bool,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         validate_sliding_contract(contract, backend)?;
-        if let Some(state) = self.models.get(&model_instance) {
-            if &state.contract != contract
-                || state.runtime.plan.backend != backend
-                || state.runtime.state_plan_v2.contract_fingerprint != contract.fingerprint()?
-            {
-                return Err(Error::InvalidInput(
-                    "one loaded model instance published incompatible managed KV contracts"
-                        .to_string(),
-                ));
-            }
-            return Ok(state.runtime.clone());
+        if let Some(runtime) = self.bound_runtime(model_instance, backend, contract)? {
+            return Ok(runtime);
         }
         if backend != self.worker_backend {
             return Err(Error::InvalidInput(format!(

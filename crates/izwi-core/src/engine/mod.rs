@@ -3315,6 +3315,7 @@ impl Engine {
         logical_context_tokens: Option<usize>,
         minimum_tokens: u64,
         reserve: StateFitReserve,
+        later_minimum_bytes: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_state(
@@ -3323,6 +3324,7 @@ impl Engine {
                 logical_context_tokens,
                 minimum_tokens,
                 reserve,
+                later_minimum_bytes,
             )
         })
         .await
@@ -3378,6 +3380,7 @@ impl Engine {
                 minimum_tokens,
                 // ASR loads reconcile their observed weight growth.
                 StateFitReserve::MeasuredUntracked,
+                0,
             )
         })
         .await

@@ -70,6 +70,7 @@ use checkpoint::{
     checkpoint_census, estimate_from_tensor_inventory, fish_s2_resource_plan,
     qwen38_representation_memory_estimate, CheckpointCensus,
 };
+use invocation::{invocation_state_bytes, LaterStateGroups};
 #[cfg(test)]
 use invocation::{
     plan_invocation_allocations, validate_physical_publication_backing,

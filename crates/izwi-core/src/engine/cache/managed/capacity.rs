@@ -749,14 +749,23 @@ impl ManagedKvCacheManager {
         let ResourceAmount::Known(headroom_bytes) = planning else {
             return Ok(maximum_tokens.min(4_096));
         };
+        let later_minimum_bytes = match headroom {
+            PortableFitHeadroom::Live {
+                later_minimum_bytes,
+                ..
+            } => later_minimum_bytes,
+            PortableFitHeadroom::Planning { .. } => 0,
+        };
         // The model-authored minimum is admitted against planning headroom;
         // live memory caps only growth above it. Right after a large load the
         // live sample undercounts what the OS reclaims on demand (clean
         // file-backed pages of the checkpoint just read, compressible
-        // pages), so a live floor refused even a one-page state.
-        let floor_budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        // pages), so a live floor refused even a one-page state. Both leave
+        // the later groups' minimums free beside the reserve.
+        let held_bytes = safety_reserve_bytes.saturating_add(later_minimum_bytes);
+        let floor_budget_bytes = headroom_bytes.saturating_sub(held_bytes);
         let growth_budget_bytes = match growth_headroom {
-            ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+            ResourceAmount::Known(bytes) => bytes.saturating_sub(held_bytes),
             ResourceAmount::Unknown => floor_budget_bytes,
         }
         .min(floor_budget_bytes);
@@ -811,14 +820,19 @@ impl ManagedKvCacheManager {
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
             tracing::warn!(
-                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
+                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, later_minimum_bytes={later_minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
                 minimum_bytes - floor_budget_bytes
             );
+            let subject = if later_minimum_bytes > 0 {
+                format!(
+                    "not enough memory for this model's minimum {minimum_tokens}-token state and the working state loaded after it"
+                )
+            } else {
+                format!("not enough memory for this model's minimum {minimum_tokens}-token state")
+            };
             let message = crate::engine::resources::state_shortfall_reason(
-                format_args!(
-                    "not enough memory for this model's minimum {minimum_tokens}-token state"
-                ),
-                minimum_bytes,
+                subject,
+                minimum_bytes.saturating_add(later_minimum_bytes),
                 headroom_bytes,
                 safety_reserve_bytes,
             );
