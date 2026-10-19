@@ -1129,6 +1129,14 @@ impl ParakeetAsrModel {
 
         let blank_idx = network.blank_idx;
         let num_durations = network.num_durations;
+        // The model loaded from the extracted checkpoint: its `.nemo` is
+        // no longer needed.
+        if let Some(artifacts) = &artifacts {
+            crate::models::shared::weights::nemo::release_extracted_nemo(
+                &artifacts.nemo_path,
+                nemo::parakeet_native_artifacts_complete(model_dir, variant),
+            );
+        }
 
         Ok(Self {
             variant,

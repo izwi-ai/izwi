@@ -2261,20 +2261,22 @@ impl ModelDownloader {
 
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
+        // The published files' sizes (unsloth Qwen3.5 GGUF and LiquidAI
+        // LFM2.5-Audio repositories, 2026-10-19).
         if file == "mmproj-F16.gguf" {
             match variant {
-                ModelVariant::Qwen3508BGguf => 52_000_000,
-                ModelVariant::Qwen352BGguf => 98_000_000,
-                ModelVariant::Qwen354BGguf => 140_000_000,
-                ModelVariant::Qwen359BGguf => 230_000_000,
-                _ => 120_000_000,
+                ModelVariant::Qwen3508BGguf => 204_987_232,
+                ModelVariant::Qwen352BGguf => 668_227_264,
+                ModelVariant::Qwen354BGguf => 672_423_616,
+                ModelVariant::Qwen359BGguf => 918_166_080,
+                _ => 670_000_000,
             }
         } else if file == "mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf" {
-            220_000_000
+            219_511_136
         } else if file == "tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf" {
-            110_000_000
+            50_546_112
         } else if file == "vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf" {
-            150_000_000
+            108_986_560
         } else if file.ends_with(".gguf") {
             let lower = file.to_ascii_lowercase();
             if file.contains("Qwen3-14B") {

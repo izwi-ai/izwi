@@ -707,6 +707,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off.",
     ),
     CoreEnvVar::new(
+        "IZWI_KEEP_NEMO_ARCHIVES",
+        Flag,
+        "false",
+        Load,
+        "Keeps the Parakeet and Nemotron ASR .nemo archives after a load from their extracted checkpoints; by default they are deleted (2.4-2.5 GB each).",
+    ),
+    CoreEnvVar::new(
         "IZWI_KOKORO_CPU_PREDECODER",
         Flag,
         "true",

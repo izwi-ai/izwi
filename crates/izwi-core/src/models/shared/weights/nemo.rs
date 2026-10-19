@@ -52,6 +52,34 @@ pub(crate) fn ensure_free_disk(location: &Path, required_bytes: u64, purpose: &s
 }
 
 /// Open a `.nemo` archive, gunzipping it when it carries the gzip magic.
+/// Delete a `.nemo` archive once a load has read the checkpoint extracted
+/// from it (`extracted_complete`): the archive is only the extraction's
+/// source, and kept 2.4-2.5 GB of disk per model beside it (B6). A family
+/// that re-extracts when its format changes (the Sortformer diarizers) must
+/// keep its archive. `IZWI_KEEP_NEMO_ARCHIVES` keeps every archive. A failure
+/// to delete is logged, never fatal.
+pub(crate) fn release_extracted_nemo(nemo_path: &Path, extracted_complete: bool) {
+    if !extracted_complete
+        || !nemo_path.is_file()
+        || crate::env::flag_or("IZWI_KEEP_NEMO_ARCHIVES", false)
+    {
+        return;
+    }
+    let bytes = fs::metadata(nemo_path).map(|meta| meta.len()).unwrap_or(0);
+    match fs::remove_file(nemo_path) {
+        Ok(()) => tracing::info!(
+            archive = %nemo_path.display(),
+            reclaimed_bytes = bytes,
+            "Deleted the .nemo archive; its extracted checkpoint replaces it"
+        ),
+        Err(error) => tracing::warn!(
+            archive = %nemo_path.display(),
+            %error,
+            "Could not delete the extracted .nemo archive"
+        ),
+    }
+}
+
 pub(crate) fn open_nemo_archive(nemo_path: &Path) -> Result<Archive<Box<dyn Read>>> {
     let mut file = File::open(nemo_path).map_err(|e| {
         Error::ModelLoadError(format!(
@@ -138,5 +166,34 @@ mod tests {
         assert!(error.contains("extracting x"), "{error}");
         assert!(error.contains("required_bytes=10"), "{error}");
         assert!(check_free_disk(u64::MAX, u64::MAX, location, "test").is_ok());
+    }
+
+    /// An archive goes once a load has read its complete extraction, unless
+    /// `IZWI_KEEP_NEMO_ARCHIVES` keeps it; an incomplete extraction keeps it.
+    #[test]
+    fn extracted_archives_are_released_unless_kept() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("izwi-nemo-release-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("model.nemo");
+        std::fs::write(&archive, b"archive").unwrap();
+
+        super::release_extracted_nemo(&archive, false);
+        assert!(archive.is_file(), "incomplete extraction keeps the archive");
+        std::env::set_var("IZWI_KEEP_NEMO_ARCHIVES", "1");
+        super::release_extracted_nemo(&archive, true);
+        std::env::remove_var("IZWI_KEEP_NEMO_ARCHIVES");
+        assert!(
+            archive.is_file(),
+            "IZWI_KEEP_NEMO_ARCHIVES keeps the archive"
+        );
+        super::release_extracted_nemo(&archive, true);
+        assert!(
+            !archive.exists(),
+            "a complete extraction releases the archive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

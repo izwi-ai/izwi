@@ -2030,6 +2030,12 @@ impl NemotronAsrModel {
             if weight_precision.projections_f16 { "F16" } else { "the model dtype" },
             weight_precision.reason
         );
+        // The model loaded from the extracted checkpoint: its `.nemo` is no
+        // longer needed.
+        crate::models::shared::weights::nemo::release_extracted_nemo(
+            &artifacts.nemo_path,
+            nemo::nemotron_native_artifacts_complete(model_dir, variant),
+        );
 
         Ok(Self {
             variant,

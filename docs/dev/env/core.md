@@ -110,6 +110,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
 | `IZWI_HOST` | text | `127.0.0.1` | startup | Sets the HTTP server bind address. |
 | `IZWI_INFERENCE_BROKER` | choice | `off` | startup | Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off. |
+| `IZWI_KEEP_NEMO_ARCHIVES` | flag | `false` | model load | Keeps the Parakeet and Nemotron ASR .nemo archives after a load from their extracted checkpoints; by default they are deleted (2.4-2.5 GB each). |
 | `IZWI_KOKORO_CPU_PREDECODER` | flag | `true` | first use | Runs the Kokoro CPU pre-decoder stages in parallel; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_RESBLOCKS` | flag | `true` | first use | Runs Kokoro decoder residual-block kernels in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_STAGE_BRANCHES` | flag | `true` | first use | Runs the two branches of each Kokoro generator upsample stage in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
