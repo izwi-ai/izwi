@@ -5,6 +5,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { cva, type VariantProps } from "class-variance-authority"
 import { X } from "lucide-react"
 
+import { useReturnFocus } from "@/lib/returnFocus"
 import { cn } from "@/lib/utils"
 
 const Sheet = DialogPrimitive.Root
@@ -57,13 +58,17 @@ interface SheetContentProps
 const SheetContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   SheetContentProps
->(({ side = "right", className, children, ...props }, ref) => (
+>(({ side = "right", className, children, onOpenAutoFocus, onCloseAutoFocus, ...props }, ref) => {
+  const returnFocus = useReturnFocus(onOpenAutoFocus, onCloseAutoFocus)
+  return (
   <SheetPortal>
     <SheetOverlay />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(sheetVariants({ side }), className)}
       {...props}
+      onOpenAutoFocus={returnFocus.onOpenAutoFocus}
+      onCloseAutoFocus={returnFocus.onCloseAutoFocus}
     >
       {children}
       <DialogPrimitive.Close className="absolute right-4 top-4 rounded-md border border-border/70 bg-muted/55 p-1 text-muted-foreground ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring/45 focus:ring-offset-2 disabled:pointer-events-none">
@@ -72,7 +77,8 @@ const SheetContent = React.forwardRef<
       </DialogPrimitive.Close>
     </DialogPrimitive.Content>
   </SheetPortal>
-))
+  )
+})
 SheetContent.displayName = DialogPrimitive.Content.displayName
 
 const SheetHeader = ({

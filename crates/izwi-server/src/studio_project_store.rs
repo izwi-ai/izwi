@@ -2249,7 +2249,7 @@ pub fn apply_pronunciations(text: &str, rules: &[StudioProjectPronunciationRecor
     if rules.is_empty() {
         return text.to_string();
     }
-    rules.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    rules.sort_by_key(|rule| std::cmp::Reverse(rule.0.len()));
 
     let chars = text.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(text.len());

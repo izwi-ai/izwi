@@ -23,7 +23,7 @@ export function NewItemButton({
     >
       <Plus className="h-4 w-4" />
       {label}
-      <kbd aria-hidden="true" className="font-sans text-[11px] opacity-55">
+      <kbd aria-hidden="true" className="font-sans text-[11px] opacity-70">
         {isMacPlatform() ? "⌘N" : "Ctrl N"}
       </kbd>
     </Button>

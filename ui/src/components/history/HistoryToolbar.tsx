@@ -131,7 +131,7 @@ export function SegmentedFilter<T extends string>({
             {option.label}
             {count != null ? " " : null}
             {count != null ? (
-              <span className="text-[11px] text-[var(--text-subtle)]">
+              <span className="text-[11px] text-[var(--text-muted)]">
                 {count}
               </span>
             ) : null}
