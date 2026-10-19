@@ -613,6 +613,23 @@ impl Ledger {
         self.apply(step)
     }
 
+    /// [`Self::fused`] for a join built at its exact size
+    /// (`memory::exact::exact_concat_rows`): the joined buffer is allocated
+    /// outside Candle's pool, so on Metal it is not rounded up.
+    fn fused_exact(
+        &mut self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+    ) -> Result<()> {
+        let mut step = self.fused_step(parts, source, dtype, 0)?;
+        if self.metal() {
+            step.high = sum(&[step.high.saturating_sub(step.resident), step.logical])?;
+            step.resident = step.logical;
+        }
+        self.apply(step)
+    }
+
     fn fused_step(
         &self,
         parts: &[&CensusTensor],
@@ -1922,8 +1939,9 @@ fn granite_plan(
 /// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
 /// and down_proj read at F16 (when selective) and then pre-scaled by the
-/// residual multiplier, and
-/// an F16 copy of a tied embedding as the LM head. The encoder and projector
+/// residual multiplier, the fused projections joined at their exact size,
+/// and a tied embedding stored once in F16 when the LM head is F16. The
+/// encoder and projector
 /// read at the audio dtype, with the encoder projections converted to F16 on
 /// the host under weight-only F16. Each encoder layer adds a host-built U32
 /// attention distance table.
@@ -1977,7 +1995,7 @@ fn price_granite(
             .map(|part| tensor(&tensors, &format!("{stem}.{part}.weight")))
             .collect::<Result<Vec<_>>>()?;
         if fuse {
-            ledger.fused(&parts, Source::Mapped, part_dtype, 0)?;
+            ledger.fused_exact(&parts, Source::Mapped, part_dtype)?;
         } else {
             for part in &parts {
                 ledger.var(part, Source::Mapped, &[part_dtype])?;
@@ -2010,11 +2028,12 @@ fn price_granite(
                 Source::Mapped,
                 &[half_if(representation.f16_lm_head)],
             )?;
+        } else if *name == EMBEDDING && load.tied_lm_head && representation.f16_lm_head {
+            // One F16 table serves the embedding (rows cast to the base
+            // dtype) and the tied F16 head.
+            ledger.var(tensor, Source::Mapped, &[DType::F16])?;
         } else {
             ledger.var(tensor, Source::Mapped, &[dtype])?;
-            if *name == EMBEDDING && load.tied_lm_head && representation.f16_lm_head {
-                ledger.derived(tensor.elements(), DType::F16, &[])?;
-            }
         }
     }
     let (layers, context) = load.encoder_attention_dists;
@@ -2895,7 +2914,7 @@ pub(super) mod tests {
             (
                 "Granite-Speech-Plus",
                 Box::new(granite),
-                [7.87, 4.78, 5.06, 3.93],
+                [7.87, 4.02, 4.02, 3.94],
             ),
             (
                 "VibeVoice-ASR",
@@ -3240,8 +3259,10 @@ pub(super) mod tests {
     /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
     /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16.
     const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 2.14;
-    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16.
-    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 6.49;
+    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16, and
+    /// 6.49 GiB before its tied table was stored once in F16 and its fused
+    /// projections joined at their exact size.
+    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 5.06;
 
     /// A staged Metal loader casts on the host, so its uploads keep their
     /// exact sizes, and it synchronizes every interval of uploads, so the
@@ -3419,7 +3440,7 @@ pub(super) mod tests {
     /// A Granite checkpoint with an untied LM head (the base variant) loads
     /// it from the checkpoint, in F16 on Metal, and makes no embedding copy.
     #[test]
-    fn granite_prices_a_tied_head_copy_or_an_untied_head() {
+    fn granite_prices_one_shared_f16_table_or_an_untied_head() {
         let tensor = |name: &str, shape: Vec<usize>| {
             census_tensor(name.into(), StoredDType::Dense(DType::BF16), shape)
         };
@@ -3444,14 +3465,13 @@ pub(super) mod tests {
                 .logical_resident_bytes
         };
         let embedding_f32 = 1000 * 64 * 4;
-        let head_f16 = 1000 * 64 * 2;
-        assert_eq!(
-            price(vec![embedding.clone()], true),
-            embedding_f32 + head_f16
-        );
+        let table_f16 = 1000 * 64 * 2;
+        // Tied with an F16 head: one F16 table serves both.
+        assert_eq!(price(vec![embedding.clone()], true), table_f16);
+        // Untied: the F32 embedding and the F16 head.
         assert_eq!(
             price(vec![embedding, head], false),
-            embedding_f32 + head_f16
+            embedding_f32 + table_f16
         );
     }
 

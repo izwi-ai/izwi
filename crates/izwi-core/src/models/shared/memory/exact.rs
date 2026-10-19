@@ -29,6 +29,44 @@ pub(crate) fn exact_zeros<S: Into<Shape>>(
     Ok(Tensor::zeros(shape, dtype, device)?)
 }
 
+/// `parts` joined along dimension 0 into one tensor whose Metal buffer is
+/// exactly its size. `Tensor::cat` draws its result from Candle's pool,
+/// rounded up to the next power of two, so a fused projection weight built
+/// with it can waste up to half its size for the model's life (Granite
+/// Speech's joined Q/K/V: 9.8 MB per layer held in 16 MiB).
+pub(crate) fn exact_concat_rows(parts: &[&Tensor]) -> Result<Tensor> {
+    let first = parts.first().ok_or_else(|| {
+        crate::error::Error::InvalidInput("cannot concatenate zero tensors".into())
+    })?;
+    let mut dims = first.dims().to_vec();
+    if dims.is_empty() {
+        return Err(crate::error::Error::InvalidInput(
+            "cannot concatenate scalar tensors".into(),
+        ));
+    }
+    let mut rows = 0;
+    for part in parts {
+        if part.dtype() != first.dtype() || part.dims()[1..] != dims[1..] {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "cannot concatenate {:?} {:?} with {:?} {:?} along rows",
+                first.dtype(),
+                first.dims(),
+                part.dtype(),
+                part.dims()
+            )));
+        }
+        rows += part.dim(0)?;
+    }
+    dims[0] = rows;
+    let joined = exact_zeros(dims, first.dtype(), first.device())?;
+    let mut offset = 0;
+    for part in parts {
+        joined.slice_set(&part.contiguous()?, 0, offset)?;
+        offset += part.dim(0)?;
+    }
+    Ok(joined)
+}
+
 /// [`exact_zeros`] as a [`Var`], for state written in place.
 pub(crate) fn exact_zeros_var<S: Into<Shape>>(
     shape: S,
@@ -81,6 +119,26 @@ fn metal_exact_zeros(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_concat_rows_equals_cat() {
+        let device = Device::Cpu;
+        let a = Tensor::arange(0f32, 6.0, &device)
+            .unwrap()
+            .reshape((2, 3))
+            .unwrap();
+        let b = Tensor::arange(6f32, 15.0, &device)
+            .unwrap()
+            .reshape((3, 3))
+            .unwrap();
+        let joined = exact_concat_rows(&[&a, &b]).unwrap();
+        let expected = Tensor::cat(&[&a, &b], 0).unwrap();
+        assert_eq!(
+            joined.to_vec2::<f32>().unwrap(),
+            expected.to_vec2::<f32>().unwrap()
+        );
+        assert!(exact_concat_rows(&[&a, &a.t().unwrap()]).is_err());
+    }
 
     #[test]
     fn exact_zeros_is_zeroed_with_the_requested_shape() {

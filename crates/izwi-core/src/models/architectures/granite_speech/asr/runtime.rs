@@ -34,6 +34,7 @@ use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::memory::exact::exact_concat_rows;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
@@ -2560,8 +2561,34 @@ fn cached_linear_no_bias_forward(x: &Tensor, weight_t: &Tensor) -> Result<Tensor
     }
 }
 
+/// The language model's token embedding, in the model's base dtype. With a
+/// tied head served in F16 (the selective F16 LM head), the table is stored
+/// once in F16, gathered rows are cast to the base dtype, and the head shares
+/// it. Keeping an F32 table beside an F16 copy for the head held 0.82 GB +
+/// 0.54 GB (rounded) for the 2B checkpoint's 100,353 x 2,048 vocabulary.
+struct GraniteTokenEmbedding {
+    table: Embedding,
+    dtype: DType,
+}
+
+impl GraniteTokenEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let rows = self.table.forward(ids)?;
+        if rows.dtype() == self.dtype {
+            Ok(rows)
+        } else {
+            rows.to_dtype(self.dtype).map_err(Error::from)
+        }
+    }
+
+    /// The model's base dtype.
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 struct GraniteLanguageModel {
-    embed_tokens: Embedding,
+    embed_tokens: GraniteTokenEmbedding,
     layers: Vec<GraniteDecoderLayer>,
     norm: RmsNorm,
     lm_head: GraniteLinearNoBias,
@@ -2578,11 +2605,25 @@ impl GraniteLanguageModel {
         vb: VarBuilder,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
-        let embed_tokens = embedding(
-            config.vocab_size,
-            config.hidden_size,
-            vb.pp("model.embed_tokens"),
-        )?;
+        let shared_f16_head = tie_word_embeddings && execution_plan.selective_f16_lm_head;
+        let embed_tokens = GraniteTokenEmbedding {
+            table: if shared_f16_head {
+                // Converted from the checkpoint on load, not cast on the
+                // device from an F32 copy.
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("model.embed_tokens").to_dtype(DType::F16),
+                )?
+            } else {
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("model.embed_tokens"),
+                )?
+            },
+            dtype: vb.dtype(),
+        };
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let residual_branches_prescaled = granite_residual_prescale_enabled(vb.device());
         for idx in 0..config.num_hidden_layers {
@@ -2596,12 +2637,9 @@ impl GraniteLanguageModel {
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if tie_word_embeddings {
-            let weight = if execution_plan.selective_f16_lm_head {
-                embed_tokens.embeddings().to_dtype(DType::F16)?
-            } else {
-                embed_tokens.embeddings().clone()
-            };
-            Linear::new(weight, None)
+            // The table is already in the head's dtype (F16 for the
+            // selective F16 head, the base dtype otherwise): share it.
+            Linear::new(embed_tokens.table.embeddings().clone(), None)
         } else {
             let lm_head_vb = if execution_plan.selective_f16_lm_head {
                 vb.to_dtype(DType::F16)
@@ -2635,7 +2673,7 @@ impl GraniteLanguageModel {
         if self.execution_plan.f16_attention_core {
             DType::F16
         } else {
-            self.embed_tokens.embeddings().dtype()
+            self.embed_tokens.dtype()
         }
     }
 
@@ -2682,7 +2720,7 @@ impl GraniteLanguageModel {
             return Ok(None);
         };
         let dtype = granite_rope_cache_dtype(
-            self.embed_tokens.embeddings().dtype(),
+            self.embed_tokens.dtype(),
             layer.self_attn.f16_attention_core,
             granite_rope_cache_attention_dtype_enabled(&self.device),
         );
@@ -2699,13 +2737,13 @@ impl GraniteLanguageModel {
     fn embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
         let ids = input_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
         let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
-        self.embed_tokens.forward(&ids).map_err(Error::from)
+        self.embed_tokens.forward(&ids)
     }
 
     /// Whether any part of the LM runs below F32: a lower base dtype, or the
     /// selective F16 projections and attention core on an F32 base.
     fn runs_below_f32(&self) -> bool {
-        self.embed_tokens.embeddings().dtype() != DType::F32 || self.execution_plan.any_f16()
+        self.embed_tokens.dtype() != DType::F32 || self.execution_plan.any_f16()
     }
 
     /// The load-time range probe: `tokens` xorshift-chosen token ids through
@@ -3246,7 +3284,9 @@ impl GraniteTextFusedQkvProjection {
                 "Granite fused QKV projection input dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
+        // Joined at its exact size: a pooled `Tensor::cat` result is rounded
+        // up to a power of two for the model's life.
+        let weight = exact_concat_rows(&[q_weight, k_weight, v_weight])?;
         Ok(Self {
             fused: GraniteLinearNoBias::from_weight(weight)?,
             q_out,
@@ -3900,7 +3940,7 @@ impl GraniteTextFusedGateUpProjection {
                 "Granite fused MLP projection dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
+        let weight = exact_concat_rows(&[gate_weight, up_weight])?;
         Ok(Self {
             fused: GraniteLinearNoBias::from_weight(weight)?,
             intermediate_size,
@@ -4703,7 +4743,7 @@ mod tests {
         .unwrap();
         let layer = &model.layers[0];
 
-        assert_eq!(model.embed_tokens.embeddings().dtype(), DType::F32);
+        assert_eq!(model.embed_tokens.dtype(), DType::F32);
         assert_eq!(model.lm_head.weight().dtype(), DType::F16);
         assert_eq!(
             layer.self_attn.qkv_proj.projection.weight_dtype().unwrap(),
