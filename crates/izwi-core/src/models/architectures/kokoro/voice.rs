@@ -10,9 +10,13 @@ use crate::error::{Error, Result};
 
 pub(crate) const KOKORO_MODEL_MEMO_MAX_BYTES: u64 = (510 * 256 * std::mem::size_of::<f32>()) as u64;
 
+/// One style row copied out of its voice pack into storage of its own, at
+/// its exact size: an `affine` copy drew from Candle's pool, which on Metal
+/// can hand a 1 KiB row a free 256 KiB buffer, and request accounting
+/// (which counts backing buffers) then refused the request for holding more
+/// than it was authorized (B2).
 fn detached_style_row(pack: &Tensor, index: usize) -> Result<Tensor> {
-    pack.i((index, .., ..))?
-        .affine(1.0, 0.0)
+    crate::models::shared::memory::accounting::deep_copy_tensor_storage(&pack.i((index, .., ..))?)
         .map_err(Error::from)
 }
 
