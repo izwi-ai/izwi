@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module};
+use candle_nn::Module;
 use candle_transformers::models::with_tracing::QMatMul;
 
 use crate::backends::kv::{
@@ -17,6 +17,7 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use crate::models::shared::sampling::device_resident_top_k_sample;
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
+use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::config::Lfm25AudioDecoderConfig;
 use super::sampling::{
@@ -33,7 +34,7 @@ const DEPTHFORMER_NORM_EPS: f64 = 1e-5;
 const DEPTHFORMER_ROPE_BASE: f64 = 1_000_000.0;
 
 pub struct Lfm25AudioHead {
-    frame_embedding: Embedding,
+    frame_embedding: QuantizedTokenTable,
     codebook_offsets: Vec<u32>,
     codebook_offsets_tensor: Tensor,
     depth_linear: QLinear,
@@ -114,7 +115,7 @@ impl Lfm25AudioHead {
         hidden_size: usize,
         device: &Device,
     ) -> Result<Self> {
-        let frame_embedding = load_embedding_any(
+        let frame_embedding = load_token_table_any(
             loader,
             device,
             &[
@@ -190,7 +191,7 @@ impl Lfm25AudioHead {
         }
 
         let token_ids = Tensor::from_vec(offset_tokens, (1, self.codebooks), device)?;
-        let embeds = self.frame_embedding.forward(&token_ids)?;
+        let embeds = self.frame_embedding.embed(&token_ids)?;
         let embeds = embeds.sum(1)?;
         embeds.unsqueeze(1).map_err(Error::from)
     }
@@ -545,7 +546,7 @@ impl Lfm25AudioHead {
             .contiguous()?;
         let embedding = self
             .frame_embedding
-            .forward(&token_ids)?
+            .embed(&token_ids)?
             .sum(1)?
             .unsqueeze(1)?;
         let samples = (0..self.codebooks)
@@ -1171,7 +1172,7 @@ impl DepthMlp {
 }
 
 struct CodebookEmbeddingHead {
-    embedding: Embedding,
+    embedding: QuantizedTokenTable,
     norm: DepthRmsNorm,
     to_logits: QLinear,
     /// Codes this head may emit: all 2049 for codebook 0, below the
@@ -1213,7 +1214,7 @@ impl CodebookEmbeddingHead {
         idx: usize,
         audio_end_token_id: u32,
     ) -> Result<Self> {
-        let embedding = load_embedding_any(
+        let embedding = load_token_table_any(
             loader,
             device,
             &[format!("depth_embeddings.{idx}.embedding.weight")],
@@ -1250,7 +1251,7 @@ impl CodebookEmbeddingHead {
     }
 
     fn embed_token_tensor(&self, token: &Tensor) -> Result<Tensor> {
-        let embed = self.embedding.forward(token)?;
+        let embed = self.embedding.embed(token)?;
         embed.squeeze(0).map_err(Error::from)
     }
 
@@ -1377,12 +1378,14 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Embedding> {
-    let weight = load_qtensor_any(loader, device, names)?
-        .dequantize(device)
-        .map_err(Error::from)?;
-    let (_, dim) = weight.dims2()?;
-    Ok(Embedding::new(weight, dim))
+/// An embedding table kept in its stored (quantized) form: rows are gathered
+/// and dequantized on demand, exactly the dequantized table's rows.
+fn load_token_table_any(
+    loader: &GgufLoader,
+    device: &Device,
+    names: &[String],
+) -> Result<QuantizedTokenTable> {
+    QuantizedTokenTable::new(load_qtensor_any(loader, device, names)?)
 }
 
 fn load_rms_norm_any(
@@ -1535,6 +1538,7 @@ mod tests {
     }
 
     fn eoa_favouring_head_on(idx: usize, device: &Device) -> super::CodebookEmbeddingHead {
+        use crate::models::shared::weights::token_table::QuantizedTokenTable;
         use candle_core::quantized::{GgmlDType, QTensor};
         use candle_transformers::models::with_tracing::QMatMul;
 
@@ -1551,10 +1555,7 @@ mod tests {
             &[3, 4],
         );
         super::CodebookEmbeddingHead {
-            embedding: candle_nn::Embedding::new(
-                Tensor::zeros((3, 4), DType::F32, device).unwrap(),
-                4,
-            ),
+            embedding: QuantizedTokenTable::new(quantize(vec![0.0; 12], &[3, 4])).unwrap(),
             norm: super::DepthRmsNorm::from_qtensor(quantize(vec![1.0; 4], &[4]), 1e-5).unwrap(),
             to_logits: super::QLinear {
                 weight: QMatMul::from_weights(std::sync::Arc::new(to_logits)).unwrap(),

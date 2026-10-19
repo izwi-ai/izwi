@@ -2,18 +2,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module};
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use crate::error::{Error, Result};
 use crate::models::shared::weights::gguf::GgufLoader;
+use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::config::{Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_AUDIO_AUDIO_VOCAB_SIZE};
 use crate::models::architectures::lfm2::backbone::{Lfm2StatelessStream, QuantizedLfm2Backbone};
 
 pub struct Lfm25AudioDetokenizer {
-    fused_embedding: Embedding,
+    fused_embedding: QuantizedTokenTable,
     backbone: Mutex<QuantizedLfm2Backbone>,
     istft_window: Vec<f32>,
     istft_window_sq: Vec<f32>,
@@ -72,8 +72,9 @@ impl Lfm25AudioDetokenizer {
         decoder_config: &Lfm25AudioDecoderConfig,
         device: &Device,
     ) -> Result<Self> {
+        // Kept quantized: rows are gathered and dequantized on demand.
         let fused_embedding =
-            load_embedding_any(decoder_loader, device, &["emb.emb.weight".to_string()])?;
+            QuantizedTokenTable::new(decoder_loader.load_qtensor("emb.emb.weight", device)?)?;
         let backbone =
             QuantizedLfm2Backbone::load_for_embeds(backbone_loader, backbone_config, device)?;
         let istft_window = load_vector_any(
@@ -362,7 +363,7 @@ impl Lfm25AudioDetokenizer {
         }
 
         let ids = Tensor::from_vec(flat, (frames, self.codebooks), device)?;
-        let embeds = self.fused_embedding.forward(&ids)?; // [T, C, D]
+        let embeds = self.fused_embedding.embed(&ids)?; // [T, C, D]
         let embeds = embeds.sum(1)?.affine(1.0 / self.codebooks as f64, 0.0)?;
         embeds.unsqueeze(0).map_err(Error::from)
     }
@@ -371,7 +372,7 @@ impl Lfm25AudioDetokenizer {
         let ids = audio_codes
             .broadcast_add(&self.codebook_offsets_tensor)?
             .contiguous()?;
-        let embeds = self.fused_embedding.forward(&ids)?; // [T, C, D]
+        let embeds = self.fused_embedding.embed(&ids)?; // [T, C, D]
         let embeds = embeds.sum(1)?.affine(1.0 / self.codebooks as f64, 0.0)?;
         embeds.unsqueeze(0).map_err(Error::from)
     }
@@ -470,12 +471,6 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Embedding> {
-    let weight = load_tensor_any(loader, device, names, DType::F32)?;
-    let (_, dim) = weight.dims2()?;
-    Ok(Embedding::new(weight, dim))
-}
-
 fn load_vector_any(
     loader: &GgufLoader,
     device: &Device,
@@ -532,7 +527,14 @@ mod tests {
             .map(|idx| (idx * (LFM25_AUDIO_AUDIO_VOCAB_SIZE - 1)) as u32)
             .collect::<Vec<_>>();
         Lfm25AudioDetokenizer {
-            fused_embedding: Embedding::new(table, 8),
+            fused_embedding: QuantizedTokenTable::new(
+                candle_core::quantized::QTensor::quantize(
+                    &table,
+                    candle_core::quantized::GgmlDType::F32,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             backbone: Mutex::new(
                 crate::models::architectures::lfm2::backbone::tests::tiny_windowed_backbone_with_head(
                     Some(30),

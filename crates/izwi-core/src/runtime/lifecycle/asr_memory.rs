@@ -2262,11 +2262,12 @@ fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<As
 }
 
 /// LFM2.5-Audio (`lfm25_audio/`, `lfm2/backbone.rs`): all four GGUFs load on
-/// every backend. Quantized projections stay quantized; F32 tensors and the
-/// embedding tables (the main backbone's `token_embd`, every loaded mmproj
-/// tensor, the vocoder's audio and depth embeddings) are dequantized to F32,
-/// the dtype the loader hard-codes (there is no dtype resolver to call). The
-/// detokenizer backbone runs on vocoder embeddings and skips its `token_embd`.
+/// every backend. Quantized projections and the vocoder's embedding tables
+/// (audio, depth and detokenizer `emb.emb`, whose rows are gathered on
+/// demand) stay quantized; F32 tensors and every loaded mmproj tensor are
+/// dequantized to F32, the dtype the loader hard-codes (there is no dtype
+/// resolver to call). The detokenizer backbone runs on vocoder embeddings
+/// and skips its `token_embd`.
 /// The main backbone has no `output.weight`, so its head reads `token_embd` a
 /// second time as a quantized projection, and keeps its first `token_embd`
 /// read alive until it finishes loading. Each backbone also
@@ -2298,8 +2299,7 @@ fn price_lfm25_audio(
         if VOCODER_UNREAD.contains(&name) {
             continue;
         }
-        let embedding = name.ends_with(".embedding.weight") || name == "emb.emb.weight";
-        if gguf_quantized(tensor) && !embedding {
+        if gguf_quantized(tensor) {
             ledger.gguf_stored(tensor)?;
         } else {
             ledger.gguf_dense(tensor, DType::F32)?;
@@ -2950,7 +2950,7 @@ pub(super) mod tests {
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [1.46, 1.46, 1.46, 1.46],
+                [1.27, 1.27, 1.27, 1.27],
             ),
             // D8: the dense text runs at F16 on Metal (4.18 GiB allocated at
             // F32).
