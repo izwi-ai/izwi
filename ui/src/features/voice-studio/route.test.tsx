@@ -79,20 +79,20 @@ describe("VoiceStudioPage", () => {
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
   });
 
-  it("opens the design step for legacy ?tab=design links over the library", async () => {
+  it("opens the design dialog for legacy ?tab=design links over the library", async () => {
     renderVoiceStudio("/voices?tab=design");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
     expect(
-      await screen.findByRole("dialog", { name: "Design Voice" }),
+      await screen.findByRole("dialog", { name: "Design a voice" }),
     ).toBeInTheDocument();
   });
 
-  it("opens the clone step for legacy ?tab=clone links", async () => {
+  it("opens the clone dialog for legacy ?tab=clone links", async () => {
     renderVoiceStudio("/voices?tab=clone");
 
     expect(
-      await screen.findByRole("dialog", { name: "Clone Voice" }),
+      await screen.findByRole("dialog", { name: "Clone a voice" }),
     ).toBeInTheDocument();
   });
 
@@ -103,14 +103,20 @@ describe("VoiceStudioPage", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("opens creation modal from the page header action", () => {
+  it.each([
+    ["Clone a voice", "Clone a voice"],
+    ["Design a voice", "Design a voice"],
+  ])("opens %s from the New voice menu", async (item, dialogName) => {
     renderVoiceStudio("/voices");
 
-    fireEvent.click(screen.getByRole("button", { name: "New voice" }));
+    const trigger = screen.getByRole("button", { name: /New voice/ });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole("menuitem", { name: new RegExp(item) }));
 
-    expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Clone Voice/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Design Voice/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("dialog", { name: dialogName }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
   it("forwards a models-button trigger to the embedded voices workspace", () => {

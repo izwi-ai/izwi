@@ -53,6 +53,10 @@ pub struct CreateSavedVoiceRequest {
     pub source_route_kind: Option<SavedVoiceSourceRouteKind>,
     #[serde(default)]
     pub source_record_id: Option<String>,
+    /// The caller confirms it may clone this voice: it is theirs, or its
+    /// owner agreed. Required for every voice that is not designed.
+    #[serde(default)]
+    pub consent: Option<bool>,
 }
 
 /// Fields spelled out: `serde(flatten)` breaks numbers in query strings.
@@ -142,6 +146,14 @@ pub async fn create_saved_voice(
 ) -> Result<Json<SavedVoice>, ApiError> {
     let name = required_trimmed(req.name.as_deref(), "name")?;
     let reference_text = required_trimmed(req.reference_text.as_deref(), "reference_text")?;
+    // A designed voice is synthetic; any other is someone's real voice.
+    if req.source_route_kind != Some(SavedVoiceSourceRouteKind::VoiceDesign)
+        && req.consent != Some(true)
+    {
+        return Err(ApiError::bad_request(
+            "Confirm you have permission to clone this voice (`consent: true`): it is yours, or its owner agreed.",
+        ));
+    }
 
     let audio_payload = req
         .audio_base64

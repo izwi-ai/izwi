@@ -258,6 +258,9 @@ export interface SavedVoiceCreateRequest {
   audio_filename?: string;
   source_route_kind?: SavedVoiceSourceRouteKind;
   source_record_id?: string;
+  /** The user confirmed they may clone this voice; required unless the
+   * voice was designed. */
+  consent?: boolean;
 }
 
 export type StudioProjectVoiceMode = "built_in" | "saved";
@@ -1666,6 +1669,7 @@ export class AudioApiClient {
   async createSpeechHistoryRecord(
     route: SpeechHistoryRoute,
     request: SpeechHistoryRecordCreateRequest,
+    signal?: AbortSignal,
   ): Promise<SpeechHistoryRecord> {
     const response = await fetch(
       this.http.url(this.speechHistoryCollectionPath(route)),
@@ -1677,6 +1681,7 @@ export class AudioApiClient {
         body: JSON.stringify(
           this.buildSpeechHistoryRecordCreateBody(request, false),
         ),
+        signal,
       },
     );
 
@@ -1953,8 +1958,9 @@ export class AudioApiClient {
 
   async createVoiceDesignRecord(
     request: SpeechHistoryRecordCreateRequest,
+    signal?: AbortSignal,
   ): Promise<SpeechHistoryRecord> {
-    return this.createSpeechHistoryRecord("voice-design", request);
+    return this.createSpeechHistoryRecord("voice-design", request, signal);
   }
 
   voiceDesignRecordAudioUrl(
@@ -2046,6 +2052,7 @@ export class AudioApiClient {
         audio_filename: request.audio_filename,
         source_route_kind: request.source_route_kind,
         source_record_id: request.source_record_id,
+        consent: request.consent,
       }),
     });
 

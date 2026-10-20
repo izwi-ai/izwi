@@ -4170,6 +4170,44 @@ async fn saved_voices_report_missing_recordings_and_search_on_the_server() {
     assert_eq!(names, ["Narrator"]);
 }
 
+/// Cloning someone's voice needs their permission; a designed voice does
+/// not.
+#[tokio::test]
+async fn cloning_a_voice_needs_consent() {
+    let (state, _root) = test_state("saved_voice_consent", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let wav = base64::engine::general_purpose::STANDARD.encode(
+        AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap(),
+    );
+    let create = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            send_request(
+                app,
+                build_request(Method::POST, "/v1/voices", Some(&body.to_string())),
+            )
+            .await
+            .status()
+        }
+    };
+    let voice = |name: &str| serde_json::json!({ "name": name, "reference_text": "Hello.", "audio_base64": wav });
+    assert_eq!(create(voice("Sam")).await, StatusCode::BAD_REQUEST);
+    let mut consented = voice("Sam");
+    consented["consent"] = serde_json::json!(true);
+    assert_eq!(create(consented).await, StatusCode::OK);
+    let mut designed = voice("Narrator");
+    designed["source_route_kind"] = serde_json::json!("voice_design");
+    assert_eq!(create(designed).await, StatusCode::OK);
+}
+
 /// Speed belongs to models with speed control, and a paragraph's voice to
 /// the model it was chosen with.
 #[tokio::test]
