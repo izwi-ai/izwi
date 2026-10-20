@@ -219,6 +219,15 @@ impl RuntimeService {
                 "Chat request missing messages".to_string(),
             ));
         }
+        // Qwen3.5/3.6/3.8 templates accept a system message only first.
+        let messages = if matches!(
+            variant.family(),
+            ModelFamily::Qwen35Chat | ModelFamily::Qwen35MoeChat | ModelFamily::Qwen38Chat
+        ) {
+            izwi_model_catalog::chat::fold_system_messages(messages)
+        } else {
+            messages
+        };
         if !chat_config.media_inputs.is_empty() && variant.family() != ModelFamily::Qwen35Chat {
             return Err(Error::InvalidInput(format!(
                 "Chat model {variant} does not support Qwen3.5 media inputs"
