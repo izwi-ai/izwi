@@ -324,7 +324,7 @@ export function DiarizationSpeakersTable({
                         style={{ width: `${Math.round(share * 100)}%` }}
                       />
                     </div>
-                    <span className="whitespace-nowrap text-right text-[13px] tabular-nums text-[var(--text-muted)]">
+                    <span className="w-[6.5rem] shrink-0 whitespace-nowrap text-right text-[13px] tabular-nums text-[var(--text-muted)]">
                       {formatTalkTime(row.talkSeconds)} · {Math.round(share * 100)}%
                     </span>
                   </div>
