@@ -79,6 +79,46 @@ pub fn build_basic_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the desktop shows tray icons. GNOME shows none unless an
+/// AppIndicator extension provides a StatusNotifierWatcher; hiding the window
+/// in a tray nobody can see would leave Izwi running with no way back to it.
+pub fn desktop_shows_tray_icons() -> bool {
+    #[cfg(target_os = "linux")]
+    if std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| is_gnome(&desktop)) {
+        return status_notifier_watcher_running();
+    }
+    true
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_gnome(xdg_current_desktop: &str) -> bool {
+    xdg_current_desktop
+        .split(':')
+        .any(|name| name.eq_ignore_ascii_case("gnome"))
+}
+
+#[cfg(target_os = "linux")]
+fn status_notifier_watcher_running() -> bool {
+    std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--timeout",
+            "2",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            "org.kde.StatusNotifierWatcher",
+        ])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("true")
+        })
+}
+
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     let window = app
         .get_webview_window("main")
@@ -126,4 +166,19 @@ fn js_string_literal(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r");
     format!("\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_gnome;
+
+    #[test]
+    fn recognizes_gnome_sessions() {
+        assert!(is_gnome("GNOME"));
+        assert!(is_gnome("ubuntu:GNOME"));
+        assert!(is_gnome("Pop:GNOME"));
+        assert!(!is_gnome("KDE"));
+        assert!(!is_gnome("XFCE"));
+        assert!(!is_gnome(""));
+    }
 }

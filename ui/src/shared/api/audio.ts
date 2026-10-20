@@ -4,6 +4,11 @@ import {
   isAbortError,
 } from "@/shared/api/http";
 import {
+  clickDownloadLink,
+  saveServerFile,
+  savesWithDialog,
+} from "@/shared/saveFile";
+import {
   buildCursorQueryString,
   normalizeCursorPaginationMeta,
   readListTotal,
@@ -1820,26 +1825,12 @@ export class AudioApiClient {
     return base;
   }
 
-  async downloadAudioFile(url: string, suggestedFilename: string): Promise<void> {
-    if (typeof window !== "undefined") {
-      const internals = (
-        window as unknown as {
-          __TAURI_INTERNALS__?: {
-            invoke?: (
-              command: string,
-              args?: Record<string, unknown>,
-            ) => Promise<unknown>;
-          };
-        }
-      ).__TAURI_INTERNALS__;
-
-      if (typeof internals?.invoke === "function" && /^https?:\/\//i.test(url)) {
-        await internals.invoke("download_audio_file", {
-          url,
-          suggested_filename: suggestedFilename,
-        });
-        return;
-      }
+  /** Save audio the user asked for; false when the save dialog was cancelled. */
+  async downloadAudioFile(url: string, suggestedFilename: string): Promise<boolean> {
+    // The desktop app asks where to save and downloads the file itself: its
+    // webview drops anchor downloads.
+    if (savesWithDialog() && /^https?:\/\//i.test(url)) {
+      return saveServerFile(url, suggestedFilename);
     }
 
     // Speech endpoints support attachment responses, including cross-origin APIs
@@ -1863,21 +1854,16 @@ export class AudioApiClient {
       objectUrl = URL.createObjectURL(await response.blob());
     }
     // Long speech goes directly to the browser's download manager, never a Blob.
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl ?? downloadUrl.toString();
-    anchor.download = suggestedFilename;
-    anchor.style.display = "none";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
+    clickDownloadLink(objectUrl ?? downloadUrl.toString(), suggestedFilename);
     if (objectUrl) {
       const temporaryUrl = objectUrl;
       window.setTimeout(() => URL.revokeObjectURL(temporaryUrl), 1000);
     }
+    return true;
   }
 
-  async saveAudioFile(url: string, suggestedFilename: string): Promise<void> {
-    await this.downloadAudioFile(url, suggestedFilename);
+  async saveAudioFile(url: string, suggestedFilename: string): Promise<boolean> {
+    return this.downloadAudioFile(url, suggestedFilename);
   }
 
   async deleteSpeechHistoryRecord(
