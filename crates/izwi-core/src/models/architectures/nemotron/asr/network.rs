@@ -4529,9 +4529,12 @@ mod tests {
         eprintln!("causal pre_encode max abs diff vs NeMo {worst:.2e}");
     }
 
-    /// The subsampling stem run by slices returns exactly the frames of the
-    /// whole-sequence stem (bit for bit), for lengths that leave a short last
-    /// slice, with frames past the valid length that must stay hidden.
+    /// The subsampling stem run by slices returns the frames of the
+    /// whole-sequence stem, for lengths that leave a short last slice, with
+    /// frames past the valid length that must stay hidden. A slice changes
+    /// only how many rows each matrix product runs over, so the frames agree
+    /// within F32 rounding: the CPU product blocks its sums by problem size,
+    /// instruction set and thread count.
     #[test]
     fn sliced_subsampling_matches_the_whole_sequence() {
         let subsampling = hashed_subsampling();
@@ -4541,6 +4544,13 @@ mod tests {
             let (sliced, sliced_len) = subsampling.forward(&features, valid).unwrap();
             assert_eq!(sliced_len, whole_len, "{valid}");
             assert_eq!(sliced.dims(), whole.dims(), "{valid}");
+            let scale = whole
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
             let difference = (sliced - whole)
                 .unwrap()
                 .abs()
@@ -4549,7 +4559,10 @@ mod tests {
                 .unwrap()
                 .to_scalar::<f32>()
                 .unwrap();
-            assert_eq!(difference, 0.0, "{valid}");
+            assert!(
+                difference <= scale * 1e-6,
+                "{valid}: {difference} of {scale}"
+            );
         }
     }
 
