@@ -72,9 +72,12 @@ describe("DesignVoiceDialog", () => {
     );
     mocks.deleteVoiceDesignRecord.mockResolvedValue({ deleted: true });
     mocks.createSavedVoice.mockResolvedValue({ id: "voice-1", name: "Calm narrator" });
+    // A string body: Node's Response can't read jsdom's Blob before Node 24.
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response(new Blob(["wav"], { type: "audio/wav" }))),
+      vi.fn(
+        async () => new Response("wav", { headers: { "content-type": "audio/wav" } }),
+      ),
     );
   });
 
