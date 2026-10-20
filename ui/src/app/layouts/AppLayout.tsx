@@ -1,22 +1,12 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import {
-  Download,
-  Github,
-  Menu,
-  PanelLeft,
-  RotateCcw,
-  Search,
-  TriangleAlert,
-  X,
-} from "lucide-react";
+import { CircleAlert, Github, Menu, PanelLeft, Search } from "lucide-react";
 import { APP_ICON_URL } from "@/shared/config/runtime";
 import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { RouteErrorBoundary } from "@/app/router/RouteErrorBoundary";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { StatePanel } from "@/components/ui/state-panel";
 import { FirstRunOnboarding } from "@/app/onboarding/FirstRunOnboarding";
 import {
   NAV_GROUPS,
@@ -24,6 +14,7 @@ import {
   type NavItem,
 } from "@/app/layouts/navigation";
 import { RuntimeCard } from "@/app/layouts/RuntimeCard";
+import { UpdateCard } from "@/app/layouts/UpdateCard";
 import { CommandPalette } from "@/app/command/CommandPalette";
 import { isMacPlatform } from "@/lib/platform";
 
@@ -31,6 +22,19 @@ const appIconUrl = APP_ICON_URL;
 const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";
 const SIDEBAR_WIDTH = "15rem";
 const SIDEBAR_COLLAPSED_WIDTH = "72px";
+const SIDEBAR_COLLAPSED_KEY = "izwi.sidebar.collapsed";
+
+function readSidebarPreference(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function isChatPath(pathname: string) {
+  return pathname === "/chat" || pathname.startsWith("/chat/");
+}
 
 function isDesktopNavigationLayout() {
   if (typeof window === "undefined") {
@@ -44,7 +48,8 @@ function isDesktopNavigationLayout() {
 
 interface LayoutProps {
   readyModelsCount: number;
-  selectedModelLabel: string | null;
+  /** Unused since the compact header matches the sidebar; AppRoutes still passes it. */
+  selectedModelLabel?: string | null;
   catalogError: string | null;
   onRetryModelCatalog: () => Promise<boolean>;
 }
@@ -60,13 +65,13 @@ function SidebarLink({
   collapsed: boolean;
   interactive: boolean;
   badge?: { label: string } | null;
-  onNavigate: (path: string) => void;
+  onNavigate: () => void;
 }) {
   return (
     <NavLink
       to={item.path}
       title={collapsed ? item.label : undefined}
-      onClick={() => onNavigate(item.path)}
+      onClick={onNavigate}
       data-app-nav-link
       tabIndex={interactive ? undefined : -1}
       className={({ isActive }) =>
@@ -118,7 +123,6 @@ function SidebarLink({
 
 export function AppLayout({
   readyModelsCount,
-  selectedModelLabel,
   catalogError,
   onRetryModelCatalog,
 }: LayoutProps) {
@@ -131,19 +135,19 @@ export function AppLayout({
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const mobileMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-    return window.localStorage.getItem("izwi.sidebar.collapsed") === "1";
-  });
+  const [prefersCollapsedSidebar, setPrefersCollapsedSidebar] = useState(
+    readSidebarPreference,
+  );
+  // Chat collapses the sidebar for room. Toggling it there lasts until you
+  // leave Chat and never changes the saved preference.
+  const onChat = isChatPath(location.pathname);
+  const [isChatSidebarCollapsed, setIsChatSidebarCollapsed] = useState(true);
 
   useEffect(() => {
-    window.localStorage.setItem(
-      "izwi.sidebar.collapsed",
-      isSidebarCollapsed ? "1" : "0",
-    );
-  }, [isSidebarCollapsed]);
+    if (!onChat) {
+      setIsChatSidebarCollapsed(true);
+    }
+  }, [onChat]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -180,6 +184,24 @@ export function AppLayout({
   }, []);
 
   const sidebarInteractive = isDesktopNavigation || mobileMenuOpen;
+  // The compact drawer always shows labels.
+  const isSidebarCollapsed =
+    isDesktopNavigation &&
+    (onChat ? isChatSidebarCollapsed : prefersCollapsedSidebar);
+
+  const toggleSidebar = () => {
+    if (onChat) {
+      setIsChatSidebarCollapsed(!isSidebarCollapsed);
+      return;
+    }
+    const next = !prefersCollapsedSidebar;
+    setPrefersCollapsedSidebar(next);
+    try {
+      window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0");
+    } catch {
+      // Unavailable storage only loses the preference across launches.
+    }
+  };
 
   useEffect(() => {
     const sidebar = sidebarRef.current;
@@ -204,39 +226,18 @@ export function AppLayout({
       ?.focus();
   }, [isDesktopNavigation, mobileMenuOpen]);
 
-  const loadedText =
-    readyModelsCount > 0
-      ? `${readyModelsCount} model${readyModelsCount !== 1 ? "s" : ""} loaded`
-      : "No models loaded";
-
-  const {
-    availableUpdate,
-    status: updateStatus,
-    isPromptOpen,
-    progressPercent,
-    errorMessage: updateErrorMessage,
-    dismissPrompt,
-    installUpdate,
-    restartToApply,
-  } = useAppUpdates();
+  const { availableUpdate } = useAppUpdates();
 
   const closeMobileMenu = () => {
     setMobileMenuOpen(false);
     mobileMenuTriggerRef.current?.focus();
   };
 
-  const handleNavClick = (path: string) => {
+  const handleNavClick = () => {
     if (isDesktopNavigation) {
       setMobileMenuOpen(false);
     } else {
       closeMobileMenu();
-    }
-    if (
-      path === "/chat" &&
-      typeof window !== "undefined" &&
-      window.innerWidth >= 1024
-    ) {
-      setIsSidebarCollapsed(true);
     }
   };
 
@@ -294,45 +295,32 @@ export function AppLayout({
         open={isCommandPaletteOpen}
         onOpenChange={setIsCommandPaletteOpen}
       />
-      {/* Mobile header */}
-      <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/80 backdrop-blur-xl">
-        <div className="flex items-center justify-between px-4 py-3.5">
-          <div className="flex items-center gap-3">
-            <div className="relative w-8 h-8 rounded-xl overflow-hidden border border-border/80 bg-card shadow-sm">
-              <img
-                src={appIconUrl}
-                alt="Izwi logo"
-                className="w-full h-full object-cover p-0.5 brightness-125 contrast-125"
-              />
-            </div>
-            <div>
-              <h1 className="text-sm font-semibold text-foreground">Izwi</h1>
-              <div className="mt-0.5 text-[11px] text-muted-foreground">
-                {selectedModelLabel ?? loadedText}
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              ref={mobileMenuTriggerRef}
-              variant="ghost"
-              size="icon"
-              onClick={() =>
-                mobileMenuOpen ? closeMobileMenu() : setMobileMenuOpen(true)
-              }
-              aria-label={
-                mobileMenuOpen ? "Close navigation" : "Open navigation"
-              }
-              aria-expanded={mobileMenuOpen}
-              aria-controls="app-sidebar-navigation"
-              data-testid="mobile-navigation-trigger"
-              className="h-8 w-8 rounded-lg"
-            >
-              <Menu className="w-5 h-5 text-foreground" />
-            </Button>
-          </div>
-        </div>
-      </div>
+      {/* Compact header: the sidebar's brand row, for narrow windows */}
+      <header className="fixed inset-x-0 top-0 z-40 flex h-14 items-center gap-2.5 border-b border-[var(--border-subtle)] bg-[var(--surface-canvas)] pl-5 pr-3 lg:hidden">
+        <img
+          src={appIconUrl}
+          alt=""
+          className="h-[26px] w-[26px] shrink-0 rounded-[7px]"
+        />
+        <span className="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+          Izwi
+        </span>
+        <Button
+          ref={mobileMenuTriggerRef}
+          variant="ghost"
+          size="icon"
+          onClick={() =>
+            mobileMenuOpen ? closeMobileMenu() : setMobileMenuOpen(true)
+          }
+          aria-label={mobileMenuOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={mobileMenuOpen}
+          aria-controls="app-sidebar-navigation"
+          data-testid="mobile-navigation-trigger"
+          className="ml-auto h-8 w-8 rounded-md text-[var(--text-subtle)] hover:text-foreground"
+        >
+          <Menu className="h-4 w-4" />
+        </Button>
+      </header>
 
       {/* Mobile menu overlay */}
       <AnimatePresence>
@@ -364,10 +352,10 @@ export function AppLayout({
           mobileMenuOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full",
         )}
       >
-        {/* Logo - hidden on mobile since it's in the header */}
+        {/* Brand row; the open drawer covers the compact header, so it shows there too */}
         <div
           className={cn(
-            "hidden lg:flex shrink-0 pt-3.5",
+            "flex shrink-0 pt-3.5",
             isSidebarCollapsed
               ? "flex-col items-center gap-2 px-3"
               : "items-center gap-2.5 px-5 pb-1",
@@ -389,14 +377,14 @@ export function AppLayout({
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => setIsSidebarCollapsed((collapsed) => !collapsed)}
+            onClick={toggleSidebar}
             aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
             aria-expanded={!isSidebarCollapsed}
             aria-controls="app-sidebar-navigation"
             data-testid="sidebar-collapse-toggle"
             tabIndex={isDesktopNavigation ? undefined : -1}
             className={cn(
-              "h-8 w-8 rounded-md text-[var(--text-subtle)] hover:text-foreground",
+              "hidden h-8 w-8 rounded-md text-[var(--text-subtle)] hover:text-foreground lg:inline-flex",
               !isSidebarCollapsed && "ml-auto",
             )}
             title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -506,7 +494,7 @@ export function AppLayout({
       {/* Main content */}
       <div
         className={cn(
-          "flex-1 flex flex-col pt-16 lg:pt-0 transition-all duration-300 min-w-0 overflow-hidden",
+          "flex-1 flex flex-col pt-14 lg:pt-0 transition-all duration-300 min-w-0 overflow-hidden",
           isSidebarCollapsed ? "lg:ml-[72px]" : "lg:ml-[15rem]",
         )}
         style={
@@ -520,24 +508,30 @@ export function AppLayout({
         {/* Page content */}
         <main className="flex-1 overflow-y-auto w-full p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 flex flex-col">
           {catalogError ? (
-            <div role="alert" className="mb-5 shrink-0">
-              <StatePanel
-                title="Model service unavailable"
-                description={catalogError}
-                icon={TriangleAlert}
-                tone="danger"
-                actions={
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={isRetryingModelCatalog}
-                    onClick={() => void handleRetryModelCatalog()}
-                  >
-                    {isRetryingModelCatalog ? "Retrying…" : "Retry models"}
-                  </Button>
-                }
+            <div
+              role="alert"
+              className="mb-5 flex shrink-0 items-start gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-3"
+            >
+              <CircleAlert
+                aria-hidden="true"
+                className="mt-0.5 h-4 w-4 shrink-0 text-[var(--danger-text)]"
               />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <p className="text-[13.5px] font-medium leading-5 text-[var(--text-primary)]">
+                  Couldn’t load models
+                </p>
+                <p className="break-words text-[12.5px] leading-[1.45] text-[var(--text-muted)]">
+                  {catalogError}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={isRetryingModelCatalog}
+                onClick={() => void handleRetryModelCatalog()}
+                className="inline-flex h-8 shrink-0 items-center rounded-full border border-[var(--border-default)] px-3.5 text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] disabled:opacity-50"
+              >
+                {isRetryingModelCatalog ? "Retrying…" : "Retry"}
+              </button>
             </div>
           ) : null}
           <RouteErrorBoundary resetKey={location.pathname}>
@@ -545,100 +539,7 @@ export function AppLayout({
           </RouteErrorBoundary>
         </main>
       </div>
-      {isPromptOpen && availableUpdate ? (
-        <div className="fixed bottom-4 right-4 z-[70] w-[min(30rem,calc(100vw-1.5rem))] rounded-2xl border border-border/80 bg-background/90 p-4 shadow-2xl backdrop-blur-xl">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                In-App Update
-              </p>
-              <h3 className="mt-1 text-sm font-semibold text-foreground">
-                {updateStatus === "downloaded"
-                  ? "Update ready to apply"
-                  : `Update available: ${availableUpdate.version}`}
-              </h3>
-            </div>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-              onClick={dismissPrompt}
-              aria-label="Dismiss update prompt"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-
-          <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            {availableUpdate.platformBehavior.appExitsDuringInstall
-              ? "Windows installs close Izwi automatically and run the updater."
-              : "Install the update now and restart when you’re ready."}
-          </p>
-
-          {availableUpdate.notes ? (
-            <p className="mt-2 max-h-20 overflow-y-auto rounded-lg border border-border/70 bg-card/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
-              {availableUpdate.notes}
-            </p>
-          ) : null}
-
-          {updateStatus === "downloading" ? (
-            <div className="mt-3 space-y-1">
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Downloading update…</span>
-                <span>{progressPercent !== null ? `${progressPercent}%` : "..."}</span>
-              </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-muted/50">
-                <div
-                  className={cn(
-                    "h-full bg-primary transition-[width] duration-200",
-                    progressPercent === null && "w-1/2 animate-pulse",
-                  )}
-                  style={
-                    progressPercent !== null
-                      ? { width: `${progressPercent}%` }
-                      : undefined
-                  }
-                />
-              </div>
-            </div>
-          ) : null}
-
-          {updateErrorMessage ? (
-            <p className="mt-3 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs text-[var(--status-warning-text)]">
-              {updateErrorMessage}
-            </p>
-          ) : null}
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {updateStatus === "downloaded" &&
-            availableUpdate.platformBehavior.supportsRestartLater ? (
-              <Button
-                type="button"
-                size="sm"
-                className="gap-2"
-                onClick={() => void restartToApply()}
-              >
-                <RotateCcw className="h-4 w-4" />
-                Restart Now
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                size="sm"
-                className="gap-2"
-                disabled={updateStatus === "downloading"}
-                onClick={() => void installUpdate()}
-              >
-                <Download className="h-4 w-4" />
-                {updateStatus === "downloading" ? "Installing…" : "Install Update"}
-              </Button>
-            )}
-
-            <Button type="button" size="sm" variant="ghost" onClick={dismissPrompt}>
-              Later
-            </Button>
-          </div>
-        </div>
-      ) : null}
+      <UpdateCard />
     </div>
   );
 }

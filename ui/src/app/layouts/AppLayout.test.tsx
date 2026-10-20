@@ -69,15 +69,13 @@ describe("AppLayout model catalog recovery", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Model service unavailable",
-    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load models");
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Local model service is offline",
     );
     expect(screen.getByText("Models route content")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     await waitFor(() => expect(onRetryModelCatalog).toHaveBeenCalledTimes(1));
   });
@@ -110,7 +108,7 @@ describe("AppLayout model catalog recovery", () => {
       );
 
       expect(await screen.findByRole("alert")).toHaveTextContent(
-        "This page could not be opened",
+        "This page hit a problem",
       );
       expect(screen.getByRole("link", { name: "Voice" })).toBeVisible();
     } finally {
