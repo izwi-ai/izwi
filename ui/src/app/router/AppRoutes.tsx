@@ -14,6 +14,7 @@ import {
 } from "@/app/providers/ModelCatalogProvider";
 import { DocumentTitle } from "@/app/router/DocumentTitle";
 import { NotFoundPage } from "@/app/router/NotFoundPage";
+import { PageLoading } from "@/components/ui/page-state";
 import { legacyDiarizationTarget } from "@/app/router/routePresentation";
 import type {
   ModelsRouteProps,
@@ -75,11 +76,7 @@ const SettingsPage = lazy(async () => ({
 }));
 
 function RouteLoadingFallback() {
-  return (
-    <div className="flex min-h-[16rem] items-center justify-center rounded-2xl border border-border/60 bg-card/60 text-sm text-muted-foreground shadow-sm">
-      Loading route...
-    </div>
-  );
+  return <PageLoading />;
 }
 
 function withSuspense(children: ReactNode) {
