@@ -1,8 +1,46 @@
 use serde::Serialize;
 
+/// Which releases a build follows. A stable build follows stable releases;
+/// a beta build follows betas and stable releases alike, so beta testers
+/// move on to the release they tested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateChannel {
-    Beta010,
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    /// The channel of a build at `version`.
+    pub fn for_version(version: &semver::Version) -> Self {
+        if version.pre.is_empty() {
+            UpdateChannel::Stable
+        } else {
+            UpdateChannel::Beta
+        }
+    }
+
+    /// Whether a build on this channel takes a release at `version`.
+    pub fn accepts(self, version: &semver::Version) -> bool {
+        match self {
+            UpdateChannel::Stable => version.pre.is_empty(),
+            UpdateChannel::Beta => true,
+        }
+    }
+}
+
+/// The updater manifest a release at `version` publishes: `latest.json`
+/// for a stable release, `latest-beta.json` for a prerelease.
+pub fn manifest_asset_name(version: &semver::Version) -> &'static str {
+    if version.pre.is_empty() {
+        "latest.json"
+    } else {
+        "latest-beta.json"
+    }
+}
+
+/// The version a release tag names: `v0.1.0`, `v0.1.0-beta-18`.
+pub fn parse_release_tag(tag_name: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag_name.strip_prefix('v')?).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,19 +48,27 @@ pub struct UpdaterContract {
     pub channel: UpdateChannel,
     pub release_owner: String,
     pub release_repo: String,
-    pub manifest_asset_name: String,
     pub releases_per_page: usize,
 }
 
-impl Default for UpdaterContract {
-    fn default() -> Self {
+impl UpdaterContract {
+    /// The contract of a build at `version`.
+    pub fn for_version(version: &semver::Version) -> Self {
         Self {
-            channel: UpdateChannel::Beta010,
+            channel: UpdateChannel::for_version(version),
             release_owner: "izwi-ai".to_string(),
             release_repo: "izwi".to_string(),
-            manifest_asset_name: "latest-beta.json".to_string(),
             releases_per_page: 50,
         }
+    }
+}
+
+impl Default for UpdaterContract {
+    /// This build's contract.
+    fn default() -> Self {
+        let version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("the package version is semver");
+        Self::for_version(&version)
     }
 }
 
@@ -31,22 +77,6 @@ impl Default for UpdaterContract {
 pub struct PlatformInstallBehavior {
     pub app_exits_during_install: bool,
     pub supports_restart_later: bool,
-}
-
-impl UpdateChannel {
-    pub fn tag_prefix(self) -> &'static str {
-        match self {
-            UpdateChannel::Beta010 => "v0.1.0-beta-",
-        }
-    }
-}
-
-pub fn parse_beta_sequence(channel: UpdateChannel, tag_name: &str) -> Option<u64> {
-    let suffix = tag_name.strip_prefix(channel.tag_prefix())?;
-    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    suffix.parse::<u64>().ok()
 }
 
 /// Numeric beta sequence of a semver prerelease label. Accepts the shipped
@@ -86,10 +116,14 @@ pub fn github_releases_api_url(contract: &UpdaterContract) -> String {
     )
 }
 
-pub fn github_manifest_url(contract: &UpdaterContract, tag_name: &str) -> String {
+pub fn github_manifest_url(
+    contract: &UpdaterContract,
+    tag_name: &str,
+    manifest_asset_name: &str,
+) -> String {
     format!(
         "https://github.com/{}/{}/releases/download/{}/{}",
-        contract.release_owner, contract.release_repo, tag_name, contract.manifest_asset_name
+        contract.release_owner, contract.release_repo, tag_name, manifest_asset_name
     )
 }
 
@@ -123,42 +157,53 @@ pub fn updater_target_for_platform(target_os: &str) -> &'static str {
 mod tests {
     use super::{
         github_manifest_url, github_releases_api_url, install_behavior_for_platform,
-        is_newer_release, parse_beta_sequence, updater_target_for_platform, UpdateChannel,
-        UpdaterContract,
+        is_newer_release, manifest_asset_name, parse_release_tag, updater_target_for_platform,
+        UpdateChannel, UpdaterContract,
     };
 
-    #[test]
-    fn parses_beta_sequence_with_valid_tag() {
-        let channel = UpdateChannel::Beta010;
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta-12"), Some(12));
+    fn version(text: &str) -> semver::Version {
+        semver::Version::parse(text).unwrap()
     }
 
     #[test]
-    fn rejects_invalid_beta_tags() {
-        let channel = UpdateChannel::Beta010;
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta"), None);
-        assert_eq!(parse_beta_sequence(channel, "v0.1.1-beta-1"), None);
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta-1a"), None);
-        assert_eq!(parse_beta_sequence(channel, "0.1.0-beta-1"), None);
+    fn parses_release_tags() {
+        assert_eq!(
+            parse_release_tag("v0.1.0-beta-12"),
+            Some(version("0.1.0-beta-12"))
+        );
+        assert_eq!(parse_release_tag("v0.1.0"), Some(version("0.1.0")));
+        assert_eq!(parse_release_tag("0.1.0"), None);
+        assert_eq!(parse_release_tag("v0.1"), None);
+        assert_eq!(parse_release_tag("nightly"), None);
     }
 
     #[test]
-    fn accepts_supported_beta_tags() {
-        let channel = UpdateChannel::Beta010;
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta-1"), Some(1));
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-alpha-1"), None);
+    fn stable_builds_follow_stable_releases_and_betas_follow_both() {
+        let stable = UpdateChannel::for_version(&version("0.1.0"));
+        let beta = UpdateChannel::for_version(&version("0.1.0-beta-18"));
+        assert_eq!(stable, UpdateChannel::Stable);
+        assert_eq!(beta, UpdateChannel::Beta);
+        assert!(stable.accepts(&version("0.1.1")));
+        assert!(!stable.accepts(&version("0.2.0-beta-1")));
+        assert!(beta.accepts(&version("0.1.0")));
+        assert!(beta.accepts(&version("0.1.0-beta-19")));
+        assert_eq!(manifest_asset_name(&version("0.1.0")), "latest.json");
+        assert_eq!(
+            manifest_asset_name(&version("0.1.0-beta-19")),
+            "latest-beta.json"
+        );
     }
 
     #[test]
     fn builds_github_endpoints_from_contract() {
-        let contract = UpdaterContract::default();
+        let contract = UpdaterContract::for_version(&version("0.1.0"));
         assert_eq!(
             github_releases_api_url(&contract),
             "https://api.github.com/repos/izwi-ai/izwi/releases?per_page=50"
         );
         assert_eq!(
-            github_manifest_url(&contract, "v0.1.0-beta-12"),
-            "https://github.com/izwi-ai/izwi/releases/download/v0.1.0-beta-12/latest-beta.json"
+            github_manifest_url(&contract, "v0.1.1", "latest.json"),
+            "https://github.com/izwi-ai/izwi/releases/download/v0.1.1/latest.json"
         );
     }
 

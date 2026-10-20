@@ -2,15 +2,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{ipc::Channel, AppHandle, State};
+use tauri::{ipc::Channel, AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::time::sleep;
 use url::Url;
 
 use super::updater_contract::{
     github_manifest_url, github_releases_api_url, install_behavior_for_platform, is_newer_release,
-    parse_beta_sequence, updater_target_for_platform, PlatformInstallBehavior, UpdaterContract,
+    manifest_asset_name, parse_release_tag, updater_target_for_platform, PlatformInstallBehavior,
+    UpdaterContract,
 };
+use super::ServerControl;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_MAX_CHECK_ATTEMPTS: usize = 3;
@@ -141,8 +143,8 @@ pub enum UpdaterError {
     Updater(#[from] tauri_plugin_updater::Error),
     #[error(transparent)]
     Url(#[from] url::ParseError),
-    #[error("no matching beta release found for channel")]
-    NoMatchingBetaRelease,
+    #[error("no release with an update manifest was found")]
+    NoMatchingRelease,
     #[error("there is no pending update")]
     NoPendingUpdate,
     #[error("in-app updates are disabled by runtime policy")]
@@ -208,8 +210,16 @@ pub async fn check_for_beta_update(
         let app_handle = app_handle.clone();
         let release_manifest_url = release_manifest_url.clone();
         async move {
+            let stopping_app = app_handle.clone();
             let updater = app_handle
                 .updater_builder()
+                // The Windows installer takes the app down: stop the server
+                // first so it is not left running.
+                .on_before_exit(move || {
+                    if let Some(server) = stopping_app.try_state::<ServerControl>() {
+                        server.stop();
+                    }
+                })
                 .timeout(runtime.request_timeout)
                 .target(updater_target)
                 .version_comparator(|current, release| is_newer_release(&current, &release.version))
@@ -295,9 +305,12 @@ pub async fn install_beta_update(
     })
 }
 
+/// Relaunch through the event loop: its Exit event stops the server before
+/// the new version starts. `restart()` from this (main-thread) command
+/// skipped that event and left the old server running on the port.
 #[tauri::command]
 pub fn relaunch_after_update(app: AppHandle) {
-    app.restart();
+    app.request_restart();
 }
 
 #[tauri::command]
@@ -327,10 +340,14 @@ async fn resolve_latest_release(
         .json::<Vec<GitHubRelease>>()
         .await?;
 
-    let best_release =
-        select_best_release(&releases, contract).ok_or(UpdaterError::NoMatchingBetaRelease)?;
+    let (best_release, version) =
+        select_best_release(&releases, contract).ok_or(UpdaterError::NoMatchingRelease)?;
 
-    let manifest_url = Url::parse(&github_manifest_url(contract, &best_release.tag_name))?;
+    let manifest_url = Url::parse(&github_manifest_url(
+        contract,
+        &best_release.tag_name,
+        manifest_asset_name(&version),
+    ))?;
     Ok(ResolvedRelease {
         tag_name: best_release.tag_name.clone(),
         manifest_url,
@@ -362,7 +379,7 @@ where
         }
     }
 
-    Err(last_error.unwrap_or(UpdaterError::NoMatchingBetaRelease))
+    Err(last_error.unwrap_or(UpdaterError::NoMatchingRelease))
 }
 
 /// The minisign public key update signatures are checked against: baked in
@@ -402,27 +419,34 @@ fn env_usize(name: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-fn release_has_manifest_asset(release: &GitHubRelease, contract: &UpdaterContract) -> bool {
-    release
-        .assets
-        .iter()
-        .any(|asset| asset.name == contract.manifest_asset_name)
+fn release_has_manifest_asset(release: &GitHubRelease, version: &semver::Version) -> bool {
+    let manifest = manifest_asset_name(version);
+    release.assets.iter().any(|asset| asset.name == manifest)
 }
 
+/// The newest published release this build's channel takes that carries
+/// its update manifest, with its version.
 fn select_best_release<'a>(
     releases: &'a [GitHubRelease],
     contract: &UpdaterContract,
-) -> Option<&'a GitHubRelease> {
+) -> Option<(&'a GitHubRelease, semver::Version)> {
     releases
         .iter()
         .filter(|release| !release.draft)
-        .filter(|release| release_has_manifest_asset(release, contract))
         .filter_map(|release| {
-            parse_beta_sequence(contract.channel, &release.tag_name)
-                .map(|sequence| (sequence, release))
+            let version = parse_release_tag(&release.tag_name)?;
+            (contract.channel.accepts(&version) && release_has_manifest_asset(release, &version))
+                .then_some((release, version))
         })
-        .max_by_key(|(sequence, _)| *sequence)
-        .map(|(_, release)| release)
+        .max_by(|(_, left), (_, right)| {
+            if is_newer_release(left, right) {
+                std::cmp::Ordering::Less
+            } else if is_newer_release(right, left) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
 }
 
 #[cfg(test)]
@@ -434,56 +458,72 @@ mod tests {
     };
     use crate::app::updater_contract::UpdaterContract;
 
-    #[test]
-    fn detects_manifest_asset_on_release() {
-        let contract = UpdaterContract::default();
-        let release = GitHubRelease {
-            tag_name: "v0.1.0-beta-12".to_string(),
+    fn release(tag_name: &str, assets: &[&str]) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
             draft: false,
-            assets: vec![
-                GitHubReleaseAsset {
-                    name: "izwi_linux_x86_64.AppImage".to_string(),
-                },
-                GitHubReleaseAsset {
-                    name: "latest-beta.json".to_string(),
-                },
-            ],
-        };
+            assets: assets
+                .iter()
+                .map(|name| GitHubReleaseAsset {
+                    name: name.to_string(),
+                })
+                .collect(),
+        }
+    }
 
-        assert!(release_has_manifest_asset(&release, &contract));
+    fn version(text: &str) -> semver::Version {
+        semver::Version::parse(text).unwrap()
+    }
+
+    fn best(releases: &[GitHubRelease], current: &str) -> Option<String> {
+        select_best_release(releases, &UpdaterContract::for_version(&version(current)))
+            .map(|(release, _)| release.tag_name.clone())
     }
 
     #[test]
-    fn selects_highest_beta_release_with_manifest() {
-        let contract = UpdaterContract::default();
-        let releases = vec![
-            GitHubRelease {
-                tag_name: "v0.1.0-beta-2".to_string(),
-                draft: false,
-                assets: vec![GitHubReleaseAsset {
-                    name: "latest-beta.json".to_string(),
-                }],
-            },
-            GitHubRelease {
-                tag_name: "v0.1.0-beta-12".to_string(),
-                draft: false,
-                assets: vec![GitHubReleaseAsset {
-                    name: "latest-beta.json".to_string(),
-                }],
-            },
-            GitHubRelease {
-                tag_name: "v0.1.0-beta-12".to_string(),
-                draft: false,
-                assets: vec![GitHubReleaseAsset {
-                    name: "something-else.json".to_string(),
-                }],
-            },
-        ];
-        let selected = select_best_release(&releases, &contract);
+    fn a_release_needs_the_manifest_for_its_kind() {
+        let beta = release("v0.1.0-beta-12", &["izwi.AppImage", "latest-beta.json"]);
+        assert!(release_has_manifest_asset(&beta, &version("0.1.0-beta-12")));
+        let stable = release("v0.1.0", &["latest-beta.json"]);
+        assert!(!release_has_manifest_asset(&stable, &version("0.1.0")));
+    }
 
+    #[test]
+    fn selects_the_newest_release_the_channel_takes() {
+        let releases = vec![
+            release("v0.1.0-beta-2", &["latest-beta.json"]),
+            release("v0.1.0-beta-12", &["latest-beta.json"]),
+            release("v0.1.0-beta-18", &["something-else.json"]),
+            release("v0.1.0", &["latest.json"]),
+            release("v0.2.0-beta-1", &["latest-beta.json"]),
+            release("v0.1.1", &["izwi.dmg"]),
+        ];
+        // A beta build moves on to the stable release it tested, and to
+        // later betas.
         assert_eq!(
-            selected.map(|release| release.tag_name.as_str()),
-            Some("v0.1.0-beta-12")
+            best(&releases, "0.1.0-beta-12"),
+            Some("v0.2.0-beta-1".into())
+        );
+        assert_eq!(best(&releases[..4], "0.1.0-beta-12"), Some("v0.1.0".into()));
+        // A stable build ignores betas and releases without a manifest.
+        assert_eq!(best(&releases, "0.1.0"), Some("v0.1.0".into()));
+        let mut drafted = releases.clone();
+        drafted.push(GitHubRelease {
+            draft: true,
+            ..release("v0.1.2", &["latest.json"])
+        });
+        assert_eq!(best(&drafted, "0.1.0"), Some("v0.1.0".into()));
+    }
+
+    #[test]
+    fn orders_beta_sequences_numerically_when_selecting() {
+        let releases = vec![
+            release("v0.1.0-beta-9", &["latest-beta.json"]),
+            release("v0.1.0-beta-10", &["latest-beta.json"]),
+        ];
+        assert_eq!(
+            best(&releases, "0.1.0-beta-1"),
+            Some("v0.1.0-beta-10".into())
         );
     }
 

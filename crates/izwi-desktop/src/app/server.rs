@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 use url::Url;
 
-use super::{alerts, desktop_log};
+use super::{alerts, desktop_log, stale_server};
 
 const SERVER_LOG_FILE: &str = "izwi-server.log";
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
@@ -36,6 +36,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// after an update relaunches the app, the old version's server is still
 /// shutting down.
 const OTHER_IZWI_GRACE: Duration = Duration::from_secs(10);
+/// How long a stale server we stopped may take to free the port.
+const STALE_SERVER_STOP: Duration = Duration::from_secs(5);
 /// Ports tried, in order, when the requested one is used by another program.
 const FALLBACK_PORTS: RangeInclusive<u16> = 8081..=8099;
 /// How often the monitor checks that the managed server is still running.
@@ -205,6 +207,16 @@ pub fn start_local_server<R: tauri::Runtime>(
         {
             desktop_log::info(format!(
                 "izwi-server {version} on port {port} has stopped; starting this version's server"
+            ));
+            None
+        }
+        // A server an older version left running (it had no owner pipe):
+        // when it runs this app's own server binary, stop it.
+        Some(Occupant::OtherIzwi { version })
+            if stop_stale_server(&host, port, resolve_server_binary(app).as_deref()) =>
+        {
+            desktop_log::info(format!(
+                "stopped izwi-server {version} left running on port {port}; starting this version's server"
             ));
             None
         }
@@ -747,6 +759,27 @@ fn is_server_reachable(host: &str, port: u16, timeout: Duration) -> bool {
     addrs
         .iter()
         .any(|addr| TcpStream::connect_timeout(addr, timeout).is_ok())
+}
+
+/// Stop the server on `port` when it runs `ours`, and say whether the port
+/// is free now. Any other program is left alone.
+fn stop_stale_server(host: &str, port: u16, ours: Option<&Path>) -> bool {
+    let Some(ours) = ours else {
+        return false;
+    };
+    let Some(pid) = stale_server::listening_pid(port) else {
+        return false;
+    };
+    match stale_server::process_executable(pid) {
+        Some(running) if stale_server::is_our_server(&running, ours) => {}
+        _ => return false,
+    }
+    stale_server::terminate(pid, false);
+    if wait_for_port_to_close(host, port, STALE_SERVER_STOP) {
+        return true;
+    }
+    stale_server::terminate(pid, true);
+    wait_for_port_to_close(host, port, STALE_SERVER_STOP)
 }
 
 fn resolve_server_binary<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {

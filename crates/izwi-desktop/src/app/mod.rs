@@ -17,6 +17,7 @@ pub mod install;
 pub mod reveal;
 pub mod server;
 pub mod settings;
+pub mod stale_server;
 pub mod tray;
 pub mod tray_visibility;
 pub mod updater;
@@ -97,6 +98,10 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             install::install_cli,
         ])
         .manage(updater::UpdaterState::new())
+        .manage(ServerControl {
+            server: Arc::clone(&managed_server),
+            shutdown: Arc::clone(&server_shutdown),
+        })
         .manage(tray_visibility::TrayVisibilityState::new(true));
 
     if let Some(app_key) = resolve_aptabase_app_key() {
@@ -239,6 +244,19 @@ fn request_server_stop(server: &Arc<Mutex<Option<ManagedServer>>>, shutdown: &Ar
         if let Some(server) = server_slot.as_mut() {
             server.request_stop();
         }
+    }
+}
+
+/// Stops the managed server from outside the event loop: before an update's
+/// installer takes the app down on Windows.
+pub struct ServerControl {
+    server: Arc<Mutex<Option<ManagedServer>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ServerControl {
+    pub fn stop(&self) {
+        stop_managed_server(&self.server, &self.shutdown);
     }
 }
 
