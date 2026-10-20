@@ -731,7 +731,8 @@ nothing uses it and it is older than the ephemeral retention. It is in use while
 a job takes it as input or an artifact row points at it (so it lives at least as
 long as its job), or while a transcription, diarization, speech-history item or
 saved voice holds its audio. A transcription's canonical WAV therefore goes with
-its job while the record keeps the upload; the canonical copy of a saved voice's
+its job while the record keeps the upload, and at once when the record is
+deleted (this sweep retries a failed delete); the canonical copy of a saved voice's
 or history item's audio is kept as long as that audio, since every speech
 request with that voice reuses it. A failed object delete leaves the row for the
 next pass.

@@ -587,6 +587,88 @@ async fn deleting_a_transcription_cancels_its_durable_job() {
     assert_eq!(job.status, RuntimeJobStatus::Cancelled);
 }
 
+/// Deleting a transcription deletes the canonical 16 kHz copy of its upload
+/// too, instead of leaving it until the job's retention runs out.
+#[tokio::test]
+async fn deleting_a_transcription_deletes_its_canonical_audio() {
+    let (state, _temp_dir) = test_state(
+        "deleting_a_transcription_deletes_its_canonical_audio",
+        false,
+    );
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let audio_body = tiny_audio_json_body();
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+    let canonical = state
+        .batch_runtime_store
+        .list_artifacts_for_job(&job.id)
+        .await
+        .expect("job artifacts")
+        .into_iter()
+        .find(|artifact| artifact.artifact_role == RuntimeArtifactRole::InputCanonical)
+        .expect("the job has a canonical input");
+    let canonical_key = canonical.storage_key.expect("canonical storage key");
+    let canonical_asset_id = canonical.media_asset_id.expect("canonical media asset");
+    state
+        .media_ingest
+        .read_object(&canonical_key)
+        .await
+        .expect("canonical audio is stored");
+
+    let deleted = send_request(
+        app.clone(),
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{record_id}?job_kind=transcription"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    assert!(state
+        .media_ingest
+        .read_object(&canonical_key)
+        .await
+        .is_err_and(|err| err.is_not_found()));
+    let asset = state
+        .batch_runtime_store
+        .get_media_asset(&canonical_asset_id)
+        .await
+        .expect("media asset read")
+        .expect("the row stays a tombstone while the job's artifact points at it");
+    assert!(asset.deleted_at.is_some());
+}
+
 /// A transcription still waiting can be cancelled: its durable job stops and
 /// the record fails with the reason. A retry runs it again on the stored
 /// audio as a new record; a job still running cannot be retried.

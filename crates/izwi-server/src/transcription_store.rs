@@ -1108,7 +1108,9 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
-    pub async fn delete_record(&self, record_id: String) -> anyhow::Result<bool> {
+    /// Delete a record and its upload. `None` when no record has that id,
+    /// otherwise the deleted upload's storage key.
+    pub async fn delete_record(&self, record_id: String) -> anyhow::Result<Option<Option<String>>> {
         let db = self.db.connection().await?;
         let audio_storage_path = db
             .query_one_raw(raw::statement(
@@ -1125,10 +1127,11 @@ impl TranscriptionStore {
             .exec(db)
             .await
             .context("Failed to delete transcription record")?;
-        if result.rows_affected > 0 {
-            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
+        if result.rows_affected == 0 {
+            return Ok(None);
         }
-        Ok(result.rows_affected > 0)
+        delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
+        Ok(Some(audio_storage_path))
     }
 }
 

@@ -244,20 +244,58 @@ pub async fn delete_record(
     )
     .await?;
     state.transcription_tasks.abort(&record_id);
-    let deleted = state
+    let Some(audio_storage_path) = state
         .transcription_store
         .delete_record(record_id.clone())
         .await
-        .map_err(map_store_error)?;
-
-    if !deleted {
+        .map_err(map_store_error)?
+    else {
         return Err(ApiError::not_found("Transcription record not found"));
+    };
+    if let Some(audio_storage_path) = audio_storage_path.as_deref() {
+        // The record is gone, so this only logs; the retention sweep
+        // removes whatever is left later.
+        if let Err(err) = delete_canonical_audio(&state, audio_storage_path).await {
+            tracing::warn!(
+                record_id,
+                "Failed to delete a deleted transcription's canonical audio: {err:#}"
+            );
+        }
     }
 
     Ok(Json(DeleteTranscriptionRecordResponse {
         id: record_id,
         deleted: true,
     }))
+}
+
+/// Delete the canonical 16 kHz copy made of an upload at ingest, so no copy
+/// of a deleted record's audio is kept until its job's retention runs out.
+async fn delete_canonical_audio(state: &AppState, source_storage_key: &str) -> anyhow::Result<()> {
+    let store = &state.batch_runtime_store;
+    let Some(source) = store
+        .get_media_asset_by_storage_key(source_storage_key)
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(canonical) = store
+        .get_canonical_media_asset(
+            &source.id,
+            CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    // Tombstone only once the object is gone: the retention sweep skips
+    // tombstoned rows, so a row left live is retried there.
+    state
+        .media_ingest
+        .delete_object(&canonical.storage_key)
+        .await?;
+    store.tombstone_media_asset(&canonical.id).await?;
+    Ok(())
 }
 
 /// Cancel the queued or running durable job behind a transcription record so
