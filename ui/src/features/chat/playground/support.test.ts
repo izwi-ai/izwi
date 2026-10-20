@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isSameCalendarDay,
   messageDayLabel,
@@ -10,6 +10,8 @@ import {
   isQwen38ThinkingModel,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
+  readChatImage,
+  stoppedReplyContent,
   summarizeChatStats,
   supportsImageAttachmentsForModel,
   stripMarkdown,
@@ -297,6 +299,25 @@ describe("chat playground support", () => {
     );
   });
 
+  it("strips emphasis without a lookbehind, which macOS 12 cannot parse", () => {
+    expect(stripMarkdown("Use *this*, _that_ (or *a b*) and * spaced *.")).toBe(
+      "Use this, that (or a b) and * spaced *.",
+    );
+    expect(stripMarkdown.toString()).not.toMatch(/\(\?<[=!]/);
+  });
+
+  it("keeps the opener of a reply stopped while it reasoned", () => {
+    expect(stoppedReplyContent("Weighing it", true)).toBe("<think>Weighing it");
+    expect(stoppedReplyContent("Weighing it</think>An answer", true)).toBe(
+      "Weighing it</think>An answer",
+    );
+    expect(stoppedReplyContent("<think>Its own opener", true)).toBe(
+      "<think>Its own opener",
+    );
+    expect(stoppedReplyContent("", true)).toBe("");
+    expect(stoppedReplyContent("An answer", false)).toBe("An answer");
+  });
+
   it("labels message days relative to now", () => {
     const now = new Date(2026, 9, 18, 9, 30).getTime();
     expect(messageDayLabel(new Date(2026, 9, 18, 0, 5).getTime(), now)).toBe(
@@ -326,5 +347,55 @@ describe("chat playground support", () => {
         new Date(2026, 9, 18, 0, 1).getTime(),
       ),
     ).toBe(false);
+  });
+});
+
+describe("readChatImage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const stubCanvas = () => {
+    const context = { fillStyle: "", fillRect: vi.fn(), drawImage: vi.fn() };
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context as unknown as CanvasRenderingContext2D,
+    );
+    const toDataUrl = vi
+      .spyOn(HTMLCanvasElement.prototype, "toDataURL")
+      .mockImplementation(function (this: HTMLCanvasElement) {
+        return `data:image/jpeg;base64,${this.width}x${this.height}`;
+      });
+    return { context, toDataUrl };
+  };
+
+  it("scales a large photo down to a 2048 px edge as JPEG", async () => {
+    const close = vi.fn();
+    vi.stubGlobal(
+      "createImageBitmap",
+      vi.fn().mockResolvedValue({ width: 4000, height: 3000, close }),
+    );
+    const { toDataUrl } = stubCanvas();
+    const file = new File([new Uint8Array(10)], "photo.png", { type: "image/png" });
+
+    await expect(readChatImage(file)).resolves.toBe(
+      "data:image/jpeg;base64,2048x1536",
+    );
+    expect(toDataUrl).toHaveBeenCalledWith("image/jpeg", 0.9);
+    expect(close).toHaveBeenCalled();
+  });
+
+  it("sends a small image as it is", async () => {
+    vi.stubGlobal(
+      "createImageBitmap",
+      vi.fn().mockResolvedValue({ width: 800, height: 600, close: vi.fn() }),
+    );
+    const { toDataUrl } = stubCanvas();
+    const file = new File([new Uint8Array([1, 2, 3])], "small.png", {
+      type: "image/png",
+    });
+
+    await expect(readChatImage(file)).resolves.toBe("data:image/png;base64,AQID");
+    expect(toDataUrl).not.toHaveBeenCalled();
   });
 });

@@ -6,8 +6,9 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router-dom";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
 
 const apiMocks = vi.hoisted(() => ({
@@ -2179,4 +2180,229 @@ describe("ChatPlayground", () => {
     expect(screen.getByText("Meaningful partial answer")).toBeInTheDocument();
   });
 
+  describe("streaming turns", () => {
+    const model = "LFM2.5-1.2B-Instruct-GGUF";
+    const thinkingModel = "Qwen3.5-4B";
+    const thread = { id: "stream-thread", title: "Stories", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 2 };
+    const other = { ...thread, id: "other-thread", title: "Other" };
+    const message = (id: string, role: "user" | "assistant", content: string,
+      createdAt: number, extra: Record<string, unknown> = {}) => ({
+      id, thread_id: thread.id, role, content, created_at: createdAt,
+      tokens_generated: null, generation_time_ms: null, ...extra });
+    const history = [
+      message("u1", "user", "Hi", 1),
+      message("a1", "assistant", "Hello there", 2, { model_id: model }),
+    ];
+    let server: Record<string, ReturnType<typeof message>[]>;
+    const router: { navigate?: NavigateFunction } = {};
+    const Navigator = () => {
+      const navigate = useNavigate();
+      useEffect(() => {
+        router.navigate = navigate;
+      }, [navigate]);
+      return null;
+    };
+
+    const renderChat = (path: string, props: Record<string, unknown> = {}) => {
+      apiMocks.listChatThreads.mockResolvedValue([thread, other]);
+      apiMocks.getChatThread.mockImplementation(async (id: string) => ({
+        thread: id === other.id ? other : thread,
+        messages: server[id] ?? [],
+      }));
+      render(<MemoryRouter initialEntries={[path]}>
+        <Navigator />
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} modelLabel="LFM2.5 1.2B"
+          modelOptions={[
+            { value: model, label: "LFM2.5 1.2B", statusLabel: "Ready", isReady: true },
+            { value: thinkingModel, label: "Qwen3.5 4B", statusLabel: "Ready", isReady: true },
+          ]}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()}
+          {...props} />
+      </MemoryRouter>);
+    };
+
+    const send = async (text: string) => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled());
+      const calls = apiMocks.sendChatThreadMessageStream.mock.calls;
+      return calls[calls.length - 1][2];
+    };
+
+    beforeEach(() => {
+      server = { [thread.id]: history, [other.id]: [
+        { ...message("o1", "user", "Elsewhere", 1), thread_id: other.id },
+        { ...message("o2", "assistant", "Other answer", 2), thread_id: other.id },
+      ] };
+    });
+
+    it("offers Retry on a stopped reply once the server has it, and a retry stays", async () => {
+      const controller = new AbortController();
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(controller);
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat?threadId=stream-thread");
+      await screen.findByText("Hello there");
+
+      const callbacks = await send("Tell me a story");
+      act(() => {
+        callbacks.onStart({ threadId: thread.id, modelId: model,
+          userMessage: message("u2", "user", "Tell me a story", 3) });
+        callbacks.onDelta("Once upon");
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel response" }));
+      act(() => callbacks.onClose());
+
+      // Not stored yet: the local copy has nothing to retry on the server.
+      expect(await screen.findByText("Stopped")).toBeInTheDocument();
+      expect(controller.signal.aborted).toBe(true);
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+      server[thread.id] = [...history, message("u2", "user", "Tell me a story", 3),
+        message("a2", "assistant", "Once upon", 4, { model_id: model, finish_reason: "cancelled" })];
+      fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a2", expect.any(Object), expect.any(Object));
+
+      const retried = message("a3", "assistant", "A whole story", 5, { model_id: model });
+      server[thread.id] = [...history, message("u2", "user", "Tell me a story", 3), retried];
+      const retry = apiMocks.regenerateChatThreadMessageStream.mock.calls[0][3];
+      act(() => {
+        retry.onDone({ threadId: thread.id, modelId: model, assistantMessage: retried,
+          stats: { tokens_generated: 3, generation_time_ms: 30 } });
+        retry.onClose();
+      });
+      await waitFor(() => expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(3));
+      expect(await screen.findByText("A whole story")).toBeInTheDocument();
+      await act(() => new Promise((resolve) => setTimeout(resolve, 30)));
+      expect(screen.queryByText("Once upon")).not.toBeInTheDocument();
+      expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+    });
+
+    it("keeps a reply stopped mid-thought as reasoning, not as the answer", async () => {
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat?threadId=stream-thread", {
+        selectedModel: thinkingModel, supportsThinking: true,
+        chatCapabilities: { supports_thinking: true, default_thinking_enabled: true,
+          thinking_toggleable: true, reasoning_efforts: [], default_reasoning_effort: null,
+          supports_preserve_thinking: false },
+        modelSupportsThinking: (variant: string) => variant === thinkingModel,
+      });
+      await screen.findByText("Hello there");
+
+      const callbacks = await send("Why is the sky blue?");
+      act(() => callbacks.onDelta("Weighing Rayleigh scattering"));
+      fireEvent.click(screen.getByRole("button", { name: "Cancel response" }));
+
+      expect(await screen.findByText("Stopped")).toBeInTheDocument();
+      expect(screen.queryByText("Weighing Rayleigh scattering")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Thought/ })).toBeInTheDocument();
+    });
+
+    it("stops a reply when you go back to another thread, and keeps it out of that thread", async () => {
+      const controller = new AbortController();
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(controller);
+      renderChat("/chat?threadId=stream-thread");
+      await screen.findByText("Hello there");
+      const callbacks = await send("Tell me a story");
+      act(() => callbacks.onDelta("Once upon"));
+
+      act(() => void router.navigate?.("/chat?threadId=other-thread"));
+      expect(await screen.findByText("Other answer")).toBeInTheDocument();
+      expect(controller.signal.aborted).toBe(true);
+      act(() => {
+        callbacks.onDelta(" a time");
+        callbacks.onClose();
+      });
+      expect(screen.queryByText(/Once upon/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
+    });
+
+    it("retries with another model using that model's thinking settings", async () => {
+      apiMocks.regenerateChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat?threadId=stream-thread", {
+        modelChatCapabilities: (variant: string) => variant === thinkingModel
+          ? { supports_thinking: true, default_thinking_enabled: true, thinking_toggleable: true,
+              reasoning_efforts: [], default_reasoning_effort: null, supports_preserve_thinking: false }
+          : null,
+      });
+      const reply = (await screen.findByText("Hello there")).closest("article") as HTMLElement;
+      const trigger = within(reply).getByRole("button", { name: "More reply actions" });
+      fireEvent.pointerDown(trigger);
+      fireEvent.click(trigger);
+      const retryWith = await screen.findByRole("menuitem", { name: "Retry with…" });
+      fireEvent.keyDown(retryWith, { key: "ArrowRight" });
+      const menus = await screen.findAllByRole("menu");
+      fireEvent.click(within(menus[menus.length - 1]).getByRole("menuitem", { name: /Qwen3.5 4B/ }));
+
+      expect(apiMocks.regenerateChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id, "a1",
+        expect.objectContaining({ model_id: thinkingModel, enable_thinking: true }),
+        expect.any(Object),
+      );
+    });
+
+    it("does not send on the Enter that ends an IME composition", async () => {
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat?threadId=stream-thread");
+      await screen.findByText("Hello there");
+      const composer = screen.getByRole("textbox");
+      fireEvent.change(composer, { target: { value: "こんにちは" } });
+
+      fireEvent.keyDown(composer, { key: "Enter", isComposing: true });
+      expect(apiMocks.sendChatThreadMessageStream).not.toHaveBeenCalled();
+      fireEvent.keyDown(composer, { key: "Enter" });
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce();
+    });
+
+    it("gives a failed first message back and leaves no empty thread", async () => {
+      const created = { ...thread, id: "created-thread", title: "New chat", message_count: 0 };
+      apiMocks.createChatThread.mockResolvedValue(created);
+      apiMocks.deleteChatThread.mockResolvedValue(undefined);
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat");
+      await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+
+      const callbacks = await send("Describe this");
+      act(() => {
+        callbacks.onError("Model crashed");
+        callbacks.onClose();
+      });
+
+      await waitFor(() => expect(apiMocks.deleteChatThread).toHaveBeenCalledWith(created.id));
+      expect(await screen.findByText("Model crashed")).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Describe this"));
+      expect(screen.queryByRole("heading", { name: "New chat" })).not.toBeInTheDocument();
+    });
+
+    it("gives a failed message back to the composer", async () => {
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      renderChat("/chat?threadId=stream-thread");
+      await screen.findByText("Hello there");
+      const callbacks = await send("One more thing");
+      expect(screen.getByRole("textbox")).toHaveValue("");
+      act(() => {
+        callbacks.onError("Model crashed");
+        callbacks.onClose();
+      });
+      await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("One more thing"));
+      expect(apiMocks.deleteChatThread).not.toHaveBeenCalled();
+    });
+
+    it("attaches only image formats the server reads", async () => {
+      renderChat("/chat?threadId=stream-thread", {
+        modelSupportsImages: () => true,
+      });
+      await screen.findByText("Hello there");
+      const input = screen.getByTestId("chat-image-input");
+      expect(input).toHaveAttribute("accept", "image/png,image/jpeg,image/gif,image/webp,image/bmp");
+
+      fireEvent.change(input, { target: { files: [
+        new File(["<svg/>"], "logo.svg", { type: "image/svg+xml" }),
+      ] } });
+      expect(await screen.findByText(/Attach PNG, JPEG, GIF, WebP or BMP images, not logo.svg/))
+        .toBeInTheDocument();
+    });
+  });
 });

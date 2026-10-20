@@ -28,6 +28,10 @@ export interface ChatPlaygroundProps {
    * model is not in the catalog. Used for threads written by another model.
    */
   modelSupportsThinking?: (variant: string) => boolean | undefined;
+  /** Catalog lookup for a model's chat capabilities, for Retry with…. */
+  modelChatCapabilities?: (
+    variant: string,
+  ) => ChatModelCapabilities | null | undefined;
   /** Catalog lookup for image input (`image_input` modality); undefined when unknown. */
   modelSupportsImages?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
@@ -319,7 +323,9 @@ export function stripMarkdown(text: string): string {
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/(\*\*|__)(.+?)\1/g, "$2")
-    .replace(/(^|[\s(])([*_])(?=\S)(.+?)(?<=\S)\2(?=[\s).,!?:;]|$)/g, "$1$3")
+    // No lookbehind: macOS 12's WebKit cannot parse it, and the whole
+    // module would fail to load.
+    .replace(/(^|[\s(])([*_])(\S(?:.*?\S)?)\2(?=[\s).,!?:;]|$)/g, "$1$3")
     .replace(/~~(.+?)~~/g, "$1")
     .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/gm, "")
     .replace(/^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*$/gm, " ")
@@ -471,6 +477,77 @@ export function buildChatThreadMessagePayload(options: {
       trimmedText || summarizePendingImages(options.images.length, options.images),
     contentParts,
   };
+}
+
+/** Image formats the server decodes. */
+export const CHAT_IMAGE_ACCEPT =
+  "image/png,image/jpeg,image/gif,image/webp,image/bmp";
+
+export function isChatImageFile(file: File): boolean {
+  return CHAT_IMAGE_ACCEPT.split(",").includes(file.type);
+}
+
+// Vision models read at most about 0.7 megapixels, so a longer edge only
+// makes the request bigger.
+const MAX_CHAT_IMAGE_EDGE = 2048;
+const MAX_CHAT_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * An attached image as a data URL. One larger than a vision model reads is
+ * scaled down and re-encoded as JPEG; without canvas support it is sent as
+ * it is.
+ */
+export async function readChatImage(file: File): Promise<string> {
+  if (
+    typeof createImageBitmap !== "function" ||
+    typeof document === "undefined"
+  ) {
+    return readImageFileAsDataUrl(file);
+  }
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return readImageFileAsDataUrl(file);
+  }
+  try {
+    const longEdge = Math.max(bitmap.width, bitmap.height);
+    if (longEdge <= MAX_CHAT_IMAGE_EDGE && file.size <= MAX_CHAT_IMAGE_BYTES) {
+      return readImageFileAsDataUrl(file);
+    }
+    const scale = Math.min(1, MAX_CHAT_IMAGE_EDGE / longEdge);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return readImageFileAsDataUrl(file);
+    }
+    // JPEG has no transparency.
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.9);
+  } finally {
+    bitmap.close();
+  }
+}
+
+/**
+ * A stopped reply as the server stores it: a reply stopped before
+ * `</think>`, after a prompt that opened the block, keeps the opener so its
+ * reasoning is not read as the answer.
+ */
+export function stoppedReplyContent(
+  content: string,
+  reasoningOpenedInPrompt: boolean,
+): string {
+  return reasoningOpenedInPrompt &&
+    content.length > 0 &&
+    !content.includes("<think>") &&
+    !content.includes("</think>")
+    ? `<think>${content}`
+    : content;
 }
 
 export async function readImageFileAsDataUrl(file: File): Promise<string> {

@@ -79,6 +79,13 @@ export function ChatPage({
     [models],
   );
 
+  const modelChatCapabilities = useCallback(
+    (variant: string) =>
+      models.find((candidate) => candidate.variant === variant)
+        ?.chat_capabilities,
+    [models],
+  );
+
   const modelSupportsImages = useCallback(
     (variant: string) => {
       const model = models.find((candidate) => candidate.variant === variant);
@@ -138,6 +145,7 @@ export function ChatPage({
         chatCapabilities={selectedModelInfo?.chat_capabilities ?? null}
         modelOptions={modelOptions}
         modelSupportsThinking={modelSupportsThinking}
+        modelChatCapabilities={modelChatCapabilities}
         modelSupportsImages={modelSupportsImages}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
