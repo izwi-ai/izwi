@@ -147,7 +147,7 @@ const SHORTCUTS = [
   },
   {
     label: "New item",
-    detail: "On Transcription, Text to Speech and Voices.",
+    detail: "On Transcription, Text to Speech, Studio and Voices.",
     mac: "⌘N",
     other: "Ctrl N",
   },
