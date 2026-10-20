@@ -6,11 +6,15 @@
 #   docker compose -f docker-compose.dev.yml up -d
 #
 # Then in separate terminals or using docker exec:
-#   - Backend: docker compose -f docker-compose.dev.yml exec dev cargo watch -x run
+#   - Backend: docker compose -f docker-compose.dev.yml exec dev cargo watch -x "run -p izwi-server"
 #   - Frontend: docker compose -f docker-compose.dev.yml exec dev bash -c "cd ui && npm run dev"
 #
 # Or use the convenience script:
 #   ./scripts/dev.sh
+#
+# The repository is mounted at /app, so the database and media live outside it
+# in the izwi-dev-data volume (/var/lib/izwi) and survive recreating the
+# containers.
 #
 # =============================================================================
 
@@ -37,12 +41,16 @@ services:
       - cargo-git:/root/.cargo/git
       - target-cache:/app/target
       - node-modules:/app/ui/node_modules
-      # Persist models
+      # Persist models, history and media
       - izwi-models:/app/models
+      - izwi-dev-data:/var/lib/izwi
     environment:
       - CARGO_HOME=/root/.cargo
       - CARGO_TARGET_DIR=/app/target
       - HF_HOME=/app/models/huggingface
+      - IZWI_MODELS_DIR=/app/models
+      - IZWI_DB_PATH=/var/lib/izwi/izwi.sqlite3
+      - IZWI_MEDIA_DIR=/var/lib/izwi/media
       # The published port needs a 0.0.0.0 bind, which requires an API key.
       - IZWI_HOST=0.0.0.0
       - IZWI_API_KEY=${IZWI_API_KEY:-}
@@ -59,7 +67,7 @@ services:
         echo 'Development environment ready!' &&
         echo '' &&
         echo 'Available commands:' &&
-        echo '  Backend:  cargo watch -x run' &&
+        echo '  Backend:  cargo watch -x \"run -p izwi-server\"' &&
         echo '  Frontend: cd ui && npm run dev -- --host' &&
         echo '  Tests:    cargo test' &&
         echo '' &&
@@ -86,15 +94,19 @@ services:
       - cargo-git:/root/.cargo/git
       - target-cache:/app/target
       - izwi-models:/app/models
+      - izwi-dev-data:/var/lib/izwi
     environment:
       - CARGO_HOME=/root/.cargo
       - CARGO_TARGET_DIR=/app/target
       - HF_HOME=/app/models/huggingface
+      - IZWI_MODELS_DIR=/app/models
+      - IZWI_DB_PATH=/var/lib/izwi/izwi.sqlite3
+      - IZWI_MEDIA_DIR=/var/lib/izwi/media
       # The published port needs a 0.0.0.0 bind, which requires an API key.
       - IZWI_HOST=0.0.0.0
       - IZWI_API_KEY=${IZWI_API_KEY:-}
     working_dir: /app
-    command: cargo watch -x run
+    command: cargo watch -x "run -p izwi-server"
 
   # ---------------------------------------------------------------------------
   # Frontend dev server (alternative to running in dev container)
@@ -126,6 +138,8 @@ volumes:
     name: izwi-node-modules
   izwi-models:
     name: izwi-models
+  izwi-dev-data:
+    name: izwi-dev-data
 
 networks:
   default:
