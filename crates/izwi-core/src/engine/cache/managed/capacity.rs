@@ -704,6 +704,97 @@ pub(super) fn tensor_state_resources(backend: BackendKind, bytes: u64) -> Result
 }
 
 impl ManagedKvCacheManager {
+    fn portable_state_plan(
+        &self,
+        contract: &InferenceStateContract,
+        page_tokens_hint: u32,
+    ) -> Result<ResolvedStatePlan> {
+        negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: Some(page_tokens_hint),
+                storage_dtype_hint: None,
+            },
+        )
+    }
+
+    /// What [`Self::fit_portable_logical_token_reach`] prices `state_plan`
+    /// at `tokens` per sequence, `(retained, staged)` rows and `copies`.
+    fn planned_portable_state_bytes(
+        &self,
+        state_plan: &ResolvedStatePlan,
+        model_instance: ModelInstanceId,
+        prefix_snapshot_rows: u32,
+        tokens: u64,
+        (retained_sequence_rows, staged_transaction_rows): (u32, u32),
+        portable_state_copies: u32,
+    ) -> Result<u64> {
+        let (allocation, _) = plan_managed_state_capacity_with_policy(
+            state_plan,
+            model_instance,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::MAX,
+                logical_token_reach: Some(tokens),
+                retained_sequence_rows,
+                staged_transaction_rows,
+            },
+            false,
+            prefix_snapshot_rows,
+        )?;
+        let resources = managed_state_resources(
+            self.worker_backend,
+            allocation.maximum_resources(state_plan)?,
+        )?;
+        let bytes = match self.worker_backend {
+            BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
+            BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
+            BackendKind::Cuda => {
+                return Err(Error::InvalidInput(
+                    "CUDA managed state is not priced by the portable fit".into(),
+                ))
+            }
+        }?;
+        bytes
+            .checked_mul(u64::from(portable_state_copies))
+            .ok_or_else(|| {
+                Error::ModelLoadError("aggregate managed-state byte plan overflow".into())
+            })
+    }
+
+    /// The bytes `contract`'s portable managed state takes at `tokens` per
+    /// sequence, priced exactly as the portable fit prices it, so a pre-load
+    /// floor and the fit after the load agree. `None` on CUDA, which does
+    /// not fit portable state.
+    pub(crate) fn portable_state_bytes(
+        &self,
+        contract: &InferenceStateContract,
+        tokens: u64,
+        page_tokens_hint: usize,
+        rows: (u32, u32),
+        portable_state_copies: u32,
+    ) -> Result<Option<u64>> {
+        if self.worker_backend == BackendKind::Cuda {
+            return Ok(None);
+        }
+        let page_tokens_hint = u32::try_from(page_tokens_hint)
+            .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
+        let state_plan = self.portable_state_plan(contract, page_tokens_hint)?;
+        // The page minimum, as the fit floors its minimum.
+        let tokens = u64::from(page_tokens_hint).max(tokens);
+        // The instance only labels the plan; no arena is bound for it.
+        self.planned_portable_state_bytes(
+            &state_plan,
+            ModelInstanceId::new(u64::MAX),
+            self.prefix_snapshot_rows_for(contract),
+            tokens,
+            rows,
+            portable_state_copies,
+        )
+        .map(Some)
+    }
+
     /// Resolve the largest portable logical reach whose exact managed-state
     /// plan fits the stable shared-memory envelope. CUDA deliberately bypasses
     /// this path and keeps admission-growable arenas.
@@ -749,56 +840,39 @@ impl ManagedKvCacheManager {
         let ResourceAmount::Known(headroom_bytes) = planning else {
             return Ok(maximum_tokens.min(4_096));
         };
+        let later_minimum_bytes = match headroom {
+            PortableFitHeadroom::Live {
+                later_minimum_bytes,
+                ..
+            } => later_minimum_bytes,
+            PortableFitHeadroom::Planning { .. } => 0,
+        };
         // The model-authored minimum is admitted against planning headroom;
         // live memory caps only growth above it. Right after a large load the
         // live sample undercounts what the OS reclaims on demand (clean
         // file-backed pages of the checkpoint just read, compressible
-        // pages), so a live floor refused even a one-page state.
-        let floor_budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        // pages), so a live floor refused even a one-page state. Both leave
+        // the later groups' minimums free beside the reserve.
+        let held_bytes = safety_reserve_bytes.saturating_add(later_minimum_bytes);
+        let floor_budget_bytes = headroom_bytes.saturating_sub(held_bytes);
         let growth_budget_bytes = match growth_headroom {
-            ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+            ResourceAmount::Known(bytes) => bytes.saturating_sub(held_bytes),
             ResourceAmount::Unknown => floor_budget_bytes,
         }
         .min(floor_budget_bytes);
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
-        let state_plan = negotiate_state_plan(
-            contract,
-            &StateBackendPlanRequest {
-                backend: self.worker_backend,
-                device_ordinal: self.worker_device_ordinal,
-                page_tokens_hint: Some(page_tokens_hint),
-                storage_dtype_hint: None,
-            },
-        )?;
+        let state_plan = self.portable_state_plan(contract, page_tokens_hint)?;
         let prefix_snapshot_rows = self.prefix_snapshot_rows_for(contract);
         let required_bytes = |tokens: u64| -> Result<u64> {
-            let (allocation, _) = plan_managed_state_capacity_with_policy(
+            self.planned_portable_state_bytes(
                 &state_plan,
                 model_instance,
-                ManagedStateCapacityRequest {
-                    total_paged_pages: u32::MAX,
-                    logical_token_reach: Some(tokens),
-                    retained_sequence_rows,
-                    staged_transaction_rows,
-                },
-                false,
                 prefix_snapshot_rows,
-            )?;
-            let resources = managed_state_resources(
-                self.worker_backend,
-                allocation.maximum_resources(&state_plan)?,
-            )?;
-            let bytes = match self.worker_backend {
-                BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
-                BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
-                BackendKind::Cuda => unreachable!("CUDA bypassed portable fitting"),
-            }?;
-            bytes
-                .checked_mul(u64::from(portable_state_copies))
-                .ok_or_else(|| {
-                    Error::ModelLoadError("aggregate managed-state byte plan overflow".into())
-                })
+                tokens,
+                (retained_sequence_rows, staged_transaction_rows),
+                portable_state_copies,
+            )
         };
 
         let floor_tokens = match headroom {
@@ -811,15 +885,21 @@ impl ManagedKvCacheManager {
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
             tracing::warn!(
-                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
+                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, later_minimum_bytes={later_minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
                 minimum_bytes - floor_budget_bytes
             );
-            let message = crate::engine::resources::capacity_shortfall_reason(
-                format_args!(
-                    "not enough memory for this model's minimum {minimum_tokens}-token state"
-                ),
-                minimum_bytes,
-                floor_budget_bytes,
+            let subject = if later_minimum_bytes > 0 {
+                format!(
+                    "not enough memory for this model's minimum {minimum_tokens}-token state and the working state loaded after it"
+                )
+            } else {
+                format!("not enough memory for this model's minimum {minimum_tokens}-token state")
+            };
+            let message = crate::engine::resources::state_shortfall_reason(
+                subject,
+                minimum_bytes.saturating_add(later_minimum_bytes),
+                headroom_bytes,
+                safety_reserve_bytes,
             );
             // A model-authored floor (ASR, TTS, chat) that headroom cannot
             // hold is a capacity refusal (503), not a load defect.
@@ -831,20 +911,33 @@ impl ManagedKvCacheManager {
             });
         }
         let budget_bytes = growth_budget_bytes.max(minimum_bytes);
-        if required_bytes(maximum_tokens)? <= budget_bytes {
-            return Ok(maximum_tokens);
-        }
-
-        let (mut low, mut high) = (minimum_tokens, maximum_tokens);
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            if required_bytes(middle)? <= budget_bytes {
-                low = middle;
-            } else {
-                high = middle - 1;
+        let selected = if required_bytes(maximum_tokens)? <= budget_bytes {
+            maximum_tokens
+        } else {
+            let (mut low, mut high) = (minimum_tokens, maximum_tokens);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if required_bytes(middle)? <= budget_bytes {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
             }
-        }
-        Ok(low)
+            low
+        };
+        tracing::info!(
+            model_instance = ?model_instance,
+            selected_tokens = selected,
+            minimum_tokens,
+            maximum_tokens,
+            state_bytes = required_bytes(selected)?,
+            growth_budget_bytes = budget_bytes,
+            retained_sequence_rows,
+            staged_transaction_rows,
+            portable_state_copies,
+            "Fitted portable retained state"
+        );
+        Ok(selected)
     }
 
     /// Fit a CUDA logical reach whose complete paged backing is materialized

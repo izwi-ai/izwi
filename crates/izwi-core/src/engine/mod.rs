@@ -177,8 +177,8 @@ pub use request::{
     RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
-    BatchWorkspaceLease, CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
-    ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
+    BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
+    PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
     ResourceAuthoritySnapshot, ResourceEstimate, ResourceLease, ResourceLedger,
     ResourceReservation, ResourceVector,
 };
@@ -3315,6 +3315,7 @@ impl Engine {
         logical_context_tokens: Option<usize>,
         minimum_tokens: u64,
         reserve: StateFitReserve,
+        later_minimum_bytes: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_state(
@@ -3323,9 +3324,21 @@ impl Engine {
                 logical_context_tokens,
                 minimum_tokens,
                 reserve,
+                later_minimum_bytes,
             )
         })
         .await
+    }
+
+    pub(crate) async fn portable_state_minimum_bytes(
+        &self,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        minimum_tokens: u64,
+    ) -> Result<Option<u64>> {
+        self.core
+            .read()
+            .await
+            .portable_state_minimum_bytes(retained_state, minimum_tokens)
     }
 
     pub(crate) async fn price_tensor_rows_with_requests(
@@ -3378,6 +3391,7 @@ impl Engine {
                 minimum_tokens,
                 // ASR loads reconcile their observed weight growth.
                 StateFitReserve::MeasuredUntracked,
+                0,
             )
         })
         .await

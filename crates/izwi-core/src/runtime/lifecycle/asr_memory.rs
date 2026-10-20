@@ -12,8 +12,8 @@
 //! memory on Metal, device memory on CUDA):
 //! - Resident weights: every tensor the loader reads, in its resident form (kept
 //!   quantized, dequantized or cast), plus the copies it makes (Granite's F16 LM
-//!   head, LFM's second Q6_K token-embedding read, Qwen3-ASR's separate Q8_0
-//!   `lm_head` beside its dense embedding) and the tables it computes. Tensors it
+//!   head, Qwen3-ASR's separate Q8_0 `lm_head` beside its dense embedding) and
+//!   the tables it computes. Tensors it
 //!   never reads are left out. On Metal, a buffer a device kernel writes (a cast,
 //!   a concatenation, any op output) is sized the way Candle 0.11's pool
 //!   allocates it, rounded up to the next power of two (`candle-core`
@@ -32,7 +32,11 @@
 //!   Freed private-pool
 //!   intermediates, such as the parts of a fused projection, are reused by later
 //!   allocations, so only their high-water mark counts. CPU and CUDA release a
-//!   buffer when it drops.
+//!   buffer when it drops. The plans price components in loader order where a
+//!   synchronization separates them: a Metal load-time probe reads the audio
+//!   tower's (or encoder's) output back before the text model loads, and the
+//!   text models read their token table first, so what each segment leaves
+//!   held never runs beside the next segment's steps.
 //! - CUDA host staging, which is the whole CUDA host authorization: the largest
 //!   per-tensor host copy (NeMo archives stream to disk, so a first load adds
 //!   no extraction buffer).
@@ -74,6 +78,7 @@ use crate::models::architectures::granite_speech::asr::{
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
+use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
     nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
@@ -88,7 +93,8 @@ use crate::models::architectures::qwen3::asr::{
     resolve_qwen_asr_gguf_path, QWEN3_ASR_AUDIO_POSITIONS, QWEN3_ASR_GGUF_CHECKPOINT_DTYPE,
 };
 use crate::models::architectures::qwen3::core::{
-    qwen3_dense_projection_fusion_enabled, qwen3_quantized_projection_grouping_for_hidden_size,
+    qwen3_dense_projection_fusion_enabled, qwen3_mlx_q4_1_enabled,
+    qwen3_quantized_projection_grouping_for_hidden_size,
 };
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
@@ -208,15 +214,21 @@ pub(super) fn residency_plan(
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             qwen3_asr_plan(variant, model_path, device, backend)
         }
-        ModelVariant::ParakeetTdt06BV3 => parakeet_plan(variant, model_path, device, backend),
+        ModelVariant::ParakeetTdt06BV3 => {
+            parakeet_plan(variant, model_path, device, backend, Precision::Selected)
+        }
         ModelVariant::Nemotron35AsrStreaming06B => {
-            nemotron_plan(variant, model_path, device, backend)
+            nemotron_plan(variant, model_path, device, backend, Precision::Selected)
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
-            granite_plan(model_path, device, backend, granite.speech_dtype.as_deref())
-        }
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => granite_plan(
+            model_path,
+            device,
+            backend,
+            granite.speech_dtype.as_deref(),
+            Precision::Selected,
+        ),
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
@@ -329,9 +341,13 @@ struct Step {
 }
 
 /// Accumulates a load's steps into an upper bound of its peak that holds for
-/// any order of the steps (the loaders' order is theirs to change): every step
-/// may run last, beside every resident byte and whatever earlier steps left
-/// for Candle to release at the next synchronization.
+/// any order of the steps within a segment (the loaders' order is theirs to
+/// change): every step may run last, beside every resident byte and whatever
+/// earlier steps in its segment left for Candle to release at the next
+/// synchronization. A segment ends where the loader synchronizes whatever it
+/// uploaded, at a load-time probe's read-back ([`Ledger::barrier`]) or after
+/// a token table it reads first and that leaves nothing held
+/// ([`Ledger::settle`]); the segments' transients never stack.
 #[derive(Debug)]
 pub(super) struct Ledger {
     backend: BackendKind,
@@ -354,8 +370,6 @@ pub(super) struct Ledger {
     extra_max_synced: u64,
     /// Largest step high point beyond the step's own resident and held bytes.
     extra_beyond_held_max: u64,
-    /// Metal: the most a synchronizing step has alive at its synchronization.
-    before_sync_max: u64,
     /// Metal: the most held by a synchronizing step's predecessor (another
     /// step, or a release) beside its own synchronization.
     at_sync_max: u64,
@@ -373,6 +387,9 @@ pub(super) struct Ledger {
     /// Metal, staged: the most one step that does not synchronize itself
     /// leaves held.
     held_step_max: u64,
+    /// Metal: the most the segments closed by a [`Self::barrier`] add beside
+    /// the residents.
+    segments: u64,
 }
 
 impl Ledger {
@@ -388,7 +405,6 @@ impl Ledger {
             extra_max: 0,
             extra_max_synced: 0,
             extra_beyond_held_max: 0,
-            before_sync_max: 0,
             at_sync_max: 0,
             prelude: 0,
             host_peak: 0,
@@ -396,6 +412,7 @@ impl Ledger {
             sync_interval: None,
             host_cast: false,
             held_step_max: 0,
+            segments: 0,
         }
     }
 
@@ -441,20 +458,19 @@ impl Ledger {
         self.logical = sum(&[self.logical, step.logical])?;
         self.resident = sum(&[self.resident, step.resident])?;
         let extra = step.high.checked_sub(step.resident).ok_or_else(overflow)?;
-        self.extra_beyond_held_max = self
-            .extra_beyond_held_max
-            .max(extra.saturating_sub(step.held_until_sync));
         self.scratch = self.scratch.max(step.intermediates);
         self.host_peak = self.host_peak.max(step.host);
         match step.before_sync.filter(|_| self.metal()) {
             Some(before_sync) => {
                 self.extra_max_synced = self.extra_max_synced.max(extra);
-                self.before_sync_max = self.before_sync_max.max(before_sync);
                 self.held_max = self.held_max.max(step.held_until_sync);
                 self.synced.push((step.held_until_sync, before_sync));
             }
             None => {
                 self.extra_max = self.extra_max.max(extra);
+                self.extra_beyond_held_max = self
+                    .extra_beyond_held_max
+                    .max(extra.saturating_sub(step.held_until_sync));
                 self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
                 self.held_step_max = self.held_step_max.max(step.held_until_sync);
             }
@@ -530,12 +546,22 @@ impl Ledger {
                     earlier.saturating_sub(stored)
                 };
                 let host = if source == Source::Copied { stored } else { 0 };
+                // `staged::metal_synced_safetensors` drops a cast's upload
+                // before it counts it, and synchronizes once the count
+                // reaches the interval: an upload that reaches it alone is
+                // freed right after its own step.
+                let synced_alone = cast
+                    && rest.is_empty()
+                    && self
+                        .sync_interval
+                        .is_some_and(|interval| stored >= interval);
                 Step {
                     logical,
                     resident,
                     high: sum(&[resident, upload_released, host])?,
-                    held_until_sync: upload_released,
+                    held_until_sync: if synced_alone { 0 } else { upload_released },
                     intermediates: private_earlier,
+                    before_sync: synced_alone.then_some(sum(&[upload_released, host])?),
                     ..Step::default()
                 }
             }
@@ -555,7 +581,11 @@ impl Ledger {
     ) -> Result<()> {
         let stored = tensor.stored_bytes;
         let elements = tensor.elements();
-        let host = sum(&[stored, if cast { upload } else { 0 }])?;
+        // `HostCastSafetensors::load` drops the stored-dtype read once it is
+        // converted, before the upload, and the converted copy once it is
+        // uploaded, before the chain's device ops run.
+        let converting = sum(&[stored, if cast { upload } else { 0 }])?;
+        let uploading = sum(&[upload, upload])?;
         let mut logical = upload;
         let mut forms = vec![upload];
         for &dtype in rest {
@@ -567,10 +597,11 @@ impl Ledger {
         // between are private.
         let released = if rest.is_empty() { 0 } else { upload };
         let private = sum(&forms)?.saturating_sub(released);
+        let device_ops = sum(&[released, resident])?;
         self.apply(Step {
             logical,
             resident,
-            high: sum(&[resident, released, host])?,
+            high: converting.max(uploading).max(device_ops),
             held_until_sync: released,
             intermediates: private,
             ..Step::default()
@@ -602,15 +633,57 @@ impl Ledger {
         source: Source,
         dtype: DType,
     ) -> Result<()> {
-        let mut step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.synced_after_join(step)?;
+        self.apply(step)
+    }
+
+    /// [`Self::fused`] for a join built at its exact size
+    /// (`memory::exact::exact_concat_rows`): the joined buffer is allocated
+    /// outside Candle's pool, so on Metal it is not rounded up.
+    fn fused_exact(&mut self, parts: &[&CensusTensor], source: Source, dtype: DType) -> Result<()> {
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.exact_join(step)?;
+        self.apply(step)
+    }
+
+    /// [`Self::fused_exact`] for a loader that then drops the parts and
+    /// synchronizes the device ([`Self::fused_then_synced`]): the Qwen3
+    /// dense projection fusion and Whisper's self-attention Q/K/V.
+    fn fused_exact_then_synced(
+        &mut self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+    ) -> Result<()> {
+        let step = self.fused_step(parts, source, dtype, 0)?;
+        let step = self.exact_join(step)?;
+        let step = self.synced_after_join(step)?;
+        self.apply(step)
+    }
+
+    /// A join's step with its result at its exact size (Metal).
+    fn exact_join(&self, mut step: Step) -> Result<Step> {
         if self.metal() {
-            let parts = sum(&[step.held_until_sync, step.intermediates])?;
+            step.high = sum(&[step.high.saturating_sub(step.resident), step.logical])?;
+            step.resident = step.logical;
+        }
+        Ok(step)
+    }
+
+    /// A join's step whose loader synchronizes once it has dropped the parts
+    /// (Metal): the parts are alive at that synchronization, beside the
+    /// join, and none stays held or pooled after it.
+    fn synced_after_join(&self, mut step: Step) -> Result<Step> {
+        if self.metal() {
             step.high = sum(&[step.high, step.intermediates])?;
-            step.before_sync = Some(parts);
+            // Everything the step allocated beyond the join is alive until
+            // that synchronization: the parts, and any host copies.
+            step.before_sync = Some(step.high.saturating_sub(step.resident));
             step.held_until_sync = 0;
             step.intermediates = 0;
         }
-        self.apply(step)
+        Ok(step)
     }
 
     fn fused_step(
@@ -780,6 +853,41 @@ impl Ledger {
             }
         };
         self.apply(step)
+    }
+
+    /// MLX 4-bit weights repacked into Q4_1 blocks on the host and uploaded
+    /// once, stacked by rows when there are several (Metal,
+    /// `qwen3::core::qwen3_mlx_q4_1_projection`). Per weight the loader reads
+    /// the packed words back from their upload (held until the next
+    /// synchronization) and the scales and biases at F32; the group's blocks
+    /// accumulate on the host until the upload.
+    fn mlx_q4_1(&mut self, parts: &[MlxWeight]) -> Result<()> {
+        let mut logical = 0;
+        let mut held = 0;
+        let mut reading = 0;
+        for part in parts {
+            let packed = part.weight.stored_bytes;
+            let params = part.params_host_bytes()?;
+            let blocks = part.elements()? / 32 * 20;
+            let readback = self.kernel(packed)?;
+            held = held.max(sum(&[packed, readback])?);
+            // The packed copy, the parameters and this weight's blocks beside
+            // the blocks of the parts before it.
+            reading = reading.max(sum(&[logical, packed, params, blocks])?);
+            logical = sum(&[logical, blocks])?;
+        }
+        // `qwen3_mlx_q4_1_projection` synchronizes once every part is read
+        // (`qwen3/core.rs`), which drops the packed uploads and read-back
+        // buffers, and only then uploads the blocks, beside their host copy.
+        // Its first synchronization is the first part's words read-back.
+        self.apply(Step {
+            logical,
+            resident: logical,
+            high: sum(&[held, reading])?.max(sum(&[logical, logical])?),
+            held_until_sync: 0,
+            before_sync: Some(held),
+            ..Step::default()
+        })
     }
 
     /// A GGUF tensor kept quantized (`QTensor` / `QMatMul`), read through a
@@ -985,20 +1093,39 @@ impl Ledger {
         self.host_staged(bytes, host)
     }
 
-    /// [`Self::host_converted`] for a weight converted straight from its
-    /// memory map (Qwen3-TTS's float text embedding): the converted copy is
-    /// the only host allocation, the mapped checkpoint pages being file
-    /// backed.
-    pub(super) fn host_converted_in_place(
+    /// A tensor read and converted on the host that stays there (Qwen3-TTS's
+    /// text table: only gathered rows reach the device). With `intermediate`
+    /// it passes through that dtype first; otherwise it is converted straight
+    /// from the memory map. On CPU and Metal it is resident in the one memory
+    /// and nothing is uploaded; on CUDA it costs host memory only.
+    pub(super) fn host_kept(
         &mut self,
         tensor: &CensusTensor,
+        intermediate: Option<DType>,
         dtype: DType,
     ) -> Result<()> {
         let bytes = dense_bytes(tensor.elements(), dtype)?;
-        self.host_staged(bytes, bytes)
+        let high = match intermediate {
+            Some(form) => {
+                let intermediate = dense_bytes(tensor.elements(), form)?;
+                sum(&[tensor.stored_bytes, intermediate])?.max(sum(&[intermediate, bytes])?)
+            }
+            None => bytes,
+        };
+        self.apply(match self.backend {
+            BackendKind::Cpu | BackendKind::Metal => Step {
+                logical: bytes,
+                resident: bytes,
+                high,
+                ..Step::default()
+            },
+            BackendKind::Cuda => Step {
+                host: high,
+                ..Step::default()
+            },
+        })
     }
 
-    /// A weight of `bytes` uploaded once from `host` bytes of host buffers.
     fn host_staged(&mut self, bytes: u64, host: u64) -> Result<()> {
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {
@@ -1040,35 +1167,58 @@ impl Ledger {
         Ok(most)
     }
 
+    /// Metal: the most the steps priced since the last barrier add beside
+    /// every resident byte. A step that does not synchronize runs beside
+    /// everything held; a synchronizing step beside it only until its first
+    /// synchronization (`before_sync`), and alone after it.
+    fn transient(&self) -> Result<u64> {
+        // Released uploads are held until the load fence, or, for a loader
+        // that synchronizes by uploaded bytes, less than an interval of them
+        // plus the step straddling the last synchronization.
+        let held = match self.sync_interval {
+            Some(interval) => self
+                .held_unsynced
+                .min(sum(&[interval, self.held_step_max])?),
+            None => self.held_unsynced,
+        };
+        let unsynced = sum(&[held, self.held_max, self.extra_beyond_held_max])?;
+        let at_sync = sum(&[held, self.at_sync_max()?])?;
+        Ok(unsynced.max(at_sync).max(self.extra_max_synced))
+    }
+
+    /// The loader synchronizes the device here whatever it uploaded (a
+    /// load-time probe reads a component's output back), and every step
+    /// priced after this runs after it: nothing released before it is still
+    /// held, so the segments' transients never stack.
+    fn barrier(&mut self) -> Result<()> {
+        if self.metal() {
+            self.segments = self.segments.max(self.transient()?);
+            self.held_unsynced = 0;
+            self.held_step_max = 0;
+            self.held_max = 0;
+            self.synced.clear();
+            self.extra_max = 0;
+            self.extra_max_synced = 0;
+            self.extra_beyond_held_max = 0;
+            self.at_sync_max = 0;
+        }
+        Ok(())
+    }
+
+    /// Closes the segment priced so far when it leaves nothing held: every
+    /// step priced after this runs after it (the loader's order), so their
+    /// transients never stack with this segment's.
+    fn settle(&mut self) -> Result<()> {
+        if self.held_unsynced == 0 && self.held_max == 0 {
+            self.barrier()?;
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> Result<Self> {
         let base = self.resident;
         self.peak = if self.metal() {
-            let base = sum(&[base, self.scratch])?;
-            if self.held_unsynced > 0 {
-                // Nothing synchronizes before the load fence: every released
-                // upload is still held when the last step runs. A staged
-                // loader synchronizes right after the upload that brings its
-                // uploads since the last synchronization to the interval, and
-                // a step releases only uploads it made before its release.
-                // So the steps released since the last synchronization made
-                // less than an interval of uploads after it, except the one
-                // step that straddles it.
-                let held_unsynced = match self.sync_interval {
-                    Some(interval) => self
-                        .held_unsynced
-                        .min(sum(&[interval, self.held_step_max])?),
-                    None => self.held_unsynced,
-                };
-                let held = sum(&[held_unsynced, self.held_max])?;
-                let extra = self.extra_beyond_held_max.max(self.before_sync_max);
-                sum(&[base, held, extra])?
-            } else {
-                // A synchronizing step drops what the previous one left held;
-                // the others run beside it.
-                let unsynced = sum(&[self.held_max, self.extra_max])?;
-                let extra = self.extra_max_synced.max(unsynced).max(self.at_sync_max()?);
-                sum(&[base, extra])?
-            }
+            sum(&[base, self.scratch, self.transient()?.max(self.segments)])?
         } else {
             sum(&[base, self.extra_max.max(self.extra_max_synced)])?
         }
@@ -1132,6 +1282,19 @@ impl<'a> MlxWeight<'a> {
         dim(self.weight, 0)?
             .checked_mul(self.in_dim)
             .ok_or_else(overflow)
+    }
+
+    /// Whether `mlx::read_q4_1_blocks` repacks this weight into Q4_1: 4-bit
+    /// in U32 words, in groups of a multiple of 32 elements. (It also needs
+    /// F16 to hold every scale and bias exactly, which a census cannot see;
+    /// every published checkpoint checked does.)
+    fn repacks_to_q4_1(&self) -> Result<bool> {
+        let groups = dim(self.scales, 1)?;
+        Ok(self.weight.dtype == StoredDType::Dense(DType::U32)
+            && dim(self.weight, 1)? * 8 == self.in_dim
+            && groups > 0
+            && self.in_dim.is_multiple_of(groups)
+            && (self.in_dim / groups).is_multiple_of(32))
     }
 
     /// The scales and biases as the loader copies them to the host, in F32.
@@ -1208,9 +1371,12 @@ fn whisper_plan(
     let Some(files) = census_of(&whisper_weight_files(model_path)?)? else {
         return Ok(None);
     };
-    // F16 on Metal by default. A failed load-time self-check reloads in F32
-    // after dropping the F16 model; that rare fallback is not priced here
-    // (as for Parakeet and Nemotron), and live-memory admission sees it.
+    // F16 on Metal by default. Its load-time self-check runs one full 30 s
+    // encoder pass, which the request floor admission folds into the load
+    // authorization prices (`admit_asr_request_floor`: one request envelope
+    // beside the residents), so the plan carries the weights alone. A failed
+    // self-check reloads in F32 after dropping the F16 model; that rare
+    // fallback is not priced here, and live-memory admission sees it.
     price_whisper(&files, backend, whisper_weight_dtype(device)?).map(Some)
 }
 
@@ -1241,7 +1407,7 @@ fn price_whisper(
             part("k_proj.weight")?,
             part("v_proj.weight")?,
         ];
-        ledger.fused(&weights, Source::Mapped, dtype, 0)?;
+        ledger.fused_exact_then_synced(&weights, Source::Mapped, dtype)?;
         let biases = [part("q_proj.bias")?, part("v_proj.bias")?];
         ledger.fused(&biases, Source::Mapped, dtype, biases[0].elements())?;
         fused.extend(weights.iter().chain(&biases).map(|t| t.name.as_str()));
@@ -1273,6 +1439,9 @@ struct Qwen3AsrLoad {
     qmatmul_text: bool,
     /// Q/K/V and gate/up are packed into one quantized projection each.
     packed_projections: bool,
+    /// The head is tied to the embedding: the `QMatMul` text path shares the
+    /// token table and does not read the stored head.
+    tied_head: bool,
 }
 
 fn qwen3_asr_plan(
@@ -1284,9 +1453,12 @@ fn qwen3_asr_plan(
     let Some(path) = resolve_qwen_asr_gguf_path(model_path, variant) else {
         return Ok(None);
     };
-    let Some(files) = census_of(&[path])? else {
+    let Some(files) = census_of(std::slice::from_ref(&path))? else {
         return Ok(None);
     };
+    let tied_head = crate::models::shared::weights::gguf::GgufLoader::from_path(&path)?
+        .get_metadata_bool("qwen3_asr.text.tie_word_embeddings")
+        .unwrap_or(false);
     let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
         device,
         ModelFamily::Qwen3Asr,
@@ -1308,6 +1480,7 @@ fn qwen3_asr_plan(
             &device.device,
             hidden_size as usize,
         ),
+        tied_head,
     };
     price_qwen3_asr(&files, backend, load).map(Some)
 }
@@ -1344,8 +1517,31 @@ fn price_qwen3_asr(
     let audio = format!("{prefix}audio_tower.");
     let text = format!("{prefix}model.");
     let lm_head = format!("{prefix}lm_head.weight");
+    let embed_tokens = format!("{text}embed_tokens.weight");
     let mut ledger = Ledger::new(backend);
+    // The audio tower loads first and, below F32 on Metal, its load-time
+    // probe reads its output back before the text model loads.
+    for (name, tensor) in &tensors {
+        if name.starts_with(&audio) {
+            ledger.gguf_dense(tensor, load.audio_dtype)?;
+        }
+    }
+    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
+    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    if load.audio_dtype != DType::F32 {
+        ledger.barrier()?;
+    }
     let mut packed = BTreeSet::new();
+    if load.qmatmul_text {
+        // `load_gguf_text` reads the token table first; its step releases
+        // nothing, so it never runs beside a later step's held buffers.
+        ledger.gguf_stored(tensor(&tensors, &embed_tokens)?)?;
+        packed.insert(embed_tokens.as_str());
+        ledger.settle()?;
+    }
     if load.qmatmul_text && load.packed_projections {
         for name in tensors.keys() {
             let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
@@ -1368,11 +1564,14 @@ fn price_qwen3_asr(
         }
     }
     for (name, tensor) in &tensors {
-        if packed.contains(name) {
+        if packed.contains(name) || name.starts_with(&audio) {
             continue;
         }
-        if name.starts_with(&audio) {
-            ledger.gguf_dense(tensor, load.audio_dtype)?;
+        if load.qmatmul_text && *name == embed_tokens {
+            // The token table stays quantized; rows are gathered from it.
+            ledger.gguf_stored(tensor)?;
+        } else if load.qmatmul_text && load.tied_head && *name == lm_head {
+            // A tied head shares the token table; the stored copy is unread.
         } else if name.starts_with(&text) || *name == lm_head {
             let projection = *name == lm_head || PROJECTIONS.iter().any(|p| name.ends_with(p));
             if load.qmatmul_text && projection {
@@ -1382,11 +1581,6 @@ fn price_qwen3_asr(
             }
         }
     }
-    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
-    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
-        .checked_mul(d_model)
-        .ok_or_else(overflow)?;
-    ledger.uploaded(positions, DType::F32)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -1400,6 +1594,8 @@ struct AlignerLoad {
     /// Each text layer's Q/K/V and gate/up are concatenated into one
     /// projection (dense projection fusion, `qwen3/core.rs`).
     fused_projections: bool,
+    /// MLX 4-bit text weights stay quantized as Q4_1 (Metal).
+    mlx_q4_1: bool,
 }
 
 fn aligner_plan(
@@ -1431,6 +1627,7 @@ fn aligner_load(
         audio_dtype: spec.audio_dtype,
         mlx_bits: spec.mlx_bits,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+        mlx_q4_1: qwen3_mlx_q4_1_enabled(&device.device),
     };
     Ok(Some((files, load)))
 }
@@ -1456,18 +1653,52 @@ pub(super) fn precision_reload_plan(
     variant: ModelVariant,
     model_path: &Path,
     device: &DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<Option<ModelResourcePlan>> {
-    if variant.family() != ModelFamily::Qwen3ForcedAligner {
-        return Ok(None);
-    }
     let backend = BackendKind::from(device.kind);
-    let Some((files, load)) = aligner_load(variant, model_path, device)? else {
-        return Ok(None);
+    let plan = match variant.family() {
+        ModelFamily::Qwen3ForcedAligner => {
+            let Some((files, load)) = aligner_load(variant, model_path, device)? else {
+                return Ok(None);
+            };
+            let Some(reload) = aligner_precision_reload(backend, load) else {
+                return Ok(None);
+            };
+            price_qwen3_aligner(&files, backend, reload)?
+        }
+        // Weight-only F16 encoder projections that fail their probe reload
+        // dense (`load_weight_only_f16`).
+        ModelFamily::ParakeetAsr => {
+            let Some(plan) =
+                parakeet_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        ModelFamily::NemotronAsr => {
+            let Some(plan) =
+                nemotron_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        ModelFamily::GraniteSpeechAsr => {
+            let Some(plan) = granite_plan(
+                model_path,
+                device,
+                backend,
+                granite.speech_dtype.as_deref(),
+                Precision::F32Reload,
+            )?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
+        _ => return super::tts_memory::precision_reload_plan(variant, model_path, device),
     };
-    let Some(reload) = aligner_precision_reload(backend, load) else {
-        return Ok(None);
-    };
-    let plan = price_qwen3_aligner(&files, backend, reload)?;
     tracing::info!(
         model = %variant,
         resident_bytes = plan.resident_bytes,
@@ -1480,8 +1711,10 @@ pub(super) fn precision_reload_plan(
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
 /// `VarBuilder`s over the mapped checkpoint (`staged::metal_synced_safetensors`),
 /// the audio tower at the audio dtype and the text model (embedding, layers,
-/// norm, the classifier head) at the text dtype. MLX-packed weights are
-/// dequantized to dense ones; the audio tower's OHWI convolution kernels (MLX
+/// norm, the classifier head) at the text dtype. MLX 4-bit text weights stay
+/// quantized as Q4_1 on Metal (Q/K/V and gate/up stacked when the grouping
+/// policy holds); other MLX-packed weights are dequantized to dense ones,
+/// fused as above; the audio tower's OHWI convolution kernels (MLX
 /// layout) are permuted and made contiguous by a device copy; with fusion,
 /// each text layer's Q/K/V and gate/up are concatenated and the device
 /// synchronized. Plus the F32 audio position table built on the
@@ -1497,6 +1730,35 @@ fn price_qwen3_aligner(
     let text = [format!("{prefix}model."), format!("{prefix}lm_head.")];
     let mut ledger = Ledger::synced(backend);
     let mut grouped = BTreeSet::new();
+    // The audio tower loads first and, below F32 on Metal, its load-time
+    // probe reads its output back before the text model loads.
+    let audio_tensors = tensors
+        .iter()
+        .filter(|(name, _)| name.starts_with(&audio))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &audio_tensors, &audio, &text, load)?;
+    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
+    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    if load.audio_dtype != DType::F32 {
+        ledger.barrier()?;
+    }
+    grouped.extend(audio_tensors.iter().map(|(name, _)| *name));
+    // `Qwen3Model::load_with_layout` reads the token table first. Its step
+    // leaves nothing held: Q4_1 synchronizes before its upload, and a dense
+    // table's upload reaches the sync interval, so the loader synchronizes
+    // right after it.
+    let table = tensors
+        .iter()
+        .filter(|(name, _)| name.starts_with(&format!("{}embed_tokens.", text[0])))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &table, &audio, &text, load)?;
+    grouped.extend(table.iter().map(|(name, _)| *name));
+    ledger.settle()?;
     if load.fused_projections {
         for name in tensors.keys() {
             let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
@@ -1518,24 +1780,44 @@ fn price_qwen3_aligner(
                     .map(|stem| MlxWeight::find(&tensors, stem, load.mlx_bits))
                     .collect::<Result<Option<Vec<_>>>>()?;
                 if let Some(parts) = packed {
-                    ledger.mlx_dequantized(&parts, load.text_dtype)?;
+                    if load.mlx_q4_1 && repack_to_q4_1(&parts)? {
+                        ledger.mlx_q4_1(&parts)?;
+                    } else {
+                        ledger.mlx_dequantized(&parts, load.text_dtype)?;
+                    }
                     grouped.extend(parts.iter().flat_map(MlxWeight::names));
                 } else {
                     let parts = stems
                         .iter()
                         .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
                         .collect::<Result<Vec<_>>>()?;
-                    ledger.fused_then_synced(&parts, Source::Mapped, load.text_dtype)?;
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, load.text_dtype)?;
                     grouped.extend(parts.iter().map(|part| part.name.as_str()));
                 }
             }
         }
     }
-    for (name, tensor) in &tensors {
-        if grouped.contains(name) {
-            continue;
-        }
-        let dtype = if name.starts_with(&audio) {
+    let rest = tensors
+        .iter()
+        .filter(|(name, _)| !grouped.contains(*name))
+        .map(|(name, tensor)| (*name, *tensor))
+        .collect::<Vec<_>>();
+    price_aligner_tensors(&mut ledger, &tensors, &rest, &audio, &text, load)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// The aligner tensors `names` as `price_qwen3_aligner`'s loader reads them
+/// one by one (grouped projections aside).
+fn price_aligner_tensors(
+    ledger: &mut Ledger,
+    tensors: &BTreeMap<&str, &CensusTensor>,
+    names: &[(&str, &CensusTensor)],
+    audio: &str,
+    text: &[String; 2],
+    load: AlignerLoad,
+) -> Result<()> {
+    for &(name, tensor) in names {
+        let dtype = if name.starts_with(audio) {
             load.audio_dtype
         } else if text.iter().any(|text| name.starts_with(text)) {
             load.text_dtype
@@ -1543,8 +1825,13 @@ fn price_qwen3_aligner(
             continue;
         };
         if let Some(stem) = name.strip_suffix(".weight") {
-            if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
-                ledger.mlx_dequantized(&[weight], dtype)?;
+            if let Some(weight) = MlxWeight::find(tensors, stem, load.mlx_bits)? {
+                // The text model keeps MLX 4-bit weights as Q4_1 on Metal.
+                if load.mlx_q4_1 && dtype == load.text_dtype && repack_to_q4_1(&[weight])? {
+                    ledger.mlx_q4_1(&[weight])?;
+                } else {
+                    ledger.mlx_dequantized(&[weight], dtype)?;
+                }
                 continue;
             }
         }
@@ -1568,12 +1855,25 @@ fn price_qwen3_aligner(
             ledger.var(tensor, Source::Mapped, &[dtype])?;
         }
     }
-    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
-    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
-        .checked_mul(d_model)
-        .ok_or_else(overflow)?;
-    ledger.uploaded(positions, DType::F32)?;
-    AsrResidencyPlan::from_ledger(ledger, 0)
+    Ok(())
+}
+
+/// Whether the loader repacks every weight of `parts` into Q4_1.
+fn repack_to_q4_1(parts: &[MlxWeight]) -> Result<bool> {
+    for part in parts {
+        if !part.repacks_to_q4_1()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Which precision a plan prices: the one the loader selects, or the F32
+/// form a load-time probe failure reloads (`precision_reload_plan`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Precision {
+    Selected,
+    F32Reload,
 }
 
 /// The NeMo ASR families.
@@ -1604,9 +1904,11 @@ fn parakeet_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = parakeet_checkpoint_paths(model_path, variant)?;
-    let f16_projections = resolve_parakeet_projection_precision(device).dtype == DType::F16;
+    let f16_projections = precision == Precision::Selected
+        && resolve_parakeet_projection_precision(device).dtype == DType::F16;
     // The loader reads the extracted checkpoint, or its zip-repacked copy when
     // Candle cannot parse the original.
     for checkpoint in [&paths.checkpoint_path, &paths.repacked_checkpoint_path] {
@@ -1644,10 +1946,12 @@ fn nemotron_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = nemotron_checkpoint_paths(model_path, variant)?;
     let dtype = resolve_nemotron_asr_dtype(device)?.dtype;
-    let f16_projections = resolve_nemotron_projection_precision(device, dtype).dtype == DType::F16;
+    let f16_projections = precision == Precision::Selected
+        && resolve_nemotron_projection_precision(device, dtype).dtype == DType::F16;
     if paths.checkpoint_path.is_file() {
         if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
             return price_nemo(
@@ -1875,6 +2179,7 @@ fn granite_plan(
     device: &DeviceProfile,
     backend: BackendKind,
     speech_dtype: Option<&str>,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let Ok(shards) = ensure_granite_speech_artifacts(model_path) else {
         return Ok(None);
@@ -1883,9 +2188,16 @@ fn granite_plan(
         return Ok(None);
     };
     let config = GraniteSpeechConfig::load(model_path)?;
-    let dtype = select_granite_speech_dtype(device, config.target_dtype_hint(), speech_dtype)?;
-    let f16_encoder_projections =
-        resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
+    // The F32 reload bounds either fallback: the encoder's dense reload or
+    // the language model's F32 one.
+    let dtype = match precision {
+        Precision::Selected => {
+            select_granite_speech_dtype(device, config.target_dtype_hint(), speech_dtype)?
+        }
+        Precision::F32Reload => DType::F32,
+    };
+    let f16_encoder_projections = precision == Precision::Selected
+        && resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
     let load = GraniteLoad {
         dtype,
         audio_dtype: if f16_encoder_projections {
@@ -1909,8 +2221,9 @@ fn granite_plan(
 /// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
 /// and down_proj read at F16 (when selective) and then pre-scaled by the
-/// residual multiplier, and
-/// an F16 copy of a tied embedding as the LM head. The encoder and projector
+/// residual multiplier, the fused projections joined at their exact size,
+/// and a tied embedding stored once in F16 when the LM head is F16. The
+/// encoder and projector
 /// read at the audio dtype, with the encoder projections converted to F16 on
 /// the host under weight-only F16. Each encoder layer adds a host-built U32
 /// attention distance table.
@@ -1937,6 +2250,51 @@ fn price_granite(
     let tensors = by_name(files);
     let mut ledger = Ledger::staged(backend);
     let mut grouped = BTreeSet::new();
+    // The encoder loads first and, under weight-only F16, its load-time
+    // probe reads its output back before the projector and the LM load.
+    for (name, tensor) in &tensors {
+        if !name.starts_with("encoder.") || name.ends_with(".num_batches_tracked") {
+            continue;
+        }
+        if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
+            ledger.host_converted(tensor, DType::F16)?;
+        } else {
+            ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
+        }
+        grouped.insert(*name);
+    }
+    let (layers, context) = load.encoder_attention_dists;
+    let dists = (layers as u64)
+        .checked_mul(context as u64)
+        .and_then(|n| n.checked_mul(context as u64))
+        .ok_or_else(overflow)?;
+    ledger.uploaded(dists, DType::U32)?;
+    if load.f16_encoder_projections {
+        ledger.barrier()?;
+    }
+    for (name, tensor) in &tensors {
+        if name.starts_with("encoder.")
+            || name.starts_with("language_model.")
+            || name.ends_with(".num_batches_tracked")
+        {
+            continue;
+        }
+        ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
+        grouped.insert(*name);
+    }
+    // The LM reads its token table first; a table that loads alone (no
+    // pre-scale chain) releases nothing, and its upload reaches the sync
+    // interval, so the loader synchronizes right after it.
+    if let Some(table) = tensors.get(EMBEDDING) {
+        let dtype = if load.tied_lm_head && representation.f16_lm_head {
+            DType::F16
+        } else {
+            dtype
+        };
+        ledger.var(table, Source::Mapped, &[dtype])?;
+        grouped.insert(EMBEDDING);
+        ledger.settle()?;
+    }
     for name in tensors.keys() {
         if !name.starts_with("language_model.") {
             continue;
@@ -1964,7 +2322,7 @@ fn price_granite(
             .map(|part| tensor(&tensors, &format!("{stem}.{part}.weight")))
             .collect::<Result<Vec<_>>>()?;
         if fuse {
-            ledger.fused(&parts, Source::Mapped, part_dtype, 0)?;
+            ledger.fused_exact(&parts, Source::Mapped, part_dtype)?;
         } else {
             for part in &parts {
                 ledger.var(part, Source::Mapped, &[part_dtype])?;
@@ -1976,13 +2334,7 @@ fn price_granite(
         if grouped.contains(name) || name.ends_with(".num_batches_tracked") {
             continue;
         }
-        if !name.starts_with("language_model.") {
-            if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
-                ledger.host_converted(tensor, DType::F16)?;
-            } else {
-                ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
-            }
-        } else if name.ends_with(".o_proj.weight") {
+        if name.ends_with(".o_proj.weight") {
             let chain = residual_chain(representation.f16_attention_output);
             ledger.var(tensor, Source::Mapped, &chain)?;
         } else if name.ends_with(".down_proj.weight") {
@@ -1997,19 +2349,14 @@ fn price_granite(
                 Source::Mapped,
                 &[half_if(representation.f16_lm_head)],
             )?;
+        } else if *name == EMBEDDING && load.tied_lm_head && representation.f16_lm_head {
+            // One F16 table serves the embedding (rows cast to the base
+            // dtype) and the tied F16 head.
+            ledger.var(tensor, Source::Mapped, &[DType::F16])?;
         } else {
             ledger.var(tensor, Source::Mapped, &[dtype])?;
-            if *name == EMBEDDING && load.tied_lm_head && representation.f16_lm_head {
-                ledger.derived(tensor.elements(), DType::F16, &[])?;
-            }
         }
     }
-    let (layers, context) = load.encoder_attention_dists;
-    let dists = (layers as u64)
-        .checked_mul(context as u64)
-        .and_then(|n| n.checked_mul(context as u64))
-        .ok_or_else(overflow)?;
-    ledger.uploaded(dists, DType::U32)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -2032,7 +2379,7 @@ fn vibevoice_plan(
             == DType::F16,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
         tts: false,
-        staged: false,
+        staged: true,
     };
     price_vibevoice(&files, backend, &load).map(Some)
 }
@@ -2122,7 +2469,14 @@ pub(super) fn price_vibevoice(
                     .iter()
                     .map(|part| tensor(&tensors, &format!("{layer}.{part}")))
                     .collect::<Result<Vec<_>>>()?;
-                ledger.fused(&parts, Source::Mapped, dtype, 0)?;
+                // `Qwen3Model` joins the weights at their exact size and the
+                // biases with `Tensor::cat`, then synchronizes the device
+                // once it has dropped the parts (`release_fused_parts`).
+                if group[0].ends_with(".bias") {
+                    ledger.fused_then_synced(&parts, Source::Mapped, dtype)?;
+                } else {
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, dtype)?;
+                }
                 grouped.extend(parts.iter().map(|part| part.name.as_str()));
             }
         }
@@ -2211,15 +2565,17 @@ fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<As
 }
 
 /// LFM2.5-Audio (`lfm25_audio/`, `lfm2/backbone.rs`): all four GGUFs load on
-/// every backend. Quantized projections stay quantized; F32 tensors and the
-/// embedding tables (the main backbone's `token_embd`, every loaded mmproj
-/// tensor, the vocoder's audio and depth embeddings) are dequantized to F32,
-/// the dtype the loader hard-codes (there is no dtype resolver to call). The
-/// detokenizer backbone runs on vocoder embeddings and skips its `token_embd`.
-/// The main backbone has no `output.weight`, so its head reads `token_embd` a
-/// second time as a quantized projection, and keeps its first `token_embd`
-/// read alive until it finishes loading. Each backbone also
-/// precomputes F32 RoPE tables over its full context (`rope_tables`).
+/// every backend. Quantized projections and the vocoder's embedding tables
+/// (audio, depth and detokenizer `emb.emb`, whose rows are gathered on
+/// demand) stay quantized, as do the encoder and adapter projections on
+/// Metal; F32 tensors and every other loaded mmproj tensor are dequantized
+/// to F32, the dtype the loader hard-codes (there is no dtype resolver to
+/// call). The detokenizer backbone runs on vocoder embeddings
+/// and skips its `token_embd`. The main backbone has no `output.weight`, so
+/// its head is the quantized `token_embd` its rows are gathered from
+/// ([`price_lfm2_backbone`]). Each backbone also precomputes F32 RoPE tables
+/// over its context (`rope_tables`: the main backbone's is clamped to the
+/// model's native 32,768 tokens).
 fn price_lfm25_audio(
     census: &Lfm25AudioCensus,
     backend: BackendKind,
@@ -2238,7 +2594,17 @@ fn price_lfm25_audio(
     price_lfm2_backbone(&mut ledger, &census.main, true)?;
     price_lfm2_backbone(&mut ledger, &census.tokenizer, false)?;
     for tensor in &census.mmproj.tensors {
-        if !MMPROJ_UNREAD.contains(&tensor.name.as_str()) {
+        let name = tensor.name.as_str();
+        if MMPROJ_UNREAD.contains(&name) {
+            continue;
+        }
+        // On Metal the encoder and adapter keep quantized projections.
+        if backend == BackendKind::Metal
+            && gguf_quantized(tensor)
+            && lfm25_audio_conformer_projection(name)
+        {
+            ledger.gguf_stored(tensor)?;
+        } else {
             ledger.gguf_dense(tensor, DType::F32)?;
         }
     }
@@ -2247,8 +2613,7 @@ fn price_lfm25_audio(
         if VOCODER_UNREAD.contains(&name) {
             continue;
         }
-        let embedding = name.ends_with(".embedding.weight") || name == "emb.emb.weight";
-        if gguf_quantized(tensor) && !embedding {
+        if gguf_quantized(tensor) {
             ledger.gguf_stored(tensor)?;
         } else {
             ledger.gguf_dense(tensor, DType::F32)?;
@@ -2346,6 +2711,311 @@ fn price_lfm2_chat(
     let mut ledger = Ledger::new(backend);
     price_lfm2_backbone(&mut ledger, gguf, true)?;
     price_lfm2_rope_table(&mut ledger, rope_table)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// Qwen3.5 dense chat (`qwen35/chat.rs`) on CPU and Metal: the text GGUF
+/// kept quantized (its token table gathered from and shared with a tied head,
+/// `token_table.rs`), F32 tensors dense, and the F16 vision tower
+/// (`qwen35/vision.rs`) with its linear weights converted on the host to F16
+/// on Metal or F32 on CPU, and every other vision tensor F32. CUDA keeps the
+/// catalog figure. `None` when a file is missing.
+pub(super) fn qwen35_chat_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<ModelResourcePlan>> {
+    if backend == BackendKind::Cuda {
+        return Ok(None);
+    }
+    let Ok(text) = crate::models::architectures::qwen35::chat::qwen35_gguf_filename(variant) else {
+        return Ok(None);
+    };
+    let paths = [model_path.join(text), model_path.join("mmproj-F16.gguf")];
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    let plan = price_qwen35_chat(&files[0], &files[1], backend)?;
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        "Priced Qwen3.5 chat load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+/// The switches a Qwen3 chat loader (`qwen3/chat.rs`) resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen3ChatLoad {
+    /// Dense weights (and the MLX weights dequantized into them) on the
+    /// safetensors path; the norms on the GGUF path.
+    dtype: DType,
+    /// Bits per element of MLX-packed weights (the 4-bit checkpoints).
+    mlx_bits: Option<u64>,
+    /// Safetensors: each layer's Q/K/V and gate/up are concatenated into one
+    /// projection (dense projection fusion, `qwen3/core.rs`).
+    fused_projections: bool,
+    /// GGUF: each layer's Q/K/V and gate/up are packed into one quantized
+    /// projection.
+    packed_projections: bool,
+    /// The head is the token table: a stored `lm_head.weight` is unread.
+    tied_head: bool,
+    /// MLX 4-bit weights stay quantized as Q4_1 (Metal).
+    mlx_q4_1: bool,
+}
+
+/// Qwen3 chat's residency plan on CPU and Metal (CUDA keeps the catalog
+/// estimate): the safetensors (dense or MLX 4-bit) or GGUF checkpoint priced
+/// as its loader keeps it.
+pub(super) fn qwen3_chat_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    use crate::models::architectures::qwen3::chat::{
+        parse_qwen3_config, qwen3_chat_dtype, qwen3_chat_gguf_path, qwen3_chat_mlx_bits,
+        qwen3_chat_safetensors_shards,
+    };
+    let backend = BackendKind::from(device.kind);
+    if backend == BackendKind::Cuda || variant.family() != ModelFamily::Qwen3Chat {
+        return Ok(None);
+    }
+    let plan = if variant.is_qwen_chat_gguf() {
+        let path = qwen3_chat_gguf_path(model_path, variant)?;
+        let Some(files) = census_of(std::slice::from_ref(&path))? else {
+            return Ok(None);
+        };
+        let tensors = by_name(&files);
+        let hidden_size = dim(tensor(&tensors, "token_embd.weight")?, 1)?;
+        let load = Qwen3ChatLoad {
+            dtype: qwen3_chat_dtype(device, None)?,
+            mlx_bits: None,
+            fused_projections: false,
+            packed_projections: qwen3_quantized_projection_grouping_for_hidden_size(
+                &device.device,
+                hidden_size as usize,
+            ),
+            // `parse_qwen3_gguf_config`: tied when no head is stored.
+            tied_head: !tensors.contains_key("output.weight"),
+            mlx_q4_1: false,
+        };
+        price_qwen3_chat_gguf(&files, backend, load)?
+    } else {
+        let Ok(config_str) = std::fs::read_to_string(model_path.join("config.json")) else {
+            return Ok(None);
+        };
+        let config = parse_qwen3_config(&config_str)?;
+        let Some(files) = census_of(&qwen3_chat_safetensors_shards(model_path)?)? else {
+            return Ok(None);
+        };
+        let load = Qwen3ChatLoad {
+            dtype: qwen3_chat_dtype(
+                device,
+                crate::models::shared::config::checkpoint_dtype_from_config_json(&config_str),
+            )?,
+            mlx_bits: qwen3_chat_mlx_bits(&config_str),
+            fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+            packed_projections: false,
+            tied_head: config.tie_word_embeddings
+                && config.lm_head_size.unwrap_or(config.vocab_size) == config.vocab_size,
+            mlx_q4_1: qwen3_mlx_q4_1_enabled(&device.device),
+        };
+        price_qwen3_chat_safetensors(&files, backend, load)?
+    };
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        "Priced Qwen3 chat load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+/// Qwen3 chat safetensors (`Qwen3Model::load` over
+/// `staged::metal_staged_safetensors`): every tensor of the text model at
+/// the load dtype, cast on the host and uploaded at its exact size on Metal.
+/// MLX 4-bit weights stay quantized as Q4_1 on Metal and are dequantized to
+/// dense ones elsewhere; with fusion, each layer's dense Q/K/V and gate/up
+/// are concatenated on the device, which is then synchronized. A tied head shares the token table, so a stored
+/// `lm_head.weight` is not read. Per-layer concatenated Q/K norm gains are
+/// not priced (under 1 MiB).
+fn price_qwen3_chat_safetensors(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: Qwen3ChatLoad,
+) -> Result<AsrResidencyPlan> {
+    let tensors = by_name(files);
+    let mut ledger = Ledger::staged(backend);
+    let mut grouped = BTreeSet::new();
+    if load.fused_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
+                continue;
+            };
+            for group in [
+                ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"].as_slice(),
+                ["mlp.gate_proj", "mlp.up_proj"].as_slice(),
+            ] {
+                let stems = group
+                    .iter()
+                    .map(|part| format!("{layer}.{part}"))
+                    .collect::<Vec<_>>();
+                let packed = stems
+                    .iter()
+                    .map(|stem| MlxWeight::find(&tensors, stem, load.mlx_bits))
+                    .collect::<Result<Option<Vec<_>>>>()?;
+                if let Some(parts) = packed {
+                    if load.mlx_q4_1 && repack_to_q4_1(&parts)? {
+                        ledger.mlx_q4_1(&parts)?;
+                    } else {
+                        ledger.mlx_dequantized(&parts, load.dtype)?;
+                    }
+                    grouped.extend(parts.iter().flat_map(MlxWeight::names));
+                } else {
+                    let parts = stems
+                        .iter()
+                        .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
+                        .collect::<Result<Vec<_>>>()?;
+                    ledger.fused_exact_then_synced(&parts, Source::Mapped, load.dtype)?;
+                    grouped.extend(parts.iter().map(|part| part.name.as_str()));
+                }
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if grouped.contains(name) || !(name.starts_with("model.") || name.starts_with("lm_head.")) {
+            continue;
+        }
+        if load.tied_head && name.starts_with("lm_head.") {
+            continue;
+        }
+        if let Some(stem) = name.strip_suffix(".weight") {
+            if let Some(weight) = MlxWeight::find(&tensors, stem, load.mlx_bits)? {
+                if load.mlx_q4_1 && repack_to_q4_1(&[weight])? {
+                    ledger.mlx_q4_1(&[weight])?;
+                } else {
+                    ledger.mlx_dequantized(&[weight], load.dtype)?;
+                }
+                continue;
+            }
+        }
+        // MLX scales and biases load with their weight.
+        let packing = [".scales", ".biases"].iter().any(|suffix| {
+            name.strip_suffix(suffix)
+                .is_some_and(|stem| tensors.contains_key(format!("{stem}.scales").as_str()))
+        });
+        if !packing {
+            ledger.var(tensor, Source::Mapped, &[load.dtype])?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// Qwen3 chat GGUF (`Qwen3Model::load_gguf_text`): the token table, the
+/// projections and an untied `output.weight` stay quantized (rows are
+/// gathered from the table; a tied head shares it), packed per layer when the
+/// grouping policy holds; the norms are dequantized to the load dtype.
+fn price_qwen3_chat_gguf(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: Qwen3ChatLoad,
+) -> Result<AsrResidencyPlan> {
+    const PROJECTIONS: [&str; 7] = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let tensors = by_name(files);
+    let mut ledger = Ledger::new(backend);
+    let mut packed = BTreeSet::new();
+    if load.packed_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".attn_q.weight") else {
+                continue;
+            };
+            for group in [
+                ["attn_q", "attn_k", "attn_v"].as_slice(),
+                ["ffn_gate", "ffn_up"].as_slice(),
+            ] {
+                let parts = group
+                    .iter()
+                    .map(|part| tensor(&tensors, &format!("{layer}.{part}.weight")))
+                    .collect::<Result<Vec<_>>>()?;
+                ledger.gguf_packed(&parts)?;
+                packed.extend(parts.iter().map(|part| part.name.as_str()));
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if packed.contains(name) {
+            continue;
+        }
+        let quantized_form = *name == "token_embd.weight"
+            || *name == "output.weight"
+            || PROJECTIONS.iter().any(|suffix| name.ends_with(suffix));
+        if quantized_form {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, load.dtype)?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// Whether a Qwen3.5 projector layer (a tensor name without its `.weight` or
+/// `.bias`) is a linear layer: the attention and MLP projections of each
+/// block and the `mm.*` projector.
+fn qwen35_vision_linear_layer(layer: &str) -> bool {
+    layer.starts_with("mm.")
+        || [".attn_qkv", ".attn_out", ".ffn_up", ".ffn_down"]
+            .iter()
+            .any(|part| layer.ends_with(part))
+}
+
+fn price_qwen35_chat(
+    text: &CensusFile,
+    vision: &CensusFile,
+    backend: BackendKind,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    for tensor in &text.tensors {
+        if gguf_quantized(tensor) {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    let linear_dtype = if backend == BackendKind::Cpu {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    for tensor in &vision.tensors {
+        let name = tensor.name.as_str();
+        if name
+            .strip_suffix(".weight")
+            .is_some_and(qwen35_vision_linear_layer)
+        {
+            ledger.host_converted_through(tensor, Some(DType::F32), linear_dtype)?;
+        } else if name
+            .strip_suffix(".bias")
+            .is_some_and(qwen35_vision_linear_layer)
+        {
+            // Linear biases stay F32, converted on the host and uploaded.
+            ledger.host_converted(tensor, DType::F32)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -2507,6 +3177,8 @@ pub(super) mod tests {
                 hidden as usize,
                 None,
             ),
+            // The published checkpoints tie the head to the embedding.
+            tied_head: true,
         };
         price_qwen3_asr(files, backend, load).unwrap()
     }
@@ -2608,7 +3280,7 @@ pub(super) mod tests {
                 None,
             ),
             tts: false,
-            staged: false,
+            staged: true,
         }
     }
 
@@ -2645,13 +3317,19 @@ pub(super) mod tests {
                 backend == BackendKind::Metal,
                 None,
             ),
+            mlx_q4_1: backend == BackendKind::Metal,
         };
         price_qwen3_aligner(files, backend, load).unwrap()
     }
 
-    /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
-    /// over 128,000 positions; head dims 2048 / 32 and 512 / 16.
-    const LFM_ROPE_TABLES: [(usize, usize); 2] = [(128_000, 64), (128_000, 32)];
+    /// The loader's RoPE geometry (`lfm25_audio_load_layout`): the main
+    /// backbone's context is clamped from the GGUF's 128,000 positions to the
+    /// model's native 32,768 (LFA-6), the detokenizer keeps 128,000; head
+    /// dims 2048 / 32 and 512 / 16.
+    const LFM_ROPE_TABLES: [(usize, usize); 2] = [
+        (ModelVariant::LFM25_AUDIO_NATIVE_CONTEXT_TOKENS, 64),
+        (128_000, 32),
+    ];
 
     /// LFM2.5-1.2B chat prices the quantized checkpoint once (its Q6_K
     /// `token_embd` serves the row gather and the tied LM head) plus RoPE
@@ -2700,6 +3378,43 @@ pub(super) mod tests {
             vocoder,
         };
         price_lfm25_audio(&census, backend, LFM_ROPE_TABLES).unwrap()
+    }
+
+    /// The encoder and adapter projections the conformer may keep
+    /// quantized are exactly its `load_linear_any` weights: 9 per block over
+    /// 17 blocks, the subsampling output and the two adapter layers, all
+    /// Q4_0 in the published mmproj.
+    #[test]
+    fn lfm25_audio_conformer_projections_match_the_mmproj() {
+        let files = census!("lfm2_5_audio_1_5b_q4_0.json");
+        let mmproj = files
+            .iter()
+            .find(|file| file.path.to_string_lossy().starts_with("mmproj-"));
+        let projections = mmproj
+            .unwrap()
+            .tensors
+            .iter()
+            .filter(|tensor| lfm25_audio_conformer_projection(&tensor.name))
+            .collect::<Vec<_>>();
+        assert_eq!(projections.len(), 17 * 9 + 3);
+        assert!(projections.iter().all(|tensor| gguf_quantized(tensor)));
+        for name in [
+            "a.blk.16.ffn_down_1.weight",
+            "a.pre_encode.out.weight",
+            "mm.a.mlp.3.weight",
+        ] {
+            assert!(
+                projections.iter().any(|tensor| tensor.name == name),
+                "{name}"
+            );
+        }
+        for name in [
+            "a.blk.0.conv_pw1.weight",
+            "a.blk.0.ffn_up.bias",
+            "a.blk.x.attn_q.weight",
+        ] {
+            assert!(!lfm25_audio_conformer_projection(name), "{name}");
+        }
     }
 
     /// The diarizers as loaded: F32 weights on CUDA's device, and in host
@@ -2784,27 +3499,27 @@ pub(super) mod tests {
             (
                 "Whisper-L-v3-Turbo",
                 Box::new(whisper),
-                [3.01, 1.51, 1.74, 1.51],
+                [3.01, 1.51, 1.51, 1.51],
             ),
             (
                 "Qwen3-ASR-0.6B",
                 Box::new(|b| qwen3_asr(&qwen06, b)),
-                [1.86, 1.23, 1.55, 1.57],
+                [1.29, 0.94, 1.05, 1.29],
             ),
             (
                 "Qwen3-ASR-1.7B",
                 Box::new(|b| qwen3_asr(&qwen17, b)),
-                [4.05, 2.87, 3.30, 3.47],
+                [2.89, 2.30, 2.30, 2.89],
             ),
             (
                 "Granite-Speech-Plus",
                 Box::new(granite),
-                [7.87, 4.78, 5.06, 3.93],
+                [7.87, 4.02, 4.02, 3.94],
             ),
             (
                 "VibeVoice-ASR",
                 Box::new(vibevoice),
-                [31.03, 15.72, 28.35, 15.52],
+                [31.03, 15.72, 15.72, 15.52],
             ),
             (
                 "Voxtral-Mini-4B-RT",
@@ -2812,25 +3527,26 @@ pub(super) mod tests {
                 [16.50, 8.25, 8.25, 8.25],
             ),
             // The main backbone gathers token rows from its quantized table
-            // (shared with its tied head) instead of a 0.5 GiB F32 copy.
+            // (shared with its tied head) instead of a 0.5 GiB F32 copy, and
+            // its RoPE tables span its clamped 32,768-token context.
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [1.46, 1.46, 1.46, 1.46],
+                [1.22, 0.90, 0.90, 1.22],
             ),
             // D8: the dense text runs at F16 on Metal (4.18 GiB allocated at
             // F32).
             (
                 "ForcedAligner-0.6B",
                 Box::new(|b| aligner(&aligner_dense, b)),
-                [3.42, 2.30, 2.69, 2.30],
+                [3.42, 1.72, 1.99, 2.30],
             ),
             // MLX weights dequantize on the host at the text dtype and upload
             // at their exact sizes (2.68 GiB with power-of-two device casts).
             (
                 "ForcedAligner-0.6B-4bit",
                 Box::new(|b| aligner(&aligner_4bit, b)),
-                [3.42, 2.30, 2.42, 2.30],
+                [3.42, 0.95, 0.95, 2.30],
             ),
             // ADM-4: F32 on every backend, in host memory on Metal (no
             // allocator rounding); the catalog held 3.0 / 2.0 GiB on CUDA.
@@ -3142,10 +3858,15 @@ pub(super) mod tests {
     }
 
     /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
-    /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16.
-    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 2.14;
-    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16.
-    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 6.49;
+    /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16, and
+    /// 2.14 GiB before its Q/K/V were joined at their exact size.
+    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 1.65;
+    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16,
+    /// 6.49 GiB before its tied table was stored once in F16 and its fused
+    /// projections joined at their exact size, and 5.06 GiB while the
+    /// table's stored-dtype host read was priced beside its upload and its
+    /// transient beside a held sync interval.
+    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 4.40;
 
     /// A staged Metal loader casts on the host, so its uploads keep their
     /// exact sizes, and it synchronizes every interval of uploads, so the
@@ -3323,7 +4044,7 @@ pub(super) mod tests {
     /// A Granite checkpoint with an untied LM head (the base variant) loads
     /// it from the checkpoint, in F16 on Metal, and makes no embedding copy.
     #[test]
-    fn granite_prices_a_tied_head_copy_or_an_untied_head() {
+    fn granite_prices_one_shared_f16_table_or_an_untied_head() {
         let tensor = |name: &str, shape: Vec<usize>| {
             census_tensor(name.into(), StoredDType::Dense(DType::BF16), shape)
         };
@@ -3348,14 +4069,13 @@ pub(super) mod tests {
                 .logical_resident_bytes
         };
         let embedding_f32 = 1000 * 64 * 4;
-        let head_f16 = 1000 * 64 * 2;
-        assert_eq!(
-            price(vec![embedding.clone()], true),
-            embedding_f32 + head_f16
-        );
+        let table_f16 = 1000 * 64 * 2;
+        // Tied with an F16 head: one F16 table serves both.
+        assert_eq!(price(vec![embedding.clone()], true), table_f16);
+        // Untied: the F32 embedding and the F16 head.
         assert_eq!(
             price(vec![embedding, head], false),
-            embedding_f32 + head_f16
+            embedding_f32 + table_f16
         );
     }
 
@@ -3585,16 +4305,20 @@ pub(super) mod tests {
             observed,
             reserved: 0,
         };
-        for (variant, files, generic_peak) in [
+        // The generic estimate prices stored bytes: the dense aligner loads
+        // more than that, the 4-bit one (Q4_1 on Metal) about as much.
+        for (variant, files, generic_peak, generic_covers) in [
             (
                 ModelVariant::Qwen3ForcedAligner06B,
                 census!("qwen3_forced_aligner_0_6b.json"),
                 2_769_739_008,
+                false,
             ),
             (
                 ModelVariant::Qwen3ForcedAligner06B4Bit,
                 census!("qwen3_forced_aligner_0_6b_4bit.json"),
                 1_126_895_360,
+                true,
             ),
         ] {
             assert!(super::super::reconciles_device_usage(
@@ -3608,6 +4332,7 @@ pub(super) mod tests {
                     audio_dtype: DType::F32,
                     mlx_bits: None,
                     fused_projections: true,
+                    mlx_q4_1: true,
                 };
                 price_qwen3_aligner(&files, BackendKind::Metal, f32_text).unwrap()
             } else {
@@ -3634,14 +4359,22 @@ pub(super) mod tests {
             )
             .unwrap();
             assert_eq!(generic.load_peak_bytes, generic_peak, "{variant}");
-            assert!(reconcile(generic.load_peak_bytes).is_err(), "{variant}");
+            assert_eq!(
+                reconcile(generic.load_peak_bytes).is_ok(),
+                generic_covers,
+                "{variant}"
+            );
         }
-        // The ASR and TTS families keep their reconciliation; families
-        // without a plan are not reconciled.
+        // The ASR and TTS families keep their reconciliation, as do Qwen3.5
+        // chat and Fish, whose plans match their measured Metal loads;
+        // families without a plan (or one not yet measured) are not
+        // reconciled.
         for variant in [
             ModelVariant::Qwen3Asr06BGguf,
             ModelVariant::ParakeetTdt06BV3,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ModelVariant::Qwen354BGguf,
+            ModelVariant::FishAudioS2Pro,
         ] {
             assert!(
                 super::super::reconciles_device_usage(variant, BackendKind::Metal),
@@ -3659,9 +4392,10 @@ pub(super) mod tests {
         }
     }
 
-    /// The aligner's Metal F16 text tier (4-bit, and dense per D8) runs a
-    /// load-time probe and reloads the text at F32 when it fails. Admission
-    /// prices the F16 load only; the F32 reload is priced separately, for
+    /// The aligner's Metal F16 tier (text and audio tower, 4-bit and dense,
+    /// per D8) runs a load-time probe per component and reloads a failing
+    /// one at F32. Admission prices the F16 load only; the F32 reload is
+    /// priced separately, for
     /// the lifecycle to grow the load's authorization to when a probe fails
     /// (a 6.37 GB worst case priced up front refused the dense aligner on a
     /// 16 GB Mac with 4.6 GB of live headroom). CPU and F32 loads have no
@@ -3674,11 +4408,12 @@ pub(super) mod tests {
             (census!("qwen3_forced_aligner_0_6b.json"), None),
         ] {
             let tiered = aligner(&fixture, BackendKind::Metal);
-            let load = |text_dtype| AlignerLoad {
-                text_dtype,
-                audio_dtype: DType::F32,
+            let load = |dtype| AlignerLoad {
+                text_dtype: dtype,
+                audio_dtype: dtype,
                 mlx_bits,
                 fused_projections: true,
+                mlx_q4_1: true,
             };
             let f16 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F16)).unwrap();
             let f32 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F32)).unwrap();
@@ -4033,14 +4768,15 @@ mod metal_residency_tests {
     /// Loads each published aligner on Metal and checks it against the plan
     /// admission prices: Metal allocations never pass the planned load peak,
     /// and after the load fence the weights occupy the planned residency.
-    /// Measured (2026-10-16, 16 GB M1 Pro; peak allocated / process footprint
-    /// with one checkpoint per process, resident; plan resident / peak):
-    /// - dense: 2.73 / 2.79, 2.69 GiB; plan 2.69 / 3.25 GiB. Before: 4.95 /
-    ///   5.03, 3.24 GiB, over a 2.69 GiB resident plan.
-    /// - dense, F32 text (the reload a failed F16 probe makes, admitted by
+    /// Measured (2026-10-19, 16 GB M1 Pro; peak allocated / process footprint
+    /// with one checkpoint per process, resident; plan resident / peak), with
+    /// the audio tower at F16 beside the F16 text:
+    /// - dense: 2.14 / 2.20, 2.10 GiB; plan 2.10 / 2.66 GiB. With an F32
+    ///   tower (2026-10-16): 2.73 / 2.79, 2.69 GiB.
+    /// - dense, F32 (the reload a failed F16 probe makes, admitted by
     ///   `precision_reload_plan`): 4.24 peak, 4.19 GiB; plan 4.19 / 4.77 GiB.
-    /// - 4-bit: 2.44 / 2.79, 2.42 GiB; plan 2.42 / 3.27 GiB. Before: 3.16 /
-    ///   3.83, 3.14 GiB over 2.69 GiB.
+    /// - 4-bit: 1.84 peak, 1.83 GiB; plan 1.83 / 2.67 GiB. With an F32
+    ///   tower: 2.44 / 2.79, 2.42 GiB.
     ///
     /// The excess over the plan was Candle's Metal pool, which keeps a
     /// released buffer until the next synchronization and hands it to the
@@ -4144,6 +4880,288 @@ mod metal_residency_tests {
             );
             drop(model);
             device.device.synchronize().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen35_plan_tests {
+    use super::*;
+
+    fn tensor(name: &str, dtype: GgmlDType, shape: &[usize]) -> CensusTensor {
+        let elements = shape.iter().product::<usize>() as u64;
+        CensusTensor {
+            name: name.to_string(),
+            dtype: StoredDType::Ggml(dtype),
+            shape: shape.to_vec(),
+            stored_bytes: elements / dtype.block_size() as u64 * dtype.type_size() as u64,
+        }
+    }
+
+    fn file(tensors: Vec<CensusTensor>) -> CensusFile {
+        CensusFile {
+            path: PathBuf::from("fixture.gguf"),
+            tensors,
+        }
+    }
+
+    /// The plan prices what the loader keeps: the quantized text tensors at
+    /// their stored size (the token table once, shared with the tied head),
+    /// F32 text tensors dense, the vision linears at F16 on Metal and F32 on
+    /// CPU, and their F32 biases and every other vision tensor at F32.
+    #[test]
+    fn qwen35_plan_prices_the_stored_text_and_the_loaded_vision_dtype() {
+        let text = file(vec![
+            tensor("token_embd.weight", GgmlDType::Q6K, &[512, 256]),
+            tensor("blk.0.attn_q.weight", GgmlDType::Q4K, &[256, 256]),
+            tensor("output_norm.weight", GgmlDType::F32, &[256]),
+        ]);
+        let vision = file(vec![
+            tensor("v.blk.0.attn_qkv.weight", GgmlDType::F16, &[768, 256]),
+            tensor("v.blk.0.attn_qkv.bias", GgmlDType::F32, &[768]),
+            tensor("mm.0.weight", GgmlDType::F16, &[256, 256]),
+            tensor("v.blk.0.ln1.weight", GgmlDType::F32, &[256]),
+            tensor("v.position_embd.weight", GgmlDType::F32, &[64, 256]),
+        ]);
+        let text_stored: u64 = text.tensors.iter().map(|tensor| tensor.stored_bytes).sum();
+        let linear_elements = (768 * 256 + 256 * 256) as u64;
+        let f32_elements = (768 + 256 + 64 * 256) as u64;
+
+        let metal = price_qwen35_chat(&text, &vision, BackendKind::Metal).unwrap();
+        assert_eq!(
+            metal.logical_resident_bytes,
+            text_stored + linear_elements * 2 + f32_elements * 4
+        );
+        let cpu = price_qwen35_chat(&text, &vision, BackendKind::Cpu).unwrap();
+        assert_eq!(
+            cpu.logical_resident_bytes,
+            text_stored + linear_elements * 4 + f32_elements * 4
+        );
+        assert!(metal.load_peak_bytes >= metal.resident_bytes);
+    }
+
+    #[test]
+    fn qwen35_vision_linear_layers_are_the_projections() {
+        for layer in [
+            "v.blk.3.attn_qkv",
+            "v.blk.3.attn_out",
+            "v.blk.3.ffn_up",
+            "v.blk.3.ffn_down",
+            "mm.0",
+            "mm.2",
+        ] {
+            assert!(qwen35_vision_linear_layer(layer), "{layer}");
+        }
+        for layer in [
+            "v.blk.3.ln1",
+            "v.patch_embd",
+            "v.position_embd",
+            "v.post_ln",
+        ] {
+            assert!(!qwen35_vision_linear_layer(layer), "{layer}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen3_chat_plan_tests {
+    use super::tests::{fixture, gib};
+    use super::*;
+
+    /// Census fixtures from the published checkpoints' headers.
+    macro_rules! census {
+        ($file:literal) => {
+            fixture(include_str!(concat!(
+                "../../../tests/fixtures/chat_residency/",
+                $file
+            )))
+        };
+    }
+
+    /// A safetensors load at `dtype`: Metal (F16, fused, MLX 4-bit kept as
+    /// Q4_1) or CPU (F32, unfused, MLX dequantized).
+    fn load(dtype: DType, fused: bool, tied: bool, mlx_bits: Option<u64>) -> Qwen3ChatLoad {
+        Qwen3ChatLoad {
+            dtype,
+            mlx_bits,
+            fused_projections: fused,
+            packed_projections: false,
+            tied_head: tied,
+            mlx_q4_1: dtype == DType::F16,
+        }
+    }
+
+    fn elements(files: &[CensusFile], keep: impl Fn(&str) -> bool) -> u64 {
+        files
+            .iter()
+            .flat_map(|file| file.tensors.iter())
+            .filter(|tensor| keep(&tensor.name))
+            .map(CensusTensor::elements)
+            .sum()
+    }
+
+    /// Qwen/Qwen3-0.6B and -1.7B declare `tie_word_embeddings` yet store a
+    /// copy of the token table as `lm_head.weight` (equal bytes, checked by
+    /// range reads). The loader ties the head and never reads the copy: on
+    /// Metal that is 0.31 / 0.62 GB of F16 the plan no longer prices.
+    #[test]
+    fn a_tied_heads_stored_copy_is_not_priced() {
+        for (files, hidden) in [
+            (census!("qwen3_0_6b.json"), 1_024u64),
+            (census!("qwen3_1_7b.json"), 2_048),
+        ] {
+            let price = |tied| {
+                price_qwen3_chat_safetensors(
+                    &files,
+                    BackendKind::Metal,
+                    load(DType::F16, true, tied, None),
+                )
+                .unwrap()
+            };
+            let (tied, untied) = (price(true), price(false));
+            assert_eq!(
+                untied.resident_bytes - tied.resident_bytes,
+                151_936 * hidden * 2
+            );
+        }
+    }
+
+    /// CPU loads every text tensor at F32, unfused. Metal loads them at F16,
+    /// cast on the host and uploaded at their exact size, and joins Q/K/V
+    /// and gate/up at their exact size too.
+    #[test]
+    fn safetensors_prices_the_load_dtype_and_the_fused_joins() {
+        let files = census!("qwen3_0_6b.json");
+        let text = |name: &str| name.starts_with("model.");
+        let cpu = price_qwen3_chat_safetensors(
+            &files,
+            BackendKind::Cpu,
+            load(DType::F32, false, true, None),
+        )
+        .unwrap();
+        assert_eq!(cpu.resident_bytes, elements(&files, text) * 4);
+
+        let metal = price_qwen3_chat_safetensors(
+            &files,
+            BackendKind::Metal,
+            load(DType::F16, true, true, None),
+        )
+        .unwrap();
+        assert_eq!(metal.resident_bytes, elements(&files, text) * 2);
+    }
+
+    /// The MLX 4-bit checkpoint keeps its packed weights as Q4_1 on Metal
+    /// (20 bytes per 32 elements) and its norms at F16; CPU dequantizes it
+    /// into the BF16 checkpoint's dense residency.
+    #[test]
+    fn mlx_4bit_prices_q4_1_on_metal_and_its_dequantization_on_cpu() {
+        let dense = census!("qwen3_0_6b.json");
+        let mlx = census!("qwen3_0_6b_4bit.json");
+        let cpu = |files| {
+            let load = load(DType::F32, false, true, Some(4));
+            price_qwen3_chat_safetensors(files, BackendKind::Cpu, load)
+                .unwrap()
+                .resident_bytes
+        };
+        assert_eq!(cpu(&mlx), cpu(&dense));
+        let metal = price_qwen3_chat_safetensors(
+            &mlx,
+            BackendKind::Metal,
+            load(DType::F16, true, true, Some(4)),
+        )
+        .unwrap();
+        let packed_elements: u64 = mlx[0]
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.dtype == StoredDType::Dense(DType::U32))
+            .map(|tensor| tensor.elements() * 8)
+            .sum();
+        let norms = elements(&mlx, |name| name.ends_with("norm.weight"));
+        assert_eq!(metal.resident_bytes, packed_elements / 32 * 20 + norms * 2);
+    }
+
+    /// Qwen3-14B Q4_K_M keeps its token table, projections and untied
+    /// Q6_K head quantized; only its F32 norms are dequantized (cast to F16
+    /// on the Metal device, so each rounds up to a power of two).
+    #[test]
+    fn gguf_keeps_the_table_projections_and_head_quantized() {
+        let files = census!("qwen3_14b_q4_k_m.json");
+        let norms = |name: &str| name.ends_with("norm.weight");
+        let stored = |keep: &dyn Fn(&str) -> bool| -> u64 {
+            files[0]
+                .tensors
+                .iter()
+                .filter(|tensor| keep(&tensor.name))
+                .map(|tensor| tensor.stored_bytes)
+                .sum()
+        };
+        let quantized = stored(&|name| !norms(name));
+        let metal = price_qwen3_chat_gguf(
+            &files,
+            BackendKind::Metal,
+            Qwen3ChatLoad {
+                dtype: DType::F16,
+                mlx_bits: None,
+                fused_projections: false,
+                packed_projections: false,
+                tied_head: false,
+                mlx_q4_1: false,
+            },
+        )
+        .unwrap();
+        let norms_f16: u64 = files[0]
+            .tensors
+            .iter()
+            .filter(|tensor| norms(&tensor.name))
+            .map(|tensor| (tensor.elements() * 2).next_power_of_two())
+            .sum();
+        assert_eq!(metal.resident_bytes, quantized + norms_f16);
+        assert!(stored(&|name| name == "output.weight") > 0);
+    }
+
+    /// Resident and load-peak GiB per checkpoint, CPU and Metal.
+    #[test]
+    fn plans_match_the_residency_table() {
+        let rows: [(&str, Vec<CensusFile>, Option<u64>, [f64; 2]); 4] = [
+            ("Qwen3-0.6B", census!("qwen3_0_6b.json"), None, [2.22, 1.11]),
+            ("Qwen3-1.7B", census!("qwen3_1_7b.json"), None, [6.41, 3.20]),
+            (
+                "Qwen3-0.6B-4bit",
+                census!("qwen3_0_6b_4bit.json"),
+                Some(4),
+                [2.22, 0.35],
+            ),
+            (
+                "Qwen3-14B-GGUF",
+                census!("qwen3_14b_q4_k_m.json"),
+                None,
+                [8.38, 8.38],
+            ),
+        ];
+        for (label, files, mlx_bits, [cpu, metal]) in rows {
+            let price = |backend, dtype, fused| {
+                if label.ends_with("GGUF") {
+                    price_qwen3_chat_gguf(&files, backend, load(dtype, false, false, None))
+                } else {
+                    price_qwen3_chat_safetensors(
+                        &files,
+                        backend,
+                        load(dtype, fused, true, mlx_bits),
+                    )
+                }
+                .unwrap()
+            };
+            let on_cpu = price(BackendKind::Cpu, DType::F32, false);
+            let on_metal = price(BackendKind::Metal, DType::F16, true);
+            eprintln!(
+                "{label:16} resident (load peak) GiB: CPU {:.2} ({:.2}), Metal {:.2} ({:.2})",
+                gib(on_cpu.resident_bytes),
+                gib(on_cpu.load_peak_bytes),
+                gib(on_metal.resident_bytes),
+                gib(on_metal.load_peak_bytes),
+            );
+            super::tests::assert_gib(&format!("{label} CPU"), on_cpu.resident_bytes, cpu);
+            super::tests::assert_gib(&format!("{label} Metal"), on_metal.resident_bytes, metal);
         }
     }
 }

@@ -1,3 +1,4 @@
+use candle_core::quantized::{GgmlDType, QMatMul};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
@@ -62,7 +63,7 @@ struct ConvSubsamplingDw {
     conv3: Conv2d,
     conv5: Conv2d,
     conv6: Conv2d,
-    out: Linear,
+    out: ConformerLinear,
 }
 
 impl ConvSubsamplingDw {
@@ -351,8 +352,8 @@ impl ConformerLayer {
 }
 
 struct FeedForward {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ConformerLinear,
+    linear2: ConformerLinear,
 }
 
 impl FeedForward {
@@ -684,11 +685,11 @@ fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
 }
 
 struct RelPosSelfAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
-    pos_proj: Linear,
+    q_proj: ConformerLinear,
+    k_proj: ConformerLinear,
+    v_proj: ConformerLinear,
+    out_proj: ConformerLinear,
+    pos_proj: ConformerLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
     n_heads: usize,
@@ -881,8 +882,8 @@ impl RelPosSelfAttention {
 
 struct AudioAdapter {
     norm: LayerNorm,
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ConformerLinear,
+    linear2: ConformerLinear,
 }
 
 impl AudioAdapter {
@@ -990,6 +991,77 @@ fn load_layer_norm_any(
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
+/// A projection of the encoder or adapter: on Metal a quantized checkpoint
+/// weight stays quantized (`QMatMul`, whose ggml kernels take the F32
+/// activations as they are); elsewhere, and for a float weight, a dense F32
+/// `Linear`. CPU and CUDA quantize the activations of a quantized matmul, so
+/// they keep the dequantized weight.
+#[derive(Debug, Clone)]
+enum ConformerLinear {
+    Dense(Linear),
+    Quantized {
+        weight: QMatMul,
+        bias: Option<Tensor>,
+    },
+}
+
+impl From<Linear> for ConformerLinear {
+    fn from(linear: Linear) -> Self {
+        Self::Dense(linear)
+    }
+}
+
+impl Module for ConformerLinear {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(linear) => linear.forward(x),
+            Self::Quantized { weight, bias } => {
+                let y = weight.forward(&x.contiguous()?)?;
+                match bias {
+                    Some(bias) => y.broadcast_add(bias),
+                    None => Ok(y),
+                }
+            }
+        }
+    }
+}
+
+/// Whether a stored weight of `dtype` loads as a quantized projection on
+/// `device` ([`ConformerLinear`]).
+fn conformer_projection_stays_quantized(dtype: GgmlDType, device: &Device) -> bool {
+    device.is_metal() && !matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+}
+
+/// Whether `name` is a projection weight the encoder and adapter load
+/// through [`load_linear_any`] (and so may keep quantized).
+pub(crate) fn lfm25_audio_conformer_projection(name: &str) -> bool {
+    const LAYER: [&str; 9] = [
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_out",
+        "linear_pos",
+        "ffn_up",
+        "ffn_down",
+        "ffn_up_1",
+        "ffn_down_1",
+    ];
+    if matches!(
+        name,
+        "a.pre_encode.out.weight" | "mm.a.mlp.1.weight" | "mm.a.mlp.3.weight"
+    ) {
+        return true;
+    }
+    name.strip_prefix("a.blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(layer, rest)| {
+            layer.parse::<usize>().is_ok()
+                && rest
+                    .strip_suffix(".weight")
+                    .is_some_and(|projection| LAYER.contains(&projection))
+        })
+}
+
 fn load_linear_any(
     loader: &GgufLoader,
     device: &Device,
@@ -997,7 +1069,7 @@ fn load_linear_any(
     out_dim: usize,
     weight_names: &[String],
     bias_names: &[String],
-) -> Result<Linear> {
+) -> Result<ConformerLinear> {
     let mut selected = None;
     let mut mismatches = Vec::new();
     for name in weight_names {
@@ -1032,13 +1104,19 @@ fn load_linear_any(
         )));
     };
 
-    let mut weight = loader.load_tensor(&selected_name, DType::F32, device)?;
+    let bias = load_optional_vector_any(loader, device, bias_names, out_dim)?;
+    let stored = loader.load_qtensor(&selected_name, device)?;
+    if !transpose && conformer_projection_stays_quantized(stored.dtype(), device) {
+        return Ok(ConformerLinear::Quantized {
+            weight: QMatMul::from_qtensor(stored)?,
+            bias,
+        });
+    }
+    let mut weight = stored.dequantize(device)?;
     if transpose {
         weight = weight.transpose(0, 1)?.contiguous()?;
     }
-
-    let bias = load_optional_vector_any(loader, device, bias_names, out_dim)?;
-    Ok(Linear::new(weight, bias))
+    Ok(Linear::new(weight, bias).into())
 }
 
 fn load_conv2d_any(
@@ -1680,7 +1758,8 @@ mod tests {
         let device = Device::Cpu;
         let identity = Tensor::eye(4, candle_core::DType::F32, &device).expect("identity");
         let zero_bias = Tensor::zeros(4, candle_core::DType::F32, &device).expect("bias");
-        let linear = || Linear::new(identity.clone(), Some(zero_bias.clone()));
+        let linear =
+            || super::ConformerLinear::from(Linear::new(identity.clone(), Some(zero_bias.clone())));
         let attn = RelPosSelfAttention {
             q_proj: linear(),
             k_proj: linear(),
@@ -1769,5 +1848,54 @@ mod tests {
 
         let _encoder =
             Lfm25AudioEncoder::load(&loader, config, &Device::Cpu).expect("load audio encoder");
+    }
+
+    /// On Metal a Q4_0 projection stays quantized and takes F32 activations
+    /// as they are: its output matches the dequantized weight's to F32
+    /// rounding. Elsewhere it loads dense.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_quantized_projection_matches_the_dequantized_weight() {
+        use super::{conformer_projection_stays_quantized, ConformerLinear};
+        assert!(!conformer_projection_stays_quantized(
+            GgmlDType::Q4_0,
+            &Device::Cpu
+        ));
+        let Some((metal, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_quantized_projection_matches_the_dequantized_weight",
+        ) else {
+            return;
+        };
+        assert!(conformer_projection_stays_quantized(
+            GgmlDType::Q4_0,
+            &metal
+        ));
+        assert!(!conformer_projection_stays_quantized(
+            GgmlDType::F32,
+            &metal
+        ));
+        let weight =
+            crate::kernels::numeric_check::xorshift_tensor(&[96, 128], 0xC0F0, 0.2, &Device::Cpu)
+                .unwrap();
+        let stored = QTensor::quantize(&weight, GgmlDType::Q4_0).unwrap();
+        let dense = stored.dequantize(&metal).unwrap();
+        let bias = Tensor::arange(0f32, 96.0, &metal).unwrap();
+        let input =
+            crate::kernels::numeric_check::xorshift_tensor(&[2, 7, 128], 0xFEED, 1.0, &metal)
+                .unwrap();
+        let quantized = ConformerLinear::Quantized {
+            weight: candle_core::quantized::QMatMul::from_qtensor(
+                QTensor::quantize(&weight.to_device(&metal).unwrap(), GgmlDType::Q4_0).unwrap(),
+            )
+            .unwrap(),
+            bias: Some(bias.clone()),
+        };
+        let expected = Linear::new(dense, Some(bias)).forward(&input).unwrap();
+        let actual = quantized.forward(&input).unwrap();
+        assert_eq!(actual.dims(), &[2, 7, 96]);
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let difference =
+            crate::kernels::numeric_check::max_abs_diff(&values(&actual), &values(&expected));
+        assert!(difference < 1e-3, "{difference}");
     }
 }

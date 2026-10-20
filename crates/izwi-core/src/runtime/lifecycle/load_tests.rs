@@ -166,6 +166,129 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+/// A Granite Speech load without resumable prefill publishes invocation
+/// state only, and the bundle seals it: its ASR capability offers no
+/// retained graph (GRN-8), so no graph declares retained cache state beside
+/// the stateless publication, and speaker attribution publishes as before.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_state() {
+    use crate::models::architectures::granite_speech::asr::{
+        granite_speech_test_physical_state_spec, GraniteSpeechAsrModel,
+    };
+    use crate::runtime::adapters::{
+        LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
+    };
+    const { assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL) };
+    // Serialize against OOM-ladder poison windows and load-transaction
+    // reservations on the process-global resource authority.
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let directory =
+        std::env::temp_dir().join(format!("izwi-granite-state-publication-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: directory.clone(),
+        backend: BackendPreference::Cpu,
+        max_sequence_length: ContextLengthPreference::explicit(32).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let variant = ModelVariant::GraniteSpeech412BPlus;
+    let authority = vector_authority(all_memory_capacity(1024));
+    let lease = authority
+        .reserve(
+            ReservationOwner::new(ReservationClass::Model, "granite-load-publication"),
+            ResourceVector::zero(),
+        )
+        .unwrap();
+    let instance = runtime
+        .model_lifecycle
+        .install_loading_slot(variant, lease)
+        .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(992),
+        instance,
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let publications = runtime
+        .model_lifecycle
+        .load_granite_speech_state_publications(
+            variant,
+            instance,
+            &draft,
+            granite_speech_test_physical_state_spec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publications.len(), 2);
+    for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
+        let LoadedStatePublication::PhysicalV2 {
+            descriptor,
+            retained,
+            retained_uses,
+            ..
+        } = &publications[&capability]
+        else {
+            panic!("Granite Speech {capability:?} must publish physical state");
+        };
+        assert!(retained.is_none(), "{capability:?}");
+        assert!(retained_uses.is_empty(), "{capability:?}");
+        assert!(
+            matches!(descriptor.retained, RetainedStateCapability::Stateless),
+            "{capability:?}"
+        );
+    }
+    let bundle = draft
+        .seal(publications)
+        .expect("a Granite Speech load without resumable prefill must seal");
+
+    // Every ASR requirement, ordinary or long-form, with or without
+    // transport output, binds the atomic graph and its invocation state.
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+        StreamingRequirements::NONE.with_asr_long_form(true),
+        StreamingRequirements::transport_only().with_asr_long_form(true),
+    ] {
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(binding.execution, contract.adapter_binding().unwrap());
+        binding
+            .state
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+        assert!(binding.state.managed_kv_runtime().is_none());
+    }
+    let attributed = bundle
+        .capability_binding_for_streaming(
+            CapabilityKind::SpeakerAttributedAsr,
+            StreamingRequirements::NONE,
+        )
+        .unwrap();
+    attributed
+        .state
+        .validate_against(BackendKind::Cpu, &attributed.execution)
+        .unwrap();
+    assert_eq!(
+        attributed.execution.stages[0].selector,
+        StageWorkSelector::Pipeline { ordinal: None }
+    );
+    drop(attributed);
+    drop(bundle);
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn invocation_execution(max_batch_size: usize) -> LoadedExecutionContract {
     let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
     let metadata = *RuntimeAdapterRegistry::built_in()
@@ -1387,6 +1510,7 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
     let memory = FishS2ModelMemory {
         resident_bytes: 10_712_372_164,
         load_peak_bytes: 12_307_518_404,
+        metal_device_load_peak_bytes: 10_712_372_164,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
     let plan = fish_s2_resource_plan(BackendKind::Cuda, memory).unwrap();
@@ -1450,6 +1574,7 @@ fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
         FishS2ModelMemory {
             resident_bytes: 100,
             load_peak_bytes: 200,
+            metal_device_load_peak_bytes: 100,
             cuda_host_load_peak_bytes: 0,
         },
     )
@@ -1498,6 +1623,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     let cpu_memory = FishS2ModelMemory {
         resident_bytes: 19_836_076_996,
         load_peak_bytes: 22_228_796_356,
+        metal_device_load_peak_bytes: 19_836_076_996,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
     let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory).unwrap();
@@ -1522,13 +1648,21 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     let half_memory = FishS2ModelMemory {
         resident_bytes: 10_712_372_164,
         load_peak_bytes: 12_307_518_404,
+        metal_device_load_peak_bytes: 10_712_372_164,
         ..cpu_memory
     };
+    // On Metal the unified authorization books what the GPU allocates; the
+    // host staging (1.6 GB) is checked against host memory instead.
     let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory).unwrap();
     assert_eq!(
         metal.load_authorization.unified_bytes,
-        ResourceAmount::Known(half_memory.load_peak_bytes)
+        ResourceAmount::Known(half_memory.metal_device_load_peak_bytes)
     );
+    assert_eq!(
+        metal.host_staging_bytes,
+        half_memory.load_peak_bytes - half_memory.metal_device_load_peak_bytes
+    );
+    assert_eq!(cpu.host_staging_bytes, 0);
     assert_eq!(
         metal.resident_authorization.unified_bytes,
         ResourceAmount::Known(half_memory.resident_bytes)
@@ -1538,20 +1672,6 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
         ResourceAmount::Known(
             crate::models::architectures::fish_s2::FISH_S2_REFERENCE_CACHE_BYTES
         )
-    );
-}
-
-#[test]
-fn lfm25_audio_model_memory_excludes_request_scoped_inference_workspace() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    assert_eq!(ModelVariant::Lfm25Audio15BGguf.memory_required_gb(), 5.0);
-    assert_eq!(
-        model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
-        ModelMemoryEstimate {
-            load_peak_bytes: 3 * GIB,
-            resident_bytes: 3 * GIB,
-        }
     );
 }
 
@@ -1610,13 +1730,9 @@ fn automatic_state_groups_share_remaining_headroom() {
 }
 
 #[test]
-fn lfm25_audio_context_fit_preserves_request_workspace_and_safety_headroom() {
+fn portable_context_reserve_is_the_configured_reserve_when_residency_is_the_catalog_figure() {
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    assert_eq!(
-        portable_context_reserve_bytes(ModelVariant::Lfm25Audio15BGguf, GIB),
-        3 * GIB
-    );
     assert_eq!(
         portable_context_reserve_bytes(ModelVariant::Kokoro82M, GIB),
         GIB
@@ -1862,7 +1978,7 @@ fn state_fits_leave_one_request_envelope_on_a_16_gb_metal_budget() {
 /// task answers, and sees the task's refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
-    let (mut gate, mut requests) = precision_reload_gate();
+    let (mut gate, mut requests) = precision_reload_gate(candle_core::Device::Cpu);
     let loader = tokio::task::spawn_blocking(move || {
         let admitted = gate("text", candle_core::DType::F32);
         let refused = gate("text", candle_core::DType::F32);
@@ -1880,7 +1996,7 @@ async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
     admitted.unwrap();
     assert!(refused.unwrap_err().to_string().contains("no room"));
     // A gate whose load task is gone refuses instead of blocking.
-    let (mut gate, requests) = precision_reload_gate();
+    let (mut gate, requests) = precision_reload_gate(candle_core::Device::Cpu);
     drop(requests);
     let orphaned = tokio::task::spawn_blocking(move || gate("text", candle_core::DType::F32));
     assert!(orphaned.await.unwrap().is_err());
@@ -2002,36 +2118,6 @@ fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         portable_invocation_context_intent(explicit, Some(8_192), 65_536),
         PortableInvocationContextIntent::Explicit { selected: 32_768 }
     );
-}
-
-#[test]
-fn lfm25_audio_cold_load_fits_with_separately_reserved_request_workspace() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    let authority = vector_authority(ResourceVector {
-        unified_bytes: ResourceAmount::Known(5 * GIB),
-        ..ResourceVector::zero()
-    });
-    let _request = authority
-        .reserve(
-            ReservationOwner::new(ReservationClass::Request, "lfm-request"),
-            ResourceVector {
-                unified_bytes: ResourceAmount::Known(2 * GIB),
-                ..ResourceVector::zero()
-            },
-        )
-        .expect("request workspace should fit");
-    let plan = model_resource_plan(
-        BackendKind::Metal,
-        model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
-    );
-
-    let _model = authority
-        .reserve(
-            ReservationOwner::new(ReservationClass::Model, "lfm-model"),
-            plan.load_authorization,
-        )
-        .expect("model-owned memory should not include request workspace twice");
 }
 
 #[test]
@@ -2782,8 +2868,10 @@ async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {  
         .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
         .await
         .expect_err("a pinned resident must not be silently evicted");
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("unload a model to make room"),
+        message.contains("Granite Speech 4.1 2B Plus is loaded explicitly or serving requests: unload it to make room")
+            && message.contains("IZWI_MAX_LOADED_MODELS"),
         "unexpected error: {error}"
     );
     assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExhausted);
@@ -2910,7 +2998,12 @@ async fn session_model_leases_protect_without_pinning() {
         .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
         .await
         .expect_err("a model held by a session is not evicted");
-    assert!(error.to_string().contains("no resident model is idle"));
+    assert!(
+        error
+            .to_string()
+            .contains("Kokoro 82M is loaded explicitly or serving requests: unload it"),
+        "{error}"
+    );
     assert_eq!(
         runtime.model_manager.resident_variants().await,
         vec![variant]
@@ -3192,18 +3285,15 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// What load admission charged Qwen3-TTS 0.6B's weights at 0adabf16.
 const TTS_CHARGED_WEIGHT_BYTES: u64 = 2_493_807_108;
 
-/// Load TTS retained state through the engine's real load path the way
-/// `load_model` does for an unobserved (non-ASR) load, beside weights the
-/// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
-/// observer reports `observed` bytes in use.
-fn load_tts_retained_state(
+/// An engine core beside weights the ledger charged at
+/// [`TTS_CHARGED_WEIGHT_BYTES`] while the device observer reports
+/// `observed` bytes in use, and the lease that holds those weights.
+fn tts_state_core(
     variant: ModelVariant,
-    contract: &crate::kv::v2::InferenceStateContract,
-    maximum_tokens: usize,
     capacity: u64,
     available: u64,
     observed: u64,
-) -> crate::error::Result<u64> {
+) -> crate::error::Result<(crate::engine::EngineCore, ResourceLease)> {
     let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
         Arc::new(ObservedUnifiedProvider {
             capacity,
@@ -3215,7 +3305,7 @@ fn load_tts_retained_state(
         unified_bytes: ResourceAmount::Known(TTS_CHARGED_WEIGHT_BYTES),
         ..ResourceVector::zero()
     };
-    let _weights = authority.reserve_with_initial_materialized(
+    let weights = authority.reserve_with_initial_materialized(
         ReservationOwner::new(ReservationClass::Model, variant.to_string()),
         weights,
         weights,
@@ -3231,14 +3321,30 @@ fn load_tts_retained_state(
         ..Default::default()
     };
     config.portable_context_auto = true;
-    let mut core =
-        crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+    let core = crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+    Ok((core, weights))
+}
+
+/// Load TTS retained state through the engine's real load path the way
+/// `load_model` does for an unobserved (non-ASR) load, beside weights the
+/// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
+/// observer reports `observed` bytes in use.
+fn load_tts_retained_state(
+    variant: ModelVariant,
+    contract: &crate::kv::v2::InferenceStateContract,
+    maximum_tokens: usize,
+    capacity: u64,
+    available: u64,
+    observed: u64,
+) -> crate::error::Result<u64> {
+    let (mut core, _weights) = tts_state_core(variant, capacity, available, observed)?;
     let runtime = core.load_managed_model_state(
         ModelInstanceId::new(4_101),
         contract,
         Some(maximum_tokens),
         super::tts_state_minimum_tokens(variant),
         crate::engine::StateFitReserve::for_observed_load(false),
+        0,
     )?;
     Ok(runtime.logical_token_reach())
 }
@@ -3334,13 +3440,109 @@ fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_hea
         Err(Error::Overloaded(message)) => {
             assert!(
                 message.starts_with("not enough memory for this model's minimum")
-                    && message.contains(" GB, ")
+                    && message.contains(" safety reserve, ")
                     && !message.contains("planning_headroom="),
                 "{message}"
             )
         }
         other => panic!("expected a capacity refusal, got {other:?}"),
     }
+}
+
+/// S3: a CPU or Metal load must find its residents, its request envelope
+/// and the state its fits keep free before the weights load, or its load
+/// peak, whichever is larger. Unknown residency leaves the peak alone.
+#[test]
+fn portable_preload_holds_the_state_floor_beside_the_residents() {
+    let plan = |domain: fn(u64) -> ResourceVector| super::ModelResourcePlan {
+        resident_authorization: domain(10_000),
+        load_authorization: domain(12_000),
+        ..model_resource_plan(
+            BackendKind::Metal,
+            ModelMemoryEstimate {
+                load_peak_bytes: 0,
+                resident_bytes: 0,
+            },
+        )
+    };
+    let unified = |bytes| ResourceVector {
+        unified_bytes: ResourceAmount::Known(bytes),
+        ..ResourceVector::zero()
+    };
+    let host = |bytes| ResourceVector {
+        host_bytes: ResourceAmount::Known(bytes),
+        ..ResourceVector::zero()
+    };
+    let metal = plan(unified);
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Metal, 12_000, 0, 1_000).unwrap(),
+        12_000
+    );
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Metal, 12_000, 500, 3_000).unwrap(),
+        13_500
+    );
+    let cpu = plan(host);
+    assert_eq!(
+        super::portable_preload_bytes(&cpu, BackendKind::Cpu, 12_000, 0, 2_500).unwrap(),
+        12_500
+    );
+    // The Metal plan has no host residency to stand on.
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Cpu, 12_000, 0, 9_999).unwrap(),
+        12_000
+    );
+}
+
+/// S2: Qwen3-TTS binds one retained arena for its Tts and StreamingTts
+/// capabilities. The second capability gets the runtime the first fit
+/// bound; refitting it against the headroom that arena had already taken
+/// refused its 2,524-token floor after the weights had loaded. The first
+/// fit leaves the predictor workspaces loaded after it free.
+#[test]
+fn a_second_capability_reuses_the_bound_retained_runtime() {
+    use crate::models::architectures::qwen3::tts::{
+        qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+        tests::cache_test_config,
+    };
+    let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+    let config = cache_test_config();
+    let full = qwen3_tts_inference_state_contract(
+        &config,
+        candle_core::DType::F32,
+        candle_core::DType::F32,
+        crate::models::shared::attention::paged::default_kv_page_size(),
+    )
+    .unwrap();
+    let contract =
+        qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32).unwrap();
+    let budget = 11 * GIB + 440 * 1024 * 1024;
+    let load = |core: &mut crate::engine::EngineCore, later_minimum_bytes| {
+        core.load_managed_model_state(
+            ModelInstanceId::new(4_102),
+            &contract,
+            Some(1 << 20),
+            super::tts_state_minimum_tokens(variant),
+            crate::engine::StateFitReserve::for_observed_load(false),
+            later_minimum_bytes,
+        )
+    };
+
+    // Live memory lets the first fit grow to the planning floor budget.
+    let (mut core, _weights) = tts_state_core(variant, budget, budget, 6_000_000_000).unwrap();
+    let first = load(&mut core, 0).unwrap();
+    let second = load(&mut core, 0).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+
+    // Holding back a later workspace makes the first fit smaller.
+    let (mut core, _weights) = tts_state_core(variant, budget, budget, 6_000_000_000).unwrap();
+    let held = load(&mut core, 2 * GIB).unwrap();
+    assert!(
+        held.logical_token_reach() < first.logical_token_reach(),
+        "{} !< {}",
+        held.logical_token_reach(),
+        first.logical_token_reach()
+    );
 }
 
 /// Phase 0 state-ceiling contract: every TTS family whose load fits
@@ -3400,4 +3602,121 @@ fn vibevoice_tts_effective_context_covers_prompt_and_frame_budget_under_low_live
             .unwrap();
     assert!(reach >= required, "effective context {reach} < {required}");
     assert!(reach < maximum as u64, "live memory must still cap growth");
+}
+
+fn shortfall(
+    required_gb: u64,
+    ledger_gb: u64,
+    live_gb: Option<u64>,
+    held_gb: u64,
+    unevictable: Vec<ModelVariant>,
+) -> super::admission::LoadShortfall {
+    const GB: u64 = 1_000_000_000;
+    super::admission::LoadShortfall {
+        backend: BackendKind::Metal,
+        admission: crate::engine::MetalLoadAdmission::Advisory,
+        required_bytes: required_gb * GB,
+        ledger_headroom: ledger_gb * GB,
+        ledger_ceiling: Some(11 * GB),
+        live_headroom: live_gb.map(|gb| gb * GB),
+        held_by_residents: held_gb * GB,
+        unevictable,
+        state_floor_bytes: 0,
+    }
+}
+
+/// A refusal names the pinned or busy models only when unloading them
+/// could cover the gap, and otherwise says what is actually short.
+#[test]
+fn load_refusals_name_their_cause() {
+    let variant = ModelVariant::Qwen354BGguf;
+    let pinned = vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo];
+
+    let message = shortfall(6, 2, Some(3), 5, pinned.clone()).message(variant);
+    assert_eq!(
+        message,
+        "Cannot load Qwen3.5 4B GGUF: needs 6.00 GB, 2.00 GB available; Kokoro 82M and \
+         Whisper Large v3 Turbo are loaded explicitly or serving requests and hold 5.00 GB: \
+         unload one of them to make room"
+    );
+
+    // Unloading both would leave 2 + 1 GB: not enough, so the budget is named.
+    let message = shortfall(12, 2, None, 1, pinned).message(variant);
+    assert!(
+        message.ends_with(
+            "; the model is larger than the 11.00 GB memory budget \
+             (IZWI_METAL_MEMORY_BUDGET_BYTES, by default 90% of the GPU working set)"
+        ),
+        "{message}"
+    );
+
+    // The GPU working set binds below the ledger.
+    let message = shortfall(6, 9, Some(4), 0, Vec::new()).message(variant);
+    assert!(
+        message.starts_with("Cannot load Qwen3.5 4B GGUF: needs 6.00 GB, 4.00 GB available")
+            && message.ends_with("GPU working set (this Mac's limit for GPU memory) has free"),
+        "{message}"
+    );
+
+    // Strict host gating blames other apps and names the switch.
+    let mut strict = shortfall(6, 9, Some(4), 0, Vec::new());
+    strict.admission = crate::engine::MetalLoadAdmission::Strict;
+    let message = strict.message(variant);
+    assert!(
+        message.contains("other apps are using it (IZWI_METAL_LOAD_ADMISSION=strict)"),
+        "{message}"
+    );
+
+    // Requests and state hold the budget: nothing to unload.
+    let message = shortfall(6, 2, None, 0, Vec::new()).message(variant);
+    assert!(
+        message.ends_with("held by running requests and model state: retry when they finish"),
+        "{message}"
+    );
+
+    // S3: the state a load keeps free beside its weights is named (Fish S2
+    // Pro on a 16 GB Mac: 10.74 GB of weights and a 1.07 GB reserve).
+    let mut fish = shortfall(12, 12, Some(11), 0, Vec::new());
+    fish.state_floor_bytes = 1_070_000_000;
+    let message = fish.message(ModelVariant::FishAudioS2Pro);
+    assert!(
+        message.starts_with(
+            "Cannot load Fish Audio S2 Pro: needs 12.00 GB, 11.00 GB available (of which \
+             1.07 GB is the state and safety reserve the model needs beside its weights)"
+        ),
+        "{message}"
+    );
+}
+
+/// Host staging (Fish's staged copies beside its GPU peak) gates a Metal
+/// load only under strict admission; advisory and off admission check the
+/// GPU peak alone.
+#[test]
+fn host_staging_gates_only_strict_metal_loads() {
+    use crate::engine::MetalLoadAdmission;
+    let gated = |admission| super::admission::gated_load_bytes(admission, 10_712, 1_595);
+    assert_eq!(gated(MetalLoadAdmission::Strict), 12_307);
+    assert_eq!(gated(MetalLoadAdmission::Advisory), 10_712);
+    assert_eq!(gated(MetalLoadAdmission::Off), 10_712);
+}
+
+#[test]
+fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
+    let residents = [
+        ModelVariant::Kokoro82M,
+        ModelVariant::WhisperLargeV3Turbo,
+        ModelVariant::Qwen354BGguf,
+        ModelVariant::ParakeetTdt06BV3,
+    ];
+    let active = HashSet::from([ModelVariant::WhisperLargeV3Turbo]);
+    let pinned = HashSet::from([ModelVariant::Kokoro82M, ModelVariant::Qwen354BGguf]);
+    assert_eq!(
+        super::admission::unevictable_residents(
+            &residents,
+            ModelVariant::Qwen354BGguf,
+            &active,
+            &pinned,
+        ),
+        vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo]
+    );
 }

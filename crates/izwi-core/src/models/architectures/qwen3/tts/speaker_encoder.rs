@@ -525,6 +525,36 @@ impl SpeakerEncoder {
         &self.config
     }
 
+    /// An upper bound of the F32 elements [`Self::embed_samples`] holds over
+    /// `seconds` of reference audio. Its peak is the attentive statistics
+    /// pooling: the pooled context (three times the last width), its
+    /// convolution's input copy, the pooling input, the attention and its
+    /// softmax, and the statistics' products, about 13 last-width planes
+    /// per mel frame, beside the block outputs the aggregation keeps and
+    /// the attention's narrow planes. A 30 s reference is about 2,800
+    /// frames.
+    pub(crate) fn embed_workspace_upper_bound_elements(&self, seconds: usize) -> Result<u64> {
+        let config = &self.config;
+        let overflow = || Error::Overloaded("speaker-encoder workspace overflow".into());
+        let samples = seconds
+            .checked_mul(config.sample_rate as usize)
+            .ok_or_else(overflow)?;
+        let frames = samples.div_ceil(SpeakerMelParams::REFERENCE.hop_size) + 1;
+        let layers = config.enc_channels.len();
+        let blocks: usize = config.enc_channels[1..layers.saturating_sub(1)]
+            .iter()
+            .sum();
+        let last = config.enc_channels.last().copied().unwrap_or(0);
+        let per_frame = blocks
+            .checked_add(last.checked_mul(13).ok_or_else(overflow)?)
+            .and_then(|elements| elements.checked_add(4 * config.enc_attention_channels))
+            .ok_or_else(overflow)?;
+        frames
+            .checked_mul(per_frame)
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(overflow)
+    }
+
     /// `[batch, frames, mel_dim]` to `[batch, enc_dim]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let mut hidden = mel.transpose(1, 2)?.contiguous()?;
@@ -559,6 +589,22 @@ impl SpeakerEncoder {
 mod tests {
     use super::*;
     use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+    /// The embedding workspace bound on the shipped encoder at a 30 s
+    /// reference: 2,814 mel frames of 13 pooling-width planes beside the
+    /// block outputs, 0.25 GB of F32. A 29.7 s reference held 397 MiB of
+    /// Metal pool buffers; the caller doubles the bound there.
+    #[test]
+    fn embed_workspace_bound_follows_the_shipped_encoder() {
+        let config: SpeakerEncoderConfig = serde_json::from_str("{}").unwrap();
+        let vb = VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, Device::Cpu);
+        let encoder = SpeakerEncoder::load(config, vb).unwrap();
+        let elements = encoder.embed_workspace_upper_bound_elements(30).unwrap();
+        let frames = 720_000u64.div_ceil(256) + 1;
+        assert_eq!(elements, frames * (3 * 512 + 13 * 1_536 + 4 * 128));
+        assert!(2 * 4 * elements > 397 * 1024 * 1024, "{elements}");
+        assert!(encoder.embed_workspace_upper_bound_elements(3).unwrap() * 9 < elements);
+    }
 
     /// Name-keyed xorshift weights: biases scaled 0.1, kernels by
     /// 1/sqrt(fan-in). The golden generator uses the same values.

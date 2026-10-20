@@ -23,6 +23,7 @@ test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
+izwi-env = { path = "../izwi-env" }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true, features = ["http2"] }

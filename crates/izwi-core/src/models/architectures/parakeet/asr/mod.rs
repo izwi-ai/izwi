@@ -39,6 +39,7 @@ use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
 };
+use crate::models::shared::memory::exact::exact_zeros;
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
@@ -271,8 +272,8 @@ pub(crate) struct ParakeetPreparationBytes {
     /// power spectrum and log-mel.
     pub(crate) host_bytes: u64,
     /// One encoder window's peak: the first subsampling convolution and its
-    /// ReLU copy, the attention scores and `rel_shift` buffers, and the
-    /// per-frame activations of a layer.
+    /// ReLU copy over one stem slice, the attention scores and `rel_shift`
+    /// buffers, and the per-frame activations of a layer.
     pub(crate) window_bytes: u64,
     /// The stitched `[1, E, D]` output, copied into the exact-size retained
     /// artifact at the end.
@@ -329,14 +330,19 @@ pub(crate) fn parakeet_preparation_bytes(
             .try_fold(1u64, |product, value| product.checked_mul(*value))
             .ok_or_else(overflow)
     };
-    // conv0 output [channels, 8T/2, mels/2] and its ReLU copy.
-    let subsampling = multiply(&[2, channels, 4 * window, mel_bins / 2, F32_BYTES])?;
+    // conv0's output [channels, 8T/2, mels/2], its bias add and its ReLU
+    // (all three were held on Metal), over one stem slice
+    // (`ConvSubsamplingDw::forward`) of T frames and its halos.
+    let stem_frames = window.min(as_u64(
+        SUBSAMPLING_SLICE_FRAMES + 2 * SUBSAMPLING_HALO_FRAMES,
+    )?);
+    let stem_plane = multiply(&[channels, 4 * stem_frames, mel_bins / 2, F32_BYTES])?;
     let scores = multiply(&[heads, window, window, F32_BYTES])?;
     // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
     let rel_shift = multiply(&[heads, window, 2 * window, F32_BYTES])?;
     let activation = multiply(&[window, ff_dim, F32_BYTES])?;
     let window_bytes = [
-        round(subsampling)?,
+        multiply(&[3, round(stem_plane)?])?,
         round(scores)?,
         multiply(&[3, round(rel_shift)?])?,
         multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
@@ -1129,6 +1135,14 @@ impl ParakeetAsrModel {
 
         let blank_idx = network.blank_idx;
         let num_durations = network.num_durations;
+        // The model loaded from the extracted checkpoint: its `.nemo` is
+        // no longer needed.
+        if let Some(artifacts) = &artifacts {
+            crate::models::shared::weights::nemo::release_extracted_nemo(
+                &artifacts.nemo_path,
+                nemo::parakeet_native_artifacts_complete(model_dir, variant),
+            );
+        }
 
         Ok(Self {
             variant,
@@ -1862,6 +1876,16 @@ struct ParakeetEncoded {
     windows: usize,
 }
 
+/// Output frames the subsampling stem computes per slice (9.6 s): a slice
+/// and its halos read 1,024 feature frames, so its first convolution's
+/// output (`[256, 512, 64]` at F32) fills exactly one 32 MiB Metal pool
+/// buffer.
+const SUBSAMPLING_SLICE_FRAMES: usize = 120;
+/// Output frames of input a stem slice reads past each of its edges: the
+/// stem's reach is under one output frame, and its zero padding at a slice
+/// edge moves inward one position per stride-2 stage.
+const SUBSAMPLING_HALO_FRAMES: usize = 4;
+
 struct ConvSubsamplingDw {
     conv0: Conv2d,
     conv2: Conv2d,
@@ -1915,7 +1939,53 @@ impl ConvSubsamplingDw {
         })
     }
 
+    /// The stem over `features` (`[B, MELS, T]`), `SUBSAMPLING_SLICE_FRAMES`
+    /// output frames at a time: its first convolution's output alone is
+    /// `[256, T/2, MELS/2]` at F32, 0.34 GB over a full encoder window, and
+    /// Metal held its bias add and ReLU beside it. Each output frame `o` reads input frames `8o - 7` to
+    /// `8o + 7` through the three stride-2 convolutions, so a slice read with
+    /// `SUBSAMPLING_HALO_FRAMES` output frames of input on each side computes
+    /// its own frames exactly as the whole sequence does; only the zero
+    /// padding at a slice's inner edges differs, and it reaches no kept
+    /// frame. Each slice's frames are copied into an exact-size output and
+    /// the slice dropped: slices held for one final `Tensor::cat` each
+    /// pinned a pooled buffer that best-fit reuse sized up to 64 MiB, growing
+    /// the pool by 512 MiB over a window.
     fn forward(&self, features: &Tensor) -> Result<Tensor> {
+        let frames = features.dim(2)?;
+        let outputs = subsampled_len_3x(frames);
+        if outputs <= SUBSAMPLING_SLICE_FRAMES {
+            return self.forward_whole(features);
+        }
+        let mut stitched: Option<Tensor> = None;
+        let mut first = 0;
+        while first < outputs {
+            let last = (first + SUBSAMPLING_SLICE_FRAMES).min(outputs);
+            let read_first = first.saturating_sub(SUBSAMPLING_HALO_FRAMES);
+            let read_last = (last + SUBSAMPLING_HALO_FRAMES).min(outputs);
+            let input_first = read_first * SUBSAMPLING_FACTOR;
+            let input_last = (read_last * SUBSAMPLING_FACTOR).min(frames);
+            let slice =
+                self.forward_whole(&features.narrow(2, input_first, input_last - input_first)?)?;
+            let kept = slice
+                .narrow(1, first - read_first, last - first)?
+                .contiguous()?;
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => exact_zeros(
+                    (kept.dim(0)?, outputs, kept.dim(2)?),
+                    kept.dtype(),
+                    kept.device(),
+                )?,
+            };
+            output.slice_set(&kept, 1, first)?;
+            stitched = Some(output);
+            first = last;
+        }
+        stitched.ok_or_else(|| Error::InferenceError("Parakeet stem produced no slices".into()))
+    }
+
+    fn forward_whole(&self, features: &Tensor) -> Result<Tensor> {
         // Input features are [B=1, MELS, T]. Convert to [B, 1, T, MELS]
         let mut x = features.transpose(1, 2)?.unsqueeze(1)?;
 
@@ -2902,6 +2972,53 @@ mod tests {
         }
     }
 
+    /// The subsampling stem run by slices returns the frames of the
+    /// whole-sequence stem, for lengths that leave a short last slice. A
+    /// slice changes only how many rows each matrix product runs over, so
+    /// the frames agree within F32 rounding: the CPU product blocks its sums
+    /// by problem size, instruction set and thread count (3e-8 apart on CI,
+    /// bit for bit on the dev Mac).
+    #[test]
+    fn sliced_subsampling_matches_the_whole_sequence() {
+        let device = Device::Cpu;
+        let stem = super::ConvSubsamplingDw::load(
+            random_encoder_vb(TINY, 0x5EED, &device).pp("pre_encode"),
+            TINY,
+            None,
+        )
+        .unwrap();
+        for frames in [8 * super::SUBSAMPLING_SLICE_FRAMES * 2 + 3, 5_001] {
+            let features = Tensor::from_vec(
+                XorShift(frames as u64).values(TINY.mel_bins * frames, 1.0, 0.0),
+                (1, TINY.mel_bins, frames),
+                &device,
+            )
+            .unwrap();
+            let whole = stem.forward_whole(&features).unwrap();
+            let sliced = stem.forward(&features).unwrap();
+            assert_eq!(sliced.dims(), whole.dims(), "{frames}");
+            let scale = whole
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let difference = (sliced - whole)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                difference <= scale * 1e-6,
+                "{frames}: {difference} of {scale}"
+            );
+        }
+    }
+
     /// A NeMo-layout encoder checkpoint with random weights, loaded through
     /// the production loaders.
     fn random_encoder(geometry: EncoderGeometry, seed: u64, device: &Device) -> ParakeetEncoder {
@@ -3828,17 +3945,21 @@ mod tests {
             assert!(total(60 * minute, backend) <= 5 * GIB / 2, "{backend:?}");
         }
 
-        // E = 1024 frames: the window term is final from here on and equals
-        // report 11's 832 MiB on every backend (all its buffers are powers
-        // of two at W = 1024).
-        let full_window = parakeet_preparation_bytes(8192 * 160, BackendKind::Cpu)
-            .unwrap()
-            .window_bytes;
-        assert_eq!(full_window, 832 << 20);
+        // E = 1024 frames: the window term is final from here on. It was
+        // report 11's 832 MiB before the stem ran by slices (its first
+        // convolution held 512 MiB of it); one 128-frame stem slice holds
+        // three 32 MiB planes, which Metal's pool does not round.
+        let full_window = |backend| {
+            parakeet_preparation_bytes(8192 * 160, backend)
+                .unwrap()
+                .window_bytes
+        };
+        assert_eq!(full_window(BackendKind::Cpu), (832 - 512 + 96) << 20);
+        assert_eq!(full_window(BackendKind::Metal), (832 - 512 + 96) << 20);
         for minutes in [2, 10, 30, 60] {
             for backend in backends {
                 let bytes = parakeet_preparation_bytes(minutes * minute, backend).unwrap();
-                assert_eq!(bytes.window_bytes, full_window);
+                assert_eq!(bytes.window_bytes, full_window(backend));
             }
         }
         for samples in [16_000, 7 * minute + 4_321, 60 * minute] {

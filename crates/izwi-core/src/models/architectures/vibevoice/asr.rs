@@ -52,7 +52,6 @@ use crate::models::architectures::vibevoice::{
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::detokenize::IncrementalDetokenizer;
-use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
@@ -145,6 +144,22 @@ pub struct VibeVoiceAsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+/// VibeVoice-ASR's checkpoint at `dtype`: host-cast, exact-size uploads with
+/// periodic synchronization on Metal (`staged`); Candle's own reads cast every
+/// tensor on the device into a power-of-two buffer and kept every upload until
+/// the load fence (a 29 GB peak for a 15.7 GB model).
+fn vibevoice_asr_weights(
+    model_dir: &Path,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<VarBuilder<'static>> {
+    let shards = crate::models::shared::weights::gguf::safetensors_weight_files(model_dir)?;
+    unsafe {
+        crate::models::shared::weights::staged::metal_staged_safetensors(&shards, dtype, device)
+    }
+    .map_err(Error::from)
 }
 
 pub struct VibeVoiceAsrModel {
@@ -549,7 +564,7 @@ impl VibeVoiceAsrModel {
         let lm_selection = vibevoice_asr_lm_precision(&device)?;
         let dtype = vibevoice_asr_audio_dtype(&device, lm_selection.dtype);
         let projection_precision = resolve_vibevoice_tokenizer_projection_precision(&device);
-        let vb = load_model_weights(model_dir, dtype, &device.device)?;
+        let vb = vibevoice_asr_weights(model_dir, dtype, &device.device)?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;
         let ((acoustic_tokenizer, semantic_tokenizer), tokenizer_weight_precision) =
@@ -614,7 +629,7 @@ impl VibeVoiceAsrModel {
                 let lm_vb = if lm_dtype == dtype {
                     vb.clone()
                 } else {
-                    load_model_weights(model_dir, lm_dtype, &device.device)?
+                    vibevoice_asr_weights(model_dir, lm_dtype, &device.device)?
                 };
                 Qwen3Model::load_with_layout(
                     config.decoder_config.clone(),

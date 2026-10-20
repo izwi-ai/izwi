@@ -218,8 +218,8 @@ impl PatchEmbed {
 }
 
 struct VisionAttention {
-    qkv: Linear,
-    proj: Linear,
+    qkv: VisionLinear,
+    proj: VisionLinear,
     num_heads: usize,
     head_dim: usize,
 }
@@ -236,13 +236,13 @@ impl VisionAttention {
                 loader,
                 device,
                 &format!("{prefix}.attn_qkv"),
-                Some(DType::F32),
+                vision_linear_dtype(device),
             )?,
             proj: load_linear(
                 loader,
                 device,
                 &format!("{prefix}.attn_out"),
-                Some(DType::F32),
+                vision_linear_dtype(device),
             )?,
             num_heads: cfg.num_heads,
             head_dim: cfg.hidden_size / cfg.num_heads,
@@ -300,13 +300,13 @@ impl VisionAttention {
         }
 
         let attn_output = Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?;
-        self.proj.forward(&attn_output).map_err(Error::from)
+        self.proj.forward(&attn_output)
     }
 }
 
 struct VisionMlp {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: VisionLinear,
+    fc2: VisionLinear,
 }
 
 impl VisionMlp {
@@ -316,13 +316,13 @@ impl VisionMlp {
                 loader,
                 device,
                 &format!("{prefix}.ffn_up"),
-                Some(DType::F32),
+                vision_linear_dtype(device),
             )?,
             fc2: load_linear(
                 loader,
                 device,
                 &format!("{prefix}.ffn_down"),
-                Some(DType::F32),
+                vision_linear_dtype(device),
             )?,
         })
     }
@@ -330,7 +330,7 @@ impl VisionMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.fc1.forward(xs)?;
         let xs = xs.gelu()?;
-        self.fc2.forward(&xs).map_err(Error::from)
+        self.fc2.forward(&xs)
     }
 }
 
@@ -387,16 +387,16 @@ struct PatchMerger {
     use_postshuffle_norm: bool,
     spatial_merge_unit: usize,
     merged_hidden_size: usize,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: VisionLinear,
+    fc2: VisionLinear,
     use_gelu: bool,
 }
 
 impl PatchMerger {
     fn load(loader: &GgufLoader, device: &Device, cfg: &Qwen35VisionConfig) -> Result<Self> {
-        let fc1 = load_linear(loader, device, "mm.0", Some(DType::F32))?;
-        let fc2 = load_linear(loader, device, "mm.2", Some(DType::F32))?;
-        let merged_hidden_size = fc1.weight().dims2()?.1;
+        let fc1 = load_linear(loader, device, "mm.0", vision_linear_dtype(device))?;
+        let fc2 = load_linear(loader, device, "mm.2", vision_linear_dtype(device))?;
+        let merged_hidden_size = fc1.in_features()?;
         let norm_weight = load_dense(loader, device, "v.post_ln.weight", Some(DType::F32))?;
         let norm_bias = load_dense(loader, device, "v.post_ln.bias", Some(DType::F32))?;
         let norm_dim = norm_weight.elem_count();
@@ -450,7 +450,7 @@ impl PatchMerger {
         } else {
             candle_nn::ops::silu(&xs)?
         };
-        self.fc2.forward(&xs).map_err(Error::from)
+        self.fc2.forward(&xs)
     }
 }
 
@@ -495,9 +495,12 @@ impl Qwen35VisionModel {
             )));
         }
         if config.hidden_size != expected_text_hidden_size && loader.has_tensor("mm.2.weight") {
-            let projector_out = load_dense(loader, device, "mm.2.weight", Some(DType::F32))?
-                .dims2()?
-                .0;
+            let projector_out = loader
+                .tensor_shape("mm.2.weight")
+                .and_then(|shape| shape.first().copied())
+                .ok_or_else(|| {
+                    Error::ModelLoadError("Qwen3.5 projector mm.2.weight has no shape".into())
+                })?;
             if projector_out != expected_text_hidden_size {
                 return Err(Error::ModelLoadError(format!(
                     "Qwen3.5 projector output width mismatch: {projector_out} vs expected text hidden size {expected_text_hidden_size}"
@@ -1530,20 +1533,72 @@ fn parse_vision_config(loader: &GgufLoader) -> Result<Qwen35VisionConfig> {
     })
 }
 
+/// The weight dtype of the vision tower's linear layers: F16 on an
+/// accelerator, where the tower is stored F16 and F32 would double it
+/// (0.66 to 1.33 GB for the 2B/4B projector), F32 on CPU.
+fn vision_linear_dtype(device: &Device) -> DType {
+    if device.is_cpu() {
+        DType::F32
+    } else {
+        DType::F16
+    }
+}
+
+/// A vision linear layer: weights kept in [`vision_linear_dtype`] and
+/// widened to the activation dtype for each product. The checkpoint stores
+/// the tower in F16, so widening is exact and the products match an F32
+/// tower bit for bit; only one layer's F32 weight exists at a time, while an
+/// image is encoded.
+struct VisionLinear(Linear);
+
+impl VisionLinear {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if self.0.weight().dtype() == xs.dtype() {
+            return self.0.forward(xs).map_err(Error::from);
+        }
+        let weight = self.0.weight().to_dtype(xs.dtype())?;
+        Linear::new(weight, self.0.bias().cloned())
+            .forward(xs)
+            .map_err(Error::from)
+    }
+
+    fn in_features(&self) -> Result<usize> {
+        Ok(self.0.weight().dims2()?.1)
+    }
+}
+
 fn load_linear(
     loader: &GgufLoader,
     device: &Device,
     prefix: &str,
-    dtype: Option<DType>,
-) -> Result<Linear> {
-    let weight = load_dense(loader, device, &format!("{prefix}.weight"), dtype)?;
+    dtype: DType,
+) -> Result<VisionLinear> {
+    let weight = load_dense_via_host(loader, device, &format!("{prefix}.weight"), dtype)?;
     let bias_name = format!("{prefix}.bias");
+    // Biases are small and stored F32; they stay F32.
     let bias = if loader.has_tensor(&bias_name) {
-        Some(load_dense(loader, device, &bias_name, dtype)?)
+        Some(load_dense_via_host(loader, device, &bias_name, DType::F32)?)
     } else {
         None
     };
-    Ok(Linear::new(weight, bias))
+    Ok(VisionLinear(Linear::new(weight, bias)))
+}
+
+/// A tensor converted to `dtype` on the host and uploaded at its exact size:
+/// a conversion on the device would hold the F32 expansion beside the
+/// result and round the result's buffer up to a power of two.
+fn load_dense_via_host(
+    loader: &GgufLoader,
+    device: &Device,
+    name: &str,
+    dtype: DType,
+) -> Result<Tensor> {
+    loader
+        .load_qtensor(name, &Device::Cpu)?
+        .dequantize(&Device::Cpu)?
+        .to_dtype(dtype)?
+        .to_device(device)
+        .map_err(Error::from)
 }
 
 fn load_layer_norm(

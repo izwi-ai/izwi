@@ -198,6 +198,9 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
     }
     cmd.env("RUST_LOG", &args.log_level);
     cmd.env("IZWI_LOG_FORMAT", args.log_format.as_str());
+    // macOS: libmalloc's large cache off, so a model load's freed host
+    // buffers leave the server's footprint (izwi_env::allocator).
+    izwi_env::apply_serving_allocator_env(cmd);
     cmd.env("IZWI_HOST", &args.runtime.host);
     cmd.env("IZWI_PORT", args.runtime.port.to_string());
     // IZWI_API_KEY is inherited unchanged; only the opt-out is resolved here.
@@ -732,6 +735,19 @@ mod tests {
             log_level: "info".to_string(),
             log_format: LogFormat::Text,
             dev: false,
+        }
+    }
+
+    #[test]
+    fn server_command_starts_with_the_serving_allocator() {
+        let mut cmd = Command::new("unused-server");
+
+        configure_server_command(&mut cmd, &sample_args()).unwrap();
+
+        for (name, value) in izwi_env::serving_allocator_env() {
+            if std::env::var_os(name).is_none() {
+                assert_eq!(command_env(&cmd, name).as_deref(), Some(*value));
+            }
         }
     }
 

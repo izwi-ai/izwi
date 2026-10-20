@@ -265,6 +265,54 @@ pub(super) fn validate_scratch_only_invocation_publication(
     Ok(())
 }
 
+/// How an invocation state fit shares memory with the state groups the load
+/// fits after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LaterStateGroups {
+    /// Automatic groups left to fit, this one included: each grows into an
+    /// equal share of the growth budget.
+    pub(super) remaining: u64,
+    /// What the later groups need at their minimums (a fixed workspace, or
+    /// a context axis at its floor); this fit leaves it free beside the
+    /// safety reserve.
+    pub(super) minimum_bytes: u64,
+}
+
+impl LaterStateGroups {
+    /// `remaining` groups that need nothing held back for them.
+    pub(super) const fn sharing(remaining: u64) -> Self {
+        Self {
+            remaining,
+            minimum_bytes: 0,
+        }
+    }
+}
+
+/// The bytes the invocation workspace of `descriptor` allocates, with its
+/// decoder context resolved to `decoder_context` tokens when given.
+pub(super) fn invocation_state_bytes(
+    descriptor: &CapabilityStateDescriptorV2,
+    invocation_contract: &InferenceStateContract,
+    executions: &[LoadedExecutionContract],
+    decoder_context: Option<u64>,
+) -> Result<u64> {
+    let mut candidate = descriptor.clone();
+    if let Some(tokens) = decoder_context {
+        candidate.resolve_capacity_axis(StateCapacityAxis::DecoderContext, tokens)?;
+    }
+    let overflow = || Error::ModelLoadError("invocation context byte plan overflow".into());
+    plan_invocation_allocations(&candidate, invocation_contract, executions)?
+        .into_iter()
+        .try_fold(0_u64, |total, allocation| {
+            let bytes = allocation
+                .domain
+                .maximum_bytes()?
+                .checked_mul(u64::from(allocation.slot_count))
+                .ok_or_else(overflow)?;
+            total.checked_add(bytes).ok_or_else(overflow)
+        })
+}
+
 impl ModelLifecycleController {
     /// Seal each advertised Fish route against its own adapter identity. Slow
     /// retained state is model-scoped and reused; invocation backing is per adapter.
@@ -381,7 +429,7 @@ impl ModelLifecycleController {
         descriptor: &mut CapabilityStateDescriptorV2,
         invocation_contract: &InferenceStateContract,
         executions: &[LoadedExecutionContract],
-        remaining_automatic_state_groups: u64,
+        later: LaterStateGroups,
     ) -> Result<()> {
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
@@ -431,45 +479,29 @@ impl ModelLifecycleController {
                 .publish_effective_context(variant, fallback)?;
             return Ok(());
         };
-        let (budget, growth_budget) =
-            state_fit_budgets(headroom_bytes, live_headroom, safety_reserve_bytes);
-        let automatic_budget =
-            automatic_state_group_budget(growth_budget, remaining_automatic_state_groups);
+        // Both budgets leave the later groups' minimums free beside the
+        // reserve, so this fit never takes the room a later floor needs.
+        let (budget, growth_budget) = state_fit_budgets(
+            headroom_bytes,
+            live_headroom,
+            safety_reserve_bytes.saturating_add(later.minimum_bytes),
+        );
+        let automatic_budget = automatic_state_group_budget(growth_budget, later.remaining);
         let required = |tokens: Option<u64>| -> Result<u64> {
-            let mut candidate = descriptor.clone();
-            if let Some(tokens) = tokens {
-                candidate.resolve_capacity_axis(StateCapacityAxis::DecoderContext, tokens)?;
-            }
-            plan_invocation_allocations(&candidate, invocation_contract, executions)?
-                .into_iter()
-                .try_fold(0_u64, |total, allocation| {
-                    total
-                        .checked_add(
-                            allocation
-                                .domain
-                                .maximum_bytes()?
-                                .checked_mul(u64::from(allocation.slot_count))
-                                .ok_or_else(|| {
-                                    Error::ModelLoadError(
-                                        "invocation context byte plan overflow".into(),
-                                    )
-                                })?,
-                        )
-                        .ok_or_else(|| {
-                            Error::ModelLoadError("invocation context byte plan overflow".into())
-                        })
-                })
+            invocation_state_bytes(descriptor, invocation_contract, executions, tokens)
         };
         let Some((minimum, maximum)) = axis_bounds else {
             let bytes = required(None)?;
             if bytes > budget {
                 tracing::warn!(
-                    "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                    "portable fixed invocation state does not fit: state_bytes={bytes}, later_minimum_bytes={}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}",
+                    later.minimum_bytes
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!("not enough memory for {variant}'s working state"),
-                    bytes,
-                    budget,
+                    bytes.saturating_add(later.minimum_bytes),
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             return Ok(());
@@ -487,10 +519,11 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!("not enough memory for {variant} at a {selected}-token context"),
-                    bytes,
-                    budget,
+                    bytes.saturating_add(later.minimum_bytes),
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             selected
@@ -515,12 +548,13 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 );
-                return Err(does_not_fit(capacity_shortfall_reason(
+                return Err(does_not_fit(state_shortfall_reason(
                     format_args!(
                         "not enough memory for {variant}'s minimum {minimum}-token context"
                     ),
-                    minimum_bytes,
-                    budget,
+                    minimum_bytes.saturating_add(later.minimum_bytes),
+                    headroom_bytes,
+                    safety_reserve_bytes,
                 )));
             }
             let (mut low, mut high) = (minimum, ceiling);
@@ -534,6 +568,14 @@ impl ModelLifecycleController {
             }
             low
         };
+        tracing::info!(
+            model = %variant,
+            selected_tokens = selected,
+            state_bytes = required(Some(selected))?,
+            planning_headroom = headroom_bytes,
+            safety_reserve = safety_reserve_bytes,
+            "Fitted invocation decoder context"
+        );
         descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, selected)?;
         let published = self
             .model_registry
@@ -560,7 +602,7 @@ impl ModelLifecycleController {
             invocation_contract,
             retained,
             retained_uses,
-            1,
+            LaterStateGroups::sharing(1),
         )
         .await
     }
@@ -573,7 +615,7 @@ impl ModelLifecycleController {
         invocation_contract: &InferenceStateContract,
         retained: Option<RetainedStateRuntimeV2>,
         retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
-        remaining_automatic_state_groups: u64,
+        later: LaterStateGroups,
     ) -> Result<LoadedStatePublication> {
         let variant = self
             .resident_variant_for_instance(model_instance_id)
@@ -587,7 +629,7 @@ impl ModelLifecycleController {
             &mut descriptor,
             invocation_contract,
             executions,
-            remaining_automatic_state_groups,
+            later,
         )?;
         validate_physical_publication_backing(
             &descriptor,

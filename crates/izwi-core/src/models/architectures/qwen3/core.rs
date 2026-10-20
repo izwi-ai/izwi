@@ -4,6 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
+
+use crate::models::shared::memory::exact::exact_concat_rows;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
@@ -40,6 +42,7 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
+use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RopeScalingConfig {
@@ -484,6 +487,60 @@ enum Qwen3Projection {
     Quantized(QMatMul),
 }
 
+/// The text model's token embedding: a dense table (safetensors and MLX
+/// checkpoints), or a GGUF table kept in its stored quantized form, whose
+/// gathered rows are cast to the model dtype. Dequantizing the whole GGUF
+/// table instead kept a dense copy beside the stored one (Qwen3-ASR-1.7B:
+/// 0.62 GB of F16, rounded to 1 GiB on Metal, next to a byte-identical Q8_0
+/// head).
+enum Qwen3TokenEmbedding {
+    Dense(Embedding),
+    Quantized {
+        table: QuantizedTokenTable,
+        dtype: DType,
+    },
+}
+
+impl Qwen3TokenEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(embedding) => embedding.forward(ids).map_err(Error::from),
+            Self::Quantized { table, dtype } => {
+                let rows = table.embed(ids)?;
+                if rows.dtype() == *dtype {
+                    Ok(rows)
+                } else {
+                    rows.to_dtype(*dtype).map_err(Error::from)
+                }
+            }
+        }
+    }
+
+    fn vocab_size(&self) -> Result<usize> {
+        match self {
+            Self::Dense(embedding) => Ok(embedding.embeddings().dim(0)?),
+            Self::Quantized { table, .. } => Ok(table.vocab_size()),
+        }
+    }
+
+    /// A head tied to this table, sharing its storage.
+    fn tied_head(&self) -> Result<Qwen3Projection> {
+        match self {
+            Self::Dense(embedding) => {
+                Ok(Qwen3Projection::tied_dense(embedding.embeddings().clone()))
+            }
+            Self::Quantized { table, .. } => Ok(Qwen3Projection::Quantized(table.tied_head()?)),
+        }
+    }
+
+    fn dtype(&self) -> DType {
+        match self {
+            Self::Dense(embedding) => embedding.embeddings().dtype(),
+            Self::Quantized { dtype, .. } => *dtype,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Qwen3ProjectionDiagnostics {
     pub dense_projection_count: usize,
@@ -507,8 +564,58 @@ impl Qwen3ProjectionDiagnostics {
     }
 }
 
+/// Whether MLX 4-bit weights stay quantized on `device`, repacked into Q4_1
+/// (`mlx::read_q4_1_blocks`): on Metal, whose ggml kernels take F32
+/// activations as they are. CPU and CUDA quantize the activations of a
+/// quantized matmul, so they keep the dense dequantization.
+pub(crate) fn qwen3_mlx_q4_1_enabled(device: &Device) -> bool {
+    device.is_metal()
+}
+
+/// The Q4_1 blocks of the MLX 4-bit weights `parts` (each `(prefix,
+/// out_dim)` under `vb`, an empty prefix for `vb` itself, `in_dim` wide,
+/// without a bias) stacked by rows into one quantized projection, built on
+/// the host and uploaded once; `None` when any part loads dense.
+fn qwen3_mlx_q4_1_projection(
+    vb: &VarBuilder,
+    parts: &[(&str, usize)],
+    in_dim: usize,
+) -> Result<Option<Qwen3Projection>> {
+    if !qwen3_mlx_q4_1_enabled(vb.device()) {
+        return Ok(None);
+    }
+    let mut blocks = Vec::new();
+    let mut rows = 0;
+    for &(prefix, out_dim) in parts {
+        let part = if prefix.is_empty() {
+            vb.clone()
+        } else {
+            vb.pp(prefix)
+        };
+        if part.contains_tensor("bias") {
+            return Ok(None);
+        }
+        let Some(part_blocks) = mlx::read_q4_1_blocks(&part, out_dim, in_dim)? else {
+            return Ok(None);
+        };
+        blocks.extend_from_slice(&part_blocks);
+        rows += out_dim;
+    }
+    // Free the packed words and parameters just read back before the upload:
+    // Candle hands a pooled buffer to the next allocation it fits, so the
+    // resident blocks would otherwise keep a larger released read buffer
+    // (11 MiB over the 4-bit aligner).
+    vb.device().synchronize()?;
+    let qtensor =
+        ggml_file::qtensor_from_ggml(GgmlDType::Q4_1, &blocks, vec![rows, in_dim], vb.device())?;
+    Qwen3Projection::from_qtensor(qtensor).map(Some)
+}
+
 impl Qwen3Projection {
     fn dense(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        if let Some(quantized) = qwen3_mlx_q4_1_projection(&vb, &[("", out_dim)], in_dim)? {
+            return Ok(quantized);
+        }
         let has_bias = vb.contains_tensor("bias");
         let linear = if has_bias {
             mlx::load_linear(in_dim, out_dim, vb)
@@ -786,7 +893,9 @@ impl Qwen3FusedQkvProjection {
                 "Qwen3 fused QKV projection input dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
+        // Joined at its exact size: `Tensor::cat` rounds the joined weight up
+        // to a power of two on Metal.
+        let weight = exact_concat_rows(&[q_weight, k_weight, v_weight])?;
         let bias = concat_linear_biases(
             "Qwen3 fused QKV projection",
             &[&q_proj.linear, &k_proj.linear, &v_proj.linear],
@@ -977,7 +1086,7 @@ impl Qwen3FusedGateUpProjection {
                 "Qwen3 fused MLP projection dimensions do not match".to_string(),
             ));
         }
-        let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
+        let weight = exact_concat_rows(&[gate_weight, up_weight])?;
         let bias = concat_linear_biases(
             "Qwen3 fused MLP projection",
             &[&gate_proj.linear, &up_proj.linear],
@@ -1198,15 +1307,38 @@ impl Qwen3Attention {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let geometry = cfg.attention_geometry()?;
         let head_dim = geometry.key_head_dim();
-        let q_proj =
-            Qwen3Projection::dense(cfg.hidden_size, geometry.query_width(), vb.pp("q_proj"))?;
-        let k_proj =
-            Qwen3Projection::dense(cfg.hidden_size, geometry.key_width(), vb.pp("k_proj"))?;
-        let v_proj =
-            Qwen3Projection::dense(cfg.hidden_size, geometry.value_width(), vb.pp("v_proj"))?;
-        let o_proj =
-            Qwen3Projection::dense(geometry.query_width(), cfg.hidden_size, vb.pp("o_proj"))?;
-        let qkv_proj = Qwen3QkvProjection::new_dense(q_proj, k_proj, v_proj, vb.device())?;
+        let (q_out, k_out, v_out) = (
+            geometry.query_width(),
+            geometry.key_width(),
+            geometry.value_width(),
+        );
+        let grouped =
+            qwen3_quantized_projection_grouping_for_hidden_size(vb.device(), cfg.hidden_size)
+                .then(|| {
+                    qwen3_mlx_q4_1_projection(
+                        &vb,
+                        &[("q_proj", q_out), ("k_proj", k_out), ("v_proj", v_out)],
+                        cfg.hidden_size,
+                    )
+                })
+                .transpose()?
+                .flatten();
+        let qkv_proj = match grouped {
+            // MLX 4-bit Q/K/V stacked as one Q4_1 projection.
+            Some(fused) => Qwen3QkvProjection::FusedQuantized(Qwen3FusedQuantizedQkvProjection {
+                fused,
+                q_out,
+                k_out,
+                v_out,
+            }),
+            None => {
+                let q_proj = Qwen3Projection::dense(cfg.hidden_size, q_out, vb.pp("q_proj"))?;
+                let k_proj = Qwen3Projection::dense(cfg.hidden_size, k_out, vb.pp("k_proj"))?;
+                let v_proj = Qwen3Projection::dense(cfg.hidden_size, v_out, vb.pp("v_proj"))?;
+                Qwen3QkvProjection::new_dense(q_proj, k_proj, v_proj, vb.device())?
+            }
+        };
+        let o_proj = Qwen3Projection::dense(q_out, cfg.hidden_size, vb.pp("o_proj"))?;
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
         let k_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm")).ok();
@@ -1759,13 +1891,44 @@ struct Qwen3Mlp {
 
 impl Qwen3Mlp {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj =
-            Qwen3Projection::dense(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj =
-            Qwen3Projection::dense(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
+        let grouped =
+            qwen3_quantized_projection_grouping_for_hidden_size(vb.device(), cfg.hidden_size)
+                .then(|| {
+                    qwen3_mlx_q4_1_projection(
+                        &vb,
+                        &[
+                            ("gate_proj", cfg.intermediate_size),
+                            ("up_proj", cfg.intermediate_size),
+                        ],
+                        cfg.hidden_size,
+                    )
+                })
+                .transpose()?
+                .flatten();
+        let gate_up_proj = match grouped {
+            // MLX 4-bit gate/up stacked as one Q4_1 projection.
+            Some(fused) => {
+                Qwen3GateUpProjection::FusedQuantized(Qwen3FusedQuantizedGateUpProjection {
+                    fused,
+                    intermediate_size: cfg.intermediate_size,
+                })
+            }
+            None => {
+                let gate_proj = Qwen3Projection::dense(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    vb.pp("gate_proj"),
+                )?;
+                let up_proj = Qwen3Projection::dense(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    vb.pp("up_proj"),
+                )?;
+                Qwen3GateUpProjection::new_dense(gate_proj, up_proj, vb.device())?
+            }
+        };
         let down_proj =
             Qwen3Projection::dense(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
-        let gate_up_proj = Qwen3GateUpProjection::new_dense(gate_proj, up_proj, vb.device())?;
         Ok(Self {
             gate_up_proj,
             down_proj,
@@ -2208,7 +2371,7 @@ impl Qwen3Layer {
 }
 
 pub struct Qwen3Model {
-    embed_tokens: Embedding,
+    embed_tokens: Qwen3TokenEmbedding,
     layers: Vec<Qwen3Layer>,
     norm: RmsNorm,
     lm_head: Qwen3Projection,
@@ -2301,14 +2464,30 @@ impl Qwen3Model {
     ) -> Result<Self> {
         cfg.attention_geometry()?;
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
-        let embed_tokens = mlx::load_embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            vb.pp(qwen3_join_prefix(layout.model_prefix, "embed_tokens")),
-        )?;
+        let embed_vb = vb.pp(qwen3_join_prefix(layout.model_prefix, "embed_tokens"));
+        // An MLX 4-bit table stays quantized where its projections do: rows
+        // are gathered from the Q4_1 blocks and cast to the model dtype,
+        // exactly the dense table's rows.
+        let embed_tokens =
+            match qwen3_mlx_q4_1_projection(&embed_vb, &[("", cfg.vocab_size)], cfg.hidden_size)? {
+                Some(Qwen3Projection::Quantized(QMatMul::QTensor(table))) => {
+                    Qwen3TokenEmbedding::Quantized {
+                        table: QuantizedTokenTable::from_arc(table)?,
+                        dtype: vb.dtype(),
+                    }
+                }
+                _ => Qwen3TokenEmbedding::Dense(mlx::load_embedding(
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                    embed_vb,
+                )?),
+            };
+        // A tied head is the token table, even where the checkpoint also
+        // stores a copy (Qwen/Qwen3-0.6B and -1.7B do): the copy is unread.
+        let tied = cfg.tie_word_embeddings && lm_head_size == cfg.vocab_size;
         let lm_head = if let Some(lm_head_prefix) = layout.lm_head_prefix {
             let lm_head_weight = qwen3_join_prefix(lm_head_prefix, "weight");
-            if vb.contains_tensor(&lm_head_weight) {
+            if vb.contains_tensor(&lm_head_weight) && !tied {
                 Qwen3Projection::dense(cfg.hidden_size, lm_head_size, vb.pp(lm_head_prefix))?
             } else {
                 if lm_head_size != cfg.vocab_size {
@@ -2317,7 +2496,7 @@ impl Qwen3Model {
                         cfg.vocab_size, lm_head_weight
                     )));
                 }
-                Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
+                embed_tokens.tied_head()?
             }
         } else {
             if lm_head_size != cfg.vocab_size {
@@ -2326,7 +2505,7 @@ impl Qwen3Model {
                     cfg.vocab_size
                 )));
             }
-            Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
+            embed_tokens.tied_head()?
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
@@ -2375,22 +2554,30 @@ impl Qwen3Model {
         let model_prefix = qwen3_join_prefix(prefix, "model");
         let embed_name = qwen3_join_prefix(&model_prefix, "embed_tokens.weight");
         let embed_name = qwen3_gguf_tensor_name(loader, &embed_name).unwrap_or(embed_name);
-        let embed_tokens = Embedding::new(
-            loader.load_tensor(&embed_name, dtype, device)?,
-            cfg.hidden_size,
-        );
+        let table = QuantizedTokenTable::new(loader.load_qtensor(&embed_name, device)?)?;
+        if table.hidden_size() != cfg.hidden_size {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3 token embedding width {} differs from hidden_size {}",
+                table.hidden_size(),
+                cfg.hidden_size
+            )));
+        }
         let lm_head_name = qwen3_join_prefix(prefix, "lm_head.weight");
-        let lm_head = if qwen3_gguf_tensor_name(loader, &lm_head_name).is_some() {
+        let stored_head = qwen3_gguf_tensor_name(loader, &lm_head_name).is_some();
+        let lm_head = if stored_head && !cfg.tie_word_embeddings {
             Qwen3Projection::quantized(loader, device, &lm_head_name)?
         } else {
             if lm_head_size != cfg.vocab_size {
                 return Err(Error::InvalidInput(format!(
-                    "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but lm_head.weight is missing",
+                    "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but the head is tied to the embedding",
                     cfg.vocab_size
                 )));
             }
-            Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
+            // A tied head (a stored copy of the table, as Qwen3-ASR
+            // checkpoints carry, is not read) shares the token table.
+            Qwen3Projection::Quantized(table.tied_head()?)
         };
+        let embed_tokens = Qwen3TokenEmbedding::Quantized { table, dtype };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
             let layer_prefix = qwen3_join_prefix(&model_prefix, &format!("layers.{idx}"));
@@ -2791,7 +2978,7 @@ impl Qwen3Model {
     }
 
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.embed_tokens.forward(input_ids).map_err(Error::from)
+        self.embed_tokens.forward(input_ids)
     }
 
     /// A load-time numeric probe: `tokens` xorshift-chosen token ids
@@ -2802,12 +2989,12 @@ impl Qwen3Model {
         tokens: usize,
         seed: u64,
     ) -> Result<Vec<(String, Tensor)>> {
-        let vocab = self.embed_tokens.embeddings().dim(0)?.max(1);
+        let vocab = self.embed_tokens.vocab_size()?.max(1);
         let ids = crate::kernels::numeric_check::xorshift_values(tokens, seed, 1.0)
             .into_iter()
             .map(|unit| (((unit + 1.0) * 0.5 * vocab as f32) as usize).min(vocab - 1) as u32)
             .collect::<Vec<_>>();
-        let device = self.embed_tokens.embeddings().device().clone();
+        let device = self.device.clone();
         let ids = Tensor::from_vec(ids, (1, tokens), &device)?;
         let logits = self.forward_stateless_with_embeds(&self.embeddings(&ids)?, 0, None)?;
         Ok(vec![("logits".to_string(), logits)])
@@ -3277,9 +3464,15 @@ pub(crate) fn tiny_qwen3_model_for_test(device: &Device) -> Qwen3Model {
 #[cfg(test)]
 pub(crate) fn tiny_non_finite_qwen3_model_for_test(device: &Device) -> Qwen3Model {
     let mut model = tests::tiny_qwen3_model(device);
-    let shape = model.embed_tokens.embeddings().shape().clone();
+    let shape = (
+        model.embed_tokens.vocab_size().unwrap(),
+        model.cfg.hidden_size,
+    );
     let hidden = model.cfg.hidden_size;
-    model.embed_tokens = Embedding::new(Tensor::full(f32::NAN, shape, device).unwrap(), hidden);
+    model.embed_tokens = Qwen3TokenEmbedding::Dense(Embedding::new(
+        Tensor::full(f32::NAN, shape, device).unwrap(),
+        hidden,
+    ));
     model
 }
 
@@ -3544,10 +3737,10 @@ mod tests {
             }),
         };
         Qwen3Model {
-            embed_tokens: Embedding::new(
+            embed_tokens: Qwen3TokenEmbedding::Dense(Embedding::new(
                 Tensor::from_vec(embeddings, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
                 cfg.hidden_size,
-            ),
+            )),
             layers: vec![layer],
             norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
             lm_head: test_projection(cfg.vocab_size, cfg.hidden_size, 8, device),
@@ -3928,10 +4121,10 @@ mod tests {
             mlp: Qwen3FeedForward::Sparse(sparse),
         };
         Qwen3Model {
-            embed_tokens: Embedding::new(
+            embed_tokens: Qwen3TokenEmbedding::Dense(Embedding::new(
                 Tensor::from_vec(embeddings, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
                 cfg.hidden_size,
-            ),
+            )),
             layers: vec![layer],
             norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
             lm_head: test_projection(cfg.vocab_size, cfg.hidden_size, 8, device),

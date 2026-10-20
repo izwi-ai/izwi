@@ -28,6 +28,7 @@ use crate::kv::v2::{
     StateComponentId, StateUpdateKind,
 };
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::exact::exact_zeros;
 use crate::models::shared::weights::mlx;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -48,6 +49,11 @@ const SUBSAMPLING_FACTOR: usize = 8;
 /// subsampler keeps before its next output: the 14-frame causal receptive
 /// field spans two.
 const SUBSAMPLING_CARRY_CELLS: usize = 2;
+/// Output frames the offline subsampling stem computes per slice (9.6 s): a
+/// slice and its carry read 976 feature frames, so its first convolution's
+/// output (`[256, 489, 65]` at F32, 31 MiB) fits one 32 MiB Metal pool
+/// buffer.
+const SUBSAMPLING_SLICE_FRAMES: usize = 120;
 const N_FFT: usize = 512;
 const WIN_LENGTH: usize = 400;
 const HOP_LENGTH: usize = 160;
@@ -2437,13 +2443,59 @@ impl ConvSubsamplingDw {
         })
     }
 
+    /// The stem over the first `feature_frames` frames of `features`
+    /// (`[B, MELS, T]`), `SUBSAMPLING_SLICE_FRAMES` output frames at a time:
+    /// its first convolution's output alone is `[256, T/2, 65]` at F32,
+    /// 0.1 GB over a 30 s chunk, and Metal held three such buffers. Output
+    /// frame `t` reads feature frames `8t - 14..=8t`, so a slice that starts
+    /// `SUBSAMPLING_CARRY_CELLS` stride cells early computes its own frames
+    /// exactly as the whole sequence does (the streaming subsampler relies
+    /// on the same carry); the zero padding at a slice's inner edges reaches
+    /// no kept frame. Each slice's frames are copied into an exact-size
+    /// output and the slice dropped, so no finished slice pins a pooled
+    /// buffer while the next one runs.
+    fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
+        let outputs = subsampled_len_3x(feature_frames);
+        if outputs <= SUBSAMPLING_SLICE_FRAMES {
+            return self.forward_whole(features, feature_frames);
+        }
+        let mut stitched: Option<Tensor> = None;
+        let mut first = 0;
+        while first < outputs {
+            let last = (first + SUBSAMPLING_SLICE_FRAMES).min(outputs);
+            let read_first = first.saturating_sub(SUBSAMPLING_CARRY_CELLS);
+            let input_first = read_first * SUBSAMPLING_FACTOR;
+            let input_last = (last * SUBSAMPLING_FACTOR).min(feature_frames);
+            let frames = input_last - input_first;
+            let (slice, _) =
+                self.forward_whole(&features.narrow(2, input_first, frames)?, frames)?;
+            let kept = slice
+                .narrow(1, first - read_first, last - first)?
+                .contiguous()?;
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => exact_zeros(
+                    (kept.dim(0)?, outputs, kept.dim(2)?),
+                    kept.dtype(),
+                    kept.device(),
+                )?,
+            };
+            output.slice_set(&kept, 1, first)?;
+            stitched = Some(output);
+            first = last;
+        }
+        let stitched = stitched
+            .ok_or_else(|| Error::InferenceError("Nemotron stem produced no slices".into()))?;
+        Ok((stitched, outputs))
+    }
+
     /// NeMo `ConvSubsampling(dw_striding, is_causal=True)`: every stride-2
     /// convolution is a `CausalConv2D` that pads (2, 1) on time and
     /// frequency, and `MaskedConvSequential` zeroes each stage past its valid
     /// length. Only the `feature_frames` valid input frames are convolved, so
     /// that zeroing is the causal right pad and every stage keeps exactly
     /// `len / 2 + 1` frames (128 -> 65 -> 33 -> 17 frequency bins).
-    fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
+    fn forward_whole(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
         let features = if features.dim(2)? > feature_frames {
             features.narrow(2, 0, feature_frames)?
         } else {
@@ -2612,6 +2664,26 @@ fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
         None
     };
     Ok((Linear::new(ws, bias), in_dim / CONV_SUB_CHANNELS))
+}
+
+/// The offline stem's live set over one pass of `feature_frames` valid
+/// frames: three `[256, T/2 + 1, 65]` F32 copies of one slice's first
+/// convolution output (its result, bias add and ReLU were all held on
+/// Metal), where `T` is the feature frames one slice and its carry read.
+pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
+    const STEM_PLANES: usize = 3;
+    let slice_frames = feature_frames
+        .min((SUBSAMPLING_SLICE_FRAMES + SUBSAMPLING_CARRY_CELLS) * SUBSAMPLING_FACTOR);
+    [
+        CONV_SUB_CHANNELS,
+        causal_stride2_len(slice_frames),
+        causal_stride2_len(N_MELS),
+        std::mem::size_of::<f32>(),
+    ]
+    .into_iter()
+    .try_fold(STEM_PLANES, usize::checked_mul)
+    .and_then(|bytes| u64::try_from(bytes).ok())
+    .ok_or_else(|| Error::Overloaded("Nemotron stem bytes overflowed".into()))
 }
 
 fn causal_stride2_conv_config() -> Conv2dConfig {
@@ -4455,6 +4527,43 @@ mod tests {
             );
         }
         eprintln!("causal pre_encode max abs diff vs NeMo {worst:.2e}");
+    }
+
+    /// The subsampling stem run by slices returns the frames of the
+    /// whole-sequence stem, for lengths that leave a short last slice, with
+    /// frames past the valid length that must stay hidden. A slice changes
+    /// only how many rows each matrix product runs over, so the frames agree
+    /// within F32 rounding: the CPU product blocks its sums by problem size,
+    /// instruction set and thread count.
+    #[test]
+    fn sliced_subsampling_matches_the_whole_sequence() {
+        let subsampling = hashed_subsampling();
+        for valid in [8 * SUBSAMPLING_SLICE_FRAMES * 2 + 3, 2_405] {
+            let features = hashed_tensor(valid as u32, (1, N_MELS, valid + 5), 2.0);
+            let (whole, whole_len) = subsampling.forward_whole(&features, valid).unwrap();
+            let (sliced, sliced_len) = subsampling.forward(&features, valid).unwrap();
+            assert_eq!(sliced_len, whole_len, "{valid}");
+            assert_eq!(sliced.dims(), whole.dims(), "{valid}");
+            let scale = whole
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let difference = (sliced - whole)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                difference <= scale * 1e-6,
+                "{valid}: {difference} of {scale}"
+            );
+        }
     }
 
     fn visible_keys(mask: &Tensor) -> Vec<Vec<bool>> {

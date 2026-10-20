@@ -541,10 +541,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(live, 0, "a claim that lands after its timeout is released");
-        assert!(
-            coordinator.claim(&key, 4).await.is_some(),
-            "claims resume once the store answers"
-        );
+        // Claims resume at the production timeout, but the first write after
+        // the hang can outlast 100 ms on a loaded CI runner (see
+        // `TEST_FLEET_CLAIM_TIMEOUT`): retry within the patient test budget.
+        // An attempt that gives up releases its claim when it lands.
+        let deadline = std::time::Instant::now() + TEST_FLEET_CLAIM_TIMEOUT;
+        let mut resumed = None;
+        while resumed.is_none() && std::time::Instant::now() < deadline {
+            resumed = coordinator.claim(&key, 4).await;
+        }
+        assert!(resumed.is_some(), "claims resume once the store answers");
     }
 
     #[tokio::test]

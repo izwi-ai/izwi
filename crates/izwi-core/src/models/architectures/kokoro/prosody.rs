@@ -1221,35 +1221,46 @@ pub(crate) struct BiLstm1 {
 }
 
 impl BiLstm1 {
+    /// Joins both directions on the host and uploads each joined weight at
+    /// its exact size: joined on the device, they came from Candle's pool
+    /// rounded up to a power of two, and the per-direction uploads stayed
+    /// held until the next synchronization (the predictor's LSTMs held
+    /// 90 MiB beyond their 62 MiB of weights).
     pub(crate) fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
         let gates = 4 * hidden_dim;
+        let host = vb.clone().set_device(candle_core::Device::Cpu);
         let mut w_ih_t = Vec::with_capacity(2);
         let mut w_hh_t = Vec::with_capacity(2);
         let mut bias = Vec::with_capacity(2);
         for suffix in ["", "_reverse"] {
-            let w_ih = vb
+            let w_ih = host
                 .get((gates, input_dim), &format!("weight_ih_l0{suffix}"))
                 .map_err(Error::from)?;
-            let w_hh = vb
+            let w_hh = host
                 .get((gates, hidden_dim), &format!("weight_hh_l0{suffix}"))
                 .map_err(Error::from)?;
-            let b_ih = vb
+            let b_ih = host
                 .get(gates, &format!("bias_ih_l0{suffix}"))
                 .map_err(Error::from)?;
-            let b_hh = vb
+            let b_hh = host
                 .get(gates, &format!("bias_hh_l0{suffix}"))
                 .map_err(Error::from)?;
             w_ih_t.push(w_ih.t().map_err(Error::from)?);
             w_hh_t.push(w_hh.t().map_err(Error::from)?);
             bias.push((b_ih + b_hh).map_err(Error::from)?);
         }
+        let device = vb.device();
         Ok(Self {
             w_ih_t: Tensor::cat(&w_ih_t, 1)
                 .and_then(|w| w.contiguous())
+                .and_then(|w| w.to_device(device))
                 .map_err(Error::from)?,
-            bias: Tensor::cat(&bias, 0).map_err(Error::from)?,
+            bias: Tensor::cat(&bias, 0)
+                .and_then(|b| b.to_device(device))
+                .map_err(Error::from)?,
             w_hh_t: Tensor::stack(&w_hh_t, 0)
                 .and_then(|w| w.contiguous())
+                .and_then(|w| w.to_device(device))
                 .map_err(Error::from)?,
             hidden_dim,
         })
@@ -1401,13 +1412,25 @@ pub(crate) fn load_plain_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Con
     Ok(Conv1d::new(w, b, cfg))
 }
 
-pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
-    let wv = vb
+/// A weight-normalized kernel, `g * v / ||v||`, fused on the host from the
+/// checkpoint's `weight_v` and `weight_g` and uploaded once at its exact size.
+/// Fused on the device, each kernel landed in a power-of-two buffer and its
+/// operands beside it (Kokoro held 0.2 GB over its plan on Metal).
+fn load_weight_norm(vb: &VarBuilder) -> Result<Tensor> {
+    let host = vb.clone().set_device(candle_core::Device::Cpu);
+    let wv = host
         .get_unchecked_dtype("weight_v", DType::F32)
         .map_err(Error::from)?;
-    let wg = vb
+    let wg = host
         .get_unchecked_dtype("weight_g", DType::F32)
         .map_err(Error::from)?;
+    fuse_weight_norm_dim0(&wv, &wg)?
+        .contiguous()?
+        .to_device(vb.device())
+        .map_err(Error::from)
+}
+
+pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
     let b = if vb.contains_tensor("bias") {
         Some(
             vb.get_unchecked_dtype("bias", DType::F32)
@@ -1416,31 +1439,17 @@ pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Resu
     } else {
         None
     };
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(Conv1d::new(w, b, cfg))
+    Ok(Conv1d::new(load_weight_norm(&vb)?, b, cfg))
 }
 
 pub(crate) fn load_weight_norm_conv1d_no_bias(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
-    let wv = vb
-        .get_unchecked_dtype("weight_v", DType::F32)
-        .map_err(Error::from)?;
-    let wg = vb
-        .get_unchecked_dtype("weight_g", DType::F32)
-        .map_err(Error::from)?;
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(Conv1d::new(w, None, cfg))
+    Ok(Conv1d::new(load_weight_norm(&vb)?, None, cfg))
 }
 
 pub(crate) fn load_weight_norm_conv_transpose1d(
     vb: VarBuilder,
     cfg: ConvTranspose1dConfig,
 ) -> Result<ConvTranspose1d> {
-    let wv = vb
-        .get_unchecked_dtype("weight_v", DType::F32)
-        .map_err(Error::from)?;
-    let wg = vb
-        .get_unchecked_dtype("weight_g", DType::F32)
-        .map_err(Error::from)?;
     let b = if vb.contains_tensor("bias") {
         Some(
             vb.get_unchecked_dtype("bias", DType::F32)
@@ -1449,8 +1458,7 @@ pub(crate) fn load_weight_norm_conv_transpose1d(
     } else {
         None
     };
-    let w = fuse_weight_norm_dim0(&wv, &wg)?;
-    Ok(ConvTranspose1d::new(w, b, cfg))
+    Ok(ConvTranspose1d::new(load_weight_norm(&vb)?, b, cfg))
 }
 
 pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Result<Tensor> {

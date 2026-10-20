@@ -101,6 +101,53 @@ pub(super) fn admit_asr_request_floor(
     Ok(authorization)
 }
 
+/// What a CPU or Metal load must find free before its weights load: its
+/// load peak, or its residents beside the request envelope its load holds
+/// (`envelope_bytes`) and the state its fits keep after the weights
+/// (`state_floor_bytes`), whichever is larger. The state fits refuse a load
+/// whose weights leave less, so admission refuses it, or evicts for it,
+/// before 20 s of weight loading instead of after.
+pub(super) fn portable_preload_bytes(
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    load_peak_bytes: u64,
+    envelope_bytes: u64,
+    state_floor_bytes: u64,
+) -> Result<u64> {
+    let ResourceAmount::Known(resident) = load_domain_bytes(plan.resident_authorization, backend)
+    else {
+        return Ok(load_peak_bytes);
+    };
+    let beside = [envelope_bytes, state_floor_bytes]
+        .into_iter()
+        .try_fold(resident, u64::checked_add)
+        .ok_or_else(|| Error::ModelLoadError("portable state floor overflow".into()))?;
+    Ok(load_peak_bytes.max(beside))
+}
+
+/// The load authorization admission checks for `variant`: the plan's, with
+/// an ASR model's per-slot request floor folded in ([`admit_asr_request_floor`]).
+pub(super) fn load_authorization_with_request_floor(
+    variant: ModelVariant,
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    request_slots: usize,
+) -> Result<ResourceVector> {
+    if !asr_memory::is_asr_variant(variant) {
+        return Ok(plan.load_authorization);
+    }
+    let Some(envelope) =
+        super::super::asr_envelope::deferred_request_envelope(variant, backend, request_slots)?
+    else {
+        return Ok(plan.load_authorization);
+    };
+    let floor_bytes = match backend {
+        BackendKind::Cuda => envelope.accelerator_bytes,
+        BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+    };
+    admit_asr_request_floor(plan, backend, floor_bytes)
+}
+
 /// A request envelope in `backend`'s ledger domains: host and accelerator
 /// share one memory on CPU and Metal; CUDA splits them.
 pub(super) fn request_envelope_resources(
@@ -141,6 +188,163 @@ pub(super) fn request_envelope_shortfall(
         need,
         available_bytes,
     )))
+}
+
+/// What a portable load must find free before it starts: `required_bytes`,
+/// plus its host staging under `IZWI_METAL_LOAD_ADMISSION=strict`, which
+/// gates on host memory too.
+pub(super) fn gated_load_bytes(
+    admission: crate::engine::MetalLoadAdmission,
+    required_bytes: u64,
+    host_staging_bytes: u64,
+) -> u64 {
+    if admission == crate::engine::MetalLoadAdmission::Strict {
+        required_bytes.saturating_add(host_staging_bytes)
+    } else {
+        required_bytes
+    }
+}
+
+/// Why a load cannot start once nothing more can be evicted for it, in the
+/// terms a client can act on: what it needs, what is free, and the one thing
+/// that would make room (unloading named models only when that would cover
+/// the gap; otherwise what is actually short).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LoadShortfall {
+    pub(super) backend: BackendKind,
+    pub(super) admission: crate::engine::MetalLoadAdmission,
+    pub(super) required_bytes: u64,
+    /// Ledger headroom: the memory budget less every reservation.
+    pub(super) ledger_headroom: u64,
+    /// The memory budget the ledger is held to.
+    pub(super) ledger_ceiling: Option<u64>,
+    /// The live sample's headroom (the GPU working set; host memory too
+    /// under `strict`), when the backend has one.
+    pub(super) live_headroom: Option<u64>,
+    /// Bytes the resident models and their state hold.
+    pub(super) held_by_residents: u64,
+    /// Residents the load may not evict: loaded explicitly (pinned) or
+    /// serving a request.
+    pub(super) unevictable: Vec<ModelVariant>,
+    /// What of `required_bytes` is the state the load's fits keep free once
+    /// the weights are resident (its safety reserve and minimum state).
+    pub(super) state_floor_bytes: u64,
+}
+
+impl LoadShortfall {
+    fn available(&self) -> u64 {
+        self.live_headroom
+            .map_or(self.ledger_headroom, |live| live.min(self.ledger_headroom))
+    }
+
+    pub(super) fn message(&self, variant: ModelVariant) -> String {
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        let available = self.available();
+        let mut message = capacity_shortfall_reason(
+            format_args!("Cannot load {variant}"),
+            self.required_bytes,
+            available,
+        );
+        if self.state_floor_bytes > 0 {
+            message.push_str(&format!(
+                " (of which {:.2} GB is the state and safety reserve the model needs beside \
+                 its weights)",
+                gb(self.state_floor_bytes)
+            ));
+        }
+        let freeable = available.saturating_add(self.held_by_residents);
+        let live_binds = self
+            .live_headroom
+            .is_some_and(|live| live < self.ledger_headroom);
+        if !self.unevictable.is_empty() && self.required_bytes <= freeable {
+            message.push_str("; ");
+            message.push_str(&unload_advice(
+                &self.unevictable,
+                Some(self.held_by_residents),
+            ));
+        } else if live_binds && self.backend == BackendKind::Metal {
+            if self.admission == crate::engine::MetalLoadAdmission::Strict {
+                message.push_str(
+                    "; macOS reports less memory available because other apps are using it \
+                     (IZWI_METAL_LOAD_ADMISSION=strict): close some, or set it to advisory to \
+                     let macOS page them out",
+                );
+            } else {
+                message.push_str(
+                    "; that is all the GPU working set (this Mac's limit for GPU memory) has \
+                     free",
+                );
+            }
+        } else if let Some(ceiling) = self
+            .ledger_ceiling
+            .filter(|ceiling| self.required_bytes > *ceiling)
+        {
+            message.push_str(&format!(
+                "; the model is larger than the {:.2} GB memory budget ({})",
+                gb(ceiling),
+                match self.backend {
+                    BackendKind::Cpu => "IZWI_CPU_MEMORY_BUDGET_BYTES",
+                    BackendKind::Metal => {
+                        "IZWI_METAL_MEMORY_BUDGET_BYTES, by default 90% of the GPU working set"
+                    }
+                    BackendKind::Cuda => "IZWI_CUDA_MEMORY_BUDGET_BYTES",
+                },
+            ));
+        } else {
+            message.push_str(
+                "; the memory budget is held by running requests and model state: retry when \
+                 they finish",
+            );
+        }
+        message
+    }
+}
+
+/// The residents a load of `requested` may not evict: loaded explicitly
+/// (pinned) or serving a request.
+pub(super) fn unevictable_residents(
+    residents: &[ModelVariant],
+    requested: ModelVariant,
+    active: &HashSet<ModelVariant>,
+    pinned: &HashSet<ModelVariant>,
+) -> Vec<ModelVariant> {
+    let mut unevictable: Vec<ModelVariant> = residents
+        .iter()
+        .copied()
+        .filter(|variant| {
+            *variant != requested && (active.contains(variant) || pinned.contains(variant))
+        })
+        .collect();
+    unevictable.sort_by_key(ToString::to_string);
+    unevictable
+}
+
+/// "X is loaded explicitly or serving requests (and holds N GB): unload it to
+/// make room", for the residents a load may not evict.
+fn unload_advice(unevictable: &[ModelVariant], held_bytes: Option<u64>) -> String {
+    let one = unevictable.len() == 1;
+    let held = held_bytes.map_or(String::new(), |bytes| {
+        format!(
+            " and {} {:.2} GB",
+            if one { "holds" } else { "hold" },
+            bytes as f64 / 1e9
+        )
+    });
+    format!(
+        "{} {} loaded explicitly or serving requests{held}: unload {} to make room",
+        join_variants(unevictable),
+        if one { "is" } else { "are" },
+        if one { "it" } else { "one of them" },
+    )
+}
+
+fn join_variants(variants: &[ModelVariant]) -> String {
+    let names: Vec<String> = variants.iter().map(ToString::to_string).collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Fixed part of the observed-materialization tolerance. Candle's Metal pool
@@ -185,6 +389,50 @@ pub(super) fn reconcile_observed_growth(
         )));
     }
     Ok(observed_growth)
+}
+
+/// The resource plan load admission prices for `variant` at `model_path` on
+/// `backend` (`device` is that backend's device). The lifecycle and the Metal
+/// footprint harness both price through this one function.
+pub(super) fn admission_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+    device: &crate::backends::DeviceProfile,
+    performance: &crate::performance::PerformanceConfig,
+    granite_speech: &crate::config::GraniteSpeechOptions,
+) -> Result<ModelResourcePlan> {
+    if variant == ModelVariant::Qwen3827BFp8 {
+        if backend != BackendKind::Cuda
+            && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+        {
+            // Fixture load (benchmark/CI): price the actual checkpoint
+            // instead of the pinned 27B constants.
+            let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
+            return Ok(model_resource_plan(backend, estimate));
+        }
+        // Every backend prices the checkpoint under the residency policy
+        // the loader resolves (CUDA runs its cached device gates here).
+        return qwen38_memory::resource_plan(model_path, &device.device, performance);
+    }
+    if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
+        if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
+            // Fixture load (benchmark/CI): price the actual checkpoint
+            // instead of the pinned 35B constants.
+            let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
+            return Ok(model_resource_plan(backend, estimate));
+        }
+        return qwen36moe_memory::resource_plan(backend, performance);
+    }
+    if let Some(plan) = checkpoint_resource_plan(variant, model_path, device, granite_speech)? {
+        return Ok(plan);
+    }
+    let estimate = if backend == BackendKind::Cuda {
+        model_memory_estimate(variant)
+    } else {
+        portable_model_memory_estimate(backend, variant, model_path)?
+    };
+    Ok(model_resource_plan(backend, estimate))
 }
 
 impl ModelLifecycleController {
@@ -232,8 +480,19 @@ impl ModelLifecycleController {
                 &pinned_variants,
                 &last_used,
             ) else {
+                let unevictable = unevictable_residents(
+                    &resident_variants,
+                    requested_variant,
+                    &active_variants,
+                    &pinned_variants,
+                );
+                let advice = if unevictable.is_empty() {
+                    "the other models are still loading: retry when they finish".to_string()
+                } else {
+                    unload_advice(&unevictable, None)
+                };
                 return Err(Error::Overloaded(format!(
-                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and available for eviction; unload a model to make room"
+                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget (IZWI_MAX_LOADED_MODELS) is full and {advice}"
                 )));
             };
 
@@ -252,47 +511,15 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         model_path: &Path,
     ) -> Result<ModelResourcePlan> {
-        let backend = self.backend_router.context().backend_kind;
-        if variant == ModelVariant::Qwen3827BFp8 {
-            if backend != BackendKind::Cuda
-                && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
-            {
-                // Fixture load (benchmark/CI): price the actual checkpoint
-                // instead of the pinned 27B constants.
-                let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
-                return Ok(model_resource_plan(backend, estimate));
-            }
-            // Every backend prices the checkpoint under the residency policy
-            // the loader resolves (CUDA runs its cached device gates here).
-            return qwen38_memory::resource_plan(
-                model_path,
-                &self.backend_router.context().device.device,
-                &self.config.performance,
-            );
-        }
-        if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
-            if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
-                // Fixture load (benchmark/CI): price the actual checkpoint
-                // instead of the pinned 35B constants.
-                let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
-                return Ok(model_resource_plan(backend, estimate));
-            }
-            return qwen36moe_memory::resource_plan(backend, &self.config.performance);
-        }
-        if let Some(plan) = checkpoint_resource_plan(
+        let context = self.backend_router.context();
+        admission_resource_plan(
             variant,
             model_path,
-            &self.backend_router.context().device,
+            context.backend_kind,
+            &context.device,
+            &self.config.performance,
             &self.config.granite_speech,
-        )? {
-            return Ok(plan);
-        }
-        let estimate = if backend == BackendKind::Cuda {
-            model_memory_estimate(variant)
-        } else {
-            portable_model_memory_estimate(backend, variant, model_path)?
-        };
-        Ok(model_resource_plan(backend, estimate))
+        )
     }
 
     /// The recurrent state floor of a model whose CUDA context is fitted
@@ -354,15 +581,62 @@ impl ModelLifecycleController {
         }))
     }
 
+    /// A Metal load the GPU working set admits but the host's available
+    /// memory does not cover goes ahead under the advisory host policy:
+    /// macOS compresses and swaps other processes to make room. Record why it
+    /// may be slow for the caller, and log it.
+    async fn note_advisory_host_shortfall(
+        &self,
+        variant: ModelVariant,
+        backend: BackendKind,
+        required_bytes: u64,
+    ) {
+        let authority = self.coordinator.resource_authority();
+        // The host sample runs `sysctl`; keep it off the async workers.
+        let available = tokio::task::spawn_blocking(move || {
+            authority.advisory_host_shortfall(backend, required_bytes)
+        })
+        .await
+        .ok()
+        .flatten();
+        let warning = available.map(|available_bytes| {
+            warn!(
+                model = %variant,
+                required_bytes,
+                available_bytes,
+                "Loading beyond the host memory macOS reports available; it will compress or swap other processes' memory"
+            );
+            format!(
+                "{variant} needs {:.2} GB and macOS reports {:.2} GB available, so it will compress or swap other apps' memory to make room; loads may be slow",
+                required_bytes as f64 / 1e9,
+                available_bytes as f64 / 1e9,
+            )
+        });
+        self.set_load_warning(variant, warning);
+    }
+
+    /// `host_staging_bytes` is host memory the load stages beside
+    /// `required_bytes` on Metal (`ModelResourcePlan::host_staging_bytes`):
+    /// required too under `IZWI_METAL_LOAD_ADMISSION=strict`, advisory
+    /// otherwise.
     pub(super) async fn ensure_portable_memory_before_load(
         &self,
         requested_variant: ModelVariant,
         required_bytes: u64,
+        host_staging_bytes: u64,
+        state_floor_bytes: u64,
     ) -> Result<()> {
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        let with_staging = required_bytes.saturating_add(host_staging_bytes);
+        let required_bytes = gated_load_bytes(
+            self.coordinator.resource_authority().metal_load_admission(),
+            required_bytes,
+            host_staging_bytes,
+        );
+        self.set_load_warning(requested_variant, None);
         let mut pooled_scratch_flushed = false;
         loop {
             let ResourceAmount::Known(planning_headroom) = self
@@ -375,8 +649,10 @@ impl ModelLifecycleController {
             // Metal loads allocate the full working set at the load fence, so
             // the pre-load check must also respect probed live availability —
             // static ledger estimates alone under-count GGUF materialization
-            // and pooled scratch. An unavailable live probe never blocks a
-            // load; planning headroom remains the contract then.
+            // and pooled scratch. What the live sample bounds (the GPU working
+            // set, host memory too under `strict`) follows
+            // `IZWI_METAL_LOAD_ADMISSION`. An unavailable live probe never
+            // blocks a load; planning headroom remains the contract then.
             let live_headroom = self
                 .coordinator
                 .resource_authority()
@@ -385,6 +661,8 @@ impl ModelLifecycleController {
                 .map(|live| planning_headroom.min(live))
                 .unwrap_or(planning_headroom);
             if required_bytes <= headroom {
+                self.note_advisory_host_shortfall(requested_variant, backend, with_staging)
+                    .await;
                 return Ok(());
             }
             let resident_variants = self.known_resident_variants().await;
@@ -427,14 +705,27 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}"
                 );
-                return Err(Error::Overloaded(format!(
-                    "{}; no idle resident model is available for eviction; unload a model to make room",
-                    capacity_shortfall_reason(
-                        format_args!("Cannot load {requested_variant}"),
-                        required_bytes,
-                        headroom,
-                    )
-                )));
+                let authority = self.coordinator.resource_authority();
+                let shortfall = LoadShortfall {
+                    backend,
+                    admission: authority.metal_load_admission(),
+                    required_bytes,
+                    ledger_headroom: planning_headroom,
+                    ledger_ceiling: authority.planning_ceiling_bytes(backend),
+                    live_headroom,
+                    held_by_residents: authority.reserved_bytes_for_classes(
+                        backend,
+                        &[ReservationClass::Model, ReservationClass::Cache],
+                    ),
+                    unevictable: unevictable_residents(
+                        &resident_variants,
+                        requested_variant,
+                        &active_variants,
+                        &pinned_variants,
+                    ),
+                    state_floor_bytes,
+                };
+                return Err(Error::Overloaded(shortfall.message(requested_variant)));
             };
             info!(
                 requested_variant = %requested_variant,
@@ -582,6 +873,62 @@ impl ModelLifecycleController {
         }))
     }
 
+    /// The memory a CPU or Metal load of `variant` must still find free once
+    /// its weights are resident: the safety reserve its state fits keep (the
+    /// measured one for a load that reconciles its device growth, else the
+    /// configured one) and, where the floor is known before load, its
+    /// minimum state (Qwen3-TTS: the retained talker at its prompt and
+    /// output budget). `0` for a model without a state fit (Kokoro, the
+    /// aligner, the diarizers), so admission refuses nothing new. The
+    /// predictor and chat floors need the loaded model and stay with the
+    /// fits.
+    pub(super) async fn portable_state_floor_bytes(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+        backend: BackendKind,
+    ) -> Result<u64> {
+        use crate::catalog::ModelFamily;
+        let fits_state = variant.is_chat()
+            || asr_memory::is_asr_variant(variant)
+            || matches!(
+                variant.family(),
+                ModelFamily::Qwen3Tts
+                    | ModelFamily::VibeVoiceTts
+                    | ModelFamily::VoxtralTts
+                    | ModelFamily::FishS2Tts
+            );
+        if backend == BackendKind::Cuda || !fits_state {
+            return Ok(0);
+        }
+        let configured = self.config.portable_context_reserve_bytes;
+        let reserve = if reconciles_device_usage(variant, backend) {
+            self.coordinator
+                .resource_authority()
+                .state_safety_reserve_bytes(backend, configured)
+        } else {
+            portable_context_reserve_bytes(variant, configured)
+        };
+        let minimum = if variant.family() == ModelFamily::Qwen3Tts {
+            let contract =
+                crate::models::architectures::qwen3::tts::qwen3_tts_retained_contract_for_load(
+                    model_path,
+                    &self.backend_router.context().device,
+                    self.config.kv_page_size,
+                    &self.config.kv_cache_dtype,
+                )?;
+            self.core_engine
+                .portable_state_minimum_bytes(&contract, tts_state_minimum_tokens(variant))
+                .await?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        reserve
+            .checked_add(minimum)
+            .ok_or_else(|| Error::ModelLoadError("portable state floor overflow".into()))
+    }
+
     /// Grows a loading slot's authorization to the precision reload plan
     /// of `variant` before a component whose load-time probe failed reloads
     /// at `request.dtype`, through the same live check as the load itself
@@ -597,7 +944,13 @@ impl ModelLifecycleController {
         request: &PrecisionReloadRequest,
     ) -> Result<Option<ModelResourcePlan>> {
         let device = &self.backend_router.context().device;
-        let Some(reload) = asr_memory::precision_reload_plan(variant, model_path, device)? else {
+        let Some(reload) = asr_memory::precision_reload_plan(
+            variant,
+            model_path,
+            device,
+            &self.config.granite_speech,
+        )?
+        else {
             return Ok(None);
         };
         self.grow_load_authorization_for_reload(variant, current, reload, request)
@@ -640,7 +993,7 @@ impl ModelLifecycleController {
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
-        self.ensure_portable_memory_before_load(variant, growth)
+        self.ensure_portable_memory_before_load(variant, growth, 0, 0)
             .await
             .map_err(refused)?;
         self.grow_loading_slot_authorization(variant, reload.load_authorization)
@@ -683,8 +1036,19 @@ impl ModelLifecycleController {
                         &pinned_variants,
                         &last_used,
                     ) else {
+                        let unevictable = unevictable_residents(
+                            &resident_variants,
+                            requested_variant,
+                            &active_variants,
+                            &pinned_variants,
+                        );
+                        let advice = if unevictable.is_empty() {
+                            "retry when running requests finish".to_string()
+                        } else {
+                            unload_advice(&unevictable, None)
+                        };
                         return Err(Error::Overloaded(format!(
-                            "Cannot reserve memory for {requested_variant}: {resource_error}; no idle resident model is available for eviction; unload a model to make room"
+                            "Cannot reserve memory for {requested_variant}: {resource_error}; {advice}"
                         )));
                     };
                     info!(

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use candle_core::{DType, Tensor};
 #[cfg(test)]
 use candle_core::{IndexOp, D};
-use candle_nn::VarBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
@@ -352,41 +351,19 @@ impl Qwen3ChatModel {
         device: DeviceProfile,
         prefix_reuse: bool,
     ) -> Result<Self> {
-        let config_path = model_dir.join("config.json");
-        let config_str = fs::read_to_string(config_path)?;
+        let config_str = fs::read_to_string(model_dir.join("config.json"))?;
         let config = parse_qwen3_config(&config_str)?;
-        let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
-
         let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
-        let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
-        let dtype = select_qwen3_dense_dtype(&device, dtype_override.as_deref(), checkpoint_dtype)?;
-
-        let index_path = model_dir.join("model.safetensors.index.json");
-        let vb = if index_path.exists() {
-            let index_data = fs::read_to_string(&index_path)?;
-            let index: Value = serde_json::from_str(&index_data)?;
-            let weight_map = index
-                .get("weight_map")
-                .and_then(|m| m.as_object())
-                .ok_or_else(|| {
-                    Error::InvalidInput("Invalid model.safetensors.index.json format".to_string())
-                })?;
-
-            let mut shard_files: Vec<String> = weight_map
-                .values()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            shard_files.sort();
-            shard_files.dedup();
-
-            let shard_paths: Vec<std::path::PathBuf> =
-                shard_files.iter().map(|f| model_dir.join(f)).collect();
-            unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)? }
-        } else {
-            let weights_path = model_dir.join("model.safetensors");
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device)? }
+        let dtype = qwen3_chat_dtype(&device, checkpoint_dtype_from_config_json(&config_str))?;
+        let shards = qwen3_chat_safetensors_shards(model_dir)?;
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`); Candle's own backend elsewhere.
+        let vb = unsafe {
+            crate::models::shared::weights::staged::metal_staged_safetensors(
+                &shards,
+                dtype,
+                &device.device,
+            )?
         };
 
         let text_model = Qwen3Model::load(config, vb)?;
@@ -411,16 +388,7 @@ impl Qwen3ChatModel {
         device: DeviceProfile,
         prefix_reuse: bool,
     ) -> Result<Self> {
-        let gguf_name = match variant {
-            ModelVariant::Qwen314BGguf => "Qwen3-14B-Q4_K_M.gguf",
-            ModelVariant::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-Q4_K_M.gguf",
-            _ => {
-                return Err(Error::ModelLoadError(format!(
-                    "Unsupported GGUF chat variant: {variant}"
-                )))
-            }
-        };
-        let gguf_path = model_dir.join(gguf_name);
+        let gguf_path = qwen3_chat_gguf_path(model_dir, variant)?;
         if !gguf_path.exists() {
             return Err(Error::ModelLoadError(format!(
                 "GGUF checkpoint not found: {}",
@@ -432,10 +400,7 @@ impl Qwen3ChatModel {
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
         let config = parse_qwen3_gguf_config(&loader)?;
         let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
-        let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
-        let dtype = select_qwen3_dense_dtype(&device, dtype_override.as_deref(), None)?;
+        let dtype = qwen3_chat_dtype(&device, None)?;
         let text_model = Qwen3Model::load_gguf_text(config, &loader, &device.device, dtype, "")?;
 
         info!(
@@ -1115,7 +1080,18 @@ fn strip_think_blocks(input: &str) -> String {
     output.replace(close, " ").trim().to_string()
 }
 
-fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
+/// The bit width of each packed MLX weight element, when `config_str` is an
+/// MLX-quantized checkpoint's config (`quantization_config` first).
+pub(crate) fn qwen3_chat_mlx_bits(config_str: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(config_str).ok()?;
+    value
+        .get("quantization_config")
+        .or_else(|| value.get("quantization"))?
+        .get("bits")?
+        .as_u64()
+}
+
+pub(crate) fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
     let value: Value = serde_json::from_str(config_str)?;
     if let Some(text_config) = value.get("text_config") {
         serde_json::from_value(text_config.clone()).map_err(Error::from)
@@ -1194,6 +1170,59 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
         moe_intermediate_size,
         norm_topk_prob,
     })
+}
+
+/// The dtype a Qwen3 chat load stores its dense weights (and a GGUF load
+/// its norms) at: `IZWI_CHAT_DTYPE`, then `IZWI_QWEN_DTYPE`, else the
+/// device's choice for a checkpoint of `checkpoint_dtype`.
+pub(crate) fn qwen3_chat_dtype(
+    device: &DeviceProfile,
+    checkpoint_dtype: Option<DType>,
+) -> Result<DType> {
+    let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
+        .ok()
+        .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
+    select_qwen3_dense_dtype(device, dtype_override.as_deref(), checkpoint_dtype)
+}
+
+/// The safetensors files of the Qwen3 chat checkpoint in `model_dir`: the
+/// shards `model.safetensors.index.json` lists, else `model.safetensors`.
+pub(crate) fn qwen3_chat_safetensors_shards(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![model_dir.join("model.safetensors")]);
+    }
+    let index: Value = serde_json::from_str(&fs::read_to_string(&index_path)?)?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| {
+            Error::InvalidInput("Invalid model.safetensors.index.json format".to_string())
+        })?;
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+    Ok(shard_files.iter().map(|f| model_dir.join(f)).collect())
+}
+
+/// The GGUF checkpoint of a Qwen3 chat GGUF `variant` in `model_dir`.
+pub(crate) fn qwen3_chat_gguf_path(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<std::path::PathBuf> {
+    let gguf_name = match variant {
+        ModelVariant::Qwen314BGguf => "Qwen3-14B-Q4_K_M.gguf",
+        ModelVariant::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-Q4_K_M.gguf",
+        _ => {
+            return Err(Error::ModelLoadError(format!(
+                "Unsupported GGUF chat variant: {variant}"
+            )))
+        }
+    };
+    Ok(model_dir.join(gguf_name))
 }
 
 fn select_qwen3_dense_dtype(
@@ -1281,10 +1310,52 @@ fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
 mod tests {
     use super::{
         argmax_last_sequence_output, continuous_decode_collation_workspace_bytes,
-        select_qwen3_dense_dtype, strip_think_blocks, take_quantum_argmax,
+        qwen3_chat_mlx_bits, qwen3_chat_safetensors_shards, select_qwen3_dense_dtype,
+        strip_think_blocks, take_quantum_argmax,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, IndexOp, Tensor};
+
+    #[test]
+    fn mlx_bits_come_from_the_quantization_config() {
+        assert_eq!(
+            qwen3_chat_mlx_bits(r#"{"quantization": {"group_size": 64, "bits": 4}}"#),
+            Some(4)
+        );
+        assert_eq!(
+            qwen3_chat_mlx_bits(
+                r#"{"quantization_config": {"bits": 8}, "quantization": {"bits": 4}}"#
+            ),
+            Some(8)
+        );
+        assert_eq!(qwen3_chat_mlx_bits(r#"{"torch_dtype": "bfloat16"}"#), None);
+    }
+
+    #[test]
+    fn safetensors_shards_come_from_the_index_once_each() {
+        let dir =
+            std::env::temp_dir().join(format!("izwi-qwen3-chat-shards-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            qwen3_chat_safetensors_shards(&dir).unwrap(),
+            vec![dir.join("model.safetensors")]
+        );
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map": {"lm_head.weight": "model-00002-of-00002.safetensors",
+                "a": "model-00001-of-00002.safetensors", "b": "model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let shards = qwen3_chat_safetensors_shards(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            shards,
+            vec![
+                dir.join("model-00001-of-00002.safetensors"),
+                dir.join("model-00002-of-00002.safetensors")
+            ]
+        );
+    }
 
     #[test]
     fn strip_think_blocks_handles_explicit_tags() {

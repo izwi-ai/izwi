@@ -16,10 +16,10 @@ use serde::Serialize;
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile, DeviceThread};
 use crate::engine::{
     AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
-    ExecutionGroupId, ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider,
-    PhysicalCapacitySnapshot, PhysicalLaunchPolicy, Priority, ReservationClass, ReservationOwner,
-    ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector,
-    StageShapePolicy, WorkCost, WorkUnit, WorkloadClass,
+    ExecutionGroupId, MetalLoadAdmission, ModelInstanceId, NativeBatchMode,
+    PhysicalCapacityProvider, PhysicalCapacitySnapshot, PhysicalLaunchPolicy, Priority,
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate,
+    ResourceLease, ResourceVector, StageShapePolicy, WorkCost, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
@@ -2245,6 +2245,26 @@ impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
             .filter_map(|provider| provider.observed_device_usage_bytes())
             .reduce(u64::saturating_add)
     }
+
+    fn metal_load_admission(&self) -> Option<MetalLoadAdmission> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        providers
+            .values()
+            .find_map(|provider| provider.metal_load_admission())
+    }
+
+    fn advisory_host_available_bytes(&self) -> Option<u64> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        providers
+            .values()
+            .find_map(|provider| provider.advisory_host_available_bytes())
+    }
 }
 
 impl SharedHostUnifiedCapacityProvider {
@@ -2875,6 +2895,10 @@ struct DeviceCapacityProbe {
     configured_cap: Option<u64>,
     configured_host_cap: Option<u64>,
     test_capacity: Option<u64>,
+    /// How host memory gates Metal loads and requests (`IZWI_METAL_LOAD_ADMISSION`).
+    metal_load_admission: MetalLoadAdmission,
+    /// A fixed host-available sample for tests (Metal advisory warnings).
+    test_host_available: Option<u64>,
 }
 
 impl DeviceCapacityProbe {
@@ -2963,7 +2987,10 @@ impl DeviceCapacityProbe {
         match self.backend {
             BackendKind::Cpu => host_memory_snapshot()
                 .map(|(total, available)| (total, available, CapacitySource::OperatingSystem)),
-            BackendKind::Metal => metal_memory_snapshot(device),
+            BackendKind::Metal => metal_memory_snapshot(
+                device,
+                self.metal_load_admission == MetalLoadAdmission::Strict,
+            ),
             BackendKind::Cuda => cuda_memory_snapshot(device),
         }
     }
@@ -3054,12 +3081,19 @@ impl DeviceCapacityProvider {
         } else {
             None
         };
+        let metal_load_admission = if backend == BackendKind::Metal {
+            MetalLoadAdmission::from_env()?
+        } else {
+            MetalLoadAdmission::default()
+        };
         let mut probe = DeviceCapacityProbe {
             backend,
             device: Some(device),
             configured_cap,
             configured_host_cap,
             test_capacity: cfg!(test).then_some(1024 * 1024 * 1024 * 1024),
+            metal_load_admission,
+            test_host_available: None,
         };
         probe.derive_default_cpu_budget();
         Self::from_probe(probe)
@@ -3073,6 +3107,8 @@ impl DeviceCapacityProvider {
             configured_cap: None,
             configured_host_cap: None,
             test_capacity: Some(64 * 1024 * 1024 * 1024),
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
         };
         Self::from_probe(probe).expect("fixed test capacity must initialize")
     }
@@ -3171,11 +3207,34 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
         .ok()
         .flatten()
     }
+
+    fn metal_load_admission(&self) -> Option<MetalLoadAdmission> {
+        (self.probe.backend == BackendKind::Metal).then_some(self.probe.metal_load_admission)
+    }
+
+    fn advisory_host_available_bytes(&self) -> Option<u64> {
+        if self.probe.backend != BackendKind::Metal
+            || self.probe.metal_load_admission == MetalLoadAdmission::Strict
+        {
+            return None;
+        }
+        if let Some(available) = self.probe.test_host_available {
+            return Some(available);
+        }
+        if self.probe.test_capacity.is_some() {
+            return None;
+        }
+        std::panic::catch_unwind(host_memory_snapshot)
+            .ok()
+            .flatten()
+            .map(|(_, available)| available)
+    }
 }
 
 /// Total and available system memory in bytes, as the operating system
-/// reports it (cgroup-limited on Linux). On macOS this runs `sysctl` and
-/// `vm_stat`, so call it off async threads and not on hot paths.
+/// reports it (cgroup-limited on Linux; the kernel's memory-pressure level on
+/// macOS). On macOS this runs `sysctl`, so call it off async threads and not
+/// on hot paths.
 pub fn system_memory_snapshot() -> Option<(u64, u64)> {
     host_memory_snapshot()
 }
@@ -3213,20 +3272,12 @@ fn host_memory_snapshot() -> Option<(u64, u64)> {
     }
     #[cfg(target_os = "macos")]
     {
-        let total_output = command_stdout_with_timeout(
+        let output = command_stdout_with_timeout(
             "/usr/sbin/sysctl",
-            &["-n", "hw.memsize"],
+            &["-n", "hw.memsize", "kern.memorystatus_level"],
             CAPACITY_COMMAND_TIMEOUT,
         )?;
-        let total = std::str::from_utf8(&total_output)
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()?;
-        let vm_output =
-            command_stdout_with_timeout("/usr/bin/vm_stat", &[], CAPACITY_COMMAND_TIMEOUT)?;
-        let available = parse_macos_vm_stat_available(std::str::from_utf8(&vm_output).ok()?)?;
-        return Some((total, available.min(total)));
+        return parse_macos_sysctl_memory(std::str::from_utf8(&output).ok()?);
     }
     #[allow(unreachable_code)]
     None
@@ -3265,46 +3316,75 @@ fn command_stdout_with_timeout(program: &str, args: &[&str], timeout: Duration) 
     }
 }
 
+/// Total memory and what the kernel reports available, from
+/// `sysctl -n hw.memsize kern.memorystatus_level`. The memory-status level is
+/// the percentage of memory the kernel counts available before it comes under
+/// pressure (what `memory_pressure` prints as the free percentage): free,
+/// reclaimable and compressible pages alike. The free, inactive and
+/// speculative page counts `vm_stat` prints leave out compressible memory and
+/// read low on any busy Mac, which refused loads the kernel would have made
+/// room for.
 #[cfg(any(target_os = "macos", test))]
-fn parse_macos_vm_stat_available(contents: &str) -> Option<u64> {
-    let page_size = contents
-        .lines()
-        .next()?
-        .split_once("page size of ")?
-        .1
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    let pages = |label: &str| {
-        contents.lines().find_map(|line| {
-            let (key, raw) = line.split_once(':')?;
-            (key.trim() == label).then(|| raw.trim().trim_end_matches('.').parse::<u64>().ok())?
-        })
-    };
-
-    // Free, inactive, and speculative pages can be reclaimed without paging
-    // anonymous active memory. Purgeable pages are deliberately excluded
-    // because they may already be represented on one of those VM queues.
-    let reclaimable_pages = pages("Pages free")?
-        .checked_add(pages("Pages inactive")?)?
-        .checked_add(pages("Pages speculative").unwrap_or(0))?;
-    reclaimable_pages.checked_mul(page_size)
+fn parse_macos_sysctl_memory(contents: &str) -> Option<(u64, u64)> {
+    let mut lines = contents.lines().map(str::trim);
+    let total = lines.next()?.parse::<u64>().ok()?;
+    let level = lines.next()?.parse::<u64>().ok()?.min(100);
+    Some((total, total / 100 * level))
 }
 
+/// Physical memory (`hw.memsize`), read once: it does not change while the
+/// process runs.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn host_total_memory() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        let output = command_stdout_with_timeout(
+            "/usr/sbin/sysctl",
+            &["-n", "hw.memsize"],
+            CAPACITY_COMMAND_TIMEOUT,
+        )?;
+        std::str::from_utf8(&output)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+fn host_total_memory() -> Option<u64> {
+    host_memory_snapshot().map(|(total, _)| total)
+}
+
+/// The Metal working set (`recommendedMaxWorkingSetSize`, at most physical
+/// memory) and what this process can still allocate in it. With
+/// `bound_by_host` (`IZWI_METAL_LOAD_ADMISSION=strict`) the host's available
+/// memory bounds that too; otherwise host memory is advisory
+/// ([`MetalLoadAdmission`]).
 #[cfg(feature = "metal")]
-fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+fn metal_memory_snapshot(
+    device: &DeviceProfile,
+    bound_by_host: bool,
+) -> Option<(u64, u64, CapacitySource)> {
     let metal = device.device.as_metal_device().ok()?.metal_device();
     let metal_total = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
     let metal_allocated = u64::try_from(metal.current_allocated_size()).ok()?;
-    let (host_total, host_available) = host_memory_snapshot()?;
+    let (host_total, host_available) = if bound_by_host {
+        let (total, available) = host_memory_snapshot()?;
+        (total, Some(available))
+    } else {
+        (host_total_memory()?, None)
+    };
     let (total, available) =
         combine_metal_memory_snapshot(metal_total, metal_allocated, host_total, host_available);
     Some((total, available, CapacitySource::MetalWorkingSet))
 }
 
 #[cfg(not(feature = "metal"))]
-fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+fn metal_memory_snapshot(
+    _device: &DeviceProfile,
+    _bound_by_host: bool,
+) -> Option<(u64, u64, CapacitySource)> {
     None
 }
 
@@ -3354,11 +3434,13 @@ fn combine_metal_memory_snapshot(
     metal_total: u64,
     metal_allocated: u64,
     host_total: u64,
-    host_available: u64,
+    host_available: Option<u64>,
 ) -> (u64, u64) {
     let total = metal_total.min(host_total);
     let metal_available = metal_total.saturating_sub(metal_allocated);
-    let available = metal_available.min(host_available).min(total);
+    let available = metal_available
+        .min(host_available.unwrap_or(u64::MAX))
+        .min(total);
     (total, available)
 }
 
@@ -4021,26 +4103,19 @@ mod tests {
     }
 
     #[test]
-    fn macos_vm_stat_parser_uses_reclaimable_pages() {
-        let snapshot = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-Pages free: 10.\n\
-Pages active: 50.\n\
-Pages inactive: 20.\n\
-Pages speculative: 5.\n\
-Pages purgeable: 7.\n";
-
+    fn macos_sysctl_parser_reads_the_kernel_available_level() {
+        // 16 GiB at a 45% memory-status level.
         assert_eq!(
-            parse_macos_vm_stat_available(snapshot),
-            Some((10 + 20 + 5) * 16_384)
+            parse_macos_sysctl_memory("17179869184\n45\n"),
+            Some((17_179_869_184, 17_179_869_184 / 100 * 45))
         );
+        assert_eq!(parse_macos_sysctl_memory("1000\n140\n"), Some((1000, 1000)));
     }
 
     #[test]
-    fn macos_vm_stat_parser_fails_closed_without_required_fields() {
-        let snapshot = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
-Pages free: 10.\n";
-
-        assert_eq!(parse_macos_vm_stat_available(snapshot), None);
+    fn macos_sysctl_parser_fails_closed_without_both_values() {
+        assert_eq!(parse_macos_sysctl_memory("17179869184\n"), None);
+        assert_eq!(parse_macos_sysctl_memory("17179869184\nlow\n"), None);
     }
 
     #[test]
@@ -4169,6 +4244,8 @@ Pages free: 10.\n";
                 configured_cap: None,
                 configured_host_cap: None,
                 test_capacity: None,
+                metal_load_admission: MetalLoadAdmission::default(),
+                test_host_available: None,
             },
             cache,
             refresh: Some(refresh),
@@ -4203,6 +4280,8 @@ Pages free: 10.\n";
             configured_cap: Some(80),
             configured_host_cap: Some(60),
             test_capacity: None,
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
         };
 
         assert_eq!(probe.apply_cap(100, 70), (80, 50));
@@ -4223,6 +4302,8 @@ Pages free: 10.\n";
             configured_cap: Some(2 * gib),
             configured_host_cap: None,
             test_capacity: None,
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
         };
         // 16 GiB host with 4 GiB available: the 2 GiB budget is all available
         // (it was 2 - 12 = 0 when other processes' 12 GiB counted against it).
@@ -4248,15 +4329,36 @@ Pages free: 10.\n";
     }
 
     #[test]
-    fn metal_capacity_is_bounded_by_host_memory_pressure() {
-        assert_eq!(combine_metal_memory_snapshot(100, 20, 200, 30), (100, 30));
-        assert_eq!(combine_metal_memory_snapshot(200, 10, 80, 70), (80, 70));
+    fn strict_metal_capacity_is_bounded_by_host_memory_pressure() {
+        assert_eq!(
+            combine_metal_memory_snapshot(100, 20, 200, Some(30)),
+            (100, 30)
+        );
+        assert_eq!(
+            combine_metal_memory_snapshot(200, 10, 80, Some(70)),
+            (80, 70)
+        );
+    }
+
+    #[test]
+    fn advisory_metal_capacity_ignores_host_memory_pressure() {
+        // Host memory is advisory: only the working set and physical memory
+        // bound what a load or request may allocate.
+        assert_eq!(combine_metal_memory_snapshot(100, 20, 200, None), (100, 80));
+        assert_eq!(combine_metal_memory_snapshot(200, 10, 80, None), (80, 80));
     }
 
     #[test]
     fn metal_capacity_is_bounded_by_working_set_pressure() {
-        assert_eq!(combine_metal_memory_snapshot(100, 90, 200, 150), (100, 10));
-        assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
+        assert_eq!(
+            combine_metal_memory_snapshot(100, 90, 200, Some(150)),
+            (100, 10)
+        );
+        assert_eq!(
+            combine_metal_memory_snapshot(100, 120, 200, Some(150)),
+            (100, 0)
+        );
+        assert_eq!(combine_metal_memory_snapshot(100, 90, 200, None), (100, 10));
     }
 
     #[test]
@@ -4279,6 +4381,8 @@ Pages free: 10.\n";
             configured_cap,
             configured_host_cap: None,
             test_capacity: Some(1000),
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
         };
         let mut derived = probe(None);
         derived.derive_default_cpu_budget();
@@ -4302,6 +4406,8 @@ Pages free: 10.\n";
             configured_cap: Some(metal_default_budget_from_working_set(1000)),
             configured_host_cap: None,
             test_capacity: Some(10_000),
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
         };
 
         let snapshot = probe.sample().expect("metal sample");

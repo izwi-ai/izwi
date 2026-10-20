@@ -253,8 +253,11 @@ impl LoadedCapabilityDescriptor {
                 retained_uses,
                 invocation_workspace,
             } => {
-                if execution.metadata().state_requirement.requires_retained() != retained.is_some()
-                {
+                if !retained_backing_matches(
+                    execution.metadata().state_requirement.requires_retained(),
+                    !matches!(descriptor.retained, RetainedStateCapability::Stateless),
+                    retained.is_some(),
+                ) {
                     return Err(Error::ModelLoadError(
                         "physical retained backing does not match the capability lifetime declaration"
                             .to_string(),
@@ -439,4 +442,47 @@ pub(super) fn validate_retained_state_use(
         ));
     }
     Ok(())
+}
+
+/// Whether a physical publication's retained backing matches what it may
+/// hold. The capability declares the most it may retain; the model's
+/// descriptor declares what this load authors (and the publication checks
+/// that against the backing). A load may author less than its capability
+/// allows: Granite Speech without resumable prefill offers no retained graph,
+/// so its load authors a stateless route and allocates nothing (GRN-8). A
+/// load may never author retained state its capability does not declare.
+fn retained_backing_matches(
+    capability_retains: bool,
+    load_authors_retained: bool,
+    has_backing: bool,
+) -> bool {
+    if load_authors_retained && !capability_retains {
+        return false;
+    }
+    has_backing == load_authors_retained
+}
+
+#[cfg(test)]
+mod retained_backing_tests {
+    use super::retained_backing_matches;
+
+    #[test]
+    fn a_load_may_author_less_retained_state_than_its_capability_allows() {
+        // Retaining capability, retained route authored and backed.
+        assert!(retained_backing_matches(true, true, true));
+        // Retaining capability, stateless route (Granite without resumable
+        // prefill): nothing is allocated, and that matches.
+        assert!(retained_backing_matches(true, false, false));
+        // Stateless capability, stateless route.
+        assert!(retained_backing_matches(false, false, false));
+    }
+
+    #[test]
+    fn backing_must_follow_the_authored_route_and_never_exceed_the_capability() {
+        assert!(!retained_backing_matches(true, true, false));
+        assert!(!retained_backing_matches(true, false, true));
+        assert!(!retained_backing_matches(false, false, true));
+        assert!(!retained_backing_matches(false, true, true));
+        assert!(!retained_backing_matches(false, true, false));
+    }
 }

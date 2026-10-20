@@ -237,8 +237,17 @@ impl FishS2Weights {
             .iter()
             .map(|(source, remapped)| (remapped.clone(), source.clone()))
             .collect::<BTreeMap<_, _>>();
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)? };
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`): Candle's own reads cast every BF16 tensor on the
+        // device into a power-of-two buffer (9.12 GB held in 12.15 GB at F16)
+        // and kept every upload until the load fence.
+        let vb = unsafe {
+            crate::models::shared::weights::staged::metal_staged_safetensors(
+                &shard_paths,
+                dtype,
+                &device.device,
+            )?
+        };
         let vb = vb.rename_f(move |name| {
             remapped_to_source
                 .get(name)
@@ -370,7 +379,10 @@ pub(crate) struct FishS2TensorMemory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FishS2ModelMemory {
     pub(crate) resident_bytes: u64,
+    /// The load's peak in one memory (CPU and Metal) or on the device (CUDA).
     pub(crate) load_peak_bytes: u64,
+    /// Metal: the part of `load_peak_bytes` the GPU allocates.
+    pub(crate) metal_device_load_peak_bytes: u64,
     pub(crate) cuda_host_load_peak_bytes: u64,
 }
 
@@ -466,6 +478,12 @@ fn fish_s2_memory_from_inventory(
     Ok(FishS2ModelMemory {
         resident_bytes,
         load_peak_bytes: transformer_peak.max(codec_peak),
+        // The staged transformer uploads each tensor at its exact size after
+        // casting it on the host, and the codec is normalized on the host
+        // and uploaded tensor by tensor: on Metal the GPU holds only the
+        // final tensors (measured: a 10.738 GB peak over a 10.737 GB
+        // residency); the rest of `load_peak_bytes` is host memory.
+        metal_device_load_peak_bytes: resident_bytes,
         cuda_host_load_peak_bytes,
     })
 }
@@ -748,7 +766,8 @@ mod tests {
         const LARGEST_SOURCE_TENSOR: u64 = 797_573_120;
         let codec = FishS2CodecMemory {
             resident_parameter_bytes: 1_565_593_540,
-            raw_load_bytes: 1_572_013_576,
+            // The F32 weights; the 6,291,456 bytes of `freqs_cis` are not read.
+            raw_load_bytes: 1_565_722_120,
             fused_load_bytes: 306_057_600,
             largest_source_tensor_bytes: 75_497_472,
             largest_target_tensor_bytes: 75_497_472,

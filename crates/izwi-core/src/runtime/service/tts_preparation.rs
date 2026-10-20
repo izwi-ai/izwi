@@ -227,10 +227,15 @@ impl RuntimeService {
             priority: request.priority,
             workload_class: request.workload_class,
             deadline: request.deadline,
+            // One retained style row (256 F32) per chunk the text can split
+            // into: a single row's authorization refused long texts (B2).
             resources: retained_artifact_resources(
                 self.backend_router.context().backend_kind,
                 artifact_host_ceiling,
-                256 * std::mem::size_of::<f32>() as u64,
+                u64::try_from(budget.max_chunks)
+                    .ok()
+                    .and_then(|chunks| chunks.checked_mul(256 * std::mem::size_of::<f32>() as u64))
+                    .ok_or_else(|| Error::Overloaded("Kokoro style rows overflowed".into()))?,
             )?,
         };
         let preparation_job = match self

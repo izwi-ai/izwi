@@ -646,8 +646,15 @@ impl GraniteSpeechAsrModel {
         self.checkpoint_kind
     }
 
+    /// Granite's retained decoder is not quality-certified, so no Granite
+    /// checkpoint resumes prefill: request preparation routes every ASR
+    /// request to the atomic graph, and the loaded ASR adapter offers no
+    /// retained sequence graph whose decoder state would be fitted,
+    /// allocated and held for nothing (GRN-8).
+    pub(crate) const RESUMABLE_PREFILL: bool = false;
+
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
-        false
+        Self::RESUMABLE_PREFILL
     }
 
     pub(crate) const fn supports_incremental_decode(&self) -> bool {
@@ -664,17 +671,12 @@ impl GraniteSpeechAsrModel {
             default_kv_page_size(),
         )?;
         let retained = granite_speech_retained_contract(invocation.clone())?;
-        let spec = granite_speech_physical_state_spec(
+        granite_speech_physical_state_spec(
             stage_graphs,
             retained,
             invocation,
             self.config.text_config.max_position_embeddings,
-        )?;
-        Ok(if self.supports_resumable_prefill() {
-            spec
-        } else {
-            granite_speech_without_retained_route(spec)
-        })
+        )
     }
 
     pub fn processor(&self) -> &GraniteSpeechProcessorConfig {
@@ -1878,9 +1880,13 @@ fn granite_speech_physical_state_spec(
                     .into(),
             ));
         }
-    } else if pipeline_graphs != stage_graphs.len() {
+    } else if pipeline_graphs != stage_graphs.len() && atomic_graphs != stage_graphs.len() {
+        // Without its retained sequence graph a capability is invocation-only:
+        // speaker attribution runs exact pipeline graphs, and ASR without
+        // resumable prefill runs only its atomic graph (GRN-8).
         return Err(Error::ModelLoadError(
-            "Granite Speech invocation-only capability requires exact pipeline graphs".into(),
+            "Granite Speech invocation-only capability requires exact pipeline graphs or only its atomic ASR graph"
+                .into(),
         ));
     }
     let max_tokens = u64::try_from(max_context_tokens)
@@ -2011,17 +2017,16 @@ fn granite_speech_physical_state_spec(
     })
 }
 
-/// Request preparation routes ASR to the retained sequence graph only for a
-/// model with resumable prefill (`runtime/service.rs`), so without it that
-/// graph never runs: its retained decoder state would be fitted, allocated
-/// and held for nothing (GRN-8). The graph keeps its scratch-only profile.
-fn granite_speech_without_retained_route(
-    mut spec: GraniteSpeechPhysicalStateSpec,
-) -> GraniteSpeechPhysicalStateSpec {
-    spec.retained = None;
-    spec.retained_max_tokens = None;
-    spec.descriptor.retained = RetainedStateCapability::Stateless;
-    spec
+/// The physical state a Granite Speech load authors for `stage_graphs`, on
+/// the test decoder geometry instead of a checkpoint's, so a bundle test can
+/// publish and seal exactly what a load would.
+#[cfg(test)]
+pub(crate) fn granite_speech_test_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<GraniteSpeechPhysicalStateSpec> {
+    let invocation = tests::granite_test_invocation_contract();
+    let retained = granite_speech_retained_contract(invocation.clone())?;
+    granite_speech_physical_state_spec(stage_graphs, retained, invocation, 128)
 }
 
 fn granite_speech_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
@@ -2632,7 +2637,7 @@ mod tests {
 
     static GRANITE_DTYPE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn granite_test_invocation_contract() -> InferenceStateContract {
+    pub(super) fn granite_test_invocation_contract() -> InferenceStateContract {
         let mut contract = crate::kv::v2::test_contract();
         for domain in &mut contract.domains {
             let StateDomainSpec::PagedAttention(domain) = domain else {
@@ -2755,25 +2760,21 @@ mod tests {
             .all(|stage| !stage.groups.is_empty()));
     }
 
+    /// Without resumable prefill the ASR capability offers only its atomic
+    /// graph, so the load authors no retained state at all (GRN-8). A
+    /// stateless descriptor beside a retained graph cannot be published.
     #[test]
-    fn disabled_retained_route_allocates_no_retained_state() {
+    fn atomic_only_asr_graphs_author_no_retained_state() {
         let invocation = granite_test_invocation_contract();
         let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
-        let normal = vec![
-            granite_test_stage(0, StageWorkSelector::PreSequencePreparation),
-            granite_test_stage(1, StageWorkSelector::SequencePrefill),
-            granite_test_stage(2, StageWorkSelector::SequenceDecode),
-        ];
         let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
-        let spec = granite_speech_without_retained_route(
-            granite_speech_physical_state_spec(
-                &[normal.as_slice(), atomic.as_slice()],
-                retained,
-                invocation,
-                128,
-            )
-            .unwrap(),
-        );
+        let spec = granite_speech_physical_state_spec(
+            &[atomic.as_slice(), atomic.as_slice()],
+            retained.clone(),
+            invocation.clone(),
+            128,
+        )
+        .unwrap();
 
         assert!(spec.retained.is_none());
         assert_eq!(spec.retained_max_tokens, None);
@@ -2781,9 +2782,23 @@ mod tests {
             spec.descriptor.retained,
             RetainedStateCapability::Stateless
         ));
-        for stages in [normal.as_slice(), atomic.as_slice()] {
-            spec.descriptor.validate_against_stages(stages).unwrap();
-        }
+        spec.descriptor
+            .validate_against_stages(atomic.as_slice())
+            .unwrap();
+
+        // An invocation-only set is uniform: atomic ASR beside pipeline
+        // speaker attribution is not one capability's graph set.
+        let pipeline = vec![granite_test_stage(
+            0,
+            StageWorkSelector::Pipeline { ordinal: None },
+        )];
+        assert!(granite_speech_physical_state_spec(
+            &[atomic.as_slice(), pipeline.as_slice()],
+            retained,
+            invocation,
+            128,
+        )
+        .is_err());
     }
 
     #[test]

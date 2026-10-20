@@ -308,7 +308,7 @@ pub fn admit_precision_reload(label: &str, dtype: DType) -> crate::error::Result
 /// and the failed check is recorded as the reason. This is the load-time
 /// gate of the Metal precision recipe (report 13): every lowered dtype
 /// either proves finite and in range on unstructured input, or falls back.
-pub fn load_with_precision_fallback<T, E>(
+pub fn load_with_precision_fallback<T, E: From<crate::error::Error>>(
     label: &str,
     selection: &DTypeSelection,
     check: bool,
@@ -338,6 +338,8 @@ pub fn load_with_precision_fallback<T, E>(
         report.reason
     );
     drop(model);
+    // The load's gate frees the dropped model and admits the reload's memory.
+    admit_precision_reload(label, fallback).map_err(E::from)?;
     let model = load(fallback)?;
     Ok((
         model,
@@ -453,9 +455,9 @@ mod tests {
                 })
             }
         };
-        let load = |loads: &mut Vec<DType>, dtype: DType| {
+        let load = |loads: &mut Vec<DType>, dtype: DType| -> crate::error::Result<Tensor> {
             loads.push(dtype);
-            Tensor::new(&[1.0f32, -2.0], &Device::Cpu)?.to_dtype(dtype)
+            Ok(Tensor::new(&[1.0f32, -2.0], &Device::Cpu)?.to_dtype(dtype)?)
         };
 
         let mut loads = Vec::new();
@@ -474,16 +476,34 @@ mod tests {
         );
         assert!(!outcome.fell_back() && outcome.self_check.unwrap().passed);
 
+        // A fallback asks the load's gate for the reload before it loads.
         let mut loads = Vec::new();
-        let (model, outcome) = load_with_precision_fallback(
-            "test",
-            &selection(DType::F16),
-            true,
-            DType::F32,
-            |dtype| load(&mut loads, dtype),
-            probe(1.0e5),
+        let admitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate_admitted = admitted.clone();
+        let (model, outcome) = with_precision_reload_gate(
+            Box::new(move |label: &str, dtype| {
+                gate_admitted
+                    .lock()
+                    .unwrap()
+                    .push((label.to_string(), dtype));
+                Ok(())
+            }),
+            || {
+                load_with_precision_fallback(
+                    "test",
+                    &selection(DType::F16),
+                    true,
+                    DType::F32,
+                    |dtype| load(&mut loads, dtype),
+                    probe(1.0e5),
+                )
+            },
         )
         .unwrap();
+        assert_eq!(
+            *admitted.lock().unwrap(),
+            [("test".to_string(), DType::F32)]
+        );
         assert_eq!(loads, [DType::F16, DType::F32]);
         assert_eq!(model.dtype(), DType::F32);
         assert!(outcome.fell_back());

@@ -183,6 +183,13 @@ pub fn build_child_launch_spec(
         }
         environment.insert(key.clone(), value.clone());
     }
+    // macOS: libmalloc's large cache off unless inherited above, so a model
+    // load's freed host buffers leave the worker's footprint.
+    for (name, value) in izwi_env::serving_allocator_env() {
+        environment
+            .entry(OsString::from(name))
+            .or_insert_with(|| OsString::from(value));
+    }
     // The operator's validated table comes next, and the supervisor's own
     // variables last, so an owned name can never be overridden.
     for (name, value) in &worker.environment {
@@ -590,10 +597,20 @@ mod tests {
         assignment: DeviceAssignment,
         mutate: impl FnOnce(&mut NodeConfig),
     ) -> ChildLaunchSpec {
+        build_inheriting(directory, assignment, mutate, &[])
+    }
+
+    /// [`build_with`], with `extra` added to the supervisor's environment.
+    fn build_inheriting(
+        directory: &Path,
+        assignment: DeviceAssignment,
+        mutate: impl FnOnce(&mut NodeConfig),
+        extra: &[(&str, &str)],
+    ) -> ChildLaunchSpec {
         let mut config = node_config(directory, &assignment);
         mutate(&mut config);
         let validated = validate_node_config(directory, config, &assignment);
-        let inherited = BTreeMap::from([
+        let mut inherited = BTreeMap::from([
             (OsString::from("PATH"), OsString::from("/bin")),
             (OsString::from("UNSAFE_PARENT_SECRET"), OsString::from("no")),
             (
@@ -601,6 +618,11 @@ mod tests {
                 OsString::from("stale"),
             ),
         ]);
+        inherited.extend(
+            extra
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        );
         let namespace = crate::LockNamespace::open(directory.join("locks")).unwrap();
         let worker_id = id("worker-a");
         let locks = WorkerLockPaths::for_worker(&namespace, &worker_id, &assignment);
@@ -639,6 +661,31 @@ mod tests {
             env_value(&with, "IZWI_KV_HOST_POOL_BUDGET_BYTES"),
             OsStr::new("512")
         );
+    }
+
+    #[test]
+    fn macos_workers_start_with_the_serving_allocator_unless_inherited() {
+        let directory = tempfile::tempdir().unwrap();
+        let assignment = || DeviceAssignment::Cpu {
+            thread_budget: 2,
+            affinity: vec![0, 1],
+            host_memory_limit_bytes: 1024,
+        };
+        let spec = build(directory.path(), assignment());
+        let expected = cfg!(target_os = "macos").then_some(OsStr::new("0"));
+        assert_eq!(
+            spec.environment
+                .get(OsStr::new("MallocLargeCache"))
+                .map(OsString::as_os_str),
+            expected
+        );
+        let operator = build_inheriting(
+            directory.path(),
+            assignment(),
+            |_| {},
+            &[("MallocLargeCache", "1")],
+        );
+        assert_eq!(env_value(&operator, "MallocLargeCache"), "1");
     }
 
     #[test]

@@ -707,6 +707,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off.",
     ),
     CoreEnvVar::new(
+        "IZWI_KEEP_NEMO_ARCHIVES",
+        Flag,
+        "false",
+        Load,
+        "Keeps the Parakeet and Nemotron ASR .nemo archives after a load from their extracted checkpoints; by default they are deleted (2.4-2.5 GB each).",
+    ),
+    CoreEnvVar::new(
         "IZWI_KOKORO_CPU_PREDECODER",
         Flag,
         "true",
@@ -1087,6 +1094,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "true",
         Once,
         "Enables the Metal simdgroup GQA decode attention kernels; off restores scalar kernels.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_METAL_LOAD_ADMISSION",
+        Choice,
+        "advisory",
+        Startup,
+        "How host memory gates Metal loads and requests: advisory (only the GPU working set gates; a load larger than macOS reports available is logged and reported), strict (host memory gates too) or off (no live check before a load); invalid = startup error.",
     ),
     CoreEnvVar::new(
         "IZWI_METAL_MEMORY_BUDGET_BYTES",

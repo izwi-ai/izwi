@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::config::ContextLengthPreference;
-use crate::engine::resources::capacity_shortfall_reason;
+use crate::engine::resources::{capacity_shortfall_reason, state_shortfall_reason};
 use crate::engine::{
     AdapterInstanceId, CacheMode, ModelInstanceId, ReservationClass, ReservationOwner,
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
@@ -50,11 +50,14 @@ mod qwen38_memory;
 mod state;
 #[path = "tts_memory.rs"]
 mod tts_memory;
-use admission::{admit_asr_request_floor, admit_cuda_state_floor, reconcile_observed_growth};
 #[cfg(test)]
 use admission::{
-    materialization_tolerance_bytes, request_envelope_resources, request_envelope_shortfall,
-    CudaStateFloor,
+    admit_asr_request_floor, materialization_tolerance_bytes, request_envelope_resources,
+    request_envelope_shortfall, CudaStateFloor,
+};
+use admission::{
+    admit_cuda_state_floor, load_authorization_with_request_floor, portable_preload_bytes,
+    reconcile_observed_growth,
 };
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
@@ -68,6 +71,7 @@ use checkpoint::{
     checkpoint_census, estimate_from_tensor_inventory, fish_s2_resource_plan,
     qwen38_representation_memory_estimate, CheckpointCensus,
 };
+use invocation::{invocation_state_bytes, LaterStateGroups};
 #[cfg(test)]
 use invocation::{
     plan_invocation_allocations, validate_physical_publication_backing,
@@ -393,6 +397,13 @@ struct ModelResourcePlan {
     /// Resident capacity reserved for lazy model-owned allocations. It remains
     /// a pending claim while physical state is fitted before first inference.
     deferred_resident_authorization: ResourceVector,
+    /// Metal: host memory the load stages beside its unified authorization,
+    /// which then books only what the GPU allocates. It is not part of the
+    /// GPU working set; it gates the load only under
+    /// `IZWI_METAL_LOAD_ADMISSION=strict`, and is advisory otherwise, like
+    /// any host memory (Fish's staged transformer holds 1.6 GB of host copies
+    /// beside a 10.7 GB GPU peak).
+    host_staging_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,12 +438,19 @@ struct PrecisionReloadRequest {
 /// the reply, so the reload allocates only once it is authorized. Loads run
 /// on the device thread, which keeps serving control jobs while it waits:
 /// the admission may evict a model, and that model's drop runs there.
-fn precision_reload_gate() -> (
+/// The gate a loader asks before it reloads a component whose
+/// lowered-precision probe failed. It first synchronizes `device`: Candle frees
+/// the dropped component's buffers only then, so the admission that follows
+/// sees them free (and the reload does not stack on them).
+fn precision_reload_gate(
+    device: candle_core::Device,
+) -> (
     PrecisionReloadGate,
     tokio::sync::mpsc::UnboundedReceiver<PrecisionReloadRequest>,
 ) {
     let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
     let gate = Box::new(move |component: &str, dtype| {
+        device.synchronize().map_err(Error::from)?;
         let (reply, outcome) = tokio::sync::oneshot::channel();
         let ended = || {
             Error::ModelLoadError(format!(
@@ -481,7 +499,12 @@ fn asr_state_rows(
 fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
     (asr_memory::has_plan(variant)
         || tts_memory::has_plan(variant)
-        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat)
+        || matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::Lfm2Chat
+                | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::FishS2Tts
+        ))
         && asr_memory::weights_on_backend_device(variant, backend)
 }
 
@@ -700,20 +723,12 @@ impl ModelLifecycleController {
                 device_capacity,
             )?;
         }
-        if asr_memory::is_asr_variant(variant) {
-            let backend = self.backend_router.context().backend_kind;
-            let slots = self.coordinator.physical_execution_admission().capacity();
-            if let Some(envelope) =
-                super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
-            {
-                let floor_bytes = match backend {
-                    BackendKind::Cuda => envelope.accelerator_bytes,
-                    BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
-                };
-                resource_plan.load_authorization =
-                    admit_asr_request_floor(&resource_plan, backend, floor_bytes)?;
-            }
-        }
+        resource_plan.load_authorization = load_authorization_with_request_floor(
+            variant,
+            &resource_plan,
+            self.backend_router.context().backend_kind,
+            self.coordinator.physical_execution_admission().capacity(),
+        )?;
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
         let portable_load_bytes = match self.backend_router.context().backend_kind {
@@ -722,8 +737,32 @@ impl ModelLifecycleController {
             BackendKind::Cuda => ResourceAmount::Known(0),
         };
         if let ResourceAmount::Known(required_bytes) = portable_load_bytes {
-            self.ensure_portable_memory_before_load(variant, required_bytes)
+            let backend = self.backend_router.context().backend_kind;
+            let envelope_bytes = match super::asr_envelope::deferred_request_envelope(
+                variant,
+                backend,
+                self.coordinator.physical_execution_admission().capacity(),
+            )? {
+                Some(envelope) => envelope.total_bytes()?,
+                None => 0,
+            };
+            let state_floor_bytes = self
+                .portable_state_floor_bytes(variant, &acquired.model_path, backend)
                 .await?;
+            let preload_bytes = portable_preload_bytes(
+                &resource_plan,
+                backend,
+                required_bytes,
+                envelope_bytes,
+                state_floor_bytes,
+            )?;
+            self.ensure_portable_memory_before_load(
+                variant,
+                preload_bytes,
+                resource_plan.host_staging_bytes,
+                state_floor_bytes,
+            )
+            .await?;
         }
         let resource_lease = self
             .reserve_model_resources(variant, resource_plan.load_authorization)
@@ -760,7 +799,8 @@ impl ModelLifecycleController {
             // load-time probe fails reloads at F32 only once this task has
             // grown the authorization for it.
             let model_path = acquired.model_path.clone();
-            let (reload_gate, mut reload_requests) = precision_reload_gate();
+            let (reload_gate, mut reload_requests) =
+                precision_reload_gate(self.backend_router.context().device.device.clone());
             let instantiate = self.instantiate_model(acquired, reload_gate);
             tokio::pin!(instantiate);
             let instantiated = loop {
@@ -1246,6 +1286,13 @@ impl RuntimeService {
         self.model_lifecycle.pinned_model_variants().await
     }
 
+    /// Why the latest load of `variant` may be slow, if admission noted
+    /// anything (a Metal load larger than the host memory macOS reports
+    /// available). Taking it clears it.
+    pub fn take_load_warning(&self, variant: ModelVariant) -> Option<String> {
+        self.model_lifecycle.take_load_warning(variant)
+    }
+
     #[cfg(test)]
     async fn ensure_model_budget_before_load(&self, requested_variant: ModelVariant) -> Result<()> {
         let _mutation_guard = self.model_lifecycle.mutation_gate.lock().await;
@@ -1279,3 +1326,6 @@ impl SessionModelLeases {
 #[cfg(test)]
 #[path = "load_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod footprint_tests;

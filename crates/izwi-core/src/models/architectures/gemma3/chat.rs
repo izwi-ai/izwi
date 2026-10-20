@@ -9,7 +9,6 @@ use std::sync::Arc;
 use candle_core::{DType, Tensor};
 #[cfg(test)]
 use candle_core::{IndexOp, D};
-use candle_nn::VarBuilder;
 use candle_transformers::models::gemma3::Config as Gemma3Config;
 use serde_json::Value;
 use tracing::{info, warn};
@@ -655,7 +654,15 @@ impl Gemma3ChatModel {
 
             let shard_paths: Vec<std::path::PathBuf> =
                 shard_files.iter().map(|f| model_dir.join(f)).collect();
-            unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)? }
+            // Host-cast, exact-size uploads with periodic synchronization on
+            // Metal (`staged`); Candle's own backend elsewhere.
+            unsafe {
+                crate::models::shared::weights::staged::metal_staged_safetensors(
+                    &shard_paths,
+                    dtype,
+                    &device.device,
+                )?
+            }
         } else {
             let weights_path = model_dir.join("model.safetensors");
             for tensor_name in [
@@ -672,7 +679,13 @@ impl Gemma3ChatModel {
                     break;
                 }
             }
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device)? }
+            unsafe {
+                crate::models::shared::weights::staged::metal_staged_safetensors(
+                    &[weights_path],
+                    dtype,
+                    &device.device,
+                )?
+            }
         };
 
         if let Some(vocab_size) = inferred_vocab_size {

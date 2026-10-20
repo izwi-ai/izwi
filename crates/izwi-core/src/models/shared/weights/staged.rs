@@ -270,4 +270,38 @@ mod tests {
         assert!(!staged.contains_tensor("layer.missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A staged load casts on the host what Candle casts on the Metal
+    /// device; both round BF16 to F16 the same way for every bit pattern
+    /// (NaNs stay NaN), so a staged F16 load holds the same weights.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn host_and_metal_bf16_to_f16_casts_agree() {
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("host_and_metal_bf16_to_f16_casts_agree")
+        else {
+            return;
+        };
+        let patterns = (0..=u16::MAX)
+            .map(half::bf16::from_bits)
+            .collect::<Vec<_>>();
+        let source = Tensor::from_vec(patterns, u16::MAX as usize + 1, &Device::Cpu).expect("bf16");
+        let host = source
+            .to_dtype(DType::F16)
+            .and_then(|t| t.to_vec1::<half::f16>())
+            .expect("host cast");
+        let device = source
+            .to_device(&metal)
+            .and_then(|t| t.to_dtype(DType::F16))
+            .and_then(|t| t.to_vec1::<half::f16>())
+            .expect("metal cast");
+        for (index, (host, device)) in host.iter().zip(&device).enumerate() {
+            assert!(
+                host.to_bits() == device.to_bits() || (host.is_nan() && device.is_nan()),
+                "bf16 {index:#06x}: host {:#06x}, metal {:#06x}",
+                host.to_bits(),
+                device.to_bits()
+            );
+        }
+    }
 }

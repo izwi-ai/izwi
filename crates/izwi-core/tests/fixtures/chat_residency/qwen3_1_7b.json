@@ -1,0 +1,23 @@
+{
+  "source": "Qwen/Qwen3-1.7B safetensors shard headers (HTTP Range); tie_word_embeddings true, lm_head.weight stored",
+  "files": [
+    {"path": "model-00001-of-00002.safetensors", "format": "safetensors", "total_bytes": 3441149952, "tensor_count": 310, "tensors": [
+      ["model.embed_tokens.weight", "BF16", [151936, 2048]],
+      ["model.norm.weight", "BF16", [2048]],
+      ["model.layers.{i}.input_layernorm.weight", "BF16", [2048], 0, 28],
+      ["model.layers.{i}.mlp.down_proj.weight", "BF16", [2048, 6144], 0, 28],
+      ["model.layers.{i}.mlp.gate_proj.weight", "BF16", [6144, 2048], 0, 28],
+      ["model.layers.{i}.mlp.up_proj.weight", "BF16", [6144, 2048], 0, 28],
+      ["model.layers.{i}.post_attention_layernorm.weight", "BF16", [2048], 0, 28],
+      ["model.layers.{i}.self_attn.k_norm.weight", "BF16", [128], 0, 28],
+      ["model.layers.{i}.self_attn.k_proj.weight", "BF16", [1024, 2048], 0, 28],
+      ["model.layers.{i}.self_attn.o_proj.weight", "BF16", [2048, 2048], 0, 28],
+      ["model.layers.{i}.self_attn.q_norm.weight", "BF16", [128], 0, 28],
+      ["model.layers.{i}.self_attn.q_proj.weight", "BF16", [2048, 2048], 0, 28],
+      ["model.layers.{i}.self_attn.v_proj.weight", "BF16", [1024, 2048], 0, 28]
+    ]},
+    {"path": "model-00002-of-00002.safetensors", "format": "safetensors", "total_bytes": 622329856, "tensor_count": 1, "tensors": [
+      ["lm_head.weight", "BF16", [151936, 2048]]
+    ]}
+  ]
+}

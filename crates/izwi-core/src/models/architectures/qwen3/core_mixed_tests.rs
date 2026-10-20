@@ -134,7 +134,7 @@ fn mixed_steps_match_split(model: &Qwen3Model, device: &Device, vocab: (u32, u32
     let geometry = model.cfg.attention_geometry().unwrap();
     let capacity = 64;
     let sequences = DECODER_PROMPTS.len() + PREFILL_PROMPTS.len();
-    let dtype = model.embed_tokens.embeddings().dtype();
+    let dtype = model.embed_tokens.dtype();
     let world = || {
         test_physical_caches_with_dtype_on(
             device,

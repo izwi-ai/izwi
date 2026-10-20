@@ -243,8 +243,19 @@ impl PthTensorMap {
         device: &Device,
         dtype: Option<DType>,
     ) -> Result<BTreeMap<String, Tensor>> {
+        self.read_where(device, dtype, |_| true)
+    }
+
+    /// [`Self::read_all`] for the tensors whose name `keep` accepts; the
+    /// others are never read.
+    pub fn read_where(
+        &self,
+        device: &Device,
+        dtype: Option<DType>,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, Tensor>> {
         let mut tensors = BTreeMap::new();
-        for name in self.tensor_infos.keys() {
+        for name in self.tensor_infos.keys().filter(|name| keep(name)) {
             let tensor = self.get(name, device, dtype)?.ok_or_else(|| {
                 Error::ModelLoadError(format!(
                     "PyTorch archive tensor disappeared while reading: {name}"

@@ -121,107 +121,127 @@ impl ModelLifecycleController {
                         "loaded Granite Speech model {variant} is missing from the registry"
                     ))
                 })?;
-            for capability in [
-                CapabilityKind::Asr,
-                CapabilityKind::SpeakerAttributedAsr,
-            ] {
-                if self.adapter_registry.require(capability, variant).is_err() {
-                    continue;
-                }
-                let contracts = bundle_draft.execution_contracts(capability)?;
-                let stage_graphs = contracts
-                    .iter()
-                    .map(|contract| contract.stages.as_ref())
-                    .collect::<Vec<_>>();
-                let physical_spec =
-                    model.granite_speech_physical_state_spec(&stage_graphs)?;
-                // Without resumable prefill the model authors no retained
-                // route, and its state is not allocated (GRN-8).
-                let retained_route = capability == CapabilityKind::Asr
-                    && physical_spec.retained.is_some();
-                let (retained, retained_uses) = if retained_route {
-                    let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
-                        Error::ModelLoadError(
-                            "Granite Speech ASR graph did not author retained decoder state"
-                                .into(),
-                        )
-                    })?;
-                    let retained_max_tokens = physical_spec
-                        .retained_max_tokens
-                        .ok_or_else(|| {
-                            Error::ModelLoadError(
-                                "Granite Speech retained decoder has no context bound".into(),
-                            )
-                        })?;
-                    let retained = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
-                            model_instance_id,
-                            retained_contract,
-                            Some(retained_max_tokens),
-                            2,
-                            self.asr_state_rows(),
-                            asr_minimum_tokens(variant),
-                        )
-                        .await?;
-                    self.model_registry.publish_effective_context(
-                        variant,
-                        retained.logical_token_reach(),
-                    )?;
-                    self.model_registry.publish_kv_storage(variant, &retained);
-                    crate::runtime::rollout::validate_managed_state_plan_eligibility(
-                        variant,
-                        CapabilityKind::Asr,
-                        retained.state_plan_v2(),
-                    )?;
-                    let uses = contracts
-                        .iter()
-                        .map(|contract| {
-                            let graph = stage_graph_fingerprint(&contract.stages)?;
-                            let use_kind = match contract.execution_profile.mode {
-                                crate::engine::ExecutionMode::Sequence => {
-                                    RetainedStateUseV2::ExternalPaged
-                                }
-                                crate::engine::ExecutionMode::Atomic => {
-                                    RetainedStateUseV2::Inactive
-                                }
-                                _ => {
-                                    return Err(Error::ModelLoadError(
-                                        "Granite Speech ASR graph has an incompatible retained-state profile"
-                                            .into(),
-                                    ));
-                                }
-                            };
-                            Ok((graph, use_kind))
-                        })
-                        .collect::<Result<HashMap<_, _>>>()?;
-                    (Some(retained.into()), uses)
-                } else {
-                    if physical_spec.retained.is_some()
-                        || physical_spec.retained_max_tokens.is_some()
-                    {
-                        return Err(Error::ModelLoadError(
-                            "speaker-attributed Granite Speech graph unexpectedly requested retained state"
-                                .into(),
-                        ));
-                    }
-                    (None, HashMap::new())
-                };
-                let publication = self
-                    .load_invocation_workspace_publication_with_remaining_groups(
-                        model_instance_id,
-                        &contracts,
-                        physical_spec.descriptor,
-                        &physical_spec.invocation,
-                        retained,
-                        retained_uses,
-                        if capability == CapabilityKind::Asr { 2 } else { 1 },
-                    )
-                    .await?;
-                state_publications.insert(capability, publication);
-            }
+            state_publications.extend(
+                self.load_granite_speech_state_publications(
+                    variant,
+                    model_instance_id,
+                    bundle_draft,
+                    |graphs| model.granite_speech_physical_state_spec(graphs),
+                )
+                .await?,
+            );
         }
         Ok(())
+    }
+
+    /// Publish the state each Granite Speech capability's stage graphs need,
+    /// as `physical_state_spec` authors it for them.
+    pub(super) async fn load_granite_speech_state_publications(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        physical_state_spec: impl Fn(
+            &[&[StageDescriptor]],
+        ) -> Result<
+            crate::models::architectures::granite_speech::asr::GraniteSpeechPhysicalStateSpec,
+        >,
+    ) -> Result<HashMap<CapabilityKind, LoadedStatePublication>> {
+        let mut publications = HashMap::new();
+        for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
+            if self.adapter_registry.require(capability, variant).is_err() {
+                continue;
+            }
+            let contracts = bundle_draft.execution_contracts(capability)?;
+            let stage_graphs = contracts
+                .iter()
+                .map(|contract| contract.stages.as_ref())
+                .collect::<Vec<_>>();
+            let physical_spec = physical_state_spec(&stage_graphs)?;
+            // Without resumable prefill the ASR capability offers no
+            // retained graph, so the model authors no retained state and
+            // none is allocated (GRN-8).
+            let retained_route =
+                capability == CapabilityKind::Asr && physical_spec.retained.is_some();
+            let (retained, retained_uses) = if retained_route {
+                let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "Granite Speech ASR graph did not author retained decoder state".into(),
+                    )
+                })?;
+                let retained_max_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "Granite Speech retained decoder has no context bound".into(),
+                    )
+                })?;
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        retained_contract,
+                        Some(retained_max_tokens),
+                        2,
+                        self.asr_state_rows(),
+                        asr_minimum_tokens(variant),
+                    )
+                    .await?;
+                self.model_registry
+                    .publish_effective_context(variant, retained.logical_token_reach())?;
+                self.model_registry.publish_kv_storage(variant, &retained);
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Asr,
+                    retained.state_plan_v2(),
+                )?;
+                let uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => {
+                                RetainedStateUseV2::Inactive
+                            }
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Granite Speech ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                (Some(retained.into()), uses)
+            } else {
+                if physical_spec.retained.is_some() || physical_spec.retained_max_tokens.is_some() {
+                    return Err(Error::ModelLoadError(
+                        "speaker-attributed Granite Speech graph unexpectedly requested retained state"
+                            .into(),
+                    ));
+                }
+                (None, HashMap::new())
+            };
+            let publication = self
+                .load_invocation_workspace_publication_with_remaining_groups(
+                    model_instance_id,
+                    &contracts,
+                    physical_spec.descriptor,
+                    &physical_spec.invocation,
+                    retained,
+                    retained_uses,
+                    LaterStateGroups::sharing(if capability == CapabilityKind::Asr {
+                        2
+                    } else {
+                        1
+                    }),
+                )
+                .await?;
+            publications.insert(capability, publication);
+        }
+        Ok(publications)
     }
 
     /// Offline ASR (every family but Granite Speech): retained and invocation
@@ -649,6 +669,7 @@ impl ModelLifecycleController {
                         Some(physical_spec.retained_max_tokens),
                         asr_minimum_tokens(variant),
                         state_fit_reserve,
+                        0,
                     )
                     .await?;
                 let retained_uses = contracts
@@ -853,7 +874,7 @@ impl ModelLifecycleController {
                             main_invocation,
                             Some(retained.into()),
                             retained_uses,
-                            remaining_automatic_state_groups,
+                            LaterStateGroups::sharing(remaining_automatic_state_groups),
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -867,9 +888,9 @@ impl ModelLifecycleController {
                         .map_or(physical_spec.retained_max_tokens, |tokens| {
                             physical_spec.retained_max_tokens.min(tokens)
                         });
-                    // The ASR fit above already sized this model's
-                    // retained runtime (bound to the same contract), so
-                    // this fit asks for no floor of its own.
+                    // The ASR fit above already bound this model's
+                    // retained runtime for the same contract; this call
+                    // returns it without fitting again.
                     let retained = self
                         .core_engine
                         .load_managed_model_state(
@@ -878,6 +899,7 @@ impl ModelLifecycleController {
                             Some(retained_max_tokens),
                             0,
                             state_fit_reserve,
+                            0,
                         )
                         .await?;
                     self.model_registry.publish_effective_context(
@@ -915,7 +937,7 @@ impl ModelLifecycleController {
                             depthformer,
                             Some(retained.into()),
                             retained_uses,
-                            remaining_automatic_state_groups,
+                            LaterStateGroups::sharing(remaining_automatic_state_groups),
                         )
                         .await?;
                     state_publications.insert(capability, publication);
@@ -935,7 +957,7 @@ impl ModelLifecycleController {
                         &physical_spec.invocation,
                         None,
                         HashMap::new(),
-                        remaining_automatic_state_groups,
+                        LaterStateGroups::sharing(remaining_automatic_state_groups),
                     )
                     .await?;
                 state_publications.insert(capability, publication);
@@ -964,6 +986,10 @@ impl ModelLifecycleController {
                         "loaded Qwen3 TTS model {variant} is missing from the registry"
                     ))
                 })?;
+            // Plan both capabilities first: the retained fit and each
+            // predictor fit must leave room for the predictor workspaces
+            // loaded after them.
+            let mut planned = Vec::with_capacity(2);
             for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
                 if self.adapter_registry.require(capability, variant).is_err() {
                     continue;
@@ -974,6 +1000,27 @@ impl ModelLifecycleController {
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                // At its context floor, if it has a context axis.
+                let floor = physical_spec
+                    .descriptor
+                    .capacity_axis_bounds(StateCapacityAxis::DecoderContext)
+                    .map(|(minimum, _)| minimum);
+                let predictor_bytes = invocation_state_bytes(
+                    &physical_spec.descriptor,
+                    &physical_spec.predictor_contract,
+                    &contracts,
+                    floor,
+                )?;
+                planned.push((capability, contracts, physical_spec, predictor_bytes));
+            }
+            let mut later_predictor_bytes = planned
+                .iter()
+                .try_fold(0_u64, |total, (.., bytes)| total.checked_add(*bytes))
+                .ok_or_else(|| {
+                    Error::ModelLoadError("Qwen3-TTS state byte plan overflow".into())
+                })?;
+            let mut remaining_groups = u64::try_from(planned.len()).unwrap_or(u64::MAX);
+            for (capability, contracts, physical_spec, predictor_bytes) in planned {
                 if !managed_kv_backend_compiled(backend) {
                     return Err(Error::ModelLoadError(format!(
                         "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
@@ -985,6 +1032,9 @@ impl ModelLifecycleController {
                     .map_or(physical_spec.retained_max_tokens, |tokens| {
                         physical_spec.retained_max_tokens.min(tokens)
                     });
+                // Both capabilities bind one retained arena: the first call
+                // fits it, leaving both predictor workspaces free; the second
+                // gets the bound runtime back.
                 let retained = self
                     .core_engine
                     .load_managed_model_state(
@@ -993,8 +1043,12 @@ impl ModelLifecycleController {
                         Some(retained_max_tokens),
                         tts_state_minimum_tokens(variant),
                         state_fit_reserve,
+                        later_predictor_bytes,
                     )
                     .await?;
+                // This capability's predictor is fitted next; only the ones
+                // after it stay held back.
+                later_predictor_bytes = later_predictor_bytes.saturating_sub(predictor_bytes);
                 // Each request reserves the encoder memory it creates
                 // (prefill workspace), so the rows are not also pending.
                 self.core_engine
@@ -1045,18 +1099,13 @@ impl ModelLifecycleController {
                         &physical_spec.predictor_contract,
                         Some(retained.into()),
                         retained_uses,
-                        if capability == CapabilityKind::Tts
-                            && self
-                                .adapter_registry
-                                .require(CapabilityKind::StreamingTts, variant)
-                                .is_ok()
-                        {
-                            3
-                        } else {
-                            1
+                        LaterStateGroups {
+                            remaining: remaining_groups,
+                            minimum_bytes: later_predictor_bytes,
                         },
                     )
                     .await?;
+                remaining_groups = remaining_groups.saturating_sub(1);
                 state_publications.insert(capability, publication);
             }
         }
@@ -1108,6 +1157,7 @@ impl ModelLifecycleController {
                     retained_max_tokens,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
+                    0,
                 )
                 .await?;
             self.model_registry.publish_effective_context(
@@ -1244,6 +1294,7 @@ impl ModelLifecycleController {
                     Some(physical_spec.retained_max_tokens),
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
+                    0,
                 )
                 .await?;
             self.model_registry.publish_effective_context(

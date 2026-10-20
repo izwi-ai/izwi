@@ -26,20 +26,9 @@ pub(super) fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimat
     const GIB: u64 = 1024 * 1024 * 1024;
 
     let inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
-    let base = match variant {
-        // The 5 GiB catalog value describes total inference memory, including
-        // request-scoped activations and audio workspace that the coordinator
-        // reserves separately. The GGUF loader retains about 2.25 GiB of
-        // quantized/dequantized tensors; 3 GiB covers model-owned load overlap,
-        // tokenizer metadata, allocator alignment, and steady residency.
-        ModelVariant::Lfm25Audio15BGguf => ModelMemoryEstimate {
-            load_peak_bytes: 3 * GIB,
-            resident_bytes: 3 * GIB,
-        },
-        _ => ModelMemoryEstimate {
-            load_peak_bytes: inference_bytes,
-            resident_bytes: inference_bytes,
-        },
+    let base = ModelMemoryEstimate {
+        load_peak_bytes: inference_bytes,
+        resident_bytes: inference_bytes,
     };
     let memo_bytes = match variant {
         ModelVariant::Nemotron35AsrStreaming06B => {
@@ -77,8 +66,9 @@ pub(super) fn checkpoint_resource_plan(
         )?;
         return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
     }
-    // ASR, TTS and LFM2.5 chat price what their loader allocates on every
-    // backend; the catalog figure stays a display value for them.
+    // ASR, TTS, LFM2.5 chat and Qwen3.5 / Qwen3 chat (CPU and Metal) price what
+    // their loader allocates; the catalog figure stays a display value for
+    // them.
     if let Some(plan) = asr_memory::resource_plan(variant, model_path, device, granite)? {
         return Ok(Some(plan));
     }
@@ -88,6 +78,16 @@ pub(super) fn checkpoint_resource_plan(
             model_path,
             BackendKind::from(device.kind),
         );
+    }
+    if variant.family() == crate::catalog::ModelFamily::Qwen35Chat {
+        return asr_memory::qwen35_chat_resource_plan(
+            variant,
+            model_path,
+            BackendKind::from(device.kind),
+        );
+    }
+    if variant.family() == crate::catalog::ModelFamily::Qwen3Chat {
+        return asr_memory::qwen3_chat_resource_plan(variant, model_path, device);
     }
     tts_memory::resource_plan(variant, model_path, device)
 }
@@ -431,6 +431,7 @@ pub(super) fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEst
         load_authorization,
         resident_authorization,
         deferred_resident_authorization: ResourceVector::zero(),
+        host_staging_bytes: 0,
     }
 }
 
@@ -463,13 +464,26 @@ pub(super) fn fish_s2_resource_plan(
     backend: BackendKind,
     memory: crate::models::architectures::fish_s2::weights::FishS2ModelMemory,
 ) -> Result<ModelResourcePlan> {
+    // On Metal the GPU allocates only the final tensors (staged transformer
+    // uploads, codec uploaded from the host); the rest of the load peak is
+    // host staging, which the GPU working set does not hold.
+    let device_load_peak_bytes = if backend == BackendKind::Metal {
+        memory.metal_device_load_peak_bytes
+    } else {
+        memory.load_peak_bytes
+    };
     let mut plan = model_resource_plan(
         backend,
         ModelMemoryEstimate {
-            load_peak_bytes: memory.load_peak_bytes,
+            load_peak_bytes: device_load_peak_bytes,
             resident_bytes: memory.resident_bytes,
         },
     );
+    if backend == BackendKind::Metal {
+        plan.host_staging_bytes = memory
+            .load_peak_bytes
+            .saturating_sub(device_load_peak_bytes);
+    }
     if backend == BackendKind::Cuda {
         plan.load_authorization.host_bytes =
             ResourceAmount::Known(memory.cuda_host_load_peak_bytes);

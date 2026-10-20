@@ -17,6 +17,8 @@ use crate::ConfigError;
 
 /// Environment variables that may be deliberately inherited by a worker.
 /// Everything else is removed before these and the assignment variables are set.
+/// The allocator switch passes an operator's own value through; unset, a
+/// worker gets the serving default ([`izwi_env::serving_allocator_env`]).
 pub const INHERITED_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "RUST_LOG",
@@ -26,6 +28,7 @@ pub const INHERITED_ENV_ALLOWLIST: &[&str] = &[
     "TEMP",
     "TMP",
     "SYSTEMROOT",
+    izwi_env::allocator::MALLOC_LARGE_CACHE_ENV,
 ];
 
 pub const MAX_WORKER_ENVIRONMENT_ENTRIES: usize = 64;

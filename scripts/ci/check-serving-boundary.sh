@@ -52,7 +52,10 @@ for crate in "${boundary_crates[@]}"; do
 done
 
 worker_tree="$(tree_of izwi-serving-worker)"
-if ! printf '%s\n' "${worker_tree}" | grep -Eq 'izwi-core v'; then
+# Here-strings, not `printf | grep -q`: grep -q exits at its first match,
+# and under pipefail the printf it leaves writing into a closed pipe fails
+# the pipeline (SIGPIPE), turning a match into a false error.
+if ! grep -Eq 'izwi-core v' <<<"${worker_tree}"; then
     echo "error: izwi-serving-worker must own its runtime via izwi-core" >&2
     failures=$((failures + 1))
 else
@@ -60,7 +63,7 @@ else
 fi
 # The worker shares only the launch contract (izwi-serving-fence) with its
 # supervisor; linking the supervisor would drag its control plane in.
-if printf '%s\n' "${worker_tree}" | grep -Eq 'izwi-serving-supervisor v'; then
+if grep -Eq 'izwi-serving-supervisor v' <<<"${worker_tree}"; then
     echo "error: izwi-serving-worker must not link izwi-serving-supervisor" >&2
     failures=$((failures + 1))
 else

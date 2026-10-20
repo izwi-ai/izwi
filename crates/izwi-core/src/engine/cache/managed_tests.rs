@@ -1177,9 +1177,24 @@ fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
             .unwrap()
     };
     assert_eq!(fit(PortableFitHeadroom::Planning { minimum_tokens: 0 }), 4_096);
+    // S3: pre-load admission prices a floor exactly as the fit does, the
+    // page minimum included.
+    assert_eq!(
+        manager
+            .portable_state_bytes(&contract, 1_307, 64, (8, 8), 1)
+            .unwrap(),
+        Some(bytes(1_307))
+    );
+    assert_eq!(
+        manager
+            .portable_state_bytes(&contract, 0, 64, (8, 8), 1)
+            .unwrap(),
+        Some(bytes(64))
+    );
     let live = fit(PortableFitHeadroom::Live {
         minimum_tokens: 0,
         reserve: StateFitReserve::MeasuredUntracked,
+        later_minimum_bytes: 0,
     });
     assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
 
@@ -1213,6 +1228,7 @@ fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
             PortableFitHeadroom::Live {
                 minimum_tokens: floor,
                 reserve: StateFitReserve::MeasuredUntracked,
+                later_minimum_bytes: 0,
             },
         )
     };
@@ -1239,6 +1255,52 @@ fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
     assert_eq!(
         fit_with(RESERVE + bytes(4_096), RESERVE / 2, 1 << 20).unwrap(),
         4_096
+    );
+
+    // S2: the minimums of the state groups loaded after this one stay free
+    // beside the reserve. Holding back 1,024 tokens' worth caps growth that
+    // much lower, and a floor that would leave them no room is refused.
+    let fit_holding = |later_minimum_bytes: u64, floor: u64| {
+        let total = host_bytes_vector(RESERVE + bytes(4_096));
+        ManagedKvCacheManager::for_worker(
+            Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
+                TestCapacityProvider {
+                    snapshot: PhysicalCapacitySnapshot {
+                        capacity: total,
+                        available: total,
+                        source: CapacitySource::Test,
+                    },
+                },
+            )))),
+            BackendKind::Cpu,
+            Device::Cpu,
+        )
+        .fit_portable_logical_token_reach(
+            ModelInstanceId::new(903),
+            &contract,
+            4_096,
+            RESERVE,
+            64,
+            8,
+            8,
+            1,
+            PortableFitHeadroom::Live {
+                minimum_tokens: floor,
+                reserve: StateFitReserve::MeasuredUntracked,
+                later_minimum_bytes,
+            },
+        )
+    };
+    assert_eq!(fit_holding(0, 0).unwrap(), 4_096);
+    assert_eq!(fit_holding(bytes(1_024), 0).unwrap(), 3_072);
+    assert_eq!(fit_holding(bytes(1_024), 3_072).unwrap(), 3_072);
+    let refused = fit_holding(bytes(1_024) + 1, 3_072).unwrap_err();
+    assert!(matches!(refused, Error::Overloaded(_)), "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("the working state loaded after it"),
+        "{refused}"
     );
 }
 

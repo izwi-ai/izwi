@@ -86,9 +86,13 @@ pub(crate) fn fish_s2_codec_memory(specs: &[PthTensorSpec]) -> Result<FishS2Code
     let has_generator = specs.iter().any(|spec| spec.name.contains("generator."));
     let mut normalized = BTreeMap::new();
     for spec in specs {
+        if is_fish_s2_codec_buffer(&spec.name) {
+            // Never read (`FishS2CodecWeights::load`).
+            continue;
+        }
         let source_bytes = codec_spec_bytes(spec, spec.dtype)?;
         let target_bytes = codec_spec_bytes(spec, DType::F32)?;
-        // read_all precedes generator selection and normalization in the loader.
+        // The host read precedes generator selection and normalization in the loader.
         memory.raw_load_bytes = checked_codec_bytes(memory.raw_load_bytes, target_bytes)?;
         memory.largest_source_tensor_bytes = memory.largest_source_tensor_bytes.max(source_bytes);
         memory.largest_target_tensor_bytes = memory.largest_target_tensor_bytes.max(target_bytes);
@@ -186,15 +190,24 @@ impl FishS2CodecArtifact {
 }
 
 impl FishS2CodecWeights {
+    /// Read the codec on the host, without the positional buffers the DAC
+    /// regenerates, and fuse its weight-norm pairs there; then upload what
+    /// the DAC reads, one tensor at a time, contiguous and at its exact size.
+    /// Read and fused on the device, the codec kept every weight-norm pair
+    /// beside its fused weight until the load fence, and each fused weight in
+    /// a power-of-two buffer for the model's life.
     pub fn load(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let archive = PthTensorMap::open_first_non_empty(
             path,
             &[None, Some("state_dict"), Some("generator")],
         )?;
         let specs = archive.specs();
-        let raw = archive.read_all(device, Some(dtype))?;
-        let tensors = normalize_fish_s2_codec_state_dict(raw)?;
-        validate_codec_state_dict(&tensors)?;
+        let raw = archive.read_where(&Device::Cpu, Some(dtype), |name| {
+            !is_fish_s2_codec_buffer(name)
+        })?;
+        let host = normalize_fish_s2_codec_state_dict(raw)?;
+        validate_codec_state_dict(&host)?;
+        let tensors = upload_codec_weights(host, device)?;
         Ok(Self {
             tensors,
             specs,
@@ -257,6 +270,46 @@ impl FishS2CodecWeights {
     pub fn var_builder(&self) -> VarBuilder<'_> {
         VarBuilder::from_tensors(self.tensors.clone(), self.dtype, &self.device)
     }
+}
+
+/// The codec's positional buffers (`freqs_cis`, `causal_mask`), which the
+/// native DAC regenerates: never read or priced. (Candle 0.11 already skips
+/// the boolean masks, 1.21 GB at F32, which it cannot parse.)
+pub(crate) fn is_fish_s2_codec_buffer(name: &str) -> bool {
+    name.ends_with(".freqs_cis") || name.ends_with(".causal_mask")
+}
+
+/// The normalized host codec on `device`: every tensor the DAC reads,
+/// contiguous, at its exact size; a weight-norm pair whose fused `weight` is
+/// present stays behind. Each host tensor is dropped once uploaded.
+fn upload_codec_weights(
+    host: HashMap<String, Tensor>,
+    device: &Device,
+) -> Result<HashMap<String, Tensor>> {
+    const PAIR_SUFFIXES: [&str; 4] = [
+        ".weight_g",
+        ".weight_v",
+        ".parametrizations.weight.original0",
+        ".parametrizations.weight.original1",
+    ];
+    let fused = |name: &str| {
+        PAIR_SUFFIXES.iter().any(|suffix| {
+            name.strip_suffix(suffix)
+                .is_some_and(|base| host.contains_key(&format!("{base}.weight")))
+        })
+    };
+    let names = host
+        .keys()
+        .filter(|name| !fused(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut host = host;
+    let mut tensors = HashMap::with_capacity(names.len());
+    for name in names {
+        let tensor = host.remove(&name).expect("listed codec tensor");
+        tensors.insert(name, tensor.contiguous()?.to_device(device)?);
+    }
+    Ok(tensors)
 }
 
 fn normalize_fish_s2_codec_state_dict(
@@ -411,7 +464,8 @@ mod tests {
             fish_s2_codec_memory(&specs).unwrap(),
             FishS2CodecMemory {
                 resident_parameter_bytes: 48,
-                raw_load_bytes: 16_480,
+                // `freqs_cis` is never read.
+                raw_load_bytes: 16_448,
                 fused_load_bytes: 40,
                 largest_source_tensor_bytes: 16_384,
                 largest_target_tensor_bytes: 16_384,

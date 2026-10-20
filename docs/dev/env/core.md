@@ -110,6 +110,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
 | `IZWI_HOST` | text | `127.0.0.1` | startup | Sets the HTTP server bind address. |
 | `IZWI_INFERENCE_BROKER` | choice | `off` | startup | Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off. |
+| `IZWI_KEEP_NEMO_ARCHIVES` | flag | `false` | model load | Keeps the Parakeet and Nemotron ASR .nemo archives after a load from their extracted checkpoints; by default they are deleted (2.4-2.5 GB each). |
 | `IZWI_KOKORO_CPU_PREDECODER` | flag | `true` | first use | Runs the Kokoro CPU pre-decoder stages in parallel; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_RESBLOCKS` | flag | `true` | first use | Runs Kokoro decoder residual-block kernels in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_STAGE_BRANCHES` | flag | `true` | first use | Runs the two branches of each Kokoro generator upsample stage in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
@@ -164,6 +165,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_MEDIA_LOCAL_ROOT` | path | unset (local file media disabled) | first use | Sets the absolute directory Qwen3.5 vision may read file:// media from; unset disables local media. |
 | `IZWI_METAL_DTYPE` | choice | `auto` | model load | Overrides the Metal compute dtype for all families: auto, f32, f16 or bf16 (aliases accepted); invalid warns, uses auto. |
 | `IZWI_METAL_GQA_DECODE` | flag | `true` | first use | Enables the Metal simdgroup GQA decode attention kernels; off restores scalar kernels. |
+| `IZWI_METAL_LOAD_ADMISSION` | choice | `advisory` | startup | How host memory gates Metal loads and requests: advisory (only the GPU working set gates; a load larger than macOS reports available is logged and reported), strict (host memory gates too) or off (no live check before a load); invalid = startup error. |
 | `IZWI_METAL_MEMORY_BUDGET_BYTES` | bytes | derived from the Metal working set | startup | Caps the Metal memory budget in bytes for admission; must be a positive integer or runtime construction fails. |
 | `IZWI_METAL_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses Metal block-FP8 projection residency: auto, native_fp8 (keep FP8) or expanded (F16); invalid = startup error. |
 | `IZWI_METAL_SDPA_F32_PREFILL_F16` | flag | `true` | first use | Casts F32 Metal prefill attention (q_seq > 8) to F16 for the SDPA kernel. |

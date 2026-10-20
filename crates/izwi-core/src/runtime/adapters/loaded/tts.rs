@@ -758,7 +758,8 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
         preparation.max_batch_size = 1;
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
-        preparation.max_work_units = 16_384;
+        preparation.max_work_units =
+            crate::models::architectures::vibevoice::VIBEVOICE_TTS_STAGE_MAX_TOKENS as u64;
         preparation.max_workspace_bytes = 512 * 1024 * 1024;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
@@ -772,7 +773,8 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
         prefill.max_batch_size = 1;
         prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Exact;
-        prefill.max_work_units = 16_384;
+        prefill.max_work_units =
+            crate::models::architectures::vibevoice::VIBEVOICE_TTS_STAGE_MAX_TOKENS as u64;
         prefill.max_workspace_bytes = 512 * 1024 * 1024;
         prefill.retained_state_selections = Some(vec![]);
         prefill.output_visibility = OutputVisibility::AfterQuantumCommit;

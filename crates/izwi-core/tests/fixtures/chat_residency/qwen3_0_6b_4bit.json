@@ -1,0 +1,36 @@
+{
+  "source": "mlx-community/Qwen3-0.6B-4bit safetensors header (MLX 4-bit, group 64)",
+  "files": [
+    {"path": "model.safetensors", "format": "safetensors", "total_bytes": 335372288, "tensor_count": 704, "tensors": [
+      ["model.embed_tokens.biases", "BF16", [151936, 16]],
+      ["model.embed_tokens.scales", "BF16", [151936, 16]],
+      ["model.embed_tokens.weight", "U32", [151936, 128]],
+      ["model.norm.weight", "BF16", [1024]],
+      ["model.layers.{i}.input_layernorm.weight", "BF16", [1024], 0, 28],
+      ["model.layers.{i}.mlp.down_proj.biases", "BF16", [1024, 48], 0, 28],
+      ["model.layers.{i}.mlp.down_proj.scales", "BF16", [1024, 48], 0, 28],
+      ["model.layers.{i}.mlp.down_proj.weight", "U32", [1024, 384], 0, 28],
+      ["model.layers.{i}.mlp.gate_proj.biases", "BF16", [3072, 16], 0, 28],
+      ["model.layers.{i}.mlp.gate_proj.scales", "BF16", [3072, 16], 0, 28],
+      ["model.layers.{i}.mlp.gate_proj.weight", "U32", [3072, 128], 0, 28],
+      ["model.layers.{i}.mlp.up_proj.biases", "BF16", [3072, 16], 0, 28],
+      ["model.layers.{i}.mlp.up_proj.scales", "BF16", [3072, 16], 0, 28],
+      ["model.layers.{i}.mlp.up_proj.weight", "U32", [3072, 128], 0, 28],
+      ["model.layers.{i}.post_attention_layernorm.weight", "BF16", [1024], 0, 28],
+      ["model.layers.{i}.self_attn.k_norm.weight", "BF16", [128], 0, 28],
+      ["model.layers.{i}.self_attn.k_proj.biases", "BF16", [1024, 16], 0, 28],
+      ["model.layers.{i}.self_attn.k_proj.scales", "BF16", [1024, 16], 0, 28],
+      ["model.layers.{i}.self_attn.k_proj.weight", "U32", [1024, 128], 0, 28],
+      ["model.layers.{i}.self_attn.o_proj.biases", "BF16", [1024, 32], 0, 28],
+      ["model.layers.{i}.self_attn.o_proj.scales", "BF16", [1024, 32], 0, 28],
+      ["model.layers.{i}.self_attn.o_proj.weight", "U32", [1024, 256], 0, 28],
+      ["model.layers.{i}.self_attn.q_norm.weight", "BF16", [128], 0, 28],
+      ["model.layers.{i}.self_attn.q_proj.biases", "BF16", [2048, 16], 0, 28],
+      ["model.layers.{i}.self_attn.q_proj.scales", "BF16", [2048, 16], 0, 28],
+      ["model.layers.{i}.self_attn.q_proj.weight", "U32", [2048, 128], 0, 28],
+      ["model.layers.{i}.self_attn.v_proj.biases", "BF16", [1024, 16], 0, 28],
+      ["model.layers.{i}.self_attn.v_proj.scales", "BF16", [1024, 16], 0, 28],
+      ["model.layers.{i}.self_attn.v_proj.weight", "U32", [1024, 128], 0, 28]
+    ]}
+  ]
+}
