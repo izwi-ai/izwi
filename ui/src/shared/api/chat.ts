@@ -115,6 +115,11 @@ export interface ChatThreadUpdateRequest {
   system_prompt?: string;
 }
 
+export interface ChatThreadTitleRequest {
+  /** The model that answered; the server defaults to the first reply's. */
+  model_id?: string | null;
+}
+
 export interface ChatThreadContentPart {
   type:
     | "text"
@@ -421,6 +426,24 @@ export class ChatApiClient {
         system_prompt: request.system_prompt,
       }),
     });
+  }
+
+  /**
+   * Titles a thread still called "New chat" from its first exchange. The
+   * server writes the title with thinking off and returns the thread; a
+   * thread that has a title comes back unchanged.
+   */
+  async generateChatThreadTitle(
+    threadId: string,
+    request: ChatThreadTitleRequest = {},
+  ): Promise<ChatThread> {
+    return this.http.request(
+      `/chat/threads/${encodeURIComponent(threadId)}/title`,
+      {
+        method: "POST",
+        body: JSON.stringify({ model: request.model_id ?? undefined }),
+      },
+    );
   }
 
   async getChatThread(threadId: string): Promise<ChatThreadDetail> {

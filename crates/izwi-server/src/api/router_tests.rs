@@ -2766,6 +2766,87 @@ async fn text_to_speech_list_reports_total_and_validates_filters() {
     }
 }
 
+/// A thread is titled from its first exchange. With no loaded model to
+/// write one, the title is the first message's opening words; a thread the
+/// user renamed keeps its name.
+#[tokio::test]
+async fn chat_thread_title_route_titles_untitled_threads_only() {
+    let (state, _root) = test_state("chat_thread_title_route", false);
+    state.lifecycle.mark_ready();
+    let thread = state.chat_store.create_thread(None, None).await.unwrap();
+    let pending = state
+        .chat_store
+        .prepare_user_message(thread.id.clone(), "  Name one\nplanet  ".into(), None)
+        .await
+        .unwrap();
+    state
+        .chat_store
+        .append_turn_with_system_prompt(
+            pending,
+            "Thinking about planets</think>Mars.".into(),
+            "Qwen3.5-0.8B".into(),
+            1,
+            1.0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let title_path = format!("/v1/chat/threads/{}/title", thread.id);
+
+    let response = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            &title_path,
+            Some(r#"{"model":"Qwen3.5-0.8B"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["title"], "Name one planet");
+
+    state
+        .chat_store
+        .update_thread_settings(thread.id.clone(), Some("Planets".into()), None)
+        .await
+        .unwrap();
+    let response = send_request(
+        app.clone(),
+        build_request(Method::POST, &title_path, Some("{}")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["title"], "Planets");
+
+    let response = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            &title_path,
+            Some(r#"{"model":"not-a-model"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a titled thread is never regenerated"
+    );
+    let response = send_request(
+        app,
+        build_request(Method::POST, "/v1/chat/threads/missing/title", Some("{}")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn chat_message_routes_delete_and_refuse_the_wrong_targets() {
     let (state, _root) = test_state("chat_message_routes", false);

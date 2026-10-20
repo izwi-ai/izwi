@@ -129,6 +129,8 @@ pub struct AdminSpeechModelCapabilities {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AdminChatModelCapabilities {
     pub supports_thinking: bool,
+    /// False when the model always reasons: a thinking switch would do nothing.
+    pub thinking_toggleable: bool,
     pub default_thinking_enabled: bool,
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
@@ -244,6 +246,7 @@ impl From<ChatModelCapabilities> for AdminChatModelCapabilities {
     fn from(capabilities: ChatModelCapabilities) -> Self {
         Self {
             supports_thinking: capabilities.supports_thinking,
+            thinking_toggleable: capabilities.thinking_toggleable,
             default_thinking_enabled: capabilities.default_thinking_enabled,
             reasoning_efforts: capabilities
                 .reasoning_efforts
@@ -1076,6 +1079,7 @@ mod tests {
         assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
         assert_eq!(value["pinned"], true);
         assert_eq!(value["chat_capabilities"]["supports_thinking"], true);
+        assert_eq!(value["chat_capabilities"]["thinking_toggleable"], true);
         assert_eq!(
             value["chat_capabilities"]["default_reasoning_effort"],
             "xhigh"

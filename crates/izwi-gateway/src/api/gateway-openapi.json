@@ -23,10 +23,15 @@
           },
           "supports_thinking": {
             "type": "boolean"
+          },
+          "thinking_toggleable": {
+            "description": "False when the model always reasons: a thinking switch would do nothing.",
+            "type": "boolean"
           }
         },
         "required": [
           "supports_thinking",
+          "thinking_toggleable",
           "default_thinking_enabled",
           "reasoning_efforts",
           "supports_preserve_thinking"

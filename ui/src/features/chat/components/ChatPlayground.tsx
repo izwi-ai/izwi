@@ -50,13 +50,11 @@ import {
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
-  fallbackThreadTitleFromUserMessage,
   getErrorMessage,
   parseAssistantContent,
   stripMarkdown,
   isSameCalendarDay,
   messageDayLabel,
-  normalizeGeneratedThreadTitle,
   readImageFileAsDataUrl,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
@@ -382,6 +380,8 @@ export function ChatPlayground({
       messagesLoading ||
       activeThreadLoadError !== null);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  // A model that always reasons shows a label, not a switch that does nothing.
+  const thinkingToggleable = chatCapabilities?.thinking_toggleable ?? true;
   const supportedReasoningEfforts =
     chatCapabilities?.reasoning_efforts ?? [];
   const reasoningEffortOptionsKey = supportedReasoningEfforts.join(",");
@@ -448,8 +448,9 @@ export function ChatPlayground({
       return;
     }
     setIsThinkingEnabled(
-      chatCapabilities?.default_thinking_enabled ??
-        defaultThinkingEnabledForModel(selectedModel),
+      !thinkingToggleable ||
+        (chatCapabilities?.default_thinking_enabled ??
+          defaultThinkingEnabledForModel(selectedModel)),
     );
     setReasoningEffort(
       chatCapabilities?.default_reasoning_effort ??
@@ -463,6 +464,7 @@ export function ChatPlayground({
     reasoningEffortOptionsKey,
     selectedModel,
     supportsThinking,
+    thinkingToggleable,
   ]);
 
   useEffect(() => {
@@ -489,73 +491,38 @@ export function ChatPlayground({
     [setActiveThreadInUrl],
   );
 
+  /**
+   * Asks the server to title a thread still called "New chat" once a turn
+   * has finished. The server writes the title from the first exchange with
+   * thinking off, so a reasoning model's thoughts never become the title. A
+   * failure leaves "New chat" for the next turn to try again.
+   */
   const maybeGenerateThreadTitle = useCallback(
-    async (args: GenerateTitleArgs) => {
-      const { threadId, userContent, assistantContent, modelId } = args;
-
+    async ({ threadId, modelId }: GenerateTitleArgs) => {
       const existingThread = threadsRef.current.find(
         (thread) => thread.id === threadId,
       );
       if (
         existingThread &&
-        existingThread.title !== DEFAULT_THREAD_TITLE &&
         displayThreadTitle(existingThread.title) !== DEFAULT_THREAD_TITLE
       ) {
         return;
       }
-
       if (titleGenerationInFlightRef.current.has(threadId)) {
         return;
       }
-
       titleGenerationInFlightRef.current.add(threadId);
-
-      let nextTitle: string | null = null;
-
-      if (modelId) {
-        try {
-          const titleResponse = await api.createResponse({
-            model_id: modelId,
-            instructions:
-              "Generate a concise chat title (max 8 words) that summarizes the conversation topic. Return only the title text with no quotes, punctuation suffix, or commentary.",
-            input: `User: ${userContent}\nAssistant: ${assistantContent}`,
-            max_output_tokens: 24,
-            store: false,
-          });
-
-          nextTitle = normalizeGeneratedThreadTitle(titleResponse.output_text);
-        } catch {
-          // Fall back to deterministic title below.
-        }
-      }
-
-      if (!nextTitle) {
-        nextTitle = fallbackThreadTitleFromUserMessage(userContent);
-      }
-
-      if (!nextTitle || nextTitle === DEFAULT_THREAD_TITLE) {
-        titleGenerationInFlightRef.current.delete(threadId);
-        return;
-      }
-
       try {
-        const updatedThread = await api.updateChatThread(threadId, {
-          title: nextTitle,
+        const updatedThread = await api.generateChatThreadTitle(threadId, {
+          model_id: modelId,
         });
-
         setThreads((previous) =>
           previous.map((thread) =>
             thread.id === updatedThread.id ? updatedThread : thread,
           ),
         );
       } catch {
-        setThreads((previous) =>
-          previous.map((thread) =>
-            thread.id === threadId
-              ? { ...thread, title: nextTitle ?? thread.title }
-              : thread,
-          ),
-        );
+        // Keep "New chat"; the next finished turn asks again.
       } finally {
         titleGenerationInFlightRef.current.delete(threadId);
       }
@@ -1056,11 +1023,6 @@ export function ChatPlayground({
       images: submittedDraft.pendingImages,
     });
 
-    const isFirstTurn =
-      targetThreadId === activeThreadId
-        ? messages.filter((message) => message.role === "user").length === 0
-        : true;
-
     const timestamp = Date.now();
     const userTempId = `tmp-user-${timestamp}`;
     const optimisticUserMessage: ChatThreadMessageRecord = {
@@ -1082,7 +1044,6 @@ export function ChatPlayground({
       shown: (previous) => [...previous, optimisticUserMessage],
       promptId: userTempId,
       replacedIds: [],
-      titleFrom: isFirstTurn ? requestPayload.content : null,
       restoreOnFailure: false,
       failureMessage: "Failed to send this message.",
       start: (callbacks) =>
@@ -1135,7 +1096,6 @@ export function ChatPlayground({
     shown,
     promptId,
     replacedIds,
-    titleFrom,
     restoreOnFailure,
     failureMessage,
     start,
@@ -1146,7 +1106,6 @@ export function ChatPlayground({
     shown: (previous: ChatThreadMessageRecord[]) => ChatThreadMessageRecord[];
     promptId: string;
     replacedIds: string[];
-    titleFrom: string | null;
     restoreOnFailure: boolean;
     failureMessage: string;
     start: (callbacks: ChatThreadStreamCallbacks) => AbortController;
@@ -1191,6 +1150,7 @@ export function ChatPlayground({
     setStreamingThreadId(threadId);
 
     let streamFailed = false;
+    let turnModelId: string | null = null;
     try {
       streamAbortRef.current = start({
         onStart: ({ userMessage }) => {
@@ -1274,15 +1234,7 @@ export function ChatPlayground({
           setReplyAnnouncement(
             spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
           );
-
-          if (titleFrom !== null) {
-            void maybeGenerateThreadTitle({
-              threadId,
-              userContent: titleFrom,
-              assistantContent: assistantMessage.content,
-              modelId,
-            });
-          }
+          turnModelId = modelId;
         },
         onError: (message) => {
           streamFailed = true;
@@ -1301,7 +1253,16 @@ export function ChatPlayground({
           setIsStreaming(false);
           setStreamingThreadId(null);
           streamAbortRef.current = null;
-          void refreshThreadList(threadId);
+          const listRefreshed = refreshThreadList(threadId);
+          // Any turn that ended without an error (finished, stopped,
+          // retried or edited) can title a thread still called "New chat".
+          // Ask after the list refresh, so its older copy of the thread
+          // cannot replace the new title.
+          if (!streamFailed) {
+            void listRefreshed.then(() =>
+              maybeGenerateThreadTitle({ threadId, modelId: turnModelId }),
+            );
+          }
           // Failed partial text of a new message is useful feedback but is
           // deliberately absent from persisted history. Keep it visible until
           // the user navigates. A failed retry or edit changed nothing.
@@ -1370,7 +1331,6 @@ export function ChatPlayground({
       },
       promptId: prompt.id,
       replacedIds: current.slice(promptIndex + 1).map((message) => message.id),
-      titleFrom: null,
       restoreOnFailure: true,
       failureMessage: "Failed to retry this reply.",
       start: (callbacks) =>
@@ -1410,7 +1370,6 @@ export function ChatPlayground({
       },
       promptId: messageId,
       replacedIds: current.slice(index + 1).map((message) => message.id),
-      titleFrom: null,
       restoreOnFailure: true,
       failureMessage: "Failed to send your edit.",
       start: (callbacks) =>
@@ -1614,7 +1573,19 @@ export function ChatPlayground({
             <Settings2 className="w-3.5 h-3.5" />
             Models
           </Button>
-          {supportsThinking && (
+          {supportsThinking && !thinkingToggleable && (
+            <span
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium",
+                chatSecondaryButtonActiveClass,
+              )}
+              title="This model always thinks before it answers"
+            >
+              <Brain className="w-3.5 h-3.5" aria-hidden="true" />
+              Thinking
+            </span>
+          )}
+          {supportsThinking && thinkingToggleable && (
             <Button
               variant="outline"
               size="sm"

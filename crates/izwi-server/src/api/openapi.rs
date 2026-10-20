@@ -804,6 +804,16 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Fetch, update, or delete a chat thread.",
         &[("thread_id", "Chat thread identifier")],
     );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/title",
+        "post",
+        "Chat",
+        "Create chat thread title",
+        "Title a thread still called \"New chat\" from its first exchange, with thinking off, and return the thread. A thread with a title keeps it. Body: optional `model`, the model that answered.",
+        &[("thread_id", "Chat thread identifier")],
+        preview_response(),
+    );
     add_collection_with_params(
         paths,
         "/v1/chat/threads/{thread_id}/messages",

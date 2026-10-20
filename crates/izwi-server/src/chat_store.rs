@@ -19,7 +19,7 @@ use crate::error::StoreError;
 use crate::ids::new_uuid;
 use crate::text_preview::plain_text_preview;
 
-const DEFAULT_THREAD_TITLE: &str = "New chat";
+pub(crate) const DEFAULT_THREAD_TITLE: &str = "New chat";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatThreadSummary {
@@ -376,6 +376,28 @@ impl ChatStore {
             return Ok(None);
         }
 
+        fetch_thread_summary(db, &thread_id).await
+    }
+
+    /// Set a generated title on a thread still called "New chat"; a thread
+    /// renamed meanwhile keeps its name. Returns the thread as it now is, or
+    /// `None` when it does not exist. The thread keeps its place in the list.
+    pub async fn set_generated_title(
+        &self,
+        thread_id: String,
+        title: String,
+    ) -> anyhow::Result<Option<ChatThreadSummary>> {
+        let db = self.db.connection().await?;
+        chat_threads::Entity::update_many()
+            .col_expr(
+                chat_threads::Column::Title,
+                Expr::value(sanitize_thread_title(Some(title.as_str()))),
+            )
+            .filter(chat_threads::Column::Id.eq(thread_id.clone()))
+            .filter(chat_threads::Column::Title.eq(DEFAULT_THREAD_TITLE))
+            .exec(db)
+            .await
+            .context("Failed to set the chat thread title")?;
         fetch_thread_summary(db, &thread_id).await
     }
 
@@ -914,6 +936,42 @@ mod tests {
     fn clear_env() {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn generated_titles_never_replace_a_users_title() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let untitled = store.create_thread(None, None).await.expect("thread");
+            assert_eq!(untitled.title, DEFAULT_THREAD_TITLE);
+            let titled = store
+                .set_generated_title(untitled.id.clone(), "  Winter   plant care ".to_string())
+                .await
+                .expect("set title")
+                .expect("thread exists");
+            assert_eq!(titled.title, "Winter plant care");
+            // A generated title does not move the thread up the list.
+            assert_eq!(titled.updated_at, untitled.updated_at);
+
+            let renamed = store
+                .create_thread(Some("My name".to_string()), None)
+                .await
+                .expect("thread");
+            let kept = store
+                .set_generated_title(renamed.id.clone(), "Generated".to_string())
+                .await
+                .expect("set title")
+                .expect("thread exists");
+            assert_eq!(kept.title, "My name");
+
+            assert!(store
+                .set_generated_title("missing".to_string(), "Title".to_string())
+                .await
+                .expect("set title")
+                .is_none());
+            clear_env();
+        })
+        .await;
     }
 
     #[tokio::test]

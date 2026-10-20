@@ -132,6 +132,7 @@ const chatMethodNames = [
   "listChatThreads",
   "createChatThread",
   "updateChatThread",
+  "generateChatThreadTitle",
   "getChatThread",
   "listChatThreadMessages",
   "deleteChatThread",

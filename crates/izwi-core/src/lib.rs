@@ -164,6 +164,9 @@ pub use runtime_models::shared::chat::{
     ChatTemplateKwargs, ChatTruncation,
 };
 
+/// How `<think>` reasoning splits from a chat answer, shared with the gateway.
+pub use izwi_model_catalog::chat::reasoning as chat_reasoning;
+
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};
 pub use runtime_models::{

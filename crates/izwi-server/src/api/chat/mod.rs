@@ -1,6 +1,7 @@
 //! Thread-based chat resources for first-party UI clients.
 
 mod handlers;
+mod title;
 
 use axum::{
     routing::{get, patch, post},
@@ -20,6 +21,10 @@ pub fn router() -> Router<AppState> {
             get(handlers::get_thread)
                 .patch(handlers::update_thread)
                 .delete(handlers::delete_thread),
+        )
+        .route(
+            "/chat/threads/{thread_id}/title",
+            post(title::generate_thread_title),
         )
         .route(
             "/chat/threads/{thread_id}/messages",

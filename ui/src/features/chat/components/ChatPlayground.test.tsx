@@ -14,6 +14,7 @@ const apiMocks = vi.hoisted(() => ({
   listChatThreads: vi.fn(),
   createResponse: vi.fn(),
   updateChatThread: vi.fn(),
+  generateChatThreadTitle: vi.fn(),
   getChatThread: vi.fn(),
   createChatThread: vi.fn(),
   deleteChatThread: vi.fn(),
@@ -62,6 +63,7 @@ vi.mock("@/api", () => ({
     listChatThreads: apiMocks.listChatThreads,
     createResponse: apiMocks.createResponse,
     updateChatThread: apiMocks.updateChatThread,
+    generateChatThreadTitle: apiMocks.generateChatThreadTitle,
     getChatThread: apiMocks.getChatThread,
     createChatThread: apiMocks.createChatThread,
     deleteChatThread: apiMocks.deleteChatThread,
@@ -78,6 +80,7 @@ describe("ChatPlayground", () => {
     apiMocks.listChatThreads.mockReset();
     apiMocks.createResponse.mockReset();
     apiMocks.updateChatThread.mockReset();
+    apiMocks.generateChatThreadTitle.mockReset();
     apiMocks.getChatThread.mockReset();
     apiMocks.createChatThread.mockReset();
     apiMocks.deleteChatThread.mockReset();
@@ -1550,6 +1553,40 @@ describe("ChatPlayground", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
     expect(writeText).toHaveBeenLastCalledWith("Solve this");
   });
+  it("shows a model that always thinks as a label, not a switch", async () => {
+    const model = "LFM2.5-1.2B-Thinking-GGUF";
+    const thread = { id: "always-thread", title: "Always thinks", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+    render(<MemoryRouter initialEntries={["/chat?threadId=always-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={true} modelLabel={model}
+        chatCapabilities={{ supports_thinking: true, thinking_toggleable: false,
+          default_thinking_enabled: true, reasoning_efforts: [],
+          default_reasoning_effort: null, supports_preserve_thinking: false }}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        modelSupportsThinking={() => true}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+
+    expect(screen.getByTitle("This model always thinks before it answers")).toHaveTextContent(
+      "Thinking",
+    );
+    expect(screen.queryByRole("button", { name: /thinking mode/ })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Plan it" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+        thread.id,
+        expect.objectContaining({ enable_thinking: true }),
+        expect.any(Object),
+      ),
+    );
+  });
+
   it("shows live reasoning while it streams, then the time it took", async () => {
     const model = "Qwen3.5-4B";
     const thread = { id: "live-thread", title: "Live reasoning", model_id: model,
@@ -1639,6 +1676,98 @@ describe("ChatPlayground", () => {
 
     expect(await screen.findByText("Visible answer")).toBeInTheDocument();
     expect(screen.queryByText(/private planning<\/think>/)).not.toBeInTheDocument();
+  });
+
+  describe("thread titles", () => {
+    const model = "Qwen3.5-4B";
+    const thread = { id: "title-thread", title: "New chat", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+
+    const sendFirstMessage = async () => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      render(<MemoryRouter initialEntries={["/chat?threadId=title-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={true} modelLabel={model}
+          modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+      </MemoryRouter>);
+      await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Houseplant tips?" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+      return apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+    };
+
+    it("asks the server for a title once the first turn finishes", async () => {
+      apiMocks.generateChatThreadTitle.mockResolvedValue({
+        ...thread, title: "Houseplant care tips",
+      });
+      const callbacks = await sendFirstMessage();
+      expect(apiMocks.generateChatThreadTitle).not.toHaveBeenCalled();
+      const assistantMessage = { id: "a1", thread_id: thread.id, role: "assistant",
+        content: "Reasoning about light</think>Water less in winter.",
+        created_at: 3, tokens_generated: 9, generation_time_ms: 90 };
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+        { id: "u1", thread_id: thread.id, role: "user", content: "Houseplant tips?",
+          created_at: 2, tokens_generated: null, generation_time_ms: null },
+        assistantMessage,
+      ] });
+      // A slow list refresh still holds the old title: it must not win.
+      apiMocks.listChatThreads.mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve([thread]), 30)),
+      );
+      act(() => {
+        callbacks.onDone({
+          threadId: thread.id,
+          modelId: model,
+          assistantMessage,
+          stats: { tokens_generated: 9, generation_time_ms: 90 },
+        });
+        callbacks.onClose();
+      });
+
+      await waitFor(() =>
+        expect(apiMocks.generateChatThreadTitle).toHaveBeenCalledWith(
+          thread.id, { model_id: model },
+        ),
+      );
+      expect(apiMocks.createResponse).not.toHaveBeenCalled();
+      expect(apiMocks.updateChatThread).not.toHaveBeenCalled();
+      expect(
+        await screen.findByRole("heading", { name: "Houseplant care tips" }),
+      ).toBeInTheDocument();
+      // ...and stays once the slow list refresh has landed.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 60)));
+      expect(
+        screen.getByRole("heading", { name: "Houseplant care tips" }),
+      ).toBeInTheDocument();
+    });
+
+    it("titles a thread whose first turn was stopped, and not one that failed", async () => {
+      apiMocks.generateChatThreadTitle.mockResolvedValue(thread);
+      const callbacks = await sendFirstMessage();
+      act(() => {
+        callbacks.onError("The model failed");
+        callbacks.onClose();
+      });
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(apiMocks.generateChatThreadTitle).not.toHaveBeenCalled();
+
+      apiMocks.sendChatThreadMessageStream.mockClear();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Try again" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+      const stopped = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+      fireEvent.click(screen.getByRole("button", { name: "Cancel response" }));
+      act(() => stopped.onClose());
+      await waitFor(() =>
+        expect(apiMocks.generateChatThreadTitle).toHaveBeenCalledWith(
+          thread.id, { model_id: null },
+        ),
+      );
+    });
   });
 
   it("shows decode speed and TTFT for a streamed turn after history refreshes", async () => {

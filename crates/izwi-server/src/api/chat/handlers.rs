@@ -1002,7 +1002,7 @@ fn parse_stored_role(role: &str) -> Result<ChatRole, ApiError> {
     }
 }
 
-async fn get_thread_or_not_found(
+pub(super) async fn get_thread_or_not_found(
     state: &AppState,
     thread_id: &str,
 ) -> Result<ChatThreadSummary, ApiError> {
@@ -1015,7 +1015,7 @@ async fn get_thread_or_not_found(
     thread.ok_or_else(|| ApiError::not_found("Thread not found"))
 }
 
-fn map_store_error(err: anyhow::Error) -> ApiError {
+pub(super) fn map_store_error(err: anyhow::Error) -> ApiError {
     tracing::error!(error = %format!("{err:#}"), "chat storage error");
     ApiError::internal(format!("Chat storage error: {err:#}"))
 }

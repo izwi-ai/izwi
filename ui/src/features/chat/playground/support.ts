@@ -90,8 +90,7 @@ export interface PendingImageAttachment {
 
 export interface GenerateTitleArgs {
   threadId: string;
-  userContent: string;
-  assistantContent: string;
+  /** The model that answered, when the turn reported it. */
   modelId: string | null;
 }
 
@@ -337,34 +336,6 @@ export function threadPreviewFromContent(
     return "No messages yet";
   }
   return truncateText(normalized, 120);
-}
-
-export function normalizeGeneratedThreadTitle(raw: string): string | null {
-  const compact = normalizeWhitespace(
-    stripThinkingArtifacts(raw)
-      .replace(/```[\s\S]*?```/g, " ")
-      .replace(/<\/?[^>]+>/g, " "),
-  );
-  if (!compact) {
-    return null;
-  }
-
-  let title = compact.replace(/^title\s*[:-]\s*/i, "").trim();
-  title = normalizeWhitespace(title.replace(/^['"`]+|['"`]+$/g, "").trim());
-
-  if (!title || /^user\s*:/i.test(title) || /^assistant\s*:/i.test(title)) {
-    return null;
-  }
-
-  return displayThreadTitle(title);
-}
-
-export function fallbackThreadTitleFromUserMessage(content: string): string {
-  const normalized = normalizeWhitespace(stripThinkingArtifacts(content));
-  if (!normalized) {
-    return DEFAULT_THREAD_TITLE;
-  }
-  return truncateText(normalized, MAX_THREAD_TITLE_CHARS);
 }
 
 export function isQwen35ThinkingModel(variant: string | null): boolean {

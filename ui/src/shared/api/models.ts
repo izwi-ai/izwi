@@ -14,6 +14,8 @@ export type ChatReasoningEffort = "xhigh" | "medium" | "low";
 
 export interface ChatModelCapabilities {
   supports_thinking: boolean;
+  /** False when the model always reasons (LFM2.5 Thinking): no switch. */
+  thinking_toggleable?: boolean;
   default_thinking_enabled: boolean;
   reasoning_efforts: ChatReasoningEffort[];
   default_reasoning_effort: ChatReasoningEffort | null;
