@@ -88,19 +88,19 @@ function getUpdateBadge(
   capabilityStatus: "unsupported" | "loading" | "ready" | "error",
 ): { label: string; tone: "neutral" | "info" | "success" | "warning" } {
   if (!updaterSupported || capabilityStatus === "unsupported") {
-    return { label: "Desktop Only", tone: "neutral" };
+    return { label: "Desktop only", tone: "neutral" };
   }
 
   if (capabilityStatus === "loading") {
-    return { label: "Checking Support", tone: "info" };
+    return { label: "Checking support", tone: "info" };
   }
 
   if (capabilityStatus === "error") {
-    return { label: "Support Unknown", tone: "warning" };
+    return { label: "Support unknown", tone: "warning" };
   }
 
   if (!updatesEnabled) {
-    return { label: "Updates Off", tone: "warning" };
+    return { label: "Updates off", tone: "warning" };
   }
 
   if (status === "checking") {
@@ -112,15 +112,15 @@ function getUpdateBadge(
   }
 
   if (status === "downloaded") {
-    return { label: "Ready To Restart", tone: "success" };
+    return { label: "Ready to restart", tone: "success" };
   }
 
   if (status === "error") {
-    return { label: "Needs Attention", tone: "warning" };
+    return { label: "Needs attention", tone: "warning" };
   }
 
   if (status === "available" || hasAvailableUpdate) {
-    return { label: "Update Available", tone: "info" };
+    return { label: "Update available", tone: "info" };
   }
 
   return { label: "Current", tone: "success" };

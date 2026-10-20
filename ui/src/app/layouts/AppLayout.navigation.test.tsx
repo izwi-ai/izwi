@@ -54,7 +54,6 @@ function renderLayout() {
           element={
             <AppLayout
               readyModelsCount={0}
-              selectedModelLabel={null}
               catalogError={null}
               onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
             />

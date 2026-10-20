@@ -21,7 +21,6 @@ import type {
   SharedPageProps,
   VoiceRouteProps,
 } from "@/app/router/types";
-import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 
 // Route code loads lazily, then preloads once the app is idle so later
 // navigation does not wait on a chunk (react-router keeps the previous page
@@ -114,7 +113,6 @@ export function AppRoutes() {
   }, []);
   const {
     models,
-    selectedModel,
     selectedModelFor,
     loading,
     catalogError,
@@ -176,12 +174,6 @@ export function AppRoutes() {
     onSetPinned: (variant, pinned) => void setModelPinned(variant, pinned),
     onRefresh: refreshModels,
   };
-  const selectedModelInfo = models.find(
-    (model) => model.variant === selectedModel,
-  );
-  const selectedModelLabel = selectedModel
-    ? getModelDisplayName(selectedModel, selectedModelInfo?.display_name)
-    : null;
   useEffect(() => {
     if (!hasTrackedInitialRouteRef.current) {
       hasTrackedInitialRouteRef.current = true;
@@ -202,7 +194,6 @@ export function AppRoutes() {
           element={
             <AppLayout
               readyModelsCount={readyModelsCount}
-              selectedModelLabel={selectedModelLabel}
               catalogError={catalogError}
               onRetryModelCatalog={refreshModels}
             />

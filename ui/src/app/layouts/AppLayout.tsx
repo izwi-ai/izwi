@@ -48,8 +48,6 @@ function isDesktopNavigationLayout() {
 
 interface LayoutProps {
   readyModelsCount: number;
-  /** Unused since the compact header matches the sidebar; AppRoutes still passes it. */
-  selectedModelLabel?: string | null;
   catalogError: string | null;
   onRetryModelCatalog: () => Promise<boolean>;
 }

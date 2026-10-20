@@ -200,7 +200,6 @@ function renderRoute(
             element={withLayout ? (
               <AppLayout
                 readyModelsCount={1}
-                selectedModelLabel="FishAudio-S2-Pro"
                 catalogError={null}
                 onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
               />

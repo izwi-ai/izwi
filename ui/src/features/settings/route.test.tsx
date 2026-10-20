@@ -147,7 +147,7 @@ describe("SettingsPage capabilities", () => {
 
     render(<SettingsPage />);
 
-    expect(screen.getByText("Desktop Only")).toBeVisible();
+    expect(screen.getByText("Desktop only")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check now" })).not.toBeInTheDocument();
     expect(screen.getByText(/Update checks and installation are available/i)).toBeVisible();
     expect(screen.getByText(/Tray behavior, launch-at-login and command line tool settings/i)).toBeVisible();
@@ -289,7 +289,7 @@ describe("SettingsPage capabilities", () => {
       },
       update: null,
       error: null,
-      badge: "Updates Off",
+      badge: "Updates off",
       detail: "Disabled by policy",
     },
     {
@@ -307,7 +307,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: null,
-      badge: "Update Available",
+      badge: "Update available",
       detail: "View 0.1.0-beta-20",
     },
     {
@@ -325,7 +325,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: "Signature verification failed",
-      badge: "Update Available",
+      badge: "Update available",
       detail: "Last error: Signature verification failed",
     },
     {
@@ -334,7 +334,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: null,
-      badge: "Ready To Restart",
+      badge: "Ready to restart",
       detail: "View 0.1.0-beta-20",
     },
   ])("renders the $name updater state honestly", async (testCase) => {
@@ -364,7 +364,7 @@ describe("SettingsPage capabilities", () => {
 
     render(<SettingsPage />);
 
-    expect(screen.getByText("Support Unknown")).toBeVisible();
+    expect(screen.getByText("Support unknown")).toBeVisible();
     expect(
       screen.getByRole("button", { name: "Retry update support" }),
     ).toBeVisible();

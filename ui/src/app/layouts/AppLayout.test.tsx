@@ -57,7 +57,6 @@ describe("AppLayout model catalog recovery", () => {
             element={
               <AppLayout
                 readyModelsCount={0}
-                selectedModelLabel={null}
                 catalogError="Local model service is offline"
                 onRetryModelCatalog={onRetryModelCatalog}
               />
@@ -95,7 +94,6 @@ describe("AppLayout model catalog recovery", () => {
               element={
                 <AppLayout
                   readyModelsCount={0}
-                  selectedModelLabel={null}
                   catalogError={null}
                   onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
                 />
