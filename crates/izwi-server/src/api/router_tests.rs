@@ -1856,6 +1856,52 @@ async fn over_limit_speech_input_is_payload_too_large_on_both_routes() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A photo sent as a base64 data URL is larger than axum's 2 MB default;
+/// chat routes read it and fail, if at all, for another reason.
+#[tokio::test]
+async fn chat_routes_accept_image_sized_bodies() {
+    let (state, _root) = test_state("chat_body_limit", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state, &config);
+    let image = format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024));
+    let image_part = serde_json::json!([
+        { "type": "text", "text": "What is this?" },
+        { "type": "image_url", "image_url": { "url": image } }
+    ]);
+    let requests = [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "Qwen3.5-0.8B",
+                "messages": [{ "role": "user", "content": image_part }]
+            }),
+        ),
+        (
+            "/v1/responses",
+            serde_json::json!({ "model": "Qwen3.5-0.8B", "input": image }),
+        ),
+        (
+            "/v1/chat/threads/missing/messages",
+            serde_json::json!({
+                "model_id": "Qwen3.5-0.8B",
+                "content": "What is this?",
+                "content_parts": image_part
+            }),
+        ),
+    ];
+    for (path, body) in requests {
+        let body = body.to_string();
+        let response =
+            send_request(app.clone(), build_request(Method::POST, path, Some(&body))).await;
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+}
+
 fn keyed_request(path: &str, body: &str, key: &str, tenant: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
