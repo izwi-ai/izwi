@@ -144,7 +144,16 @@ async fn render_segment(state: &AppState, claim: &StudioRenderClaim) -> Result<(
         reference_text: None,
         saved_voice_id: settings.saved_voice_id,
         temperature: None,
-        speed: settings.speed.map(|value| value as f32),
+        // A model without speed control rejects a speed: the project may
+        // keep one from an earlier model.
+        speed: settings
+            .speed
+            .filter(|_| {
+                variant
+                    .speech_capabilities()
+                    .is_some_and(|caps| caps.supports_speed_control)
+            })
+            .map(|value| value as f32),
         max_tokens: Some(0),
         max_output_tokens: None,
         top_k: None,

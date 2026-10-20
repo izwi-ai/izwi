@@ -89,6 +89,18 @@ describe("ScriptParagraph", () => {
     expect(props.onSave).not.toHaveBeenCalled();
   });
 
+  it("deletes an emptied paragraph on Backspace instead of merging its old text back", async () => {
+    const props = renderParagraph("rendered");
+    const text = screen.getByRole("textbox", { name: "Paragraph 2" }) as HTMLTextAreaElement;
+    fireEvent.change(text, { target: { value: "" } });
+    text.setSelectionRange(0, 0);
+    await act(async () => {
+      fireEvent.keyDown(text, { key: "Backspace" });
+    });
+    expect(props.onDelete).toHaveBeenCalled();
+    expect(props.onMergeIntoPrevious).not.toHaveBeenCalled();
+  });
+
   it("saves edits on its own after a pause and shows them as changed", async () => {
     vi.useFakeTimers();
     const props = renderParagraph("rendered");

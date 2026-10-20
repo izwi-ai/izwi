@@ -204,6 +204,12 @@ export function ScriptParagraph({
       element.selectionEnd === 0
     ) {
       event.preventDefault();
+      // An emptied paragraph goes: merging would bring back the text the
+      // user just deleted, which is still the saved text.
+      if (!draft.trim()) {
+        onDelete();
+        return;
+      }
       await save(draft);
       onMergeIntoPrevious();
     }

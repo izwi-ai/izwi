@@ -591,6 +591,12 @@ pub async fn update_studio_project(
         .ok_or_else(|| ApiError::not_found("Studio project not found"))?;
 
     let req = normalize_update_request(req);
+    // Only a voice change is checked: a rename must work after the
+    // project's saved voice was deleted.
+    let voice_changed = req.model_id.is_some()
+        || req.voice_mode.is_some()
+        || req.speaker.is_some()
+        || req.saved_voice_id.is_some();
     let next_voice_mode = req.voice_mode.unwrap_or(existing.voice_mode);
     let next_model_id = req
         .model_id
@@ -606,14 +612,33 @@ pub async fn update_studio_project(
         None => existing.saved_voice_id.clone(),
     };
 
-    validate_project_voice_state(
-        &state,
-        next_model_id.as_str(),
-        next_voice_mode,
-        next_speaker.as_deref(),
-        next_saved_voice_id.as_deref(),
-    )
-    .await?;
+    if voice_changed {
+        validate_project_voice_state(
+            &state,
+            next_model_id.as_str(),
+            next_voice_mode,
+            next_speaker.as_deref(),
+            next_saved_voice_id.as_deref(),
+        )
+        .await?;
+    }
+    let supports_speed = parse_tts_model_variant(&next_model_id)
+        .ok()
+        .and_then(|variant| variant.speech_capabilities())
+        .is_some_and(|caps| caps.supports_speed_control);
+    if req.speed.is_some() && !supports_speed {
+        return Err(ApiError::bad_request(format!(
+            "{next_model_id} has no speed control."
+        )));
+    }
+    // A model without speed control drops the speed an earlier one kept.
+    let speed = if supports_speed {
+        req.speed.map(|value| Some(f64::from(value)))
+    } else if req.model_id.is_some() {
+        Some(None)
+    } else {
+        None
+    };
 
     let project = state
         .studio_store
@@ -628,7 +653,7 @@ pub async fn update_studio_project(
                     next_voice_mode,
                     next_saved_voice_id,
                 )),
-                speed: req.speed.map(|value| Some(f64::from(value))),
+                speed,
             },
         )
         .await
@@ -677,8 +702,15 @@ pub async fn update_studio_project_segment(
         Some(None)
     } else if has_voice_update {
         // The override keeps what the segment already chose and changes
-        // what the request names; anything left unset follows the project.
-        let model_id = req.model_id.clone().or_else(|| segment.model_id.clone());
+        // what the request names. Its voice belongs to a model, so the
+        // override is bound to the model it was chosen with (the project's
+        // now, unless named): a later project model change must not render
+        // this paragraph's speaker with a model that lacks it.
+        let model_id = req
+            .model_id
+            .clone()
+            .or_else(|| segment.model_id.clone())
+            .or_else(|| project.model_id.clone());
         let voice_mode = req
             .voice_mode
             .or(segment.voice_mode)

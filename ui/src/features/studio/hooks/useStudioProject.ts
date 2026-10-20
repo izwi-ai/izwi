@@ -70,9 +70,20 @@ export function useStudioProject(projectId: string, onError: (message: string) =
 
   const accept = useCallback((next: StudioProjectRecord) => {
     if (next.id !== projectId) return;
-    setProject((previous) =>
-      previous && snapshot(previous) === snapshot(next) ? previous : next,
-    );
+    setProject((previous) => {
+      if (!previous) return next;
+      // Responses can arrive out of order (two quick saves of a paragraph):
+      // a paragraph already newer here is kept, so an older reply cannot
+      // revert it. The paragraph list itself follows the reply.
+      const merged = {
+        ...next,
+        segments: next.segments.map((segment) => {
+          const held = previous.segments.find((candidate) => candidate.id === segment.id);
+          return held && held.updated_at > segment.updated_at ? held : segment;
+        }),
+      };
+      return snapshot(previous) === snapshot(merged) ? previous : merged;
+    });
   }, [projectId]);
 
   const refresh = useCallback(async () => {
@@ -83,12 +94,20 @@ export function useStudioProject(projectId: string, onError: (message: string) =
     }
   }, [accept, projectId]);
 
-  const activeJobId = project?.active_render_job?.id ?? null;
+  // Polls while the server renders: a job is active, or a paragraph is still
+  // queued or rendering (one rendered on its own, or one a stopped job left).
+  const rendering =
+    Boolean(project?.active_render_job) ||
+    (project?.segments.some(
+      (segment) =>
+        segment.render_state === "queued" || segment.render_state === "rendering",
+    ) ??
+      false);
   useEffect(() => {
-    if (!activeJobId) return;
+    if (!rendering) return;
     const timer = window.setInterval(() => void refresh(), RENDER_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [activeJobId, refresh]);
+  }, [rendering, refresh]);
 
   /** Run a change that returns the project; errors go to `onError`. */
   const mutate = useCallback(

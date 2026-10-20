@@ -8,6 +8,7 @@ import type {
   StudioSegmentRenderState,
 } from "@/api";
 import {
+  importedScript,
   defaultStudioVoice,
   mainAction,
   paragraphVoice,
@@ -172,3 +173,19 @@ describe("voices", () => {
     expect(voiceName(own!, [])).not.toBe("am_adam");
   });
 });
+
+describe("importedScript", () => {
+  it("keeps HTML blocks as paragraphs and drops scripts and styles", () => {
+    const html = `<html><head><title>Ignored</title><style>p { color: red }</style></head>
+      <body><h1>Chapter one</h1><p>The harbour   woke.<br>Gulls circled.</p>
+      <script>alert("not narrated")</script><div><p>Nested</p> tail</div></body></html>`;
+    expect(importedScript("story.html", html)).toBe(
+      "Chapter one\n\nThe harbour woke. Gulls circled.\n\nNested\n\ntail",
+    );
+  });
+
+  it("reads other files as they are", () => {
+    expect(importedScript("notes.md", "# Title\n\nText")).toBe("# Title\n\nText");
+  });
+});
+

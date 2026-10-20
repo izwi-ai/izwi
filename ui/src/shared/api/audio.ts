@@ -2152,6 +2152,7 @@ export class AudioApiClient {
         voice_mode: request.voice_mode,
         speaker: request.speaker,
         saved_voice_id: request.saved_voice_id,
+        use_project_voice: request.use_project_voice,
       }),
     });
   }

@@ -4048,6 +4048,84 @@ async fn studio_segment_refusals_are_bad_requests() {
 /// The server owns Studio rendering: clients queue and cancel, the
 /// worker sets every other status, and export refuses audio that doesn't
 /// match the script.
+/// Speed belongs to models with speed control, and a paragraph's voice to
+/// the model it was chosen with.
+#[tokio::test]
+async fn studio_keeps_speed_and_paragraph_voices_with_their_models() {
+    let (state, _root) = test_state("studio_speed_and_voices", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let request = |method: Method, path: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let response =
+                send_request(app, build_request(method, &path, Some(&body.to_string()))).await;
+            (response.status(), read_json(response).await)
+        }
+    };
+    let (status, project) = request(
+        Method::POST,
+        "/v1/studio/projects".to_string(),
+        serde_json::json!({
+            "model_id": "Kokoro-82M",
+            "speaker": "af_heart",
+            "source_text": "One sentence. Another sentence."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let segment_id = project["segments"][0]["id"].as_str().unwrap().to_string();
+    let project_path = format!("/v1/studio/projects/{project_id}");
+
+    let (status, project) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({ "speed": 1.2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!((project["speed"].as_f64().unwrap() - 1.2).abs() < 1e-6);
+
+    // A paragraph voice is bound to the model it was chosen with.
+    let (status, project) = request(
+        Method::PATCH,
+        format!("{project_path}/segments/{segment_id}"),
+        serde_json::json!({ "speaker": "am_adam" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(project["segments"][0]["model_id"], "Kokoro-82M");
+
+    // Switching to a model without speed control drops the speed...
+    let (status, project) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "speaker": "Vivian"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{project}");
+    assert!(project["speed"].is_null());
+    // ...and a speed for it is refused.
+    let (status, _) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({ "speed": 1.2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The paragraph keeps its Kokoro voice.
+    assert_eq!(project["segments"][0]["model_id"], "Kokoro-82M");
+}
+
 #[tokio::test]
 async fn studio_render_jobs_are_server_owned_and_export_refuses_unrendered_audio() {
     let (state, _root) = test_state("studio_render_contract", false);
