@@ -493,15 +493,25 @@ async fn unified_transcription_list_filters_and_totals() {
         (0, 0)
     );
     // Jobs can fail in the background here (no model is installed), so check
-    // that every job matches exactly one status rather than which one.
+    // that every job matches exactly one status rather than which one. A job
+    // that changes status between the four queries is counted twice or not
+    // at all (seen on a loaded machine), so retry until a pass is consistent;
+    // a job that really matches two statuses or none still fails every pass.
     let mut by_status = 0;
-    for uri in [
-        "/v1/speech-to-text/jobs?status=pending",
-        "/v1/speech-to-text/jobs?status=processing",
-        "/v1/speech-to-text/jobs?status=ready",
-        "/v1/speech-to-text/jobs?status=failed",
-    ] {
-        by_status += total(uri).await.0;
+    for _ in 0..20 {
+        by_status = 0;
+        for uri in [
+            "/v1/speech-to-text/jobs?status=pending",
+            "/v1/speech-to-text/jobs?status=processing",
+            "/v1/speech-to-text/jobs?status=ready",
+            "/v1/speech-to-text/jobs?status=failed",
+        ] {
+            by_status += total(uri).await.0;
+        }
+        if by_status == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(by_status, 3);
     assert_eq!(
