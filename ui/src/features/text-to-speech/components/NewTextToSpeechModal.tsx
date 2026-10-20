@@ -18,6 +18,7 @@ import {
 } from "@/components/creation/CreationParts";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
 import {
   Select,
   SelectContent,
@@ -80,6 +81,7 @@ export function NewTextToSpeechModal({
   const [speaker, setSpeaker] = useState(initialSpeaker || "Vivian");
   const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
   const [voiceDescription, setVoiceDescription] = useState("");
+  const [speed, setSpeed] = useState(1);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [modelActionPending, setModelActionPending] = useState<
@@ -92,6 +94,7 @@ export function NewTextToSpeechModal({
   const wasOpenRef = useRef(false);
 
   const capabilities = selectedModelInfo?.speech_capabilities ?? null;
+  const supportsSpeed = capabilities?.supports_speed_control ?? false;
   const supportsBuiltInVoices = capabilities?.supports_builtin_voices ?? false;
   const supportsReferenceVoices =
     capabilities?.supports_reference_voice ?? false;
@@ -307,6 +310,8 @@ export function NewTextToSpeechModal({
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
           : undefined,
+      // Only a model with speed control gets one (Kokoro); 1× sends none.
+      speed: supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
     };
 
     setIsSubmitting(true);
@@ -337,8 +342,10 @@ export function NewTextToSpeechModal({
     savedVoiceId,
     selectedModel,
     selectedModelReady,
+    speed,
     streamAvailable,
     streamingEnabled,
+    supportsSpeed,
     text,
     voiceDescription,
     usesBuiltInVoiceSelection,
@@ -403,6 +410,23 @@ export function NewTextToSpeechModal({
           }
           side={
             <>
+              {supportsSpeed ? (
+                <CreationField
+                  label="Speed"
+                  hint={`${speed.toFixed(2)}×`}
+                >
+                  <Slider
+                    aria-label="Speed"
+                    min={0.5}
+                    max={1.5}
+                    step={0.05}
+                    value={[speed]}
+                    onValueChange={([next]) => setSpeed(next ?? 1)}
+                    disabled={isSubmitting}
+                  />
+                </CreationField>
+              ) : null}
+
               {usesBuiltInVoiceSelection ? (
                 <CreationField label="Built-in voice">
                   <Select

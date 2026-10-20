@@ -342,7 +342,8 @@ pub struct SpeechHistoryRecordListCursor {
 pub enum SpeechHistoryVoiceKind {
     /// A model's built-in speaker.
     BuiltIn,
-    /// A saved (cloned or designed) voice.
+    /// The user's own voice: a saved (cloned or designed) voice, or a take
+    /// generated from a voice description.
     Saved,
 }
 
@@ -1331,10 +1332,19 @@ macro_rules! speech_history_filter {
     () => {
         r#"
     WHERE route_kind = ?1
-        AND (?2 IS NULL OR input_text LIKE ?2 ESCAPE '\' OR speaker LIKE ?2 ESCAPE '\')
+        AND (
+            ?2 IS NULL
+            OR input_text LIKE ?2 ESCAPE '\'
+            OR LOWER(REPLACE(speaker, '_', ' ')) LIKE LOWER(?2) ESCAPE '\'
+            OR EXISTS (
+                SELECT 1 FROM saved_voices v
+                WHERE v.id = speech_history_records.saved_voice_id
+                  AND LOWER(v.name) LIKE LOWER(?2) ESCAPE '\'
+            )
+        )
         AND (
             ?3 IS NULL
-            OR (?3 = 'saved' AND saved_voice_id IS NOT NULL)
+            OR (?3 = 'saved' AND (saved_voice_id IS NOT NULL OR voice_description IS NOT NULL))
             OR (?3 = 'built_in' AND saved_voice_id IS NULL AND speaker IS NOT NULL)
         )
         AND (?4 IS NULL OR instr(?4, ',' || processing_status || ',') > 0)
@@ -1876,6 +1886,15 @@ mod tests {
         std::env::remove_var("IZWI_MEDIA_DIR");
     }
 
+    async fn db_delete_designed(store: &SpeechHistoryStore) {
+        let db = store.db.connection().await.expect("connection");
+        db.execute_unprepared(
+            "DELETE FROM speech_history_records WHERE input_text = 'Designed line'",
+        )
+        .await
+        .expect("delete designed");
+    }
+
     #[tokio::test]
     async fn filters_and_counts_history_records() {
         let _guard = env_lock();
@@ -1931,6 +1950,35 @@ mod tests {
         .await;
         assert_eq!(by_speaker.total, 2, "the two built-in Serena records");
 
+        // A voice is found by the name the app shows for it: built-in ids
+        // read with spaces ("casual_female" as "Casual Female"), saved
+        // voices by their saved name.
+        let db = store.db.connection().await.expect("connection");
+        db.execute_unprepared(
+            "UPDATE speech_history_records SET speaker = 'casual_female' WHERE input_text = 'The quick brown fox'",
+        )
+        .await
+        .expect("speaker update");
+        db.execute_unprepared(
+            "INSERT INTO saved_voices (id, created_at, updated_at, name, reference_text, \
+             audio_mime_type, audio_storage_path, source_route_kind) VALUES \
+             ('sv_one', 1, 1, 'Andrej', 'hello', 'audio/wav', 'a.wav', 'voice_cloning')",
+        )
+        .await
+        .expect("saved voice insert");
+        for (search, expected) in [
+            ("Casual Female", "The quick brown fox"),
+            ("andrej", "Saved voice line"),
+        ] {
+            let found = list(SpeechHistoryListFilter {
+                search: Some(search.to_string()),
+                ..Default::default()
+            })
+            .await;
+            assert_eq!(found.total, 1, "{search}");
+            assert_eq!(found.records[0].input_preview, expected, "{search}");
+        }
+
         let saved = list(SpeechHistoryListFilter {
             voice_kind: Some(SpeechHistoryVoiceKind::Saved),
             ..Default::default()
@@ -1943,6 +1991,23 @@ mod tests {
         })
         .await;
         assert_eq!(built_in.total, 2);
+        // A take from a voice description is one of the user's own voices.
+        store
+            .create_record(NewSpeechHistoryRecord {
+                input_text: "Designed line".to_string(),
+                speaker: None,
+                voice_description: Some("A warm, low narrator".to_string()),
+                ..ready_record()
+            })
+            .await
+            .expect("designed record");
+        let mine = list(SpeechHistoryListFilter {
+            voice_kind: Some(SpeechHistoryVoiceKind::Saved),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(mine.total, 2);
+        db_delete_designed(&store).await;
 
         let failed = list(SpeechHistoryListFilter {
             statuses: vec![SpeechHistoryProcessingStatus::Failed],
