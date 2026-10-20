@@ -32,7 +32,10 @@ import type { Breadcrumb } from "@/components/PageShell";
 import { FactsList, formatProcessingFact } from "@/components/FactsList";
 import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
-import { normalizeSpeechProcessingStatus } from "@/features/text-to-speech/support";
+import {
+  normalizeSpeechProcessingStatus,
+  speechDownloadFilename,
+} from "@/features/text-to-speech/support";
 
 const TITLE_MAX_CHARS = 60;
 
@@ -134,10 +137,7 @@ export function TextToSpeechRecordDetail({
     if (!hasAudio || !audioUrl || !record) {
       return;
     }
-    const filename =
-      record.audio_filename ||
-      `tts-${record.id}.${record.audio_mime_type.includes("wav") ? "wav" : "audio"}`;
-    await api.downloadAudioFile(audioUrl, filename);
+    await api.downloadAudioFile(audioUrl, speechDownloadFilename(record));
   }
 
   async function handleConfirmDelete(): Promise<void> {

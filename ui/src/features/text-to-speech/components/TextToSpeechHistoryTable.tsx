@@ -25,6 +25,7 @@ import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
+  speechDownloadFilename,
 } from "@/features/text-to-speech/support";
 import { cn } from "@/lib/utils";
 
@@ -171,15 +172,18 @@ export function TextToSpeechHistoryTable({
     setBusyRecordId(record.id);
     try {
       const audioUrl = api.textToSpeechRecordAudioUrl(record.id);
-      const filename =
-        record.audio_filename ||
-        `tts-${record.id}.${record.audio_mime_type.includes("wav") ? "wav" : "audio"}`;
-      await api.downloadAudioFile(audioUrl, filename);
-      notify({
-        title: "Download started",
-        description: rowLabel(record, voiceLabel),
-        tone: "success",
-      });
+      const saved = await api.downloadAudioFile(
+        audioUrl,
+        speechDownloadFilename(record),
+      );
+      // The desktop app's save dialog can be cancelled.
+      if (saved) {
+        notify({
+          title: "Download started",
+          description: rowLabel(record, voiceLabel),
+          tone: "success",
+        });
+      }
     } catch (err) {
       notify({
         title: "Could not download audio",
