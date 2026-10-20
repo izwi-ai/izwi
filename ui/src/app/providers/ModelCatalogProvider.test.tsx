@@ -564,7 +564,7 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
         </span>
       );
     }
-    render(
+    const view = render(
       <NotificationProvider>
         <ModelCatalogProvider>
           <ProgressProbe />
@@ -597,6 +597,7 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
     });
     expect(screen.getByTestId("percent")).toHaveTextContent("100");
 
+    view.unmount();
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
@@ -710,7 +711,7 @@ describe("ModelCatalogProvider per-page choices", () => {
     apiMocks.listModels.mockResolvedValue({
       models: [{ ...model, status: "downloading", download_progress: 0 }],
     });
-    render(
+    const view = render(
       <NotificationProvider>
         <ModelCatalogProvider>
           <RouteProbe />
@@ -726,6 +727,7 @@ describe("ModelCatalogProvider per-page choices", () => {
     });
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(screen.queryByText("Model download cancelled")).not.toBeInTheDocument();
+    view.unmount();
     vi.unstubAllGlobals();
   });
 });
@@ -751,7 +753,7 @@ describe("ModelCatalogProvider download notifications", () => {
         { ...model, variant: "Kokoro-82M", status: "downloading", download_progress: 0 },
       ],
     });
-    render(
+    const view = render(
       <NotificationProvider>
         <ModelCatalogProvider>
           <CatalogProbe />
@@ -785,6 +787,7 @@ describe("ModelCatalogProvider download notifications", () => {
     await waitFor(() =>
       expect(apiMocks.downloadModel).toHaveBeenCalledWith("Kokoro-82M"),
     );
+    view.unmount();
     vi.unstubAllGlobals();
   });
 });
