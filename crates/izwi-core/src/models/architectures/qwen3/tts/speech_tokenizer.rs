@@ -20,6 +20,7 @@ use crate::models::shared::attention::flash::{
 use crate::models::shared::attention::gqa::{
     banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask, BANDED_QUERY_BLOCK,
 };
+use crate::models::shared::memory::exact::exact_zeros;
 
 /// Speech Tokenizer Configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -456,6 +457,34 @@ enum EncoderModule {
     Elu,
 }
 
+/// Output frames a reference encode runs the convolution stack over at a
+/// time: with its left context a window reads 132 frames (126,720 samples
+/// on the shipped encoder), so the full-rate activations, 64 channels at
+/// F32, fit 32 MiB pool buffers. One 30 s pass held 2.5 GB.
+const REFERENCE_ENCODE_WINDOW_FRAMES: usize = 128;
+
+/// The encoder convolution stack's hop (input samples per output frame,
+/// the product of its strides) and its causal reach: the samples before a
+/// frame's own hop that the frame reads. Every conv is causal, so output
+/// `j` of a conv with effective kernel `e` and stride `s` reads its input
+/// `j·s − (e − s) .. (j + 1)·s`; the reaches add up across the stack in
+/// input samples.
+fn encoder_net_hop_and_reach(cfg: &EncoderConfig) -> (usize, usize) {
+    let mut stride = 1usize;
+    let mut reach = cfg.kernel_size.saturating_sub(1);
+    for &ratio in cfg.upsampling_ratios.iter().rev() {
+        for j in 0..cfg.num_residual_layers {
+            let dilation = cfg.dilation_growth_rate.pow(j as u32);
+            reach += cfg.residual_kernel_size.saturating_sub(1) * dilation * stride;
+        }
+        // Kernel 2·ratio, stride ratio.
+        reach += ratio * stride;
+        stride *= ratio.max(1);
+    }
+    reach += cfg.last_kernel_size.saturating_sub(1) * stride;
+    (stride, reach)
+}
+
 struct SpeechTokenizerEncoderNet {
     layers: Vec<EncoderModule>,
 }
@@ -538,6 +567,56 @@ impl SpeechTokenizerEncoderNet {
             };
         }
         Ok(hidden)
+    }
+
+    /// [`Self::forward`] over `x` (`[1, C, samples]`) `window_frames`
+    /// output frames at a time. Each window starts on a hop boundary and
+    /// reads `ceil(reach / hop)` frames of left context, whose outputs it
+    /// drops: those are the only frames the window's zero padding reaches.
+    /// Every window but the last spans whole hops, so no stage pads its
+    /// right edge; the last ends where the whole sequence ends and pads
+    /// exactly as it does. Each window's frames are copied into an
+    /// exact-size output and the window dropped.
+    fn forward_windowed(
+        &self,
+        x: &Tensor,
+        (hop, reach): (usize, usize),
+        window_frames: usize,
+    ) -> Result<Tensor> {
+        let samples = x.dim(2)?;
+        let hop = hop.max(1);
+        let frames = samples.div_ceil(hop);
+        let window_frames = window_frames.max(1);
+        if frames <= window_frames {
+            return self.forward(x);
+        }
+        let context = reach.div_ceil(hop);
+        let mut stitched: Option<Tensor> = None;
+        let mut first = 0;
+        while first < frames {
+            let last = (first + window_frames).min(frames);
+            let read_first = first.saturating_sub(context);
+            let input_first = read_first * hop;
+            let input_last = (last * hop).min(samples);
+            let window = self.forward(&x.narrow(2, input_first, input_last - input_first)?)?;
+            let kept = window
+                .narrow(2, first - read_first, last - first)?
+                .contiguous()?;
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => exact_zeros(
+                    (kept.dim(0)?, kept.dim(1)?, frames),
+                    kept.dtype(),
+                    kept.device(),
+                )?,
+            };
+            output.slice_set(&kept, 2, first)?;
+            stitched = Some(output);
+            first = last;
+        }
+        stitched.ok_or_else(|| {
+            Error::InferenceError("speech-tokenizer encoder produced no windows".into())
+        })
     }
 }
 
@@ -1481,7 +1560,11 @@ impl SpeechTokenizerEncoder {
             &self.device,
         )?
         .to_dtype(self.dtype)?;
-        hidden = self.encoder_net.forward(&hidden)?;
+        hidden = self.encoder_net.forward_windowed(
+            &hidden,
+            encoder_net_hop_and_reach(&self.config),
+            REFERENCE_ENCODE_WINDOW_FRAMES,
+        )?;
         hidden = hidden.transpose(1, 2)?;
         hidden = self.encoder_transformer.forward(&hidden)?;
         hidden = hidden.transpose(1, 2)?;
@@ -2389,15 +2472,27 @@ pub(crate) fn reference_encode_workspace_upper_bound_bytes(
     let overflow = || Error::Overloaded("speech-tokenizer reference workspace overflow".into());
     let mul = |left: usize, right: usize| left.checked_mul(right).ok_or_else(overflow);
     let samples = mul(input_sample_rate, max_seconds)?;
+    // The convolution stack runs by windows of
+    // `REFERENCE_ENCODE_WINDOW_FRAMES` frames and their left context
+    // (`SpeechTokenizerEncoderNet::forward_windowed`) into a stitched
+    // output; the transformer and quantizer see every frame.
+    let (hop, reach) = encoder_net_hop_and_reach(cfg);
+    let hop = hop.max(1);
+    let all_frames = samples.div_ceil(hop);
+    let window_samples = if all_frames <= REFERENCE_ENCODE_WINDOW_FRAMES {
+        samples
+    } else {
+        mul(REFERENCE_ENCODE_WINDOW_FRAMES + reach.div_ceil(hop), hop)?.min(samples)
+    };
     // First conv: input, padded input, im2col and output.
     let mut peak = mul(
-        mul(cfg.audio_channels.max(1), samples)?,
+        mul(cfg.audio_channels.max(1), window_samples)?,
         cfg.kernel_size.saturating_add(2),
     )?
-    .checked_add(mul(cfg.num_filters, samples)?)
+    .checked_add(mul(cfg.num_filters, window_samples)?)
     .ok_or_else(overflow)?;
     let mut channels = cfg.num_filters.max(1);
-    let mut length = samples;
+    let mut length = window_samples;
     for &ratio in cfg.upsampling_ratios.iter().rev() {
         let activation = mul(channels, length)?;
         // Residual units: input, ELU, padded copy, conv output and sum
@@ -2416,6 +2511,11 @@ pub(crate) fn reference_encode_workspace_upper_bound_bytes(
             .checked_add(mul(cfg.hidden_size, length)?)
             .ok_or_else(overflow)?,
     );
+    // The stitched output of every window, beside the window running.
+    peak = peak
+        .checked_add(mul(cfg.hidden_size, all_frames)?)
+        .ok_or_else(overflow)?;
+    let length = all_frames;
     // Encoder transformer at the conv output rate: attention scores and
     // their softmax, plus the layer activations.
     let attention = mul(mul(mul(cfg.num_attention_heads, length)?, length)?, 2)?;
@@ -2527,22 +2627,71 @@ pub(crate) const QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON: &str = r#"{"_frame_rate": 1
 mod tests {
     use super::*;
 
-    /// A 30 s reference on the shipped encoder: the full-rate residual
-    /// unit (64 channels x 720,000 samples, five activations beside a
-    /// kernel-3 im2col) dominates, about 1.5 GB of F32 temporaries. The old
-    /// bound charged every sample at the 2,048-wide transformer width eight
-    /// times, 47 GB.
+    /// A 30 s reference on the shipped encoder: the convolution stack runs
+    /// by windows of 128 frames and 4 of left context (126,720 samples), so
+    /// its full-rate residual unit (64 channels, five activations beside a
+    /// kernel-3 im2col) is priced over one window, not 720,000 samples
+    /// (1.5 GB of F32 before windowing; the whole pass measured 2.5 GB on
+    /// Metal). Up to one window, the bound grows with the reference.
     #[test]
     fn reference_encode_bound_follows_the_shipped_encoder() {
         let cfg: EncoderConfig = serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        assert_eq!(encoder_net_hop_and_reach(&cfg), (960, 3_320));
         let bytes =
             reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 30, 4).unwrap();
-        let full_rate_activation = 64u64 * 720_000 * 4;
-        assert!(bytes >= full_rate_activation * 8, "{bytes}");
-        assert!(bytes < 2_000_000_000, "{bytes}");
-        // Shorter references cost proportionally less.
-        let ten = reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 10, 4).unwrap();
-        assert!(ten * 2 < bytes);
+        let window_activation = 64u64 * 132 * 960 * 4;
+        assert!(bytes >= window_activation * 8, "{bytes}");
+        assert!(bytes < 400_000_000, "{bytes}");
+        let two = reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 2, 4).unwrap();
+        let five = reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 5, 4).unwrap();
+        assert!(two < five && five <= bytes, "{two} {five} {bytes}");
+    }
+
+    /// The windowed convolution stack returns the whole-sequence stack's
+    /// frames, for lengths that end mid-hop and leave a short last window.
+    #[test]
+    fn windowed_encoder_stack_matches_the_whole_sequence() {
+        let cfg: EncoderConfig = serde_json::from_str(
+            &QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON
+                .replace("\"num_filters\": 64", "\"num_filters\": 4")
+                .replace("\"hidden_size\": 512", "\"hidden_size\": 16")
+                .replace("[8, 6, 5, 4]", "[3, 2]"),
+        )
+        .unwrap();
+        let (hop, reach) = encoder_net_hop_and_reach(&cfg);
+        assert_eq!((hop, reach), (6, 6 + 2 + 2 + 2 * 2 + 3 * 2 + 2 * 6));
+        let device = Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let net = SpeechTokenizerEncoderNet::load(&cfg, vb).unwrap();
+        for samples in [hop * 40, hop * 41 + 5, hop * 9 + 1] {
+            let values = (0..samples)
+                .map(|i| ((i * 2_654_435_761) % 1_000) as f32 / 500.0 - 1.0)
+                .collect::<Vec<_>>();
+            let x = Tensor::from_vec(values, (1, 1, samples), &device).unwrap();
+            let whole = net.forward(&x).unwrap();
+            let windowed = net.forward_windowed(&x, (hop, reach), 8).unwrap();
+            assert_eq!(windowed.dims(), whole.dims(), "{samples}");
+            let scale = whole
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let difference = (windowed - whole)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                difference <= scale * 1e-6,
+                "{samples}: {difference} of {scale}"
+            );
+        }
     }
 
     #[test]

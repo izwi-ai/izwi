@@ -2228,14 +2228,30 @@ impl Qwen3TtsModel {
             .checked_add(embedding_bytes)
             .ok_or_else(|| Error::Overloaded("Qwen3-TTS prefill tensor overflow".into()))?;
         if has_reference {
+            let encode = self
+                .speech_tokenizer
+                .reference_encode_temporary_upper_bound_bytes(
+                    MAX_REFERENCE_AUDIO_SECS,
+                    self.speech_tokenizer_dtype.size_in_bytes(),
+                )?;
+            // The speaker embedding runs after the encode, whose buffers
+            // the quantizer's code read-back frees. Its context planes at a
+            // 30 s reference sit in power-of-two pool buffers up to twice
+            // their size on Metal (a 29.7 s reference held 397 MiB).
+            let speaker = match &self.speaker_encoder {
+                Some(encoder) => encoder
+                    .embed_workspace_upper_bound_elements(MAX_REFERENCE_AUDIO_SECS)?
+                    .checked_mul(std::mem::size_of::<f32>() as u64)
+                    .and_then(|bytes| {
+                        bytes.checked_mul(if self.device.kind.is_metal() { 2 } else { 1 })
+                    })
+                    .ok_or_else(|| {
+                        Error::Overloaded("Qwen3-TTS speaker workspace overflow".into())
+                    })?,
+                None => 0,
+            };
             accelerator = accelerator
-                .checked_add(
-                    self.speech_tokenizer
-                        .reference_encode_temporary_upper_bound_bytes(
-                            MAX_REFERENCE_AUDIO_SECS,
-                            self.speech_tokenizer_dtype.size_in_bytes(),
-                        )?,
-                )
+                .checked_add(encode.max(speaker))
                 .ok_or_else(|| {
                     Error::Overloaded("Qwen3-TTS reference workspace overflow".into())
                 })?;
