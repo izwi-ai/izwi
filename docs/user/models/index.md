@@ -19,7 +19,9 @@ Those endpoints only show variants that are enabled for download/use.
 | Qwen3 VoiceDesign | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 | Voxtral TTS | `Voxtral-4B-TTS-2603` |
 | VibeVoice TTS | `VibeVoice-1.5B` |
+| Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
 | Kokoro | `Kokoro-82M` |
+| LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
 > `Kokoro-82M` requires `espeak-ng`:
 > [macOS](/installation/macos#optional-install-espeak-ng-for-kokoro-82m),
@@ -62,6 +64,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | Family | Canonical IDs |
 |--------|---------------|
 | Qwen3.5 GGUF | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
+| Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text chat) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text chat; 28.74 GiB checkpoint payload) |
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 
@@ -178,7 +181,7 @@ izwi rm Qwen3-TTS-12Hz-0.6B-Base
 |----------|----------|
 | **macOS** | `~/Library/Application Support/izwi/models/` |
 | **Linux** | `~/.local/share/izwi/models/` |
-| **Windows** | `%APPDATA%\izwi\models\` |
+| **Windows** | `%LOCALAPPDATA%\izwi\models\` |
 
 ### Custom Model Directory
 

@@ -28,27 +28,27 @@ Before choosing an install path, check the [Runtime Support Matrix](/support-mat
 ### macOS
 
 ```bash
-# Download and install the .dmg from GitHub Releases
+# Download and install Izwi_<version>_aarch64.dmg (Apple Silicon) from GitHub Releases
 open https://github.com/izwi-ai/izwi/releases
 ```
 
 ### Linux (Debian/Ubuntu)
 
+Download `Izwi_<version>_amd64.deb` from the [Releases page](https://github.com/izwi-ai/izwi/releases), then:
+
 ```bash
-# Download the .deb package
-wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
-sudo dpkg -i izwi_amd64.deb
+sudo apt install ./Izwi_*_amd64.deb
 ```
 
 ### Windows
 
-Download and run the installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
+Download and run `Izwi_<version>_x64-setup.exe` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 ---
 
 ## Verify Installation
 
-After installation, verify everything is working:
+After installation, install the `izwi` command line tool from **Settings > System > Command line tool > Install** in the desktop app (the `.deb` installs it for you), then verify everything is working in a new terminal:
 
 ```bash
 izwi version --full

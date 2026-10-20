@@ -21,7 +21,7 @@ macOS 15+; macOS 12-14 remain supported with the CPU backend.
 
 ### Step 1: Download
 
-Download the latest `Izwi-*.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
+Download the latest `Izwi_<version>_aarch64.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases). The DMG is for Apple Silicon Macs; there is no Intel build.
 
 ### Step 2: Install
 
@@ -35,10 +35,7 @@ Download the latest `Izwi-*.dmg` from [GitHub Releases](https://github.com/izwi-
 2. If prompted about an unidentified developer:
    - Go to **System Settings → Privacy & Security**
    - Click **Open Anyway** next to the Izwi message
-3. On first launch, Izwi will:
-   - Create the `~/.local/bin` directory if needed
-   - Link `izwi` and `izwi-server` to your PATH
-   - May prompt for administrator access
+3. To use `izwi` in Terminal, open **Settings > System > Command line tool** and select **Install**. Izwi links `izwi` and `izwi-server` into `/opt/homebrew/bin` or `/usr/local/bin` and may ask for an administrator password.
 
 ### Step 4: Verify
 
@@ -64,14 +61,6 @@ brew install espeak-ng
 
 ```bash
 espeak-ng --version
-```
-
----
-
-## Install via Homebrew (Coming Soon)
-
-```bash
-brew install --cask izwi
 ```
 
 ---
@@ -234,7 +223,9 @@ pgrep -af "izwi" || echo "no izwi processes running"
 
 ### Command not found: izwi
 
-The CLI tools may not be in your PATH. Add this to your `~/.zshrc`:
+If you installed the desktop app, open **Settings > System > Command line tool**, select **Install**, then open a new Terminal window.
+
+If you installed with `./scripts/install-cli.sh`, the tools are in `~/.local/bin`, which may not be in your PATH. Add this to your `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"

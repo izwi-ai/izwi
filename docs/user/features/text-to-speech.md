@@ -25,12 +25,12 @@ Izwi's text-to-speech converts written text into spoken audio. Features include:
 ### Download a TTS Model
 
 ```bash
-izwi pull Qwen3-TTS-12Hz-0.6B-Base
+izwi pull Kokoro-82M
 ```
 
 ### Kokoro-82M Prerequisite (`espeak-ng`)
 
-If you plan to use `Kokoro-82M`, install `espeak-ng` on your system first.
+`Kokoro-82M` is the default TTS model. Install `espeak-ng` on your system first.
 Izwi uses it for Kokoro phonemization and will return an error if it is missing.
 
 - macOS: see [macOS Installation](/installation/macos#optional-install-espeak-ng-for-kokoro-82m)
@@ -45,14 +45,13 @@ Izwi uses it for Kokoro phonemization and will return an error if it is missing.
 izwi tts "Hello, welcome to Izwi!" --output hello.wav
 ```
 
-**Request playback:**
+**Play after generation:**
 
 ```bash
 izwi tts "Hello, welcome to Izwi!" --play
 ```
 
-The current CLI saves the audio and reports playback as not implemented. Use
-your system audio player to open the generated file.
+Izwi saves the file, then plays it with the system player.
 
 ---
 
@@ -68,20 +67,19 @@ izwi tts "Your text here" --output output.wav
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--model`, `-m` | TTS model to use | `qwen3-tts-0.6b-base` |
-| `--output`, `-o` | Output file path | stdout |
-| `--format`, `-f` | Audio format | `wav` |
-| `--speed`, `-r` | Speech speed (0.5-2.0) | `1.0` |
-| `--speaker`, `-s` | Voice/speaker ID | `default` |
+| `--model`, `-m` | TTS model to use | `Kokoro-82M` |
+| `--output`, `-o` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
+| `--format`, `-f` | Audio format: `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
+| `--speed`, `-r` | Speech speed multiplier (models with speed control) | Model default |
+| `--speaker`, `-s` | Voice/speaker ID | Model default (Kokoro: `af_heart`) |
 | `--saved-voice-id` | Reuse a saved reference voice | — |
 | `--reference-audio` | Reference audio file for cloning | — |
 | `--reference-text` | Transcript for the reference audio | — |
 | `--reference-text-file` | File containing the reference transcript | — |
 | `--instructions` | Voice-design direction prompt | — |
-| `--temperature`, `-t` | Sampling temperature | `0.7` |
-| `--play`, `-p` | Request playback after generation; current CLI reports playback as not implemented | — |
-| `--stream` | Stream output in real-time | — |
-| `--allow-format-fallback` | Accept WAV bytes when a compressed format is unavailable | — |
+| `--temperature`, `-t` | Sampling temperature | Model default |
+| `--play`, `-p` | Play the saved file with the system player (WAV only) | — |
+| `--stream` | Stream the audio as it is generated into a WAV file and report time to first audio | — |
 
 ### Examples
 
@@ -172,9 +170,9 @@ POST /v1/audio/speech
 
 ```json
 {
-  "model": "Qwen3-TTS-12Hz-0.6B-Base",
+  "model": "Kokoro-82M",
   "input": "Hello, this is a test.",
-  "voice": "default",
+  "voice": "af_heart",
   "speed": 1.0,
   "response_format": "wav"
 }
@@ -194,7 +192,7 @@ voice-cloning fields, saved voices, and model-specific controls.
 ```bash
 curl -X POST http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-TTS-12Hz-0.6B-Base", "input": "Hello world"}' \
+  -d '{"model": "Kokoro-82M", "input": "Hello world", "voice": "af_heart"}' \
   --output speech.wav
 ```
 
@@ -212,8 +210,8 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice | Medium |
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 
-For reference-audio cloning, use **Base** variants or `VibeVoice-1.5B`.  
-For built-in voice presets, use **CustomVoice** variants.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B` or `FishAudio-S2-Pro`.  
+For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603` or `LFM2.5-Audio-1.5B-GGUF`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its

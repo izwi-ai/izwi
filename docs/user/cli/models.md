@@ -21,7 +21,7 @@ izwi models <COMMAND>
 |---------|-------------|
 | `list` | List available models |
 | `info` | Show model information |
-| `load` | Load a model into memory |
+| `load` | Load a model into memory and wait until it is ready |
 | `unload` | Unload a model from memory |
 | `progress` | Show download progress |
 
@@ -61,19 +61,19 @@ izwi models info Qwen3-TTS-12Hz-0.6B-Base --json
 
 ## izwi models load
 
-Load a model into memory for inference.
+Load a model into memory and wait until it is ready. The model must be downloaded first: `izwi models load` refuses a model that is not downloaded (run `izwi pull <MODEL>`).
 
 ```bash
 izwi models load <MODEL>
 izwi models load Qwen3-TTS-12Hz-0.6B-Base
-izwi models load Qwen3-TTS-12Hz-0.6B-Base --wait
+izwi models load Qwen3-TTS-12Hz-0.6B-Base --timeout 1200
 ```
 
 ### Options
 
-| Option | Description |
-|--------|-------------|
-| `-w, --wait` | Wait for model to be fully loaded |
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--timeout <SECS>` | Seconds to wait for the load | `600` |
 
 ---
 
@@ -103,10 +103,10 @@ izwi models unload all --yes
 
 ## izwi models progress
 
-Show download progress for active downloads.
+Show download progress for a model. The model argument is required.
 
 ```bash
-izwi models progress
+izwi models progress <MODEL>
 izwi models progress Qwen3-TTS-12Hz-0.6B-Base
 ```
 

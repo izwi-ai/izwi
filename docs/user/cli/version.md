@@ -39,8 +39,17 @@ izwi version
 
 Output:
 ```
-izwi 0.1.0
+ ___ ____ ____
+|_ _|_  /_  /  High-performance audio inference
+ | | / / / /   Text-to-Speech & Speech-to-Text
+|___/___/___|  Optimized for Apple Silicon & CUDA
+
+Version: 0.1.0
+
+For more information, visit: https://github.com/izwi-ai/izwi
 ```
+
+For a single line, use `izwi --version`, which prints `izwi 0.1.0`.
 
 ### Full version info
 
@@ -48,20 +57,22 @@ izwi 0.1.0
 izwi version --full
 ```
 
-Output:
+After the same banner, the output is:
 ```
 Version: 0.1.0
 
 Build Info:
-  Target:    darwin-aarch64
-  Rust:      1.83.0
+  Target:    macos-aarch64
+  Rust:      1.x.y
 
 Compiled Backends:
   ✓ CPU
   ✓ Metal
 
-Features:
-  (none)
+License:
+  Apache 2.0
+
+For more information, visit: https://github.com/izwi-ai/izwi
 ```
 
 `Compiled Backends` reflects cargo features compiled into the binary. It does

@@ -16,7 +16,10 @@ The Settings page contains device-level controls for the local app. Open
 | Appearance | Choose System, Light, or Dark theme. |
 | Updates | View the current app version, check for updates, and open an available update prompt. |
 | Privacy | Enable or disable anonymous analytics for this device. |
-| System | Desktop-only tray icon and launch-at-login controls. |
+| System | Desktop-only tray icon, launch-at-login and **Command line tool** (install the `izwi` command) controls. |
+| Runtime | The local server's backend, reserved memory and version. |
+| Shortcuts | Keyboard shortcuts available across Izwi. |
+| About | The app version and a link to the source code. |
 
 ---
 
@@ -73,6 +76,7 @@ These controls are available only in the desktop app:
 |---------|--------|
 | Show tray icon | When enabled, closing the window keeps Izwi running in the tray. When disabled, closing exits Izwi. |
 | Launch at login | Opens Izwi automatically when you sign in. |
+| Command line tool | **Install** puts the `izwi` command on your PATH so you can use it from a terminal. Open a new terminal window afterwards. |
 
 The browser UI shows these controls as unavailable because it cannot change OS
 desktop integration settings.

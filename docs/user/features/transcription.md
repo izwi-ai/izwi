@@ -54,6 +54,8 @@ izwi transcribe <audio-file>
 | `--output`, `-o` | Output file | stdout |
 | `--word-timestamps` | Include word timing | — |
 
+The CLI uploads the file as multipart form data. The server accepts up to 25 MiB per file by default; set `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server to raise it.
+
 ### Examples
 
 **Basic transcription:**
@@ -77,7 +79,7 @@ izwi transcribe meeting.wav --format json --output transcript.json
 **With word timestamps:**
 
 ```bash
-izwi transcribe meeting.wav --format verbose_json --word-timestamps
+izwi transcribe meeting.wav --format verbose-json --word-timestamps
 ```
 
 **Specify language:**
@@ -205,7 +207,7 @@ transcripts, and `job_kind=diarization` for speaker timelines.
 
 | Model | Size | Accuracy | Speed |
 |-------|------|----------|-------|
-| `Parakeet-TDT-0.6B-v3` | 9.4 GB | Strong baseline | Medium |
+| `Parakeet-TDT-0.6B-v3` | 2.5 GB | Strong baseline | Medium |
 | `Whisper-Large-v3-Turbo` | 1.5 GB | Strong multilingual baseline | Medium |
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Good | Fast |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Better | Medium |
@@ -244,8 +246,8 @@ Hello, this is a transcription test.
 ### Verbose JSON
 
 Includes language, duration, processing-time, realtime-factor, and optional
-runtime diagnostics. Word-level timestamps are not currently returned by this
-endpoint.
+runtime diagnostics. Add `timestamp_granularities[]=word` (CLI
+`--word-timestamps`) to get a `words` array.
 
 ```json
 {

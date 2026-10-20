@@ -14,7 +14,6 @@ You'll need to manually download models when:
 
 - The model requires accepting a license agreement
 - The model is gated (requires Hugging Face authentication)
-- You want to use a custom or fine-tuned model
 - Automatic download fails due to network issues
 
 ---
@@ -61,7 +60,7 @@ Izwi stores models in a specific location:
 |----------|----------|
 | **macOS** | `~/Library/Application Support/izwi/models/` |
 | **Linux** | `~/.local/share/izwi/models/` |
-| **Windows** | `%APPDATA%\izwi\models\` |
+| **Windows** | `%LOCALAPPDATA%\izwi\models\` |
 
 ### Step 2: Download the Model
 
@@ -72,6 +71,8 @@ huggingface-cli download <repo-id> \
   --repo-type model \
   --local-dir "<izwi-models-path>/<model-name>"
 ```
+
+`<model-name>` is the exact model ID from `izwi list` (for example `Kokoro-82M`).
 
 **Example for macOS:**
 
@@ -131,14 +132,6 @@ By default, Hugging Face caches downloads in `~/.cache/huggingface/`. To use a d
 export HF_HOME=/path/to/cache
 huggingface-cli download <repo-id> --local-dir "<path>"
 ```
-
----
-
-## Common Models Requiring Manual Download
-
-| Model | Repository | Notes |
-|-------|------------|-------|
-| Llama 3 | `meta-llama/Llama-3-*` | Requires license acceptance |
 
 ---
 

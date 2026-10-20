@@ -8,8 +8,7 @@ Voice Studio is the unified workspace for reusable voices. In the current app,
 open **Voices** from the sidebar to manage saved voices, browse built-in voices,
 and create new cloned or designed voices.
 
-The legacy `/voice-cloning` and `/voice-design` routes redirect into this
-workspace when Voice Studio is enabled.
+The legacy `/voice-cloning` and `/voice-design` routes redirect to `/voices`.
 
 ---
 

@@ -16,7 +16,7 @@ The CLI is the fastest way to:
 
 ```bash
 # from repository root
-cargo install --path crates/izwi-cli --force --offline
+cargo install --path crates/izwi-cli --force
 ```
 
 ### Build without installing
@@ -53,17 +53,21 @@ izwi status
 izwi list --local
 ```
 
+`izwi status` exits with status 1 when the server is unreachable or unhealthy.
+
 3) Run ASR:
 
 ```bash
+izwi pull Qwen3-ASR-0.6B-GGUF
 izwi transcribe data/test.wav --model qwen3-asr-0.6b --format text
 ```
 
-4) Run TTS:
+4) Run TTS (Kokoro-82M needs `espeak-ng`):
 
 ```bash
+izwi pull Kokoro-82M
 izwi tts "hello from izwi cli" \
-  --model qwen3-tts-0.6b-base \
+  --model Kokoro-82M \
   --format wav \
   --output /tmp/hello.wav
 ```
@@ -77,8 +81,7 @@ Metal backend examples require Apple Silicon with macOS 15+.
 ```bash
 izwi serve
 izwi serve --mode desktop
-izwi serve --host 0.0.0.0 --port 8080 --backend metal
-izwi serve --dev
+IZWI_API_KEY=<long random key> izwi serve --host 0.0.0.0 --port 8080 --backend metal
 ```
 
 ### Models
@@ -88,24 +91,30 @@ izwi list
 izwi list --local
 izwi list --local --output-format json
 
-izwi pull qwen3-tts-0.6b-base
-izwi rm qwen3-tts-0.6b-base
+izwi pull Kokoro-82M
+izwi rm Kokoro-82M
 
 izwi models list --local --detailed
 izwi models info qwen3-asr-0.6b
-izwi models load qwen3-tts-0.6b-base --wait
-izwi models unload qwen3-tts-0.6b-base
+izwi models load Kokoro-82M --timeout 600
+izwi models unload Kokoro-82M
 izwi models progress qwen3-asr-0.6b
 ```
+
+`izwi models load` waits until the model is ready and refuses a model that is
+not downloaded yet.
 
 ### TTS
 
 ```bash
 izwi tts "Hello world"
-izwi tts "Hello world" --speaker default --speed 1.0 --temperature 0.7
+izwi tts "Hello world" --speaker af_heart --speed 1.0
 echo "Hello from stdin" | izwi tts -
 izwi tts "Stream me" --stream --output /tmp/stream.wav
+izwi tts "Hello world" --play
 ```
+
+`--play` saves the WAV file, then plays it with the system player.
 
 ### ASR
 
@@ -133,24 +142,28 @@ IZWI_ASR_WARMUP_DURATION_MS=800
 IZWI_STREAM_TEXT_QUEUE_CAPACITY=4096
 ```
 
-Note: `--word-timestamps` is accepted by the CLI but currently ignored by the server.
+`--word-timestamps` returns verbose JSON with a `words` array.
+
+The CLI uploads the audio file as multipart form data. The server accepts up to
+25 MiB per file by default (raise it with `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on
+the server).
 
 ### Chat
 
 ```bash
-izwi chat --model qwen3-0.6b
-izwi chat --model qwen3-0.6b-4bit
-izwi chat --model qwen3-0.6b-4bit --system "You are concise."
+izwi chat
+izwi chat --model Qwen3.5-4B
+izwi chat --model Qwen3.5-0.8B --system "You are concise." --no-thinking
 ```
 
 ### Benchmarks
 
 ```bash
 izwi bench chat --model Qwen3.5-4B --iterations 5 --max-tokens 128 --warmup
-izwi bench tts --model qwen3-tts-0.6b-base --iterations 5 --concurrent 2
+izwi bench tts --model Kokoro-82M --iterations 5 --concurrent 2
 izwi bench asr --model parakeet-tdt-0.6b-v3 --file data/test.wav --iterations 3 --concurrent 2
 izwi --output-format json bench chat --iterations 5
-izwi --output-format json bench run benchmarks/local.toml --artifact-dir benchmarks/results/run-001
+izwi --output-format json bench run benchmarks/manifests/cpu-continuous-batching.toml --artifact-dir benchmarks/results/run-001
 izwi bench compare current.json baseline.json --tolerance-percent 5
 ```
 
@@ -180,7 +193,7 @@ izwi completions fish > ~/.config/fish/completions/izwi.fish
 ```text
 --config <PATH>             Configuration file path
 --server <URL>              API server base URL (default: http://localhost:8080)
---output-format <FORMAT>    table | json | plain | yaml
+--output-format <FORMAT>    table | json | plain
 --quiet                     Suppress non-result output
 --verbose                   Enable verbose logs
 --no-color                  Disable colored output
@@ -191,6 +204,7 @@ izwi completions fish > ~/.config/fish/completions/izwi.fish
 ```bash
 # Server defaults
 IZWI_HOST=0.0.0.0
+IZWI_API_KEY=<long random key>   # required for a non-loopback IZWI_HOST
 IZWI_PORT=8080
 IZWI_SERVE_MODE=server
 IZWI_MODELS_DIR=/path/to/models

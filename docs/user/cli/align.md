@@ -40,8 +40,10 @@ Aligns reference text to audio, producing word-level timestamps. Useful for:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-m, --model <MODEL>` | Alignment model | `qwen3-forcedaligner-0.6b` |
-| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `json` |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `json` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
+
+The CLI uploads the audio file as multipart form data. The server accepts up to 25 MiB per file by default; raise it with `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server.
 
 ---
 
@@ -81,7 +83,9 @@ izwi align audio.wav "Hello world" --format text
     {"word": "a", "start": 1.50, "end": 1.55},
     {"word": "test", "start": 1.60, "end": 2.00}
   ],
-  "duration": 2.0
+  "duration": 2.0,
+  "alignment_source": "model",
+  "warnings": []
 }
 ```
 
@@ -121,7 +125,7 @@ izwi align podcast.wav "um actually" --format json
 Analyze timing of spoken words:
 
 ```bash
-izwi align recording.wav "The quick brown fox" --format verbose_json
+izwi align recording.wav "The quick brown fox" --format verbose-json
 ```
 
 ---

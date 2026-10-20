@@ -49,7 +49,7 @@ The resolved settings are passed through to the spawned `izwi-server` process, s
 | `--allow-unauthenticated-network` | Start a non-loopback bind without an API key (unsafe) | Disabled |
 | `-p, --port <PORT>` | Port to listen on | `8080` |
 | `-m, --models-dir <PATH>` | Models directory | Platform default |
-| `--max-batch-size <N>` | Maximum batch size | `8` |
+| `--max-batch-size <auto\|N>` | Physical tensor batch width (`auto` or a positive row count) | `auto` |
 | `--backend <BACKEND>` | Backend preference: `auto`, `cpu`, `metal`, `cuda` | `auto` |
 | `-t, --threads <N>` | Number of CPU threads | Auto (`available_parallelism`, capped at `8`) |
 | `--max-concurrent <N>` | Max concurrent requests | `100` |
@@ -155,14 +155,14 @@ izwi serve --mode web --no-ui
 | `IZWI_BACKEND` | `--backend` |
 | `IZWI_MAX_BATCH_SIZE` | `--max-batch-size` |
 | `IZWI_MAX_TOKENS_PER_STEP` | Environment only: scheduler token budget per step (default `0`, the backend's: 2048 on CUDA, 384 on CPU/Metal) |
-| `IZWI_CHUNKED_PREFILL_THRESHOLD` | Environment only: prefill chunk in tokens when chunked prefill is on (default `0`, the backend's: 512 on CUDA, 192 on CPU/Metal) |
+| `IZWI_CHUNKED_PREFILL_THRESHOLD` | No flag (also `runtime.chunked_prefill_threshold` in `config.toml`): prefill chunk in tokens when chunked prefill is on (default `0`, the backend's: 512 on CUDA, 192 on CPU/Metal) |
 | `IZWI_NUM_THREADS` | `--threads` |
 | `IZWI_MAX_CONCURRENT` | `--max-concurrent` |
 | `IZWI_TIMEOUT` | `--timeout` |
 | `IZWI_CORS` | `--cors` |
-| `IZWI_CORS_ORIGINS` | Config-only CORS origin list |
+| `IZWI_CORS_ORIGINS` | CORS origin list (no flag; same as `server.cors_origins`) |
 | `IZWI_NO_UI` | `--no-ui` |
-| `IZWI_UI_DIR` | Config-only UI build directory |
+| `IZWI_UI_DIR` | UI build directory (no flag; same as `ui.dir`) |
 | `RUST_LOG` | `--log-level` |
 | `IZWI_LOG_FORMAT` | `--log-format` |
 | `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | Environment only: how long a streamed chat answer waits for a client that stopped reading before it fails (default `30000`). While the client lags, text is merged rather than dropped |

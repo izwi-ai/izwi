@@ -19,7 +19,11 @@ The app isn't code-signed yet:
 
 ### macOS: Command not found: izwi
 
-The CLI tools aren't in your PATH:
+The CLI tools aren't in your PATH. If you installed the desktop app, open
+**Settings > System > Command line tool**, select **Install**, then open a new
+Terminal window.
+
+If you installed with `./scripts/install-cli.sh`, add `~/.local/bin` to your PATH:
 
 ```bash
 # Add to ~/.zshrc
@@ -34,7 +38,7 @@ source ~/.zshrc
 Use sudo:
 
 ```bash
-sudo dpkg -i izwi_*.deb
+sudo apt install ./Izwi_*_amd64.deb
 ```
 
 ### Windows: SmartScreen blocks installation
@@ -147,8 +151,11 @@ izwi pull <model-name>
 
 Check available RAM:
 ```bash
-# macOS/Linux
+# Linux
 free -h
+
+# macOS
+vm_stat
 
 # Or check Activity Monitor / Task Manager
 ```
@@ -159,7 +166,7 @@ For `Qwen3.8-27B-FP8` on CUDA, inspect the loaded entry returned by
 `/v1/health`. A successful compressed load reports
 `family_diagnostics.resident_representation` as
 `q8_0_requantized_projections_with_dense_bf16` and
-`fp8_execution_mode` as `q8_0_compressed_fallback`. This is intended for
+`fp8_execution_mode` as `q8_0_fallback:<reason>`. This is intended for
 40/48 GB-class devices with a resource-fitted context, but admission can still
 fail when free VRAM or allocator headroom is insufficient. It is not a native
 FP8 mode; see the [support matrix](/support-matrix#qwen38-cuda-weight-residency).
@@ -217,7 +224,7 @@ izwi pull <model-name>
 1. Verify correct directory:
    - macOS: `~/Library/Application Support/izwi/models/`
    - Linux: `~/.local/share/izwi/models/`
-   - Windows: `%APPDATA%\izwi\models\`
+   - Windows: `%LOCALAPPDATA%\izwi\models\`
 
 2. Check folder name matches expected variant name
 
@@ -241,7 +248,7 @@ izwi serve --backend metal
 
 Linux (Docker CUDA):
 ```bash
-IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
+IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up -d izwi-cuda
 ```
 
 Linux/Windows source build (CUDA):
@@ -260,7 +267,7 @@ on hosts with the matching NVIDIA libraries, for example
 
 **Use smaller models:**
 - `Qwen3-TTS-12Hz-0.6B-Base` instead of `Qwen3-TTS-12Hz-1.7B-Base`
-- Quantized variants (`-4bit`)
+- `Qwen3.5-0.8B` instead of a larger chat model
 
 **Close other applications** to free memory
 
@@ -394,12 +401,12 @@ izwi status --detailed
 
 1. Download a model:
    ```bash
-   izwi pull Qwen3-TTS-12Hz-0.6B-Base
+   izwi pull Kokoro-82M
    ```
 
 2. Load the model:
    ```bash
-   izwi models load Qwen3-TTS-12Hz-0.6B-Base
+   izwi models load Kokoro-82M
    ```
 
 3. Refresh the page
@@ -410,10 +417,10 @@ Ensure required models are loaded:
 
 | Feature | Required Model Type |
 |---------|---------------------|
-| TTS | `*-tts-*` |
+| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, or `FishAudio-S2-Pro` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, or `LFM2.5-Audio-*` |
-| Chat | `Qwen3-*`, `Qwen3.5-*`, `Qwen3.8-*`, or `LFM2.5-1.2B-*` |
-| Voice Cloning | `Qwen3-TTS-12Hz-*-Base*` |
+| Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, or `LFM2.5-1.2B-*` |
+| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, or `FishAudio-S2-Pro` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` |
 
 ---
@@ -433,7 +440,7 @@ check you're connecting to the right server and that no proxy is interfering.
 ### 403 Cross-origin request rejected
 
 The server rejects writes from web pages on other sites. If your own web app
-calls the API, add its origin to `cors_origins` (or `IZWI_CORS_ORIGINS`).
+calls the API, add its origin to `server.cors_origins` (or `IZWI_CORS_ORIGINS`).
 
 ### 404 Not Found
 
