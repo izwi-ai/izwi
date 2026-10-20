@@ -838,7 +838,7 @@ impl ModelVariant {
     /// consumes. Keep reasoning effort narrower than generic thinking support:
     /// today only Qwen3.8 implements the three-level effort contract. The
     /// LFM2.5 Thinking checkpoint always reasons (the upstream template never
-    /// gates thinking on a kwarg), so its controls are display-level only.
+    /// gates thinking on a kwarg), so its thinking is not toggleable.
     pub fn chat_capabilities(&self) -> Option<ChatModelCapabilities> {
         let (default_thinking_enabled, reasoning_efforts, supports_preserve_thinking) = match self {
             Self::Qwen3827BFp8 => (
@@ -859,11 +859,22 @@ impl ModelVariant {
 
         Some(ChatModelCapabilities {
             supports_thinking: true,
+            thinking_toggleable: !matches!(self, Self::Lfm2512BThinkingGguf),
             default_thinking_enabled,
             default_reasoning_effort: reasoning_efforts.first().copied(),
             reasoning_efforts,
             supports_preserve_thinking,
         })
+    }
+
+    /// The variant that answers like this one without reasoning, for a model
+    /// whose thinking can't be turned off. Server-side generations that must
+    /// not think (chat titles) use it when it is loaded.
+    pub fn non_thinking_sibling(&self) -> Option<ModelVariant> {
+        match self {
+            Self::Lfm2512BThinkingGguf => Some(Self::Lfm2512BInstructGguf),
+            _ => None,
+        }
     }
 
     /// Max output codec frames for this TTS variant, if known.
@@ -1189,6 +1200,10 @@ impl SpeechModelCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatModelCapabilities {
     pub supports_thinking: bool,
+    /// Whether `enable_thinking: false` turns thinking off. False for a model
+    /// that always reasons; its non-thinking sibling, when the catalog names
+    /// one, is `ModelVariant::non_thinking_sibling`.
+    pub thinking_toggleable: bool,
     pub default_thinking_enabled: bool,
     pub reasoning_efforts: Vec<ChatReasoningEffort>,
     pub default_reasoning_effort: Option<ChatReasoningEffort>,
@@ -1305,6 +1320,14 @@ mod tests {
         assert!(lfm25_thinking.reasoning_efforts.is_empty());
         assert_eq!(lfm25_thinking.default_reasoning_effort, None);
         assert!(!lfm25_thinking.supports_preserve_thinking);
+        assert!(!lfm25_thinking.thinking_toggleable);
+        assert_eq!(
+            ModelVariant::Lfm2512BThinkingGguf.non_thinking_sibling(),
+            Some(ModelVariant::Lfm2512BInstructGguf)
+        );
+        assert!(qwen35.thinking_toggleable);
+        assert!(qwen38.thinking_toggleable);
+        assert_eq!(ModelVariant::Qwen354BGguf.non_thinking_sibling(), None);
         assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
     }
 

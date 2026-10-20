@@ -12,6 +12,27 @@ interface MarkdownContentProps {
 
 type Element = NonNullable<ExtraProps["node"]>;
 
+function supportsRegExpLookbehind(): boolean {
+  try {
+    new RegExp("(?<=a)b");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * GFM (tables, strikethrough, autolinks) where the engine can run it.
+ * remark-gfm's autolinks use a regex lookbehind, which WebKit before
+ * Safari 16.4 lacks (macOS 12, early macOS 13): there it threw on every
+ * reply, so Markdown renders without GFM instead.
+ */
+export function remarkPluginsFor(supportsLookbehind: boolean) {
+  return supportsLookbehind ? [remarkGfm] : [];
+}
+
+const REMARK_PLUGINS = remarkPluginsFor(supportsRegExpLookbehind());
+
 function isExternalLink(href?: string): boolean {
   if (!href) {
     return false;
@@ -64,7 +85,7 @@ export function MarkdownContent({ content, className }: MarkdownContentProps) {
   return (
     <div className={clsx("chat-markdown", className)}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={REMARK_PLUGINS}
         components={{
           a: ({ href, children, node: _node, ...props }) => {
             const external = isExternalLink(href);

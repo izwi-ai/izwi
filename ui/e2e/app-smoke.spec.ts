@@ -29,7 +29,9 @@ test("keeps the application shell within the viewport", async ({ page }) => {
   expect(documentWidth).toBeLessThanOrEqual(viewportWidth);
 
   if (viewportWidth < 1024) {
-    await expect(page.getByRole("heading", { name: "Izwi" })).toBeVisible();
+    await expect(
+      page.getByRole("banner").getByText("Izwi", { exact: true }),
+    ).toBeVisible();
   } else {
     await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
   }

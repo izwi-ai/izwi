@@ -71,6 +71,14 @@ fn chat_messages_after_prefix(messages: &[ChatMessage], prefix_end: usize) -> Ve
     compacted
 }
 
+/// The answer of a server-side generation with any reasoning split off:
+/// `None` when nothing is left (the budget ran out inside `<think>`).
+fn auxiliary_answer(text: &str, opened_in_prompt: bool) -> Option<String> {
+    let (_, answer) = izwi_model_catalog::chat::reasoning::split_reasoning(text, opened_in_prompt);
+    let answer = answer.trim();
+    (!answer.is_empty()).then(|| answer.to_string())
+}
+
 fn prompt_too_long(prompt_tokens: usize, context_limit: usize) -> Error {
     Error::ContextLengthExceeded(format!(
         "This model's maximum context length is {context_limit} tokens. However, your messages resulted in {prompt_tokens} tokens. Please reduce the length of the messages."
@@ -211,6 +219,15 @@ impl RuntimeService {
                 "Chat request missing messages".to_string(),
             ));
         }
+        // Qwen3.5/3.6/3.8 templates accept a system message only first.
+        let messages = if matches!(
+            variant.family(),
+            ModelFamily::Qwen35Chat | ModelFamily::Qwen35MoeChat | ModelFamily::Qwen38Chat
+        ) {
+            izwi_model_catalog::chat::fold_system_messages(messages)
+        } else {
+            messages
+        };
         if !chat_config.media_inputs.is_empty() && variant.family() != ModelFamily::Qwen35Chat {
             return Err(Error::InvalidInput(format!(
                 "Chat model {variant} does not support Qwen3.5 media inputs"
@@ -508,6 +525,53 @@ impl RuntimeService {
         })
     }
 
+    /// The chat config of the server's own generations (summaries, titles,
+    /// memory): thinking off and truncation on, whatever the model defaults to.
+    pub fn auxiliary_chat_config() -> ChatRequestConfig {
+        ChatRequestConfig {
+            enable_thinking: Some(false),
+            truncation: ChatTruncation::Auto,
+            ..ChatRequestConfig::default()
+        }
+    }
+
+    /// A generation the server makes for its own features. Thinking is off,
+    /// and only the answer comes back: a model that reasons anyway (LFM2.5
+    /// Thinking ignores the switch) has its `<think>` block split off, and an
+    /// answer left empty, because the budget ran out while reasoning, is an
+    /// error instead of reasoning stored as the result.
+    pub async fn auxiliary_generate(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<ChatGeneration> {
+        let chat_config = Self::auxiliary_chat_config();
+        let opened_in_prompt = izwi_model_catalog::chat::reasoning::reasoning_opened_in_prompt(
+            variant,
+            chat_config.enable_thinking,
+        );
+        let mut generation = self
+            .chat_generate_with_runtime_context(
+                variant,
+                messages,
+                params,
+                chat_config,
+                correlation_id,
+                runtime_context,
+            )
+            .await?;
+        generation.text =
+            auxiliary_answer(&generation.text, opened_in_prompt).ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "{variant} returned no answer (its output budget ran out while reasoning)"
+                ))
+            })?;
+        Ok(generation)
+    }
+
     pub async fn chat_generate_streaming<F>(
         &self,
         variant: ModelVariant,
@@ -767,8 +831,8 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completion_budget, chat_messages_after_prefix, complete_chat_turn_prefix_ends,
-        reconcile_streamed_chat_text, CHAT_MAX_TOKENS_UNSET,
+        auxiliary_answer, chat_completion_budget, chat_messages_after_prefix,
+        complete_chat_turn_prefix_ends, reconcile_streamed_chat_text, CHAT_MAX_TOKENS_UNSET,
     };
     use crate::error::Error;
     use crate::models::shared::chat::{ChatMessage, ChatRole, ChatTruncation};
@@ -778,6 +842,41 @@ mod tests {
             role,
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn auxiliary_answers_never_carry_reasoning() {
+        // Thinking off: the answer passes through.
+        assert_eq!(
+            auxiliary_answer("  Tips for winter houseplants \n", false).as_deref(),
+            Some("Tips for winter houseplants")
+        );
+        // A model that reasons anyway writes its own opener (LFM2.5 Thinking).
+        assert_eq!(
+            auxiliary_answer(
+                "<think>Okay, the user wants</think>\n\nWinter plant care",
+                false
+            )
+            .as_deref(),
+            Some("Winter plant care")
+        );
+        // A block the prompt opened (Qwen3.5 with thinking on).
+        assert_eq!(
+            auxiliary_answer(
+                "Thinking Process:\n1. **Analyze**</think>\n\nA summary.",
+                true
+            )
+            .as_deref(),
+            Some("A summary.")
+        );
+        // The budget ran out while reasoning: nothing is returned, so the
+        // reasoning is never stored as the result.
+        assert_eq!(
+            auxiliary_answer("Thinking Process:\n\n1.  **Analyze the Request:**", true),
+            None
+        );
+        assert_eq!(auxiliary_answer("<think> Okay, let's see", false), None);
+        assert_eq!(auxiliary_answer("   ", false), None);
     }
 
     #[test]

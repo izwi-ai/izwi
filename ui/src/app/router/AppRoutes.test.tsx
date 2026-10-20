@@ -20,6 +20,7 @@ vi.mock("@/app/providers/ModelCatalogProvider", () => ({
   useModelCatalog: () => ({
     models: [],
     selectedModel: null,
+    selectedModelFor: () => null,
     loading: false,
     downloadProgress: {},
     readyModelsCount: 0,

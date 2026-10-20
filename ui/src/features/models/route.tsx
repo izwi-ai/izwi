@@ -1,13 +1,5 @@
 import { useMemo, useState } from "react";
-import {
-  Download,
-  Loader2,
-  Play,
-  RefreshCw,
-  Square,
-  Trash2,
-  X,
-} from "lucide-react";
+import { Loader2, RefreshCw, Trash2 } from "lucide-react";
 import type { ModelInfo, RemovedModelInfo } from "@/api";
 import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
 import {
@@ -15,10 +7,13 @@ import {
   SearchField,
   SegmentedFilter,
 } from "@/components/history/HistoryToolbar";
-import { RowBadge } from "@/components/history/RowBadge";
-import { RowMenu, type RowMenuItem } from "@/components/history/RowMenu";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
+import { useOptionalModelCatalog } from "@/app/providers/ModelCatalogProvider";
+import {
+  ModelListRow,
+  revealModelActions,
+} from "@/features/models/components/ModelListRow";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   compareQwenVersionRank,
@@ -46,6 +41,8 @@ interface MyModelsPageProps {
   onLoad: (variant: string) => void;
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
+  /** "Keep loaded" on or off. */
+  onSetPinned?: (variant: string, pinned: boolean) => void;
   onRefresh: () => void;
 }
 
@@ -92,11 +89,6 @@ function getModelSizeBytes(model: ModelInfo): number {
   return model.estimated_size_bytes ?? 0;
 }
 
-function getModelSizeLabel(model: ModelInfo): string {
-  const bytes = getModelSizeBytes(model);
-  return bytes > 0 ? formatBytes(bytes) : "Size unknown";
-}
-
 function getProviderLabel(variant: string): string {
   return getModelProviderLabel(variant);
 }
@@ -120,72 +112,6 @@ function compareProviders(left: string, right: string): number {
 
 function isOnDisk(model: ModelInfo): boolean {
   return model.status === "downloaded" || model.status === "ready";
-}
-
-function StatusCell({
-  model,
-  progress,
-}: {
-  model: ModelInfo;
-  progress: number;
-}) {
-  const live = {
-    role: model.status === "error" ? "alert" : "status",
-    "aria-live": model.status === "error" ? "assertive" : "polite",
-    "aria-atomic": true,
-  } as const;
-  switch (model.status) {
-    case "ready":
-      return (
-        <span {...live}>
-          <RowBadge tone="positive" dot>
-            Loaded
-          </RowBadge>
-        </span>
-      );
-    case "downloading":
-      return (
-        <div {...live} className="flex flex-col gap-1.5">
-          <RowBadge tone="info" dot className="self-start">
-            Downloading {Math.round(progress)}%
-          </RowBadge>
-          <div className="h-[3px] w-28 overflow-hidden rounded-full bg-[var(--surface-raised)]">
-            <div
-              className="h-full bg-[var(--text-primary)] transition-[width]"
-              style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
-            />
-          </div>
-        </div>
-      );
-    case "loading":
-      return (
-        <span {...live}>
-          <RowBadge tone="info" icon={<Loader2 className="h-3 w-3 animate-spin" />}>
-            Loading
-          </RowBadge>
-        </span>
-      );
-    case "downloaded":
-      return (
-        <span {...live}>
-          <RowBadge>Downloaded</RowBadge>
-        </span>
-      );
-    case "error":
-      return (
-        <span {...live} title={model.error_message ?? undefined}>
-          <RowBadge tone="danger" dot>
-            Error
-          </RowBadge>
-        </span>
-      );
-    default:
-      return (
-        <span {...live} className="text-[13px] text-[var(--text-subtle)]">
-          Not downloaded
-        </span>
-      );
-  }
 }
 
 function SummaryCard({
@@ -234,6 +160,7 @@ export function MyModelsPage({
   onLoad,
   onUnload,
   onDelete,
+  onSetPinned,
   onRefresh,
 }: MyModelsPageProps) {
   const [searchQuery, setSearchQuery] = useState("");
@@ -243,6 +170,10 @@ export function MyModelsPage({
     null,
   );
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const catalog = useOptionalModelCatalog();
+  const revealActions = revealModelActions((message) =>
+    catalog?.reportError(message),
+  );
 
   const visibleModels = useMemo(
     () => models.filter((m) => !m.variant.includes("Tokenizer")),
@@ -362,95 +293,6 @@ export function MyModelsPage({
   const hasActiveFilters =
     searchQuery.trim().length > 0 || statusFilter !== "all";
 
-  const primaryAction = (model: ModelInfo, displayName: string) => {
-    const common = "h-8 gap-1.5 px-2.5 text-[13px]";
-    switch (model.status) {
-      case "not_downloaded":
-        return (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={common}
-            onClick={() => onDownload(model.variant)}
-            aria-label={`Download ${displayName}`}
-          >
-            <Download className="h-3.5 w-3.5" />
-            Download
-          </Button>
-        );
-      case "downloading":
-        return onCancelDownload ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className={common}
-            onClick={() => onCancelDownload(model.variant)}
-          >
-            <X className="h-3.5 w-3.5" />
-            Cancel
-          </Button>
-        ) : null;
-      case "downloaded":
-        return (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={common}
-            onClick={() => onLoad(model.variant)}
-            aria-label={`Load ${displayName}`}
-          >
-            <Play className="h-3.5 w-3.5" />
-            Load
-          </Button>
-        );
-      case "loading":
-        return (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className={common}
-            onClick={() => onUnload(model.variant)}
-          >
-            <X className="h-3.5 w-3.5" />
-            Cancel load
-          </Button>
-        );
-      case "ready":
-        return (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={common}
-            onClick={() => onUnload(model.variant)}
-            aria-label={`Unload ${displayName}`}
-          >
-            <Square className="h-3.5 w-3.5" />
-            Unload
-          </Button>
-        );
-      default:
-        return null;
-    }
-  };
-
-  const menuItems = (model: ModelInfo): RowMenuItem[] =>
-    isOnDisk(model) || (model.status === "error" && model.local_path)
-      ? [
-          {
-            id: "delete",
-            label: "Delete",
-            icon: Trash2,
-            danger: true,
-            onSelect: () => setDeleteModalVariant(model.variant),
-          },
-        ]
-      : [];
-
   return (
     <PageShell>
       <PageHeader
@@ -537,9 +379,9 @@ export function MyModelsPage({
           }
           detail={
             stats.loaded.some((m) => m.pinned)
-              ? "Pinned models stay loaded across pages."
+              ? "Models you keep loaded stay until you unload them."
               : stats.loaded.length > 0
-                ? "Unloaded automatically under memory pressure."
+                ? "Loaded models make room when another model needs it."
                 : "No model loaded."
           }
         />
@@ -617,42 +459,31 @@ export function MyModelsPage({
                     downloadProgress[model.variant]?.percent ??
                     model.download_progress ??
                     0;
-                  const items = menuItems(model);
                   return (
-                    <li
+                    <ModelListRow
                       key={model.variant}
-                      data-testid={`model-row-${model.variant}`}
-                      className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--border-subtle)] px-4 py-3 last:border-b-0"
-                    >
-                      <div className="min-w-0 flex-1 basis-64">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-[14px] font-medium text-[var(--text-primary)]">
-                            {displayName}
-                          </span>
-                          {model.pinned ? <RowBadge>Pinned</RowBadge> : null}
-                        </div>
-                        <div className="mt-0.5 truncate text-[12.5px] text-[var(--text-subtle)]">
-                          {details.description ? (
-                            <span>{details.description} · </span>
-                          ) : null}
-                          <span>{getProviderLabel(model.variant)}</span>
-                        </div>
-                      </div>
-                      <div className="w-36">
-                        <StatusCell model={model} progress={progress} />
-                      </div>
-                      <div className="w-20 text-right text-[13px] tabular-nums text-[var(--text-muted)]">
-                        {getModelSizeLabel(model)}
-                      </div>
-                      <div className="flex w-[7.5rem] justify-end">
-                        {primaryAction(model, displayName)}
-                      </div>
-                      <div className="flex w-7 justify-end">
-                        {items.length > 0 ? (
-                          <RowMenu label={displayName} items={items} />
-                        ) : null}
-                      </div>
-                    </li>
+                      model={model}
+                      label={displayName}
+                      subtitle={[
+                        details.description || null,
+                        model.status === "ready" && model.pinned
+                          ? "Kept loaded"
+                          : null,
+                        getProviderLabel(model.variant),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                      progress={progress}
+                      actions={{
+                        onDownload,
+                        onCancelDownload,
+                        onLoad,
+                        onUnload,
+                        onDelete: setDeleteModalVariant,
+                        onSetPinned,
+                        ...revealActions,
+                      }}
+                    />
                   );
                 })}
               </ul>

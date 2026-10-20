@@ -1,4 +1,7 @@
 use console::style;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::borrow::Cow;
+use std::time::Duration;
 
 pub const HELP_TEMPLATE: &str = r#"
 {before-help}{name} {version}
@@ -74,3 +77,21 @@ impl Theme {
     }
 }
 
+/// Prints a failed command's error to stderr, on one line.
+pub fn print_error(error: &dyn std::fmt::Display) {
+    eprintln!("{} {}", style("error:").for_stderr().red().bold(), error);
+}
+
+/// A spinner with the elapsed time on stderr; hidden when stderr is not a
+/// terminal, so it never mixes with output on stdout.
+pub fn spinner(message: impl Into<Cow<'static, str>>) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    if let Ok(template) =
+        ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed}] {msg}")
+    {
+        spinner.set_style(template);
+    }
+    spinner.set_message(message);
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    spinner
+}

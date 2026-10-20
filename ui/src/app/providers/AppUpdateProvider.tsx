@@ -46,6 +46,8 @@ export type UpdaterCapabilityStatus =
 interface AppUpdateContextValue {
   availableUpdate: AppUpdateMetadata | null;
   status: UpdateStatus;
+  /** Version installed and waiting for a restart; it stays ready through re-checks. */
+  downloadedVersion: string | null;
   lastCheckedAt: number | null;
   errorMessage: string | null;
   isPromptOpen: boolean;
@@ -74,6 +76,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     null,
   );
   const [status, setStatus] = useState<UpdateStatus>("idle");
+  const [downloadedVersion, setDownloadedVersion] = useState<string | null>(null);
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isPromptOpen, setIsPromptOpen] = useState(false);
@@ -84,6 +87,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       updaterSupported ? "loading" : "unsupported",
     );
   const statusRef = useRef<UpdateStatus>("idle");
+  const downloadedVersionRef = useRef<string | null>(null);
   const healthRef = useRef<UpdaterHealthStatus | null>(null);
 
   useEffect(() => {
@@ -154,9 +158,27 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       setProgressPercent(null);
       void trackUpdateCheckStarted(manual ? "manual" : "background");
 
+      const downloaded = downloadedVersionRef.current;
       try {
         const update = await checkForBetaUpdate();
         setLastCheckedAt(Date.now());
+
+        // An update waiting for a restart stays ready unless a newer one is out.
+        if (downloaded && (!update || update.version === downloaded)) {
+          if (update) {
+            setAvailableUpdate(update);
+          }
+          statusRef.current = "downloaded";
+          setStatus("downloaded");
+          if (manual) {
+            setIsPromptOpen(true);
+          }
+          void trackUpdateCheckCompleted(
+            update ? "update_available" : "no_update",
+            update?.version,
+          );
+          return;
+        }
 
         if (!update) {
           setAvailableUpdate(null);
@@ -164,38 +186,32 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
           setStatus("idle");
           void trackUpdateCheckCompleted("no_update");
           if (manual) {
-            notify({
-              title: "You’re up to date",
-              description: "No new beta update is available right now.",
-              tone: "success",
-            });
+            notify({ title: "Izwi is up to date", tone: "success" });
           }
           return;
         }
 
+        // The update card opens and says it; no separate notification.
         setAvailableUpdate(update);
         statusRef.current = "available";
         setStatus("available");
         setIsPromptOpen(true);
         void trackUpdateCheckCompleted("update_available", update.version);
-
-        if (!manual) {
-          notify({
-            title: `Update available: ${update.version}`,
-            description: "Open the update prompt to install this release.",
-            tone: "info",
-          });
-        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : "Unknown update-check error.";
-        statusRef.current = "error";
-        setStatus("error");
-        setErrorMessage(message);
+        if (currentStatus === "downloaded") {
+          statusRef.current = "downloaded";
+          setStatus("downloaded");
+        } else {
+          statusRef.current = "error";
+          setStatus("error");
+          setErrorMessage(message);
+        }
         void trackUpdateCheckCompleted("failed", undefined, message);
         if (manual) {
           notify({
-            title: "Could not check for updates",
+            title: "Couldn’t check for updates",
             description: message,
             tone: "warning",
           });
@@ -209,7 +225,10 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     if (!availableUpdate || !updaterSupported) {
       return;
     }
-    if (statusRef.current === "downloading") {
+    if (
+      statusRef.current === "downloading" ||
+      downloadedVersionRef.current === availableUpdate.version
+    ) {
       return;
     }
 
@@ -248,22 +267,18 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
 
       if (result.appExitsDuringInstall) {
         notify({
-          title: "Applying update",
-          description:
-            "Windows will close Izwi to run the installer automatically.",
+          title: "Installing the update",
+          description: "Izwi closes to run the installer.",
           tone: "info",
         });
         return;
       }
 
-      setStatus("downloaded");
+      downloadedVersionRef.current = availableUpdate.version;
+      setDownloadedVersion(availableUpdate.version);
       statusRef.current = "downloaded";
+      setStatus("downloaded");
       setIsPromptOpen(true);
-      notify({
-        title: "Update installed",
-        description: "Restart Izwi when you’re ready to apply it.",
-        tone: "success",
-      });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown update-install error.";
@@ -271,11 +286,8 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
       setStatus("available");
       setErrorMessage(message);
       void trackUpdateInstallFailed(message);
-      notify({
-        title: "Could not install update",
-        description: message,
-        tone: "warning",
-      });
+      // The update card shows the reason.
+      setIsPromptOpen(true);
     }
   }, [availableUpdate, notify, updaterSupported]);
 
@@ -317,6 +329,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     () => ({
       availableUpdate,
       status,
+      downloadedVersion,
       lastCheckedAt,
       errorMessage,
       isPromptOpen,
@@ -334,6 +347,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     [
       availableUpdate,
       status,
+      downloadedVersion,
       lastCheckedAt,
       errorMessage,
       isPromptOpen,

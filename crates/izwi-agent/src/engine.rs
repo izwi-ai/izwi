@@ -183,30 +183,37 @@ impl AgentEngine {
             }
         }
 
-        let mut model_messages = Vec::with_capacity(history.len() + 4);
+        // One leading system message: chat templates such as Qwen3.5's reject
+        // a system message anywhere else, so the memory context, the plan and
+        // a tool result join the agent's prompt instead of following it.
+        let mut system_parts = vec![agent.system_prompt.clone()];
+        let mut conversation = Vec::with_capacity(history.len() + 1);
+        for message in history {
+            if message.role == MemoryMessageRole::System {
+                system_parts.push(message.content);
+            } else {
+                conversation.push(message);
+            }
+        }
+        if let Some(plan_summary) = &plan {
+            system_parts.push(format!(
+                "Planning summary for this request (do not expose as hidden reasoning): {}",
+                plan_summary.steps.join(" | ")
+            ));
+        }
+        if let Some(tool_note) = tool_context_note {
+            system_parts.push(format!(
+                "Use this verified tool result if relevant: {tool_note}"
+            ));
+        }
+        system_parts.retain(|part| !part.trim().is_empty());
+
+        let mut model_messages = Vec::with_capacity(conversation.len() + 2);
         model_messages.push(MemoryMessage {
             role: MemoryMessageRole::System,
-            content: agent.system_prompt.clone(),
+            content: system_parts.join("\n\n"),
         });
-        model_messages.extend(history);
-
-        if let Some(plan_summary) = &plan {
-            model_messages.push(MemoryMessage {
-                role: MemoryMessageRole::System,
-                content: format!(
-                    "Planning summary for this request (do not expose as hidden reasoning): {}",
-                    plan_summary.steps.join(" | ")
-                ),
-            });
-        }
-
-        if let Some(tool_note) = tool_context_note {
-            model_messages.push(MemoryMessage {
-                role: MemoryMessageRole::System,
-                content: format!("Use this verified tool result if relevant: {tool_note}"),
-            });
-        }
-
+        model_messages.extend(conversation);
         model_messages.push(MemoryMessage {
             role: MemoryMessageRole::User,
             content: user_text,
@@ -473,6 +480,60 @@ mod tests {
 
     /// SPK-F13: a caller that defers the reply stores it later, once it
     /// knows how much of it the user heard.
+    /// Chat templates such as Qwen3.5's accept a system message only first:
+    /// memory, a plan and a tool result all join the one leading message.
+    #[tokio::test]
+    async fn the_prompt_has_one_leading_system_message() {
+        let memory = TestMemory::default();
+        memory.messages.lock().expect("lock").extend([
+            message(MemoryMessageRole::System, "Remembered: likes tea"),
+            message(MemoryMessageRole::User, "Hi"),
+            message(MemoryMessageRole::Assistant, "Hello"),
+        ]);
+        let model = TestModel::default();
+        let (mut agent, session) = test_agent();
+        agent.capabilities.tools = true;
+        let mut tools = ToolRegistry::new();
+        tools.register(TimeTool);
+        AgentEngine
+            .run_turn(
+                &agent,
+                &session,
+                TurnInput {
+                    text: "Help me plan my time today".to_string(),
+                },
+                None,
+                &memory,
+                &model,
+                &SimplePlanner,
+                &tools,
+                AgentTurnOptions::default(),
+            )
+            .await
+            .expect("turn");
+
+        let prompt = model.prompts.lock().expect("lock").pop().expect("prompt");
+        let roles: Vec<_> = prompt.iter().map(|message| message.role).collect();
+        assert_eq!(
+            roles,
+            [
+                MemoryMessageRole::System,
+                MemoryMessageRole::User,
+                MemoryMessageRole::Assistant,
+                MemoryMessageRole::User,
+            ]
+        );
+        let system = &prompt[0].content;
+        for part in [
+            "Be helpful",
+            "Remembered: likes tea",
+            "Planning summary",
+            "Tool `time`",
+        ] {
+            assert!(system.contains(part), "{part} missing from {system}");
+        }
+    }
+
     #[tokio::test]
     async fn a_deferred_reply_is_stored_only_when_committed() {
         let memory = TestMemory::default();

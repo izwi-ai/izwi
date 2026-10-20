@@ -62,7 +62,7 @@ Voice cloning now lives inside the unified **Voices** workspace.
 
 ## Using the CLI
 
-Use `izwi tts` with a Base or VibeVoice TTS model and provide both the
+Use `izwi tts` with a Base, VibeVoice or `FishAudio-S2-Pro` TTS model and provide both the
 reference audio and its transcript:
 
 ```bash
@@ -182,6 +182,7 @@ saved voice routes and exact fields.
 | `Qwen3-TTS-12Hz-0.6B-Base` | ~2.3 GB | Good |
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better |
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
+| `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
 
 Larger models produce more accurate voice clones.
 

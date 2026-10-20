@@ -3,13 +3,17 @@
 mod dto;
 mod handlers;
 
-use axum::{routing::get, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::get, routing::post, Router};
 
+use crate::api::chat::CHAT_REQUEST_LIMIT_BYTES;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/responses", post(handlers::create_response))
+        .route(
+            "/responses",
+            post(handlers::create_response).layer(DefaultBodyLimit::max(CHAT_REQUEST_LIMIT_BYTES)),
+        )
         .route(
             "/responses/{response_id}",
             get(handlers::get_response).delete(handlers::delete_response),

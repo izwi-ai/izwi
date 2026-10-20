@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::api::audio_payload::{
     decode_audio_payload_canonical_with_diagnostics, decode_base64_audio_payload,
@@ -27,19 +27,19 @@ use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
-    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
-    DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
-    JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
+    validate_diarization_speaker_limits, DiarizationConfig, DiarizationPipelineOptions,
+    DiarizationTranscriptResult, JobCancellation, ModelVariant, RuntimeService, WorkloadClass,
 };
 use tracing::{info, info_span, warn, Instrument};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
+use crate::api::summary::{
+    spawn_summary_generation, truncate_summary_error, SummaryJob, SummaryKind,
+    DEFAULT_SUMMARY_MODEL,
+};
 
 const HISTORY_LIST_LIMIT: usize = 200;
-const DEFAULT_DIARIZATION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
-const DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS: usize = 384;
-const DIARIZATION_SUMMARY_SYSTEM_PROMPT: &str = "You summarize diarized transcripts for fast review. Return only the final summary text. Do not output markdown, bullet markers, XML tags, code fences, or <think> content. Keep it concise while preserving major speaker contributions, decisions, action items, and unresolved questions.";
 
 #[derive(Debug, Serialize)]
 pub struct DiarizationRecordListResponse {
@@ -69,8 +69,6 @@ pub struct RerunDiarizationRecordRequest {
     pub min_speech_duration_ms: Option<f64>,
     #[serde(default)]
     pub min_silence_duration_ms: Option<f64>,
-    #[serde(default)]
-    pub enable_llm_refinement: Option<bool>,
     /// Defaults to whether the source record asked for a summary.
     #[serde(default)]
     pub generate_summary: Option<bool>,
@@ -99,7 +97,6 @@ struct ParsedDiarizationCreateRequest {
     max_speakers: Option<usize>,
     min_speech_duration_ms: Option<f64>,
     min_silence_duration_ms: Option<f64>,
-    enable_llm_refinement: Option<bool>,
     /// Summarize the transcript with the pipeline LLM once it is ready (D6).
     generate_summary: bool,
     /// ASR language hint; `None` detects the language per chunk.
@@ -128,8 +125,6 @@ struct JsonCreateRequest {
     min_speech_duration_ms: Option<f64>,
     #[serde(default)]
     min_silence_duration_ms: Option<f64>,
-    #[serde(default)]
-    enable_llm_refinement: Option<bool>,
     #[serde(default)]
     generate_summary: Option<bool>,
     #[serde(default)]
@@ -208,6 +203,9 @@ pub async fn delete_record(
     if !deleted {
         return Err(ApiError::not_found("Diarization record not found"));
     }
+    // A run still in progress stops instead of working on for a record that
+    // no longer exists.
+    state.diarization_jobs.cancel(&record_id);
 
     Ok(Json(DeleteDiarizationRecordResponse {
         id: record_id,
@@ -392,7 +390,6 @@ async fn create_pending_record(
             max_speakers: parsed.max_speakers,
             min_speech_duration_ms: parsed.min_speech_duration_ms,
             min_silence_duration_ms: parsed.min_silence_duration_ms,
-            enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
             language: parsed.language.clone(),
             vad_gate: parsed.vad_gate,
             processing_time_ms: 0.0,
@@ -401,7 +398,6 @@ async fn create_pending_record(
             speaker_count: 0,
             alignment_coverage: None,
             unattributed_words: 0,
-            llm_refined: false,
             asr_text: String::new(),
             raw_transcript: String::new(),
             transcript: String::new(),
@@ -475,7 +471,7 @@ fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Re
     if let Some(raw) = parsed.llm_model_id.as_deref() {
         let variant = resolve_diarization_llm_variant(Some(raw)).map_err(|_| {
             ApiError::bad_request(format!(
-                "Model '{raw}' is not a chat model for diarization refinement or summaries."
+                "Model '{raw}' is not a chat model for diarization summaries."
             ))
         })?;
         parsed.llm_model_id = Some(variant.dir_name().to_string());
@@ -491,7 +487,6 @@ struct GeneratedDiarizationArtifacts {
     speaker_count: usize,
     alignment_coverage: Option<f64>,
     unattributed_words: usize,
-    llm_refined: bool,
     asr_text: String,
     raw_transcript: String,
     transcript: String,
@@ -587,14 +582,12 @@ fn spawn_diarization_processing_task(
                             max_speakers: parsed.max_speakers,
                             min_speech_duration_ms: parsed.min_speech_duration_ms,
                             min_silence_duration_ms: parsed.min_silence_duration_ms,
-                            enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
                             processing_time_ms: artifacts.processing_time_ms,
                             duration_secs: Some(artifacts.duration_secs),
                             rtf: artifacts.rtf,
                             speaker_count: artifacts.speaker_count,
                             alignment_coverage: artifacts.alignment_coverage,
                             unattributed_words: artifacts.unattributed_words,
-                            llm_refined: artifacts.llm_refined,
                             asr_text: artifacts.asr_text,
                             raw_transcript: artifacts.raw_transcript,
                             transcript: artifacts.transcript,
@@ -685,11 +678,10 @@ async fn generate_diarization_artifacts(
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let started = Instant::now();
-    let (model_id, asr_model_id, aligner_model_id, llm_model_id) = (
+    let (model_id, asr_model_id, aligner_model_id) = (
         parsed.model_id.as_deref(),
         parsed.asr_model_id.as_deref(),
         parsed.aligner_model_id.as_deref(),
-        parsed.llm_model_id.as_deref(),
     );
     let config = DiarizationConfig {
         min_speakers: parsed.min_speakers,
@@ -699,7 +691,6 @@ async fn generate_diarization_artifacts(
         vad_gate: parsed.vad_gate,
     };
     let options = DiarizationPipelineOptions {
-        enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
         language: parsed.language.clone(),
         cancellation: cancellation.clone(),
     };
@@ -712,7 +703,6 @@ async fn generate_diarization_artifacts(
                 model_id,
                 asr_model_id,
                 aligner_model_id,
-                llm_model_id,
                 &config,
                 &options,
             )
@@ -724,7 +714,6 @@ async fn generate_diarization_artifacts(
                 model_id,
                 asr_model_id,
                 aligner_model_id,
-                llm_model_id,
                 &config,
                 &options,
             )
@@ -763,7 +752,6 @@ fn diarization_artifacts(
         speaker_count: output.speaker_count,
         alignment_coverage: Some(output.alignment_coverage as f64),
         unattributed_words: output.unattributed_words,
-        llm_refined: output.llm_refined,
         asr_text: output.asr_text,
         raw_transcript: output.raw_transcript,
         transcript: output.transcript,
@@ -829,11 +817,6 @@ fn build_rerun_create_request(
         min_silence_duration_ms: rerun
             .min_silence_duration_ms
             .or(source_record.min_silence_duration_ms),
-        enable_llm_refinement: Some(
-            rerun
-                .enable_llm_refinement
-                .unwrap_or(source_record.enable_llm_refinement),
-        ),
         generate_summary: rerun
             .generate_summary
             .unwrap_or(source_record.summary_status != DiarizationSummaryStatus::NotRequested),
@@ -861,9 +844,7 @@ fn validate_speaker_bounds(
 
 /// The model that summarizes a record: its pipeline LLM, else the default.
 fn summary_model_id(llm_model_id: Option<&str>) -> String {
-    llm_model_id
-        .unwrap_or(DEFAULT_DIARIZATION_SUMMARY_MODEL)
-        .to_string()
+    llm_model_id.unwrap_or(DEFAULT_SUMMARY_MODEL).to_string()
 }
 
 /// A summary is generated only when the job asked for one (`summary_model`)
@@ -894,13 +875,38 @@ fn maybe_spawn_summary_generation(
         state,
         summary_timeout_secs,
         record.id.clone(),
-        record.transcript.clone(),
+        transcript_with_speaker_names(&record.transcript, &record.speaker_name_overrides),
         record
             .summary_model_id
             .clone()
             .unwrap_or_else(|| summary_model_id(record.llm_model_id.as_deref())),
         correlation_id,
     );
+}
+
+/// The transcript with each line's speaker label (`SPEAKER_00 [0.00s - …]:`)
+/// replaced by the name the user gave that speaker, so a summary says
+/// "Erin" instead of "Speaker 00".
+fn transcript_with_speaker_names(
+    transcript: &str,
+    speaker_names: &BTreeMap<String, String>,
+) -> String {
+    if speaker_names.is_empty() {
+        return transcript.to_string();
+    }
+    transcript
+        .lines()
+        .map(|line| {
+            let label_end = line.find([' ', ':']).unwrap_or(line.len());
+            match speaker_names.get(&line[..label_end]) {
+                Some(name) if !name.trim().is_empty() => {
+                    format!("{}{}", name.trim(), &line[label_end..])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn spawn_summary_generation_task(
@@ -911,45 +917,33 @@ fn spawn_summary_generation_task(
     model_id: String,
     correlation_id: Option<String>,
 ) {
-    tokio::spawn(async move {
-        let runtime = state.runtime.clone();
-        let diarization_store = state.diarization_store.clone();
-        let permit = match state
-            .acquire_owned_workload_permit(WorkloadClass::Background)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
+    let diarization_store = state.diarization_store.clone();
+    let variant = match resolve_diarization_llm_variant(Some(&model_id)) {
+        Ok(variant) => variant,
+        Err(err) => {
+            tokio::spawn(async move {
                 persist_summary_update(
                     &diarization_store,
                     record_id.as_str(),
                     summary_failure_update(
-                        "Summary generation unavailable: request queue closed.",
+                        &format!("Invalid summary model '{model_id}': {err}"),
                         &model_id,
                     ),
                 )
                 .await;
-                return;
-            }
-        };
-
-        let summary_result = if transcript.trim().is_empty() {
-            Err("Summary generation failed: transcript is empty".to_string())
-        } else {
-            generate_diarization_summary_with_timeout(
-                runtime,
-                &model_id,
-                transcript.as_str(),
-                correlation_id.as_deref(),
-                summary_timeout_secs,
-                permit.runtime_context(),
-            )
-            .await
-        };
-
-        drop(permit);
-
-        let summary_update = match summary_result {
+            });
+            return;
+        }
+    };
+    let job = SummaryJob {
+        kind: SummaryKind::DiarizedTranscript,
+        variant,
+        transcript,
+        correlation_id,
+        timeout_secs: summary_timeout_secs,
+    };
+    spawn_summary_generation(state, job, move |result| async move {
+        let summary_update = match result {
             Ok(summary_text) => UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Ready,
                 model_id: Some(model_id),
@@ -957,82 +951,10 @@ fn spawn_summary_generation_task(
                 error: None,
                 updated_at: None,
             },
-            Err(err) => summary_failure_update(err.as_str(), &model_id),
+            Err(err) => summary_failure_update(&err, &model_id),
         };
-
         persist_summary_update(&diarization_store, record_id.as_str(), summary_update).await;
     });
-}
-
-async fn generate_diarization_summary_with_timeout(
-    runtime: Arc<RuntimeService>,
-    model_id: &str,
-    transcript: &str,
-    correlation_id: Option<&str>,
-    timeout_secs: u64,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(
-            runtime,
-            model_id,
-            transcript,
-            correlation_id,
-            runtime_context,
-        ),
-    )
-    .await
-    .map_err(|_| summary_timeout_error(timeout_secs))?
-}
-
-async fn generate_diarization_summary(
-    runtime: Arc<RuntimeService>,
-    model_id: &str,
-    transcript: &str,
-    correlation_id: Option<&str>,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    let variant = resolve_diarization_llm_variant(Some(model_id))
-        .map_err(|err| format!("Invalid summary model '{model_id}': {err}"))?;
-    let params = GenerationParams {
-        max_tokens: DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS,
-        temperature: 0.2,
-        top_p: 0.9,
-        ..Default::default()
-    };
-
-    let generation = runtime
-        .chat_generate_with_runtime_context(
-            variant,
-            vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: DIARIZATION_SUMMARY_SYSTEM_PROMPT.to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "Summarize the following diarized transcript.\n\nTranscript:\n{}",
-                        transcript
-                    ),
-                },
-            ],
-            params,
-            // Long transcripts keep fitting the summary model by trimming the
-            // output budget, as before D8.
-            ChatRequestConfig {
-                truncation: ChatTruncation::Auto,
-                ..ChatRequestConfig::default()
-            },
-            correlation_id,
-            runtime_context,
-        )
-        .await
-        .map_err(|err| format!("Summary generation failed: {err}"))?;
-
-    sanitize_summary_output(generation.text.as_str())
-        .ok_or_else(|| "Summary generation returned empty text".to_string())
 }
 
 fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSummary {
@@ -1043,13 +965,6 @@ fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSumma
         error: Some(truncate_summary_error(error)),
         updated_at: None,
     }
-}
-
-fn summary_timeout_error(timeout_secs: u64) -> String {
-    format!(
-        "Summary generation timed out after {} seconds.",
-        timeout_secs.max(1)
-    )
 }
 
 async fn persist_summary_update(
@@ -1076,58 +991,6 @@ async fn persist_summary_update(
             );
         }
     }
-}
-
-fn sanitize_summary_output(raw: &str) -> Option<String> {
-    let without_think = strip_think_sections(raw);
-    let without_fence_markers = strip_code_fence_markers(without_think.as_str());
-    let normalized = without_fence_markers
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn strip_think_sections(input: &str) -> String {
-    let mut out = if let Some((_, tail)) = input.rsplit_once("</think>") {
-        tail.to_string()
-    } else {
-        input.to_string()
-    };
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-
-    while let Some(start) = out.find(open_tag) {
-        if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
-            let end = start + open_tag.len() + end_rel;
-            let mut next = String::with_capacity(out.len());
-            next.push_str(&out[..start]);
-            next.push_str(&out[end + close_tag.len()..]);
-            out = next;
-        } else {
-            out.truncate(start);
-            break;
-        }
-    }
-
-    out.replace(open_tag, " ").replace(close_tag, " ")
-}
-
-fn strip_code_fence_markers(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn truncate_summary_error(raw: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 320;
-    raw.chars().take(MAX_ERROR_CHARS).collect::<String>()
 }
 
 async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateRequest, ApiError> {
@@ -1172,7 +1035,6 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             max_speakers: payload.max_speakers,
             min_speech_duration_ms: payload.min_speech_duration_ms,
             min_silence_duration_ms: payload.min_silence_duration_ms,
-            enable_llm_refinement: payload.enable_llm_refinement,
             generate_summary: payload.generate_summary.unwrap_or(false),
             language: sanitize_optional(payload.language),
             vad_gate: payload.vad_gate,
@@ -1318,14 +1180,6 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     })?;
                     out.min_silence_duration_ms = text.trim().parse::<f64>().ok();
                 }
-                "enable_llm_refinement" => {
-                    let text = field.text().await.map_err(|err| {
-                        ApiError::bad_request(format!(
-                            "Failed reading multipart 'enable_llm_refinement' field: {err}"
-                        ))
-                    })?;
-                    out.enable_llm_refinement = Some(parse_truthy(text.as_str()));
-                }
                 "generate_summary" => {
                     let text = field.text().await.map_err(|err| {
                         ApiError::bad_request(format!(
@@ -1442,6 +1296,7 @@ mod tests {
     use axum::body::Body;
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
+    use std::time::Duration;
 
     fn wav_data_url(content_type: &str) -> String {
         let wav = AudioEncoder::new(16_000, 1)
@@ -1465,7 +1320,6 @@ mod tests {
             max_speakers: Some(4),
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
-            enable_llm_refinement: true,
             processing_time_ms: 120.0,
             duration_secs: Some(9.5),
             rtf: Some(0.4),
@@ -1473,7 +1327,6 @@ mod tests {
             corrected_speaker_count: 2,
             alignment_coverage: Some(0.94),
             unattributed_words: 0,
-            llm_refined: true,
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00: hello there".to_string(),
             transcript: "SPEAKER_00: hello there".to_string(),
@@ -1511,7 +1364,6 @@ mod tests {
             speaker_count: 1,
             alignment_coverage: 0.0,
             unattributed_words: 0,
-            llm_refined: false,
             warnings: vec![warning.to_string()],
         };
         let artifacts = diarization_artifacts(output, 1_500.0, None);
@@ -1553,6 +1405,48 @@ mod tests {
         );
     }
 
+    /// LLM refinement was removed in 0.1.0-beta-18: older clients that still send
+    /// `enable_llm_refinement` keep working, and the field does nothing.
+    #[tokio::test]
+    async fn create_and_rerun_requests_ignore_the_removed_refinement_field() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "enable_llm_refinement": true
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        parse_create_request(request)
+            .await
+            .expect("a create naming the removed field should parse");
+
+        let rerun: RerunDiarizationRecordRequest =
+            serde_json::from_value(serde_json::json!({ "enable_llm_refinement": false }))
+                .expect("a rerun naming the removed field should parse");
+        assert!(rerun.min_speakers.is_none());
+    }
+
+    #[test]
+    fn summaries_read_the_names_the_user_gave_speakers() {
+        let transcript =
+            "SPEAKER_00 [0.00s - 1.00s]: Hi\nSPEAKER_01 [1.00s - 2.00s]: Hello\nSPEAKER_10: Hey";
+        let names = BTreeMap::from([
+            ("SPEAKER_00".to_string(), "Erin".to_string()),
+            ("SPEAKER_01".to_string(), "  ".to_string()),
+        ]);
+        assert_eq!(
+            transcript_with_speaker_names(transcript, &names),
+            "Erin [0.00s - 1.00s]: Hi\nSPEAKER_01 [1.00s - 2.00s]: Hello\nSPEAKER_10: Hey"
+        );
+        assert_eq!(
+            transcript_with_speaker_names(transcript, &BTreeMap::new()),
+            transcript
+        );
+    }
+
     #[test]
     fn rerun_request_inherits_existing_record_settings() {
         let parsed = build_rerun_create_request(
@@ -1575,7 +1469,6 @@ mod tests {
         assert_eq!(parsed.max_speakers, Some(4));
         assert_eq!(parsed.min_speech_duration_ms, Some(240.0));
         assert_eq!(parsed.min_silence_duration_ms, Some(200.0));
-        assert_eq!(parsed.enable_llm_refinement, Some(true));
         assert_eq!(parsed.audio_bytes, vec![1_u8, 2_u8, 3_u8]);
     }
 
@@ -1781,7 +1674,6 @@ mod tests {
                 max_speakers: Some(5),
                 min_speech_duration_ms: Some(180.0),
                 min_silence_duration_ms: Some(140.0),
-                enable_llm_refinement: Some(false),
                 ..Default::default()
             },
         );
@@ -1790,7 +1682,6 @@ mod tests {
         assert_eq!(parsed.max_speakers, Some(5));
         assert_eq!(parsed.min_speech_duration_ms, Some(180.0));
         assert_eq!(parsed.min_silence_duration_ms, Some(140.0));
-        assert_eq!(parsed.enable_llm_refinement, Some(false));
     }
 
     #[test]
@@ -1859,7 +1750,7 @@ mod tests {
         let (status, model_id) = initial_summary_state("   ", requested);
         assert_eq!(status, DiarizationSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
-        assert_eq!(summary_model_id(None), DEFAULT_DIARIZATION_SUMMARY_MODEL);
+        assert_eq!(summary_model_id(None), DEFAULT_SUMMARY_MODEL);
     }
 
     #[tokio::test]
@@ -1902,27 +1793,6 @@ mod tests {
         source.summary_status = DiarizationSummaryStatus::Ready;
         assert!(rerun(&source, None));
         assert!(!rerun(&source, Some(false)));
-    }
-
-    #[test]
-    fn sanitizes_summary_output_for_display_and_storage() {
-        let raw = "<think>reasoning</think>\n```text\nSummary text.\n```\n";
-        assert_eq!(
-            sanitize_summary_output(raw).as_deref(),
-            Some("Summary text.")
-        );
-    }
-
-    #[test]
-    fn summary_timeout_error_enforces_minimum_one_second() {
-        assert_eq!(
-            summary_timeout_error(0),
-            "Summary generation timed out after 1 seconds."
-        );
-        assert_eq!(
-            summary_timeout_error(12),
-            "Summary generation timed out after 12 seconds."
-        );
     }
 
     #[test]

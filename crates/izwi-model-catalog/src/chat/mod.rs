@@ -4,14 +4,15 @@
 
 mod generation;
 mod messages;
+pub mod reasoning;
 mod sampling;
 
 pub use generation::{
     ChatGeneration, FinishReason, LatencyBreakdown, TokenLogprob, TopTokenLogprob,
 };
 pub use messages::{
-    ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole, ChatTemplateKwargs,
-    ChatTruncation,
+    fold_system_messages, ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole,
+    ChatTemplateKwargs, ChatTruncation,
 };
 pub use sampling::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,

@@ -421,7 +421,8 @@ pub async fn transcriptions(
             .body(Body::from(
                 serde_json::to_string(&VerboseJsonTranscriptionResponse {
                     text: output.text,
-                    language: output.language,
+                    // The model's detected language, else the one asked for.
+                    language: output.language.or_else(|| req.language.clone()),
                     duration: output.duration_secs,
                     words,
                     segments,

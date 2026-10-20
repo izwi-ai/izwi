@@ -13,8 +13,35 @@ permissions:
   contents: write
 
 jobs:
+  versions:
+    name: Check versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # The tag, the workspace version and the UI package must agree: the
+      # updater compares them, and the desktop app takes Cargo's version
+      # (tauri.conf.json carries none).
+      - name: Tag, Cargo and package.json versions match
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/[" ]/,"",$0); sub(/version=/,"",$0); print; exit}' Cargo.toml)"
+          ui_version="$(jq -r '.version' ui/package.json)"
+          echo "tag=${tag_version} cargo=${cargo_version} ui=${ui_version}"
+          if [ "$tag_version" != "$cargo_version" ] || [ "$tag_version" != "$ui_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml (${cargo_version}) and ui/package.json (${ui_version})."
+            exit 1
+          fi
+          if jq -e 'has("version")' crates/izwi-desktop/tauri.conf.json > /dev/null; then
+            echo "::error::tauri.conf.json sets a version; it must inherit Cargo's."
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.os }})
+    needs: versions
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,8 +72,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Validate updater signing inputs (beta channel)
-        if: startsWith(github.ref_name, 'v0.1.0-beta-')
+      # Every release is signed for the updater: stable builds follow
+      # latest.json, prereleases latest-beta.json.
+      - name: Validate updater signing inputs
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -86,8 +114,7 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Inject updater pubkey into Tauri config (beta channel)
-        if: startsWith(github.ref_name, 'v0.1.0-beta-')
+      - name: Inject updater pubkey into Tauri config
         shell: bash
         run: |
           node <<'NODE'
@@ -230,6 +257,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           cargo tauri build --bundles ${{ matrix.bundle_kind }}
+
+      - name: Stable releases are signed and notarized on macOS
+        if: runner.os == 'macOS' && !contains(github.ref_name, '-') && env.APPLE_SIGNING_IDENTITY == ''
+        run: |
+          echo "::error::A stable release needs the Apple signing and notarization secrets (APPLE_SIGNING_IDENTITY and the rest)."
+          exit 1
 
       - name: Build desktop bundle (unsigned macOS)
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
@@ -376,6 +409,10 @@ jobs:
             exit 1
           fi
           cp "$bundle_path" release-assets/
+          # A signed .deb lets a .deb install update itself (linux-deb).
+          if [ -f "${bundle_path}.sig" ]; then
+            cp "${bundle_path}.sig" release-assets/
+          fi
 
       - name: Collect desktop bundle artifact (Windows)
         if: runner.os == 'Windows'
@@ -455,73 +492,71 @@ jobs:
           - Native artifacts are checked for CUDA runtime payloads and per-file size before release publication.
           EOF
 
-      - name: Generate beta updater manifest
-        if: startsWith(github.ref_name, 'v0.1.0-beta-')
+      - name: Generate updater manifest
         run: |
+          # Stable tags publish latest.json; prereleases latest-beta.json.
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            manifest="dist/latest-beta.json"
+          else
+            manifest="dist/latest.json"
+          fi
+          echo "UPDATER_MANIFEST=${manifest}" >> "$GITHUB_ENV"
+
           linux_bundle="$(find dist -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
           macos_bundle="$(find dist -maxdepth 1 -type f -name '*.app.tar.gz' | head -n 1)"
           windows_bundle="$(find dist -maxdepth 1 -type f -name '*-setup.exe' | head -n 1)"
+          deb_bundle="$(find dist -maxdepth 1 -type f -name '*.deb' | head -n 1)"
 
           if [ -z "$linux_bundle" ] || [ -z "$macos_bundle" ] || [ -z "$windows_bundle" ]; then
             echo "::error::Missing updater bundles in dist/."
             exit 1
           fi
 
-          linux_sig="${linux_bundle}.sig"
-          macos_sig="${macos_bundle}.sig"
-          windows_sig="${windows_bundle}.sig"
+          for bundle in "$linux_bundle" "$macos_bundle" "$windows_bundle"; do
+            if [ ! -f "${bundle}.sig" ]; then
+              echo "::error::Missing updater signature ${bundle}.sig."
+              exit 1
+            fi
+          done
 
-          if [ ! -f "$linux_sig" ] || [ ! -f "$macos_sig" ] || [ ! -f "$windows_sig" ]; then
-            echo "::error::Missing one or more updater signature files in dist/."
-            exit 1
+          base_url="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          entry() {
+            jq -n --arg url "${base_url}/$(basename "$1")" --arg signature "$(tr -d '\r\n' < "$1.sig")" \
+              '{url: $url, signature: $signature}'
+          }
+          platforms="$(jq -n \
+            --argjson linux "$(entry "$linux_bundle")" \
+            --argjson macos "$(entry "$macos_bundle")" \
+            --argjson windows "$(entry "$windows_bundle")" \
+            '{linux: $linux, macos: $macos, windows: $windows}')"
+          # A .deb install updates with the .deb when the build signed it.
+          if [ -n "$deb_bundle" ] && [ -f "${deb_bundle}.sig" ]; then
+            platforms="$(jq --argjson deb "$(entry "$deb_bundle")" '. + {"linux-deb": $deb}' <<< "$platforms")"
+          else
+            echo "::warning::No signed .deb in dist/: .deb installs get no in-app update for this release."
           fi
 
-          linux_sig_value="$(tr -d '\r\n' < "$linux_sig")"
-          macos_sig_value="$(tr -d '\r\n' < "$macos_sig")"
-          windows_sig_value="$(tr -d '\r\n' < "$windows_sig")"
+          jq -n \
+            --arg version "${{ github.ref_name }}" \
+            --arg notes "Izwi ${{ github.ref_name }}" \
+            --arg pub_date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --argjson platforms "$platforms" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' > "$manifest"
+          cat "$manifest"
 
-          linux_name="$(basename "$linux_bundle")"
-          macos_name="$(basename "$macos_bundle")"
-          windows_name="$(basename "$windows_bundle")"
-          published_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-          cat > dist/latest-beta.json <<EOF
-          {
-            "version": "${{ github.ref_name }}",
-            "notes": "Izwi beta release ${{ github.ref_name }}",
-            "pub_date": "${published_at}",
-            "platforms": {
-              "linux": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${linux_name}",
-                "signature": "${linux_sig_value}"
-              },
-              "macos": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${macos_name}",
-                "signature": "${macos_sig_value}"
-              },
-              "windows": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${windows_name}",
-                "signature": "${windows_sig_value}"
-              }
-            }
-          }
-          EOF
-
-      - name: Validate beta updater manifest
-        if: startsWith(github.ref_name, 'v0.1.0-beta-')
+      - name: Validate updater manifest
         run: |
-          jq -e '.version and .platforms.linux.url and .platforms.linux.signature and .platforms.macos.url and .platforms.macos.signature and .platforms.windows.url and .platforms.windows.signature' dist/latest-beta.json > /dev/null
+          jq -e '.version and .platforms.linux.url and .platforms.linux.signature and .platforms.macos.url and .platforms.macos.signature and .platforms.windows.url and .platforms.windows.signature' "$UPDATER_MANIFEST" > /dev/null
 
       - name: Enforce updater asset matrix consistency
-        if: startsWith(github.ref_name, 'v0.1.0-beta-')
         run: |
-          version="$(jq -r '.version' dist/latest-beta.json)"
+          version="$(jq -r '.version' "$UPDATER_MANIFEST")"
           if [ "$version" != "${{ github.ref_name }}" ]; then
-            echo "::error::latest-beta.json version ($version) does not match tag (${{ github.ref_name }})."
+            echo "::error::$(basename "$UPDATER_MANIFEST") version ($version) does not match tag (${{ github.ref_name }})."
             exit 1
           fi
 
-          jq -r '.platforms | to_entries[] | [.key, .value.url, .value.signature] | @tsv' dist/latest-beta.json | \
+          jq -r '.platforms | to_entries[] | [.key, .value.url, .value.signature] | @tsv' "$UPDATER_MANIFEST" | \
           while IFS=$'\t' read -r platform_key asset_url signature; do
             if [ -z "$signature" ] || [ "$signature" = "null" ]; then
               echo "::error::Missing signature for platform $platform_key."

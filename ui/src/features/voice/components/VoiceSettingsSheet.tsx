@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import type { ModelInfo } from "@/api";
+import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
@@ -41,6 +42,7 @@ import type { SpeakerProfile } from "@/types";
 export type VoiceSettingsView = "main" | "memories" | "engine";
 
 const VISIBLE_VOICES = 5;
+const PROMPT_SAVE_DELAY_MS = 800;
 
 interface VoiceSettingsSheetProps {
   open: boolean;
@@ -156,9 +158,33 @@ function MainView({
   }, [showAllVoices, speaker, speakers]);
 
   const [draft, setDraft] = useState(preferences.savedPrompt);
+  // A save of what is being typed (trimmed) leaves the text as typed; a
+  // prompt loaded or reset elsewhere replaces it.
   useEffect(() => {
-    setDraft(preferences.savedPrompt);
+    setDraft((current) =>
+      current.trim() === preferences.savedPrompt.trim()
+        ? current
+        : preferences.savedPrompt,
+    );
   }, [preferences.savedPrompt]);
+
+  // Instructions save as you type, and when the sheet closes mid-edit
+  // (Escape or the close button unmount the field without a blur).
+  const { savePrompt } = preferences;
+  const latestDraftRef = useRef(draft);
+  const savePromptRef = useRef(savePrompt);
+  useEffect(() => {
+    latestDraftRef.current = draft;
+    savePromptRef.current = savePrompt;
+  }, [draft, savePrompt]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void savePrompt(draft), PROMPT_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [draft, savePrompt]);
+  useEffect(
+    () => () => void savePromptRef.current(latestDraftRef.current),
+    [],
+  );
 
   const promptHint =
     preferences.promptSaveState === "saving"
@@ -426,17 +452,18 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
               >
                 Cancel
               </button>
-              <button
+              <Button
                 type="button"
+                variant="destructive"
                 disabled={preferences.isMemoryBusy}
                 onClick={() => {
                   setConfirmingForgetAll(false);
                   void preferences.forgetAllMemories();
                 }}
-                className="h-10 rounded-full bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                className="h-10 rounded-full px-4 font-medium"
               >
                 Forget all
-              </button>
+              </Button>
             </>
           ) : (
             <button

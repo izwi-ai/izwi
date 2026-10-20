@@ -5,7 +5,7 @@ sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
 Use these IDs with `izwi tts --speaker`, the Text to Speech page, or
-`voice`/`speaker` fields on `/v1/audio/speech`.
+the `voice` field on `/v1/audio/speech` (or `speaker` on `/v1/text-to-speech`).
 
 Saved and reference voices use `--saved-voice-id`, `reference_audio`, or the
 Voice Studio saved voice library instead of these built-in speaker IDs.
@@ -17,10 +17,11 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | Family | Voice source |
 |--------|--------------|
 | Qwen3 CustomVoice | Nine named built-in speakers |
-| Kokoro-82M | 54 multilingual voice IDs; requires `espeak-ng` |
+| Kokoro-82M | 41 voice IDs (English, Spanish, French, Hindi, Italian, Portuguese); requires `espeak-ng` |
 | Voxtral TTS | 20 bundled preset voices |
 | LFM2.5 Audio | Four English regional presets |
 | VibeVoice-1.5B | Reference voice or saved voice only; no built-in presets |
+| FishAudio-S2-Pro | Reference voice or saved voice only |
 | Qwen3 Base | Reference voice or saved voice only |
 | Qwen3 VoiceDesign | Prompt instructions, then optional saved voice reuse |
 
@@ -59,8 +60,6 @@ Kokoro voice IDs use a two-letter prefix:
 |--------|-----------------|---------------|
 | `af`, `am` | American English | female / male |
 | `bf`, `bm` | British English | female / male |
-| `jf`, `jm` | Japanese | female / male |
-| `zf`, `zm` | Mandarin Chinese | female / male |
 | `ef`, `em` | Spanish | female / male |
 | `ff` | French | female |
 | `hf`, `hm` | Hindi | female / male |
@@ -76,10 +75,7 @@ am_echo, am_eric, am_fenrir, am_liam, am_michael, am_onyx,
 am_puck, am_santa, bf_alice, bf_emma, bf_isabella, bf_lily,
 bm_daniel, bm_fable, bm_george, bm_lewis, ef_dora, em_alex,
 em_santa, ff_siwis, hf_alpha, hf_beta, hm_omega, hm_psi,
-if_sara, im_nicola, jf_alpha, jf_gongitsune, jf_nezumi,
-jf_tebukuro, jm_kumo, pf_dora, pm_alex, pm_santa, zf_xiaobei,
-zf_xiaoni, zf_xiaoxiao, zf_xiaoyi, zm_yunjian, zm_yunxi,
-zm_yunxia, zm_yunyang
+if_sara, im_nicola, pf_dora, pm_alex, pm_santa
 ```
 
 Example:

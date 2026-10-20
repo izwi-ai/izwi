@@ -111,7 +111,7 @@ impl Default for ServeRuntimeConfig {
             port: default_port(),
             models_dir: default_models_dir(),
             // Fits the shipped multi-model pipeline worst case (diarization
-            // + ASR + forced aligner + LLM refiner resident together). The
+            // + ASR + forced aligner + summary LLM resident together). The
             // count is a residency guardrail only: the per-backend memory
             // ledger remains the physical admission gate and evicts idle
             // unpinned models under pressure.
@@ -676,7 +676,7 @@ mod tests {
         clear_env();
 
         // Frozen default: the desktop diarization pipeline needs diarization
-        // + ASR + aligner + LLM refiner resident together.
+        // + ASR + aligner + summary LLM resident together.
         let defaults = ServeRuntimeConfig::default();
         assert_eq!(defaults.max_loaded_models, 4);
         assert_eq!(defaults.engine_config().max_loaded_models, Some(4));

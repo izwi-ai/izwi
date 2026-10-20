@@ -20,7 +20,6 @@ const updatedRecord = {
   max_speakers: 4,
   min_speech_duration_ms: 240,
   min_silence_duration_ms: 200,
-  enable_llm_refinement: false,
   processing_time_ms: 120,
   duration_secs: 6,
   rtf: 0.5,
@@ -28,7 +27,6 @@ const updatedRecord = {
   corrected_speaker_count: 2,
   alignment_coverage: 1,
   unattributed_words: 0,
-  llm_refined: false,
   asr_text: "Hello there. Hi back.",
   raw_transcript: "",
   transcript: "",
@@ -934,7 +932,6 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
           asr_model: undefined,
           aligner_model: undefined,
           llm_model: undefined,
-          enable_llm_refinement: true,
           generate_summary: false,
           min_speakers: undefined,
           max_speakers: undefined,
@@ -985,7 +982,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(form.get("model")).toBe("diar_streaming_sortformer_4spk-v2.1");
     expect(form.get("asr_model")).toBe("Whisper-Large-v3-Turbo");
     expect(form.get("aligner_model")).toBe("Qwen3-ForcedAligner-0.6B");
-    expect(form.get("enable_llm_refinement")).toBe("true");
+    expect(form.get("enable_llm_refinement")).toBeNull();
     expect(form.get("generate_summary")).toBe("true");
 
     xhr.emitUploadProgress(5, 10);

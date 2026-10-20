@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo } from "@/api";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
@@ -15,29 +15,24 @@ import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { DiarizationPage } from "./route";
 
 const apiMocks = vi.hoisted(() => ({
-  listDiarizationRecords: vi.fn(),
-  listDiarizationRecordPage: vi.fn(),
   getDiarizationRecord: vi.fn(),
   updateDiarizationRecord: vi.fn(),
   rerunDiarizationRecord: vi.fn(),
   cancelDiarizationRecord: vi.fn(),
   regenerateDiarizationSummary: vi.fn(),
   deleteDiarizationRecord: vi.fn(),
-  createDiarizationRecord: vi.fn(),
   diarizationRecordAudioUrl: vi.fn(),
 }));
 
 vi.mock("@/api", () => ({
   api: {
-    listDiarizationRecords: apiMocks.listDiarizationRecords,
-    listDiarizationRecordPage: apiMocks.listDiarizationRecordPage,
+    getHealth: () => Promise.reject(new Error("offline")),
     getDiarizationRecord: apiMocks.getDiarizationRecord,
     updateDiarizationRecord: apiMocks.updateDiarizationRecord,
     rerunDiarizationRecord: apiMocks.rerunDiarizationRecord,
     cancelDiarizationRecord: apiMocks.cancelDiarizationRecord,
     regenerateDiarizationSummary: apiMocks.regenerateDiarizationSummary,
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
-    createDiarizationRecord: apiMocks.createDiarizationRecord,
     diarizationRecordAudioUrl: apiMocks.diarizationRecordAudioUrl,
   },
 }));
@@ -47,20 +42,17 @@ const componentMocks = vi.hoisted(() => ({
     ({
       isOpen,
       title,
-      zIndexClassName,
       models = [],
       sections = [],
     }: {
       isOpen: boolean;
       title: string;
-      zIndexClassName?: string;
       models?: ModelInfo[];
       sections?: Array<{ title?: string; models: ModelInfo[] }>;
     }) =>
       isOpen ? (
         <div
           data-testid="route-model-modal"
-          data-z-index={zIndexClassName ?? ""}
           data-models={models.map((model) => model.variant).join(",")}
           data-sections={sections
             .map((section) => section.title ?? "")
@@ -127,7 +119,6 @@ const graniteModel: ModelInfo = {
 
 const baseProps = {
   models: baseModels,
-  selectedModel: "diar_streaming_sortformer_4spk-v2.1" as string | null,
   loading: false,
   downloadProgress: {},
   onDownload: vi.fn(),
@@ -155,17 +146,25 @@ function createRouteProps(
   };
 }
 
-function renderRoute(
-  initialEntry: string,
-  props: typeof baseProps = createRouteProps(),
-) {
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">{`${location.pathname}${location.search}`}</div>
+  );
+}
+
+/** The page is a record's detail, reached through the transcription route. */
+const DETAIL_ENTRY = "/transcription/diar-1?mode=diarization";
+
+function renderRoute(props: typeof baseProps = createRouteProps()) {
   return render(
     <NotificationProvider>
-      <MemoryRouter initialEntries={[initialEntry]}>
+      <MemoryRouter initialEntries={[DETAIL_ENTRY]}>
+        <LocationProbe />
         <Routes>
-          <Route path="/diarization" element={<DiarizationPage {...props} />} />
+          <Route path="/transcription" element={<h1>Transcription list</h1>} />
           <Route
-            path="/diarization/:recordId"
+            path="/transcription/:recordId"
             element={<DiarizationPage {...props} />}
           />
         </Routes>
@@ -174,34 +173,13 @@ function renderRoute(
   );
 }
 
-const pendingSummaryRecord = {
-  id: "diar-1",
-  created_at: 1,
-  model_id: "diar_streaming_sortformer_4spk-v2.1",
-  processing_status: "ready" as const,
-  processing_error: null,
-  speaker_count: 2,
-  corrected_speaker_count: 2,
-  duration_secs: 42,
-  processing_time_ms: 120,
-  rtf: 0.5,
-  audio_mime_type: "audio/wav",
-  audio_filename: "meeting.wav",
-  transcript_preview: "Hello there.",
-  transcript_chars: 12,
-  summary_status: "pending",
-  summary_preview: null,
-  summary_chars: 0,
-};
-
-const readySummaryRecord = {
-  ...pendingSummaryRecord,
-  id: "diar-2",
-  audio_filename: "board-call.wav",
-  summary_status: "ready",
-  summary_preview: "Board sync covered runway, launch timing, and next hiring steps.",
-  summary_chars: 63,
-};
+async function openRecordMenu() {
+  const recordMenu = await screen.findByRole("button", {
+    name: /^More actions for /,
+  });
+  fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+  fireEvent.click(recordMenu);
+}
 
 const fullRecord = {
   id: "diar-1",
@@ -216,7 +194,6 @@ const fullRecord = {
   max_speakers: 4,
   min_speech_duration_ms: 240,
   min_silence_duration_ms: 200,
-  enable_llm_refinement: true,
   processing_time_ms: 120,
   duration_secs: 42,
   rtf: 0.5,
@@ -224,7 +201,6 @@ const fullRecord = {
   corrected_speaker_count: 2,
   alignment_coverage: 0.82,
   unattributed_words: 0,
-  llm_refined: true,
   asr_text: "Hello there.",
   raw_transcript: "Speaker 1: Hello there.",
   transcript: "Speaker 1: Hello there.",
@@ -279,308 +255,25 @@ function caps(
   };
 }
 
-describe("DiarizationPage routes", () => {
+describe("DiarizationPage record detail", () => {
   beforeEach(() => {
     vi.useRealTimers();
-    apiMocks.listDiarizationRecords.mockReset();
-    apiMocks.listDiarizationRecordPage.mockReset();
     apiMocks.getDiarizationRecord.mockReset();
     apiMocks.updateDiarizationRecord.mockReset();
     apiMocks.rerunDiarizationRecord.mockReset();
     apiMocks.cancelDiarizationRecord.mockReset();
     apiMocks.regenerateDiarizationSummary.mockReset();
     apiMocks.deleteDiarizationRecord.mockReset();
-    apiMocks.createDiarizationRecord.mockReset();
     apiMocks.diarizationRecordAudioUrl.mockReset();
     componentMocks.routeModelModal.mockClear();
 
-    apiMocks.listDiarizationRecords.mockResolvedValue([]);
-    apiMocks.listDiarizationRecordPage.mockImplementation(async () => ({
-      items: await apiMocks.listDiarizationRecords(),
-      pagination: {
-        next_cursor: null,
-        has_more: false,
-        limit: 25,
-      },
-    }));
     apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
     apiMocks.cancelDiarizationRecord.mockResolvedValue({
       ...fullRecord,
       processing_status: "failed",
       processing_error: "Cancelled by user.",
     });
-    apiMocks.createDiarizationRecord.mockResolvedValue(fullRecord);
     apiMocks.diarizationRecordAudioUrl.mockReturnValue("/audio/meeting.wav");
-  });
-
-  it("renders the diarization route and loads history from the route hook", async () => {
-    renderRoute("/diarization");
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    expect(
-      await screen.findByRole("heading", { name: "Diarization" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /New diarization/i }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "History" }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByText("No diarization records yet")).toBeInTheDocument();
-  });
-
-  it("loads more diarization history rows", async () => {
-    apiMocks.listDiarizationRecordPage.mockReset();
-    apiMocks.listDiarizationRecordPage
-      .mockResolvedValueOnce({
-        items: [{ ...readySummaryRecord, id: "diar-page-1", audio_filename: "page-one.wav" }],
-        pagination: {
-          next_cursor: "diar-cursor-2",
-          has_more: true,
-          limit: 25,
-        },
-      })
-      .mockResolvedValueOnce({
-        items: [{ ...readySummaryRecord, id: "diar-page-2", audio_filename: "page-two.wav" }],
-        pagination: {
-          next_cursor: null,
-          has_more: false,
-          limit: 25,
-        },
-      });
-
-    renderRoute("/diarization");
-
-    expect(await screen.findByText("page-one.wav")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
-    expect(await screen.findByText("page-two.wav")).toBeInTheDocument();
-    expect(await screen.findByText("page-one.wav")).toBeInTheDocument();
-
-    expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(1, {
-      limit: 25,
-      cursor: null,
-      filters: {},
-    });
-    expect(apiMocks.listDiarizationRecordPage).toHaveBeenNthCalledWith(2, {
-      limit: 25,
-      cursor: "diar-cursor-2",
-      filters: {},
-    });
-  });
-
-  it("shows summaries in the diarization history table", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([readySummaryRecord]);
-
-    renderRoute("/diarization");
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    expect(screen.getByRole("columnheader", { name: "Summary" })).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Board sync covered runway, launch timing, and next hiring steps.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByText("diar_streaming_sortformer_4spk-v2.1"),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByText("Hello there.")).not.toBeInTheDocument();
-  });
-
-  it("shows standard row actions from the diarization history menu", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([readySummaryRecord]);
-
-    renderRoute("/diarization");
-
-    expect(await screen.findByText("board-call.wav")).toBeInTheDocument();
-
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for board-call\.wav/i }),
-      { button: 0, ctrlKey: false },
-    );
-
-    expect(await screen.findByRole("menuitem", { name: /Open record/i })).toBeVisible();
-    expect(screen.getByRole("menuitem", { name: /Copy transcript/i })).toBeVisible();
-    expect(screen.getByRole("menuitem", { name: /^Export$/i })).toBeVisible();
-    expect(screen.getByRole("menuitem", { name: /^Delete$/i })).toBeVisible();
-  });
-
-  it("opens the creation modal and routes new diarization runs to their detail page", async () => {
-    let resolveRefreshHistory: ((records: unknown[]) => void) | null = null;
-    const pendingCreatedRecord = {
-      ...fullRecord,
-      processing_status: "pending" as const,
-      processing_time_ms: 0,
-      duration_secs: null,
-      rtf: null,
-      speaker_count: 0,
-      corrected_speaker_count: 0,
-      alignment_coverage: null,
-      llm_refined: false,
-      asr_text: "",
-      raw_transcript: "",
-      transcript: "",
-      summary_status: "not_requested" as const,
-      summary_model_id: null,
-      segments: [],
-      words: [],
-      utterances: [],
-    };
-    const refreshedCreatedSummaryRecord = {
-      ...readySummaryRecord,
-      id: "diar-1",
-      audio_filename: "meeting.wav",
-    };
-    apiMocks.listDiarizationRecords
-      .mockResolvedValueOnce([])
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            resolveRefreshHistory = resolve;
-          }),
-      );
-    apiMocks.createDiarizationRecord.mockResolvedValueOnce(pendingCreatedRecord);
-    apiMocks.getDiarizationRecord
-      .mockResolvedValueOnce(pendingCreatedRecord)
-      .mockResolvedValueOnce(fullRecord);
-
-    renderRoute("/diarization");
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-
-    expect(
-      await screen.findByRole("heading", { name: "New diarization" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Record audio/i })).toBeInTheDocument();
-    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
-
-    const fileInput = document.querySelector(
-      'input[type="file"]',
-    ) as HTMLInputElement | null;
-    expect(fileInput).not.toBeNull();
-
-    fireEvent.change(fileInput!, {
-      target: {
-        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
-      },
-    });
-
-    await waitFor(() =>
-      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
-    );
-    expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
-      expect.objectContaining({
-        audio_filename: "meeting.wav",
-      }),
-      expect.objectContaining({
-        onUploadProgress: expect.any(Function),
-        signal: expect.any(AbortSignal),
-      }),
-    );
-    await waitFor(() =>
-      expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
-    );
-
-    expect(
-      await screen.findByRole("navigation", { name: "Breadcrumb" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "New diarization" }),
-    ).not.toBeInTheDocument();
-
-    await act(async () => {
-      if (resolveRefreshHistory) {
-        resolveRefreshHistory([refreshedCreatedSummaryRecord]);
-      }
-    });
-
-    fireEvent.click(
-      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
-    );
-
-    expect(
-      await screen.findByText(
-        "Board sync covered runway, launch timing, and next hiring steps.",
-      ),
-    ).toBeInTheDocument();
-  });
-
-  it("shows selected diarization file details and upload progress before navigation", async () => {
-    let resolveCreate:
-      | ((record: typeof fullRecord) => void)
-      | null = null;
-    apiMocks.createDiarizationRecord.mockImplementationOnce(
-      (_request, options) => {
-        options.onUploadProgress?.({
-          loadedBytes: 6,
-          totalBytes: 12,
-          percent: 50,
-          lengthComputable: true,
-        });
-        return new Promise<typeof fullRecord>((resolve) => {
-          resolveCreate = resolve;
-        });
-      },
-    );
-    apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
-
-    renderRoute("/diarization");
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(
-      await screen.findByRole("heading", { name: "New diarization" }),
-    ).toBeInTheDocument();
-
-    const fileInput = document.querySelector(
-      'input[type="file"]',
-    ) as HTMLInputElement | null;
-    expect(fileInput).not.toBeNull();
-
-    fireEvent.change(fileInput!, {
-      target: {
-        files: [
-          new File(["012345678901"], "meeting.mp3", {
-            type: "audio/mpeg",
-          }),
-        ],
-      },
-    });
-
-    expect(await screen.findByText("meeting.mp3")).toBeInTheDocument();
-    expect(screen.getByText("MP3")).toBeInTheDocument();
-    expect(screen.getByText("12 B")).toBeInTheDocument();
-    expect(screen.getByText("Uploading audio")).toBeInTheDocument();
-    expect(screen.getByText("50%")).toBeInTheDocument();
-    expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
-      expect.objectContaining({
-        audio_filename: "meeting.mp3",
-      }),
-      expect.objectContaining({
-        onUploadProgress: expect.any(Function),
-        signal: expect.any(AbortSignal),
-      }),
-    );
-
-    await act(async () => {
-      resolveCreate?.(fullRecord);
-    });
-
-    expect(
-      await screen.findByRole("navigation", { name: "Breadcrumb" }),
-    ).toBeInTheDocument();
   });
 
   it("polls a newly created pending diarization record until processing completes", async () => {
@@ -594,7 +287,6 @@ describe("DiarizationPage routes", () => {
       speaker_count: 0,
       corrected_speaker_count: 0,
       alignment_coverage: null,
-      llm_refined: false,
       asr_text: "",
       raw_transcript: "",
       transcript: "",
@@ -604,12 +296,11 @@ describe("DiarizationPage routes", () => {
       words: [],
       utterances: [],
     };
-    apiMocks.listDiarizationRecords.mockResolvedValue([]);
     apiMocks.getDiarizationRecord
       .mockResolvedValueOnce(pendingCreatedRecord)
       .mockResolvedValueOnce(fullRecord);
 
-    renderRoute("/diarization/diar-1");
+    renderRoute();
 
     await act(async () => {
       await Promise.resolve();
@@ -627,375 +318,7 @@ describe("DiarizationPage routes", () => {
     expect(apiMocks.getDiarizationRecord).toHaveBeenCalledTimes(2);
   });
 
-  it("surfaces a stale diarization selection instead of silently re-resolving", async () => {
-    const props = createRouteProps({
-      models: [
-        {
-          variant: "diar_streaming_sortformer_4spk-v2.1",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "ready" as const,
-          local_path: "/models/diar",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-      ],
-      selectedModel: "Nemotron-3-Diarization",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Record audio/i }),
-    );
-
-    expect(
-      await screen.findByText(
-        "Select and load a diarization model before creating a run.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByText(
-        "Could not access microphone. Please grant permission.",
-      ),
-    ).not.toBeInTheDocument();
-  });
-
-  it("runs diarization with a loaded diarization model and no explicit selection", async () => {
-    // The user's scenario: the pipeline stack was loaded (the aligner last, so
-    // the global selection is not a diarization variant) and the preferred
-    // v2.1 default was never loaded. The ready Nemotron must satisfy the gate.
-    const props = createRouteProps({
-      models: [
-        {
-          variant: "diar_streaming_sortformer_4spk-v2.1",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "downloaded" as const,
-          local_path: "/models/diar",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Nemotron-3-Diarization",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "ready" as const,
-          local_path: "/models/nemotron",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Whisper-Large-v3-Turbo",
-          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
-          status: "ready" as const,
-          local_path: "/models/asr",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3-ForcedAligner-0.6B",
-          route_capabilities: caps({ forced_alignment: true }),
-          status: "ready" as const,
-          local_path: "/models/aligner",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-      ],
-      selectedModel: "Qwen3-ForcedAligner-0.6B",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Record audio/i }),
-    );
-
-    // The diarization gate passed (recording started and jsdom denied the
-    // microphone); neither model-required error may appear.
-    expect(
-      await screen.findByText(
-        "Could not access microphone. Please grant permission.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByText(
-        "Select and load a diarization model before creating a run.",
-      ),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByText(
-        "Load ASR and forced aligner models before diarization.",
-      ),
-    ).not.toBeInTheDocument();
-  });
-
-  it("shows no bulk load action before the diarization stack is ready", async () => {
-    const props = createRouteProps({
-      models: [
-        {
-          variant: "diar_streaming_sortformer_4spk-v2.1",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "downloaded" as const,
-          local_path: "/models/diar",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Whisper-Large-v3-Turbo",
-          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
-          status: "not_downloaded" as const,
-          local_path: "/models/asr",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3-ForcedAligner-0.6B",
-          route_capabilities: caps({ forced_alignment: true }),
-          status: "ready" as const,
-          local_path: "/models/aligner",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3.5-4B",
-          route_capabilities: caps({ openai_chat_completions: true }),
-          status: "downloaded" as const,
-          local_path: "/models/llm",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-      ],
-      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Not loaded")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Load Models" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Unload Models" }),
-    ).not.toBeInTheDocument();
-
-    expect(props.onLoad).not.toHaveBeenCalled();
-    expect(props.onDownload).not.toHaveBeenCalled();
-    expect(props.onUnload).not.toHaveBeenCalled();
-  });
-
-  it("opens configured diarization models from the new modal readiness panel", async () => {
-    const props = createRouteProps({
-      models: [
-        {
-          variant: "diar_streaming_sortformer_4spk-v2.1",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "downloaded" as const,
-          local_path: "/models/diar",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Whisper-Large-v3-Turbo",
-          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
-          status: "not_downloaded" as const,
-          local_path: "/models/asr",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3-ForcedAligner-0.6B",
-          route_capabilities: caps({ forced_alignment: true }),
-          status: "ready" as const,
-          local_path: "/models/aligner",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3.5-4B",
-          route_capabilities: caps({ openai_chat_completions: true }),
-          status: "downloaded" as const,
-          local_path: "/models/llm",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-      ],
-      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-
-    const openModelsButton = await screen.findByRole("button", {
-      name: "Change diarization models",
-    });
-
-    fireEvent.click(openModelsButton);
-
-    const modelModal = await screen.findByTestId("route-model-modal");
-    expect(modelModal).toHaveTextContent("Diarization Models");
-    expect(modelModal).toHaveAttribute("data-z-index", "z-[70]");
-    expect(modelModal.getAttribute("data-models")).toContain(
-      "diar_streaming_sortformer_4spk-v2.1",
-    );
-    expect(modelModal.getAttribute("data-models")).toContain(
-      "Whisper-Large-v3-Turbo",
-    );
-    expect(modelModal.getAttribute("data-models")).toContain(
-      "Qwen3-ForcedAligner-0.6B",
-    );
-    expect(modelModal.getAttribute("data-models")).toContain("Qwen3.5-4B");
-    expect(modelModal.getAttribute("data-sections")).toBe(
-      "Diarization,ASR,Forced Aligner,Refiner + Summary",
-    );
-    expect(props.onError).not.toHaveBeenCalled();
-  });
-
-  it("keeps Granite out of diarization model groups", async () => {
-    const props = createRouteProps({
-      models: [...baseModels, graniteModel],
-      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
-    expect(screen.getByText("Loaded")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Change diarization models" }));
-
-    const modelModal = await screen.findByTestId("route-model-modal");
-    expect(modelModal.getAttribute("data-models")).not.toContain(
-      "Granite-Speech-4.1-2B-Plus",
-    );
-    expect(modelModal.getAttribute("data-models")).toContain(
-      "diar_streaming_sortformer_4spk-v2.1",
-    );
-    expect(modelModal.getAttribute("data-sections")).toBe(
-      "Diarization,ASR,Forced Aligner,Refiner + Summary",
-    );
-  });
-
-  it("shows unload only after the full diarization stack is ready", async () => {
-    const props = createRouteProps();
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Loaded")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Load Models" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Unload Models" }),
-    );
-
-    expect(props.onUnload).toHaveBeenCalledWith("diar_streaming_sortformer_4spk-v2.1");
-    expect(props.onUnload).toHaveBeenCalledWith("Whisper-Large-v3-Turbo");
-    expect(props.onUnload).toHaveBeenCalledWith("Qwen3-ForcedAligner-0.6B");
-    expect(props.onUnload).toHaveBeenCalledWith("Qwen3.5-4B");
-  });
-
-  it("shows a loading readiness state while diarization models are loading", async () => {
-    const props = createRouteProps({
-      models: [
-        {
-          variant: "diar_streaming_sortformer_4spk-v2.1",
-          route_capabilities: caps({ diarization_records: true }),
-          status: "loading" as const,
-          local_path: "/models/diar",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Whisper-Large-v3-Turbo",
-          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
-          status: "ready" as const,
-          local_path: "/models/asr",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3-ForcedAligner-0.6B",
-          route_capabilities: caps({ forced_alignment: true }),
-          status: "ready" as const,
-          local_path: "/models/aligner",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-        {
-          variant: "Qwen3.5-4B",
-          route_capabilities: caps({ openai_chat_completions: true }),
-          status: "ready" as const,
-          local_path: "/models/llm",
-          size_bytes: null,
-          download_progress: null,
-          error_message: null,
-        },
-      ],
-      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
-    });
-
-    renderRoute("/diarization", props);
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Loading")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Unload Models" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Load Models" }),
-    ).not.toBeInTheDocument();
-  });
-
   it("shows a failed run as failed, without a loading state or speaker count", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([]);
     apiMocks.getDiarizationRecord.mockResolvedValue({
       ...fullRecord,
       processing_status: "failed",
@@ -1009,7 +332,7 @@ describe("DiarizationPage routes", () => {
       summary_status: "not_requested",
     });
 
-    renderRoute("/diarization/diar-1");
+    renderRoute();
 
     expect(
       await screen.findByText(
@@ -1020,11 +343,8 @@ describe("DiarizationPage routes", () => {
     expect(screen.queryByText(/0 speakers/)).not.toBeInTheDocument();
   });
 
-  it("loads the selected diarization record on /diarization/:recordId", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
-    apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
-
-    renderRoute("/diarization/diar-1");
+  it("loads the selected diarization record on /transcription/:recordId", async () => {
+    renderRoute();
 
     await waitFor(() =>
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
@@ -1036,61 +356,36 @@ describe("DiarizationPage routes", () => {
     expect(screen.getByTestId("diarization-review-player")).toHaveClass("fixed");
   });
 
-  it("opens saved diarization records from the history table", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
-
-    renderRoute("/diarization");
-
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
-    );
-
-    fireEvent.click(screen.getByText("meeting.wav"));
-
-    await waitFor(() =>
-      expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
-    );
-    expect(
-      await screen.findByRole("navigation", { name: "Breadcrumb" }),
-    ).toBeInTheDocument();
-  });
-
-  it("navigates back to the diarization index from a record page", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
-
-    renderRoute("/diarization/diar-1");
+  it("navigates back to the transcription list from a record page", async () => {
+    renderRoute();
 
     await waitFor(() =>
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
     fireEvent.click(
-      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Diarization" }),
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Transcription" }),
     );
 
     expect(
-      await screen.findByRole("heading", { name: "Diarization" }),
+      await screen.findByRole("heading", { name: "Transcription list" }),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/transcription$/);
   });
 
-  it("deletes a diarization record from the detail page and returns to history", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
+  it("deletes a diarization record from the detail page and returns to the transcription list", async () => {
     apiMocks.deleteDiarizationRecord.mockResolvedValue({
       id: "diar-1",
       deleted: true,
     });
 
-    renderRoute("/diarization/diar-1");
+    renderRoute();
 
     await waitFor(() =>
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    const recordMenu = await screen.findByRole("button", {
-      name: /^More actions for /,
-    });
-    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
-    fireEvent.click(recordMenu);
+    await openRecordMenu();
     fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
     fireEvent.click(
       await screen.findByRole("button", { name: /Delete record/i }),
@@ -1100,12 +395,12 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.deleteDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
     expect(
-      await screen.findByRole("heading", { name: "Diarization" }),
+      await screen.findByRole("heading", { name: "Transcription list" }),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/transcription$/);
   });
 
   it("cancels a pending diarization record from the detail page", async () => {
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
     apiMocks.getDiarizationRecord.mockResolvedValue({
       ...fullRecord,
       processing_status: "processing" as const,
@@ -1119,17 +414,13 @@ describe("DiarizationPage routes", () => {
       summary_text: null,
     });
 
-    renderRoute("/diarization/diar-1");
+    renderRoute();
 
     await waitFor(() =>
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    const recordMenu = await screen.findByRole("button", {
-      name: /^More actions for /,
-    });
-    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
-    fireEvent.click(recordMenu);
+    await openRecordMenu();
     fireEvent.click(await screen.findByRole("menuitem", { name: /Cancel run/i }));
 
     await waitFor(() =>
@@ -1137,66 +428,36 @@ describe("DiarizationPage routes", () => {
     );
   });
 
-  it("deletes from the diarization history menu and refreshes the table", async () => {
-    apiMocks.listDiarizationRecords
-      .mockResolvedValueOnce([readySummaryRecord])
-      .mockResolvedValueOnce([]);
-    apiMocks.deleteDiarizationRecord.mockResolvedValue({
-      id: readySummaryRecord.id,
-      deleted: true,
+  it("opens the diarization models, without Granite, from the record menu", async () => {
+    const props = createRouteProps({
+      models: [...baseModels, graniteModel],
     });
 
-    renderRoute("/diarization");
-
-    expect(await screen.findByText("board-call.wav")).toBeInTheDocument();
-
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /More actions for board-call\.wav/i }),
-      { button: 0, ctrlKey: false },
-    );
-    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Delete diarization/i }),
-    );
+    renderRoute(props);
 
     await waitFor(() =>
-      expect(apiMocks.deleteDiarizationRecord).toHaveBeenCalledWith(
-        readySummaryRecord.id,
-      ),
+      expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
-    await waitFor(() =>
-      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(2),
+
+    await openRecordMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Models" }));
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal).toHaveTextContent("Diarization models");
+    expect(modelModal.getAttribute("data-models")).toBe(
+      "diar_streaming_sortformer_4spk-v2.1,Whisper-Large-v3-Turbo,Qwen3-ForcedAligner-0.6B,Qwen3.5-4B",
     );
-    expect(
-      await screen.findByRole("heading", { name: "No diarization records yet" }),
-    ).toBeInTheDocument();
-  });
-
-  it("does not keep polling diarization history while viewing the route", async () => {
-    vi.useFakeTimers();
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
-
-    renderRoute("/diarization");
-
-    await act(async () => {
-      await Promise.resolve();
-    });
-
-    expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      vi.advanceTimersByTime(2600);
-    });
-
-    expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1);
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,ASR,Forced Aligner,Summary",
+    );
+    expect(props.onError).not.toHaveBeenCalled();
   });
 
   it("polls the selected record while its summary is pending", async () => {
     vi.useFakeTimers();
-    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
     apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
 
-    renderRoute("/diarization/diar-1");
+    renderRoute();
 
     await act(async () => {
       await Promise.resolve();

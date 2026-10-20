@@ -1,16 +1,18 @@
 use crate::error::{CliError, Result};
 use crate::http;
-use crate::style::Theme;
+use crate::style::{self, Theme};
 use crate::AudioFormat;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::header::HeaderMap;
+use futures::StreamExt;
+use indicatif::ProgressBar;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 const TTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
@@ -28,7 +30,6 @@ pub struct TtsArgs {
     pub speed: Option<f32>,
     pub temperature: Option<f32>,
     pub stream: bool,
-    pub allow_format_fallback: bool,
     pub play: bool,
 }
 
@@ -47,7 +48,6 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         speed,
         temperature,
         stream,
-        allow_format_fallback,
         play,
     } = args;
 
@@ -66,6 +66,11 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         return Err(CliError::InvalidInput("Text cannot be empty".to_string()));
     }
     reject_unsupported_cli_stream(&format, stream)?;
+    if play && matches!(format, AudioFormat::Pcm) {
+        return Err(CliError::InvalidInput(
+            "--play needs WAV audio; drop --format pcm.".to_string(),
+        ));
+    }
 
     theme.step(1, 2, &format!("Generating speech with '{}'...", model));
 
@@ -82,7 +87,6 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         speed,
         temperature,
         stream,
-        allow_format_fallback,
     })?;
 
     // Dense diffusion TTS can legitimately exceed five minutes on
@@ -90,187 +94,170 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
     // but leave enough room for the server's own configured request deadline.
     let client = http::client(Some(TTS_REQUEST_TIMEOUT))?;
 
-    let start_time = std::time::Instant::now();
-
-    if stream {
-        // Streaming mode
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
-                .unwrap(),
-        );
-        pb.set_message("Generating audio chunks...");
-
-        let response = client
-            .post(format!("{}/v1/audio/speech", server))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| CliError::ConnectionError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(CliError::ApiError {
-                status,
-                message: text,
-            });
-        }
-
-        // Server-Sent Events: `audio.chunk` events carry base64 16-bit PCM,
-        // assembled here into one WAV file.
-        let mut assembler = SseSpeechAssembler::default();
-        let mut body = response.bytes_stream();
-        while let Some(bytes) = futures::StreamExt::next(&mut body).await {
-            let bytes = bytes.map_err(|e| CliError::Other(e.to_string()))?;
-            if assembler.push(&bytes)? && assembler.first_audio.is_none() {
-                assembler.first_audio = Some(start_time.elapsed());
-                pb.set_message("Receiving audio...");
-            }
-        }
-        let audio_data = assembler.finish()?;
-        pb.finish_with_message("Generation complete");
-        if let Some(first_audio) = assembler.first_audio {
-            theme.info(&format!(
-                "First audio after {:.2}s",
-                first_audio.as_secs_f64()
-            ));
-        }
-
-        handle_output(
-            audio_data,
-            output.clone(),
-            &format,
-            Some("wav"),
-            None,
-            play,
-            theme,
-        )
-        .await?;
+    let start_time = Instant::now();
+    let progress = style::spinner(if stream {
+        "Generating audio chunks..."
     } else {
-        // Non-streaming mode
-        let pb = ProgressBar::new(100);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                .unwrap(),
-        );
-
-        pb.set_message("Sending request...");
-
-        let response = client
-            .post(format!("{}/v1/audio/speech", server))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| CliError::ConnectionError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(CliError::ApiError {
-                status,
-                message: text,
-            });
-        }
-
-        pb.set_message("Receiving audio...");
-
-        let actual_format = response_header(response.headers(), "x-actual-response-format");
-        let format_fallback = response_header(response.headers(), "x-response-format-fallback");
-
-        let audio_data = response
-            .bytes()
-            .await
-            .map_err(|e| CliError::Other(e.to_string()))?;
-
-        pb.finish_with_message("Complete");
-
-        handle_output(
-            audio_data,
-            output,
-            &format,
-            actual_format.as_deref(),
-            format_fallback.as_deref(),
-            play,
-            theme,
-        )
-        .await?;
+        "Generating audio..."
+    });
+    let generated = generate_audio(
+        &client,
+        server,
+        &request_body,
+        stream,
+        &progress,
+        start_time,
+    )
+    .await;
+    progress.finish_and_clear();
+    let (audio_data, first_audio) = generated?;
+    if let Some(first_audio) = first_audio {
+        theme.info(&format!(
+            "First audio after {:.2}s",
+            first_audio.as_secs_f64()
+        ));
     }
 
+    let output_path = save_audio(audio_data, output, &format, theme).await?;
     let duration = start_time.elapsed();
     theme.step(2, 2, &format!("Done in {:.2}s", duration.as_secs_f64()));
 
+    if play {
+        play_audio(&output_path, theme).await?;
+    }
+
     Ok(())
 }
 
-async fn handle_output(
+/// The generated audio, and for a stream when its first audio arrived.
+async fn generate_audio(
+    client: &reqwest::Client,
+    server: &str,
+    request_body: &Value,
+    stream: bool,
+    progress: &ProgressBar,
+    started: Instant,
+) -> Result<(bytes::Bytes, Option<Duration>)> {
+    let response = client
+        .post(format!("{}/v1/audio/speech", server))
+        .json(request_body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(CliError::from_response(response).await);
+    }
+    if !stream {
+        progress.set_message("Receiving audio...");
+        return Ok((response.bytes().await?, None));
+    }
+
+    // Server-Sent Events: `audio.chunk` events carry base64 16-bit PCM,
+    // assembled here into one WAV file.
+    let mut assembler = SseSpeechAssembler::default();
+    let mut body = response.bytes_stream();
+    while let Some(bytes) = body.next().await {
+        if assembler.push(&bytes?)? && assembler.first_audio.is_none() {
+            assembler.first_audio = Some(started.elapsed());
+            progress.set_message("Receiving audio...");
+        }
+    }
+    Ok((assembler.finish()?, assembler.first_audio))
+}
+
+async fn save_audio(
     audio_data: bytes::Bytes,
     output: Option<PathBuf>,
     format: &AudioFormat,
-    actual_format: Option<&str>,
-    format_fallback: Option<&str>,
-    _play: bool,
     theme: &Theme,
-) -> Result<()> {
-    let output_was_explicit = output.is_some();
-    let output_path = match output {
-        Some(path) => path,
-        None => {
-            // Generate default filename
-            let timestamp = chrono::Utc::now().timestamp();
-            let extension = output_extension(format, actual_format);
-            PathBuf::from(format!("izwi_output_{}.{}", timestamp, extension))
-        }
-    };
-
-    if let Some(fallback) = format_fallback {
-        let actual = actual_format.unwrap_or("wav");
-        theme.warning(&format!(
-            "Server used audio format fallback ({fallback}); saved {actual} audio."
-        ));
-        if output_was_explicit {
-            theme.warning(
-                "The output path was left unchanged; make sure its extension matches the saved audio.",
-            );
-        }
-    }
-
-    let mut file = tokio::fs::File::create(&output_path)
+) -> Result<PathBuf> {
+    let output_path = output.unwrap_or_else(|| {
+        let timestamp = chrono::Utc::now().timestamp();
+        PathBuf::from(format!(
+            "izwi_output_{}.{}",
+            timestamp,
+            format_label(format)
+        ))
+    });
+    tokio::fs::write(&output_path, &audio_data)
         .await
-        .map_err(CliError::Io)?;
-
-    tokio::io::AsyncWriteExt::write_all(&mut file, &audio_data)
-        .await
-        .map_err(CliError::Io)?;
-
+        .map_err(|error| {
+            CliError::Other(format!(
+                "Could not write {}: {error}",
+                output_path.display()
+            ))
+        })?;
     theme.success(&format!("Audio saved to: {}", output_path.display()));
+    Ok(output_path)
+}
 
-    if _play {
-        theme.info("Playing audio... (not implemented in this version)");
-        // Would use rodio or external player here
+/// Plays a saved WAV with the first command-line player the system has.
+async fn play_audio(path: &Path, theme: &Theme) -> Result<()> {
+    theme.info("Playing audio...");
+    let players = audio_players(path);
+    for (program, args) in &players {
+        let played = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .status()
+            .await;
+        match played {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                return Err(CliError::Other(format!(
+                    "{program} could not play {} ({status})",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CliError::Other(format!("Could not run {program}: {error}"))),
+        }
     }
-
-    Ok(())
+    let tried: Vec<&str> = players.iter().map(|(program, _)| *program).collect();
+    Err(CliError::Other(format!(
+        "No audio player found (tried {}); the audio is saved at {}.",
+        tried.join(", "),
+        path.display()
+    )))
 }
 
-fn response_header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+/// The players `--play` tries, in order, with their arguments.
+fn audio_players(path: &Path) -> Vec<(&'static str, Vec<OsString>)> {
+    let path = OsString::from(path);
+    if cfg!(target_os = "macos") {
+        vec![("afplay", vec![path])]
+    } else if cfg!(windows) {
+        let path = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        let script = format!(
+            "(New-Object Media.SoundPlayer '{}').PlaySync()",
+            path.display().to_string().replace('\'', "''")
+        );
+        let args = ["-NoProfile", "-NonInteractive", "-Command"];
+        let mut args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+        args.push(script.into());
+        vec![("powershell", args)]
+    } else {
+        let with = |flags: &[&str]| {
+            let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
+            args.push(path.clone());
+            args
+        };
+        vec![
+            ("paplay", with(&[])),
+            ("aplay", with(&["-q"])),
+            (
+                "ffplay",
+                with(&["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+            ),
+            ("play", with(&["-q"])),
+        ]
+    }
 }
 
-fn requested_format_label(format: &AudioFormat) -> &'static str {
+/// The format's name in requests and its file extension.
+fn format_label(format: &AudioFormat) -> &'static str {
     match format {
         AudioFormat::Wav => "wav",
-        AudioFormat::Mp3 => "mp3",
-        AudioFormat::Ogg => "ogg",
-        AudioFormat::Flac => "flac",
-        AudioFormat::Aac => "aac",
+        AudioFormat::Pcm => "pcm",
     }
 }
 
@@ -287,7 +274,6 @@ struct BuildRequestArgs<'a> {
     speed: Option<f32>,
     temperature: Option<f32>,
     stream: bool,
-    allow_format_fallback: bool,
 }
 
 fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
@@ -311,9 +297,8 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
         "model": args.model,
         "input": args.text,
         // A stream carries raw 16-bit PCM chunks, assembled into a WAV.
-        "response_format": if args.stream { "pcm" } else { requested_format_label(args.format) },
+        "response_format": if args.stream { "pcm" } else { format_label(args.format) },
         "stream": args.stream,
-        "allow_format_fallback": args.allow_format_fallback,
     });
     // Unset sampling and speed keep the model's own defaults.
     if let Some(speed) = args.speed {
@@ -458,50 +443,54 @@ impl SseSpeechAssembler {
     }
 }
 
-fn output_extension(requested_format: &AudioFormat, actual_format: Option<&str>) -> &'static str {
-    match actual_format.map(normalize_format_label).as_deref() {
-        Some("wav") => "wav",
-        Some("mp3") => "mp3",
-        Some("ogg") => "ogg",
-        Some("flac") => "flac",
-        Some("aac") => "aac",
-        Some("pcm_i16") => "pcm",
-        Some("pcm_f32") => "f32",
-        _ => requested_format_label(requested_format),
-    }
-}
-
-fn normalize_format_label(label: &str) -> String {
-    label.trim().to_ascii_lowercase().replace('-', "_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
-    fn output_extension_uses_actual_format_after_fallback() {
-        assert_eq!(output_extension(&AudioFormat::Mp3, Some("wav")), "wav");
-    }
-
-    #[test]
-    fn output_extension_falls_back_to_requested_format_when_header_missing() {
-        assert_eq!(output_extension(&AudioFormat::Flac, None), "flac");
-    }
-
-    #[test]
-    fn output_extension_handles_raw_audio_labels() {
-        assert_eq!(output_extension(&AudioFormat::Wav, Some("pcm-f32")), "f32");
-    }
-
-    #[test]
     fn cli_streaming_writes_wav_only() {
         reject_unsupported_cli_stream(&AudioFormat::Wav, true).expect("WAV streams");
-        reject_unsupported_cli_stream(&AudioFormat::Mp3, false).expect("non-stream MP3");
-        let err = reject_unsupported_cli_stream(&AudioFormat::Mp3, true)
-            .expect_err("a compressed stream is refused");
+        reject_unsupported_cli_stream(&AudioFormat::Pcm, false).expect("non-stream PCM");
+        let err = reject_unsupported_cli_stream(&AudioFormat::Pcm, true)
+            .expect_err("a raw PCM stream file is refused");
         assert!(err.to_string().contains("--format wav"));
+    }
+
+    #[test]
+    fn requests_name_formats_the_server_encodes() {
+        let body = |format: &AudioFormat| {
+            build_request_body(BuildRequestArgs {
+                model: "Kokoro-82M".to_string(),
+                text: "hello".to_string(),
+                speaker: None,
+                saved_voice_id: None,
+                reference_audio: None,
+                reference_text: None,
+                reference_text_file: None,
+                instructions: None,
+                format,
+                speed: None,
+                temperature: None,
+                stream: false,
+            })
+            .expect("request body")
+        };
+        assert_eq!(body(&AudioFormat::Wav)["response_format"], "wav");
+        assert_eq!(body(&AudioFormat::Pcm)["response_format"], "pcm");
+        assert!(body(&AudioFormat::Wav)
+            .get("allow_format_fallback")
+            .is_none());
+    }
+
+    #[test]
+    fn play_tries_a_system_player_with_the_file() {
+        let players = audio_players(Path::new("speech.wav"));
+        assert!(!players.is_empty());
+        for (program, args) in players {
+            let last = args.last().expect("player arguments").to_string_lossy();
+            assert!(last.contains("speech.wav"), "{program}: {last}");
+        }
     }
 
     /// TPIPE-25: `--stream` assembles the SSE PCM chunks into a WAV, even
@@ -549,7 +538,6 @@ mod tests {
             speed: None,
             temperature: None,
             stream: true,
-            allow_format_fallback: false,
         })
         .expect("request body");
         assert!(body.get("speed").is_none() && body.get("temperature").is_none());
@@ -571,7 +559,6 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             stream: false,
-            allow_format_fallback: false,
         })
         .expect("request body");
 
@@ -598,7 +585,6 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             stream: false,
-            allow_format_fallback: false,
         })
         .expect("request body");
 
@@ -622,7 +608,6 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             stream: false,
-            allow_format_fallback: false,
         })
         .expect_err("partial reference should fail");
 

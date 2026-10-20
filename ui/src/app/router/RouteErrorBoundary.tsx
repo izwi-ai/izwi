@@ -1,8 +1,8 @@
-import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Component, useState, type ErrorInfo, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
-import { StatePanel } from "@/components/ui/state-panel";
+import { PageState, pageStateButtonClass } from "@/components/ui/page-state";
+import { APP_VERSION } from "@/shared/config/runtime";
 
 interface RouteErrorBoundaryProps {
   children: ReactNode;
@@ -11,6 +11,86 @@ interface RouteErrorBoundaryProps {
 
 interface RouteErrorBoundaryState {
   error: Error | null;
+}
+
+function errorDetails(error: Error): string {
+  return [
+    `${error.name}: ${error.message}`,
+    `Route: ${window.location.pathname}${window.location.search}`,
+    `Izwi ${APP_VERSION}`,
+  ].join("\n");
+}
+
+function RouteErrorFallback({
+  error,
+  onRetry,
+  onReload,
+}: {
+  error: Error;
+  onRetry: () => void;
+  onReload: () => void;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+  const details = errorDetails(error);
+
+  const copyDetails = async () => {
+    try {
+      await navigator.clipboard.writeText(details);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+  };
+
+  return (
+    <PageState
+      role="alert"
+      icon={TriangleAlert}
+      tone="danger"
+      title="This page hit a problem"
+      description="Your recordings and history are safe. Reloading usually fixes it."
+      actions={
+        <>
+          <button
+            type="button"
+            onClick={onReload}
+            className={pageStateButtonClass.primary}
+          >
+            Reload page
+          </button>
+          <button
+            type="button"
+            onClick={onRetry}
+            className={pageStateButtonClass.secondary}
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            onClick={() => void copyDetails()}
+            className={pageStateButtonClass.secondary}
+          >
+            {copyState === "copied"
+              ? "Copied"
+              : copyState === "failed"
+                ? "Couldn't copy"
+                : "Copy details"}
+          </button>
+        </>
+      }
+    >
+      <details open className="border-t border-[var(--border-muted)] pt-4">
+        <summary className="cursor-pointer text-[13px] text-[var(--text-muted)]">
+          Details
+        </summary>
+        <pre className="mt-3 whitespace-pre-wrap break-words rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-3 font-mono text-[12px] leading-5 text-[var(--text-subtle)]">
+          {details}
+        </pre>
+      </details>
+    </PageState>
+  );
 }
 
 export class RouteErrorBoundary extends Component<
@@ -50,38 +130,11 @@ export class RouteErrorBoundary extends Component<
     }
 
     return (
-      <div role="alert" className="flex min-h-[20rem] items-center justify-center">
-        <StatePanel
-          className="w-full max-w-2xl"
-          align="center"
-          tone="danger"
-          icon={TriangleAlert}
-          eyebrow="Page error"
-          title="This page could not be opened"
-          description={
-            <>
-              Your navigation is still available. Try opening the page again, or
-              reload Izwi if the problem continues.
-              <span className="mt-2 block text-xs">{this.state.error.message}</span>
-            </>
-          }
-          actions={
-            <>
-              <Button type="button" size="sm" onClick={this.retry}>
-                Try again
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={this.reload}
-              >
-                Reload Izwi
-              </Button>
-            </>
-          }
-        />
-      </div>
+      <RouteErrorFallback
+        error={this.state.error}
+        onRetry={this.retry}
+        onReload={this.reload}
+      />
     );
   }
 }

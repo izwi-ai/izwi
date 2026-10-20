@@ -9,18 +9,15 @@ import {
   StudioVoicePicker,
   type StudioModelDownloads,
 } from "@/features/studio/components/StudioVoicePicker";
-import { defaultStudioVoice, estimatedLength, type StudioVoice } from "@/features/studio/studio";
+import {
+  defaultStudioVoice,
+  estimatedLength,
+  importedScript,
+  type StudioVoice,
+} from "@/features/studio/studio";
 
 const IMPORT_ACCEPT = ".txt,.md,.html,.htm,text/plain,text/markdown,text/html";
 
-/** Script text from an imported file: HTML loses its markup. */
-function importedScript(filename: string, text: string): string {
-  if (/\.html?$/i.test(filename) && typeof DOMParser !== "undefined") {
-    const document = new DOMParser().parseFromString(text, "text/html");
-    return document.body?.textContent?.trim() || text;
-  }
-  return text;
-}
 
 interface NewStudioProjectDialogProps {
   open: boolean;

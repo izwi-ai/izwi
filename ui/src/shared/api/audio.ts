@@ -4,6 +4,11 @@ import {
   isAbortError,
 } from "@/shared/api/http";
 import {
+  clickDownloadLink,
+  saveServerFile,
+  savesWithDialog,
+} from "@/shared/saveFile";
+import {
   buildCursorQueryString,
   normalizeCursorPaginationMeta,
   readListTotal,
@@ -136,6 +141,11 @@ export interface SpeechHistoryRecord {
   tokens_generated: number | null;
   audio_mime_type: string;
   audio_filename: string | null;
+  /** Why generation ended: `stop`, or `length`/`context_length` when the
+   * model ran out of room before the end of the text. */
+  stop_reason?: string | null;
+  /** A failed attempt whose job will run again. */
+  retry_pending?: boolean;
 }
 
 export interface CancelSpeechHistoryRecordResponse {
@@ -253,6 +263,9 @@ export interface SavedVoiceCreateRequest {
   audio_filename?: string;
   source_route_kind?: SavedVoiceSourceRouteKind;
   source_record_id?: string;
+  /** The user confirmed they may clone this voice; required unless the
+   * voice was designed. */
+  consent?: boolean;
 }
 
 export type StudioProjectVoiceMode = "built_in" | "saved";
@@ -616,12 +629,10 @@ export interface SpeechTextDiarizationJob extends SpeechTextJobBase {
   max_speakers: number | null;
   min_speech_duration_ms: number | null;
   min_silence_duration_ms: number | null;
-  enable_llm_refinement: boolean;
   speaker_count: number;
   corrected_speaker_count?: number;
   alignment_coverage: number | null;
   unattributed_words: number;
-  llm_refined: boolean;
   asr_text: string;
   raw_transcript: string;
   transcript: string;
@@ -675,7 +686,6 @@ export interface SpeechTextDiarizationJobCreateRequest
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
 }
 
 export type SpeechTextJobCreateRequest =
@@ -914,7 +924,6 @@ export interface DiarizationRecord {
   max_speakers: number | null;
   min_speech_duration_ms: number | null;
   min_silence_duration_ms: number | null;
-  enable_llm_refinement: boolean;
   processing_time_ms: number;
   duration_secs: number | null;
   rtf: number | null;
@@ -922,7 +931,6 @@ export interface DiarizationRecord {
   corrected_speaker_count?: number;
   alignment_coverage: number | null;
   unattributed_words: number;
-  llm_refined: boolean;
   asr_text: string;
   raw_transcript: string;
   transcript: string;
@@ -954,7 +962,8 @@ export interface DiarizationRecordCreateRequest {
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
+  /** ASR language hint; omitted, the language is detected. */
+  language?: string;
   /** Summarize the transcript with the pipeline LLM once it is ready. */
   generate_summary?: boolean;
 }
@@ -968,7 +977,6 @@ export interface DiarizationRecordRerunRequest {
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
   generate_summary?: boolean;
 }
 
@@ -1666,6 +1674,7 @@ export class AudioApiClient {
   async createSpeechHistoryRecord(
     route: SpeechHistoryRoute,
     request: SpeechHistoryRecordCreateRequest,
+    signal?: AbortSignal,
   ): Promise<SpeechHistoryRecord> {
     const response = await fetch(
       this.http.url(this.speechHistoryCollectionPath(route)),
@@ -1677,6 +1686,7 @@ export class AudioApiClient {
         body: JSON.stringify(
           this.buildSpeechHistoryRecordCreateBody(request, false),
         ),
+        signal,
       },
     );
 
@@ -1815,26 +1825,12 @@ export class AudioApiClient {
     return base;
   }
 
-  async downloadAudioFile(url: string, suggestedFilename: string): Promise<void> {
-    if (typeof window !== "undefined") {
-      const internals = (
-        window as unknown as {
-          __TAURI_INTERNALS__?: {
-            invoke?: (
-              command: string,
-              args?: Record<string, unknown>,
-            ) => Promise<unknown>;
-          };
-        }
-      ).__TAURI_INTERNALS__;
-
-      if (typeof internals?.invoke === "function" && /^https?:\/\//i.test(url)) {
-        await internals.invoke("download_audio_file", {
-          url,
-          suggested_filename: suggestedFilename,
-        });
-        return;
-      }
+  /** Save audio the user asked for; false when the save dialog was cancelled. */
+  async downloadAudioFile(url: string, suggestedFilename: string): Promise<boolean> {
+    // The desktop app asks where to save and downloads the file itself: its
+    // webview drops anchor downloads.
+    if (savesWithDialog() && /^https?:\/\//i.test(url)) {
+      return saveServerFile(url, suggestedFilename);
     }
 
     // Speech endpoints support attachment responses, including cross-origin APIs
@@ -1858,21 +1854,16 @@ export class AudioApiClient {
       objectUrl = URL.createObjectURL(await response.blob());
     }
     // Long speech goes directly to the browser's download manager, never a Blob.
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl ?? downloadUrl.toString();
-    anchor.download = suggestedFilename;
-    anchor.style.display = "none";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
+    clickDownloadLink(objectUrl ?? downloadUrl.toString(), suggestedFilename);
     if (objectUrl) {
       const temporaryUrl = objectUrl;
       window.setTimeout(() => URL.revokeObjectURL(temporaryUrl), 1000);
     }
+    return true;
   }
 
-  async saveAudioFile(url: string, suggestedFilename: string): Promise<void> {
-    await this.downloadAudioFile(url, suggestedFilename);
+  async saveAudioFile(url: string, suggestedFilename: string): Promise<boolean> {
+    return this.downloadAudioFile(url, suggestedFilename);
   }
 
   async deleteSpeechHistoryRecord(
@@ -1953,8 +1944,9 @@ export class AudioApiClient {
 
   async createVoiceDesignRecord(
     request: SpeechHistoryRecordCreateRequest,
+    signal?: AbortSignal,
   ): Promise<SpeechHistoryRecord> {
-    return this.createSpeechHistoryRecord("voice-design", request);
+    return this.createSpeechHistoryRecord("voice-design", request, signal);
   }
 
   voiceDesignRecordAudioUrl(
@@ -2046,6 +2038,7 @@ export class AudioApiClient {
         audio_filename: request.audio_filename,
         source_route_kind: request.source_route_kind,
         source_record_id: request.source_record_id,
+        consent: request.consent,
       }),
     });
 
@@ -2152,6 +2145,7 @@ export class AudioApiClient {
         voice_mode: request.voice_mode,
         speaker: request.speaker,
         saved_voice_id: request.saved_voice_id,
+        use_project_voice: request.use_project_voice,
       }),
     });
   }
@@ -2572,7 +2566,6 @@ export class AudioApiClient {
         max_speakers: request.max_speakers,
         min_speech_duration_ms: request.min_speech_duration_ms,
         min_silence_duration_ms: request.min_silence_duration_ms,
-        enable_llm_refinement: request.enable_llm_refinement,
       }),
     });
     const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
@@ -2743,6 +2736,21 @@ export class AudioApiClient {
     const record = await this.regenerateSpeechTextJobSummary(recordId, {
       job_kind: "transcription",
     });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  /** Stops a transcription or speaker-attributed job still waiting or running. */
+  async cancelTranscriptionRecord(recordId: string): Promise<TranscriptionRecord> {
+    const record = await this.cancelSpeechTextJob(recordId);
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  /**
+   * Runs a finished transcription or speaker-attributed job again on its
+   * stored audio with the same settings, as a new record.
+   */
+  async retryTranscriptionRecord(recordId: string): Promise<TranscriptionRecord> {
+    const record = await this.rerunSpeechTextJob(recordId, {});
     return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
@@ -3251,8 +3259,6 @@ export class AudioApiClient {
   private buildDiarizationRecordRequestInit(
     request: DiarizationRecordCreateRequest,
   ): RequestInit {
-    const enableLlmRefinement = request.enable_llm_refinement ?? true;
-
     if (request.audio_file) {
       assertFirstPartyAudioUploadWithinLimit(request.audio_file);
       const form = new FormData();
@@ -3273,12 +3279,11 @@ export class AudioApiClient {
       if (request.llm_model_id) {
         form.append("llm_model", request.llm_model_id);
       }
-      form.append(
-        "enable_llm_refinement",
-        enableLlmRefinement ? "true" : "false",
-      );
       if (request.generate_summary) {
         form.append("generate_summary", "true");
+      }
+      if (request.language) {
+        form.append("language", request.language);
       }
       if (typeof request.min_speakers === "number") {
         form.append("min_speakers", String(request.min_speakers));
@@ -3320,8 +3325,8 @@ export class AudioApiClient {
         asr_model: request.asr_model_id,
         aligner_model: request.aligner_model_id,
         llm_model: request.llm_model_id,
-        enable_llm_refinement: enableLlmRefinement,
         generate_summary: Boolean(request.generate_summary),
+        language: request.language,
         min_speakers: request.min_speakers,
         max_speakers: request.max_speakers,
         min_speech_duration_ms: request.min_speech_duration_ms,

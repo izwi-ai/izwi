@@ -1,8 +1,8 @@
 use crate::error::{CliError, Result};
 use crate::http;
+use crate::utils;
 use crate::TranscriptFormat;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use reqwest::multipart::Form;
 use std::path::PathBuf;
 
 pub struct AlignArgs {
@@ -36,44 +36,32 @@ pub async fn execute(args: AlignArgs, server: &str) -> Result<()> {
         ));
     }
 
-    // Read audio file
-    let audio_data = tokio::fs::read(&file).await.map_err(CliError::Io)?;
-    let audio_base64 = STANDARD.encode(&audio_data);
-
     let format_str = match format {
         TranscriptFormat::Text => "text",
         TranscriptFormat::Json => "json",
         TranscriptFormat::VerboseJson => "verbose_json",
     };
 
-    let request_body = serde_json::json!({
-        "model": model,
-        "audio_base64": audio_base64,
-        "text": text,
-        "response_format": format_str,
-    });
+    // The audio goes as a multipart file, not base64 JSON, so the whole
+    // upload limit is available for the audio itself.
+    let form = Form::new()
+        .part("file", utils::audio_file_part(&file).await?)
+        .text("model", model)
+        .text("text", text)
+        .text("response_format", format_str);
 
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let response = client
         .post(format!("{}/v1/audio/align", server))
-        .json(&request_body)
+        .multipart(form)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
-    let result = response
-        .text()
-        .await
-        .map_err(|e| CliError::Other(e.to_string()))?;
+    let result = response.text().await?;
 
     // Output result
     if let Some(output_path) = output {

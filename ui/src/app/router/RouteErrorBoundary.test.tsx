@@ -41,15 +41,36 @@ describe("RouteErrorBoundary", () => {
 
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "This page could not be opened",
+      "This page hit a problem",
     );
     expect(screen.getByRole("alert")).toHaveTextContent("Route chunk failed");
+    expect(screen.getByRole("button", { name: "Reload page" })).toBeVisible();
 
     shouldThrow = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(screen.getByText("Recovered route")).toBeVisible();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("copies the error details for a bug report", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(
+      <RouteErrorBoundary>
+        <RecoverableRoute />
+      </RouteErrorBoundary>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy details" }));
+
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeVisible();
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringContaining("Error: Route chunk failed\nRoute: /"),
+    );
   });
 
   it("turns a rejected lazy route into recovery UI", async () => {

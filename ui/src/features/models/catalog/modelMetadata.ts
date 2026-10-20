@@ -235,7 +235,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
   "Qwen3.5-9B": {
     shortName: "Qwen3.5 9B",
     fullName: "Qwen3.5 9B (GGUF Q4_K_M)",
-    description: "Largest requested hybrid multimodal Qwen3.5 checkpoint",
+    description: "Largest hybrid multimodal Qwen3.5 checkpoint, for the best answers",
     category: "chat",
     capabilities: ["Chat", "Multimodal", "GGUF", "Q4_K_M"],
     size: "6.60 GB",
@@ -434,10 +434,18 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     size: "0.2 GB",
   },
   // Voxtral
+  "Voxtral-4B-TTS-2603": {
+    shortName: "Voxtral 4B TTS",
+    fullName: "Voxtral 4B TTS by Mistral AI",
+    description: "Mistral AI text to speech model with 20 built-in voices",
+    category: "tts",
+    capabilities: ["Text to Speech", "20 Voices", "Streaming"],
+    size: "8.65 GB",
+  },
   "Voxtral-Mini-4B-Realtime-2602": {
     shortName: "Voxtral 4B",
     fullName: "Voxtral Mini 4B Realtime",
-    description: "Mistral AI speech transcription model with realtime support planned",
+    description: "Mistral AI speech transcription model",
     category: "asr",
     capabilities: ["Transcription"],
     size: "8.0 GB",

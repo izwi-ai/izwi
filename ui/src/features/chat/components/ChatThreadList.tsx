@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ImageIcon, Loader2, SquarePen, Trash2 } from "lucide-react";
 
 import type { ChatThread } from "@/api";
@@ -36,6 +36,8 @@ interface ChatThreadListProps {
   onSelect: (threadId: string) => void;
   onDelete: (threadId: string) => void;
   onNewChat: () => void;
+  /** Server search over titles and message text. */
+  searchThreads?: (query: string) => Promise<ChatThread[]>;
   className?: string;
 }
 
@@ -48,25 +50,60 @@ export function ChatThreadList({
   onSelect,
   onDelete,
   onNewChat,
+  searchThreads,
   className,
 }: ChatThreadListProps) {
   const [search, setSearch] = useState("");
+  const term = search.trim();
+  // The server also searches what was said. Until it answers, titles and
+  // previews that match show at once.
+  const [serverMatches, setServerMatches] = useState<{
+    term: string;
+    ids: Set<string>;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!term || !searchThreads) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      searchThreads(term)
+        .then((matches) => {
+          if (!cancelled) {
+            setServerMatches({
+              term,
+              ids: new Set(matches.map((thread) => thread.id)),
+            });
+          }
+        })
+        .catch(() => {
+          // Keep the matches by title.
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [searchThreads, term]);
 
   const groups = useMemo(() => {
-    const term = search.trim().toLowerCase();
-    const visible = term
-      ? threads.filter((thread) =>
-          [displayThreadTitle(thread.title), thread.last_message_preview ?? ""]
-            .some((value) => value.toLowerCase().includes(term)),
-        )
-      : threads;
+    const lowered = term.toLowerCase();
+    const visible = !term
+      ? threads
+      : serverMatches?.term === term
+        ? threads.filter((thread) => serverMatches.ids.has(thread.id))
+        : threads.filter((thread) =>
+            [displayThreadTitle(thread.title), thread.last_message_preview ?? ""]
+              .some((value) => value.toLowerCase().includes(lowered)),
+          );
     const byGroup = new Map<string, ChatThread[]>();
     for (const thread of [...visible].sort((a, b) => b.updated_at - a.updated_at)) {
       const group = threadDateGroup(thread.updated_at);
       byGroup.set(group, [...(byGroup.get(group) ?? []), thread]);
     }
     return Array.from(byGroup.entries());
-  }, [search, threads]);
+  }, [serverMatches, term, threads]);
 
   return (
     <div className={cn("flex min-h-0 flex-col gap-2.5", className)}>
@@ -98,7 +135,7 @@ export function ChatThreadList({
           </div>
         ) : groups.length === 0 ? (
           <p className="px-2 py-3 text-xs text-[var(--text-muted)]">
-            {search.trim() ? "No chats match." : "No chats yet. Send a message to start one."}
+            {term ? "No chats match." : "No chats yet. Send a message to start one."}
           </p>
         ) : (
           groups.map(([group, groupThreads]) => (

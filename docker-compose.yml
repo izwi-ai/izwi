@@ -5,7 +5,11 @@
 # Usage (set IZWI_API_KEY first, e.g. in .env; clients send it as
 # "Authorization: Bearer <key>"):
 #   CPU:  IZWI_API_KEY=... docker compose up -d
-#   CUDA: IZWI_API_KEY=... docker compose --profile cuda up -d
+#   CUDA: IZWI_API_KEY=... docker compose --profile cuda up -d izwi-cuda
+#         (name the service: both publish port 8080 and share the volumes)
+#
+# Models live in the izwi-models volume; history (the database) and media in
+# izwi-data, so both survive `docker compose up --force-recreate`.
 #
 # =============================================================================
 
@@ -30,9 +34,10 @@ services:
     environment:
       # Required: the container binds 0.0.0.0, so the server needs an API key.
       - IZWI_API_KEY=${IZWI_API_KEY:-}
-      - IZWI_CONFIG_PATH=/app/config.toml
       - IZWI_UI_DIR=/app/ui/dist
       - IZWI_MODELS_DIR=/app/models
+      - IZWI_DB_PATH=/app/data/izwi.sqlite3
+      - IZWI_MEDIA_DIR=/app/data/media
       - HF_HOME=/app/models/huggingface
       - TRANSFORMERS_CACHE=/app/models/huggingface
     healthcheck:
@@ -72,9 +77,10 @@ services:
     environment:
       # Required: the container binds 0.0.0.0, so the server needs an API key.
       - IZWI_API_KEY=${IZWI_API_KEY:-}
-      - IZWI_CONFIG_PATH=/app/config.toml
       - IZWI_UI_DIR=/app/ui/dist
       - IZWI_MODELS_DIR=/app/models
+      - IZWI_DB_PATH=/app/data/izwi.sqlite3
+      - IZWI_MEDIA_DIR=/app/data/media
       - IZWI_BACKEND=cuda
       - IZWI_LFM2_DIAGNOSTICS=${IZWI_LFM2_DIAGNOSTICS:-0}
       # Candidate native Fish batching stays opt-in until this GPU is qualified.

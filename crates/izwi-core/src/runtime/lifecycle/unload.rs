@@ -234,6 +234,7 @@ impl ModelLifecycleController {
             .await;
         self.forget_model_usage(variant).await;
         self.unpin_model(variant).await;
+        self.forget_kept_model(variant).await;
         self.maybe_recover_poisoned_authority().await;
         Ok(())
     }
@@ -412,8 +413,8 @@ impl RuntimeService {
 
     /// Spawn the idle keep-alive reaper: transient (job auto-loaded)
     /// residents idle longer than `model_keep_alive_secs` are unloaded.
-    /// Pinned residents, models with active leases, and models with
-    /// in-flight engine work are never reaped. A no-op when the keep-alive
+    /// Pinned residents, models loaded on request, models with active
+    /// leases, and models with in-flight engine work are never reaped. A no-op when the keep-alive
     /// is disabled (0).
     pub fn spawn_idle_model_reaper(self: &Arc<Self>) {
         if self.config.model_keep_alive_secs == 0 {
@@ -445,11 +446,12 @@ impl RuntimeService {
         let keep_alive_millis = keep_alive_secs.saturating_mul(1000);
         let now = now_unix_millis();
         let pinned = self.model_lifecycle.pinned_model_variants().await;
+        let kept = self.model_lifecycle.kept_model_variants().await;
         let active = self.core_engine.active_model_variants().await;
         let last_used = self.model_lifecycle.model_last_used.lock().await.clone();
         let mut candidates = Vec::new();
         for variant in self.model_manager.resident_variants().await {
-            if pinned.contains(&variant) || active.contains(&variant) {
+            if pinned.contains(&variant) || kept.contains(&variant) || active.contains(&variant) {
                 continue;
             }
             if self.model_manager.active_residency_leases(variant) > 0 {

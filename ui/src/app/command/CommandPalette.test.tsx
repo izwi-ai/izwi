@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,8 +10,8 @@ const themeMocks = vi.hoisted(() => ({ setThemePreference: vi.fn() }));
 vi.mock("@/api", () => ({
   api: { getHealth: vi.fn(() => new Promise(() => {})) },
 }));
-vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
-  FirstRunOnboarding: () => null,
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  FirstRunGate: ({ children }: { children: ReactNode }) => children,
 }));
 vi.mock("@/app/providers/AppUpdateProvider", () => ({
   useAppUpdates: () => ({ availableUpdate: null, isPromptOpen: false }),
@@ -37,7 +38,6 @@ function renderLayout() {
           element={
             <AppLayout
               readyModelsCount={0}
-              selectedModelLabel={null}
               catalogError={null}
               onRetryModelCatalog={vi.fn().mockResolvedValue(true)}
             />

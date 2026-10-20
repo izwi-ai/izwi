@@ -1,10 +1,11 @@
 use crate::error::{CliError, Result};
 use crate::http;
+use crate::utils::{audio_filename_from_path, audio_mime_type_from_path};
 use crate::TranscriptFormat;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct DiarizeArgs {
@@ -66,8 +67,6 @@ struct DiarizationJobRecord {
     raw_transcript: String,
     #[serde(default)]
     transcript: String,
-    #[serde(default)]
-    llm_refined: bool,
     alignment_coverage: Option<f32>,
     #[serde(default)]
     unattributed_words: usize,
@@ -93,7 +92,6 @@ struct VerboseJsonDiarizationOutput {
     asr_text: String,
     raw_transcript: String,
     transcript: String,
-    llm_refined: bool,
     alignment_coverage: f32,
     unattributed_words: usize,
     speaker_count: usize,
@@ -153,16 +151,10 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
         .post(create_diarization_job_url(server))
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     let created = response
@@ -215,12 +207,13 @@ async fn wait_for_diarization_job_with_polling(
         match record.processing_status.as_str() {
             "ready" => return Ok(record),
             "failed" => {
-                return Err(CliError::ApiError {
-                    status: 500,
-                    message: record
+                return Err(CliError::Other(format!(
+                    "Diarization failed: {}",
+                    record
                         .processing_error
-                        .unwrap_or_else(|| "Diarization failed".to_string()),
-                });
+                        .as_deref()
+                        .unwrap_or("the server gave no reason")
+                )));
             }
             "pending" | "processing" => {}
             other => {
@@ -236,16 +229,15 @@ async fn wait_for_diarization_job_with_polling(
             .send()
             .await
             .map_err(|e| {
-                CliError::ConnectionError(format!("{e} ({})", job_resume_hint(server, &record.id)))
+                CliError::ConnectionError(format!(
+                    "{} {}",
+                    CliError::from(e),
+                    job_resume_hint(server, &record.id)
+                ))
             })?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(CliError::ApiError {
-                status,
-                message: text,
-            });
+            return Err(CliError::from_response(response).await);
         }
 
         record = response
@@ -277,31 +269,6 @@ fn diarization_job_url(server: &str, record_id: &str) -> String {
     )
 }
 
-fn audio_filename_from_path(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
-        .map(ToOwned::to_owned)
-}
-
-fn audio_mime_type_from_path(path: &Path) -> Option<&'static str> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.trim().to_ascii_lowercase())?;
-    match extension.as_str() {
-        "wav" | "wave" => Some("audio/wav"),
-        "mp3" => Some("audio/mpeg"),
-        "m4a" | "mp4" => Some("audio/mp4"),
-        "webm" => Some("audio/webm"),
-        "ogg" | "oga" | "opus" => Some("audio/ogg"),
-        "flac" => Some("audio/flac"),
-        "aac" => Some("audio/aac"),
-        _ => None,
-    }
-}
-
 fn format_diarization_output(
     record: &DiarizationJobRecord,
     format: TranscriptFormat,
@@ -320,7 +287,6 @@ fn format_diarization_output(
             asr_text: record.asr_text.clone(),
             raw_transcript: record.raw_transcript.clone(),
             transcript: record.transcript.clone(),
-            llm_refined: record.llm_refined,
             alignment_coverage: record.alignment_coverage.unwrap_or(0.0),
             unattributed_words: record.unattributed_words,
             speaker_count: record.speaker_count,
@@ -422,7 +388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_diarization_job_maps_failed_records_to_api_error() {
+    async fn wait_for_diarization_job_reports_a_failed_record() {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -433,15 +399,9 @@ mod tests {
             failed_record("job-2", "model failed"),
         )
         .await
-        .expect_err("failed records should return api error");
+        .expect_err("a failed record is an error");
 
-        match err {
-            CliError::ApiError { status, message } => {
-                assert_eq!(status, 500);
-                assert_eq!(message, "model failed");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(err.to_string(), "Diarization failed: model failed");
     }
 
     /// PIPE-16: a job that stays queued or processing is polled until it is
@@ -491,18 +451,6 @@ mod tests {
             diarization_job_url("http://localhost:8080/", "abc"),
             "http://localhost:8080/v1/speech-to-text/jobs/abc?job_kind=diarization"
         );
-    }
-
-    #[test]
-    fn audio_upload_metadata_uses_basename_and_known_mime() {
-        let path = PathBuf::from("/Users/example/private/call.OPUS");
-
-        assert_eq!(
-            audio_filename_from_path(&path).as_deref(),
-            Some("call.OPUS")
-        );
-        assert_eq!(audio_mime_type_from_path(&path), Some("audio/ogg"));
-        assert_eq!(audio_mime_type_from_path(Path::new("unknown.bin")), None);
     }
 
     async fn spawn_flow_server(
@@ -586,7 +534,6 @@ mod tests {
             asr_text: String::new(),
             raw_transcript: String::new(),
             transcript: String::new(),
-            llm_refined: false,
             alignment_coverage: None,
             unattributed_words: 0,
             speaker_count: 0,
@@ -624,7 +571,6 @@ mod tests {
             transcript: "Speaker one text".to_string(),
             asr_text: "Speaker one text".to_string(),
             raw_transcript: "speaker one text".to_string(),
-            llm_refined: true,
             alignment_coverage: Some(1.0),
             unattributed_words: 0,
             speaker_count: 1,

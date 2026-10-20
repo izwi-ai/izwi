@@ -836,6 +836,29 @@ pub(crate) fn metal_test_device_or_skip(
     Some((device, lease))
 }
 
+/// Whether `device` is the "Apple Paravirtual device" of a macOS VM
+/// (GitHub's hosted runners among them). It reports an older family than its
+/// host and rounds F16 several times coarser than Apple silicon, so tests
+/// hold it to looser bounds.
+#[cfg(test)]
+pub(crate) fn metal_device_is_paravirtual(device: &Device) -> bool {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use objc2_metal::MTLDevice;
+
+        if let Device::Metal(metal) = device {
+            return metal
+                .device()
+                .as_ref()
+                .name()
+                .to_string()
+                .contains("Paravirtual");
+        }
+    }
+    let _ = device;
+    false
+}
+
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod metal_test_lease {
     use std::cell::Cell;
@@ -1844,9 +1867,7 @@ mod tests {
             metal.device().as_ref().name().to_string()
         };
         eprintln!("Metal device family: Apple{} ({name})", family.0);
-        // macOS VMs (GitHub's hosted runners among them) expose an "Apple
-        // Paravirtual device" that reports an older family than its host.
-        if !name.contains("Paravirtual") {
+        if !metal_device_is_paravirtual(&device) {
             assert!(family >= AppleGpuFamily(7), "{family:?} on {name}");
         }
         assert_eq!(

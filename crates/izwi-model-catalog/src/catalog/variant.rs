@@ -432,10 +432,9 @@ pub fn parse_chat_model_variant(
     }
 }
 
-/// Resolve the LLM variant for diarization transcript refinement. Any
-/// chat-capable catalog model is accepted — the refiner prompt and the
-/// output sanitizer are model-agnostic, and summary generation already
-/// follows the same rule. Defaults to Qwen3.5-4B. Legacy records may still
+/// Resolve the LLM variant that summarizes a diarization transcript. Any
+/// chat-capable catalog model is accepted: the summary prompt is
+/// model-agnostic. Defaults to Qwen3.5-4B. Legacy records may still
 /// carry "Qwen3-1.7B-GGUF" (removed from the catalog); that id maps onto the
 /// current default instead of erroring on previously stored settings.
 pub fn resolve_diarization_llm_variant(

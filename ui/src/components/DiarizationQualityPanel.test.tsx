@@ -6,8 +6,6 @@ import { DiarizationQualityPanel } from "./DiarizationQualityPanel";
 const record = {
   alignment_coverage: 0.82,
   corrected_speaker_count: 2,
-  enable_llm_refinement: true,
-  llm_refined: false,
   max_speakers: 4,
   min_silence_duration_ms: 200,
   min_speakers: 1,
@@ -33,7 +31,7 @@ describe("DiarizationQualityPanel", () => {
       screen.getByText("Alignment coverage needs review"),
     ).toBeInTheDocument();
     expect(screen.getByText("Unattributed words detected")).toBeInTheDocument();
-    expect(screen.getByText("LLM refinement did not apply")).toBeInTheDocument();
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Min speakers"), {
       target: { value: "2" },
@@ -47,9 +45,6 @@ describe("DiarizationQualityPanel", () => {
     fireEvent.change(screen.getByLabelText("Min silence (ms)"), {
       target: { value: "120" },
     });
-    fireEvent.click(
-      screen.getByRole("switch", { name: "LLM transcript refinement" }),
-    );
     fireEvent.click(screen.getByRole("button", { name: "Rerun saved audio" }));
 
     await waitFor(() =>
@@ -58,7 +53,6 @@ describe("DiarizationQualityPanel", () => {
         max_speakers: 5,
         min_speech_duration_ms: 180,
         min_silence_duration_ms: 120,
-        enable_llm_refinement: false,
       }),
     );
   });

@@ -101,10 +101,14 @@ export function TranscriptionPage({
   const [searchParams, setSearchParams] = useSearchParams();
   const [isNewTranscriptionModalOpen, setIsNewTranscriptionModalOpen] =
     useState(false);
+  // An upload in the creation dialog keeps it open: closing would abort it.
+  const [isCreationBusy, setIsCreationBusy] = useState(false);
   const [newSpeechTextMode, setNewSpeechTextMode] =
     useState<SpeechTextCreationMode>("transcription");
   const [recordActionError, setRecordActionError] = useState<string | null>(null);
   const [recordDeletePending, setRecordDeletePending] = useState(false);
+  const [recordCancelPending, setRecordCancelPending] = useState(false);
+  const [recordRetryPending, setRecordRetryPending] = useState(false);
   const [recordSummaryRefreshPending, setRecordSummaryRefreshPending] =
     useState(false);
   const [recordSummaryRefreshError, setRecordSummaryRefreshError] = useState<
@@ -202,7 +206,7 @@ export function TranscriptionPage({
     const modelName = resolvedSummaryModel || "Qwen3.5-4B";
     switch (summaryModelStatus) {
       case "downloaded":
-        return `Load ${modelName} in Transcription Models to generate summaries.`;
+        return `Load ${modelName} in Transcription models to generate summaries.`;
       case "downloading":
         return `${modelName} is downloading. Wait for download to complete, then generate the summary.`;
       case "loading":
@@ -210,7 +214,7 @@ export function TranscriptionPage({
       case "not_downloaded":
       case "error":
       default:
-        return `Download and load ${modelName} in Transcription Models to generate summaries.`;
+        return `Download and load ${modelName} in Transcription models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
   const resolvedSpeakerAttributedAsrModel = useMemo(
@@ -332,9 +336,20 @@ export function TranscriptionPage({
       resolvedDiarizationModel,
     ],
   );
-  const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
+  // The summary model joins the dialog's stack only when a summary is asked
+  // for, so the dialog counts it separately.
+  const diarizationStackModels = diarizationManagedModels.filter(
+    (model) => model.variant !== resolvedDiarizationLlmModel,
+  );
+  const readyDiarizationStackModelCount = diarizationStackModels.filter(
     (model) => model.status === "ready",
   ).length;
+  const diarizationSummaryModelReady =
+    resolvedDiarizationLlmModel != null &&
+    diarizationLlmPipelineModels.some(
+      (model) =>
+        model.variant === resolvedDiarizationLlmModel && model.status === "ready",
+    );
   const canUnloadAnyDiarizationManagedModels = diarizationManagedModels.some(
     (model) => model.status === "ready",
   );
@@ -406,9 +421,8 @@ export function TranscriptionPage({
       },
       {
         key: "llm",
-        title: "Refiner + Summary",
-        description:
-          "LLM used for transcript refinement and diarization summaries.",
+        title: "Summary",
+        description: "LLM that writes diarization summaries.",
         models: diarizationLlmPipelineModels,
       },
     ],
@@ -568,6 +582,49 @@ export function TranscriptionPage({
       setRecordDeletePending(false);
     }
   }, [navigate, recordDeletePending, recordId, refreshHistory, speechTextMode]);
+
+  const handleDetailCancel = useCallback(async () => {
+    if (!recordId || recordCancelPending) {
+      return;
+    }
+    setRecordCancelPending(true);
+    setRecordActionError(null);
+    try {
+      await api.cancelTranscriptionRecord(recordId);
+      await refreshRecord();
+      await refreshHistory();
+    } catch (err) {
+      setRecordActionError(
+        err instanceof Error ? err.message : "Failed to cancel this job.",
+      );
+    } finally {
+      setRecordCancelPending(false);
+    }
+  }, [recordCancelPending, recordId, refreshHistory, refreshRecord]);
+
+  /** A retry is a new record with the same settings: open it. */
+  const handleDetailRetry = useCallback(async () => {
+    if (!recordId || recordRetryPending) {
+      return;
+    }
+    setRecordRetryPending(true);
+    setRecordActionError(null);
+    try {
+      const retried = await api.retryTranscriptionRecord(recordId);
+      await refreshHistory();
+      navigate(
+        retried.transcription_mode === "speaker_attributed_asr"
+          ? `/transcription/${retried.id}?mode=speaker_attributed_asr`
+          : `/transcription/${retried.id}`,
+      );
+    } catch (err) {
+      setRecordActionError(
+        err instanceof Error ? err.message : "Failed to retry this job.",
+      );
+    } finally {
+      setRecordRetryPending(false);
+    }
+  }, [navigate, recordId, recordRetryPending, refreshHistory]);
 
   const handleHistoryDelete = useCallback(
     async (targetRecord: SpeechTextJobSummary) => {
@@ -776,6 +833,10 @@ export function TranscriptionPage({
             deleteError={recordActionError}
             summaryModelGuidance={summaryModelReady ? null : summaryModelRequirementMessage}
             onDelete={handleDetailDelete}
+            onCancel={() => void handleDetailCancel()}
+            cancelPending={recordCancelPending}
+            onRetry={() => void handleDetailRetry()}
+            retryPending={recordRetryPending}
             onRegenerateSummary={() => void handleDetailRegenerateSummary()}
             deletePending={recordDeletePending}
             summaryRefreshPending={recordSummaryRefreshPending}
@@ -856,7 +917,7 @@ export function TranscriptionPage({
             open={isNewTranscriptionModalOpen}
             modal={!isModelModalOpen}
             onOpenChange={(open) => {
-              if (!open) {
+              if (!open && !isCreationBusy) {
                 handleCloseNewTranscriptionModal();
               }
             }}
@@ -864,17 +925,17 @@ export function TranscriptionPage({
             <DialogContent
               className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-[52rem]")}
               onEscapeKeyDown={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
               onPointerDownOutside={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
               onInteractOutside={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
@@ -918,6 +979,7 @@ export function TranscriptionPage({
                         openTranscriptionModelManager();
                         onError("Load the timestamp aligner model to enable timestamps.");
                       }}
+                      onBusyChange={setIsCreationBusy}
                       onCreated={async (createdRecord: TranscriptionRecord) => {
                         setStreamingRecord(createdRecord);
                         await refreshHistory().catch(() => undefined);
@@ -993,6 +1055,7 @@ export function TranscriptionPage({
                       pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
                       pipelineModelsReady={diarizationPipelineModelsReady}
+                      summaryModelReady={diarizationSummaryModelReady}
                       onModelRequired={() => {
                         openDiarizationModelManager();
                         onError("Select and load a diarization model to start.");
@@ -1003,12 +1066,13 @@ export function TranscriptionPage({
                           "Load ASR and forced aligner models before diarization.",
                         );
                       }}
-                      managedModelCount={diarizationManagedModels.length}
-                      readyManagedModelCount={readyDiarizationManagedModelCount}
+                      managedModelCount={diarizationStackModels.length}
+                      readyManagedModelCount={readyDiarizationStackModelCount}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}
                       onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
+                      onBusyChange={setIsCreationBusy}
                       onCreated={handleCreatedDiarizationRecord}
                     />
                   )}
@@ -1024,10 +1088,10 @@ export function TranscriptionPage({
         onClose={closeModelModal}
         title={
           isDiarizationModelModal
-            ? "Diarization Models"
+            ? "Diarization models"
             : isSpeakerAttributedAsrModelModal
-              ? "Speaker Attributed ASR Models"
-              : "Transcription Models"
+              ? "Speaker-attributed transcription models"
+              : "Transcription models"
         }
         description={
           isDiarizationModelModal

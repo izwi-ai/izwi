@@ -1,8 +1,8 @@
 use crate::error::{CliError, Result};
 use crate::http;
+use crate::utils;
 use crate::TranscriptFormat;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use reqwest::multipart::Form;
 use std::path::PathBuf;
 
 pub struct TranscribeArgs {
@@ -36,41 +36,27 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         )));
     }
 
-    // Read audio file
-    let audio_data = tokio::fs::read(&file).await.map_err(CliError::Io)?;
-    let audio_base64 = STANDARD.encode(&audio_data);
-
-    let request_body = build_transcription_request_body(
-        model,
-        audio_base64,
-        language,
-        prompt,
-        max_tokens,
-        format,
-        word_timestamps,
-    );
+    // The audio goes as a multipart file, not base64 JSON, so the whole
+    // upload limit is available for the audio itself.
+    let mut form = Form::new().part("file", utils::audio_file_part(&file).await?);
+    for (name, value) in
+        transcription_form_fields(model, language, prompt, max_tokens, format, word_timestamps)
+    {
+        form = form.text(name, value);
+    }
 
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let response = client
         .post(format!("{}/v1/audio/transcriptions", server))
-        .json(&request_body)
+        .multipart(form)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
-    let result = response
-        .text()
-        .await
-        .map_err(|e| CliError::Other(e.to_string()))?;
+    let result = response.text().await?;
 
     // Output result
     if let Some(output_path) = output {
@@ -85,15 +71,15 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_transcription_request_body(
+/// The text fields of the multipart transcription request.
+fn transcription_form_fields(
     model: String,
-    audio_base64: String,
     language: Option<String>,
     prompt: Option<String>,
     max_tokens: Option<usize>,
     format: TranscriptFormat,
     word_timestamps: bool,
-) -> serde_json::Value {
+) -> Vec<(&'static str, String)> {
     let format_str = if word_timestamps {
         "verbose_json"
     } else {
@@ -104,32 +90,31 @@ fn build_transcription_request_body(
         }
     };
 
-    let mut request_body = serde_json::json!({
-        "model": model,
-        "audio_base64": audio_base64,
-        "response_format": format_str,
-    });
+    let mut fields = vec![
+        ("model", model),
+        ("response_format", format_str.to_string()),
+    ];
 
     if let Some(language) = language {
-        request_body["language"] = serde_json::Value::String(language);
+        fields.push(("language", language));
     }
 
     if let Some(prompt) = prompt
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        request_body["prompt"] = serde_json::Value::String(prompt);
+        fields.push(("prompt", prompt));
     }
 
     if let Some(max_tokens) = max_tokens {
-        request_body["max_tokens"] = serde_json::json!(max_tokens);
+        fields.push(("max_tokens", max_tokens.to_string()));
     }
 
     if word_timestamps {
-        request_body["timestamp_granularities"] = serde_json::json!(["word"]);
+        fields.push(("timestamp_granularities[]", "word".to_string()));
     }
 
-    request_body
+    fields
 }
 
 #[cfg(test)]
@@ -137,22 +122,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_body_includes_prompt_max_tokens_and_word_timestamps() {
-        let body = build_transcription_request_body(
+    fn form_fields_include_prompt_max_tokens_and_word_timestamps() {
+        let fields = transcription_form_fields(
             "Granite-Speech-4.1-2B-Plus".to_string(),
-            "AAAA".to_string(),
             Some("en".to_string()),
             Some("keywords: izwi, granite".to_string()),
             Some(64),
             TranscriptFormat::Text,
             true,
         );
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, value)| value.as_str())
+        };
 
-        assert_eq!(body["model"], "Granite-Speech-4.1-2B-Plus");
-        assert_eq!(body["response_format"], "verbose_json");
-        assert_eq!(body["language"], "en");
-        assert_eq!(body["prompt"], "keywords: izwi, granite");
-        assert_eq!(body["max_tokens"], 64);
-        assert_eq!(body["timestamp_granularities"][0], "word");
+        assert_eq!(field("model"), Some("Granite-Speech-4.1-2B-Plus"));
+        assert_eq!(field("response_format"), Some("verbose_json"));
+        assert_eq!(field("language"), Some("en"));
+        assert_eq!(field("prompt"), Some("keywords: izwi, granite"));
+        assert_eq!(field("max_tokens"), Some("64"));
+        assert_eq!(field("timestamp_granularities[]"), Some("word"));
+        assert_eq!(field("audio_base64"), None);
     }
 }

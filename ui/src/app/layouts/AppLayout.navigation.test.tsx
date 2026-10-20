@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,8 +9,8 @@ vi.mock("@/api", () => ({
   api: { getHealth: vi.fn(() => new Promise(() => {})) },
 }));
 
-vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
-  FirstRunOnboarding: () => null,
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  FirstRunGate: ({ children }: { children: ReactNode }) => children,
 }));
 
 vi.mock("@/app/providers/AppUpdateProvider", () => ({
@@ -54,7 +55,6 @@ function renderLayout() {
           element={
             <AppLayout
               readyModelsCount={0}
-              selectedModelLabel={null}
               catalogError={null}
               onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
             />
@@ -168,5 +168,74 @@ describe("AppLayout compact navigation accessibility", () => {
 
     expect(collapse).toHaveAccessibleName("Expand sidebar");
     expect(collapse).toHaveAttribute("aria-expanded", "false");
+  });
+});
+
+describe("AppLayout sidebar on Chat", () => {
+  let savedPreference: string | null;
+
+  beforeEach(() => {
+    savedPreference = null;
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn(() => savedPreference),
+        setItem: vi.fn((_key: string, value: string) => {
+          savedPreference = value;
+        }),
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+      },
+    });
+    setDesktopNavigation(true);
+  });
+
+  function navigate(name: string) {
+    fireEvent.click(
+      within(screen.getByTestId("app-sidebar")).getByRole("link", { name }),
+    );
+  }
+
+  it("collapses for Chat without overwriting the saved preference", () => {
+    renderLayout();
+    const collapse = screen.getByTestId("sidebar-collapse-toggle");
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+
+    navigate("Chat");
+    expect(screen.getByText("Chat content")).toBeVisible();
+    expect(collapse).toHaveAccessibleName("Expand sidebar");
+
+    // Expanding it on Chat lasts while there, and is not saved.
+    fireEvent.click(collapse);
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+
+    navigate("Voice");
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+    navigate("Chat");
+    expect(collapse).toHaveAccessibleName("Expand sidebar");
+    navigate("Voice");
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+    expect(window.localStorage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("restores a collapsed preference after Chat and saves changes made elsewhere", () => {
+    savedPreference = "1";
+    renderLayout();
+    const collapse = screen.getByTestId("sidebar-collapse-toggle");
+    expect(collapse).toHaveAccessibleName("Expand sidebar");
+
+    navigate("Chat");
+    fireEvent.click(collapse);
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+    navigate("Voice");
+    expect(collapse).toHaveAccessibleName("Expand sidebar");
+    expect(savedPreference).toBe("1");
+
+    fireEvent.click(collapse);
+    expect(collapse).toHaveAccessibleName("Collapse sidebar");
+    expect(window.localStorage.setItem).toHaveBeenCalledWith(
+      "izwi.sidebar.collapsed",
+      "0",
+    );
   });
 });

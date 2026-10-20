@@ -67,7 +67,7 @@ export function SpeechTextPage(props: SharedPageProps) {
   );
 
   if (mode === "diarization") {
-    return <DiarizationPage {...props} routeBasePath="/transcription" />;
+    return <DiarizationPage {...props} />;
   }
   if (mode === "speaker_attributed_asr") {
     return (

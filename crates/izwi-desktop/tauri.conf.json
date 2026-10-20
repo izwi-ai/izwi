@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Izwi",
-  "version": "0.1.0-beta-18",
   "identifier": "com.agentem.izwi.desktop",
   "build": {
     "frontendDist": "../../ui/dist",
@@ -33,6 +32,8 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Izwi AI",
+    "copyright": "Copyright 2026 Izwi AI",
     "createUpdaterArtifacts": true,
     "targets": [
       "deb",

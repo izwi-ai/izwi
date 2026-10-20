@@ -69,7 +69,7 @@ function EditMessageForm({
         rows={Math.min(8, Math.max(2, draft.split("\n").length))}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
             submit();
           } else if (event.key === "Escape") {

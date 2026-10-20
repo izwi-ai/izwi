@@ -1543,7 +1543,10 @@ async fn bench_manifest(
     }
     let benchmark_cases = expand_manifest_cases(&manifest)?;
 
-    let suite_server = manifest.server.as_deref().unwrap_or(server).to_string();
+    let suite_server = match manifest.server.as_deref() {
+        Some(manifest_server) => http::normalize_server_url(manifest_server)?,
+        None => server.to_string(),
+    };
     let started_at = Utc::now();
     let observability_before = capture_observability(&suite_server).await;
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -2852,16 +2855,10 @@ async fn run_tts_request(
         .post(format!("{}/v1/audio/speech", server))
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     if stream_output {
@@ -2873,10 +2870,7 @@ async fn run_tts_request(
     let rtf = header_f64(&response, "x-rtf");
     let tokens_generated = header_u64(&response, "x-tokens-generated");
     let diagnostics = header_json(&response, "x-izwi-tts-diagnostics");
-    response
-        .bytes()
-        .await
-        .map_err(|error| CliError::ConnectionError(error.to_string()))?;
+    response.bytes().await?;
     Ok(TtsBenchSample {
         total_ms: started.elapsed().as_secs_f64() * 1000.0,
         first_audio_ms: None,
@@ -2897,9 +2891,7 @@ async fn consume_tts_benchmark_stream(
     let mut buffer = Vec::new();
     let mut timing = TtsStreamTimingState::default();
     while let Some(chunk) = bytes.next().await {
-        buffer.extend_from_slice(
-            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
-        );
+        buffer.extend_from_slice(&chunk?);
         while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
             let event = buffer.drain(..boundary).collect::<Vec<_>>();
             buffer.drain(..2);
@@ -3034,16 +3026,10 @@ async fn run_asr_request(
         .post(format!("{}/v1/audio/transcriptions", server))
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     if stream_output {
@@ -3069,9 +3055,7 @@ async fn consume_asr_benchmark_stream(
     let mut buffer = Vec::new();
     let mut timing = AsrStreamTimingState::default();
     while let Some(chunk) = bytes.next().await {
-        buffer.extend_from_slice(
-            &chunk.map_err(|error| CliError::ConnectionError(error.to_string()))?,
-        );
+        buffer.extend_from_slice(&chunk?);
         while let Some(boundary) = buffer.windows(2).position(|window| window == b"\n\n") {
             let event = buffer.drain(..boundary).collect::<Vec<_>>();
             buffer.drain(..2);
@@ -3199,16 +3183,10 @@ async fn run_chat_request(
         .post(format!("{}/v1/chat/completions", server))
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     let mut first_delta_at: Option<f64> = None;
@@ -3219,7 +3197,7 @@ async fn run_chat_request(
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        let chunk = chunk?;
         let chunk_text = std::str::from_utf8(&chunk)
             .map_err(|e| CliError::Other(format!("Invalid UTF-8 in chat stream: {e}")))?;
         buffer.push_str(chunk_text);

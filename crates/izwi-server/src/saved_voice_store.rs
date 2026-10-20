@@ -148,38 +148,44 @@ impl SavedVoiceStore {
         Self { db, media_storage }
     }
 
+    /// A page of saved voices, newest first; `search` matches the name or
+    /// the reference text, ignoring case.
     pub async fn list_voices_page(
         &self,
         limit: usize,
         cursor: Option<SavedVoiceListCursor>,
+        search: Option<&str>,
     ) -> anyhow::Result<(Vec<SavedVoiceSummary>, Option<SavedVoiceListCursor>)> {
         let db = self.db.connection().await?;
         let list_limit = i64::try_from(limit.clamp(1, 2000).max(1)).unwrap_or(500);
         let page_size = usize::try_from(list_limit).unwrap_or(500);
         let fetch_limit = list_limit.saturating_add(1);
 
-        let rows = if let Some(cursor) = cursor {
-            let cursor_updated_at = i64::try_from(cursor.updated_at).unwrap_or(i64::MAX);
-            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(raw::statement(
+        let (cursor_updated_at, cursor_created_at, cursor_id) = match cursor {
+            Some(cursor) => (
+                Some(i64::try_from(cursor.updated_at).unwrap_or(i64::MAX)),
+                Some(i64::try_from(cursor.created_at).unwrap_or(i64::MAX)),
+                Some(cursor.id),
+            ),
+            None => (None, None, None),
+        };
+        let search = search
+            .map(str::trim)
+            .filter(|search| !search.is_empty())
+            .map(raw::like_contains_pattern);
+        let rows = db
+            .query_all_raw(raw::statement(
                 db,
-                SAVED_VOICE_PAGE_AFTER_CURSOR_SQL,
+                SAVED_VOICE_PAGE_SQL,
                 vec![
+                    search.into(),
                     cursor_updated_at.into(),
                     cursor_created_at.into(),
-                    cursor.id.into(),
+                    cursor_id.into(),
                     fetch_limit.into(),
                 ],
             )?)
             .await
-        } else {
-            db.query_all_raw(raw::statement(
-                db,
-                SAVED_VOICE_PAGE_SQL,
-                vec![fetch_limit.into()],
-            )?)
-            .await
-        }
         .context("Failed to list saved voices")?;
 
         let mut records = rows
@@ -234,9 +240,19 @@ impl SavedVoiceStore {
         let audio_storage_path: String = row.try_get_by_index(0)?;
         let audio_mime_type: String = row.try_get_by_index(1)?;
         let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let audio = read_media_object(&self.media_storage, audio_storage_path.as_str())
-            .await
-            .context("Failed to read saved voice media")?;
+        // A voice whose recording is gone (deleted or moved by hand) has no
+        // audio: callers answer "not found", not a server error.
+        let audio = match read_media_object(&self.media_storage, audio_storage_path.as_str()).await
+        {
+            Ok(audio) => audio,
+            Err(err) if err.is_not_found() => {
+                tracing::warn!(path = %audio_storage_path, "saved voice audio is missing");
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context("Failed to read saved voice media"))
+            }
+        };
 
         Ok(Some(StoredSavedVoiceAudio {
             audio_bytes: audio.bytes,
@@ -360,6 +376,7 @@ const SAVED_VOICE_COLUMNS: &str = r#"
     permission_revoked_at
 "#;
 
+/// ?1 search pattern (or NULL), ?2-?4 cursor (or NULL), ?5 limit.
 const SAVED_VOICE_PAGE_SQL: &str = r#"
     SELECT
         id,
@@ -377,38 +394,24 @@ const SAVED_VOICE_PAGE_SQL: &str = r#"
         permission_provenance,
         permission_revoked_at
     FROM saved_voices
-    ORDER BY updated_at DESC, created_at DESC, id DESC
-    LIMIT ?1
-"#;
-
-const SAVED_VOICE_PAGE_AFTER_CURSOR_SQL: &str = r#"
-    SELECT
-        id,
-        created_at,
-        updated_at,
-        name,
-        reference_text,
-        audio_mime_type,
-        audio_filename,
-        source_route_kind,
-        source_record_id,
-        permission_scope,
-        consent_status,
-        allowed_uses_json,
-        permission_provenance,
-        permission_revoked_at
-    FROM saved_voices
-    WHERE
-        updated_at < ?1
+    WHERE (
+        ?1 IS NULL
+        OR LOWER(name) LIKE LOWER(?1) ESCAPE '\'
+        OR LOWER(reference_text) LIKE LOWER(?1) ESCAPE '\'
+    )
+    AND (
+        ?2 IS NULL
+        OR updated_at < ?2
         OR (
-            updated_at = ?1
+            updated_at = ?2
             AND (
-                created_at < ?2
-                OR (created_at = ?2 AND id < ?3)
+                created_at < ?3
+                OR (created_at = ?3 AND id < ?4)
             )
         )
+    )
     ORDER BY updated_at DESC, created_at DESC, id DESC
-    LIMIT ?4
+    LIMIT ?5
 "#;
 
 async fn fetch_voice_without_audio(
@@ -651,7 +654,7 @@ mod tests {
         assert_eq!(audio.audio_bytes, vec![1, 2, 3, 4]);
 
         let (voices, cursor) = store
-            .list_voices_page(10, None)
+            .list_voices_page(10, None, None)
             .await
             .expect("voices should list");
         assert!(cursor.is_none());

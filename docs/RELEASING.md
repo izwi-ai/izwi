@@ -6,20 +6,21 @@ There is no manual trigger in the workflow right now.
 
 ## Files to update for a new version
 
-For `v0.1.0-alpha-1`, update these files before tagging:
+The version lives in two files; the release workflow checks that the tag
+matches both before it builds anything:
 
-1. `Cargo.toml`
-   - Set `[workspace.package].version = "0.1.0-alpha-1"`.
-2. `crates/izwi-desktop/tauri.conf.json`
-   - Set `"version": "0.1.0-alpha-1"`.
-3. `ui/package.json`
-   - Set `"version": "0.1.0-alpha-1"` to keep frontend package metadata aligned.
-4. `ui/package-lock.json`
-   - Update the root package version to the same release identifier.
-5. `crates/izwi-core/src/artifacts/downloader.rs` (recommended)
-   - Update the hardcoded `User-Agent` version string (`izwi/...`) to match.
+1. `Cargo.toml`: `[workspace.package].version`. The desktop app
+   (`crates/izwi-desktop/tauri.conf.json` has no version), the CLI and the
+   downloader's User-Agent all follow it.
+2. `ui/package.json` and the root of `ui/package-lock.json`: the same version.
 
-## Release steps (example: v0.1.0-alpha-1)
+Then run `cargo check --workspace` so `Cargo.lock` picks it up.
+
+Version numbers are semver. Stable releases are `0.1.0`, `0.1.1`…;
+prereleases add a label, `0.2.0-beta-1`. Beta numbers compare as numbers
+(`beta-10` is newer than `beta-9`).
+
+## Release steps (example: v0.1.1)
 
 1. Update the version files listed above.
 2. Run local checks:
@@ -33,8 +34,8 @@ npm --prefix ui run build
 3. Commit the release prep changes:
 
 ```bash
-git add Cargo.toml Cargo.lock crates/izwi-desktop/tauri.conf.json ui/package.json ui/package-lock.json crates/izwi-core/src/artifacts/downloader.rs
-git commit -m "Prepare release v0.1.0-alpha-1"
+git add Cargo.toml Cargo.lock ui/package.json ui/package-lock.json
+git commit -m "Prepare release v0.1.1"
 ```
 
 4. Push the commit:
@@ -46,15 +47,51 @@ git push origin <your-branch>
 5. Tag and push the release tag:
 
 ```bash
-git tag -a v0.1.0-alpha-1 -m "Izwi v0.1.0-alpha-1"
-git push origin v0.1.0-alpha-1
+git tag -a v0.1.1 -m "Izwi v0.1.1"
+git push origin v0.1.1
 ```
 
 6. Verify release:
-   - Open GitHub Actions and confirm the `Release` workflow runs for tag `v0.1.0-alpha-1`.
+   - Open GitHub Actions and confirm the `Release` workflow runs for the tag.
    - Confirm the `Backend Truth` workflow is green on the branch or merge commit that produced the tag.
-   - Open the GitHub Releases page and confirm all assets are attached.
+   - Open the GitHub Releases page and confirm all assets are attached,
+     including the updater manifest (`latest.json`, or `latest-beta.json`
+     for a prerelease) and the `.sig` files it points to.
    - Confirm the release body includes the runtime support note describing the CPU-only native artifacts and Docker/source CUDA paths.
+
+## In-app updates
+
+Every release is signed for the updater (`TAURI_SIGNING_PRIVATE_KEY`,
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, and the matching `IZWI_UPDATER_PUBKEY`
+that the workflow bakes into the app). The publish job writes the manifest:
+
+- a stable tag (`v0.1.1`) publishes `latest.json` and is a normal release;
+- a tag with a label (`v0.2.0-beta-1`) publishes `latest-beta.json` and is a
+  prerelease.
+
+A stable build follows stable releases only. A beta build follows betas and
+stable releases, so testers move on to the release they tested. The app
+reads GitHub's release list, takes the newest release its channel accepts
+that carries the right manifest, and installs the entry for its platform:
+`macos`, `windows`, `linux` (the AppImage) or `linux-deb` for an app
+installed from the `.deb` (added when the build signed the `.deb`).
+
+To try an update before publishing, point a build at a staged manifest:
+`IZWI_UPDATER_FORCE_MANIFEST_URL=https://…/latest.json`.
+
+### From the old betas to 0.1.0
+
+Betas up to `v0.1.0-beta-17` only look at `v0.1.0-beta-N` tags with
+`latest-beta.json`, so they never see a stable release. `v0.1.0-beta-18` is
+their bridge: a normal beta release, built with the updater above. Users
+go beta-17 → beta-18 → 0.1.0:
+
+1. Release `v0.1.0-beta-18`. Old betas update to it; it stops the server an
+   old beta left running.
+2. Release `v0.1.0`. beta-18 follows stable releases too, so it offers 0.1.0.
+
+Keep the beta-18 release published after 0.1.0 ships: it is the only way
+from an old beta to 0.1.0.
 
 ## What the release workflow builds
 
@@ -104,9 +141,10 @@ Linux `.deb` installs:
 
 ## Signing and notarization
 
-macOS signing is optional. If no Apple signing identity is configured, macOS builds run unsigned.
+A stable release must be signed and notarized on macOS: its build fails
+without the Apple secrets. Prereleases build unsigned when they are missing.
 
-When you are ready to sign/notarize, configure these repository secrets:
+The repository secrets:
 
 1. `APPLE_CERTIFICATE`
 2. `APPLE_CERTIFICATE_PASSWORD`

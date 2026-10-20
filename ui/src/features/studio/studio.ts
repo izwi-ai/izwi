@@ -246,3 +246,50 @@ export function scriptFilename(name: string, extension: string): string {
     .replace(/^-+|-+$/g, "");
   return `${slug || "studio-project"}.${extension}`;
 }
+
+const HTML_BLOCKS = new Set([
+  "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DD", "DIV", "DL", "DT", "FIGCAPTION",
+  "FOOTER", "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "LI", "MAIN", "NAV", "OL",
+  "P", "PRE", "SECTION", "TABLE", "TD", "TH", "TR", "UL",
+]);
+const HTML_SKIPPED = "script, style, noscript, template, head, svg, iframe";
+
+/**
+ * Script text from an imported file. HTML keeps its blocks as paragraphs
+ * (blank lines, which split the script) and loses its markup, scripts and
+ * styles; other files are read as they are.
+ */
+export function importedScript(filename: string, text: string): string {
+  if (!/\.html?$/i.test(filename) || typeof DOMParser === "undefined") {
+    return text;
+  }
+  const document = new DOMParser().parseFromString(text, "text/html");
+  document.querySelectorAll(HTML_SKIPPED).forEach((node) => node.remove());
+  const paragraphs: string[] = [];
+  let current = "";
+  const flush = () => {
+    const paragraph = current.replace(/\s+/g, " ").trim();
+    if (paragraph) paragraphs.push(paragraph);
+    current = "";
+  };
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      current += node.textContent ?? "";
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as Element;
+    if (element.tagName === "BR") {
+      current += " ";
+      return;
+    }
+    const block = HTML_BLOCKS.has(element.tagName);
+    if (block) flush();
+    element.childNodes.forEach(walk);
+    if (block) flush();
+  };
+  if (document.body) walk(document.body);
+  flush();
+  return paragraphs.join("\n\n") || text;
+}
+

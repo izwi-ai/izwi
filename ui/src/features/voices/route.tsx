@@ -134,6 +134,16 @@ export function VoicesPage({
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<VoiceLibraryTab>("saved");
   const [voiceSearch, setVoiceSearch] = useState("");
+  // Saved voices are searched on the server (all of them, not the loaded
+  // pages), shortly after typing stops.
+  const [savedVoiceQuery, setSavedVoiceQuery] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setSavedVoiceQuery(voiceSearch.trim()),
+      250,
+    );
+    return () => window.clearTimeout(timer);
+  }, [voiceSearch]);
   const [savedVoices, setSavedVoices] = useState<SavedVoiceSummary[]>([]);
   const [savedVoicesLoading, setSavedVoicesLoading] = useState(true);
   const [savedVoicesLoadingMore, setSavedVoicesLoadingMore] = useState(false);
@@ -230,6 +240,7 @@ export function VoicesPage({
       const page = await api.listSavedVoicePage({
         limit: SAVED_VOICES_PAGE_LIMIT,
         cursor: null,
+        filters: savedVoiceQuery ? { q: savedVoiceQuery } : undefined,
       });
       setSavedVoices(page.items);
       setSavedVoicesNextCursor(page.pagination.next_cursor);
@@ -241,7 +252,7 @@ export function VoicesPage({
     } finally {
       setSavedVoicesLoading(false);
     }
-  }, []);
+  }, [savedVoiceQuery]);
 
   const loadMoreSavedVoices = useCallback(async () => {
     if (
@@ -258,6 +269,7 @@ export function VoicesPage({
       const page = await api.listSavedVoicePage({
         limit: SAVED_VOICES_PAGE_LIMIT,
         cursor: savedVoicesNextCursor,
+        filters: savedVoiceQuery ? { q: savedVoiceQuery } : undefined,
       });
       setSavedVoices((current) => {
         const seen = new Set(current.map((voice) => voice.id));
@@ -274,6 +286,7 @@ export function VoicesPage({
       setSavedVoicesLoadingMore(false);
     }
   }, [
+    savedVoiceQuery,
     savedVoicesHasMore,
     savedVoicesLoading,
     savedVoicesLoadingMore,
@@ -504,15 +517,20 @@ export function VoicesPage({
       : activeTab === "saved"
         ? savedVoiceItems
         : builtInVoiceItems;
-  // Search the loaded voices by name, notes and kind.
+  // Saved voices come back already searched by the server; built-in voices
+  // are searched here by name, notes and kind.
   const searchTerm = voiceSearch.trim().toLowerCase();
+  const savedItemIds = new Set(savedVoiceItems.map((item) => item.id));
   const activeItems = searchTerm
-    ? tabItems.filter((item) =>
-        [item.name, item.description, item.meta]
-          .filter(Boolean)
-          .some((value) => value!.toLowerCase().includes(searchTerm)),
+    ? tabItems.filter(
+        (item) =>
+          savedItemIds.has(item.id) ||
+          [item.name, item.description, item.meta]
+            .filter(Boolean)
+            .some((value) => value!.toLowerCase().includes(searchTerm)),
       )
     : tabItems;
+  const noMatches = Boolean(searchTerm) && !savedVoicesLoading;
   const showSavedVoiceLoadMore =
     (activeTab === "saved" || activeTab === "all") &&
     savedVoices.length > 0 &&
@@ -564,7 +582,9 @@ export function VoicesPage({
           <VoiceLibraryGrid
             items={activeItems}
             emptyTitle={
-              activeTab === "all"
+              noMatches
+                ? "No matches"
+                : activeTab === "all"
                 ? savedVoicesLoading
                   ? "Loading voices"
                   : "No voices yet"
@@ -575,16 +595,18 @@ export function VoicesPage({
                   : "No built-in voices available"
             }
             emptyDescription={
-              activeTab === "all"
+              noMatches
+                ? `No voice matches "${voiceSearch.trim()}".`
+                : activeTab === "all"
                 ? routeModels.length === 0
-                  ? "Save a voice or load a supported built-in voice model to populate the library."
-                  : "Save a voice from voice cloning or voice design to build out your library."
+                  ? "Clone or design a voice with New voice, or load a model with built-in voices."
+                  : "Clone a voice from a short recording, or design one from a description, with New voice."
                 : activeTab === "saved"
                   ? savedVoicesLoading
-                    ? "Fetching your reusable cloned and designed voices."
-                    : "Save a result from voice cloning or voice design to build a reusable voice library."
+                    ? "Fetching your cloned and designed voices."
+                    : "Clone a voice from a short recording, or design one from a description, with New voice."
                   : routeModels.length === 0
-                    ? "Load a CustomVoice, Kokoro, or Voxtral TTS model to browse built-in voices."
+                    ? "Load Kokoro, Qwen3-TTS CustomVoice or Voxtral TTS to browse their built-in voices."
                     : "Try a different built-in voice model."
             }
             className="mt-1"
@@ -684,7 +706,7 @@ export function VoicesPage({
     <RouteModelModal
       isOpen={isModelModalOpen}
       onClose={closeModelModal}
-      title="Built-in Voice Models"
+      title="Built-in voice models"
       description="Manage the voice models that expose built-in speaker libraries."
       models={routeModels}
       loading={loading}

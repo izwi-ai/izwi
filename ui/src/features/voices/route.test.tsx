@@ -25,6 +25,7 @@ const typeMocks = vi.hoisted(() => ({
 
 vi.mock("@/api", () => ({
   api: {
+    getHealth: () => Promise.reject(new Error("offline")),
     listSavedVoices: apiMocks.listSavedVoices,
     listSavedVoicePage: apiMocks.listSavedVoicePage,
     deleteSavedVoice: apiMocks.deleteSavedVoice,
@@ -102,14 +103,21 @@ describe("VoicesPage", () => {
       } satisfies SavedVoiceSummary,
     ]);
     apiMocks.deleteSavedVoice.mockResolvedValue(undefined);
-    apiMocks.listSavedVoicePage.mockImplementation(async () => ({
-      items: await apiMocks.listSavedVoices(),
+    // The server searches saved voices by name and reference text.
+    apiMocks.listSavedVoicePage.mockImplementation(
+      async (query?: { filters?: { q?: string } }) => ({
+      items: ((await apiMocks.listSavedVoices()) as SavedVoiceSummary[]).filter(
+        (voice) =>
+          !query?.filters?.q ||
+          voice.name.toLowerCase().includes(query.filters.q.toLowerCase()),
+      ),
       pagination: {
         next_cursor: null,
         has_more: false,
         limit: 25,
       },
-    }));
+    }),
+    );
     apiMocks.generateTTSWithStats.mockImplementation(
       () => new Promise(() => {}),
     );
@@ -351,7 +359,7 @@ describe("VoicesPage", () => {
     );
   });
 
-  it("searches the loaded voices by name and notes", async () => {
+  it("searches saved voices on the server and built-in voices here", async () => {
     render(
       <MemoryRouter>
         <VoicesPage {...baseProps} />
@@ -370,6 +378,14 @@ describe("VoicesPage", () => {
       expect(screen.queryByTestId("voice-card-voice-balanced")).not.toBeInTheDocument(),
     );
     expect(screen.getByTestId("voice-card-alloy")).toBeInTheDocument();
+    expect(apiMocks.listSavedVoicePage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ filters: { q: "alloy" } }),
+    );
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search voices" }), {
+      target: { value: "nothing like it" },
+    });
+    expect(await screen.findByText("No matches")).toBeInTheDocument();
   });
 
   it("keeps only top-level model action while removing secondary strips", async () => {
@@ -515,10 +531,10 @@ describe("VoicesPage", () => {
     );
 
     const qwenModelRow = await screen.findByTestId(
-      `route-model-row-${qwenVariant}`,
+      `model-row-${qwenVariant}`,
     );
     fireEvent.click(
-      within(qwenModelRow).getByRole("button", { name: /Use model/i }),
+      within(qwenModelRow).getByRole("button", { name: /^Use / }),
     );
     expect(onSelect).toHaveBeenCalledWith(qwenVariant);
 

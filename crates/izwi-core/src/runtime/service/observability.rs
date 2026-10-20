@@ -891,8 +891,8 @@ izwi_inference_coordinator_poisoned {}\n",
         self.telemetry.record_pipeline_execution(&summary);
     }
 
-    pub(crate) fn record_diarization_transcript_pipeline(&self, enable_llm_refinement: bool) {
-        let graph = PipelineGraph::diarization_transcript(enable_llm_refinement);
+    pub(crate) fn record_diarization_transcript_pipeline(&self) {
+        let graph = PipelineGraph::diarization_transcript();
         let summary = PipelineExecutor.execute_contract(&graph);
         self.telemetry.record_pipeline_execution(&summary);
     }

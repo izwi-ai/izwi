@@ -1,5 +1,8 @@
-import { Check } from "lucide-react";
-
+import {
+  downloadPercent,
+  SetupRow,
+  type SetupRowTone,
+} from "@/components/SetupRow";
 import type { VoicePageProps } from "@/features/voice/realtime/support";
 import {
   formatBytes,
@@ -9,21 +12,18 @@ import {
   voiceEngineTotalBytes,
   type VoiceEngineModel,
 } from "@/features/voice/engine";
-import { cn } from "@/lib/utils";
 
 type DownloadProgress = VoicePageProps["downloadProgress"];
 
 function rowStatus(
   row: VoiceEngineModel,
   progress: DownloadProgress,
-): { text: string; tone: "done" | "active" | "muted" | "error"; percent?: number } {
+): { text: string; tone: SetupRowTone; percent?: number } {
   const model = row.model;
   if (!model) return { text: "Unavailable", tone: "error" };
   if (isUsableVoiceModelStatus(model.status)) return { text: "Ready", tone: "done" };
   if (model.status === "downloading") {
-    const percent = Math.round(
-      progress[model.variant]?.percent ?? model.download_progress ?? 0,
-    );
+    const percent = downloadPercent(model, progress);
     return { text: `Downloading · ${percent}%`, tone: "active", percent };
   }
   if (model.status === "error") return { text: "Failed", tone: "error" };
@@ -83,50 +83,14 @@ export function VoiceSetup({
         {rows.map((row) => {
           const status = rowStatus(row, downloadProgress);
           return (
-            <li
+            <SetupRow
               key={row.variant}
-              className="flex flex-col gap-2.5 border-b border-[var(--border-muted)] py-3.5"
-            >
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4">
-                <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="text-sm font-medium text-[var(--text-primary)]">
-                    {row.role}
-                  </span>
-                  <span className="truncate text-[13px] text-[var(--text-muted)]">
-                    {row.label}
-                  </span>
-                </div>
-                <span
-                  className={cn(
-                    "flex items-center gap-1.5 whitespace-nowrap text-[13px]",
-                    status.tone === "done" && "text-[var(--status-positive-text)]",
-                    status.tone === "active" && "text-[var(--text-primary)]",
-                    status.tone === "muted" && "text-[var(--text-muted)]",
-                    status.tone === "error" && "text-[var(--danger-text)]",
-                  )}
-                >
-                  {status.tone === "done" && (
-                    <Check className="h-[15px] w-[15px]" strokeWidth={2.5} />
-                  )}
-                  {status.text}
-                </span>
-              </div>
-              {status.percent !== undefined && (
-                <div
-                  role="progressbar"
-                  aria-label={`${row.role} download`}
-                  aria-valuenow={status.percent}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  className="h-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]"
-                >
-                  <div
-                    className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
-                    style={{ width: `${status.percent}%` }}
-                  />
-                </div>
-              )}
-            </li>
+              title={row.role}
+              model={row.label}
+              status={status.text}
+              tone={status.tone}
+              percent={status.percent}
+            />
           );
         })}
       </ul>

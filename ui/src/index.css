@@ -223,91 +223,6 @@ body {
   background: var(--scroll-thumb-hover);
 }
 
-/* Card - subtle lift with shadow */
-.card {
-  @apply border;
-  border-radius: var(--radius-lg);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-surface-1) 86%, transparent), var(--bg-surface-1));
-  border-color: var(--border-muted);
-  box-shadow: var(--app-shadow-soft);
-}
-
-/* Button styles */
-.btn {
-  @apply px-4 py-2 font-medium transition-colors duration-150 flex items-center justify-center gap-2;
-  border-radius: var(--radius-md);
-  @apply disabled:opacity-55 disabled:cursor-not-allowed;
-}
-
-.btn-primary {
-  background-color: var(--accent-solid);
-  color: var(--text-on-accent);
-  box-shadow: var(--shadow-soft);
-}
-
-.btn-primary:hover {
-  filter: brightness(0.92);
-}
-
-.btn-secondary {
-  @apply border;
-  background-color: var(--bg-surface-1);
-  color: var(--text-secondary);
-  border-color: var(--border-muted);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
-}
-
-.btn-secondary:hover {
-  background-color: var(--bg-surface-3);
-  border-color: var(--border-strong);
-}
-
-html.theme-light .btn:disabled {
-  opacity: 0.72;
-}
-
-html.theme-light .btn-secondary:disabled {
-  background-color: var(--bg-surface-2);
-  border-color: var(--border-strong);
-  color: var(--text-muted);
-}
-
-.btn-ghost {
-  @apply bg-transparent;
-  color: var(--text-muted);
-}
-
-.btn-ghost:hover {
-  background-color: var(--accent-soft);
-  color: var(--text-primary);
-}
-
-.btn-danger {
-  @apply border;
-  background: transparent;
-  color: var(--text-muted);
-  border-color: var(--danger-border);
-}
-
-.btn-danger:hover {
-  background-color: var(--danger-bg);
-  color: var(--danger-text);
-}
-
-/* Input styles - slightly elevated from cards */
-.input {
-  @apply w-full border px-3 py-2;
-  border-radius: var(--radius-md);
-  background-color: var(--bg-surface-1);
-  border-color: var(--border-muted);
-  color: var(--text-primary);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
-  @apply focus:outline-none focus:ring-2 focus:ring-ring/35;
-  caret-color: var(--text-primary);
-  @apply transition-all duration-150;
-}
-
 .input::placeholder {
   color: var(--text-subtle);
 }
@@ -401,14 +316,6 @@ html.theme-light .btn-secondary:disabled {
     radial-gradient(circle at top left, var(--bg-glow-1), transparent 30%),
     linear-gradient(180deg, color-mix(in srgb, var(--bg-surface-1) 92%, transparent), var(--bg-surface-1));
   box-shadow: var(--shadow-raised);
-}
-
-.app-section-label {
-  color: var(--text-muted);
-  font-size: 0.6875rem;
-  font-weight: 700;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
 }
 
 .app-kbd {

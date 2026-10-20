@@ -96,7 +96,7 @@ FROM debian:bookworm-slim AS production
 
 LABEL org.opencontainers.image.title="Izwi Audio"
 LABEL org.opencontainers.image.description="Rust-native audio inference engine"
-LABEL org.opencontainers.image.vendor="Agentem"
+LABEL org.opencontainers.image.vendor="Izwi"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
@@ -124,13 +124,17 @@ COPY --from=rust-builder-cpu /app/target/release/izwi-serving-worker /usr/local/
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
 
-# Copy configuration (use Docker-specific config)
-COPY config.docker.toml /app/config.toml
+# License and notice for the binaries this image distributes
+COPY LICENSE NOTICE /usr/share/doc/izwi/
 
-# Set up environment
-ENV IZWI_CONFIG_PATH=/app/config.toml
+# Set up environment. The server is configured through IZWI_* variables
+# (docker run -e / compose environment).
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
+# History (database) and media live on the /app/data volume, so they survive
+# the container being recreated.
+ENV IZWI_DB_PATH=/app/data/izwi.sqlite3
+ENV IZWI_MEDIA_DIR=/app/data/media
 # The container must listen on all interfaces; the server then refuses to
 # start unless IZWI_API_KEY is provided at runtime (docker run -e IZWI_API_KEY).
 ENV IZWI_HOST=0.0.0.0
@@ -139,8 +143,8 @@ ENV IZWI_HOST=0.0.0.0
 RUN mkdir -p /app/models /app/data && \
     chown -R izwi:izwi /app
 
-# Volume for model storage
-VOLUME ["/app/models"]
+# Volumes for model storage and for the database and media
+VOLUME ["/app/models", "/app/data"]
 
 # Expose server port
 EXPOSE 8080
@@ -161,7 +165,7 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)"
 LABEL org.opencontainers.image.description="Rust-native audio inference engine with CUDA support"
-LABEL org.opencontainers.image.vendor="Agentem"
+LABEL org.opencontainers.image.vendor="Izwi"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
@@ -189,13 +193,17 @@ COPY --from=rust-builder-cuda /app/target/release/izwi-serving-worker /usr/local
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
 
-# Copy configuration (use Docker-specific config)
-COPY config.docker.toml /app/config.toml
+# License and notice for the binaries this image distributes
+COPY LICENSE NOTICE /usr/share/doc/izwi/
 
-# Set up environment
-ENV IZWI_CONFIG_PATH=/app/config.toml
+# Set up environment. The server is configured through IZWI_* variables
+# (docker run -e / compose environment).
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
+# History (database) and media live on the /app/data volume, so they survive
+# the container being recreated.
+ENV IZWI_DB_PATH=/app/data/izwi.sqlite3
+ENV IZWI_MEDIA_DIR=/app/data/media
 # The container must listen on all interfaces; the server then refuses to
 # start unless IZWI_API_KEY is provided at runtime (docker run -e IZWI_API_KEY).
 ENV IZWI_HOST=0.0.0.0
@@ -207,8 +215,8 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 RUN mkdir -p /app/models /app/data && \
     chown -R izwi:izwi /app
 
-# Volume for model storage
-VOLUME ["/app/models"]
+# Volumes for model storage and for the database and media
+VOLUME ["/app/models", "/app/data"]
 
 # Expose server port
 EXPOSE 8080
@@ -230,16 +238,26 @@ FROM debian:bookworm-slim AS production-gateway
 
 LABEL org.opencontainers.image.title="Izwi Gateway"
 LABEL org.opencontainers.image.description="Izwi public API gateway: OpenAI-compatible routing to approved inference workers"
-LABEL org.opencontainers.image.vendor="Agentem"
+LABEL org.opencontainers.image.vendor="Izwi"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 izwi
+    && useradd -m -u 1000 izwi \
+    && mkdir -p /app/data \
+    && chown -R izwi:izwi /app
 
 COPY --from=rust-builder-gateway /app/target/release/izwi-gateway /usr/local/bin/izwi-gateway
+
+# License and notice for the binary this image distributes
+COPY LICENSE NOTICE /usr/share/doc/izwi/
+
+# The scoped principal-key store (read when a key manifest is set) lives on
+# the /app/data volume, so it survives the container being recreated.
+ENV IZWI_DB_PATH=/app/data/izwi.sqlite3
+VOLUME ["/app/data"]
 
 # The container must listen on all interfaces; the gateway then refuses to
 # start unless IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1 asserts that TLS terminates

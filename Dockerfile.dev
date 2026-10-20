@@ -31,11 +31,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Install cargo-watch for Rust hot reload
 RUN cargo install cargo-watch
 
-# Set up environment
+# Set up environment. /app is the bind-mounted repository, so the database
+# and media live outside it (the compose file mounts a volume there).
 ENV CARGO_TARGET_DIR=/app/target
+ENV IZWI_MODELS_DIR=/app/models
+ENV IZWI_DB_PATH=/var/lib/izwi/izwi.sqlite3
+ENV IZWI_MEDIA_DIR=/var/lib/izwi/media
 
 # Create directories
-RUN mkdir -p /app/models /app/data
+RUN mkdir -p /app/models /var/lib/izwi
 
 # Expose ports
 # 8080 - Rust backend

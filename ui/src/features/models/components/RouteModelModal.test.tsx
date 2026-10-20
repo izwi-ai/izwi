@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ModelInfo } from "@/api";
@@ -70,7 +70,9 @@ describe("RouteModelModal", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel load" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Cancel loading / }),
+    );
     expect(onUnload).toHaveBeenCalledWith(
       "diar_streaming_sortformer_4spk-v2.1",
     );
@@ -100,24 +102,16 @@ describe("RouteModelModal", () => {
       />,
     );
 
+    expect(screen.queryByText(/^Selected/)).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Selected/i }),
+      screen.queryByRole("button", { name: /^Use / }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Use model/i }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /Unload/i }),
+      screen.getByRole("button", { name: /^Unload / }),
     ).toBeInTheDocument();
-
-    const row = screen.getByTestId(
-      "route-model-row-diar_streaming_sortformer_4spk-v2.1",
-    );
-    expect(row.className).toContain("border-[var(--border-muted)]");
-    expect(row.className).not.toContain("border-[var(--border-strong)]");
   });
 
-  it("shows pinned badges and the residency summary in manage mode", () => {
+  it("marks kept-loaded models and shows the residency summary in manage mode", () => {
     render(
       <RouteModelModal
         isOpen
@@ -145,10 +139,9 @@ describe("RouteModelModal", () => {
       />,
     );
 
-    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText(/Kept loaded/)).toBeInTheDocument();
     const summary = screen.getByTestId("route-model-residency-summary");
-    expect(summary).toHaveTextContent("1 model resident of 4 allowed");
-    expect(summary).toHaveTextContent("idle models unload after 10 min");
+    expect(summary).toHaveTextContent("1 model loaded of 4");
   });
 
   it("omits the residency summary when the server does not provide one", () => {
@@ -172,8 +165,8 @@ describe("RouteModelModal", () => {
     );
 
     expect(
-      screen.queryByTestId("route-model-residency-summary"),
-    ).not.toBeInTheDocument();
+      screen.getByTestId("route-model-residency-summary"),
+    ).toBeEmptyDOMElement();
   });
 
   it("uses a named modal dialog, closes with Escape, and returns focus", async () => {
@@ -239,24 +232,24 @@ describe("RouteModelModal", () => {
       />,
     );
 
-    const deleteButton = screen.getByRole("button", {
-      name: "Delete ready-model",
+    const menuButton = screen.getByRole("button", {
+      name: "More actions for ready-model",
     });
-    fireEvent.click(deleteButton);
+    fireEvent.pointerDown(menuButton);
+    fireEvent.click(menuButton);
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Delete download" }),
+    );
 
     const confirmDialog = await screen.findByRole("dialog", {
-      name: "Delete model?",
+      name: /Delete download/,
     });
-    expect(confirmDialog).toHaveAccessibleDescription(
-      "This removes ready-model from local storage.",
-    );
-    expect(screen.getByText("TTS Models")).toBeInTheDocument();
+    expect(confirmDialog).toHaveTextContent("stops any job using the model");
 
     fireEvent.keyDown(document.activeElement ?? confirmDialog, { key: "Escape" });
 
     await waitFor(() => expect(confirmDialog).not.toBeInTheDocument());
     expect(screen.getByRole("dialog", { name: "TTS Models" })).toBeInTheDocument();
-    expect(deleteButton).toHaveFocus();
   });
 
   it("offers a download action for not-downloaded models", () => {
@@ -309,15 +302,15 @@ describe("RouteModelModal", () => {
       />,
     );
 
-    expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
+    expect(screen.getAllByText(/^Qwen$/)).toHaveLength(3);
     expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
 
     // Version order wins over size order: the 27B Qwen3.8 renders after the
     // 35B Qwen3.6, and the Qwen3.5 model stays before both.
     const orderedRows = [
-      "route-model-row-Qwen3.5-9B",
-      "route-model-row-Qwen3.6-35B-A3B-FP8",
-      "route-model-row-Qwen3.8-27B-FP8",
+      "model-row-Qwen3.5-9B",
+      "model-row-Qwen3.6-35B-A3B-FP8",
+      "model-row-Qwen3.8-27B-FP8",
     ].map((testId) => screen.getByTestId(testId));
     for (let index = 0; index + 1 < orderedRows.length; index += 1) {
       expect(
@@ -325,5 +318,80 @@ describe("RouteModelModal", () => {
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
     }
+  });
+
+  it("says why a model can't run here and why a download failed", () => {
+    const onDownload = vi.fn();
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="Chat models"
+        description="Manage chat models."
+        models={[
+          buildModel({
+            variant: "Qwen3.8-27B-FP8",
+            status: "not_downloaded",
+            device_fit: "too_large",
+            estimated_memory_bytes: 80 * 1024 ** 3,
+          }),
+          buildModel({
+            variant: "Qwen3.5-9B",
+            status: "error",
+            error_message: "Not enough free disk space for downloading Qwen3.5-9B",
+          }),
+        ]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={onDownload}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+      />,
+    );
+
+    const tooLarge = screen.getByTestId("model-row-Qwen3.8-27B-FP8");
+    expect(within(tooLarge).getByText("Needs 80 GB of memory")).toBeInTheDocument();
+    expect(within(tooLarge).queryByRole("button", { name: /^Download/ })).toBeNull();
+
+    const failed = screen.getByTestId("model-row-Qwen3.5-9B");
+    expect(within(failed).getByText(/Not enough free disk space/)).toBeInTheDocument();
+    fireEvent.click(within(failed).getByRole("button", { name: /^Retry / }));
+    expect(onDownload).toHaveBeenCalledWith("Qwen3.5-9B");
+  });
+
+  it("uses another loaded model on this page", () => {
+    const onUseModel = vi.fn();
+    const onClose = vi.fn();
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={onClose}
+        title="Chat models"
+        description="Manage chat models."
+        routeLabel="Chat"
+        models={[
+          buildModel({ variant: "Qwen3.5-4B", status: "ready" }),
+          buildModel({ variant: "Qwen3.5-2B", status: "ready" }),
+        ]}
+        loading={false}
+        selectedVariant="Qwen3.5-4B"
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={onUseModel}
+      />,
+    );
+
+    expect(
+      within(screen.getByTestId("model-row-Qwen3.5-4B")).getByText(/Selected in Chat/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Use / }));
+    expect(onUseModel).toHaveBeenCalledWith("Qwen3.5-2B");
+    expect(onClose).toHaveBeenCalled();
   });
 });

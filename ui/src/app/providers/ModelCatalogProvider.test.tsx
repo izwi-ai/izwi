@@ -14,6 +14,8 @@ const apiMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
   loadModel: vi.fn(),
   unloadModel: vi.fn(),
+  downloadModel: vi.fn(),
+  getModelInfo: vi.fn(),
 }));
 
 vi.mock("@/api", async (importOriginal) => {
@@ -25,6 +27,8 @@ vi.mock("@/api", async (importOriginal) => {
       listModels: apiMocks.listModels,
       loadModel: apiMocks.loadModel,
       unloadModel: apiMocks.unloadModel,
+      downloadModel: apiMocks.downloadModel,
+      getModelInfo: apiMocks.getModelInfo,
     },
   };
 });
@@ -331,7 +335,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     vi.clearAllMocks();
   });
 
-  it("keeps the diarization refiner resident across chat model switches", async () => {
+  it("keeps the diarization summary LLM resident across chat model switches", async () => {
     apiMocks.listModels.mockResolvedValue({
       models: [
         { ...model, status: "ready" },
@@ -497,7 +501,7 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
   });
 
   it("does not adopt a speech-pipeline model load as the selection", async () => {
-    // Qwen3.5-4B is a pipeline stack member (refiner/summary LLM): loading it
+    // Qwen3.5-4B is a pipeline stack member (summary LLM): loading it
     // is pipeline setup, not a model switch.
     apiMocks.loadModel.mockResolvedValue({
       status: "loaded",
@@ -560,7 +564,7 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
         </span>
       );
     }
-    render(
+    const view = render(
       <NotificationProvider>
         <ModelCatalogProvider>
           <ProgressProbe />
@@ -593,7 +597,197 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
     });
     expect(screen.getByTestId("percent")).toHaveTextContent("100");
 
+    view.unmount();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+});
+
+describe("ModelCatalogProvider per-page choices", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
+        { ...model, variant: "Kokoro-82M", status: "downloaded" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+  });
+
+  function RouteProbe() {
+    const { selectedModelFor, selectModel, loadModel } = useModelCatalog();
+    return (
+      <div>
+        <span data-testid="chat-choice">{selectedModelFor("chat") ?? "none"}</span>
+        <span data-testid="tts-choice">
+          {selectedModelFor("text-to-speech") ?? "none"}
+        </span>
+        <button type="button" onClick={() => selectModel("Qwen3.5-4B", "chat")}>
+          Pick chat
+        </button>
+        <button
+          type="button"
+          onClick={() => void loadModel("Kokoro-82M", { route: "text-to-speech" })}
+        >
+          Load speech
+        </button>
+      </div>
+    );
+  }
+
+  it("keeps a page's choice when another page loads a model", async () => {
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Pick chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load speech" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("tts-choice")).toHaveTextContent("Kokoro-82M"),
+    );
+    expect(screen.getByTestId("chat-choice")).toHaveTextContent("Qwen3.5-4B");
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("izwi.modelCatalog.routeSelections") ?? "{}",
+      ),
+    ).toEqual({ chat: "Qwen3.5-4B", "text-to-speech": "Kokoro-82M" });
+  });
+
+  it("shows why a load may be slow", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+      warning: "Needs 6.9 GB; macOS reports 4.1 GB free, so it may swap.",
+    });
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Load speech" }));
+    expect(
+      await screen.findByText(/macOS reports 4.1 GB free/),
+    ).toBeInTheDocument();
+  });
+
+  it("refreshes the model list when the window regains focus", async () => {
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await screen.findByRole("button", { name: "Pick chat" });
+    await waitFor(() => expect(apiMocks.listModels).toHaveBeenCalled());
+    const calls = apiMocks.listModels.mock.calls.length;
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(apiMocks.listModels.mock.calls.length).toBeGreaterThan(calls),
+    );
+  });
+
+  it("says nothing about a download that ended before the app opened", async () => {
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      constructor(public url: string) {
+        FakeEventSource.instances.push(this);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "downloading", download_progress: 0 }],
+    });
+    const view = render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const stream = FakeEventSource.instances[FakeEventSource.instances.length - 1];
+    act(() => {
+      stream.onmessage?.({
+        data: JSON.stringify({ percent: 0, status: "cancelled" }),
+      });
+    });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(screen.queryByText("Model download cancelled")).not.toBeInTheDocument();
+    view.unmount();
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("ModelCatalogProvider download notifications", () => {
+  it("groups downloads into one row and offers Retry when one fails", async () => {
+    vi.clearAllMocks();
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      constructor(public url: string) {
+        FakeEventSource.instances.push(this);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    apiMocks.getModelInfo.mockResolvedValue({ ...model, status: "downloading" });
+    apiMocks.downloadModel.mockResolvedValue({ status: "started", message: "started" });
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "downloading", download_progress: 0 },
+        { ...model, variant: "Kokoro-82M", status: "downloading", download_progress: 0 },
+      ],
+    });
+    const view = render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <CatalogProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(2));
+    const [first, second] = FakeEventSource.instances;
+    act(() => {
+      first.onmessage?.({ data: JSON.stringify({ percent: 20, status: "downloading" }) });
+      second.onmessage?.({ data: JSON.stringify({ percent: 60, status: "downloading" }) });
+    });
+    expect(await screen.findByText("Downloading 2 models")).toBeInTheDocument();
+
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "downloading", download_progress: 20 },
+        { ...model, variant: "Kokoro-82M", status: "error", error_message: "Not enough free disk space" },
+      ],
+    });
+    act(() => {
+      second.onmessage?.({
+        data: JSON.stringify({ percent: 60, status: "error", error: "Not enough free disk space" }),
+      });
+    });
+    expect(await screen.findByText("Not enough free disk space")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("model-count")).toHaveTextContent("2"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(apiMocks.downloadModel).toHaveBeenCalledWith("Kokoro-82M"),
+    );
+    view.unmount();
+    vi.unstubAllGlobals();
   });
 });

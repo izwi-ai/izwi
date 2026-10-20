@@ -68,7 +68,7 @@ izwi bench tts [OPTIONS]
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-m, --model <MODEL>` | Model to benchmark | `qwen3-tts-0.6b-base` |
+| `-m, --model <MODEL>` | Model to benchmark | `Kokoro-82M` |
 | `-i, --iterations <N>` | Number of iterations | `10` |
 | `-t, --text <TEXT>` | Text to synthesize | Default test text |
 | `-c, --concurrent <N>` | Concurrent requests | `1` |
@@ -77,7 +77,7 @@ izwi bench tts [OPTIONS]
 ### Example
 
 ```bash
-izwi bench tts --model qwen3-tts-0.6b-base --iterations 20 --warmup
+izwi bench tts --model Kokoro-82M --iterations 20 --warmup
 ```
 
 ---
@@ -96,7 +96,7 @@ izwi bench asr [OPTIONS]
 |--------|-------------|---------|
 | `-m, --model <MODEL>` | Model to benchmark | `parakeet-tdt-0.6b-v3` |
 | `-i, --iterations <N>` | Number of iterations | `10` |
-| `-f, --file <PATH>` | Audio file to use | Built-in test audio |
+| `-f, --file <PATH>` | Audio file to use | `data/test.wav` (relative to the current directory; present in a repo checkout) |
 | `-l, --language <LANG>` | Optional ASR language hint (e.g., `en`) | Auto-detect |
 | `-c, --concurrent <N>` | Concurrent requests | `1` |
 | `--warmup` | Enable warmup iteration | — |
@@ -287,8 +287,8 @@ removed.
 Run a TOML benchmark manifest with one or more benchmark cases.
 
 ```bash
-izwi bench run benchmarks/local.toml
-izwi bench run benchmarks/local.toml --artifact-dir benchmarks/results/run-001
+izwi bench run benchmarks/manifests/cpu-continuous-batching.toml
+izwi bench run benchmarks/manifests/cpu-continuous-batching.toml --artifact-dir benchmarks/results/run-001
 ```
 
 ### Manifest Format
@@ -328,7 +328,7 @@ iterations = 10
 warmup = true
 
 [benchmarks.matrix]
-model = ["Qwen3.5-4B", "Qwen3.5-8B"]
+model = ["Qwen3.5-4B", "Qwen3.5-9B"]
 concurrent = [1, 2, 4]
 max_tokens = [64, 128]
 ```
@@ -398,7 +398,7 @@ izwi bench chat \
   --prompt "You are optimizing an inference runtime. Explain, in detail, how prefill and decode differ for attention kernels, why page-based KV caches help memory at long context, what tradeoffs they can introduce for throughput, and how to design a benchmark protocol that separates TTFT improvements from decode TPS improvements."
 
 # Kernel-path counter snapshot
-curl -sS http://127.0.0.1:11435/internal/metrics/prometheus | rg '^izwi_kernel_'
+curl -sS http://127.0.0.1:8080/internal/metrics/prometheus | grep '^izwi_kernel_'
 ```
 
 The `izwi bench chat` runtime delta now includes kernel-path counts for:

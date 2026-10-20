@@ -1,4 +1,5 @@
 use crate::errors::Result;
+use crate::tools::has_any_word;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -47,15 +48,15 @@ impl Planner for SimplePlanner {
         let should_plan = match ctx.planning_mode {
             PlanningMode::On => true,
             PlanningMode::Off => false,
+            // Whole words: "planet", "explanation" or "relearned" do not plan.
             PlanningMode::Auto => {
-                lower.contains("research")
-                    || lower.contains("compare")
-                    || lower.contains("teach")
-                    || lower.contains("learn")
-                    || lower.contains("language")
-                    || lower.contains("lesson")
-                    || lower.contains("plan")
-                    || lower.starts_with("how do i")
+                has_any_word(
+                    &lower,
+                    &[
+                        "research", "compare", "teach", "learn", "language", "lesson", "plan",
+                        "planning",
+                    ],
+                ) || lower.starts_with("how do i")
                     || lower.starts_with("how can i")
             }
         };
@@ -64,26 +65,25 @@ impl Planner for SimplePlanner {
             return Ok(PlannerDecision::DirectRespond);
         }
 
-        let mut steps =
-            if lower.contains("teach") || lower.contains("learn") || lower.contains("language") {
-                vec![
-                    "Identify the user's learning goal and current level.".to_string(),
-                    "Teach in short steps with simple examples and checks.".to_string(),
-                    "End with a small practice task or recap.".to_string(),
-                ]
-            } else if lower.contains("research") || lower.contains("compare") {
-                vec![
-                    "Clarify the topic and what the user wants compared or researched.".to_string(),
-                    "Gather facts from available tools or prior context.".to_string(),
-                    "Return a concise summary with clear next steps.".to_string(),
-                ]
-            } else {
-                vec![
-                    "Break the request into a few concrete steps.".to_string(),
-                    "Work through the steps and keep the user updated.".to_string(),
-                    "Summarize the result and next actions.".to_string(),
-                ]
-            };
+        let mut steps = if has_any_word(&lower, &["teach", "learn", "language", "lesson"]) {
+            vec![
+                "Identify the user's learning goal and current level.".to_string(),
+                "Teach in short steps with simple examples and checks.".to_string(),
+                "End with a small practice task or recap.".to_string(),
+            ]
+        } else if has_any_word(&lower, &["research", "compare"]) {
+            vec![
+                "Clarify the topic and what the user wants compared or researched.".to_string(),
+                "Gather facts from available tools or prior context.".to_string(),
+                "Return a concise summary with clear next steps.".to_string(),
+            ]
+        } else {
+            vec![
+                "Break the request into a few concrete steps.".to_string(),
+                "Work through the steps and keep the user updated.".to_string(),
+                "Summarize the result and next actions.".to_string(),
+            ]
+        };
 
         if ctx.tools_enabled && !ctx.available_tool_names.is_empty() {
             steps.insert(
@@ -102,6 +102,33 @@ impl Planner for SimplePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_plans_on_whole_words_only() {
+        let decide = |text: &str| {
+            SimplePlanner
+                .decide(&PlannerContext {
+                    user_text: text.to_string(),
+                    planning_mode: PlanningMode::Auto,
+                    tools_enabled: false,
+                    available_tool_names: Vec::new(),
+                })
+                .expect("decision")
+        };
+        for chat in [
+            "Tell me about the planet Mars",
+            "Thanks for the explanation",
+        ] {
+            assert!(
+                matches!(decide(chat), PlannerDecision::DirectRespond),
+                "{chat}"
+            );
+        }
+        assert!(matches!(
+            decide("Help me plan a trip"),
+            PlannerDecision::PlanThenAct(_)
+        ));
+    }
 
     #[test]
     fn auto_mode_plans_for_teaching_requests() {

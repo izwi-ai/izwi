@@ -39,5 +39,6 @@ export interface ModelsRouteProps {
   onLoad: (variant: string) => void;
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
+  onSetPinned?: (variant: string, pinned: boolean) => void;
   onRefresh: () => Promise<boolean>;
 }

@@ -71,15 +71,16 @@ pub async fn rerun_job(
     ApiJson(req): ApiJson<diarization_handlers::RerunDiarizationRecordRequest>,
 ) -> Result<Response, ApiError> {
     let kind = parse_job_kind(query.job_kind.as_deref(), true)?;
-    match resolve_diarization_only_kind(&state, record_id.as_str(), kind).await? {
+    match resolve_existing_kind(&state, record_id.as_str(), kind).await? {
         MutationJobKind::Diarization => {
             diarization_handlers::rerun_record(state, ctx, Path(record_id), ApiJson(req)).await
         }
-        MutationJobKind::All
-        | MutationJobKind::Transcription
-        | MutationJobKind::SpeakerAttributedAsr => Err(ApiError::bad_request(
-            "Reruns are supported only for diarization jobs.",
-        )),
+        // A transcription retry keeps the job's settings: the diarization
+        // tuning fields in the body do not apply.
+        MutationJobKind::Transcription | MutationJobKind::SpeakerAttributedAsr => {
+            super::handlers::retry_record(state, ctx, Path(record_id)).await
+        }
+        MutationJobKind::All => Err(ApiError::not_found("Speech text job record not found")),
     }
 }
 
@@ -89,16 +90,16 @@ pub async fn cancel_job(
     Query(query): Query<UnifiedMutationQuery>,
 ) -> Result<Response, ApiError> {
     let kind = parse_job_kind(query.job_kind.as_deref(), true)?;
-    match resolve_diarization_only_kind(&state, record_id.as_str(), kind).await? {
+    match resolve_existing_kind(&state, record_id.as_str(), kind).await? {
         MutationJobKind::Diarization => {
             let response = diarization_handlers::cancel_record(state, Path(record_id)).await?;
             Ok(response.into_response())
         }
-        MutationJobKind::All
-        | MutationJobKind::Transcription
-        | MutationJobKind::SpeakerAttributedAsr => Err(ApiError::bad_request(
-            "Cancellation is currently supported only for diarization jobs.",
-        )),
+        MutationJobKind::Transcription | MutationJobKind::SpeakerAttributedAsr => {
+            let response = super::handlers::cancel_record(state, Path(record_id)).await?;
+            Ok(response.into_response())
+        }
+        MutationJobKind::All => Err(ApiError::not_found("Speech text job record not found")),
     }
 }
 
@@ -235,6 +236,22 @@ async fn ensure_transcription_backed_kind(
         return Err(ApiError::not_found("Speech text job record not found"));
     }
     Ok(requested)
+}
+
+/// The kind of an existing record: the requested kind, checked against a
+/// transcription-backed record's mode, or detected when none was named.
+async fn resolve_existing_kind(
+    state: &AppState,
+    record_id: &str,
+    requested: MutationJobKind,
+) -> Result<MutationJobKind, ApiError> {
+    match requested {
+        MutationJobKind::All => detect_existing_job_kind(state, record_id).await,
+        MutationJobKind::Diarization => Ok(MutationJobKind::Diarization),
+        MutationJobKind::Transcription | MutationJobKind::SpeakerAttributedAsr => {
+            ensure_transcription_backed_kind(state, record_id, requested).await
+        }
+    }
 }
 
 async fn resolve_diarization_only_kind(

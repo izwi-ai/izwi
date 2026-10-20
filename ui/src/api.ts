@@ -9,8 +9,10 @@ export type {
 export type {
   ChatModelCapabilities,
   ChatReasoningEffort,
+  ModelActionResponse,
   ModelInfo,
   ModelResidencySummary,
+  ModelStorage,
   ModelsResponse,
   RemovedModelInfo,
   SpeechModelCapabilities,

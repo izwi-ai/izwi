@@ -39,13 +39,6 @@ pub fn execute(full: bool, theme: &Theme) {
             println!("  ✓ {}", backend);
         }
 
-        println!("\n{}", style("Features:").bold());
-        if cfg!(feature = "playback") {
-            println!("  ✓ Audio playback");
-        } else {
-            println!("  (none)");
-        }
-
         println!("\n{}", style("License:").bold());
         println!("  Apache 2.0");
     }

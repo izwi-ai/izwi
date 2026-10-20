@@ -42,20 +42,19 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-m, --model <MODEL>` | TTS model to use | `qwen3-tts-0.6b-base` |
+| `-m, --model <MODEL>` | TTS model to use | `Kokoro-82M` |
 | `-s, --speaker <VOICE>` | Built-in voice/speaker ID, or VibeVoice speaker label | model default |
 | `--saved-voice-id <ID>` | Reuse a saved reference voice from `/v1/voices` | — |
 | `--reference-audio <PATH>` | Reference audio file for voice cloning | — |
 | `--reference-text <TEXT>` | Transcript for the reference audio | — |
 | `--reference-text-file <PATH>` | File containing the reference transcript | — |
 | `--instructions <TEXT>` | Voice direction prompt for voice-design models | — |
-| `-o, --output <PATH>` | Output file path | stdout |
-| `-f, --format <FORMAT>` | Audio format requested from the server. OSS native output is `wav`; compressed choices require server-side encoder support. | `wav` |
-| `-r, --speed <SPEED>` | Speech speed (0.5-2.0) | `1.0` |
-| `-t, --temperature <TEMP>` | Sampling temperature | `0.7` |
-| `--stream` | Stream output in real-time | — |
-| `--allow-format-fallback` | Allow WAV output when a requested compressed format is unavailable | — |
-| `-p, --play` | Request playback after generation. The current CLI saves audio and reports playback as not implemented. | — |
+| `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
+| `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
+| `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
+| `-t, --temperature <TEMP>` | Sampling temperature | model default |
+| `--stream` | Stream audio as it is generated into a WAV file and report time to first audio (WAV only) | — |
+| `-p, --play` | Play the saved WAV with the system player (afplay on macOS; paplay, aplay, ffplay or play on Linux; PowerShell on Windows). Not with `--format pcm`. | — |
 
 ---
 
@@ -76,14 +75,13 @@ izwi tts "Hello my name is Bella" \
   --output kokoro.wav
 ```
 
-### Request playback
+### Play after generation
 
 ```bash
 izwi tts "Hello, world!" --play
 ```
 
-The current CLI still saves the generated audio, then reports that playback is
-not implemented in this version.
+Izwi saves the generated audio, then plays it with the system player.
 
 ### WAV output
 
@@ -119,7 +117,7 @@ izwi tts "Hello from a built-in CustomVoice speaker" \
 
 ### Reference-audio voice cloning
 
-Base and VibeVoice models can clone from a reference audio sample. Provide the
+Base, VibeVoice and FishAudio-S2-Pro models can clone from a reference audio sample. Provide the
 audio and matching transcript together:
 
 ```bash
@@ -166,11 +164,13 @@ izwi tts "Welcome to the evening edition." \
   --output designed.wav
 ```
 
-### Streaming with playback request
+### Streaming, then play
 
 ```bash
 izwi tts "Long text for streaming" --stream --play
 ```
+
+Izwi saves the streamed audio, then plays it.
 
 ---
 
@@ -178,8 +178,8 @@ izwi tts "Long text for streaming" --stream --play
 
 | Format | Extension | Notes |
 |--------|-----------|-------|
-| `wav` | `.wav` | Native OSS output format. |
-| `mp3`, `ogg`, `flac`, `aac` | Matching extension when supported | Recognized by the CLI enum, but the OSS server does not bundle compressed encoders yet. Add `--allow-format-fallback` when you intentionally want the CLI to accept WAV bytes for a compressed request; default filenames then use the actual returned extension. |
+| `wav` | `.wav` | 16-bit PCM WAV (default) |
+| `pcm` | `.pcm` | Raw 16-bit little-endian mono PCM, no header (no `--play` or `--stream`) |
 
 ---
 
@@ -187,11 +187,12 @@ izwi tts "Long text for streaming" --stream --play
 
 | Model | Type | Description |
 |-------|------|-------------|
-| `Kokoro-82M` | Standard | Lightweight TTS (requires `espeak-ng`) |
-| `qwen3-tts-0.6b-base` | Base | General-purpose TTS + reference-voice workflows |
+| `Kokoro-82M` | Standard | Default; lightweight TTS with built-in voices (requires `espeak-ng`) |
+| `qwen3-tts-0.6b-base` | Base | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `qwen3-tts-0.6b-customvoice` | CustomVoice | Built-in speaker presets |
-| `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Design | Voice design-capable model family |
+| `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Design | Voice design-capable model family; needs `--instructions` |
 | `VibeVoice-1.5B` | Long-form/reference voice | Reference-voice TTS with long-form positioning |
+| `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 

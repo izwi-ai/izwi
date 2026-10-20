@@ -1,20 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Settings2 } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
-import { VoiceCreationModal } from "@/components/VoiceCreationModal";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
-  TEXT_TO_SPEECH_PREFERRED_MODELS,
+  VOICE_CLONING_PREFERRED_MODELS,
   VOICE_DESIGN_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
-import { NewItemButton } from "@/components/history/NewItemButton";
+import { CloneVoiceDialog } from "@/features/voice-studio/components/CloneVoiceDialog";
+import { DesignVoiceDialog } from "@/features/voice-studio/components/DesignVoiceDialog";
+import {
+  NewVoiceMenu,
+  type NewVoiceKind,
+} from "@/features/voice-studio/components/NewVoiceMenu";
 import { VoicesPage } from "@/features/voices/route";
 import { VIEW_CONFIGS } from "@/types";
 
@@ -47,27 +51,21 @@ export function VoiceStudioPage({
 }: VoiceStudioPageProps) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [isCreationModalOpen, setIsCreationModalOpen] = useState(false);
-  const [creationStep, setCreationStep] = useState<
-    "choice" | "clone" | "design"
-  >("choice");
+  const [isNewVoiceMenuOpen, setIsNewVoiceMenuOpen] = useState(false);
+  const [newVoiceDialog, setNewVoiceDialog] = useState<NewVoiceKind | null>(
+    null,
+  );
+  useNewItemShortcut(() => setIsNewVoiceMenuOpen(true));
 
   // /voice-cloning and /voice-design redirect here with ?tab=clone|design:
-  // open the creation modal on that step, then drop the parameter so a
-  // refresh or Back does not reopen it.
-  const openNewVoice = () => {
-    setCreationStep("choice");
-    setIsCreationModalOpen(true);
-  };
-  useNewItemShortcut(openNewVoice);
-
+  // open that dialog, then drop the parameter so a refresh or Back does not
+  // reopen it.
   const requestedTab = searchParams.get("tab");
   useEffect(() => {
     if (requestedTab !== "clone" && requestedTab !== "design") {
       return;
     }
-    setCreationStep(requestedTab);
-    setIsCreationModalOpen(true);
+    setNewVoiceDialog(requestedTab);
     const next = new URLSearchParams(searchParams);
     next.delete("tab");
     setSearchParams(next, { replace: true });
@@ -79,14 +77,13 @@ export function VoiceStudioPage({
   const {
     routeModels: designRouteModels,
     resolvedSelectedModel: designResolvedModel,
+    selectedModelInfo: designModelInfo,
     selectedModelReady: designModelReady,
     isModelModalOpen: isDesignModelModalOpen,
     intentVariant: designIntentVariant,
     closeModelModal: closeDesignModelModal,
     openModelManager: openDesignModelManager,
     requestModel: requestDesignModel,
-    handleModelSelect: handleDesignModelSelect,
-    modelOptions: designModelOptions,
   } = useRouteModelSelection({
     models,
     selectedModel,
@@ -100,28 +97,48 @@ export function VoiceStudioPage({
       }),
   });
 
-  const preferredSavedVoiceModel = useMemo(() => {
-    const savedVoiceModels = models.filter(
-      (model) =>
-        !model.variant.includes("Tokenizer") &&
-        model.speech_capabilities?.supports_reference_voice === true,
-    );
-    if (savedVoiceModels.length === 0) {
-      return null;
+  // The models that speak with a saved voice: the clone dialog shows the one
+  // a new voice will use, and "Use in Text to Speech" opens with it.
+  const {
+    routeModels: savedVoiceRouteModels,
+    resolvedSelectedModel: savedVoiceModel,
+    selectedModelInfo: savedVoiceModelInfo,
+    selectedModelReady: savedVoiceModelReady,
+    isModelModalOpen: isSavedVoiceModelModalOpen,
+    intentVariant: savedVoiceIntentVariant,
+    closeModelModal: closeSavedVoiceModelModal,
+    openModelManager: openSavedVoiceModelManager,
+    handleModelSelect: handleSavedVoiceModelSelect,
+  } = useRouteModelSelection({
+    models,
+    selectedModel,
+    onSelect,
+    modelFilter: (variant) =>
+      models.some(
+        (model) =>
+          model.variant === variant &&
+          model.speech_capabilities?.supports_reference_voice === true,
+      ),
+    resolveSelectedModel: (routeModels, currentModel) =>
+      resolvePreferredRouteModel({
+        models: routeModels,
+        selectedModel: currentModel,
+        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
+      }),
+  });
+
+  const handleVoiceSaved = () => {
+    setVoicesRefreshKey((current) => current + 1);
+  };
+  const openVoiceInTextToSpeech = (voiceId: string) => {
+    const params = new URLSearchParams();
+    params.set("voiceId", voiceId);
+    if (savedVoiceModel) {
+      params.set("model", savedVoiceModel);
     }
-
-    const selectedSavedVoiceModel =
-      selectedModel &&
-      savedVoiceModels.some((model) => model.variant === selectedModel)
-        ? selectedModel
-        : null;
-
-    return resolvePreferredRouteModel({
-      models: savedVoiceModels,
-      selectedModel: selectedSavedVoiceModel,
-      preferredVariants: TEXT_TO_SPEECH_PREFERRED_MODELS,
-    });
-  }, [models, selectedModel]);
+    navigate(`/text-to-speech?${params.toString()}`);
+  };
+  const closeNewVoiceDialog = () => setNewVoiceDialog(null);
 
   return (
     <PageShell>
@@ -142,7 +159,11 @@ export function VoiceStudioPage({
               <Settings2 className="h-4 w-4" />
               Models
             </Button>
-            <NewItemButton label="New voice" onClick={openNewVoice} />
+            <NewVoiceMenu
+              open={isNewVoiceMenuOpen}
+              onOpenChange={setIsNewVoiceMenuOpen}
+              onSelect={setNewVoiceDialog}
+            />
           </>
         }
       />
@@ -166,36 +187,60 @@ export function VoiceStudioPage({
         />
       </div>
 
-      <VoiceCreationModal
-        open={isCreationModalOpen}
-        onOpenChange={setIsCreationModalOpen}
-        initialStep={creationStep}
-        onVoiceCreated={() => {
-          setVoicesRefreshKey((current) => current + 1);
-        }}
-        onUseSavedVoiceInTts={(voiceId) => {
-          const params = new URLSearchParams();
-          params.set("voiceId", voiceId);
-          if (preferredSavedVoiceModel) {
-            params.set("model", preferredSavedVoiceModel);
-          }
-          navigate(`/text-to-speech?${params.toString()}`);
-        }}
-        designModel={designResolvedModel}
-        designModelReady={designModelReady}
-        designModelOptions={designModelOptions}
-        onSelectDesignModel={handleDesignModelSelect}
-        onOpenDesignModelManager={openDesignModelManager}
-        onDesignModelRequired={() => {
+      <CloneVoiceDialog
+        open={newVoiceDialog === "clone"}
+        onClose={closeNewVoiceDialog}
+        model={savedVoiceModel}
+        modelInfo={savedVoiceModelInfo}
+        modelReady={savedVoiceModelReady}
+        isModelManagerOpen={isSavedVoiceModelModalOpen}
+        onOpenModelManager={openSavedVoiceModelManager}
+        onSaved={handleVoiceSaved}
+        onUseInTextToSpeech={openVoiceInTextToSpeech}
+      />
+
+      <DesignVoiceDialog
+        open={newVoiceDialog === "design"}
+        onClose={closeNewVoiceDialog}
+        model={designResolvedModel}
+        modelInfo={designModelInfo}
+        modelReady={designModelReady}
+        isModelManagerOpen={isDesignModelModalOpen}
+        onOpenModelManager={openDesignModelManager}
+        onModelRequired={() => {
           requestDesignModel();
           onError("Select and load a VoiceDesign model to continue.");
         }}
+        onSaved={handleVoiceSaved}
+        onUseInTextToSpeech={openVoiceInTextToSpeech}
+      />
+
+      <RouteModelModal
+        isOpen={isSavedVoiceModelModalOpen}
+        onClose={closeSavedVoiceModelModal}
+        title="Voice cloning models"
+        routeLabel="Voices"
+        description="Manage the models that speak with saved and cloned voices."
+        models={savedVoiceRouteModels}
+        loading={loading}
+        selectedVariant={savedVoiceModel}
+        intentVariant={savedVoiceIntentVariant}
+        downloadProgress={downloadProgress}
+        onDownload={onDownload}
+        onCancelDownload={onCancelDownload}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        onDelete={onDelete}
+        onUseModel={handleSavedVoiceModelSelect}
+        emptyMessage={VIEW_CONFIGS["voice-clone"].emptyStateDescription}
+        zIndexClassName="z-[70]"
       />
 
       <RouteModelModal
         isOpen={isDesignModelModalOpen}
         onClose={closeDesignModelModal}
-        title="Voice Design Models"
+        title="Voice design models"
+        routeLabel="Voices"
         description="Manage VoiceDesign models for voice creation."
         models={designRouteModels}
         loading={loading}

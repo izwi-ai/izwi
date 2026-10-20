@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 use crate::voice_observation_store::CandidateObservation;
-use izwi_core::{parse_chat_model_variant, ChatMessage, ChatRole, WorkloadClass};
+use izwi_core::{parse_chat_model_variant, ChatMessage, ChatRole, GenerationParams, WorkloadClass};
 
 const EXTRACTION_SYSTEM_PROMPT: &str = "Extract durable user memory from a single conversation turn. Return strict JSON only. Output a JSON array of objects with keys `category`, `summary`, and `confidence`. Only include stable user preferences, personal facts, recurring constraints, or long-lived goals that would help future conversations. Do not include temporary requests, assistant-only facts, or speculative guesses. If nothing is worth remembering, return []. Limit to at most 5 observations.";
 
@@ -25,9 +25,11 @@ pub async fn extract_observation_candidates(
     let permit = state
         .acquire_workload_permit(WorkloadClass::Background)
         .await;
+    // Thinking off and reasoning split off: reasoning text must never be
+    // mined for "facts" about the user.
     let response = state
         .runtime
-        .chat_generate_with_correlation_and_runtime_context(
+        .auxiliary_generate(
             variant,
             vec![
                 ChatMessage {
@@ -43,7 +45,10 @@ pub async fn extract_observation_candidates(
                     ),
                 },
             ],
-            512,
+            GenerationParams {
+                max_tokens: 512,
+                ..Default::default()
+            },
             Some(correlation_id),
             permit.runtime_context(),
         )

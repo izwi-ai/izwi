@@ -17,7 +17,7 @@ izwi diarize <FILE> [OPTIONS]
 
 ## Description
 
-Analyzes audio to identify different speakers and when they spoke. Optionally includes transcription with speaker labels.
+Analyzes audio to identify different speakers and when they spoke. The output includes a transcript with speaker labels.
 
 ---
 
@@ -35,7 +35,7 @@ Analyzes audio to identify different speakers and when they spoke. Optionally in
 |--------|-------------|---------|
 | `-m, --model <MODEL>` | Diarization model | `diar_streaming_sortformer_4spk-v2.1` |
 | `-n, --num-speakers <N>` | Expected number of speakers | Auto-detect |
-| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
 | `--transcribe` | Compatibility flag (transcript output is included by default) | — |
 | `--asr-model <MODEL>` | ASR model used for transcript generation | `parakeet-tdt-0.6b-v3` |
@@ -73,7 +73,7 @@ izwi diarize meeting.wav --format json --output diarization.json
 ```bash
 izwi diarize interview.wav \
   --asr-model Qwen3-ASR-1.7B-GGUF \
-  --format verbose_json \
+  --format verbose-json \
   --output interview_transcript.json
 ```
 
@@ -84,9 +84,9 @@ izwi diarize interview.wav \
 ### Text
 
 ```
-[00:00 - 00:05] Speaker 1: Welcome to the meeting.
-[00:05 - 00:12] Speaker 2: Thanks for having me.
-[00:12 - 00:20] Speaker 1: Let's start with the agenda.
+SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.
+SPEAKER_01 [5.50s - 12.10s]: Thanks for having me.
+SPEAKER_00 [12.30s - 20.00s]: Let's start with the agenda.
 ```
 
 ### JSON
@@ -94,10 +94,10 @@ izwi diarize interview.wav \
 ```json
 {
   "segments": [
-    {"speaker": "Speaker 1", "start": 0.0, "end": 5.2},
-    {"speaker": "Speaker 2", "start": 5.5, "end": 12.1}
+    {"speaker": "SPEAKER_00", "start": 0.0, "end": 5.2},
+    {"speaker": "SPEAKER_01", "start": 5.5, "end": 12.1}
   ],
-  "speaker_count": 2
+  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me."
 }
 ```
 
@@ -106,23 +106,29 @@ izwi diarize interview.wav \
 ```json
 {
   "segments": [
-    {
-      "speaker": "Speaker 1",
-      "start": 0.0,
-      "end": 5.2,
-      "text": "Welcome to the meeting."
-    },
-    {
-      "speaker": "Speaker 2", 
-      "start": 5.5,
-      "end": 12.1,
-      "text": "Thanks for having me."
-    }
+    {"speaker": "SPEAKER_00", "start": 0.0, "end": 5.2},
+    {"speaker": "SPEAKER_01", "start": 5.5, "end": 12.1}
   ],
+  "words": [
+    {"word": "Welcome", "speaker": "SPEAKER_00", "start": 0.0, "end": 0.6, "overlaps_segment": true}
+  ],
+  "utterances": [
+    {"speaker": "SPEAKER_00", "start": 0.0, "end": 5.2, "text": "Welcome to the meeting.", "word_start": 0, "word_end": 3},
+    {"speaker": "SPEAKER_01", "start": 5.5, "end": 12.1, "text": "Thanks for having me.", "word_start": 4, "word_end": 7}
+  ],
+  "asr_text": "Welcome to the meeting. Thanks for having me.",
+  "raw_transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me.",
+  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me.",
+  "alignment_coverage": 1.0,
+  "unattributed_words": 0,
   "speaker_count": 2,
-  "duration": 120.5
+  "duration": 120.5,
+  "processing_time_ms": 4210.0,
+  "rtf": 0.035
 }
 ```
+
+`words` is shortened here; the real output lists every word.
 
 ---
 
@@ -131,7 +137,8 @@ izwi diarize interview.wav \
 | Model | Description |
 |-------|-------------|
 | `sortformer-4spk` | Alias for `diar_streaming_sortformer_4spk-v2.1` |
-| `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID (default) |
+| `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID (default), up to 4 speakers |
+| `Nemotron-3-Diarization` | NVIDIA Nemotron 3 diarization, up to 8 speakers |
 
 ---
 

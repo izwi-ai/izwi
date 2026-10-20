@@ -68,11 +68,12 @@ Common models:
 
 | Model | Type | Size |
 |-------|------|------|
+| `Kokoro-82M` | TTS (default, built-in voices; needs `espeak-ng`) | ~350 MB |
 | `Qwen3-TTS-12Hz-0.6B-Base` | TTS (base) | ~2.3 GB |
 | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | TTS (built-in voices) | ~2.3 GB |
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | TTS (voice design) | ~4.2 GB |
 | `Voxtral-4B-TTS-2603` | TTS (20 preset voices, CC BY-NC 4.0) | ~8.1 GB |
-| `Parakeet-TDT-0.6B-v3` | ASR (default) | ~9.4 GB |
+| `Parakeet-TDT-0.6B-v3` | ASR (default) | ~2.5 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | ASR (NVIDIA multilingual `.nemo`) | ~2.37 GB |
 | `Granite-Speech-4.1-2B-Plus` | ASR (IBM rich transcription) | ~4.2 GB |

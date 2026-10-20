@@ -14,6 +14,8 @@ export type ChatReasoningEffort = "xhigh" | "medium" | "low";
 
 export interface ChatModelCapabilities {
   supports_thinking: boolean;
+  /** False when the model always reasons (LFM2.5 Thinking): no switch. */
+  thinking_toggleable?: boolean;
   default_thinking_enabled: boolean;
   reasoning_efforts: ChatReasoningEffort[];
   default_reasoning_effort: ChatReasoningEffort | null;
@@ -51,6 +53,12 @@ export interface ModelInfo {
   estimated_size_bytes?: number;
   /** Catalog estimate of memory needed to run the model, in GB. */
   memory_required_gb?: number;
+  /** Memory the model needs to load, from the catalog. */
+  estimated_memory_bytes?: number;
+  /** Whether the model can load on this device at all. */
+  device_fit?: "fits" | "too_large" | "unknown";
+  /** Free disk a download needs (0 once downloaded). */
+  disk_required_bytes?: number;
   enabled?: boolean;
   status:
     | "not_downloaded"
@@ -63,7 +71,7 @@ export interface ModelInfo {
   size_bytes: number | null;
   download_progress: number | null;
   error_message: string | null;
-  /** Explicitly loaded: survives budget/memory-pressure eviction until unloaded. */
+  /** "Keep loaded": other loads cannot evict it until it is unloaded. */
   pinned?: boolean;
   modalities?: string[];
   route_capabilities?: ModelRouteCapabilities;
@@ -87,6 +95,21 @@ export interface RemovedModelInfo {
   /** The supported variant to use instead. */
   replacement: string;
   reason: string;
+}
+
+/** Where models are stored and the room left on that volume. */
+export interface ModelStorage {
+  models_dir: string;
+  free_bytes: number | null;
+  total_bytes: number | null;
+  models_bytes: number;
+}
+
+export interface ModelActionResponse {
+  status: string;
+  message: string;
+  /** Why the action may be slow (a load larger than free memory). */
+  warning?: string;
 }
 
 export interface ModelsResponse {
@@ -114,22 +137,42 @@ export class ModelApiClient {
     });
   }
 
+  /**
+   * Loads a model. The app loads without a pin: the model stays loaded
+   * while idle, but a load that needs its room evicts it ("Keep loaded"
+   * pins it).
+   */
   async loadModel(
     variant: string,
     options?: { signal?: AbortSignal },
-  ): Promise<{ status: string; message: string }> {
-    return this.http.request(`/admin/models/${variant}/load`, {
+  ): Promise<ModelActionResponse> {
+    return this.http.request(`/admin/models/${variant}/load?pin=false`, {
       method: "POST",
       signal: options?.signal,
     });
   }
 
-  async unloadModel(
-    variant: string,
-  ): Promise<{ status: string; message: string }> {
+  async unloadModel(variant: string): Promise<ModelActionResponse> {
     return this.http.request(`/admin/models/${variant}/unload`, {
       method: "POST",
     });
+  }
+
+  /** Keep a loaded model loaded until it is unloaded. */
+  async pinModel(variant: string): Promise<ModelActionResponse> {
+    return this.http.request(`/admin/models/${variant}/pin`, {
+      method: "POST",
+    });
+  }
+
+  async unpinModel(variant: string): Promise<ModelActionResponse> {
+    return this.http.request(`/admin/models/${variant}/unpin`, {
+      method: "POST",
+    });
+  }
+
+  async getModelStorage(): Promise<ModelStorage> {
+    return this.http.request("/admin/storage");
   }
 
   async deleteModel(

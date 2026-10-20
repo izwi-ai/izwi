@@ -3,7 +3,7 @@ title: "izwi config"
 description: "Manage Izwi configuration values, files, and precedence from the command line."
 icon: "settings"
 ---
-Manage the local `config.toml` used by `izwi serve`.
+Manage the local `config.toml` used by `izwi serve`. `server.host` and `server.port` configure `izwi serve` only; other commands connect to `--server` (default `http://localhost:8080`).
 
 ---
 
@@ -39,14 +39,30 @@ izwi config <COMMAND>
 - `models.dir`
 - `runtime.backend`
 - `runtime.max_batch_size`
+- `runtime.physical_execution_mode`
+- `runtime.max_physical_in_flight`
+- `runtime.max_scheduler_batch_size`
+- `runtime.max_loaded_models`
+- `runtime.model_keep_alive_secs`
+- `runtime.enable_prefix_caching`
+- `runtime.prefix_reuse_catalog_auto`
+- `runtime.managed_prefix_cache_salt`
+- `runtime.max_prefix_cache_pages`
+- `runtime.enable_chunked_prefill`
+- `runtime.chunked_prefill_threshold`
+- `runtime.max_retained_sequences`
+- `runtime.max_staged_transactions`
+- `runtime.max_queued_requests`
+- `runtime.max_sequence_length`
 - `runtime.threads`
 - `runtime.max_concurrent`
 - `runtime.timeout`
 - `ui.enabled`
 - `ui.dir`
-- `defaults.model`
-- `defaults.speaker`
-- `defaults.format`
+- `runtime.performance.cuda.*`: `mode`, `projection_backend`, `packed_projections`, `fused_decode`, `device_sampling`, `decode_graphs`, `mtp`, `mtp_quantum`, `mtp_draft_tokens`, `mtp_adaptive`, `mtp_in_continuous`
+- `runtime.performance.loading.*`: `mode`, `derived_weight_cache`, `parallel_conversion`, `pinned_uploads`, `io_strategy`, `workers`, `max_staging_bytes`, `cache_max_bytes`, `cache_dir`
+- `runtime.performance.metal.projection_backend`
+- `runtime.performance.cpu.projection_backend`
 
 ---
 

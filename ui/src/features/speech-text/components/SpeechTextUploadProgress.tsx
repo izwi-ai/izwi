@@ -119,9 +119,9 @@ export function SpeechTextUploadProgress({
               >
                 {fileName}
               </div>
-              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-medium uppercase tracking-[0.12em] text-[var(--text-muted)]">
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-[var(--text-muted)]">
                 <span>{fileKind}</span>
-                <span aria-hidden="true">/</span>
+                <span aria-hidden="true">·</span>
                 <span>{formatUploadFileSize(fileSizeBytes)}</span>
               </div>
             </div>

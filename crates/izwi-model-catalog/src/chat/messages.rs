@@ -28,10 +28,39 @@ impl ChatRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+}
+
+/// One leading system message holding every system message's text, in
+/// order, with the rest of the conversation unchanged. Chat templates that
+/// accept a system message only first (Qwen3.5/3.6/3.8) get this instead of
+/// a rejected request when a client sends instructions mid-conversation.
+pub fn fold_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let folded_needed = messages
+        .iter()
+        .enumerate()
+        .any(|(index, message)| index > 0 && message.role == ChatRole::System);
+    if !folded_needed {
+        return messages;
+    }
+    let (system, conversation): (Vec<_>, Vec<_>) = messages
+        .into_iter()
+        .partition(|message| message.role == ChatRole::System);
+    let content = system
+        .into_iter()
+        .map(|message| message.content)
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    std::iter::once(ChatMessage {
+        role: ChatRole::System,
+        content,
+    })
+    .chain(conversation)
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,4 +119,51 @@ pub enum ChatTruncation {
     /// Drop the oldest complete turns until the prompt fits, and shorten
     /// the output budget to the remaining context.
     Auto,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn extra_system_messages_join_the_leading_one() {
+        use ChatRole::{Assistant, System, User};
+        let folded = fold_system_messages(vec![
+            message(System, "Be brief."),
+            message(User, "Hi"),
+            message(Assistant, "Hello"),
+            message(System, "Answer in French."),
+            message(User, "Name a planet"),
+        ]);
+        assert_eq!(
+            folded,
+            vec![
+                message(System, "Be brief.\n\nAnswer in French."),
+                message(User, "Hi"),
+                message(Assistant, "Hello"),
+                message(User, "Name a planet"),
+            ]
+        );
+        // A system message after the first turn and none before it.
+        assert_eq!(
+            fold_system_messages(vec![message(User, "Hi"), message(System, "Be brief.")]),
+            vec![message(System, "Be brief."), message(User, "Hi")]
+        );
+    }
+
+    #[test]
+    fn a_conversation_already_in_shape_is_unchanged() {
+        use ChatRole::{System, User};
+        let messages = vec![message(System, "Be brief."), message(User, "Hi")];
+        assert_eq!(fold_system_messages(messages.clone()), messages);
+        let messages = vec![message(User, "Hi")];
+        assert_eq!(fold_system_messages(messages.clone()), messages);
+    }
 }

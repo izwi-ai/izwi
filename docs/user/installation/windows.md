@@ -25,7 +25,7 @@ See the [Runtime Support Matrix](/support-matrix) for the current artifact contr
 
 ### Step 1: Download
 
-Download `Izwi-Setup-*.exe` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
+Download `Izwi_<version>_x64-setup.exe` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 ### Step 2: Run Installer
 
@@ -36,7 +36,9 @@ Download `Izwi-Setup-*.exe` from [GitHub Releases](https://github.com/izwi-ai/iz
 
 ### Step 3: Verify
 
-Open **Command Prompt** or **PowerShell** and run:
+To use `izwi` from a terminal, open Izwi, go to **Settings > System > Command line tool** and select **Install**. Izwi copies `izwi.exe` and `izwi-server.exe` to `%LOCALAPPDATA%\Izwi\bin` and adds that folder to your user PATH.
+
+Open a new **Command Prompt** or **PowerShell** window and run:
 
 ```powershell
 izwi version --full
@@ -61,14 +63,6 @@ Open a new PowerShell window and run:
 
 ```powershell
 espeak-ng --version
-```
-
----
-
-## Install via winget (Coming Soon)
-
-```powershell
-winget install Agentem.Izwi
 ```
 
 ---
@@ -119,7 +113,7 @@ Look for:
 
 | Data | Location |
 |------|----------|
-| **Models** | `%APPDATA%\izwi\models\` |
+| **Models** | `%LOCALAPPDATA%\izwi\models\` |
 | **Config** | `%APPDATA%\izwi\config.toml` |
 | **Logs** | `%APPDATA%\izwi\logs\` |
 | **Program** | `C:\Program Files\Izwi\` |
@@ -128,10 +122,10 @@ To open these folders:
 
 ```powershell
 # Open models folder
-explorer "%APPDATA%\izwi\models"
+explorer "$env:LOCALAPPDATA\izwi\models"
 
 # Open config folder
-explorer "%APPDATA%\izwi"
+explorer "$env:APPDATA\izwi"
 ```
 
 ---
@@ -173,7 +167,7 @@ explorer "%APPDATA%\izwi"
 
 ```powershell
 # Remove all Izwi data (including models!)
-Remove-Item -Recurse -Force "$env:APPDATA\izwi"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\izwi", "$env:APPDATA\izwi"
 ```
 
 ---
@@ -189,12 +183,7 @@ This appears because the app isn't code-signed yet:
 
 ### Command not found: izwi
 
-The installer should add Izwi to your PATH. If not:
-
-1. Open **System Properties → Environment Variables**
-2. Under **User variables**, edit **Path**
-3. Add `C:\Program Files\Izwi`
-4. Restart your terminal
+The installer does not add `izwi` to your PATH. Open Izwi, go to **Settings > System > Command line tool** and select **Install**. This copies the command to `%LOCALAPPDATA%\Izwi\bin` and adds that folder to your user PATH. Then restart your terminal.
 
 ### Kokoro error: `espeak-ng not found`
 
@@ -264,7 +253,7 @@ If you can't access Izwi from other devices:
 ```powershell
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
-cargo build --release
+cargo build --release -p izwi-cli -p izwi-server
 ```
 
 Binaries will be in `target\release\`.

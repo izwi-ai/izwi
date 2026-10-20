@@ -61,9 +61,6 @@ miette = { version = "7.2", features = ["fancy"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Audio playback (optional, for preview)
-# rodio = { version = "0.19", optional = true }
-
 # Utilities
 base64 = "0.22"
 rustc_version_runtime = "0.3"
@@ -82,7 +79,6 @@ cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda"]
 metal = ["izwi-core/metal"]
-playback = [] # rodio
 
 [target.'cfg(target_os = "macos")'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false, features = ["accelerate"] }

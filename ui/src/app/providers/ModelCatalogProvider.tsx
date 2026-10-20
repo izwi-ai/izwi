@@ -20,6 +20,7 @@ import {
   trackModelDownloadStarted,
   trackModelLoaded,
 } from "@/app/analytics/events";
+import { Download } from "lucide-react";
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeStoredModelId } from "@/features/models/catalog/routeModelCatalog";
@@ -27,9 +28,20 @@ import type { ModelDownloadProgressMap } from "@/features/models/downloadProgres
 import { VIEW_CONFIGS } from "@/types";
 import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
 
+/** Pages that keep their own model choice. */
+export type ModelRouteKey =
+  | "chat"
+  | "text-to-speech"
+  | "studio"
+  | "voices"
+  | "transcription";
+
 interface ModelCatalogContextValue {
   models: ModelInfo[];
+  /** The model chosen last, on any page. */
   selectedModel: string | null;
+  /** A page's own choice, else the model chosen last. */
+  selectedModelFor: (route: ModelRouteKey) => string | null;
   loading: boolean;
   error: string | null;
   catalogError: string | null;
@@ -37,18 +49,43 @@ interface ModelCatalogContextValue {
   readyModelsCount: number;
   residencySummary: ModelResidencySummary | null;
   removedModels: RemovedModelInfo[];
-  selectModel: (variant: string | null) => void;
+  selectModel: (variant: string | null, route?: ModelRouteKey) => void;
   reportError: (message: string) => void;
   clearError: () => void;
   refreshModels: () => Promise<boolean>;
   downloadModel: (variant: string) => Promise<void>;
   cancelModelDownload: (variant: string) => Promise<void>;
-  loadModel: (variant: string) => Promise<void>;
+  /** Loads a model; with `route`, it becomes that page's choice. */
+  loadModel: (variant: string, options?: { route?: ModelRouteKey }) => Promise<void>;
   unloadModel: (variant: string) => Promise<void>;
+  /** "Keep loaded" on or off for a loaded model. */
+  setModelPinned: (variant: string, pinned: boolean) => Promise<void>;
   deleteModel: (variant: string) => Promise<void>;
 }
 
 const ModelCatalogContext = createContext<ModelCatalogContextValue | null>(null);
+
+/** Several downloads at once show as one notification. */
+const DOWNLOADS_GROUP = {
+  key: "model-downloads",
+  title: (count: number) => `Downloading ${count} models`,
+};
+
+const downloadNotificationId = (variant: string) => `download:${variant}`;
+
+function formatDownloadedBytes(downloaded: number, total: number): string | undefined {
+  if (!(total > 0)) {
+    return undefined;
+  }
+  const gigabytes = (bytes: number) => (bytes / 1e9).toFixed(1);
+  return total >= 1e9
+    ? `${gigabytes(downloaded)} of ${gigabytes(total)} GB`
+    : `${Math.round(downloaded / 1e6)} of ${Math.round(total / 1e6)} MB`;
+}
+
+/** The model list also refreshes on this interval and on focus, so state
+ * changed elsewhere (another window, the CLI, an idle unload) shows up. */
+const BACKGROUND_REFRESH_INTERVAL_MS = 15_000;
 
 /**
  * Download progress arrives as a stream of SSE messages, and every state
@@ -86,6 +123,38 @@ function persistUserSelectedModel(variant: string | null): void {
   }
 }
 
+const ROUTE_SELECTIONS_STORAGE_KEY = "izwi.modelCatalog.routeSelections";
+
+type RouteSelections = Partial<Record<ModelRouteKey, string>>;
+
+function readPersistedRouteSelections(): RouteSelections {
+  try {
+    const stored = window.localStorage.getItem(ROUTE_SELECTIONS_STORAGE_KEY);
+    const parsed: unknown = stored ? JSON.parse(stored) : null;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>)
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+        .map(([route, variant]) => [route, normalizeStoredModelId(variant)]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistRouteSelections(selections: RouteSelections): void {
+  try {
+    window.localStorage.setItem(
+      ROUTE_SELECTIONS_STORAGE_KEY,
+      JSON.stringify(selections),
+    );
+  } catch {
+    // Persistence is best-effort.
+  }
+}
+
 interface ModelCatalogProviderProps {
   children: ReactNode;
 }
@@ -93,7 +162,13 @@ interface ModelCatalogProviderProps {
 export function ModelCatalogProvider({
   children,
 }: ModelCatalogProviderProps) {
-  const { notify } = useNotifications();
+  const { notify, dismiss } = useNotifications();
+  // Last whole percent shown per download: progress arrives many times a
+  // second, the notification changes once per percent.
+  const notifiedPercentRef = useRef<Record<string, number>>({});
+  // Retry from a failed download's notification; set once downloadModel
+  // exists.
+  const retryDownloadRef = useRef<(variant: string) => void>(() => {});
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [residencySummary, setResidencySummary] =
     useState<ModelResidencySummary | null>(null);
@@ -105,6 +180,9 @@ export function ModelCatalogProvider({
   // select or load) versus auto-picked as a fallback. Only user choices are
   // persisted, and only user choices survive a vanished catalog variant.
   const userSelectedModelRef = useRef(selectedModel !== null);
+  const [routeSelections, setRouteSelections] = useState<RouteSelections>(() =>
+    readPersistedRouteSelections(),
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -129,6 +207,10 @@ export function ModelCatalogProvider({
   const lastProgressAtRef = useRef<Record<string, number>>({});
   const suppressReconnectRef = useRef<Set<string>>(new Set());
   const lastDownloadTerminalStateRef = useRef<Record<string, string>>({});
+  // Streams that reported progress in this session. A stream's first
+  // message can be a stale "cancelled" snapshot of a download that ended
+  // before the app opened; that is not news.
+  const streamedProgressRef = useRef<Set<string>>(new Set());
 
   // Notifications name models by display name. Read the catalog through a
   // ref so the label lookup (and the stream callbacks that use it) stay
@@ -153,11 +235,35 @@ export function ModelCatalogProvider({
     setSelectedModelState(variant);
   }, []);
 
-  const selectModel = useCallback(
-    (variant: string | null) => {
-      adoptUserSelectedModel(variant);
+  const adoptRouteSelection = useCallback(
+    (route: ModelRouteKey, variant: string | null) => {
+      setRouteSelections((current) => {
+        const next = { ...current };
+        if (variant === null) {
+          delete next[route];
+        } else {
+          next[route] = variant;
+        }
+        persistRouteSelections(next);
+        return next;
+      });
     },
-    [adoptUserSelectedModel],
+    [],
+  );
+
+  const selectModel = useCallback(
+    (variant: string | null, route?: ModelRouteKey) => {
+      adoptUserSelectedModel(variant);
+      if (route) {
+        adoptRouteSelection(route, variant);
+      }
+    },
+    [adoptRouteSelection, adoptUserSelectedModel],
+  );
+
+  const selectedModelFor = useCallback(
+    (route: ModelRouteKey) => routeSelections[route] ?? selectedModel,
+    [routeSelections, selectedModel],
   );
 
   const reportError = useCallback((message: string) => {
@@ -354,6 +460,10 @@ export function ModelCatalogProvider({
             data.status === "completed" ||
             data.status === "error" ||
             data.status === "cancelled";
+          const sawProgress = streamedProgressRef.current.has(variant);
+          if (!isTerminal) {
+            streamedProgressRef.current.add(variant);
+          }
           queueDownloadProgress(
             variant,
             {
@@ -365,36 +475,89 @@ export function ModelCatalogProvider({
             },
             isTerminal,
           );
+          const percent = Math.floor(Number(data.percent) || 0);
+          if (!isTerminal && notifiedPercentRef.current[variant] !== percent) {
+            notifiedPercentRef.current[variant] = percent;
+            notify({
+              id: downloadNotificationId(variant),
+              title: `Downloading ${getModelLabel(variant)}`,
+              icon: Download,
+              progress: percent,
+              detail: formatDownloadedBytes(
+                Number(data.downloaded_bytes) || 0,
+                Number(data.total_bytes) || 0,
+              ),
+              group: DOWNLOADS_GROUP,
+            });
+          }
 
           if (isTerminal) {
             const previousTerminalState =
               lastDownloadTerminalStateRef.current[variant];
             if (previousTerminalState !== data.status) {
               lastDownloadTerminalStateRef.current[variant] = data.status;
+              const id = downloadNotificationId(variant);
               if (data.status === "completed") {
                 void trackModelDownloadCompleted(variant);
                 notify({
-                  title: "Model download complete",
-                  description: `${getModelLabel(variant)} is ready to load.`,
+                  id,
+                  title: `${getModelLabel(variant)} downloaded`,
+                  description: "Ready to load.",
                   tone: "success",
                 });
               } else if (data.status === "cancelled") {
-                notify({
-                  title: "Model download cancelled",
-                  description: `${getModelLabel(variant)} download was stopped.`,
-                  tone: "info",
-                });
+                // A stale snapshot from before the app opened is not news.
+                if (sawProgress) {
+                  notify({
+                    id,
+                    title: `${getModelLabel(variant)} download cancelled`,
+                    tone: "info",
+                  });
+                } else {
+                  dismiss(id);
+                }
               } else if (data.status === "error") {
                 notify({
-                  title: "Model download failed",
-                  description: `Izwi could not finish downloading ${getModelLabel(variant)}.`,
+                  id,
+                  title: `${getModelLabel(variant)} didn't download`,
+                  description:
+                    typeof data.error === "string" && data.error.trim()
+                      ? data.error
+                      : "Try the download again.",
                   tone: "danger",
+                  action: {
+                    label: "Retry",
+                    onClick: () => retryDownloadRef.current(variant),
+                  },
                 });
               }
             }
+            delete notifiedPercentRef.current[variant];
+            streamedProgressRef.current.delete(variant);
             closeDownloadStream(variant);
             activeDownloadsRef.current.delete(variant);
             suppressReconnectRef.current.delete(variant);
+            // Until the refresh lands the list still says "downloading",
+            // which would register the download again.
+            const settled = {
+              completed: "downloaded",
+              error: "error",
+              cancelled: "not_downloaded",
+            } as const;
+            setModels((previous) =>
+              previous.map((model) =>
+                model.variant === variant
+                  ? {
+                      ...model,
+                      status: settled[data.status as keyof typeof settled],
+                      error_message:
+                        data.status === "error" && typeof data.error === "string"
+                          ? data.error
+                          : model.error_message,
+                    }
+                  : model,
+              ),
+            );
 
             void refreshModels();
 
@@ -451,6 +614,7 @@ export function ModelCatalogProvider({
       clearDownloadProgress,
       clearReconnectTimer,
       closeDownloadStream,
+      dismiss,
       getModelLabel,
       notify,
       queueDownloadProgress,
@@ -612,9 +776,11 @@ export function ModelCatalogProvider({
 
         const response = await api.downloadModel(variant);
         notify({
-          title: "Downloading model",
-          description: `${getModelLabel(variant)} download started in the background.`,
-          tone: "info",
+          id: downloadNotificationId(variant),
+          title: `Downloading ${getModelLabel(variant)}`,
+          icon: Download,
+          progress: 0,
+          group: DOWNLOADS_GROUP,
         });
         void trackModelDownloadStarted(variant);
 
@@ -636,12 +802,15 @@ export function ModelCatalogProvider({
             : "Failed to download model. Please try again.",
         );
         notify({
-          title: "Model download failed",
+          id: downloadNotificationId(variant),
+          title: `${getModelLabel(variant)} didn't download`,
           description:
-            err instanceof Error
-              ? err.message
-              : `Izwi could not download ${getModelLabel(variant)}.`,
+            err instanceof Error ? err.message : "Try the download again.",
           tone: "danger",
+          action: {
+            label: "Retry",
+            onClick: () => retryDownloadRef.current(variant),
+          },
         });
 
         closeDownloadStream(variant);
@@ -658,6 +827,10 @@ export function ModelCatalogProvider({
     ],
   );
 
+  useEffect(() => {
+    retryDownloadRef.current = (variant) => void downloadModel(variant);
+  }, [downloadModel]);
+
   const cancelModelDownload = useCallback(
     async (variant: string) => {
       try {
@@ -668,6 +841,8 @@ export function ModelCatalogProvider({
 
         await api.cancelDownload(variant);
         lastDownloadTerminalStateRef.current[variant] = "cancelled";
+        dismiss(downloadNotificationId(variant));
+        delete notifiedPercentRef.current[variant];
 
         clearDownloadProgress(variant);
 
@@ -704,6 +879,7 @@ export function ModelCatalogProvider({
     [
       clearDownloadProgress,
       closeDownloadStream,
+      dismiss,
       getModelLabel,
       notify,
       refreshModels,
@@ -711,7 +887,7 @@ export function ModelCatalogProvider({
   );
 
   const loadModel = useCallback(
-    async (variant: string) => {
+    async (variant: string, options?: { route?: ModelRouteKey }) => {
       if (activeModelLoadsRef.current.has(variant)) {
         return;
       }
@@ -723,7 +899,7 @@ export function ModelCatalogProvider({
       try {
         const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
         // Chat stays single-active, but pinned models and speech-pipeline
-        // stack members (diarization + ASR + aligner + refiner) are never
+        // stack members (diarization + ASR + aligner + summary LLM) are never
         // evicted by a chat switch: unloading one silently degrades the
         // pipeline. Unload them explicitly instead.
         const isEvictableChatModel = (model: ModelInfo) =>
@@ -755,10 +931,12 @@ export function ModelCatalogProvider({
         // which for large models runs far past the default request timeout.
         // It therefore rides this controller's signal (no client timeout);
         // an explicit unload or delete aborts it.
-        await api.loadModel(variant, { signal: abortController.signal });
+        const response = await api.loadModel(variant, {
+          signal: abortController.signal,
+        });
         if (!cancelledModelLoadsRef.current.has(variant)) {
           // Loading a speech-pipeline stack member (diarization checkpoint,
-          // ASR, aligner, refiner LLM) is pipeline setup, not a model switch:
+          // ASR, aligner, summary LLM) is pipeline setup, not a model switch:
           // adopting it as the global selection overwrote — and since the
           // persistence change, permanently rewrote — whatever the user had
           // selected.
@@ -766,12 +944,23 @@ export function ModelCatalogProvider({
           if (!loadedModel || !isSpeechPipelineManagedModel(loadedModel)) {
             adoptUserSelectedModel(variant);
           }
+          if (options?.route) {
+            adoptRouteSelection(options.route, variant);
+          }
           void trackModelLoaded(variant);
-          notify({
-            title: "Model loaded",
-            description: `${getModelLabel(variant)} is now active.`,
-            tone: "success",
-          });
+          notify(
+            response?.warning
+              ? {
+                  title: `${getModelLabel(variant)} loaded`,
+                  description: response.warning,
+                  tone: "warning",
+                }
+              : {
+                  title: "Model loaded",
+                  description: `${getModelLabel(variant)} is now active.`,
+                  tone: "success",
+                },
+          );
         }
       } catch (err) {
         if (cancelledModelLoadsRef.current.has(variant)) {
@@ -794,7 +983,14 @@ export function ModelCatalogProvider({
         await refreshModels();
       }
     },
-    [adoptUserSelectedModel, getModelLabel, models, notify, refreshModels],
+    [
+      adoptRouteSelection,
+      adoptUserSelectedModel,
+      getModelLabel,
+      models,
+      notify,
+      refreshModels,
+    ],
   );
 
   const unloadModel = useCallback(
@@ -809,7 +1005,7 @@ export function ModelCatalogProvider({
         loadModelAbortControllersRef.current.get(variant)?.abort();
       }
       try {
-        await api.unloadModel(variant);
+        const response = await api.unloadModel(variant);
         await refreshModels();
         setSelectedModelState((current) =>
           current === variant ? null : current,
@@ -818,12 +1014,16 @@ export function ModelCatalogProvider({
           userSelectedModelRef.current = false;
           persistUserSelectedModel(null);
         }
+        // The server stops jobs that were using the model, and says so.
+        const stoppedJobs = /cancelling \d+/.test(response?.message ?? "");
         notify({
           title: cancellingLoad ? "Model load cancelled" : "Model unloaded",
           description: cancellingLoad
             ? `${getModelLabel(variant)} was stopped and unloaded.`
-            : `${getModelLabel(variant)} was unloaded from memory.`,
-          tone: "info",
+            : stoppedJobs
+              ? response.message
+              : `${getModelLabel(variant)} was unloaded from memory.`,
+          tone: stoppedJobs ? "warning" : "info",
         });
       } catch (err) {
         console.error("Unload failed:", err);
@@ -870,10 +1070,14 @@ export function ModelCatalogProvider({
       } catch (err) {
         suppressReconnectRef.current.delete(variant);
         console.error("Delete failed:", err);
-        setError("Failed to delete model. Please try again.");
+        const message = modelActionError(
+          err,
+          `Izwi could not delete ${getModelLabel(variant)}.`,
+        );
+        setError(message);
         notify({
           title: "Delete failed",
-          description: `Izwi could not delete ${getModelLabel(variant)}.`,
+          description: message,
           tone: "danger",
         });
         await refreshModels();
@@ -889,10 +1093,49 @@ export function ModelCatalogProvider({
     ],
   );
 
+  const setModelPinned = useCallback(
+    async (variant: string, pinned: boolean) => {
+      try {
+        await (pinned ? api.pinModel(variant) : api.unpinModel(variant));
+      } catch (err) {
+        notify({
+          title: pinned ? "Couldn't keep the model loaded" : "Couldn't change the model",
+          description: modelActionError(err, getModelLabel(variant)),
+          tone: "danger",
+        });
+      } finally {
+        await refreshModels();
+      }
+    },
+    [getModelLabel, notify, refreshModels],
+  );
+
+  // Background refresh: state can change without this window (an idle
+  // unload, the CLI, another window). Skipped while the window is hidden.
+  useEffect(() => {
+    const refreshIfVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refreshModels();
+      }
+    };
+    const timer = window.setInterval(
+      refreshIfVisible,
+      BACKGROUND_REFRESH_INTERVAL_MS,
+    );
+    window.addEventListener("focus", refreshIfVisible);
+    document.addEventListener("visibilitychange", refreshIfVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshIfVisible);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
+    };
+  }, [refreshModels]);
+
   const value = useMemo<ModelCatalogContextValue>(
     () => ({
       models,
       selectedModel,
+      selectedModelFor,
       loading,
       error,
       catalogError,
@@ -908,6 +1151,7 @@ export function ModelCatalogProvider({
       cancelModelDownload,
       loadModel,
       unloadModel,
+      setModelPinned,
       deleteModel,
     }),
     [
@@ -927,6 +1171,8 @@ export function ModelCatalogProvider({
       residencySummary,
       selectModel,
       selectedModel,
+      selectedModelFor,
+      setModelPinned,
       unloadModel,
     ],
   );
@@ -936,6 +1182,11 @@ export function ModelCatalogProvider({
       {children}
     </ModelCatalogContext.Provider>
   );
+}
+
+/** The catalog, or null outside the provider (isolated components). */
+export function useOptionalModelCatalog() {
+  return useContext(ModelCatalogContext);
 }
 
 export function useModelCatalog() {

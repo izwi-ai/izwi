@@ -119,8 +119,26 @@ pub(super) fn deltas(text: &str, size: usize) -> Vec<ChatStreamEvent> {
 pub(super) fn tool_format(tool_calls: Option<ToolCallFormat>) -> AnswerFormat {
     AnswerFormat {
         compat_profile: OpenAiCompatibilityProfile::Strict,
-        reasoning: None,
+        parse_reasoning: false,
+        reasoning_opened_in_prompt: false,
         tool_calls,
+    }
+}
+
+/// Unparsed, a stream whose prompt opened `<think>` gets the opener back in
+/// its first content delta, so `content` reads `<think>…</think>…`.
+#[tokio::test]
+async fn unparsed_stream_writes_back_the_opener_the_prompt_held() {
+    let text = "r</think>\n\nA";
+    let format = AnswerFormat {
+        reasoning_opened_in_prompt: true,
+        ..tool_format(None)
+    };
+    let body = json!({"model": "m", "messages": [], "stream": true});
+    for size in [1, 3, text.len()] {
+        let payloads = sse_payloads(body.clone(), format, deltas(text, size)).await;
+        let (content, _, _) = read_stream(&payloads);
+        assert_eq!(content, "<think>r</think>\n\nA", "split {size}");
     }
 }
 

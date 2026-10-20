@@ -6,7 +6,8 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
+import type { ModelInfo } from "@/api";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -45,16 +46,22 @@ const componentMocks = vi.hoisted(() => ({
       title,
       zIndexClassName,
       onUseModel,
+      models = [],
+      sections = [],
     }: {
       isOpen: boolean;
       title: string;
       zIndexClassName?: string;
       onUseModel?: (variant: string) => void;
+      models?: ModelInfo[];
+      sections?: Array<{ title?: string }>;
     }) =>
       isOpen ? (
         <div
           data-testid="route-model-modal"
           data-z-index={zIndexClassName ?? ""}
+          data-models={models.map((model) => model.variant).join(",")}
+          data-sections={sections.map((section) => section.title ?? "").join(",")}
         >
           {title}
           <button
@@ -186,6 +193,67 @@ function caps(
     tokenizer: false,
     ...overrides,
   };
+}
+
+const DIARIZATION_STACK_CAPABILITIES: Record<
+  string,
+  Partial<ModelRouteCapabilities>
+> = {
+  "diar_streaming_sortformer_4spk-v2.1": { diarization_records: true },
+  "Nemotron-3-Diarization": { diarization_records: true },
+  "Whisper-Large-v3-Turbo": {
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+  },
+  "Granite-Speech-4.1-2B-Plus": {
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+  },
+  "Qwen3-ForcedAligner-0.6B": { forced_alignment: true },
+  "Qwen3.5-4B": { openai_chat_completions: true },
+};
+
+/** A diarization-stack fixture model in the given state. */
+function stackModel(variant: string, status: ModelInfo["status"]): ModelInfo {
+  return {
+    variant,
+    route_capabilities: caps(DIARIZATION_STACK_CAPABILITIES[variant]),
+    status,
+    local_path: `/models/${variant}`,
+    size_bytes: null,
+    download_progress: null,
+    error_message: null,
+  };
+}
+
+/**
+ * Model selection whose manager really opens the model modal, so a test can
+ * see what the diarization dialog's "Change" action shows.
+ */
+function useOpenableRouteModelSelection() {
+  const [isModelModalOpen, setIsModelModalOpen] = useState(false);
+  return {
+    routeModels: [],
+    resolvedSelectedModel: "Parakeet-TDT-0.6B-v3",
+    selectedModelReady: true,
+    isModelModalOpen,
+    intentVariant: null,
+    closeModelModal: () => setIsModelModalOpen(false),
+    openModelManager: () => setIsModelModalOpen(true),
+    requestModel: () => setIsModelModalOpen(true),
+    handleModelSelect: () => undefined,
+    modelOptions: [],
+  };
+}
+
+/** "New transcript", switched to diarization. */
+async function openNewDiarization() {
+  await waitFor(() =>
+    expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+  fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+  await screen.findByRole("heading", { name: "New diarization" });
 }
 
 describe("TranscriptionPage detail route", () => {
@@ -1173,6 +1241,77 @@ describe("TranscriptionPage detail route", () => {
           asr_model_id: "Whisper-Large-v3-Turbo",
           aligner_model_id: "Qwen3-ForcedAligner-0.6B",
           llm_model_id: "Qwen3.5-4B",
+          // A summary is only made when asked for, as in the other modes.
+          generate_summary: false,
+          language: undefined,
+        }),
+        expect.objectContaining({
+          onUploadProgress: expect.any(Function),
+          signal: expect.any(AbortSignal),
+        }),
+      ),
+    );
+    expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
+  });
+
+  it("asks for a diarization summary and language only when chosen", async () => {
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      id: "diar-created-1",
+      created_at: 1,
+      model_id: "Parakeet-TDT-0.6B-v3",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "meeting.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+
+    await screen.findByRole("heading", { name: "New diarization" });
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const activeUploadButton = uploadButtons[uploadButtons.length - 1];
+    const fileInput = activeUploadButton?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: /Generate summary/ }));
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          audio_filename: "meeting.wav",
+          model_id: "diar_streaming_sortformer_4spk-v2.1",
+          asr_model_id: "Whisper-Large-v3-Turbo",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+          llm_model_id: "Qwen3.5-4B",
           generate_summary: true,
         }),
         expect.objectContaining({
@@ -1182,6 +1321,292 @@ describe("TranscriptionPage detail route", () => {
       ),
     );
     expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
+  });
+
+  it("shows selected diarization file details and upload progress before navigation", async () => {
+    let resolveCreate: ((record: { id: string }) => void) | null = null;
+    apiMocks.createDiarizationRecord.mockImplementationOnce(
+      (_request, options) => {
+        options.onUploadProgress?.({
+          loadedBytes: 6,
+          totalBytes: 12,
+          percent: 50,
+          lengthComputable: true,
+        });
+        return new Promise<{ id: string }>((resolve) => {
+          resolveCreate = resolve;
+        });
+      },
+    );
+    // This harness mounts TranscriptionPage on the detail path; in the app,
+    // SpeechTextPage shows DiarizationPage there for mode=diarization.
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      id: "diar-created-1",
+      created_at: 1,
+      model_id: "diar_streaming_sortformer_4spk-v2.1",
+      aligner_model_id: null,
+      language: null,
+      processing_status: "pending",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/mpeg",
+      audio_filename: "meeting.mp3",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const fileInput = uploadButtons[uploadButtons.length - 1]?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [
+          new File(["012345678901"], "meeting.mp3", { type: "audio/mpeg" }),
+        ],
+      },
+    });
+
+    expect(await screen.findByText("meeting.mp3")).toBeInTheDocument();
+    expect(screen.getByText("MP3")).toBeInTheDocument();
+    expect(screen.getByText("12 B")).toBeInTheDocument();
+    expect(screen.getByText("Uploading audio")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+      expect.objectContaining({ audio_filename: "meeting.mp3" }),
+      expect.objectContaining({
+        onUploadProgress: expect.any(Function),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(screen.getByTestId("location-search")).toBeEmptyDOMElement();
+
+    await act(async () => {
+      resolveCreate?.({ id: "diar-created-1" });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("location-search")).toHaveTextContent(
+        "?mode=diarization",
+      ),
+    );
+    await waitFor(() =>
+      expect(apiMocks.getTranscriptionRecord).toHaveBeenCalledWith(
+        "diar-created-1",
+      ),
+    );
+    expect(
+      await screen.findByRole("navigation", { name: "Breadcrumb" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "New diarization" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("surfaces a stale diarization selection instead of silently re-resolving", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+    ];
+    baseProps.selectedModel = "Nemotron-3-Diarization";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    fireEvent.click(screen.getByRole("button", { name: /Record audio/i }));
+
+    expect(
+      await screen.findByText(
+        "Select and load a diarization model before creating a run.",
+      ),
+    ).toBeInTheDocument();
+    expect(baseProps.onError).toHaveBeenCalledWith(
+      "Select and load a diarization model to start.",
+    );
+    expect(
+      screen.queryByText(
+        "Could not access microphone. Please grant permission.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("runs diarization with a loaded diarization model and no explicit selection", async () => {
+    // The pipeline stack was loaded (the aligner last, so the global
+    // selection is not a diarization variant) and the preferred v2.1 default
+    // was never loaded. The ready Nemotron must satisfy the gate.
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
+      stackModel("Nemotron-3-Diarization", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+    ];
+    baseProps.selectedModel = "Qwen3-ForcedAligner-0.6B";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    fireEvent.click(screen.getByRole("button", { name: /Record audio/i }));
+
+    // The gates passed (recording started and jsdom denied the microphone);
+    // neither model-required error may appear.
+    expect(
+      await screen.findByText(
+        "Could not access microphone. Please grant permission.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Select and load a diarization model before creating a run.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Load ASR and forced aligner models before diarization.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("shows no bulk load action before the diarization stack is ready", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
+      stackModel("Whisper-Large-v3-Turbo", "not_downloaded"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "downloaded"),
+    ];
+    baseProps.selectedModel = "diar_streaming_sortformer_4spk-v2.1";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(screen.getByText("Not loaded")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load Models" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Unload Models" }),
+    ).not.toBeInTheDocument();
+    expect(baseProps.onLoad).not.toHaveBeenCalled();
+    expect(baseProps.onDownload).not.toHaveBeenCalled();
+    expect(baseProps.onUnload).not.toHaveBeenCalled();
+  });
+
+  it("opens the configured diarization models from the new diarization readiness panel", async () => {
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
+      stackModel("Whisper-Large-v3-Turbo", "not_downloaded"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "downloaded"),
+    ];
+    baseProps.selectedModel = "diar_streaming_sortformer_4spk-v2.1";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    expect(screen.queryByTestId("route-model-modal")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change diarization models" }),
+    );
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal).toHaveTextContent("Diarization models");
+    expect(modelModal.getAttribute("data-models")).toBe(
+      "diar_streaming_sortformer_4spk-v2.1,Whisper-Large-v3-Turbo,Qwen3-ForcedAligner-0.6B,Qwen3.5-4B",
+    );
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,ASR,Forced Aligner,Summary",
+    );
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps Granite out of diarization model groups", async () => {
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "ready"),
+      stackModel("Granite-Speech-4.1-2B-Plus", "ready"),
+    ];
+    baseProps.selectedModel = "diar_streaming_sortformer_4spk-v2.1";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change diarization models" }),
+    );
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-models")).not.toContain(
+      "Granite-Speech-4.1-2B-Plus",
+    );
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "diar_streaming_sortformer_4spk-v2.1",
+    );
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,ASR,Forced Aligner,Summary",
+    );
+  });
+
+  it("shows unload only after the full diarization stack is ready", async () => {
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load Models" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Unload Models" }));
+
+    // The diarization stack only: the ready transcription model stays.
+    expect(baseProps.onUnload).toHaveBeenCalledTimes(4);
+    expect(baseProps.onUnload).toHaveBeenCalledWith(
+      "diar_streaming_sortformer_4spk-v2.1",
+    );
+    expect(baseProps.onUnload).toHaveBeenCalledWith("Whisper-Large-v3-Turbo");
+    expect(baseProps.onUnload).toHaveBeenCalledWith("Qwen3-ForcedAligner-0.6B");
+    expect(baseProps.onUnload).toHaveBeenCalledWith("Qwen3.5-4B");
+  });
+
+  it("shows a loading readiness state while diarization models are loading", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "loading"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "ready"),
+    ];
+    baseProps.selectedModel = "diar_streaming_sortformer_4spk-v2.1";
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(screen.getByText("Loading")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Unload Models" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load Models" }),
+    ).not.toBeInTheDocument();
   });
 
   it("creates speaker-attributed ASR from the combined modal", async () => {

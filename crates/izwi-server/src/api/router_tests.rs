@@ -493,15 +493,25 @@ async fn unified_transcription_list_filters_and_totals() {
         (0, 0)
     );
     // Jobs can fail in the background here (no model is installed), so check
-    // that every job matches exactly one status rather than which one.
+    // that every job matches exactly one status rather than which one. A job
+    // that changes status between the four queries is counted twice or not
+    // at all (seen on a loaded machine), so retry until a pass is consistent;
+    // a job that really matches two statuses or none still fails every pass.
     let mut by_status = 0;
-    for uri in [
-        "/v1/speech-to-text/jobs?status=pending",
-        "/v1/speech-to-text/jobs?status=processing",
-        "/v1/speech-to-text/jobs?status=ready",
-        "/v1/speech-to-text/jobs?status=failed",
-    ] {
-        by_status += total(uri).await.0;
+    for _ in 0..20 {
+        by_status = 0;
+        for uri in [
+            "/v1/speech-to-text/jobs?status=pending",
+            "/v1/speech-to-text/jobs?status=processing",
+            "/v1/speech-to-text/jobs?status=ready",
+            "/v1/speech-to-text/jobs?status=failed",
+        ] {
+            by_status += total(uri).await.0;
+        }
+        if by_status == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(by_status, 3);
     assert_eq!(
@@ -575,6 +585,211 @@ async fn deleting_a_transcription_cancels_its_durable_job() {
         .expect("job read")
         .expect("job row is kept");
     assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+}
+
+/// Deleting a transcription deletes the canonical 16 kHz copy of its upload
+/// too, instead of leaving it until the job's retention runs out.
+#[tokio::test]
+async fn deleting_a_transcription_deletes_its_canonical_audio() {
+    let (state, _temp_dir) = test_state(
+        "deleting_a_transcription_deletes_its_canonical_audio",
+        false,
+    );
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let audio_body = tiny_audio_json_body();
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+    let canonical = state
+        .batch_runtime_store
+        .list_artifacts_for_job(&job.id)
+        .await
+        .expect("job artifacts")
+        .into_iter()
+        .find(|artifact| artifact.artifact_role == RuntimeArtifactRole::InputCanonical)
+        .expect("the job has a canonical input");
+    let canonical_key = canonical.storage_key.expect("canonical storage key");
+    let canonical_asset_id = canonical.media_asset_id.expect("canonical media asset");
+    state
+        .media_ingest
+        .read_object(&canonical_key)
+        .await
+        .expect("canonical audio is stored");
+
+    let deleted = send_request(
+        app.clone(),
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{record_id}?job_kind=transcription"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    assert!(state
+        .media_ingest
+        .read_object(&canonical_key)
+        .await
+        .is_err_and(|err| err.is_not_found()));
+    let asset = state
+        .batch_runtime_store
+        .get_media_asset(&canonical_asset_id)
+        .await
+        .expect("media asset read")
+        .expect("the row stays a tombstone while the job's artifact points at it");
+    assert!(asset.deleted_at.is_some());
+}
+
+/// A transcription still waiting can be cancelled: its durable job stops and
+/// the record fails with the reason. A retry runs it again on the stored
+/// audio as a new record; a job still running cannot be retried.
+#[tokio::test]
+async fn transcription_jobs_can_be_cancelled_and_retried() {
+    let (state, _temp_dir) = test_state("transcription_jobs_cancel_and_retry", false);
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+    let audio_body = tiny_audio_json_body_with_fields(r#""generate_summary":true"#);
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+    let member = |suffix: &str| format!("/v1/speech-to-text/jobs/{record_id}{suffix}");
+
+    let early_retry = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/reruns"), Some("{}")),
+    )
+    .await;
+    assert_eq!(early_retry.status(), StatusCode::BAD_REQUEST);
+
+    for _ in 0..2 {
+        let cancelled = send_request(
+            app.clone(),
+            build_request(Method::POST, &member("/cancel"), None),
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let body = read_json(cancelled).await;
+        assert_eq!(body["processing_status"], "failed");
+        assert_eq!(body["processing_error"], "Cancelled by user.");
+    }
+    let job = state
+        .batch_runtime_store
+        .get_job(&job.id)
+        .await
+        .expect("job read")
+        .expect("job row is kept");
+    assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+
+    let retried = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/reruns"), Some("{}")),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::ACCEPTED);
+    let retried = read_json(retried).await;
+    let retried_id = retried["id"].as_str().expect("retried id");
+    assert_ne!(retried_id, record_id);
+    assert_eq!(retried["processing_status"], "pending");
+    assert_eq!(retried["transcription_mode"], "transcription");
+    assert!(state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            retried_id,
+        )
+        .await
+        .expect("job lookup")
+        .is_some());
+    // The source record stays, failed with its reason.
+    let source = send_request(app, build_request(Method::GET, &member(""), None)).await;
+    assert_eq!(read_json(source).await["processing_status"], "failed");
+}
+
+/// Deleting a diarization that is still running stops its pipeline.
+#[tokio::test]
+async fn deleting_a_running_diarization_cancels_it() {
+    let (state, _temp_dir) = test_state("deleting_a_running_diarization_cancels_it", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .diarization_store
+        .create_record(crate::diarization_store::tests::sample_record())
+        .await
+        .expect("record");
+    let job = state.diarization_jobs.register(&record.id);
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let deleted = send_request(
+        app,
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{}?job_kind=diarization", record.id),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(job.cancellation().is_cancelled());
 }
 
 #[tokio::test]
@@ -1723,6 +1938,52 @@ async fn over_limit_speech_input_is_payload_too_large_on_both_routes() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A photo sent as a base64 data URL is larger than axum's 2 MB default;
+/// chat routes read it and fail, if at all, for another reason.
+#[tokio::test]
+async fn chat_routes_accept_image_sized_bodies() {
+    let (state, _root) = test_state("chat_body_limit", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state, &config);
+    let image = format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024));
+    let image_part = serde_json::json!([
+        { "type": "text", "text": "What is this?" },
+        { "type": "image_url", "image_url": { "url": image } }
+    ]);
+    let requests = [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "Qwen3.5-0.8B",
+                "messages": [{ "role": "user", "content": image_part }]
+            }),
+        ),
+        (
+            "/v1/responses",
+            serde_json::json!({ "model": "Qwen3.5-0.8B", "input": image }),
+        ),
+        (
+            "/v1/chat/threads/missing/messages",
+            serde_json::json!({
+                "model_id": "Qwen3.5-0.8B",
+                "content": "What is this?",
+                "content_parts": image_part
+            }),
+        ),
+    ];
+    for (path, body) in requests {
+        let body = body.to_string();
+        let response =
+            send_request(app.clone(), build_request(Method::POST, path, Some(&body))).await;
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+}
+
 fn keyed_request(path: &str, body: &str, key: &str, tenant: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -2180,6 +2441,137 @@ async fn durable_speech_replay_preserves_pcm_stats_and_terminal_cancel() {
         StatusCode::OK,
     )
     .await;
+}
+
+/// A failed attempt of a speech job that will run again reads as a pending
+/// retry, so the record page keeps polling instead of showing "Failed".
+#[tokio::test]
+async fn a_failed_speech_attempt_with_a_retry_pending_says_so() {
+    use crate::speech_history_store::{
+        NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
+    };
+    let (state, _root) = test_state("speech_retry_pending", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .speech_history_store
+        .create_record(NewSpeechHistoryRecord {
+            stop_reason: None,
+            route_kind: SpeechRouteKind::TextToSpeech,
+            processing_status: SpeechHistoryProcessingStatus::Failed,
+            processing_error: Some("Metal out of memory".into()),
+            model_id: Some("Kokoro-82M".into()),
+            speaker: None,
+            language: None,
+            saved_voice_id: None,
+            speed: None,
+            input_text: "hello".into(),
+            voice_description: None,
+            reference_text: None,
+            generation_time_ms: 0.0,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            audio_mime_type: "audio/wav".into(),
+            audio_filename: None,
+            audio_bytes: AudioEncoder::new(24000, 1)
+                .encode(&[0.0], AudioFormat::Wav)
+                .unwrap(),
+        })
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let path = format!("/v1/text-to-speech/{}", record.id);
+    let retry_pending = |app: axum::Router| {
+        let path = path.clone();
+        async move {
+            read_json(send_request(app, build_request(Method::GET, &path, None)).await).await
+                ["retry_pending"]
+                .clone()
+        }
+    };
+    assert_eq!(retry_pending(app.clone()).await, false);
+
+    state.batch_runtime_store.create_job(NewRuntimeJob {
+        job_kind: RuntimeJobKind::TtsSpeech, status: RuntimeJobStatus::Retrying, priority: 0,
+        model_id: Some("Kokoro-82M".into()), capability: Some("tts".into()),
+        route_record_kind: Some("text_to_speech".into()), route_record_id: Some(record.id.clone()),
+        input_media_asset_id: None, input_text_asset_id: None,
+        request_json: serde_json::json!({"route_kind":"text_to_speech","model_id":"Kokoro-82M","input_text":"hello","request":{}}),
+        model_snapshot_json: serde_json::json!({"version":1}), retry_policy_json: serde_json::json!({}),
+        max_attempts: 3, idempotency_key: None, correlation_id: None,
+    }).await.unwrap();
+    assert_eq!(retry_pending(app).await, true);
+}
+
+/// A text-to-speech stream runs in this process, not as a durable job:
+/// cancelling its record aborts the stream task and says why it stopped.
+#[tokio::test]
+async fn cancelling_a_speech_stream_aborts_its_task() {
+    use crate::speech_history_store::{
+        NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
+    };
+    let (state, _root) = test_state("cancelling_a_speech_stream", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .speech_history_store
+        .create_record(NewSpeechHistoryRecord {
+            stop_reason: None,
+            route_kind: SpeechRouteKind::TextToSpeech,
+            processing_status: SpeechHistoryProcessingStatus::Processing,
+            processing_error: None,
+            model_id: Some("Kokoro-82M".into()),
+            speaker: None,
+            language: None,
+            saved_voice_id: None,
+            speed: None,
+            input_text: "hello".into(),
+            voice_description: None,
+            reference_text: None,
+            generation_time_ms: 0.0,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            audio_mime_type: "audio/wav".into(),
+            audio_filename: None,
+            audio_bytes: AudioEncoder::new(24000, 1)
+                .encode(&[0.0], AudioFormat::Wav)
+                .unwrap(),
+        })
+        .await
+        .unwrap();
+    let stream = tokio::spawn(std::future::pending::<()>());
+    state
+        .speech_stream_tasks
+        .insert(&record.id, stream.abort_handle());
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+
+    let response = send_request(
+        app,
+        build_request(
+            Method::POST,
+            &format!("/v1/text-to-speech/{}/cancel", record.id),
+            Some("{}"),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["record"]["processing_status"], "failed");
+    assert_eq!(body["record"]["processing_error"], "Cancelled by user.");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), stream)
+        .await
+        .expect("the aborted task ends");
+    assert!(outcome.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
@@ -2766,6 +3158,87 @@ async fn text_to_speech_list_reports_total_and_validates_filters() {
     }
 }
 
+/// A thread is titled from its first exchange. With no loaded model to
+/// write one, the title is the first message's opening words; a thread the
+/// user renamed keeps its name.
+#[tokio::test]
+async fn chat_thread_title_route_titles_untitled_threads_only() {
+    let (state, _root) = test_state("chat_thread_title_route", false);
+    state.lifecycle.mark_ready();
+    let thread = state.chat_store.create_thread(None, None).await.unwrap();
+    let pending = state
+        .chat_store
+        .prepare_user_message(thread.id.clone(), "  Name one\nplanet  ".into(), None)
+        .await
+        .unwrap();
+    state
+        .chat_store
+        .append_turn_with_system_prompt(
+            pending,
+            "Thinking about planets</think>Mars.".into(),
+            "Qwen3.5-0.8B".into(),
+            1,
+            1.0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let title_path = format!("/v1/chat/threads/{}/title", thread.id);
+
+    let response = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            &title_path,
+            Some(r#"{"model":"Qwen3.5-0.8B"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["title"], "Name one planet");
+
+    state
+        .chat_store
+        .update_thread_settings(thread.id.clone(), Some("Planets".into()), None)
+        .await
+        .unwrap();
+    let response = send_request(
+        app.clone(),
+        build_request(Method::POST, &title_path, Some("{}")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["title"], "Planets");
+
+    let response = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            &title_path,
+            Some(r#"{"model":"not-a-model"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a titled thread is never regenerated"
+    );
+    let response = send_request(
+        app,
+        build_request(Method::POST, "/v1/chat/threads/missing/title", Some("{}")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn chat_message_routes_delete_and_refuse_the_wrong_targets() {
     let (state, _root) = test_state("chat_message_routes", false);
@@ -3098,6 +3571,71 @@ async fn admin_models_expose_voice_app_capabilities() {
         .any(|modality| modality.as_str() == Some("audio_output")));
 
     drop(temp_dir);
+}
+
+/// What first-run setup needs before anything is downloaded: each model's
+/// memory and whether it fits this device, the disk a download needs, and
+/// the room left where models are stored.
+#[tokio::test]
+async fn admin_models_report_fit_disk_and_storage() {
+    let (app, _temp_dir) = test_api_app("admin_models_report_fit_disk_and_storage", false);
+
+    let body = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/admin/models", None),
+        )
+        .await,
+    )
+    .await;
+    let models = body["models"].as_array().expect("models");
+    let find = |variant: &str| {
+        models
+            .iter()
+            .find(|model| model["variant"].as_str() == Some(variant))
+            .unwrap_or_else(|| panic!("{variant} should be listed"))
+    };
+    let kokoro = find("Kokoro-82M");
+    assert!(kokoro["estimated_memory_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+    assert!(matches!(
+        kokoro["device_fit"].as_str(),
+        Some("fits" | "too_large" | "unknown")
+    ));
+    assert_eq!(
+        kokoro["disk_required_bytes"].as_u64(),
+        kokoro["size_bytes"].as_u64(),
+        "a model that is not downloaded needs its files"
+    );
+    // A .nemo checkpoint is unpacked beside its archive on first load.
+    let parakeet = find("Parakeet-TDT-0.6B-v3");
+    assert_eq!(
+        parakeet["disk_required_bytes"].as_u64(),
+        parakeet["size_bytes"].as_u64().map(|bytes| bytes * 2)
+    );
+
+    let storage = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/admin/storage", None),
+        )
+        .await,
+    )
+    .await;
+    assert!(storage["models_dir"]
+        .as_str()
+        .is_some_and(|dir| !dir.is_empty()));
+    assert!(storage["free_bytes"].as_u64().is_some());
+    assert_eq!(storage["models_bytes"].as_u64(), Some(0));
+
+    // "Keep loaded" applies to loaded models only.
+    let response = send_request(
+        app,
+        build_request(Method::POST, "/v1/admin/models/Kokoro-82M/pin", None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -3703,6 +4241,198 @@ async fn studio_segment_refusals_are_bad_requests() {
 /// The server owns Studio rendering: clients queue and cancel, the
 /// worker sets every other status, and export refuses audio that doesn't
 /// match the script.
+/// A voice whose recording went missing answers 404, not 500, and saved
+/// voices are searched on the server.
+#[tokio::test]
+async fn saved_voices_report_missing_recordings_and_search_on_the_server() {
+    let (state, root) = test_state("saved_voice_recordings", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let wav = base64::engine::general_purpose::STANDARD.encode(
+        AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap(),
+    );
+    let mut ids = Vec::new();
+    for (name, source) in [("Sam", "voice_cloning"), ("Narrator", "voice_design")] {
+        let body = serde_json::json!({
+            "name": name, "reference_text": "Hello.", "audio_base64": wav,
+            "source_route_kind": source, "consent": true
+        });
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/voices", Some(&body.to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(
+            read_json(response).await["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // Remove the recording the way a user deleting files by hand would.
+    fn remove_files_named(dir: &std::path::Path, needle: &str) -> usize {
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                removed += remove_files_named(&path, needle);
+            } else if path.to_string_lossy().contains(needle) {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+        removed
+    }
+    assert!(remove_files_named(&root.0.join("media"), &ids[0]) > 0);
+    let audio = send_request(
+        app.clone(),
+        build_request(Method::GET, &format!("/v1/voices/{}/audio", ids[0]), None),
+    )
+    .await;
+    assert_eq!(audio.status(), StatusCode::NOT_FOUND);
+
+    // Search runs on the server, over every voice, not one loaded page.
+    let found = send_request(
+        app,
+        build_request(Method::GET, "/v1/voices?q=narr&limit=1", None),
+    )
+    .await;
+    assert_eq!(found.status(), StatusCode::OK);
+    let found = read_json(found).await;
+    let names: Vec<_> = found["voices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|voice| voice["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["Narrator"]);
+}
+
+/// Cloning someone's voice needs their permission; a designed voice does
+/// not.
+#[tokio::test]
+async fn cloning_a_voice_needs_consent() {
+    let (state, _root) = test_state("saved_voice_consent", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let wav = base64::engine::general_purpose::STANDARD.encode(
+        AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap(),
+    );
+    let create = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            send_request(
+                app,
+                build_request(Method::POST, "/v1/voices", Some(&body.to_string())),
+            )
+            .await
+            .status()
+        }
+    };
+    let voice = |name: &str| serde_json::json!({ "name": name, "reference_text": "Hello.", "audio_base64": wav });
+    assert_eq!(create(voice("Sam")).await, StatusCode::BAD_REQUEST);
+    let mut consented = voice("Sam");
+    consented["consent"] = serde_json::json!(true);
+    assert_eq!(create(consented).await, StatusCode::OK);
+    let mut designed = voice("Narrator");
+    designed["source_route_kind"] = serde_json::json!("voice_design");
+    assert_eq!(create(designed).await, StatusCode::OK);
+}
+
+/// Speed belongs to models with speed control, and a paragraph's voice to
+/// the model it was chosen with.
+#[tokio::test]
+async fn studio_keeps_speed_and_paragraph_voices_with_their_models() {
+    let (state, _root) = test_state("studio_speed_and_voices", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let request = |method: Method, path: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let response =
+                send_request(app, build_request(method, &path, Some(&body.to_string()))).await;
+            (response.status(), read_json(response).await)
+        }
+    };
+    let (status, project) = request(
+        Method::POST,
+        "/v1/studio/projects".to_string(),
+        serde_json::json!({
+            "model_id": "Kokoro-82M",
+            "speaker": "af_heart",
+            "source_text": "One sentence. Another sentence."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let segment_id = project["segments"][0]["id"].as_str().unwrap().to_string();
+    let project_path = format!("/v1/studio/projects/{project_id}");
+
+    let (status, project) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({ "speed": 1.2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!((project["speed"].as_f64().unwrap() - 1.2).abs() < 1e-6);
+
+    // A paragraph voice is bound to the model it was chosen with.
+    let (status, project) = request(
+        Method::PATCH,
+        format!("{project_path}/segments/{segment_id}"),
+        serde_json::json!({ "speaker": "am_adam" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(project["segments"][0]["model_id"], "Kokoro-82M");
+
+    // Switching to a model without speed control drops the speed...
+    let (status, project) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "speaker": "Vivian"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{project}");
+    assert!(project["speed"].is_null());
+    // ...and a speed for it is refused.
+    let (status, _) = request(
+        Method::PATCH,
+        project_path.clone(),
+        serde_json::json!({ "speed": 1.2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The paragraph keeps its Kokoro voice.
+    assert_eq!(project["segments"][0]["model_id"], "Kokoro-82M");
+}
+
 #[tokio::test]
 async fn studio_render_jobs_are_server_owned_and_export_refuses_unrendered_audio() {
     let (state, _root) = test_state("studio_render_contract", false);

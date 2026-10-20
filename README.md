@@ -40,10 +40,14 @@ audio payloads, local paths, or personal identifiers.
 Download the latest build from
 [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
-- **macOS:** install the `.dmg`, drag `Izwi.app` to Applications, then launch
-  it.
-- **Linux:** install the `.deb` package with `sudo dpkg -i izwi_*.deb`.
-- **Windows:** run the `.exe` installer.
+- **macOS (Apple Silicon):** open `Izwi_<version>_aarch64.dmg`, drag
+  `Izwi.app` to Applications, then launch it.
+- **Linux:** install the `.deb` package with
+  `sudo apt install ./Izwi_*_amd64.deb`, or run `Izwi_<version>_amd64.AppImage`.
+- **Windows:** run `Izwi_<version>_x64-setup.exe`.
+
+To use `izwi` in a terminal, open **Settings > System > Command line tool** in
+the app and select **Install** (the `.deb` installs it for you).
 
 Runtime support depends on the artifact:
 
@@ -71,10 +75,12 @@ izwi serve
 izwi serve --mode desktop
 ```
 
-Download a model and generate speech:
+In a second terminal, download the default speech model and generate speech
+(Kokoro-82M needs `espeak-ng`: `brew install espeak-ng` or
+`sudo apt install espeak-ng`):
 
 ```bash
-izwi pull Qwen3-TTS-12Hz-0.6B-Base
+izwi pull Kokoro-82M
 izwi tts "Hello from Izwi." --output hello.wav
 ```
 
@@ -93,11 +99,13 @@ at `http://localhost:8080/docs`, and the raw OpenAPI document is available at
 
 Run `izwi list` to see the enabled catalog. Current families include:
 
-- **TTS:** Qwen3-TTS, Kokoro-82M, Voxtral TTS, and VibeVoice.
+- **TTS:** Qwen3-TTS, Kokoro-82M, Voxtral TTS, VibeVoice, Fish Audio S2 Pro,
+  and LFM2.5 Audio.
 - **ASR:** Parakeet, Whisper, Qwen3-ASR, Nemotron 3.5 ASR, VibeVoice ASR,
-  LFM2.5 Audio, and Voxtral Mini.
-- **Diarization and alignment:** Sortformer diarization and Qwen3 ForcedAligner.
-- **Chat:** Qwen3, Qwen3.5, LFM2.5, and Gemma.
+  Granite Speech 4.1, LFM2.5 Audio, and Voxtral Mini.
+- **Diarization and alignment:** Sortformer and Nemotron 3 diarization, and
+  Qwen3 ForcedAligner.
+- **Chat:** Qwen3.5, Qwen3.6, Qwen3.8, and LFM2.5.
 
 Some model weights and bundled assets have their own licenses or access terms.
 Check the [Models Guide](https://izwiai.com/docs/models) before redistribution
@@ -110,6 +118,10 @@ For CLI/server installs, use the project install script:
 ```bash
 ./scripts/install-cli.sh
 ```
+
+It needs Node.js 18+ (it installs Rust if missing), and on Linux the Tauri
+system packages (see
+[From Source](https://izwiai.com/docs/installation/from-source)).
 
 For manual builds, scope Cargo to the binaries you need:
 
@@ -134,4 +146,4 @@ for platform-specific setup.
 
 ## License
 
-Izwi is licensed under the [MIT License](LICENSE).
+Izwi is licensed under the [Apache License 2.0](LICENSE).

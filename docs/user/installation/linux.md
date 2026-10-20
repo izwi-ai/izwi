@@ -35,21 +35,15 @@ The public command names stay `izwi` and `izwi-server`. CUDA runtime libraries a
 
 ### Step 1: Download
 
-```bash
-wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
-```
+Download `Izwi_<version>_amd64.deb` from the [Releases page](https://github.com/izwi-ai/izwi/releases).
 
 ### Step 2: Install
 
 ```bash
-sudo dpkg -i izwi_amd64.deb
+sudo apt install ./Izwi_*_amd64.deb
 ```
 
-If you encounter dependency errors:
-
-```bash
-sudo apt-get install -f
-```
+`apt` installs the package's dependencies for you. The package installs `izwi` and `izwi-server` to `/usr/bin`.
 
 ### Step 3: Verify
 
@@ -57,7 +51,9 @@ sudo apt-get install -f
 izwi version --full
 ```
 
-For terminal tarballs, unpack the release archive and keep the bundled binaries together.
+For terminal tarballs (`izwi-cli-v<version>-linux-x86_64.tar.gz`), unpack the release archive and keep the bundled binaries together.
+
+With the AppImage (`Izwi_<version>_amd64.AppImage`), open **Settings > System > Command line tool** and select **Install** to copy `izwi` to `~/.local/bin` (Izwi adds that folder to your PATH in `~/.profile` if needed; open a new shell afterwards).
 
 ---
 
@@ -96,10 +92,13 @@ espeak-ng --version
 
 ### Prerequisites
 
+`./scripts/install-cli.sh` also builds the web UI and the desktop app, so you need Node.js 18+ (with `npm`) and the Tauri system libraries.
+
 ```bash
 # Ubuntu/Debian
 sudo apt update
-sudo apt install -y build-essential curl git pkg-config libssl-dev
+sudo apt install -y build-essential curl git pkg-config libssl-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
 # Fedora
 sudo dnf install -y gcc gcc-c++ make curl git openssl-devel
@@ -137,7 +136,7 @@ Native Linux GitHub Release artifacts are CPU-only. For CUDA-capable binaries on
 nvidia-smi
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
-IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
+IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up -d izwi-cuda
 ```
 
 The container listens on `0.0.0.0`, so the server requires `IZWI_API_KEY` and refuses to start without it. Clients send the key as `Authorization: Bearer <key>`.
@@ -190,7 +189,7 @@ For source builds, `izwi version --full` should include `CUDA` under **Compiled 
 | **Models** | `~/.local/share/izwi/models/` |
 | **Config** | `~/.config/izwi/config.toml` |
 | **Logs** | `~/.local/share/izwi/logs/` |
-| **Binaries** | `/usr/bin/` (deb) or `~/.local/bin/` (source) |
+| **Binaries** | `/usr/bin/` (deb) or `~/.local/bin/` (source, or the AppImage's command line tool install) |
 
 ---
 
@@ -301,14 +300,14 @@ sudo setcap 'cap_net_bind_service=+ep' $(which izwi-server)
 
 ### Audio playback not working
 
-Install audio libraries:
+`izwi tts --play` plays the saved file with an external player. Install one of `paplay` (pulseaudio-utils), `aplay` (alsa-utils), `ffplay` (ffmpeg) or `play` (sox):
 
 ```bash
 # Ubuntu/Debian
-sudo apt install -y libasound2-dev
+sudo apt install -y pulseaudio-utils
 
 # Fedora
-sudo dnf install -y alsa-lib-devel
+sudo dnf install -y pulseaudio-utils
 ```
 
 ### Kokoro error: `espeak-ng not found`

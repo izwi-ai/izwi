@@ -28,6 +28,7 @@ use crate::chat_store::{
 };
 use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
+use izwi_core::chat_reasoning::reasoning_opened_in_prompt;
 use izwi_core::{
     ChatFinishReason, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole,
     ChatTemplateKwargs, ChatTruncation,
@@ -617,6 +618,10 @@ async fn run_thread_turn(
         model_id,
         placement: turn.placement,
         system_prompt_update: requested_system_prompt,
+        reasoning_opened_in_prompt: reasoning_opened_in_prompt(
+            model_variant,
+            execution_request.chat_config.enable_thinking,
+        ),
     };
 
     if options.stream.unwrap_or(false) {
@@ -657,6 +662,9 @@ struct TurnCommit {
     model_id: String,
     placement: TurnPlacement,
     system_prompt_update: Option<String>,
+    /// The prompt opened `<think>`, so the reply streams its reasoning
+    /// without the opener.
+    reasoning_opened_in_prompt: bool,
 }
 
 impl TurnCommit {
@@ -775,7 +783,14 @@ impl Drop for StopOnDisconnect {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let text = std::mem::take(&mut self.text);
+        let mut text = std::mem::take(&mut self.text);
+        // A reply stopped before `</think>` is all reasoning. Its opener was
+        // in the prompt, so store it: otherwise the reasoning reads as the
+        // answer.
+        if self.commit.reasoning_opened_in_prompt && !text.is_empty() && !text.contains("</think>")
+        {
+            text.insert_str(0, "<think>");
+        }
         let reasoning_ms = self.clock.finish(&text);
         let generation_time_ms = self.clock.started.elapsed().as_secs_f64() * 1000.0;
         let turn = self.commit.turn(
@@ -948,11 +963,13 @@ fn build_runtime_messages(
                 ApiError::internal(format!("Invalid stored chat message payload: {err}"))
             })?;
         if role == ChatRole::Assistant
-            && flattened.runtime_text.trim().is_empty()
+            && (flattened.runtime_text.trim().is_empty()
+                || is_unfinished_reasoning(&flattened.runtime_text))
             && !flattened.has_media()
         {
-            // Older versions persisted empty successful responses. They are
-            // not model answers and must not become assistant prompt turns.
+            // Older versions persisted empty successful responses, and a
+            // reply stopped while it reasoned has no answer. Neither is a
+            // model answer, so neither becomes an assistant prompt turn.
             continue;
         }
         let content = if include_history_media || !flattened.has_media() {
@@ -976,6 +993,11 @@ fn build_runtime_messages(
     );
 
     Ok((messages, media_inputs))
+}
+
+/// A reply stopped before its reasoning closed: `<think>` with no `</think>`.
+fn is_unfinished_reasoning(text: &str) -> bool {
+    text.trim_start().starts_with("<think>") && !text.contains("</think>")
 }
 
 /// Chat templates expect user and assistant turns to alternate. A deleted
@@ -1002,7 +1024,7 @@ fn parse_stored_role(role: &str) -> Result<ChatRole, ApiError> {
     }
 }
 
-async fn get_thread_or_not_found(
+pub(super) async fn get_thread_or_not_found(
     state: &AppState,
     thread_id: &str,
 ) -> Result<ChatThreadSummary, ApiError> {
@@ -1015,7 +1037,7 @@ async fn get_thread_or_not_found(
     thread.ok_or_else(|| ApiError::not_found("Thread not found"))
 }
 
-fn map_store_error(err: anyhow::Error) -> ApiError {
+pub(super) fn map_store_error(err: anyhow::Error) -> ApiError {
     tracing::error!(error = %format!("{err:#}"), "chat storage error");
     ApiError::internal(format!("Chat storage error: {err:#}"))
 }
@@ -1139,23 +1161,29 @@ mod tests {
 
     #[test]
     fn runtime_history_skips_legacy_empty_assistant_entries() {
-        let existing = ["", " \n", "<think>reasoning</think>", "Answer"]
-            .iter()
-            .enumerate()
-            .map(|(index, content)| ChatThreadMessage {
-                id: format!("message-{index}"),
-                thread_id: "thread-1".into(),
-                role: "assistant".into(),
-                content: (*content).into(),
-                content_parts: None,
-                created_at: index as u64,
-                tokens_generated: Some(48),
-                generation_time_ms: Some(224.0),
-                model_id: None,
-                finish_reason: None,
-                reasoning_ms: None,
-            })
-            .collect::<Vec<_>>();
+        let existing = [
+            "",
+            " \n",
+            "<think>stopped while reasoning",
+            "<think>reasoning</think>",
+            "Answer",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, content)| ChatThreadMessage {
+            id: format!("message-{index}"),
+            thread_id: "thread-1".into(),
+            role: "assistant".into(),
+            content: (*content).into(),
+            content_parts: None,
+            created_at: index as u64,
+            tokens_generated: Some(48),
+            generation_time_ms: Some(224.0),
+            model_id: None,
+            finish_reason: None,
+            reasoning_ms: None,
+        })
+        .collect::<Vec<_>>();
         let (messages, _) = build_runtime_messages(
             &existing,
             &FlattenedMultimodalContent {
@@ -1417,6 +1445,7 @@ mod tests {
             model_id: "Qwen3.5-0.8B".into(),
             placement: TurnPlacement::Append,
             system_prompt_update: None,
+            reasoning_opened_in_prompt: false,
         };
 
         // A stream that ended on its own stores nothing on drop.
@@ -1454,6 +1483,29 @@ mod tests {
             messages[1].finish_reason.as_deref(),
             Some(CANCELLED_FINISH_REASON)
         );
+
+        // Stopped while reasoning after a prompt that opened `<think>`: the
+        // opener is stored, so the reply reads as reasoning, not an answer.
+        let next = store
+            .prepare_user_message(thread.id.clone(), "Another".into(), None)
+            .await
+            .unwrap();
+        let (completion, completion_rx) = ChatStreamCompletion::channel();
+        drop(StopOnDisconnect {
+            commit: TurnCommit {
+                user_message: next,
+                reasoning_opened_in_prompt: true,
+                ..commit()
+            },
+            clock: ReasoningClock::new(Instant::now()),
+            text: "The user wants a story".into(),
+            completion: Some(completion),
+        });
+        let _ = completion_rx.await;
+        let messages = store.list_messages(thread.id.clone()).await.unwrap();
+        let stopped = messages.last().unwrap();
+        assert_eq!(stopped.content, "<think>The user wants a story");
+        assert!(stopped.reasoning_ms.is_some());
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
     }

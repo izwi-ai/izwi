@@ -8,7 +8,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api::admin::models::{
     AdminModelActionResponse, AdminModelBatchCapabilities, AdminModelDownloadProgressEvent,
     AdminModelInfo, AdminModelRouteCapabilities, AdminModelsResponse, AdminRemovedModelInfo,
-    AdminSpeechModelCapabilities,
+    AdminSpeechModelCapabilities, AdminStorageResponse,
 };
 use crate::api::openai::audio::align::{
     AlignmentJsonRequest, AlignmentMultipartRequest, AlignmentResponse, AlignmentWord,
@@ -51,6 +51,7 @@ use crate::api::openai::audio::align::{
         AdminModelsResponse,
         AdminRemovedModelInfo,
         AdminSpeechModelCapabilities,
+        AdminStorageResponse,
         AlignmentJsonRequest,
         AlignmentMultipartRequest,
         AlignmentResponse,
@@ -414,7 +415,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "post",
         "Admin",
         "Load model",
-        "Load model weights into runtime memory.",
+        "Load model weights into runtime memory. The model stays loaded until it is unloaded; with `?pin=false` it stays loaded while idle, but a load that needs its room evicts it.",
         &[("variant", "Model variant identifier")],
         json_schema_response("AdminModelActionResponse", "Model load result"),
     );
@@ -427,6 +428,35 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Unload model weights from runtime memory.",
         &[("variant", "Model variant identifier")],
         json_schema_response("AdminModelActionResponse", "Model unload result"),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/pin",
+        "post",
+        "Admin",
+        "Pin model",
+        "Keep a loaded model loaded until it is unloaded: other loads cannot evict it. 409 when it is not loaded.",
+        &[("variant", "Model variant identifier")],
+        json_schema_response("AdminModelActionResponse", "Model pin result"),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/unpin",
+        "post",
+        "Admin",
+        "Unpin model",
+        "Let other loads evict a loaded model when they need its room. 409 when it is not loaded.",
+        &[("variant", "Model variant identifier")],
+        json_schema_response("AdminModelActionResponse", "Model unpin result"),
+    );
+    add_operation(
+        paths,
+        "/v1/admin/storage",
+        "get",
+        "Admin",
+        "Get model storage",
+        "Where models are stored, the free and total space of that volume, and the disk downloaded models use.",
+        json_schema_response("AdminStorageResponse", "Model storage"),
     );
 
     add_collection(
@@ -804,6 +834,16 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Fetch, update, or delete a chat thread.",
         &[("thread_id", "Chat thread identifier")],
     );
+    add_operation_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/title",
+        "post",
+        "Chat",
+        "Create chat thread title",
+        "Title a thread still called \"New chat\" from its first exchange, with thinking off, and return the thread. A thread with a title keeps it. Body: optional `model`, the model that answered.",
+        &[("thread_id", "Chat thread identifier")],
+        preview_response(),
+    );
     add_collection_with_params(
         paths,
         "/v1/chat/threads/{thread_id}/messages",
@@ -1066,6 +1106,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/onboarding/reset",
+        "post",
+        "Preferences",
+        "Reset onboarding",
+        "Show first-run setup again; the analytics choice stays.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
         "/v1/preferences",
         "get",
         "Preferences",
@@ -1292,14 +1341,15 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "llm_model".to_string(),
         json!({
             "type": "string",
-            "description": "Optional diarization chat model for transcript refinement and the summary."
+            "description": "Optional diarization chat model for the summary."
         }),
     );
     properties.insert(
         "enable_llm_refinement".to_string(),
         json!({
             "type": "boolean",
-            "description": "For diarization jobs, enable optional LLM transcript refinement."
+            "deprecated": true,
+            "description": "Ignored: LLM transcript refinement was removed in 0.1.0-beta-18."
         }),
     );
     properties.insert(
@@ -2822,16 +2872,19 @@ mod tests {
             "Load",
             "Merge",
             "Open",
+            "Pin",
             "Regenerate",
             "Render",
             "Reorder",
             "Replace",
+            "Reset",
             "Restore",
             "Rerun",
             "Split",
             "Start",
             "Stream",
             "Unload",
+            "Unpin",
             "Update",
         ]
         .into_iter()

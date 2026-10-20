@@ -13,6 +13,9 @@ const modelMethodNames = [
   "downloadModel",
   "loadModel",
   "unloadModel",
+  "pinModel",
+  "unpinModel",
+  "getModelStorage",
   "deleteModel",
   "cancelDownload",
 ] as const;
@@ -103,6 +106,8 @@ const audioMethodNames = [
   "createTranscriptionRecordStream",
   "regenerateTranscriptionSummary",
   "transcriptionRecordAudioUrl",
+  "cancelTranscriptionRecord",
+  "retryTranscriptionRecord",
   "deleteTranscriptionRecord",
   "listSpeakerAttributedAsrRecords",
   "listSpeakerAttributedAsrRecordPage",
@@ -132,6 +137,7 @@ const chatMethodNames = [
   "listChatThreads",
   "createChatThread",
   "updateChatThread",
+  "generateChatThreadTitle",
   "getChatThread",
   "listChatThreadMessages",
   "deleteChatThread",
@@ -163,6 +169,7 @@ const voiceMethodNames = [
 const onboardingMethodNames = [
   "getOnboardingState",
   "completeOnboarding",
+  "resetOnboarding",
 ] as const;
 
 const healthMethodNames = ["getHealth"] as const;

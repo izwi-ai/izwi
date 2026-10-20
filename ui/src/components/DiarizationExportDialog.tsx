@@ -1,90 +1,66 @@
-import { useMemo, useState } from "react";
-import { Download } from "lucide-react";
+import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
+  ExportDialog,
+  ExportSwitchRow,
+  type ExportFormatOption,
+} from "@/components/ExportDialog";
+import { saveFile } from "@/shared/saveFile";
 import type { DiarizationRecord } from "../api";
 import {
   buildDiarizationExport,
   type DiarizationExportFormat,
 } from "../utils/diarizationExport";
 
+type ExportableDiarizationRecord = Pick<
+  DiarizationRecord,
+  | "id"
+  | "created_at"
+  | "model_id"
+  | "speaker_count"
+  | "corrected_speaker_count"
+  | "duration_secs"
+  | "audio_filename"
+  | "speaker_name_overrides"
+  | "utterances"
+  | "transcript"
+  | "raw_transcript"
+>;
+
 interface DiarizationExportDialogProps {
-  record: Pick<
-    DiarizationRecord,
-    | "id"
-    | "created_at"
-    | "model_id"
-    | "speaker_count"
-    | "corrected_speaker_count"
-    | "duration_secs"
-    | "audio_filename"
-    | "speaker_name_overrides"
-    | "utterances"
-    | "transcript"
-    | "raw_transcript"
-  > | null;
+  record: ExportableDiarizationRecord | null;
   children?: React.ReactNode;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
 }
 
-const FORMAT_OPTIONS: Array<{
-  value: DiarizationExportFormat;
-  label: string;
-  description: string;
-}> = [
+const FORMAT_OPTIONS: ExportFormatOption<DiarizationExportFormat>[] = [
   {
-    value: "txt",
-    label: "TXT transcript",
-    description: "Readable speaker-attributed transcript with corrected labels.",
+    id: "txt",
+    label: "Text",
+    description: "A readable transcript, each line marked with its speaker.",
   },
   {
-    value: "json",
-    label: "JSON transcript",
-    description: "Structured transcript entries for downstream workflows.",
+    id: "json",
+    label: "JSON",
+    description: "Structured transcript entries for other tools.",
   },
   {
-    value: "srt",
-    label: "SRT captions",
-    description: "Subtitle file with corrected speaker names in each cue.",
+    id: "srt",
+    label: "SRT",
+    description: "Captions with the speaker in each cue.",
   },
   {
-    value: "vtt",
-    label: "VTT captions",
-    description: "Web subtitle file suitable for HTML5 video workflows.",
+    id: "vtt",
+    label: "VTT",
+    description: "Captions for video on the web, with the speaker in each cue.",
   },
 ];
 
-function downloadTextFile(
-  content: string,
-  filename: string,
-  mimeType: string,
-): void {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
+function hasSpeakerNames(record: ExportableDiarizationRecord | null): boolean {
+  return Object.values(record?.speaker_name_overrides ?? {}).some(
+    (name) => String(name).trim().length > 0,
+  );
 }
 
 export function DiarizationExportDialog({
@@ -95,113 +71,64 @@ export function DiarizationExportDialog({
 }: DiarizationExportDialogProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const [format, setFormat] = useState<DiarizationExportFormat>("txt");
+  const [useSpeakerNames, setUseSpeakerNames] = useState(true);
   const [includeMetadata, setIncludeMetadata] = useState(false);
   const open = controlledOpen ?? uncontrolledOpen;
   const setOpen = controlledOnOpenChange ?? setUncontrolledOpen;
 
-  const selectedOption = useMemo(
-    () => FORMAT_OPTIONS.find((option) => option.value === format) ?? FORMAT_OPTIONS[0],
-    [format],
-  );
+  const namedSpeakers = hasSpeakerNames(record);
   const canIncludeMetadata = format === "txt" || format === "json";
 
-  function handleExport(): void {
+  async function handleExport(): Promise<boolean> {
     if (!record) {
-      return;
+      return false;
     }
-
-    const payload = buildDiarizationExport(record, format, {
-      includeMetadata: canIncludeMetadata ? includeMetadata : false,
+    // Without the names, the export uses the labels diarization gave.
+    const source =
+      namedSpeakers && !useSpeakerNames
+        ? {
+            ...record,
+            speaker_name_overrides: {},
+            corrected_speaker_count: record.speaker_count,
+          }
+        : record;
+    const payload = buildDiarizationExport(source, format, {
+      includeMetadata: canIncludeMetadata && includeMetadata,
     });
-
-    downloadTextFile(payload.content, payload.filename, payload.mimeType);
-    setOpen(false);
+    return saveFile(payload.filename, payload.content, payload.mimeType);
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      {children ? <DialogTrigger asChild>{children}</DialogTrigger> : null}
-      <DialogContent className="max-w-lg border-[var(--border-strong)] bg-[var(--bg-surface-0)]">
-        <DialogHeader>
-          <DialogTitle className="text-base text-[var(--text-primary)]">
-            Export diarization
-          </DialogTitle>
-          <DialogDescription className="text-[var(--text-muted)]">
-            Export corrected speaker labels in transcript or subtitle formats.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label
-              htmlFor="diarization-export-format"
-              className="text-xs uppercase tracking-wider text-[var(--text-subtle)]"
-            >
-              Format
-            </Label>
-            <Select
-              value={format}
-              onValueChange={(value) => setFormat(value as DiarizationExportFormat)}
-            >
-              <SelectTrigger
-                id="diarization-export-format"
-                className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]"
-              >
-                <SelectValue placeholder="Choose an export format" />
-              </SelectTrigger>
-              <SelectContent>
-                {FORMAT_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-[var(--text-muted)]">
-              {selectedOption.description}
-            </p>
-          </div>
-
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-            <div>
-              <div className="text-sm font-medium text-[var(--text-primary)]">
-                Include metadata
-              </div>
-              <div className="text-xs text-[var(--text-muted)]">
-                Add file, model, speaker, and duration details to TXT or JSON exports.
-              </div>
-            </div>
-            <Switch
-              checked={canIncludeMetadata && includeMetadata}
-              onCheckedChange={setIncludeMetadata}
-              disabled={!canIncludeMetadata}
-              aria-label="Include metadata"
-            />
-          </div>
-        </div>
-
-        <DialogFooter className="gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-1)]"
-            onClick={() => setOpen(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            className="h-9 gap-1.5"
-            onClick={handleExport}
-            disabled={!record}
-          >
-            <Download className="h-3.5 w-3.5" />
-            Export file
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <ExportDialog
+      title="Export transcript"
+      open={open}
+      onOpenChange={setOpen}
+      trigger={children}
+      formats={FORMAT_OPTIONS}
+      format={format}
+      onFormatChange={setFormat}
+      onExport={handleExport}
+      disabled={!record}
+    >
+      {namedSpeakers ? (
+        <ExportSwitchRow
+          title="Speaker names"
+          description="Use the names you gave each speaker"
+          checked={useSpeakerNames}
+          onCheckedChange={setUseSpeakerNames}
+        />
+      ) : null}
+      <ExportSwitchRow
+        title="Details"
+        description={
+          canIncludeMetadata
+            ? "File name, model, speakers and length"
+            : "Only in Text and JSON files"
+        }
+        checked={canIncludeMetadata && includeMetadata}
+        onCheckedChange={setIncludeMetadata}
+        disabled={!canIncludeMetadata}
+      />
+    </ExportDialog>
   );
 }

@@ -37,9 +37,11 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 | `-l, --language <LANG>` | Language hint (e.g., `en`, `es`) | Auto-detect |
 | `--prompt <TEXT>` | Initial ASR prompt or keyword guidance | — |
 | `--max-tokens <N>` | Maximum number of ASR decoder tokens to generate | Model default |
-| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
 | `--word-timestamps` | Request word-level timestamps; automatically uses `verbose_json` response format | — |
+
+The CLI uploads the audio file as multipart form data. The server accepts up to 25 MiB per file by default; raise it with `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server.
 
 ---
 
@@ -84,7 +86,7 @@ izwi transcribe audio.wav \
 ### With timestamps
 
 ```bash
-izwi transcribe audio.wav --format verbose_json --word-timestamps
+izwi transcribe audio.wav --format verbose-json --word-timestamps
 ```
 
 ### Specify language
@@ -103,7 +105,7 @@ izwi transcribe audio.wav --model Qwen3-ASR-1.7B-GGUF
 ### Use Voxtral
 
 ```bash
-izwi transcribe audio.wav --model Voxtral-Mini-4B-Realtime-2602 --format verbose_json
+izwi transcribe audio.wav --model Voxtral-Mini-4B-Realtime-2602 --format verbose-json
 ```
 
 ---
@@ -159,7 +161,7 @@ selected model or forced aligner can provide word timing metadata.
 
 | Model | Size | Speed | Accuracy |
 |-------|------|-------|----------|
-| `Parakeet-TDT-0.6B-v3` | 9.4 GB | Medium | Strong baseline (default) |
+| `Parakeet-TDT-0.6B-v3` | 2.5 GB | Medium | Strong baseline (default) |
 | `Whisper-Large-v3-Turbo` | 1.5 GB | Medium | Strong multilingual baseline |
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Fast | Good |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Medium | Better |

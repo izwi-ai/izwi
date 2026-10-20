@@ -62,9 +62,6 @@ Category filters:
 | Unload | Ready model card | Frees runtime memory while keeping files on disk. |
 | Delete | Downloaded or ready model card | Removes local model files after confirmation. |
 
-Gemma models may show **Manual DL** because they require manual Hugging Face
-access setup. See [Manual Model Downloads](/models/manual-download).
-
 ---
 
 ## CLI

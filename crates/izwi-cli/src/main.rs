@@ -6,6 +6,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use clap::Parser;
+use std::process::ExitCode;
 
 mod app;
 mod commands;
@@ -19,15 +20,16 @@ pub use app::cli::{
     AudioFormat, Backend, BenchCommands, Cli, Commands, ConfigCommands, LogFormat, ModelCommands,
     OutputFormat, ServeMode, Shell, TranscriptFormat,
 };
-use error::Result;
 use style::Theme;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
 
     let theme = if no_color {
+        console::set_colors_enabled(false);
+        console::set_colors_enabled_stderr(false);
         Theme::no_color()
     } else {
         Theme::default()
@@ -37,7 +39,13 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt::init();
     }
 
-    app::run(cli, theme).await
+    match app::run(cli, theme).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            style::print_error(&error);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import {
   AlertTriangle,
   CalendarDays,
@@ -51,6 +51,12 @@ interface TranscriptionRecordDetailProps {
   summaryModelGuidance?: string | null;
   onDelete?: () => Promise<void> | void;
   onRegenerateSummary?: () => void;
+  /** Stop a job still waiting or running. */
+  onCancel?: () => void;
+  cancelPending?: boolean;
+  /** Run a failed job again on its stored audio. */
+  onRetry?: () => void;
+  retryPending?: boolean;
   deletePending?: boolean;
   summaryRefreshPending?: boolean;
   summaryRefreshError?: string | null;
@@ -117,8 +123,10 @@ function progressDetailLabel(
 
 function ProcessingProgressCard({
   progress,
+  action,
 }: {
   progress: TranscriptionProcessingProgress | null | undefined;
+  action?: ReactNode;
 }) {
   const percent = clampProgressPercent(progress);
   const detail = progressDetailLabel(progress);
@@ -135,11 +143,12 @@ function ProcessingProgressCard({
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-3">
             <p className="font-medium">{progressPhaseLabel(progress)}</p>
-            {detail ? (
-              <span className="shrink-0 text-xs text-[var(--text-muted)]">
-                {detail}
-              </span>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-3">
+              {detail ? (
+                <span className="text-xs text-[var(--text-muted)]">{detail}</span>
+              ) : null}
+              {action}
+            </div>
           </div>
           <div
             className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--border-muted)]"
@@ -173,6 +182,10 @@ export function TranscriptionRecordDetail({
   summaryModelGuidance = null,
   onDelete,
   onRegenerateSummary,
+  onCancel,
+  cancelPending = false,
+  onRetry,
+  retryPending = false,
   deletePending = false,
   summaryRefreshPending = false,
   summaryRefreshError = null,
@@ -339,7 +352,23 @@ export function TranscriptionRecordDetail({
           ) : null}
 
           {processingStatus === "pending" || processingStatus === "processing" ? (
-            <ProcessingProgressCard progress={record?.processing_progress} />
+            <ProcessingProgressCard
+              progress={record?.processing_progress}
+              action={
+                onCancel ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-xs"
+                    onClick={onCancel}
+                    disabled={cancelPending}
+                  >
+                    {cancelPending ? "Cancelling…" : "Cancel"}
+                  </Button>
+                ) : null
+              }
+            />
           ) : null}
 
           {statusMessage ? (
@@ -350,7 +379,20 @@ export function TranscriptionRecordDetail({
             >
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                <p>{statusMessage}</p>
+                <p className="min-w-0 flex-1">{statusMessage}</p>
+                {onRetry ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
+                    onClick={onRetry}
+                    disabled={retryPending}
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    {retryPending ? "Retrying…" : "Retry"}
+                  </Button>
+                ) : null}
               </div>
             </Card>
           ) : null}

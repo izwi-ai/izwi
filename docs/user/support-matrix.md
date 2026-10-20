@@ -46,7 +46,7 @@ If another page says something different, this page should win.
 | **Single-host Linux server on NVIDIA GPU** | Supported / Preview by artifact | Use the Docker CUDA image/profile, or build from source with `--features cuda`. Native Linux release artifacts are CPU-only. |
 | **Windows desktop evaluation** | Stable CPU | Native Windows release artifacts are CPU-only. CUDA on Windows is source-build preview only. |
 | **Docker Compose on CPU** | Stable | Use the default `izwi` service. |
-| **Docker Compose on NVIDIA GPU** | Preview | Use `IZWI_API_KEY=<key> docker compose --profile cuda up`; the profile runs the `izwi-cuda` service, which binds `0.0.0.0` and therefore requires an API key, and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
+| **Docker Compose on NVIDIA GPU** | Preview | Use `IZWI_API_KEY=<key> docker compose --profile cuda up -d izwi-cuda`; name the `izwi-cuda` service, because the profile otherwise also starts the CPU `izwi` service on the same port. The `izwi-cuda` service binds `0.0.0.0` and therefore requires an API key, and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
 | **Kubernetes / Helm / multi-node production orchestration** | Not yet supported | Not published in OSS today. |
 
 ---
@@ -239,13 +239,11 @@ The load path currently publishes ABI-v2 state as follows:
 
 | Model family / route | ABI-v2 topology | Provider-promotion status |
 |---|---|---|
-| **Qwen3 chat** | Retained paged KV | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3.5 chat** | Composite retained paged/ring state | Portable route validated; eligible CUDA paged cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3.8 chat (`Qwen38Chat`)** | Composite retained paged/tensor state under an independent family contract | Separate conformance and backend evidence required; Qwen3.5 results do not certify this family |
-| **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
-| **LFM2 chat** | Retained paged attention plus transactional ShortConv ring state | Portable route validated; eligible accelerator cells remain unverified until hardware evidence is retained |
+| **LFM2.5 chat** | Retained paged attention plus transactional ShortConv ring state | Portable route validated; eligible accelerator cells remain unverified until hardware evidence is retained |
 | **LFM2.5 Audio** | Bounded invocation-scoped paged/ring/composite state | ABI-v2 physical ownership; no Optimized attestation |
 | **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite publishes both ASR routes | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
@@ -274,8 +272,7 @@ native CUDA ceilings are:
 |---|---:|---|
 | Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
 | Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
-| LFM2.5 chat | 128,000 tokens | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
-| Gemma 3 4B (catalog-disabled) | 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
+| LFM2.5 chat | 32,768 tokens (Izwi cap; the checkpoint advertises 128,000) | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
 
 Optional YaRN extensions are not included: the local adapters do not implement
 their scaling parameters. Qwen3.8 fits its effective context to remaining
@@ -343,8 +340,8 @@ Use the following expectations when validating a host:
 - **Apple Silicon, macOS 15+:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
 - **macOS 12-14:** run with `--backend cpu`; `auto` and explicit `metal` requests fall back to CPU.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Docker CUDA on NVIDIA Linux hosts:** run `IZWI_API_KEY=<key> docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` (with `Authorization: Bearer <key>`) or `izwi status --detailed` from a client environment that exports the same `IZWI_API_KEY`. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
-- **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
+- **Docker CUDA on NVIDIA Linux hosts:** run `IZWI_API_KEY=<key> docker compose --profile cuda up -d izwi-cuda`, then confirm the container selects CUDA through `/v1/health` (with `Authorization: Bearer <key>`) or `izwi status --detailed` from a client environment that exports the same `IZWI_API_KEY`. Eligible Candle FlashAttention and Qwen3/Qwen3.5 RoPE CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
+- **Linux/Windows source build for CUDA:** build with `cargo build --release -p izwi-cli -p izwi-server --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
 
 ---
 

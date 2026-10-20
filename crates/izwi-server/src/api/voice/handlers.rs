@@ -353,6 +353,12 @@ pub async fn delete_voice_session(
     if !deleted {
         return Err(ApiError::not_found("Voice session not found"));
     }
+    // The agent's memory of the session goes with it.
+    state
+        .chat_store
+        .delete_voice_threads(session_id.clone())
+        .await
+        .map_err(map_store_error)?;
     Ok(Json(serde_json::json!({
         "id": session_id,
         "deleted": true,

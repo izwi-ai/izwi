@@ -57,18 +57,24 @@ impl<O: ChatStreamObserver> ChatStreamObserver for AuditedStream<O> {
 }
 
 /// Streamed answer text on its way to the client: reasoning is split off
-/// first, then tool-call markup becomes `tool_calls`.
+/// (or, unsplit, gets back the opener the prompt held) first, then tool-call
+/// markup becomes `tool_calls`.
 struct AnswerStream {
     splitter: Option<super::reasoning::ReasoningSplitter>,
+    opener: super::reasoning::PromptOpener,
     tool_calls: Option<ToolCallParser>,
 }
 
 impl AnswerStream {
     fn new(format: AnswerFormat) -> Self {
+        let opened_in_prompt = format.reasoning_opened_in_prompt;
         Self {
             splitter: format
-                .reasoning
-                .map(super::reasoning::ReasoningSplitter::new),
+                .parse_reasoning
+                .then(|| super::reasoning::ReasoningSplitter::new(opened_in_prompt)),
+            opener: super::reasoning::PromptOpener::new(
+                opened_in_prompt && !format.parse_reasoning,
+            ),
             tool_calls: format.tool_calls.map(ToolCallParser::new),
         }
     }
@@ -77,7 +83,7 @@ impl AnswerStream {
     fn push(&mut self, text: &str) -> OpenAiDelta {
         let (reasoning, content) = match self.splitter.as_mut() {
             Some(splitter) => splitter.push(text),
-            None => (String::new(), text.to_string()),
+            None => (String::new(), self.opener.push(text)),
         };
         let parsed = match self.tool_calls.as_mut() {
             Some(parser) => parser.push(&content),

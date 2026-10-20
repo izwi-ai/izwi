@@ -53,17 +53,37 @@ pub struct CreateSavedVoiceRequest {
     pub source_route_kind: Option<SavedVoiceSourceRouteKind>,
     #[serde(default)]
     pub source_record_id: Option<String>,
+    /// The caller confirms it may clone this voice: it is theirs, or its
+    /// owner agreed. Required for every voice that is not designed.
+    #[serde(default)]
+    pub consent: Option<bool>,
+}
+
+/// Fields spelled out: `serde(flatten)` breaks numbers in query strings.
+#[derive(Debug, Default, Deserialize)]
+pub struct SavedVoiceListQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Case-insensitive search over names and reference text.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 pub async fn list_saved_voices(
     State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
+    Query(query): Query<SavedVoiceListQuery>,
 ) -> Result<Json<SavedVoiceListResponse>, ApiError> {
-    let limit = query.resolved_limit(SAVED_VOICE_LIST_LIMIT, 1000);
-    let cursor = query.decode_cursor::<SavedVoiceListCursor>()?;
+    let page = CursorPaginationQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+    };
+    let limit = page.resolved_limit(SAVED_VOICE_LIST_LIMIT, 1000);
+    let cursor = page.decode_cursor::<SavedVoiceListCursor>()?;
     let (voices, next_cursor) = state
         .saved_voice_store
-        .list_voices_page(limit, cursor)
+        .list_voices_page(limit, cursor, query.q.as_deref())
         .await
         .map_err(map_store_error)?;
 
@@ -126,6 +146,14 @@ pub async fn create_saved_voice(
 ) -> Result<Json<SavedVoice>, ApiError> {
     let name = required_trimmed(req.name.as_deref(), "name")?;
     let reference_text = required_trimmed(req.reference_text.as_deref(), "reference_text")?;
+    // A designed voice is synthetic; any other is someone's real voice.
+    if req.source_route_kind != Some(SavedVoiceSourceRouteKind::VoiceDesign)
+        && req.consent != Some(true)
+    {
+        return Err(ApiError::bad_request(
+            "Confirm you have permission to clone this voice (`consent: true`): it is yours, or its owner agreed.",
+        ));
+    }
 
     let audio_payload = req
         .audio_base64

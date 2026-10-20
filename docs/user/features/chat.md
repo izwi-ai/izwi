@@ -12,7 +12,7 @@ Have local conversations with chat models running on your own machine.
 Izwi chat provides:
 
 - **Local inference** — Model execution stays on-device
-- **Multiple model families** — Qwen3, Qwen3.5, Qwen3.8, LFM2.5, and Gemma
+- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, and LFM2.5
 - **System prompts** — Shape assistant behavior
 - **Streaming output** — Incremental response tokens
 - **Multimodal support (Qwen3.5 only)** — Image inputs in chat API requests
@@ -45,19 +45,20 @@ http://localhost:8080/chat
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--model`, `-m` | Chat model to use | `qwen3-0.6b-4bit` |
+| `--model`, `-m` | Chat model to use | The chat model the server has loaded, else `Qwen3.5-0.8B` |
 | `--system`, `-s` | System prompt | — |
-| `--voice`, `-v` | Voice for spoken responses | — |
+| `--thinking` | Let the model reason before it answers (models that can think); the reasoning is shown dimmed and kept out of the history | The model's own setting |
+| `--no-thinking` | Answer without reasoning first | The model's own setting |
 
-`qwen3-0.6b-4bit` remains the CLI default for backward compatibility.
-For new setups, prefer an enabled model from `izwi list`, such as `Qwen3.5-4B` or `Qwen3.5-9B`.
+Without `--model`, `izwi chat` uses the chat model the server has loaded, or `Qwen3.5-0.8B` when none is loaded (pull it first with `izwi pull Qwen3.5-0.8B`).
+Pick any enabled model from `izwi list`, such as `Qwen3.5-4B` or `Qwen3.5-9B`.
 
 Examples:
 
 ```bash
 izwi chat --system "You are a helpful coding assistant."
 izwi chat --model Qwen3.5-4B
-izwi chat --model Qwen3.5-4B
+izwi chat --model Qwen3.5-9B
 izwi chat --model LFM2.5-1.2B-Instruct-GGUF
 ```
 
@@ -135,6 +136,7 @@ streaming sequence.
 | Family | Models |
 |--------|--------|
 | Qwen3.5 | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
+| Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text only) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 

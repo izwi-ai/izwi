@@ -78,3 +78,30 @@ export function resolveSpeechVoiceLabel({
   }
   return "Generated voice";
 }
+
+const DOWNLOAD_NAME_MAX_CHARS = 60;
+
+/**
+ * A take's file name: the opening words of what it says, which name it
+ * better than its id. Characters file systems refuse are dropped.
+ */
+export function speechDownloadFilename(record: {
+  id: string;
+  input_text?: string | null;
+  input_preview?: string | null;
+  audio_mime_type: string;
+}): string {
+  const text = (record.input_text ?? record.input_preview ?? "")
+    .replace(/[\\/:*?"<>|]/g, " ")
+    .replace(/\p{Cc}/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const cut =
+    text.length > DOWNLOAD_NAME_MAX_CHARS
+      ? text.slice(0, DOWNLOAD_NAME_MAX_CHARS).replace(/\s+\S*$/, "")
+      : text;
+  const base = cut.replace(/[.\s]+$/, "") || `speech-${record.id.slice(0, 8)}`;
+  const subtype = record.audio_mime_type.split("/")[1]?.split(";")[0] ?? "";
+  const extension = subtype.includes("wav") ? "wav" : subtype || "audio";
+  return `${base}.${extension}`;
+}

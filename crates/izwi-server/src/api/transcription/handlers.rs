@@ -54,19 +54,18 @@ use crate::transcription_store::{
 use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
-    ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams, ModelVariant,
+    parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ModelVariant,
     RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
+use crate::api::summary::{
+    spawn_summary_generation, SummaryJob, SummaryKind, DEFAULT_SUMMARY_MODEL,
+};
 
 const DEFAULT_TRANSCRIPTION_ALIGNER_MODEL: &str = "Qwen3-ForcedAligner-0.6B";
 const DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL: &str = "Granite-Speech-4.1-2B-Plus";
-const DEFAULT_TRANSCRIPTION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
-const DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS: usize = 384;
-const TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT: &str = "You summarize transcripts for fast review. Return only the final summary text. Do not output markdown, bullet markers, XML tags, code fences, or <think> content. Keep the summary concise while covering key topics, decisions, action items, and unresolved questions when present.";
 const MAX_SEGMENT_WORDS: usize = 18;
 const MAX_SEGMENT_DURATION_SECS: f32 = 9.0;
 const MIN_SENTENCE_BREAK_WORDS: usize = 5;
@@ -74,6 +73,7 @@ const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
 const DURABLE_ASR_IDEMPOTENCY_OPERATION: &str = "transcription.create";
+const TRANSCRIPTION_CANCELLED_ERROR: &str = "Cancelled by user.";
 /// The upload is ingested and canonicalized while the key is reserved.
 const DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 5 * 60 * 1_000;
 #[cfg(not(test))]
@@ -243,20 +243,59 @@ pub async fn delete_record(
         "Cancelled because the transcription record was deleted",
     )
     .await?;
-    let deleted = state
+    state.transcription_tasks.abort(&record_id);
+    let Some(audio_storage_path) = state
         .transcription_store
         .delete_record(record_id.clone())
         .await
-        .map_err(map_store_error)?;
-
-    if !deleted {
+        .map_err(map_store_error)?
+    else {
         return Err(ApiError::not_found("Transcription record not found"));
+    };
+    if let Some(audio_storage_path) = audio_storage_path.as_deref() {
+        // The record is gone, so this only logs; the retention sweep
+        // removes whatever is left later.
+        if let Err(err) = delete_canonical_audio(&state, audio_storage_path).await {
+            tracing::warn!(
+                record_id,
+                "Failed to delete a deleted transcription's canonical audio: {err:#}"
+            );
+        }
     }
 
     Ok(Json(DeleteTranscriptionRecordResponse {
         id: record_id,
         deleted: true,
     }))
+}
+
+/// Delete the canonical 16 kHz copy made of an upload at ingest, so no copy
+/// of a deleted record's audio is kept until its job's retention runs out.
+async fn delete_canonical_audio(state: &AppState, source_storage_key: &str) -> anyhow::Result<()> {
+    let store = &state.batch_runtime_store;
+    let Some(source) = store
+        .get_media_asset_by_storage_key(source_storage_key)
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(canonical) = store
+        .get_canonical_media_asset(
+            &source.id,
+            CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    // Tombstone only once the object is gone: the retention sweep skips
+    // tombstoned rows, so a row left live is retried there.
+    state
+        .media_ingest
+        .delete_object(&canonical.storage_key)
+        .await?;
+    store.tombstone_media_asset(&canonical.id).await?;
+    Ok(())
 }
 
 /// Cancel the queued or running durable job behind a transcription record so
@@ -292,6 +331,111 @@ async fn cancel_active_transcription_job(
     Ok(())
 }
 
+/// Stop a transcription or speaker-attributed job that is still pending or
+/// processing. Its durable job is cancelled and the record fails with the
+/// reason; a job that already finished is returned as it is.
+pub async fn cancel_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+) -> Result<Json<TranscriptionRecord>, ApiError> {
+    let existing = state
+        .transcription_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    if !matches!(
+        existing.processing_status,
+        TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing
+    ) {
+        return Ok(Json(existing));
+    }
+    cancel_active_transcription_job(&state, &record_id, TRANSCRIPTION_CANCELLED_ERROR).await?;
+    state.transcription_tasks.abort(&record_id);
+    let record = state
+        .transcription_store
+        .cancel_record(record_id, TRANSCRIPTION_CANCELLED_ERROR.to_string())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    Ok(Json(record))
+}
+
+/// Run a finished transcription or speaker-attributed job again on its
+/// stored audio, with the same model, language, timestamps and summary
+/// choice, as a new record (as a diarization rerun does).
+pub async fn retry_record(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    Path(record_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let source = state
+        .transcription_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    if matches!(
+        source.processing_status,
+        TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing
+    ) {
+        return Err(ApiError::bad_request(
+            "This job is still running. Cancel it before retrying.",
+        ));
+    }
+    let audio = state
+        .transcription_store
+        .get_audio(record_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("The job's audio is no longer stored"))?;
+    let mut parsed = retry_create_request(&source, audio.audio_bytes);
+    prepare_create_request(&mut parsed)?;
+    let placeholder = create_pending_record(&state, &mut parsed).await?;
+    if let Err(err) = enqueue_batch_transcription_job(
+        &state,
+        &placeholder,
+        &parsed,
+        Some(ctx.correlation_id),
+        None,
+    )
+    .await
+    {
+        let _ = state
+            .transcription_store
+            .update_processing_status(
+                placeholder.id.clone(),
+                TranscriptionProcessingStatus::Failed,
+                Some(err.message.clone()),
+            )
+            .await;
+        return Err(err);
+    }
+    Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response())
+}
+
+/// The create request a retry runs: the source record's settings and audio.
+fn retry_create_request(
+    source: &TranscriptionRecord,
+    audio_bytes: Vec<u8>,
+) -> ParsedTranscriptionCreateRequest {
+    ParsedTranscriptionCreateRequest {
+        audio_bytes,
+        audio_mime_type: Some(source.audio_mime_type.clone()),
+        audio_filename: source.audio_filename.clone(),
+        duration_secs: source.duration_secs,
+        record_mode: source.transcription_mode,
+        model_id: source.model_id.clone(),
+        aligner_model_id: source.aligner_model_id.clone(),
+        language: source.language.clone(),
+        include_timestamps: source.aligner_model_id.is_some(),
+        stream: false,
+        generate_summary: source.summary_status != TranscriptionSummaryStatus::NotRequested,
+        min_speakers: None,
+        max_speakers: None,
+    }
+}
+
 pub async fn regenerate_summary(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -303,7 +447,7 @@ pub async fn regenerate_summary(
             record_id,
             UpdateTranscriptionSummary {
                 status: TranscriptionSummaryStatus::Pending,
-                model_id: Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL.to_string()),
+                model_id: Some(DEFAULT_SUMMARY_MODEL.to_string()),
                 text: None,
                 error: None,
                 updated_at: None,
@@ -942,28 +1086,11 @@ fn send_stream_event_lossy(
     }
 }
 
-const TRANSCRIPTION_STREAM_DISCONNECTED_ERROR: &str =
-    "Stream client disconnected; transcription was cancelled";
-
-/// Run `work` to completion, or until the SSE client reading `event_tx`
-/// disconnects. Dropping `work` drops the runtime call, whose pending-request
-/// guard cancels the engine request; long-form ASR then stops at its next
-/// chunk boundary instead of holding the model until the end of the file.
-/// Without a stream there is nobody to disconnect and `work` always finishes.
-async fn run_until_stream_disconnect<T>(
-    event_tx: Option<&mpsc::Sender<String>>,
-    work: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    let Some(event_tx) = event_tx else {
-        return Some(work.await);
-    };
-    tokio::select! {
-        biased;
-        output = work => Some(output),
-        _ = event_tx.closed() => None,
-    }
-}
-
+/// Run a streamed transcription in this process. The job outlives its SSE
+/// client: a reload or a closed window stops the events, not the job, and
+/// the job page follows it by polling. Cancelling the record aborts the task
+/// (`RecordTaskRegistry`), which drops the runtime call and with it
+/// the engine request.
 fn spawn_transcription_processing_task(
     state: AppState,
     record_id: String,
@@ -972,11 +1099,12 @@ fn spawn_transcription_processing_task(
     workload_class: WorkloadClass,
     event_tx: Option<mpsc::Sender<String>>,
 ) {
-    tokio::spawn(async move {
-        let transcription_store = state.transcription_store.clone();
-        let processing = process_transcription_record(
+    let tasks = state.transcription_tasks.clone();
+    let task_record_id = record_id.clone();
+    let task = tokio::spawn(async move {
+        let result = process_transcription_record(
             state,
-            record_id.clone(),
+            task_record_id,
             parsed,
             correlation_id,
             workload_class,
@@ -985,17 +1113,8 @@ fn spawn_transcription_processing_task(
             None,
             None,
             None,
-        );
-        let Some(result) = run_until_stream_disconnect(event_tx.as_ref(), processing).await else {
-            let _ = transcription_store
-                .update_processing_status(
-                    record_id,
-                    TranscriptionProcessingStatus::Failed,
-                    Some(TRANSCRIPTION_STREAM_DISCONNECTED_ERROR.to_string()),
-                )
-                .await;
-            return;
-        };
+        )
+        .await;
         if let Some(tx) = event_tx {
             let payload = match result {
                 Ok((record, _)) => serde_json::to_string(&StreamFinalEvent {
@@ -1012,6 +1131,7 @@ fn spawn_transcription_processing_task(
             send_transcription_terminal_events(tx, payload).await;
         }
     });
+    tasks.insert(&record_id, task.abort_handle());
 }
 
 async fn process_transcription_record(
@@ -1976,7 +2096,7 @@ fn initial_summary_state(
     } else {
         (
             TranscriptionSummaryStatus::Pending,
-            Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL.to_string()),
+            Some(DEFAULT_SUMMARY_MODEL.to_string()),
         )
     }
 }
@@ -2004,46 +2124,37 @@ fn spawn_summary_generation_task(
     transcription: String,
     correlation_id: Option<String>,
 ) {
-    tokio::spawn(async move {
-        let runtime = state.runtime.clone();
-        let transcription_store = state.transcription_store.clone();
-        let permit = match state
-            .acquire_owned_workload_permit(WorkloadClass::Background)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
-
-        let summary_result = if transcription.trim().is_empty() {
-            Err("Summary generation failed: transcription is empty".to_string())
-        } else {
-            generate_transcription_summary(
-                runtime,
-                transcription.as_str(),
-                correlation_id.as_deref(),
-                permit.runtime_context(),
-            )
-            .await
-        };
-
-        let summary_update = match summary_result {
+    let transcription_store = state.transcription_store.clone();
+    let job = match parse_chat_model_variant(Some(DEFAULT_SUMMARY_MODEL)) {
+        Ok(variant) => SummaryJob {
+            kind: SummaryKind::Transcript,
+            variant,
+            transcript: transcription,
+            correlation_id,
+            timeout_secs: state.request_timeout_secs,
+        },
+        Err(err) => {
+            tracing::error!("transcription summary model is invalid: {err}");
+            return;
+        }
+    };
+    spawn_summary_generation(state, job, move |result| async move {
+        let summary_update = match result {
             Ok(summary_text) => UpdateTranscriptionSummary {
                 status: TranscriptionSummaryStatus::Ready,
-                model_id: Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL.to_string()),
+                model_id: Some(DEFAULT_SUMMARY_MODEL.to_string()),
                 text: Some(summary_text),
                 error: None,
                 updated_at: None,
             },
             Err(err) => UpdateTranscriptionSummary {
                 status: TranscriptionSummaryStatus::Failed,
-                model_id: Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL.to_string()),
+                model_id: Some(DEFAULT_SUMMARY_MODEL.to_string()),
                 text: None,
-                error: Some(truncate_summary_error(err.as_str())),
+                error: Some(err),
                 updated_at: None,
             },
         };
-
         if let Err(err) = transcription_store
             .update_summary(record_id.clone(), summary_update)
             .await
@@ -2055,163 +2166,6 @@ fn spawn_summary_generation_task(
             );
         }
     });
-}
-
-async fn generate_transcription_summary(
-    runtime: Arc<RuntimeService>,
-    transcription: &str,
-    correlation_id: Option<&str>,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    let variant =
-        parse_chat_model_variant(Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL)).map_err(|err| {
-            format!("Invalid summary model '{DEFAULT_TRANSCRIPTION_SUMMARY_MODEL}': {err}")
-        })?;
-
-    let first = generate_transcription_summary_attempt(
-        runtime.clone(),
-        variant,
-        transcription,
-        correlation_id,
-        None,
-        runtime_context,
-    )
-    .await;
-    match first {
-        Ok(summary) => Ok(summary),
-        Err(err) if should_retry_transcription_summary_generation(&err) => {
-            tracing::warn!(
-                summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
-                error = %err,
-                "transcription summary sampled decode failed; retrying with thinking disabled"
-            );
-            generate_transcription_summary_attempt(
-                runtime,
-                variant,
-                transcription,
-                correlation_id,
-                Some(false),
-                runtime_context,
-            )
-            .await
-            .map_err(|retry_err| format!("{err}; retry with thinking disabled failed: {retry_err}"))
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn generate_transcription_summary_attempt(
-    runtime: Arc<RuntimeService>,
-    variant: ModelVariant,
-    transcription: &str,
-    correlation_id: Option<&str>,
-    enable_thinking: Option<bool>,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    let generation = runtime
-        .chat_generate_with_runtime_context(
-            variant,
-            transcription_summary_messages(transcription),
-            transcription_summary_params(),
-            // Long transcripts keep fitting the summary model by trimming the
-            // output budget, as before D8.
-            ChatRequestConfig {
-                enable_thinking,
-                truncation: ChatTruncation::Auto,
-                ..Default::default()
-            },
-            correlation_id,
-            runtime_context,
-        )
-        .await
-        .map_err(|err| format!("Summary generation failed: {err}"))?;
-
-    sanitize_summary_output(generation.text.as_str())
-        .ok_or_else(|| "Summary generation returned empty text".to_string())
-}
-
-fn transcription_summary_params() -> GenerationParams {
-    GenerationParams {
-        max_tokens: DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS,
-        temperature: 0.2,
-        top_p: 0.9,
-        ..Default::default()
-    }
-}
-
-fn transcription_summary_messages(transcription: &str) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            role: ChatRole::System,
-            content: TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT.to_string(),
-        },
-        ChatMessage {
-            role: ChatRole::User,
-            content: format!(
-                "Summarize the following transcript.\n\nTranscript:\n{}",
-                transcription
-            ),
-        },
-    ]
-}
-
-fn should_retry_transcription_summary_generation(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("no valid qwen3.5 logits to sample")
-        || normalized.contains("non-finite")
-        || (normalized.contains("logit") && normalized.contains("nan"))
-}
-
-fn sanitize_summary_output(raw: &str) -> Option<String> {
-    let without_think = strip_think_sections(raw);
-    let without_fence_markers = strip_code_fence_markers(without_think.as_str());
-    let normalized = without_fence_markers
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn strip_think_sections(input: &str) -> String {
-    let mut out = if let Some((_, tail)) = input.rsplit_once("</think>") {
-        tail.to_string()
-    } else {
-        input.to_string()
-    };
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-
-    while let Some(start) = out.find(open_tag) {
-        if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
-            let end = start + open_tag.len() + end_rel;
-            let mut next = String::with_capacity(out.len());
-            next.push_str(&out[..start]);
-            next.push_str(&out[end + close_tag.len()..]);
-            out = next;
-        } else {
-            out.truncate(start);
-            break;
-        }
-    }
-
-    out.replace(open_tag, " ").replace(close_tag, " ")
-}
-
-fn strip_code_fence_markers(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn truncate_summary_error(raw: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 320;
-    raw.chars().take(MAX_ERROR_CHARS).collect::<String>()
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
@@ -2241,12 +2195,9 @@ mod tests {
     use super::{
         alignments_to_word_records, asr_queue_class, build_segment_records,
         duration_secs_from_millis, initial_summary_state, multipart_field_api_error, parse_bool,
-        parse_create_request, progress_event_payload, run_until_stream_disconnect,
-        sanitize_summary_output, send_stream_event_lossy, send_transcription_terminal_events,
-        should_retry_transcription_summary_generation, transcription_summary_messages,
-        transcription_summary_params, validate_batch_transcription_model, QueueClass,
-        TranscriptionSummaryStatus, TranscriptionWordRecord,
-        TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+        parse_create_request, progress_event_payload, send_stream_event_lossy,
+        send_transcription_terminal_events, validate_batch_transcription_model, QueueClass,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
     use super::{
         prepare_create_request, ParsedTranscriptionCreateRequest, TranscriptionRecordMode,
@@ -2600,8 +2551,11 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// A streamed job keeps running when its client goes; cancelling the
+    /// record aborts the task, which drops the runtime call so its request
+    /// guard cancels the engine request.
     #[tokio::test]
-    async fn stream_disconnect_drops_the_transcription_work() {
+    async fn cancelling_aborts_a_registered_transcription_task() {
         struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for DropFlag {
             fn drop(&mut self) {
@@ -2611,38 +2565,26 @@ mod tests {
 
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = DropFlag(dropped.clone());
-        let (event_tx, event_rx) = mpsc::channel::<String>(1);
-        let work = async move {
+        let tasks = crate::state::RecordTaskRegistry::default();
+        let task = tokio::spawn(async move {
             let _flag = flag;
             std::future::pending::<()>().await;
-        };
-        let driver = tokio::spawn(async move {
-            let outcome = run_until_stream_disconnect(Some(&event_tx), work).await;
-            (outcome, event_tx)
         });
+        tasks.insert("record-1", task.abort_handle());
         tokio::task::yield_now().await;
         assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!tasks.abort("other-record"));
 
-        drop(event_rx);
-        let (outcome, _event_tx) = tokio::time::timeout(Duration::from_secs(1), driver)
-            .await
-            .expect("a disconnect must end the stream task")
-            .unwrap();
-        assert!(outcome.is_none());
+        assert!(tasks.abort("record-1"));
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
         assert!(
             dropped.load(std::sync::atomic::Ordering::Acquire),
             "the runtime call must be dropped so its request guard cancels"
         );
-    }
-
-    #[tokio::test]
-    async fn work_without_a_stream_runs_to_completion() {
-        let outcome = run_until_stream_disconnect(None, async { 7 }).await;
-        assert_eq!(outcome, Some(7));
-        let (event_tx, event_rx) = mpsc::channel::<String>(1);
-        let outcome = run_until_stream_disconnect(Some(&event_tx), async { 8 }).await;
-        assert_eq!(outcome, Some(8));
-        drop(event_rx);
+        assert!(
+            !tasks.abort("record-1"),
+            "a cancelled task leaves the registry"
+        );
     }
 
     #[tokio::test]
@@ -2729,52 +2671,5 @@ mod tests {
         let (status, model_id) = initial_summary_state("   ", true);
         assert_eq!(status, TranscriptionSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
-    }
-
-    #[test]
-    fn sanitizes_summary_output_for_display_and_storage() {
-        let raw = "<think>reasoning</think>\n```text\nThis is the summary.\n```\n";
-        assert_eq!(
-            sanitize_summary_output(raw).as_deref(),
-            Some("This is the summary.")
-        );
-
-        let close_only = "planning first</think>\nFinal summary";
-        assert_eq!(
-            sanitize_summary_output(close_only).as_deref(),
-            Some("Final summary")
-        );
-    }
-
-    #[test]
-    fn transcription_summary_uses_sampled_qwen35_settings() {
-        let params = transcription_summary_params();
-        assert_eq!(params.max_tokens, 384);
-        assert_eq!(params.temperature, 0.2);
-        assert_eq!(params.top_p, 0.9);
-
-        let messages = transcription_summary_messages("hello world");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, izwi_core::ChatRole::System);
-        assert!(messages[1].content.contains("hello world"));
-    }
-
-    #[test]
-    fn transcription_summary_retries_invalid_qwen35_logits() {
-        assert!(should_retry_transcription_summary_generation(
-            "Summary generation failed: Inference error: No valid Qwen3.5 logits to sample"
-        ));
-        assert!(should_retry_transcription_summary_generation(
-            "Summary generation failed: non-finite logits"
-        ));
-        assert!(should_retry_transcription_summary_generation(
-            "Summary generation failed: logits contained NaN values"
-        ));
-        assert!(!should_retry_transcription_summary_generation(
-            "Summary generation failed: Model not found"
-        ));
-        assert!(!should_retry_transcription_summary_generation(
-            "Summary generation failed: missing banana model"
-        ));
     }
 }

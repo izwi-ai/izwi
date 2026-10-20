@@ -25,12 +25,13 @@ Starts an interactive chat session with a loaded chat model. Type messages and r
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-m, --model <MODEL>` | Chat model to use | `qwen3-0.6b-4bit` |
+| `-m, --model <MODEL>` | Chat model to use | The chat model the server has loaded, else `Qwen3.5-0.8B` |
 | `-s, --system <PROMPT>` | System prompt | — |
-| `-v, --voice <VOICE>` | Voice for spoken responses | — |
+| `--thinking` | Let the model reason before it answers (models that can think); the reasoning is shown dimmed and kept out of the history | The model's own setting |
+| `--no-thinking` | Answer without reasoning first | — |
 
-`qwen3-0.6b-4bit` remains the CLI default for backward compatibility.
-For new setups, use an enabled catalog ID from `izwi list` (for example `Qwen3.5-4B`, `Qwen3.5-9B`, or `Qwen3.8-27B-FP8`). Model IDs are accepted as free-form strings, so no CLI upgrade-specific enum is required when a new server catalog model is added.
+When no chat model is loaded, the CLI uses `Qwen3.5-0.8B`; pull it first with `izwi pull Qwen3.5-0.8B`. There is no default system prompt; set one with `--system`.
+Use an enabled catalog ID from `izwi list` (for example `Qwen3.5-4B`, `Qwen3.5-9B`, or `Qwen3.8-27B-FP8`). Model IDs are accepted as free-form strings, so no CLI upgrade-specific enum is required when a new server catalog model is added.
 The CLI forwards `Qwen3.8-27B-FP8` unchanged; the server routes it through the
 separate `Qwen38Chat` family rather than Qwen3.5.
 
@@ -54,15 +55,15 @@ izwi chat --system "You are a helpful coding assistant"
 
 ```bash
 izwi chat --model Qwen3.5-4B
-izwi chat --model Qwen3.5-4B
+izwi chat --model Qwen3.5-9B
 izwi chat --model Qwen3.8-27B-FP8
 izwi chat --model LFM2.5-1.2B-Instruct-GGUF
 ```
 
-### With voice responses
+### Without reasoning
 
 ```bash
-izwi chat --voice default
+izwi chat --model Qwen3.5-4B --no-thinking
 ```
 
 ---
@@ -74,8 +75,10 @@ During a chat session:
 | Command | Action |
 |---------|--------|
 | Type message + Enter | Send message |
-| `exit` or `quit` | End session |
-| `clear` | Clear conversation |
+| `/quit` (or `/exit`, `/q`) | End session |
+| `/clear` | Clear conversation |
+| `/help` | Show the commands |
+| `Ctrl+D` | End session |
 | `Ctrl+C` | Exit immediately |
 
 ---

@@ -2,6 +2,7 @@ pub mod cli;
 
 use crate::commands;
 use crate::error::Result;
+use crate::http;
 use crate::style::Theme;
 use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 use std::path::PathBuf;
@@ -12,11 +13,13 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
     let Cli {
         command,
         config,
-        server,
+        server: raw_server,
         output_format,
         quiet,
         ..
     } = cli;
+    // Only the commands that call the server need a valid URL.
+    let server = || http::normalize_server_url(&raw_server);
 
     match command {
         Commands::Serve {
@@ -75,16 +78,16 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             .await?;
         }
         Commands::Models { command } => {
-            commands::models::execute(command, &server, output_format, quiet).await?;
+            commands::models::execute(command, &server()?, output_format, &theme).await?;
         }
         Commands::Pull { model, force, yes } => {
-            commands::pull::execute(model, force, yes, &server, &theme).await?;
+            commands::pull::execute(model, force, yes, &server()?, &theme).await?;
         }
         Commands::Rm { model, yes } => {
-            commands::rm::execute(model, yes, &server, &theme).await?;
+            commands::rm::execute(model, yes, &server()?, &theme).await?;
         }
         Commands::List { local, detailed } => {
-            commands::list::execute(local, detailed, &server, output_format).await?;
+            commands::list::execute(local, detailed, &server()?, output_format).await?;
         }
         Commands::Tts {
             text,
@@ -100,7 +103,6 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             speed,
             temperature,
             stream,
-            allow_format_fallback,
             play,
         } => {
             commands::tts::execute(
@@ -118,10 +120,9 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     speed,
                     temperature,
                     stream,
-                    allow_format_fallback,
                     play,
                 },
-                &server,
+                &server()?,
                 &theme,
             )
             .await?;
@@ -147,22 +148,27 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     output,
                     word_timestamps,
                 },
-                &server,
+                &server()?,
             )
             .await?;
         }
         Commands::Chat {
             model,
             system,
-            voice,
+            thinking,
+            no_thinking,
         } => {
             commands::chat::execute(
                 commands::chat::ChatArgs {
                     model,
                     system,
-                    voice,
+                    thinking: match (thinking, no_thinking) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
                 },
-                &server,
+                &server()?,
                 &theme,
             )
             .await?;
@@ -186,7 +192,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     transcribe,
                     asr_model,
                 },
-                &server,
+                &server()?,
             )
             .await?;
         }
@@ -205,15 +211,15 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     format,
                     output,
                 },
-                &server,
+                &server()?,
             )
             .await?;
         }
         Commands::Bench { command } => {
-            commands::bench::execute(command, &server, output_format, quiet, &theme).await?;
+            commands::bench::execute(command, &server()?, output_format, quiet, &theme).await?;
         }
         Commands::Status { detailed, watch } => {
-            commands::status::execute(detailed, watch, &server, &theme).await?;
+            commands::status::execute(detailed, watch, &server()?, &theme).await?;
         }
         Commands::Version { full } => {
             commands::version::execute(full, &theme);

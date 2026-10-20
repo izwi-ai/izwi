@@ -9,12 +9,10 @@ import { useAudioPlayback } from "@/components/audio/useAudioPlayback";
 import { FactsList, formatProcessingFact } from "@/components/FactsList";
 import { formatClockDuration } from "@/components/history/format";
 import { Card, CardContent } from "@/components/ui/card";
-import { StatusBadge } from "@/components/ui/status-badge";
 import type { TranscriptionRecord } from "@/api";
 import {
   normalizeSummaryStatus,
   summaryStatusLabel,
-  summaryStatusTone,
 } from "@/features/transcription/playground/support";
 import {
   transcriptionEntriesFromRecord,
@@ -249,9 +247,11 @@ export function TranscriptionReviewWorkspace({
               <h3 className="text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
                 Summary
               </h3>
-              <StatusBadge tone={summaryStatusTone(summaryStatus)}>
-                {summaryStatusLabel(summaryStatus)}
-              </StatusBadge>
+              {summaryStatus !== "ready" ? (
+                <span className="text-xs text-[var(--text-muted)]">
+                  {summaryStatusLabel(summaryStatus)}
+                </span>
+              ) : null}
             </div>
             {summaryText ? (
               <p className="mt-2 text-[15px] leading-7 text-[var(--text-secondary)]">
@@ -308,7 +308,7 @@ export function TranscriptionReviewWorkspace({
                       </div>
                       {active ? (
                         <span
-                          className="rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em]"
+                          className="rounded-full px-2 py-0.5 text-[11px] font-medium"
                           style={{
                             color: ACCENT_SOLID,
                             backgroundColor: ACCENT_SOFT,

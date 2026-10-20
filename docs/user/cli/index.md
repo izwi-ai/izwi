@@ -6,7 +6,7 @@ icon: "terminal"
 ---
 ## Installation
 
-The CLI is installed automatically with Izwi. Verify installation:
+The `.deb` installs `izwi` to `/usr/bin`. With the macOS, Windows or AppImage app, open **Settings > System > Command line tool** and select **Install**. Source installs (`./scripts/install-cli.sh`) put it in `~/.local/bin`. Verify installation:
 
 ```bash
 izwi --version
@@ -20,14 +20,16 @@ These options work with all commands:
 
 | Option | Description |
 |--------|-------------|
-| `--server <URL>` | Server URL (default: `http://localhost:8080`) |
+| `--server <URL>` | Server URL (default: `http://localhost:8080`; `http://` is assumed when no scheme is given) |
 | `--config <PATH>` | Configuration file path |
-| `--output-format <FORMAT>` | Output format: `table`, `json`, `plain`, `yaml` |
+| `--output-format <FORMAT>` | Output format: `table`, `json`, `plain` |
 | `--quiet` | Suppress all output except results |
 | `--verbose` | Enable verbose output |
 | `--no-color` | Disable colored output |
 | `--help` | Show help information |
 | `--version` | Show version |
+
+When a command fails, it prints one line to stderr, `error: <message>` (for a server error, the server's message), and exits with status 1.
 
 ---
 
@@ -84,7 +86,7 @@ izwi serve --port 9000
 
 ```bash
 izwi list
-izwi pull Qwen3-TTS-12Hz-0.6B-Base
+izwi pull Kokoro-82M
 izwi list --local
 ```
 
@@ -145,7 +147,7 @@ izwi tts --help
 | `IZWI_PORT` | Server port |
 | `IZWI_MODELS_DIR` | Models directory |
 | `IZWI_BACKEND` | Backend preference (`auto`, `cpu`, `metal`, `cuda`) |
-| `IZWI_MAX_BATCH_SIZE` | Maximum batch size |
+| `IZWI_MAX_BATCH_SIZE` | Physical tensor batch width (`auto` or a positive row count) |
 | `IZWI_MAX_CONCURRENT` | Maximum concurrent requests |
 | `IZWI_TIMEOUT` | Request timeout (seconds) |
 | `RUST_LOG` | Log level |

@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,8 +13,8 @@ vi.mock("@/api", () => ({
   api: { getHealth: vi.fn(() => new Promise(() => {})) },
 }));
 
-vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
-  FirstRunOnboarding: () => null,
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  FirstRunGate: ({ children }: { children: ReactNode }) => children,
 }));
 
 vi.mock("@/app/providers/AppUpdateProvider", () => ({
@@ -57,7 +57,6 @@ describe("AppLayout model catalog recovery", () => {
             element={
               <AppLayout
                 readyModelsCount={0}
-                selectedModelLabel={null}
                 catalogError="Local model service is offline"
                 onRetryModelCatalog={onRetryModelCatalog}
               />
@@ -69,15 +68,13 @@ describe("AppLayout model catalog recovery", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Model service unavailable",
-    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load models");
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Local model service is offline",
     );
     expect(screen.getByText("Models route content")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     await waitFor(() => expect(onRetryModelCatalog).toHaveBeenCalledTimes(1));
   });
@@ -97,7 +94,6 @@ describe("AppLayout model catalog recovery", () => {
               element={
                 <AppLayout
                   readyModelsCount={0}
-                  selectedModelLabel={null}
                   catalogError={null}
                   onRetryModelCatalog={vi.fn().mockResolvedValue(undefined)}
                 />
@@ -110,7 +106,7 @@ describe("AppLayout model catalog recovery", () => {
       );
 
       expect(await screen.findByRole("alert")).toHaveTextContent(
-        "This page could not be opened",
+        "This page hit a problem",
       );
       expect(screen.getByRole("link", { name: "Voice" })).toBeVisible();
     } finally {

@@ -38,6 +38,8 @@ Displays the current state of the Izwi server, including health, loaded models, 
 izwi status
 ```
 
+`izwi status` exits with status 1 when the server is unreachable or unhealthy, so scripts can use it as a check.
+
 ### Detailed metrics
 
 ```bash
@@ -69,12 +71,11 @@ Updates every 2 seconds. Press `Ctrl+C` to stop.
 
 The status command shows:
 
-- **Server health** — Running, stopped, or error
+- **Server health** — Healthy, or Unhealthy with the HTTP status; an unreachable server is an error
 - **Loaded models** — Currently loaded models
 - **Runtime backend** — Requested backend, selected backend, and fallback reason
 - **Compiled backends** — CPU / Metal / CUDA support built into the server binary
 - **Device summary** — Capability details reported by the selected device
-- **Active requests** — Current request count
 
 ---
 

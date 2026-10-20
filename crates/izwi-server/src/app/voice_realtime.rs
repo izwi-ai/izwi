@@ -66,6 +66,8 @@ const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
 /// A spoken reply's default token budget: a few sentences, not an essay
 /// (SPK-F2). Clients may raise it with `max_output_tokens`.
 const VOICE_DEFAULT_MAX_OUTPUT_TOKENS: usize = 384;
+const VOICE_EMPTY_REPLY_ERROR: &str =
+    "The model gave no answer to speak. Try again, or choose another chat model.";
 /// The conversation history a voice turn's prompt carries (SPK-F13).
 const VOICE_HISTORY_BUDGET: HistoryBudget = HistoryBudget {
     max_messages: 24,
@@ -1884,7 +1886,9 @@ async fn handle_text_message(
                             "Model `{asr_model_id}` is not a supported modular ASR model."
                         ));
                     }
-                    let _ = resolve_chat_model_id(Some(text_model_id.as_str()))?;
+                    let text_variant = parse_chat_model_variant(Some(text_model_id.as_str()))
+                        .map_err(|err| format!("Invalid chat model: {err}"))?;
+                    validate_realtime_text_model(text_variant)?;
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
@@ -2339,7 +2343,12 @@ fn spawn_turn_task(
                     );
 
                     let agent_session_id = agent_session
-                        .ensure(&state, &system_prompt, &config.text_model_id)
+                        .ensure(
+                            &state,
+                            &voice_session_id,
+                            &system_prompt,
+                            &config.text_model_id,
+                        )
                         .await?;
                     let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
                         .map_err(|err| format!("Invalid chat model: {err}"))?;
@@ -2373,6 +2382,10 @@ fn spawn_turn_task(
                         })
                         .await?;
                         let assistant_text = strip_reasoning(&raw_text);
+                        // Silence is not an answer: the turn fails and says so.
+                        if assistant_text.is_empty() {
+                            return Err(VOICE_EMPTY_REPLY_ERROR.to_string());
+                        }
                         send_turn_json(
                             &out_tx,
                             output_generation,
@@ -3008,6 +3021,21 @@ async fn speak_reply(
 /// with here, and one that does not stream would delay the first audio to
 /// the end (TPIPE-21). The admin `voice_realtime_modular_tts` flag uses the
 /// same check.
+/// The voice chat model must answer without reasoning: a model that always
+/// reasons (LFM2.5 Thinking) spends the reply on thoughts no one hears.
+pub(crate) fn validate_realtime_text_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
+    let always_reasons = variant
+        .chat_capabilities()
+        .is_some_and(|caps| caps.supports_thinking && !caps.thinking_toggleable);
+    if always_reasons {
+        return Err(format!(
+            "`{}` always thinks before it answers, so it can't hold a voice conversation. Choose another chat model.",
+            variant.dir_name()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
     let capabilities = variant
         .speech_capabilities()
@@ -3305,6 +3333,18 @@ fn interrupt_active_turn(
     };
     out_tx.cutoff_turn(turn.output_generation);
     if turn.task.is_finished() {
+        // The reply was all sent and its `turn_done` too, but the client may
+        // still be playing it: tell it to stop now instead of when the user
+        // stops talking.
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_interrupted",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+                "reason": reason,
+            }),
+        );
         return false;
     }
 
@@ -3371,6 +3411,7 @@ impl AgentSessionSlot {
     async fn ensure(
         &self,
         state: &AppState,
+        voice_session_id: &str,
         system_prompt: &str,
         text_model_id: &str,
     ) -> Result<String, String> {
@@ -3382,9 +3423,11 @@ impl AgentSessionSlot {
         }
 
         let model_id = resolve_chat_model_id(Some(text_model_id))?;
+        // The thread is the agent's memory for this voice session: not a
+        // Chat thread, and deleted with the session.
         let thread = state
             .chat_store
-            .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
+            .create_voice_thread(voice_session_id.to_string(), Some(model_id.clone()))
             .await
             .map_err(|err| format!("Chat storage error: {err:#}"))?;
 
@@ -4297,6 +4340,37 @@ mod tests {
             .map(|event| event["type"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(types, ["turn_interrupted", "turn_done"]);
+    }
+
+    /// A barge-in on a reply whose turn already finished (all of it sent,
+    /// still playing on the client) stops the client's playback; the turn's
+    /// `turn_done` was already sent, so only the interruption is.
+    #[tokio::test]
+    async fn barge_in_stops_a_finished_reply_still_playing() {
+        let (_dir, state) = test_app_state(1);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut active = Some(ActiveTurn {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_record_id: "turn-1".to_string(),
+            state: state.clone(),
+            conversation: Arc::default(),
+            task: finished,
+            control: TurnControl::new(Instant::now()),
+            output_generation: 1,
+        });
+
+        assert!(!interrupt_active_turn(&out_tx, &mut active, "barge_in"));
+        assert!(active.is_none());
+        let events = drain_text(&out_tx).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "turn_interrupted");
+        assert_eq!(events[0]["utterance_seq"], 1);
+        assert_eq!(events[0]["reason"], "barge_in");
     }
 
     /// SPK-F21: starting an input stream loads and leases its models in the

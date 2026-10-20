@@ -140,6 +140,10 @@ pub(crate) struct ModelLifecycleController {
     /// budget/pressure eviction and idle-TTL reaping until explicitly
     /// unloaded. Session-scoped.
     pub(super) pinned_variants: Mutex<HashSet<ModelVariant>>,
+    /// Residents loaded on request without a pin: the idle reaper keeps
+    /// them, but a load that needs their room evicts them like any idle
+    /// model. Session-scoped.
+    pub(super) kept_variants: Mutex<HashSet<ModelVariant>>,
     pub(super) mutation_gate: Mutex<()>,
     /// The latest load's admission warning per model (a Metal load larger
     /// than the host memory macOS reports available), taken by the caller
@@ -187,6 +191,7 @@ impl ModelLifecycleController {
             realtime_asr_sequence_capacity,
             model_last_used: Mutex::new(HashMap::new()),
             pinned_variants: Mutex::new(HashSet::new()),
+            kept_variants: Mutex::new(HashSet::new()),
             mutation_gate: Mutex::new(()),
             load_warnings: StdMutex::new(HashMap::new()),
             state: StdMutex::new(LifecycleState::default()),

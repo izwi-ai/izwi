@@ -2,5 +2,5 @@
 
 pub mod completions;
 pub mod dto;
-pub mod reasoning;
+pub use izwi_model_catalog::chat::reasoning;
 pub mod stream;

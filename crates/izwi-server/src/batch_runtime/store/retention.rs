@@ -342,7 +342,9 @@ impl BatchRuntimeStore {
     /// `default`-labelled input media that has outlived everything that
     /// used it: its job (swept after job retention) and its product record
     /// (deleted by the user). A transcription's canonical WAV goes with its
-    /// job while the record keeps the upload. Media no record ever took up
+    /// job while the record keeps the upload; deleting the record deletes
+    /// it at once (this sweep retries a delete that failed). Media no
+    /// record ever took up
     /// (an upload whose job was never accepted) goes once it is older than
     /// the ephemeral retention. Media a saved voice, a history item or
     /// another record still uses, and the canonical copy of a saved voice's

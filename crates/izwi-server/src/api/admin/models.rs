@@ -1,12 +1,12 @@
 //! Model management API endpoints
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Sse,
     Json,
 };
 use futures::stream::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -15,9 +15,9 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
-use crate::error::{core_api_error, ApiError};
+use crate::error::{core_api_error, ApiError, ErrorClass};
 use crate::state::AppState;
-use izwi_core::model::download::DownloadState;
+use izwi_core::model::download::{download_disk_required_bytes, DownloadState};
 use izwi_core::{
     parse_model_variant, removed_model_variant, ChatModelCapabilities, ChatReasoningEffort,
     ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
@@ -87,6 +87,18 @@ pub struct AdminModelInfo {
     pub estimated_size_bytes: u64,
     /// Catalog estimate of memory needed to run the model, in GB.
     pub memory_required_gb: f32,
+    /// Memory the model needs to load, in bytes: the catalog's estimate,
+    /// which is all there is before the model is downloaded.
+    pub estimated_memory_bytes: u64,
+    /// Whether the model can load on this device at all: `fits`,
+    /// `too_large` (it needs more memory than loads here are planned
+    /// against) or `unknown`. Other loaded models may still have to make
+    /// room for one that fits.
+    pub device_fit: String,
+    /// Free disk a download of the model needs: its files, plus the
+    /// checkpoint a `.nemo` archive unpacks on first load. 0 once
+    /// downloaded.
+    pub disk_required_bytes: u64,
     pub enabled: bool,
     pub license: Option<String>,
     pub status: String,
@@ -129,6 +141,8 @@ pub struct AdminSpeechModelCapabilities {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AdminChatModelCapabilities {
     pub supports_thinking: bool,
+    /// False when the model always reasons: a thinking switch would do nothing.
+    pub thinking_toggleable: bool,
     pub default_thinking_enabled: bool,
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
@@ -190,6 +204,9 @@ pub struct AdminModelDownloadProgressEvent {
     pub files_total: usize,
     pub percent: f32,
     pub status: String,
+    /// Why the download failed, on an `error` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl From<ModelInfo> for AdminModelInfo {
@@ -211,6 +228,17 @@ impl AdminModelInfo {
             task: variant.primary_task().as_str().to_string(),
             estimated_size_bytes: variant.estimated_size(),
             memory_required_gb: variant.memory_required_gb(),
+            estimated_memory_bytes: 0,
+            device_fit: DEVICE_FIT_UNKNOWN.to_string(),
+            disk_required_bytes: match info.status {
+                ModelStatus::NotDownloaded | ModelStatus::Downloading | ModelStatus::Error => {
+                    download_disk_required_bytes(
+                        variant,
+                        info.size_bytes.unwrap_or_else(|| variant.estimated_size()),
+                    )
+                }
+                ModelStatus::Downloaded | ModelStatus::Loading | ModelStatus::Ready => 0,
+            },
             enabled: info.enabled,
             license: variant.license_label().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
@@ -240,10 +268,33 @@ impl AdminModelInfo {
     }
 }
 
+const DEVICE_FIT_UNKNOWN: &str = "unknown";
+
+impl AdminModelInfo {
+    /// The memory the model needs against what loads on this device are
+    /// planned against.
+    fn with_device_fit(
+        mut self,
+        runtime: &izwi_core::RuntimeService,
+        variant: ModelVariant,
+    ) -> Self {
+        let needed = runtime.estimated_model_load_bytes(variant);
+        self.estimated_memory_bytes = needed;
+        self.device_fit = match runtime.model_capacity_bytes() {
+            Some(capacity) if needed > capacity => "too_large",
+            Some(_) => "fits",
+            None => DEVICE_FIT_UNKNOWN,
+        }
+        .to_string();
+        self
+    }
+}
+
 impl From<ChatModelCapabilities> for AdminChatModelCapabilities {
     fn from(capabilities: ChatModelCapabilities) -> Self {
         Self {
             supports_thinking: capabilities.supports_thinking,
+            thinking_toggleable: capabilities.thinking_toggleable,
             default_thinking_enabled: capabilities.default_thinking_enabled,
             reasoning_efforts: capabilities
                 .reasoning_efforts
@@ -454,7 +505,8 @@ pub async fn list_models(
                 let diagnostics = runtime_diagnostics.get(info.variant.dir_name()).cloned();
                 let pinned = pinned_variants.contains(&info.variant);
                 let variant = info.variant;
-                let mut model = AdminModelInfo::from_model_info(info, diagnostics, pinned);
+                let mut model = AdminModelInfo::from_model_info(info, diagnostics, pinned)
+                    .with_device_fit(&state.runtime, variant);
                 if let Some(speech) = model.speech_capabilities.as_mut() {
                     speech.streaming_mode =
                         Some(state.runtime.tts_streaming_mode(variant).as_str());
@@ -488,7 +540,8 @@ pub async fn get_model_info(
         info,
         runtime_diagnostics.get(variant.dir_name()).cloned(),
         pinned,
-    );
+    )
+    .with_device_fit(&state.runtime, variant);
     if let Some(speech) = model.speech_capabilities.as_mut() {
         speech.streaming_mode = Some(state.runtime.tts_streaming_mode(variant).as_str());
     }
@@ -554,24 +607,132 @@ pub async fn download_model(
     }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct LoadModelQuery {
+    /// Keep the model loaded until it is unloaded (the default). With
+    /// `false` it stays loaded while idle, but a load that needs its room
+    /// evicts it.
+    #[serde(default)]
+    pub pin: Option<bool>,
+}
+
 /// Load a model into memory
 pub async fn load_model(
     State(state): State<AppState>,
     Path(variant): Path<String>,
+    Query(query): Query<LoadModelQuery>,
 ) -> Result<Json<DownloadResponse>, ApiError> {
     let variant = parse_variant(&variant)?;
     info!("Loading model: {}", variant);
 
-    state
-        .runtime
-        .load_model(variant)
-        .await
-        .map_err(core_api_error)?;
+    let loaded = if query.pin.unwrap_or(true) {
+        state.runtime.load_model(variant).await
+    } else {
+        state.runtime.load_model_unpinned(variant).await
+    };
+    loaded.map_err(core_api_error)?;
 
     Ok(Json(DownloadResponse {
         status: "loaded",
         message: format!("Model {} loaded successfully", variant),
         warning: state.runtime.take_load_warning(variant),
+    }))
+}
+
+/// Keep a loaded model loaded until it is unloaded: other loads cannot
+/// evict it.
+pub async fn pin_model(
+    State(state): State<AppState>,
+    Path(variant): Path<String>,
+) -> Result<Json<DownloadResponse>, ApiError> {
+    let variant = parse_variant(&variant)?;
+    if !state.runtime.pin_resident_model(variant).await {
+        return Err(ApiError::of(
+            ErrorClass::Conflict,
+            format!("{} is not loaded: load it first", variant.display_name()),
+        ));
+    }
+    Ok(Json(DownloadResponse {
+        status: "pinned",
+        message: format!(
+            "{} stays loaded until you unload it",
+            variant.display_name()
+        ),
+        warning: None,
+    }))
+}
+
+/// Let other loads evict a loaded model when they need its room.
+pub async fn unpin_model(
+    State(state): State<AppState>,
+    Path(variant): Path<String>,
+) -> Result<Json<DownloadResponse>, ApiError> {
+    let variant = parse_variant(&variant)?;
+    if !state.runtime.unpin_resident_model(variant).await {
+        return Err(ApiError::of(
+            ErrorClass::Conflict,
+            format!("{} is not loaded", variant.display_name()),
+        ));
+    }
+    Ok(Json(DownloadResponse {
+        status: "unpinned",
+        message: format!(
+            "{} stays loaded until another model needs its room",
+            variant.display_name()
+        ),
+        warning: None,
+    }))
+}
+
+/// Where models are stored and how much room is left there.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminStorageResponse {
+    pub models_dir: String,
+    /// Free bytes on the volume holding the models; `None` when it cannot
+    /// be read.
+    pub free_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    /// Disk the downloaded models use.
+    pub models_bytes: u64,
+}
+
+pub async fn storage(
+    State(state): State<AppState>,
+) -> Result<Json<AdminStorageResponse>, ApiError> {
+    let models_dir = state.runtime.config().models_dir.clone();
+    let models_bytes = state
+        .runtime
+        .list_models()
+        .await
+        .into_iter()
+        .filter(|model| {
+            matches!(
+                model.status,
+                ModelStatus::Downloaded | ModelStatus::Loading | ModelStatus::Ready
+            )
+        })
+        .filter_map(|model| model.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    let probe_dir = models_dir.clone();
+    let (free_bytes, total_bytes) = tokio::task::spawn_blocking(move || {
+        // A fresh install has no models directory yet: ask its volume.
+        let volume = probe_dir
+            .ancestors()
+            .find(|path| path.exists())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(probe_dir);
+        (
+            fs2::available_space(&volume).ok(),
+            fs2::total_space(&volume).ok(),
+        )
+    })
+    .await
+    .unwrap_or((None, None));
+    Ok(Json(AdminStorageResponse {
+        models_dir: models_dir.to_string_lossy().into_owned(),
+        free_bytes,
+        total_bytes,
+        models_bytes,
     }))
 }
 
@@ -740,6 +901,7 @@ pub async fn download_progress_stream(
                             } else {
                                 "downloading".to_string()
                             },
+                            error: None,
                         };
 
                         let json = serde_json::to_string(&event).unwrap_or_default();
@@ -793,6 +955,7 @@ pub async fn download_progress_stream(
                                         files_total: 0,
                                         percent: 100.0,
                                         status: "completed".to_string(),
+                                        error: None,
                                     };
                                     let json = serde_json::to_string(&event).unwrap_or_default();
                                     yield Ok(Event::default().data(json));
@@ -810,8 +973,14 @@ pub async fn download_progress_stream(
                                     files_total: 0,
                                     percent: 0.0,
                                     status: "error".to_string(),
+                                    error: None,
                                 });
                                 event.status = "error".to_string();
+                                event.error = state
+                                    .runtime
+                                    .model_manager()
+                                    .download_error(variant)
+                                    .await;
                                 let json = serde_json::to_string(&event).unwrap_or_default();
                                 yield Ok(Event::default().data(json));
                             }
@@ -827,6 +996,7 @@ pub async fn download_progress_stream(
                                     files_total: 0,
                                     percent: 0.0,
                                     status: "cancelled".to_string(),
+                                    error: None,
                                 });
                                 event.status = "cancelled".to_string();
                                 let json = serde_json::to_string(&event).unwrap_or_default();
@@ -870,6 +1040,7 @@ async fn terminal_progress_event(state: &AppState, variant: ModelVariant) -> Pro
             files_total: 1,
             percent: 100.0,
             status: "completed".to_string(),
+            error: None,
         },
         DownloadState::Error => ProgressEvent {
             variant: variant.dir_name().to_string(),
@@ -882,6 +1053,7 @@ async fn terminal_progress_event(state: &AppState, variant: ModelVariant) -> Pro
             files_total: 0,
             percent: 0.0,
             status: "error".to_string(),
+            error: state.runtime.model_manager().download_error(variant).await,
         },
         DownloadState::NotDownloaded => ProgressEvent {
             variant: variant.dir_name().to_string(),
@@ -894,6 +1066,7 @@ async fn terminal_progress_event(state: &AppState, variant: ModelVariant) -> Pro
             files_total: 0,
             percent: 0.0,
             status: "cancelled".to_string(),
+            error: None,
         },
         DownloadState::Downloading => ProgressEvent {
             variant: variant.dir_name().to_string(),
@@ -906,6 +1079,7 @@ async fn terminal_progress_event(state: &AppState, variant: ModelVariant) -> Pro
             files_total: 0,
             percent: 0.0,
             status: "error".to_string(),
+            error: None,
         },
     }
 }
@@ -1076,6 +1250,7 @@ mod tests {
         assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
         assert_eq!(value["pinned"], true);
         assert_eq!(value["chat_capabilities"]["supports_thinking"], true);
+        assert_eq!(value["chat_capabilities"]["thinking_toggleable"], true);
         assert_eq!(
             value["chat_capabilities"]["default_reasoning_effort"],
             "xhigh"

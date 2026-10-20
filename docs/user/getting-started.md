@@ -13,27 +13,27 @@ Before you pick an install path, check the [Runtime Support Matrix](/support-mat
 
 ### macOS
 
-Download the latest `.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases), then:
+Download `Izwi_<version>_aarch64.dmg` (Apple Silicon) from [GitHub Releases](https://github.com/izwi-ai/izwi/releases), then:
 
 1. Open the downloaded `.dmg` file
 2. Drag **Izwi.app** to your Applications folder
 3. Launch Izwi from Applications
 
-On first launch, Izwi will set up the `izwi` command-line tool automatically.
+To use the `izwi` command in a terminal, open **Settings > System > Command line tool** in the app and select **Install**. Izwi links `izwi` into `/opt/homebrew/bin` or `/usr/local/bin` and may ask for an administrator password.
 
 ### Linux
 
-Download the `.deb` package from [GitHub Releases](https://github.com/izwi-ai/izwi/releases):
+Download `Izwi_<version>_amd64.deb` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases), then install it (this also installs the `izwi` command):
 
 ```bash
-sudo dpkg -i izwi_*.deb
+sudo apt install ./Izwi_*_amd64.deb
 ```
 
 > The Linux release package is CPU-only. Use Docker CUDA or a source build for NVIDIA acceleration.
 
 ### Windows
 
-Download and run the `.exe` installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
+Download and run `Izwi_<version>_x64-setup.exe` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases), then install the `izwi` command from **Settings > System > Command line tool**.
 
 > The Windows release package is CPU-only. CUDA on Windows is currently a source-build preview path.
 
@@ -52,8 +52,12 @@ izwi serve
 You should see:
 
 ```
-Izwi server running at http://localhost:8080
+Server is running!
+  API endpoint: http://127.0.0.1:8080/v1
+  Web UI:       http://127.0.0.1:8080
 ```
+
+Leave it running and use a second terminal for the next steps.
 
 **Desktop mode** (opens the native app):
 
@@ -74,10 +78,10 @@ izwi serve --mode web
 Izwi needs AI models to work. Download your first model:
 
 ```bash
-izwi pull Qwen3-TTS-12Hz-0.6B-Base
+izwi pull Kokoro-82M
 ```
 
-This downloads a compact, general-purpose text-to-speech model.
+This downloads the default text-to-speech model. Install `espeak-ng` first (`brew install espeak-ng` on macOS, `sudo apt install espeak-ng` on Ubuntu/Debian).
 
 View all available models:
 
@@ -101,7 +105,7 @@ izwi list --local
 izwi tts "Hello! Welcome to Izwi." --output hello.wav
 ```
 
-Play the generated audio:
+Generate speech and play it with the system player (Izwi saves the file first):
 
 ```bash
 izwi tts "Hello! Welcome to Izwi." --play

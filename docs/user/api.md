@@ -102,7 +102,7 @@ izwi serve --host 0.0.0.0
 - Every route under `/v1` and `/internal` needs the key. The probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/internal/live`, `/internal/ready`), the docs and the web UI's static files do not.
 - `--allow-unauthenticated-network` (or `IZWI_ALLOW_UNAUTHENTICATED_NETWORK=1`) starts a network bind without a key. Anyone who can reach the port can then download, load and delete models and read or delete history. Use it only behind your own access controls.
 - Browser protections apply to every bind: a loopback-bound server only answers `localhost`, `*.localhost`, `127.0.0.1` and `[::1]` `Host` names (this blocks DNS rebinding), and writes and WebSocket upgrades from another site's page are rejected by their `Origin`. Allowed origins are the server's own origin, loopback pages, the desktop app (`tauri://localhost`, `http://tauri.localhost`) and any configured CORS origins.
-- `--cors` enables wildcard browser CORS responses, which also lets any web page send requests. Prefer listing origins in `cors_origins`.
+- `--cors` enables wildcard browser CORS responses, which also lets any web page send requests. Prefer listing origins in `server.cors_origins` (or `IZWI_CORS_ORIGINS`).
 - A reverse proxy in front of a loopback-bound server must forward a loopback `Host` header (nginx does by default with `proxy_pass http://127.0.0.1:8080`).
 
 ### Pagination
@@ -242,7 +242,7 @@ Supported request fields:
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
-| `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
+| `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`, including the `<think>` a Qwen prompt opens when thinking is on; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
 
 Through the gateway, a chat request runs on a worker exactly as on the local
@@ -340,9 +340,9 @@ Generates audio bytes. JSON request:
 
 ```json
 {
-  "model": "Qwen3-TTS-12Hz-0.6B-Base",
+  "model": "Kokoro-82M",
   "input": "Hello from Izwi.",
-  "voice": "default",
+  "voice": "af_heart",
   "response_format": "wav"
 }
 ```
@@ -1097,7 +1097,7 @@ Speech model capabilities, when present:
 ```json
 {
   "supports_builtin_voices": true,
-  "built_in_voice_count": 54,
+  "built_in_voice_count": 41,
   "supports_reference_voice": false,
   "supports_voice_description": false,
   "supports_streaming": true,

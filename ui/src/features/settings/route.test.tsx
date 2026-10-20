@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   getPreferences: vi.fn(),
   updateAnalyticsPreference: vi.fn(),
   notify: vi.fn(),
+  runSetupAgain: vi.fn(),
 }));
 
 const updateState = vi.hoisted(() => ({
@@ -81,6 +82,10 @@ vi.mock("@/app/providers/ThemeProvider", () => ({
   }),
 }));
 
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  useFirstRun: () => ({ runSetupAgain: apiMocks.runSetupAgain }),
+}));
+
 vi.mock("@/app/providers/NotificationProvider", () => ({
   useNotifications: () => ({ notify: apiMocks.notify }),
 }));
@@ -147,7 +152,7 @@ describe("SettingsPage capabilities", () => {
 
     render(<SettingsPage />);
 
-    expect(screen.getByText("Desktop Only")).toBeVisible();
+    expect(screen.getByText("Desktop only")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check now" })).not.toBeInTheDocument();
     expect(screen.getByText(/Update checks and installation are available/i)).toBeVisible();
     expect(screen.getByText(/Tray behavior, launch-at-login and command line tool settings/i)).toBeVisible();
@@ -196,6 +201,30 @@ describe("SettingsPage capabilities", () => {
 
     await screen.findByText("This build does not include the izwi command.");
     expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
+  });
+
+  it("runs first-run setup again, and says why when it can't", async () => {
+    apiMocks.runSetupAgain
+      .mockRejectedValueOnce(new Error("Request failed"))
+      .mockResolvedValue(undefined);
+    render(<SettingsPage />);
+
+    const about = screen.getByRole("region", { name: "About" });
+    const button = within(about).getByRole("button", { name: "Run setup again" });
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(apiMocks.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Couldn't start setup",
+          description: "Request failed",
+          tone: "danger",
+        }),
+      ),
+    );
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(apiMocks.runSetupAgain).toHaveBeenCalledTimes(2);
   });
 
   it("shows the runtime and the keyboard shortcuts", async () => {
@@ -289,7 +318,7 @@ describe("SettingsPage capabilities", () => {
       },
       update: null,
       error: null,
-      badge: "Updates Off",
+      badge: "Updates off",
       detail: "Disabled by policy",
     },
     {
@@ -307,7 +336,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: null,
-      badge: "Update Available",
+      badge: "Update available",
       detail: "View 0.1.0-beta-20",
     },
     {
@@ -325,7 +354,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: "Signature verification failed",
-      badge: "Update Available",
+      badge: "Update available",
       detail: "Last error: Signature verification failed",
     },
     {
@@ -334,7 +363,7 @@ describe("SettingsPage capabilities", () => {
       health: updateState.value.health,
       update: availableUpdate,
       error: null,
-      badge: "Ready To Restart",
+      badge: "Ready to restart",
       detail: "View 0.1.0-beta-20",
     },
   ])("renders the $name updater state honestly", async (testCase) => {
@@ -364,7 +393,7 @@ describe("SettingsPage capabilities", () => {
 
     render(<SettingsPage />);
 
-    expect(screen.getByText("Support Unknown")).toBeVisible();
+    expect(screen.getByText("Support unknown")).toBeVisible();
     expect(
       screen.getByRole("button", { name: "Retry update support" }),
     ).toBeVisible();

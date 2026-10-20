@@ -8,17 +8,19 @@ import {
 } from "react-router-dom";
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
-import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
+import {
+  useModelCatalog,
+  type ModelRouteKey,
+} from "@/app/providers/ModelCatalogProvider";
 import { DocumentTitle } from "@/app/router/DocumentTitle";
 import { NotFoundPage } from "@/app/router/NotFoundPage";
+import { PageLoading } from "@/components/ui/page-state";
 import { legacyDiarizationTarget } from "@/app/router/routePresentation";
 import type {
   ModelsRouteProps,
   SharedPageProps,
   VoiceRouteProps,
 } from "@/app/router/types";
-import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
-import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 
 // Route code loads lazily, then preloads once the app is idle so later
 // navigation does not wait on a chunk (react-router keeps the previous page
@@ -26,9 +28,6 @@ import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 const ROUTE_MODULES = {
   TextToSpeechPage: () => import("@/features/text-to-speech/route"),
   StudioPage: () => import("@/features/studio/route"),
-  VoiceCloningPage: () => import("@/features/voice-cloning/route"),
-  VoiceDesignPage: () => import("@/features/voice-design/route"),
-  VoicesPage: () => import("@/features/voices/route"),
   VoiceStudioPage: () => import("@/features/voice-studio/route"),
   SpeechTextPage: () => import("@/features/speech-text/route"),
   ChatPage: () => import("@/features/chat/route"),
@@ -49,18 +48,6 @@ const TextToSpeechPage = lazy(async () => ({
 
 const StudioPage = lazy(async () => ({
   default: (await ROUTE_MODULES.StudioPage()).StudioPage,
-}));
-
-const VoiceCloningPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoiceCloningPage()).VoiceCloningPage,
-}));
-
-const VoiceDesignPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoiceDesignPage()).VoiceDesignPage,
-}));
-
-const VoicesPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoicesPage()).VoicesPage,
 }));
 
 const VoiceStudioPage = lazy(async () => ({
@@ -88,11 +75,7 @@ const SettingsPage = lazy(async () => ({
 }));
 
 function RouteLoadingFallback() {
-  return (
-    <div className="flex min-h-[16rem] items-center justify-center rounded-2xl border border-border/60 bg-card/60 text-sm text-muted-foreground shadow-sm">
-      Loading route...
-    </div>
-  );
+  return <PageLoading />;
 }
 
 function withSuspense(children: ReactNode) {
@@ -130,7 +113,7 @@ export function AppRoutes() {
   }, []);
   const {
     models,
-    selectedModel,
+    selectedModelFor,
     loading,
     catalogError,
     downloadProgress,
@@ -144,24 +127,27 @@ export function AppRoutes() {
     cancelModelDownload,
     loadModel,
     unloadModel,
+    setModelPinned,
     deleteModel,
   } = useModelCatalog();
 
-  const pageProps: SharedPageProps = {
+  // Each page keeps its own model choice: loading or picking a model on
+  // one page does not change another's.
+  const pageProps = (route: ModelRouteKey): SharedPageProps => ({
     models,
-    selectedModel,
+    selectedModel: selectedModelFor(route),
     loading,
     downloadProgress,
     residencySummary,
     onDownload: downloadModel,
     onCancelDownload: cancelModelDownload,
-    onLoad: loadModel,
+    onLoad: (variant) => void loadModel(variant, { route }),
     onUnload: unloadModel,
     onDelete: deleteModel,
-    onSelect: (variant) => selectModel(variant),
+    onSelect: (variant) => selectModel(variant, route),
     onError: reportError,
     onRefresh: refreshModels,
-  };
+  });
 
   const voicePageProps: VoiceRouteProps = {
     models,
@@ -185,14 +171,9 @@ export function AppRoutes() {
     onLoad: loadModel,
     onUnload: unloadModel,
     onDelete: deleteModel,
+    onSetPinned: (variant, pinned) => void setModelPinned(variant, pinned),
     onRefresh: refreshModels,
   };
-  const selectedModelInfo = models.find(
-    (model) => model.variant === selectedModel,
-  );
-  const selectedModelLabel = selectedModel
-    ? getModelDisplayName(selectedModel, selectedModelInfo?.display_name)
-    : null;
   useEffect(() => {
     if (!hasTrackedInitialRouteRef.current) {
       hasTrackedInitialRouteRef.current = true;
@@ -213,7 +194,6 @@ export function AppRoutes() {
           element={
             <AppLayout
               readyModelsCount={readyModelsCount}
-              selectedModelLabel={selectedModelLabel}
               catalogError={catalogError}
               onRetryModelCatalog={refreshModels}
             />
@@ -221,58 +201,39 @@ export function AppRoutes() {
         >
           <Route
             path="/text-to-speech"
-            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+            element={withSuspense(<TextToSpeechPage {...pageProps("text-to-speech")} />)}
           />
           <Route
             path="/text-to-speech/:recordId"
-            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+            element={withSuspense(<TextToSpeechPage {...pageProps("text-to-speech")} />)}
           />
           <Route
             path="/studio"
-            element={withSuspense(<StudioPage {...pageProps} />)}
+            element={withSuspense(<StudioPage {...pageProps("studio")} />)}
           />
           <Route
             path="/studio/:projectId"
-            element={withSuspense(<StudioPage {...pageProps} />)}
+            element={withSuspense(<StudioPage {...pageProps("studio")} />)}
           />
-          {VOICE_STUDIO_ENABLED ? (
-            <>
-              <Route
-                path="/voices"
-                element={withSuspense(<VoiceStudioPage {...pageProps} />)}
-              />
-              <Route
-                path="/voice-cloning"
-                element={<Navigate to="/voices?tab=clone" replace />}
-              />
-              <Route
-                path="/voice-design"
-                element={<Navigate to="/voices?tab=design" replace />}
-              />
-            </>
-          ) : (
-            <>
-              <Route
-                path="/voice-cloning"
-                element={withSuspense(<VoiceCloningPage {...pageProps} />)}
-              />
-              <Route
-                path="/voice-design"
-                element={withSuspense(<VoiceDesignPage {...pageProps} />)}
-              />
-              <Route
-                path="/voices"
-                element={withSuspense(<VoicesPage {...pageProps} />)}
-              />
-            </>
-          )}
+          <Route
+            path="/voices"
+            element={withSuspense(<VoiceStudioPage {...pageProps("voices")} />)}
+          />
+          <Route
+            path="/voice-cloning"
+            element={<Navigate to="/voices?tab=clone" replace />}
+          />
+          <Route
+            path="/voice-design"
+            element={<Navigate to="/voices?tab=design" replace />}
+          />
           <Route
             path="/transcription"
-            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
           />
           <Route
             path="/transcription/:recordId"
-            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
           />
           <Route path="/diarization" element={<LegacyDiarizationRedirect />} />
           <Route
@@ -281,7 +242,7 @@ export function AppRoutes() {
           />
           <Route
             path="/chat"
-            element={withSuspense(<ChatPage {...pageProps} />)}
+            element={withSuspense(<ChatPage {...pageProps("chat")} />)}
           />
           <Route
             path="/voice"

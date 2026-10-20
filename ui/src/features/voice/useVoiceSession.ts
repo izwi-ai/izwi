@@ -97,6 +97,9 @@ export function useVoiceSession({
   );
   const voiceWsRef = useRef<WebSocket | null>(null);
   const voiceWsConnectingRef = useRef<Promise<WebSocket> | null>(null);
+  /** Bumped when the socket is closed on purpose: a connection opened for
+   * an earlier generation closes itself instead of becoming current. */
+  const voiceWsGenerationRef = useRef(0);
   const voiceWsSessionReadyRef = useRef(false);
   const voiceWsInputStreamStartedRef = useRef(false);
   const voiceWsInputStreamStartingRef = useRef<Promise<void> | null>(null);
@@ -206,6 +209,7 @@ export function useVoiceSession({
 
   const closeVoiceRealtimeSocket = useCallback(
     (reason?: string) => {
+      voiceWsGenerationRef.current += 1;
       voiceWsSessionReadyRef.current = false;
       voiceWsInputStreamStartedRef.current = false;
       voiceWsInputFrameSeqRef.current = 0;
@@ -767,6 +771,22 @@ export function useVoiceSession({
             return;
           }
 
+          // A reply that failed part-way sends no more audio: what arrived
+          // plays out, then the status returns to listening instead of
+          // staying on "Speaking".
+          const playback = voiceWsPlaybackRef.current;
+          if (
+            playback &&
+            event.status !== "ok" &&
+            playback.utteranceSeq === event.utterance_seq
+          ) {
+            playback.streamDone = true;
+            finalizeVoiceWsPlaybackIfComplete(
+              playback.utteranceSeq,
+              playback.streamSession,
+            );
+          }
+
           if (!voiceWsPlaybackRef.current && isSessionActiveRef.current) {
             if (runtimeStatusRef.current !== "user_speaking") {
               setRuntimeStatus("listening");
@@ -821,6 +841,7 @@ export function useVoiceSession({
       }
 
       const url = buildVoiceRealtimeWebSocketUrl(api.baseUrl);
+      const generation = voiceWsGenerationRef.current;
       const promise = new Promise<WebSocket>((resolve, reject) => {
         let settled = false;
         const ws = new WebSocket(url);
@@ -833,6 +854,18 @@ export function useVoiceSession({
         };
 
         ws.onopen = () => {
+          if (generation !== voiceWsGenerationRef.current) {
+            // The conversation ended while this socket was connecting.
+            settle(() =>
+              reject(new Error("Voice realtime connection was closed")),
+            );
+            try {
+              ws.close(1000, "session_closed");
+            } catch {
+              // Best effort.
+            }
+            return;
+          }
           voiceWsRef.current = ws;
           voiceWsSessionReadyRef.current = false;
           voiceWsInputStreamStartedRef.current = false;
@@ -859,6 +892,10 @@ export function useVoiceSession({
         };
 
         ws.onmessage = (messageEvent) => {
+          // Events of a socket that is no longer current are stale.
+          if (voiceWsRef.current !== ws) {
+            return;
+          }
           if (messageEvent.data instanceof ArrayBuffer) {
             const chunk = parseVoiceRealtimeAssistantAudioBinaryChunk(
               messageEvent.data,
@@ -940,9 +977,12 @@ export function useVoiceSession({
           }
           const wasActive = isSessionActiveRef.current;
           const wasCurrent = voiceWsRef.current === ws;
-          if (wasCurrent) {
-            voiceWsRef.current = null;
+          // An earlier socket closing late must not reset the state of the
+          // one that replaced it.
+          if (!wasCurrent && voiceWsRef.current !== null) {
+            return;
           }
+          voiceWsRef.current = null;
           voiceWsSessionReadyRef.current = false;
           voiceWsInputStreamStartedRef.current = false;
           voiceWsInputFrameSeqRef.current = 0;
@@ -998,7 +1038,7 @@ export function useVoiceSession({
         const readyPromise = waitForVoiceRealtimeInputStreamReady();
         const stream = {
           speaker,
-          max_output_tokens: 1536,
+          // Replies use the server's voice length (short, spoken answers).
           max_utterance_ms: 20_000,
           pre_roll_ms: 160,
           input_sample_rate: Math.round(inputSampleRate),
@@ -1098,6 +1138,19 @@ export function useVoiceSession({
 
     try {
       streamRef.current = stream;
+      // A microphone that goes away (unplugged, permission revoked) ends
+      // the conversation instead of leaving it listening to nothing.
+      stream.getTracks().forEach((track) => {
+        track.onended = () => {
+          if (isSessionActiveRef.current && streamRef.current === stream) {
+            // Not "blocked": it was working and went away.
+            failSession({
+              kind: "other",
+              message: "The microphone stopped. Check it is connected, then start again.",
+            });
+          }
+        };
+      });
 
       const audioContext = new AudioContext();
       audioContextRef.current = audioContext;

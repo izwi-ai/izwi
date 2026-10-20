@@ -16,7 +16,6 @@ import {
   Send,
   Square,
   Loader2,
-  Settings2,
   Plus,
   Trash2,
   AlertTriangle,
@@ -43,6 +42,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   buildChatThreadMessagePayload,
+  CHAT_IMAGE_ACCEPT,
   DEFAULT_THREAD_TITLE,
   type ChatPlaygroundProps,
   type GenerateTitleArgs,
@@ -50,14 +50,14 @@ import {
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
-  fallbackThreadTitleFromUserMessage,
   getErrorMessage,
+  isChatImageFile,
   parseAssistantContent,
   stripMarkdown,
   isSameCalendarDay,
   messageDayLabel,
-  normalizeGeneratedThreadTitle,
-  readImageFileAsDataUrl,
+  readChatImage,
+  stoppedReplyContent,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
   threadHasImageAttachments,
@@ -76,7 +76,7 @@ import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
-import { RouteModelSelect } from "@/components/RouteModelSelect";
+import { ChatModelPicker } from "@/features/chat/components/ChatModelPicker";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
 
@@ -90,11 +90,35 @@ interface StoppedTurn {
   replacedIds: string[];
 }
 
-/** What a streaming turn started from, for keeping it if it is stopped. */
-interface TurnContext {
+/** The turn streaming now, kept apart from the view so a stop keeps its
+ * prompt and reply whatever is on screen. */
+interface StreamingTurn {
+  threadId: string;
+  /** The prompt as shown; the server's copy once the stream starts. */
+  prompt: ChatThreadMessageRecord;
+  assistantTempId: string;
+  modelId: string;
+  /** The reply so far. */
+  content: string;
+  /** The prompt opened `<think>`, so the reply streams reasoning first. */
+  reasoningOpenedInPrompt: boolean;
+  /** Messages the thread had before the turn started. */
   priorIds: Set<string>;
+  /** Messages the turn replaces (a retried reply, or replies after an edit). */
   replacedIds: string[];
+  controller: AbortController | null;
 }
+
+/** Thinking settings a turn is sent with. */
+interface TurnThinking {
+  supported: boolean;
+  enabled: boolean;
+  effort: ChatReasoningEffort | undefined;
+}
+
+/** Waits between history reloads after a stop, until the server has stored
+ * the stopped turn. */
+const STOPPED_TURN_SYNC_DELAYS_MS = [0, 250, 750, 2000];
 
 interface ChatComposerDraft {
   input: string;
@@ -120,6 +144,26 @@ function isEmptyDraft(draft: ChatComposerDraft): boolean {
   return draft.input.length === 0 && draft.pendingImages.length === 0;
 }
 
+/** Whether the server has stored a stopped turn: a reply it did not have
+ * before follows the turn's prompt, found by id once the server named it. */
+function stoppedTurnStored(
+  turn: StoppedTurn,
+  history: ChatThreadMessageRecord[],
+): boolean {
+  const [prompt] = turn.messages;
+  return history.some((message, index) => {
+    const previous = history[index - 1];
+    return (
+      message.role === "assistant" &&
+      !turn.priorIds.has(message.id) &&
+      previous?.role === "user" &&
+      (prompt.id.startsWith("tmp-")
+        ? previous.content === prompt.content
+        : previous.id === prompt.id)
+    );
+  });
+}
+
 export function ChatPlayground({
   selectedModel,
   selectedModelReady,
@@ -128,6 +172,7 @@ export function ChatPlayground({
   modelLabel,
   modelOptions,
   modelSupportsThinking,
+  modelChatCapabilities,
   modelSupportsImages,
   onSelectModel,
   onOpenModelManager,
@@ -149,6 +194,8 @@ export function ChatPlayground({
     Record<string, number>
   >({});
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  // Thinking as the streaming turn was sent, whatever the toggle says now.
+  const [streamThinkingEnabled, setStreamThinkingEnabled] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(
     null,
@@ -214,7 +261,7 @@ export function ChatPlayground({
   const streamingThreadIdRef = useRef<string | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const titleGenerationInFlightRef = useRef<Set<string>>(new Set());
-  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamingTurnRef = useRef<StreamingTurn | null>(null);
   const messageViewportRef = useRef<HTMLDivElement | null>(null);
   const followingOutputRef = useRef(true);
   const followingOutputThreadRef = useRef<string | null>(null);
@@ -229,7 +276,6 @@ export function ChatPlayground({
   // can be after the history reload that follows Stop. Until then the turn
   // lives here, per thread.
   const stoppedTurnsRef = useRef<Map<string, StoppedTurn[]>>(new Map());
-  const turnContextRef = useRef<TurnContext | null>(null);
   const deletedDraftKeysRef = useRef<Set<string>>(new Set());
 
   const activeDraftKey = draftKeyForThread(activeThreadId);
@@ -245,23 +291,21 @@ export function ChatPlayground({
 
   /** History from the server plus this session's stopped turns that the
    * server has not stored yet, each kept whole and placed by when it was
-   * sent. The server's copy is a new stopped reply right after the prompt. */
+   * sent. Once the server has a turn, its copy is the only one: a later
+   * retry, edit or delete of it must not bring the local copy back. */
   const withStoppedTurns = useCallback(
     (threadId: string, history: ChatThreadMessageRecord[]) => {
+      const pending = (stoppedTurnsRef.current.get(threadId) ?? []).filter(
+        (turn) => !stoppedTurnStored(turn, history),
+      );
+      if (pending.length > 0) {
+        stoppedTurnsRef.current.set(threadId, pending);
+      } else {
+        stoppedTurnsRef.current.delete(threadId);
+      }
       let merged = history;
-      for (const turn of stoppedTurnsRef.current.get(threadId) ?? []) {
+      for (const turn of pending) {
         const [prompt] = turn.messages;
-        const stored = history.some(
-          (message, index) =>
-            message.role === "assistant" &&
-            message.finish_reason === "cancelled" &&
-            !turn.priorIds.has(message.id) &&
-            history[index - 1]?.role === "user" &&
-            history[index - 1].content === prompt.content,
-        );
-        if (stored) {
-          continue;
-        }
         const hidden = new Set([prompt.id, ...turn.replacedIds]);
         merged = merged.filter((message) => !hidden.has(message.id));
         const insertAt = merged.findIndex(
@@ -382,6 +426,8 @@ export function ChatPlayground({
       messagesLoading ||
       activeThreadLoadError !== null);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  // A model that always reasons shows a label, not a switch that does nothing.
+  const thinkingToggleable = chatCapabilities?.thinking_toggleable ?? true;
   const supportedReasoningEfforts =
     chatCapabilities?.reasoning_efforts ?? [];
   const reasoningEffortOptionsKey = supportedReasoningEfforts.join(",");
@@ -413,19 +459,28 @@ export function ChatPlayground({
   const imageModelOption = modelOptions.find((option) =>
     acceptsImages(option.value),
   );
+  /** The model emits its reasoning before `</think>`. */
+  const writesImplicitThink = useCallback(
+    (variant: string) =>
+      modelSupportsThinking?.(variant) ??
+      supportsImplicitOpenThinkTagParsing(variant),
+    [modelSupportsThinking],
+  );
   const renderModelId = activeThread?.model_id ?? selectedModel;
   // Parse by the capabilities of the model that wrote the thread, not the
   // model selected now.
   const implicitOpenThinkTagModel = renderModelId
-    ? (modelSupportsThinking?.(renderModelId) ??
-      supportsImplicitOpenThinkTagParsing(renderModelId))
+    ? writesImplicitThink(renderModelId)
     : false;
   const chatSecondaryButtonClass =
     "rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]";
-  const chatSecondaryButtonActiveClass =
-    "rounded-lg border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-primary)] shadow-none";
   const chatAccentButtonClass =
     "rounded-lg bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-none hover:opacity-90";
+  // The composer's controls are pills, like its model picker.
+  const composerPillClass =
+    "h-9 rounded-full border border-[var(--border-default)] bg-transparent text-[13.5px] text-[var(--text-primary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--accent-soft)]";
+  const composerPillActiveClass =
+    "border-[var(--border-strong)] bg-[var(--accent-soft)]";
   const chatComposerSendButtonClass =
     "chat-composer-send-button rounded-full border-transparent text-[var(--text-primary)] shadow-none";
 
@@ -448,8 +503,9 @@ export function ChatPlayground({
       return;
     }
     setIsThinkingEnabled(
-      chatCapabilities?.default_thinking_enabled ??
-        defaultThinkingEnabledForModel(selectedModel),
+      !thinkingToggleable ||
+        (chatCapabilities?.default_thinking_enabled ??
+          defaultThinkingEnabledForModel(selectedModel)),
     );
     setReasoningEffort(
       chatCapabilities?.default_reasoning_effort ??
@@ -463,6 +519,7 @@ export function ChatPlayground({
     reasoningEffortOptionsKey,
     selectedModel,
     supportsThinking,
+    thinkingToggleable,
   ]);
 
   useEffect(() => {
@@ -489,73 +546,38 @@ export function ChatPlayground({
     [setActiveThreadInUrl],
   );
 
+  /**
+   * Asks the server to title a thread still called "New chat" once a turn
+   * has finished. The server writes the title from the first exchange with
+   * thinking off, so a reasoning model's thoughts never become the title. A
+   * failure leaves "New chat" for the next turn to try again.
+   */
   const maybeGenerateThreadTitle = useCallback(
-    async (args: GenerateTitleArgs) => {
-      const { threadId, userContent, assistantContent, modelId } = args;
-
+    async ({ threadId, modelId }: GenerateTitleArgs) => {
       const existingThread = threadsRef.current.find(
         (thread) => thread.id === threadId,
       );
       if (
         existingThread &&
-        existingThread.title !== DEFAULT_THREAD_TITLE &&
         displayThreadTitle(existingThread.title) !== DEFAULT_THREAD_TITLE
       ) {
         return;
       }
-
       if (titleGenerationInFlightRef.current.has(threadId)) {
         return;
       }
-
       titleGenerationInFlightRef.current.add(threadId);
-
-      let nextTitle: string | null = null;
-
-      if (modelId) {
-        try {
-          const titleResponse = await api.createResponse({
-            model_id: modelId,
-            instructions:
-              "Generate a concise chat title (max 8 words) that summarizes the conversation topic. Return only the title text with no quotes, punctuation suffix, or commentary.",
-            input: `User: ${userContent}\nAssistant: ${assistantContent}`,
-            max_output_tokens: 24,
-            store: false,
-          });
-
-          nextTitle = normalizeGeneratedThreadTitle(titleResponse.output_text);
-        } catch {
-          // Fall back to deterministic title below.
-        }
-      }
-
-      if (!nextTitle) {
-        nextTitle = fallbackThreadTitleFromUserMessage(userContent);
-      }
-
-      if (!nextTitle || nextTitle === DEFAULT_THREAD_TITLE) {
-        titleGenerationInFlightRef.current.delete(threadId);
-        return;
-      }
-
       try {
-        const updatedThread = await api.updateChatThread(threadId, {
-          title: nextTitle,
+        const updatedThread = await api.generateChatThreadTitle(threadId, {
+          model_id: modelId,
         });
-
         setThreads((previous) =>
           previous.map((thread) =>
             thread.id === updatedThread.id ? updatedThread : thread,
           ),
         );
       } catch {
-        setThreads((previous) =>
-          previous.map((thread) =>
-            thread.id === threadId
-              ? { ...thread, title: nextTitle ?? thread.title }
-              : thread,
-          ),
-        );
+        // Keep "New chat"; the next finished turn asks again.
       } finally {
         titleGenerationInFlightRef.current.delete(threadId);
       }
@@ -583,9 +605,7 @@ export function ChatPlayground({
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      if (streamAbortRef.current) {
-        streamAbortRef.current.abort();
-      }
+      streamingTurnRef.current?.controller?.abort();
       for (const draft of Object.values(composerDraftsRef.current)) {
         revokeImagePreviews(draft.pendingImages);
       }
@@ -757,58 +777,103 @@ export function ChatPlayground({
     };
   }, [activeThreadId, threadLoadAttempt, withStoppedTurns]);
 
-  const stopStreaming = useCallback(() => {
-    if (streamAbortRef.current) {
-      streamAbortRef.current.abort();
-      streamAbortRef.current = null;
-    }
+  /** Reloads a thread until the server has stored its stopped turns, which
+   * it does once the stream has wound down, after the stop. */
+  const syncStoppedTurns = useCallback(
+    async (threadId: string) => {
+      for (const delayMs of STOPPED_TURN_SYNC_DELAYS_MS) {
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        // A new turn reloads history itself when it ends.
+        if (
+          !isMountedRef.current ||
+          streamingTurnRef.current ||
+          activeThreadIdRef.current !== threadId
+        ) {
+          return;
+        }
+        try {
+          const detail = await api.getChatThread(threadId);
+          if (
+            streamingTurnRef.current ||
+            activeThreadIdRef.current !== threadId
+          ) {
+            return;
+          }
+          setMessages(withStoppedTurns(threadId, detail.messages));
+        } catch {
+          return;
+        }
+        if (!stoppedTurnsRef.current.has(threadId)) {
+          return;
+        }
+      }
+    },
+    [withStoppedTurns],
+  );
 
+  /** Stops the streaming turn. Its prompt and partial reply stay, marked as
+   * stopped, until the server's copy loads. */
+  const stopStreaming = useCallback(() => {
+    const turn = streamingTurnRef.current;
+    if (!turn) {
+      return;
+    }
+    streamingTurnRef.current = null;
+    turn.controller?.abort();
     setIsStreaming(false);
     setStreamingThreadId(null);
 
-    const activeId = activeThreadIdRef.current;
-    if (activeId) {
-      // Keep the stopped prompt and partial reply, marked as stopped.
-      const current = messagesRef.current;
-      let lastUserIndex = -1;
-      for (let index = current.length - 1; index >= 0; index -= 1) {
-        if (current[index].role === "user") {
-          lastUserIndex = index;
-          break;
-        }
-      }
-      if (lastUserIndex >= 0) {
-        const stoppedTurn = current
-          .slice(lastUserIndex)
-          .map((message) =>
-            message.role === "assistant"
-              ? { ...message, finish_reason: "cancelled" }
-              : message,
-          );
-        stoppedTurnsRef.current.set(activeId, [
-          ...(stoppedTurnsRef.current.get(activeId) ?? []),
-          {
-            messages: stoppedTurn,
-            priorIds: turnContextRef.current?.priorIds ?? new Set(),
-            replacedIds: turnContextRef.current?.replacedIds ?? [],
-          },
-        ]);
-        setMessages([...current.slice(0, lastUserIndex), ...stoppedTurn]);
-      }
-      void api
-        .getChatThread(activeId)
-        .then((detail) => {
-          if (detail.thread.id !== activeThreadIdRef.current) {
-            return;
-          }
-          setMessages(withStoppedTurns(activeId, detail.messages));
-        })
-        .catch(() => {
-          // Ignore follow-up sync failures after cancel.
-        });
-      void refreshThreadList(activeId);
+    const stoppedMessages: ChatThreadMessageRecord[] = [
+      turn.prompt,
+      {
+        id: turn.assistantTempId,
+        thread_id: turn.threadId,
+        role: "assistant",
+        content: stoppedReplyContent(
+          turn.content,
+          turn.reasoningOpenedInPrompt,
+        ),
+        created_at: turn.prompt.created_at + 1,
+        tokens_generated: null,
+        generation_time_ms: null,
+        model_id: turn.modelId,
+        finish_reason: "cancelled",
+      },
+    ];
+    stoppedTurnsRef.current.set(turn.threadId, [
+      ...(stoppedTurnsRef.current.get(turn.threadId) ?? []),
+      {
+        messages: stoppedMessages,
+        priorIds: turn.priorIds,
+        replacedIds: turn.replacedIds,
+      },
+    ]);
+    if (activeThreadIdRef.current === turn.threadId) {
+      // The turn is the last thing in its thread.
+      const hidden = new Set([
+        turn.prompt.id,
+        turn.assistantTempId,
+        ...turn.replacedIds,
+      ]);
+      setMessages((previous) => [
+        ...previous.filter((message) => !hidden.has(message.id)),
+        ...stoppedMessages,
+      ]);
     }
-  }, [refreshThreadList, withStoppedTurns]);
+    void syncStoppedTurns(turn.threadId);
+    void refreshThreadList(turn.threadId);
+  }, [refreshThreadList, syncStoppedTurns]);
+
+  // Leaving a thread mid-reply (Back) stops the reply, as leaving Chat does,
+  // so its stream never writes into another thread.
+  useEffect(() => {
+    const turn = streamingTurnRef.current;
+    if (turn && turn.threadId !== activeThreadId) {
+      stopStreaming();
+    }
+  }, [activeThreadId, stopStreaming]);
 
   const {
     state: readAloud,
@@ -854,6 +919,11 @@ export function ChatPlayground({
     setError(null);
     textareaRef.current?.focus();
   }, [activeThreadId, isPreparingThread, isStreaming, setActiveThreadInUrl]);
+
+  const searchThreads = useCallback(
+    (query: string) => api.listChatThreads({ q: query }),
+    [],
+  );
 
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
     setDeleteTargetThreadId(threadId);
@@ -940,9 +1010,11 @@ export function ChatPlayground({
         return;
       }
 
-      const invalidFile = files.find((file) => !file.type.startsWith("image/"));
+      const invalidFile = files.find((file) => !isChatImageFile(file));
       if (invalidFile) {
-        setError(`Only image files are supported here, not ${invalidFile.name}.`);
+        setError(
+          `Attach PNG, JPEG, GIF, WebP or BMP images, not ${invalidFile.name}.`,
+        );
         event.target.value = "";
         return;
       }
@@ -955,7 +1027,7 @@ export function ChatPlayground({
           files.map(async (file) => {
             pendingImageSeqRef.current += 1;
             const sequence = pendingImageSeqRef.current;
-            const source = await readImageFileAsDataUrl(file);
+            const source = await readChatImage(file);
             return {
               id: `image-${sequence}`,
               source,
@@ -1020,6 +1092,7 @@ export function ChatPlayground({
 
     let targetThreadId = activeThreadId;
     let targetDraftKey = submittedDraftKey;
+    const createsThread = !targetThreadId;
     if (!targetThreadId) {
       setIsPreparingThread(true);
       try {
@@ -1028,6 +1101,8 @@ export function ChatPlayground({
         });
         setThreads((previous) => [createdThread, ...previous]);
         setActiveThreadInUrl(createdThread.id);
+        // The stream can answer before the new URL renders.
+        activeThreadIdRef.current = createdThread.id;
         setMessages([]);
         setExpandedThoughts({});
         targetThreadId = createdThread.id;
@@ -1056,11 +1131,6 @@ export function ChatPlayground({
       images: submittedDraft.pendingImages,
     });
 
-    const isFirstTurn =
-      targetThreadId === activeThreadId
-        ? messages.filter((message) => message.role === "user").length === 0
-        : true;
-
     const timestamp = Date.now();
     const userTempId = `tmp-user-${timestamp}`;
     const optimisticUserMessage: ChatThreadMessageRecord = {
@@ -1076,20 +1146,22 @@ export function ChatPlayground({
     const threadIdForTurn = targetThreadId;
     const draftKeyForTurn = targetDraftKey;
 
+    const thinking = thinkingFor(selectedModel);
     startTurnStream({
       threadId: threadIdForTurn,
       startedAt: timestamp,
+      modelId: selectedModel,
+      thinking,
       shown: (previous) => [...previous, optimisticUserMessage],
-      promptId: userTempId,
+      prompt: optimisticUserMessage,
       replacedIds: [],
-      titleFrom: isFirstTurn ? requestPayload.content : null,
       restoreOnFailure: false,
       failureMessage: "Failed to send this message.",
       start: (callbacks) =>
         api.sendChatThreadMessageStream(
           threadIdForTurn,
           {
-            ...generationOptions(selectedModel),
+            ...generationOptions(selectedModel, thinking),
             content: requestPayload.content,
             content_parts: requestPayload.contentParts,
           },
@@ -1099,58 +1171,136 @@ export function ChatPlayground({
         clearComposerDraft(draftKeyForTurn);
         setImagePreview(null);
       },
+      onFailed: () => {
+        // The server keeps no failed turn: give the message back to send
+        // again. Its previews were released when it was sent.
+        updateComposerDraft(draftKeyForTurn, (draft) =>
+          isEmptyDraft(draft)
+            ? {
+                input: submittedDraft.input,
+                pendingImages: submittedDraft.pendingImages.map((image) => ({
+                  ...image,
+                  previewUrl: undefined,
+                })),
+              }
+            : draft,
+        );
+        if (createsThread) {
+          void discardEmptyThread(threadIdForTurn);
+        }
+      },
     });
   };
 
-  /** Settings every turn sends: the model, thinking and truncation. */
-  const generationOptions = (modelId: string) => {
-    const enableThinking =
-      // Every thinking-capable template reads enable_thinking; sending it
-      // only for some families left Qwen3.6 thinking regardless of the toggle.
-      supportsThinking ? thinkingEnabledForModel : undefined;
+  /** A first message that failed leaves its new thread empty. The thread
+   * goes, and the message moves back to a new chat's composer. */
+  const discardEmptyThread = async (threadId: string) => {
+    try {
+      const detail = await api.getChatThread(threadId);
+      if (detail.messages.length > 0) {
+        return;
+      }
+      await api.deleteChatThread(threadId);
+    } catch {
+      return;
+    }
+    setThreads((previous) => previous.filter((thread) => thread.id !== threadId));
+    const threadDraftKey = draftKeyForThread(threadId);
+    setComposerDrafts((previous) => {
+      const draft = previous[threadDraftKey];
+      const next = { ...previous };
+      delete next[threadDraftKey];
+      if (draft && !next[NEW_CHAT_DRAFT_KEY]) {
+        next[NEW_CHAT_DRAFT_KEY] = draft;
+      }
+      return next;
+    });
+    if (activeThreadIdRef.current === threadId) {
+      setActiveThreadInUrl(null, true);
+      setMessages([]);
+      setExpandedThoughts({});
+    }
+  };
+
+  /** Thinking for a turn on `modelId`: the composer's settings for the
+   * selected model, and another model's own defaults (Retry with…), which
+   * the composer shows once it switches to that model. */
+  const thinkingFor = (modelId: string): TurnThinking => {
+    if (modelId === selectedModel) {
+      return {
+        supported: supportsThinking,
+        enabled: thinkingEnabledForModel,
+        effort:
+          thinkingEnabledForModel &&
+          supportedReasoningEfforts.includes(reasoningEffort)
+            ? reasoningEffort
+            : undefined,
+      };
+    }
+    const capabilities = modelChatCapabilities?.(modelId) ?? null;
+    const supported = capabilities?.supports_thinking ?? false;
+    const enabled =
+      supported &&
+      (capabilities?.thinking_toggleable === false ||
+        (capabilities?.default_thinking_enabled ??
+          defaultThinkingEnabledForModel(modelId)));
     return {
-      model_id: modelId,
-      system_prompt: systemPromptForModel(supportsThinking),
-      enable_thinking: enableThinking,
-      reasoning_effort:
-        thinkingEnabledForModel &&
-        supportedReasoningEfforts.includes(reasoningEffort)
-          ? reasoningEffort
-          : undefined,
-      // Long threads keep working: the server drops the oldest turns once
-      // the history outgrows the model's context.
-      truncation: "auto" as const,
+      supported,
+      enabled,
+      effort: enabled
+        ? (capabilities?.default_reasoning_effort ??
+          capabilities?.reasoning_efforts[0])
+        : undefined,
     };
   };
+
+  /** Settings every turn sends: the model, thinking and truncation. */
+  const generationOptions = (modelId: string, thinking: TurnThinking) => ({
+    model_id: modelId,
+    system_prompt: systemPromptForModel(thinking.supported),
+    // Every thinking-capable template reads enable_thinking; sending it
+    // only for some families left Qwen3.6 thinking regardless of the toggle.
+    enable_thinking: thinking.supported ? thinking.enabled : undefined,
+    reasoning_effort: thinking.effort,
+    // Long threads keep working: the server drops the oldest turns once
+    // the history outgrows the model's context.
+    truncation: "auto" as const,
+  });
 
   /**
    * Streams one turn into the view: a new message, a retried reply or an
    * edited prompt. `shown` lays out the messages the turn streams after.
    * A retry or edit that fails reloads history, since the server left the
-   * thread as it was.
+   * thread as it was. The stream writes only to its own thread, and only
+   * while it is the current turn.
    */
   const startTurnStream = ({
     threadId,
     startedAt,
+    modelId,
+    thinking,
     shown,
-    promptId,
+    prompt,
     replacedIds,
-    titleFrom,
     restoreOnFailure,
     failureMessage,
     start,
     onStarted,
+    onFailed,
   }: {
     threadId: string;
     startedAt: number;
+    modelId: string;
+    thinking: TurnThinking;
     shown: (previous: ChatThreadMessageRecord[]) => ChatThreadMessageRecord[];
-    promptId: string;
+    prompt: ChatThreadMessageRecord;
     replacedIds: string[];
-    titleFrom: string | null;
     restoreOnFailure: boolean;
     failureMessage: string;
     start: (callbacks: ChatThreadStreamCallbacks) => AbortController;
     onStarted?: () => void;
+    /** After a stream that failed has closed. */
+    onFailed?: () => void;
   }) => {
     const assistantTempId = `tmp-assistant-${startedAt}`;
     const optimisticAssistantMessage: ChatThreadMessageRecord = {
@@ -1161,15 +1311,30 @@ export function ChatPlayground({
       created_at: startedAt + 1,
       tokens_generated: null,
       generation_time_ms: null,
+      model_id: modelId,
     };
-    turnContextRef.current = {
+    const turn: StreamingTurn = {
+      threadId,
+      prompt,
+      assistantTempId,
+      modelId,
+      content: "",
+      reasoningOpenedInPrompt: thinking.enabled && writesImplicitThink(modelId),
       priorIds: new Set(
         messagesRef.current
           .filter((message) => !message.id.startsWith("tmp-"))
           .map((message) => message.id),
       ),
       replacedIds,
+      controller: null,
     };
+    // The server stores a stopped turn before it starts the next one, so
+    // the history this turn reloads has it.
+    stoppedTurnsRef.current.delete(threadId);
+    streamingTurnRef.current = turn;
+    const isCurrent = () => streamingTurnRef.current === turn;
+    const onScreen = () =>
+      isCurrent() && activeThreadIdRef.current === threadId;
     const reloadHistory = () =>
       void api
         .getChatThread(threadId)
@@ -1189,11 +1354,21 @@ export function ChatPlayground({
     setIsStreaming(true);
     setStreamStartedAt(startedAt);
     setStreamingThreadId(threadId);
+    setStreamThinkingEnabled(thinking.enabled);
 
     let streamFailed = false;
+    let turnModelId: string | null = null;
     try {
-      streamAbortRef.current = start({
+      turn.controller = start({
         onStart: ({ userMessage }) => {
+          if (!isCurrent()) {
+            return;
+          }
+          const promptId = turn.prompt.id;
+          turn.prompt = userMessage;
+          if (!onScreen()) {
+            return;
+          }
           setMessages((previous) => {
             let replaced = false;
             const updated = previous.map((message) => {
@@ -1215,12 +1390,20 @@ export function ChatPlayground({
           });
         },
         onDelta: (delta) => {
+          if (!isCurrent()) {
+            return;
+          }
+          turn.content += delta;
+          const content = turn.content;
+          if (!onScreen()) {
+            return;
+          }
           setMessages((previous) => {
             let updatedAssistant = false;
             const updated = previous.map((message) => {
               if (message.id === assistantTempId) {
                 updatedAssistant = true;
-                return { ...message, content: `${message.content}${delta}` };
+                return { ...message, content };
               }
               return message;
             });
@@ -1229,13 +1412,14 @@ export function ChatPlayground({
               return updated;
             }
 
-            return [
-              ...updated,
-              { ...optimisticAssistantMessage, content: delta },
-            ];
+            return [...updated, { ...optimisticAssistantMessage, content }];
           });
         },
-        onDone: ({ assistantMessage, stats: streamStats, modelId }) => {
+        onDone: ({ assistantMessage, stats: streamStats, modelId: doneModelId }) => {
+          turnModelId = doneModelId;
+          if (!onScreen()) {
+            return;
+          }
           const carryOver = <T,>(previous: Record<string, T>) =>
             assistantTempId in previous
               ? { ...previous, [assistantMessage.id]: previous[assistantTempId] }
@@ -1274,18 +1458,15 @@ export function ChatPlayground({
           setReplyAnnouncement(
             spokenAnswer ? `Reply: ${spokenAnswer}` : "Reply finished.",
           );
-
-          if (titleFrom !== null) {
-            void maybeGenerateThreadTitle({
-              threadId,
-              userContent: titleFrom,
-              assistantContent: assistantMessage.content,
-              modelId,
-            });
-          }
         },
         onError: (message) => {
+          if (!isCurrent()) {
+            return;
+          }
           streamFailed = true;
+          if (!onScreen()) {
+            return;
+          }
           setError(message);
           setMessages((previous) =>
             previous.filter(
@@ -1298,10 +1479,25 @@ export function ChatPlayground({
           );
         },
         onClose: () => {
-          setIsStreaming(false);
-          setStreamingThreadId(null);
-          streamAbortRef.current = null;
-          void refreshThreadList(threadId);
+          // A stopped turn has already left the view to the stop.
+          const current = isCurrent();
+          if (current) {
+            streamingTurnRef.current = null;
+            setIsStreaming(false);
+            setStreamingThreadId(null);
+          }
+          const listRefreshed = refreshThreadList(threadId);
+          // Any turn that ended without an error (finished, stopped,
+          // retried or edited) can title a thread still called "New chat".
+          // Ask after the list refresh, so its older copy of the thread
+          // cannot replace the new title.
+          if (!streamFailed) {
+            void listRefreshed.then(() =>
+              maybeGenerateThreadTitle({ threadId, modelId: turnModelId }),
+            );
+          }
+          if (!current) return;
+          if (streamFailed) onFailed?.();
           // Failed partial text of a new message is useful feedback but is
           // deliberately absent from persisted history. Keep it visible until
           // the user navigates. A failed retry or edit changed nothing.
@@ -1311,6 +1507,7 @@ export function ChatPlayground({
       });
       onStarted?.();
     } catch (sendError) {
+      streamingTurnRef.current = null;
       setIsStreaming(false);
       setStreamingThreadId(null);
       setError(getErrorMessage(sendError, failureMessage));
@@ -1320,7 +1517,7 @@ export function ChatPlayground({
         setMessages((previous) =>
           previous.filter(
             (message) =>
-              message.id !== promptId && message.id !== assistantTempId,
+              message.id !== prompt.id && message.id !== assistantTempId,
           ),
         );
       }
@@ -1361,23 +1558,25 @@ export function ChatPlayground({
     }
     const threadId = activeThreadId;
     const prompt = current[promptIndex];
+    const thinking = thinkingFor(modelId);
     startTurnStream({
       threadId,
       startedAt: Date.now(),
+      modelId,
+      thinking,
       shown: (previous) => {
         const index = previous.findIndex((message) => message.id === prompt.id);
         return index === -1 ? previous : previous.slice(0, index + 1);
       },
-      promptId: prompt.id,
+      prompt,
       replacedIds: current.slice(promptIndex + 1).map((message) => message.id),
-      titleFrom: null,
       restoreOnFailure: true,
       failureMessage: "Failed to retry this reply.",
       start: (callbacks) =>
         api.regenerateChatThreadMessageStream(
           threadId,
           replyId,
-          generationOptions(modelId),
+          generationOptions(modelId, thinking),
           callbacks,
         ),
     });
@@ -1401,23 +1600,25 @@ export function ChatPlayground({
       content_parts: null,
     };
     setEditingMessageId(null);
+    const thinking = thinkingFor(selectedModel);
     startTurnStream({
       threadId,
       startedAt: Date.now(),
+      modelId: selectedModel,
+      thinking,
       shown: (previous) => {
         const at = previous.findIndex((message) => message.id === messageId);
         return at === -1 ? previous : [...previous.slice(0, at), edited];
       },
-      promptId: messageId,
+      prompt: edited,
       replacedIds: current.slice(index + 1).map((message) => message.id),
-      titleFrom: null,
       restoreOnFailure: true,
       failureMessage: "Failed to send your edit.",
       start: (callbacks) =>
         api.editChatThreadMessageStream(
           threadId,
           messageId,
-          { ...generationOptions(selectedModel), content },
+          { ...generationOptions(selectedModel, thinking), content },
           callbacks,
         ),
     });
@@ -1447,19 +1648,14 @@ export function ChatPlayground({
     }
   };
 
-  const handleOpenModels = () => {
-    onOpenModelManager();
-  };
-
   const renderModelSelector = (menuPlacement: "top" | "bottom") => (
-    <RouteModelSelect
+    <ChatModelPicker
       value={selectedModel}
       options={modelOptions}
       onSelect={onSelectModel}
+      onManage={onOpenModelManager}
+      disabled={busy}
       menuPlacement={menuPlacement}
-      aria-label="Chat model"
-      className="w-[180px] max-w-[calc(100vw-12rem)] sm:w-[220px]"
-      triggerClassName="h-8 text-xs"
     />
   );
 
@@ -1537,7 +1733,12 @@ export function ChatPlayground({
           }));
         }}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
+          // Enter that ends an IME composition picks the text; it does not send.
+          if (
+            event.key === "Enter" &&
+            !event.shiftKey &&
+            !event.nativeEvent.isComposing
+          ) {
             event.preventDefault();
             void sendMessage();
             return;
@@ -1574,7 +1775,7 @@ export function ChatPlayground({
         ref={imageInputRef}
         data-testid="chat-image-input"
         type="file"
-        accept="image/*"
+        accept={CHAT_IMAGE_ACCEPT}
         multiple
         className="hidden"
         onChange={(event) => {
@@ -1593,7 +1794,7 @@ export function ChatPlayground({
               size="icon"
               onClick={openImagePicker}
               disabled={isStreaming || isPreparingThread || isReadingImages}
-              className={cn("h-8 w-8 border p-0", chatSecondaryButtonClass)}
+              className={cn("w-9 p-0", composerPillClass)}
               title="Attach image"
               aria-label="Attach image"
             >
@@ -1605,26 +1806,29 @@ export function ChatPlayground({
             </Button>
           )}
           {renderModelSelector(centered ? "bottom" : "top")}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleOpenModels}
-            className={cn("h-8 gap-1.5 border text-xs", chatSecondaryButtonClass)}
-          >
-            <Settings2 className="w-3.5 h-3.5" />
-            Models
-          </Button>
-          {supportsThinking && (
+          {supportsThinking && !thinkingToggleable && (
+            <span
+              className={cn(
+                "inline-flex items-center gap-1.5 px-3.5",
+                composerPillClass,
+                composerPillActiveClass,
+              )}
+              title="This model always thinks before it answers"
+            >
+              <Brain className="w-3.5 h-3.5" aria-hidden="true" />
+              Thinking
+            </span>
+          )}
+          {supportsThinking && thinkingToggleable && (
             <Button
               variant="outline"
               size="sm"
               onClick={() => setIsThinkingEnabled((previous) => !previous)}
               disabled={isStreaming || isPreparingThread}
               className={cn(
-                "h-8 gap-1.5 border text-xs shadow-none",
-                thinkingEnabledForModel
-                  ? chatSecondaryButtonActiveClass
-                  : chatSecondaryButtonClass,
+                "gap-1.5 px-3.5",
+                composerPillClass,
+                thinkingEnabledForModel && composerPillActiveClass,
               )}
               title={
                 thinkingEnabledForModel
@@ -1652,7 +1856,7 @@ export function ChatPlayground({
               <SelectTrigger
                 aria-label="Reasoning effort"
                 title="Reasoning effort"
-                className="h-8 w-[7.25rem] border bg-[var(--bg-surface-2)] px-2.5 text-xs shadow-none"
+                className={cn("w-[7.5rem] px-3.5", composerPillClass)}
               >
                 <SelectValue />
               </SelectTrigger>
@@ -1721,6 +1925,7 @@ export function ChatPlayground({
   };
   const renderThreadList = (onAfterSelect?: () => void) => (
     <ChatThreadList
+      searchThreads={searchThreads}
       threads={threads}
       activeThreadId={activeThreadId}
       loading={threadsLoading}
@@ -1768,7 +1973,7 @@ export function ChatPlayground({
         {showThreadColumn ? null : (
         <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
           <RouteHistoryDrawer
-            title="Chat History"
+            title="Chat history"
             countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
             open={isHistoryDrawerOpen}
             onOpenChange={handleHistoryDrawerOpenChange}
@@ -1905,6 +2110,9 @@ export function ChatPlayground({
                   <div className="mx-auto flex max-w-3xl flex-col gap-7">
                     {visibleMessages.map((message, index) => {
                       const isUser = message.role === "user";
+                      // A stopped reply the server has not stored yet has
+                      // nothing to retry or delete there.
+                      const isStored = !message.id.startsWith("tmp-");
                       const isStreamingReply =
                         !isUser &&
                         index === visibleMessages.length - 1 &&
@@ -1914,8 +2122,7 @@ export function ChatPlayground({
                       // per message; the thread model for older replies), so
                       // past reasoning does not depend on today's toggle.
                       const writerImplicitThink = message.model_id
-                        ? (modelSupportsThinking?.(message.model_id) ??
-                          supportsImplicitOpenThinkTagParsing(message.model_id))
+                        ? writesImplicitThink(message.model_id)
                         : implicitOpenThinkTagModel;
                       const messageKey = message.id;
                       const previous = visibleMessages[index - 1];
@@ -1955,7 +2162,7 @@ export function ChatPlayground({
                                 isStreamingReply={isStreamingReply}
                                 isLatestReply={index === lastAssistantIndex}
                                 implicitThink={writerImplicitThink}
-                                thinkingEnabled={thinkingEnabledForModel}
+                                thinkingEnabled={streamThinkingEnabled}
                                 modelLabel={
                                   message.model_id
                                     ? (modelOptions.find(
@@ -1990,6 +2197,7 @@ export function ChatPlayground({
                                 }
                                 canRetry={
                                   !busy &&
+                                  isStored &&
                                   index === lastAssistantIndex &&
                                   index === visibleMessages.length - 1
                                 }
@@ -1999,7 +2207,7 @@ export function ChatPlayground({
                                   retryReply(messageKey, modelId)
                                 }
                                 onDelete={
-                                  busy
+                                  busy || !isStored
                                     ? undefined
                                     : () => {
                                         setDeleteReplyError(null);

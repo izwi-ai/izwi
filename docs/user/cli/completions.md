@@ -83,7 +83,6 @@ After installation, restart your shell or source your config file. Then use Tab 
 ```bash
 izwi <TAB>
 izwi serve --<TAB>
-izwi pull qwen3-<TAB>
 ```
 
 ---

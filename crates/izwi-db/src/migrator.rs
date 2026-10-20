@@ -41,6 +41,11 @@ impl Schema {
                 (7, "chat message model and finish reason"),
                 (8, "chat message reasoning time"),
                 (9, "studio segment render state"),
+                (
+                    10,
+                    "repair reasoning stored as summaries, titles and memories",
+                ),
+                (11, "voice session chat threads"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -194,6 +199,15 @@ async fn apply_migration<C: ConnectionTrait>(
             for column in STUDIO_SEGMENT_RENDER_COLUMNS {
                 ensure_column(db, column).await?;
             }
+        }
+        (Schema::App, 10) => {
+            for statement in REASONING_DATA_REPAIR {
+                db.execute_unprepared(statement).await?;
+            }
+        }
+        (Schema::App, 11) => {
+            ensure_column(db, &CHAT_THREAD_VOICE_SESSION_COLUMN).await?;
+            db.execute_unprepared(HIDE_LEGACY_VOICE_THREADS).await?;
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1078,6 +1092,68 @@ const STUDIO_SEGMENT_RENDER_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 10: text thinking models stored before the server's own
+/// generations ran with thinking off (0.1.0-beta-18). Summaries that are reasoning
+/// traces become failed, so the app offers to regenerate them; thread titles
+/// that are reasoning become the first message's opening words; voice
+/// memories, all extracted with thinking on, are cleared. Portable SQL, and
+/// a no-op on an empty database.
+const REASONING_DATA_REPAIR: &[&str] = &[
+    r#"
+    UPDATE transcription_records
+    SET summary_status = 'failed',
+        summary_text = NULL,
+        summary_error = 'This summary held the model''s reasoning instead of a summary. Regenerate it.'
+    WHERE summary_status = 'ready'
+      AND (summary_text LIKE '%Thinking Process%'
+        OR summary_text LIKE '%**Analy%'
+        OR summary_text LIKE '%**Draft%'
+        OR summary_text LIKE '%<think>%'
+        OR summary_text LIKE '%</think>%')
+    "#,
+    r#"
+    UPDATE diarization_records
+    SET summary_status = 'failed',
+        summary_text = NULL,
+        summary_error = 'This summary held the model''s reasoning instead of a summary. Regenerate it.'
+    WHERE summary_status = 'ready'
+      AND (summary_text LIKE '%Thinking Process%'
+        OR summary_text LIKE '%**Analy%'
+        OR summary_text LIKE '%**Draft%'
+        OR summary_text LIKE '%<think>%'
+        OR summary_text LIKE '%</think>%')
+    "#,
+    r#"
+    UPDATE chat_threads
+    SET title = COALESCE(
+        (SELECT NULLIF(substr(trim(m.content), 1, 80), '')
+         FROM chat_messages m
+         WHERE m.thread_id = chat_threads.id AND m.role = 'user'
+         ORDER BY m.created_at, m.id
+         LIMIT 1),
+        'New chat')
+    WHERE title LIKE 'Thinking Process%'
+       OR title LIKE 'We need to output%'
+       OR title LIKE '%<think>%'
+       OR title LIKE '%</think>%'
+    "#,
+    "DELETE FROM voice_observations",
+];
+
+/// Migration 11: the voice session a chat thread holds the agent memory of.
+/// Chat lists only threads without one, and deleting the voice session
+/// deletes its thread.
+const CHAT_THREAD_VOICE_SESSION_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "chat_threads",
+    column: "voice_session_id",
+    definition: "TEXT NULL",
+};
+
+/// Voice threads created before migration 11 name no session; the voice
+/// agent titled them "Voice Session". They leave Chat and stay stored.
+const HIDE_LEGACY_VOICE_THREADS: &str = "UPDATE chat_threads SET voice_session_id = 'legacy' \
+     WHERE voice_session_id IS NULL AND title = 'Voice Session'";
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1610,6 +1686,9 @@ pub(crate) fn postgres_schema_sql() -> String {
     for column in STUDIO_SEGMENT_RENDER_COLUMNS {
         push(&add_column(column));
     }
+    // Migration 10 repairs stored data: an empty schema has none.
+    // Migration 11.
+    push(&add_column(&CHAT_THREAD_VOICE_SESSION_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1849,6 +1928,193 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    async fn text(db: &DatabaseConnection, sql: &str) -> Option<String> {
+        db.query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+            .await
+            .expect("text query")
+            .expect("text row")
+            .try_get_by_index::<Option<String>>(0)
+            .expect("text value")
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_9_loses_reasoning_stored_as_text() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 10",
+        )
+        .await
+        .expect("version row deletes");
+        let reasoning = "Thinking Process: 1. **Analyze the Request:** * Task: Summarize.";
+        for (id, summary) in [
+            ("t-reasoning", reasoning),
+            (
+                "t-cut",
+                "` or thinking content. * Goal: Concise. 3. **Drafting the Summary:**",
+            ),
+            ("t-clean", "Erin is struggling to review for an exam."),
+        ] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO transcription_records (id, created_at, processing_time_ms, \
+                 audio_mime_type, audio_storage_path, transcription, summary_status, summary_text) \
+                 VALUES ('{id}', 1, 0, 'audio/wav', 'a.wav', 'text', 'ready', '{summary}')"
+            ))
+            .await
+            .expect("transcription inserts");
+        }
+        for (id, summary) in [
+            ("d-reasoning", reasoning),
+            ("d-clean", "Two speakers agree."),
+        ] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO diarization_records (id, created_at, enable_llm_refinement, \
+                 processing_time_ms, speaker_count, unattributed_words, llm_refined, asr_text, \
+                 raw_transcript, transcript, segments_json, words_json, utterances_json, \
+                 audio_mime_type, audio_storage_path, summary_status, summary_text) VALUES \
+                 ('{id}', 1, 0, 0, 2, 0, 0, '', '', 't', '[]', '[]', '[]', 'audio/wav', 'a.wav', \
+                 'ready', '{summary}')"
+            ))
+            .await
+            .expect("diarization inserts");
+        }
+        for (id, title) in [
+            (
+                "c-reasoning",
+                "Thinking Process: 1. **Analyze the Request:** * Task: Generate",
+            ),
+            (
+                "c-image",
+                "We need to output a concise chat title max 8 words",
+            ),
+            ("c-clean", "Winter houseplant care"),
+        ] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO chat_threads (id, title, created_at, updated_at) \
+                 VALUES ('{id}', '{title}', 1, 1)"
+            ))
+            .await
+            .expect("thread inserts");
+        }
+        for (id, thread, role, content, at) in [
+            ("m1", "c-reasoning", "user", "  Name one planet  ", 1),
+            ("m2", "c-reasoning", "assistant", "Mars.", 2),
+            ("m3", "c-reasoning", "user", "Another one", 3),
+            ("m4", "c-image", "user", "", 1),
+        ] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO chat_messages (id, thread_id, role, content, created_at) \
+                 VALUES ('{id}', '{thread}', '{role}', '{content}', {at})"
+            ))
+            .await
+            .expect("message inserts");
+        }
+        db.execute_unprepared(&format!(
+            "INSERT INTO voice_observations (id, profile_id, category, summary, \
+             canonical_summary, confidence, created_at, updated_at) VALUES \
+             ('o1', '{DEFAULT_VOICE_PROFILE_ID}', 'fact', 'Plants need light', \
+             'plants need light', 1.0, 1, 1)"
+        ))
+        .await
+        .expect("observation inserts");
+
+        Migrator::up(db).await.expect("the database upgrades");
+
+        let status =
+            |table: &str, id: &str| format!("SELECT summary_status FROM {table} WHERE id = '{id}'");
+        for (table, id) in [
+            ("transcription_records", "t-reasoning"),
+            ("transcription_records", "t-cut"),
+            ("diarization_records", "d-reasoning"),
+        ] {
+            assert_eq!(
+                text(db, &status(table, id)).await.as_deref(),
+                Some("failed"),
+                "{id}"
+            );
+            assert_eq!(
+                text(
+                    db,
+                    &format!("SELECT summary_text FROM {table} WHERE id = '{id}'")
+                )
+                .await,
+                None
+            );
+            assert!(text(
+                db,
+                &format!("SELECT summary_error FROM {table} WHERE id = '{id}'")
+            )
+            .await
+            .is_some_and(|error| error.contains("Regenerate")));
+        }
+        assert_eq!(
+            text(db, &status("transcription_records", "t-clean"))
+                .await
+                .as_deref(),
+            Some("ready")
+        );
+        assert_eq!(
+            text(db, &status("diarization_records", "d-clean"))
+                .await
+                .as_deref(),
+            Some("ready")
+        );
+        let title = |id: &str| format!("SELECT title FROM chat_threads WHERE id = '{id}'");
+        assert_eq!(
+            text(db, &title("c-reasoning")).await.as_deref(),
+            Some("Name one planet")
+        );
+        assert_eq!(
+            text(db, &title("c-image")).await.as_deref(),
+            Some("New chat")
+        );
+        assert_eq!(
+            text(db, &title("c-clean")).await.as_deref(),
+            Some("Winter houseplant care")
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM voice_observations").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_10_hides_its_voice_threads_from_chat() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let column = &CHAT_THREAD_VOICE_SESSION_COLUMN;
+        db.execute_unprepared(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            column.table, column.column
+        ))
+        .await
+        .expect("column drops");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 11",
+        )
+        .await
+        .expect("version row deletes");
+        for (id, title) in [("voice", "Voice Session"), ("chat", "Planets")] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO chat_threads (id, title, created_at, updated_at) \
+                 VALUES ('{id}', '{title}', 1, 1)"
+            ))
+            .await
+            .expect("thread inserts");
+        }
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert!(table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+        let session =
+            |id: &str| format!("SELECT voice_session_id FROM chat_threads WHERE id = '{id}'");
+        assert_eq!(text(db, &session("voice")).await.as_deref(), Some("legacy"));
+        assert_eq!(text(db, &session("chat")).await, None);
     }
 
     fn shipped_postgres_schema_path() -> std::path::PathBuf {

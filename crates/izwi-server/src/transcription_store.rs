@@ -721,6 +721,27 @@ impl TranscriptionStore {
             )?)
             .await
             .context("Failed to fail interrupted transcription records")?;
+        // A summary runs as a task of the process that asked for it, so a
+        // pending one has nothing left to finish it after a restart.
+        db.execute_raw(raw::statement(
+            db,
+            format!(
+                r#"
+                UPDATE transcription_records
+                SET
+                    summary_status = 'failed',
+                    summary_error = ?1
+                WHERE summary_status = 'pending'
+                  AND (owner_node_id = ?2 {unowned})
+                "#
+            ),
+            vec![
+                crate::diarization_store::SUMMARY_INTERRUPTED_ERROR.into(),
+                scope.owner.clone().into(),
+            ],
+        )?)
+        .await
+        .context("Failed to fail interrupted transcription summaries")?;
         Ok(result.rows_affected())
     }
 
@@ -803,6 +824,44 @@ impl TranscriptionStore {
         if result.rows_affected == 0 {
             return Ok(None);
         }
+        fetch_record_without_audio(db, &record_id).await
+    }
+
+    /// Fail a record that is still pending or processing, and drop its
+    /// runtime attempt so a stage that is still running cannot write a
+    /// result over the cancellation. Returns the record as it now is, or
+    /// `None` when it does not exist.
+    pub async fn cancel_record(
+        &self,
+        record_id: String,
+        reason: String,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        let db = self.db.connection().await?;
+        transcription_records::Entity::update_many()
+            .col_expr(
+                transcription_records::Column::ProcessingStatus,
+                Expr::value(TranscriptionProcessingStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                transcription_records::Column::ProcessingError,
+                Expr::value(sanitize_optional_text(Some(reason.as_str()), 1_000)),
+            )
+            .col_expr(
+                transcription_records::Column::RuntimeStageId,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                transcription_records::Column::RuntimeAttemptToken,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::ProcessingStatus.is_in([
+                TranscriptionProcessingStatus::Pending.as_db_value(),
+                TranscriptionProcessingStatus::Processing.as_db_value(),
+            ]))
+            .exec(db)
+            .await
+            .context("Failed to cancel transcription record")?;
         fetch_record_without_audio(db, &record_id).await
     }
 
@@ -1049,7 +1108,9 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
-    pub async fn delete_record(&self, record_id: String) -> anyhow::Result<bool> {
+    /// Delete a record and its upload. `None` when no record has that id,
+    /// otherwise the deleted upload's storage key.
+    pub async fn delete_record(&self, record_id: String) -> anyhow::Result<Option<Option<String>>> {
         let db = self.db.connection().await?;
         let audio_storage_path = db
             .query_one_raw(raw::statement(
@@ -1066,10 +1127,11 @@ impl TranscriptionStore {
             .exec(db)
             .await
             .context("Failed to delete transcription record")?;
-        if result.rows_affected > 0 {
-            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
+        if result.rows_affected == 0 {
+            return Ok(None);
         }
-        Ok(result.rows_affected > 0)
+        delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
+        Ok(Some(audio_storage_path))
     }
 }
 
@@ -2191,6 +2253,49 @@ mod tests {
             TranscriptionProcessingStatus::Failed
         );
         assert_eq!(summaries[0].transcription_preview, "Runtime unavailable");
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// A summary left pending by a previous process fails at startup with a
+    /// reason, instead of staying pending (and polled) forever.
+    #[tokio::test]
+    async fn startup_fails_summaries_left_pending() {
+        let (store, root) = build_test_store();
+        let mut pending = sample_record();
+        pending.summary_status = TranscriptionSummaryStatus::Pending;
+        pending.summary_text = None;
+        let pending = store.create_record(pending).await.expect("pending summary");
+        let ready = store
+            .create_record(sample_record())
+            .await
+            .expect("ready summary");
+
+        store
+            .fail_interrupted_records()
+            .await
+            .expect("startup recovery");
+
+        let pending = store
+            .get_record(pending.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(pending.summary_status, TranscriptionSummaryStatus::Failed);
+        assert_eq!(
+            pending.summary_error.as_deref(),
+            Some(crate::diarization_store::SUMMARY_INTERRUPTED_ERROR)
+        );
+        let ready = store
+            .get_record(ready.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(ready.summary_status, TranscriptionSummaryStatus::Ready);
+        assert_eq!(
+            ready.summary_text.as_deref(),
+            Some("A short summary of the transcript.")
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

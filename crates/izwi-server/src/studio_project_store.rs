@@ -2268,6 +2268,24 @@ pub fn apply_pronunciations(text: &str, rules: &[StudioProjectPronunciationRecor
     output
 }
 
+/// A letter or digit of a script that separates words with spaces. Chinese,
+/// Japanese and Thai don't, so a rule in them matches inside a longer run.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        && !matches!(ch,
+            '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
+            | '\u{31F0}'..='\u{31FF}' // Katakana phonetic extensions
+            | '\u{3400}'..='\u{4DBF}' // CJK extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+            | '\u{FF66}'..='\u{FF9F}' // halfwidth Katakana
+            | '\u{20000}'..='\u{2FFFF}' // CJK extensions B onward
+            | '\u{0E00}'..='\u{0EFF}' // Thai, Lao
+            | '\u{1000}'..='\u{109F}' // Myanmar
+            | '\u{1780}'..='\u{17FF}' // Khmer
+        )
+}
+
 fn matches_whole_word(text: &[char], start: usize, word: &[char]) -> bool {
     let end = start + word.len();
     if end > text.len() {
@@ -2282,11 +2300,9 @@ fn matches_whole_word(text: &[char], start: usize, word: &[char]) -> bool {
     }
     // A boundary only matters next to a word character of the rule itself,
     // so rules such as "C++" or "e.g." still match.
-    let starts_clean =
-        !word[0].is_alphanumeric() || start == 0 || !text[start - 1].is_alphanumeric();
-    let ends_clean = !word[word.len() - 1].is_alphanumeric()
-        || end == text.len()
-        || !text[end].is_alphanumeric();
+    let starts_clean = !is_word_char(word[0]) || start == 0 || !is_word_char(text[start - 1]);
+    let ends_clean =
+        !is_word_char(word[word.len() - 1]) || end == text.len() || !is_word_char(text[end]);
     starts_clean && ends_clean
 }
 
@@ -4040,6 +4056,19 @@ mod tests {
                 &[rule("York", "Yawk"), rule("New York", "Noo Yawk")]
             ),
             "Noo Yawk and Yawk"
+        );
+    }
+
+    #[test]
+    fn pronunciations_match_inside_text_written_without_spaces() {
+        assert_eq!(
+            apply_pronunciations("東京都に行きます", &[rule("東京", "とうきょう")]),
+            "とうきょう都に行きます"
+        );
+        // A Latin rule still needs its word boundary next to CJK text.
+        assert_eq!(
+            apply_pronunciations("SQLとMySQL", &[rule("SQL", "sequel")]),
+            "sequelとMySQL"
         );
     }
 }

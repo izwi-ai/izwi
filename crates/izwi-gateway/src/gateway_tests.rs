@@ -269,7 +269,8 @@ async fn registry_gateway_state_with_config(
 
 #[tokio::test]
 async fn public_chat_nonstream_and_stream_use_registry_dispatcher() {
-    let model = ModelVariant::Qwen354BGguf;
+    // A model that answers without thinking by default, as the test worker does.
+    let model = ModelVariant::Qwen352BGguf;
     let (state, _worker) = registry_gateway_state(model).await;
     let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
@@ -337,7 +338,8 @@ async fn public_chat_nonstream_and_stream_use_registry_dispatcher() {
 /// `delta.tool_calls` with no markup in `delta.content`.
 #[tokio::test]
 async fn gateway_streams_worker_tool_markup_as_tool_calls() {
-    let model = ModelVariant::Qwen354BGguf;
+    // A model that answers without thinking by default, as the test worker does.
+    let model = ModelVariant::Qwen352BGguf;
     let deltas = [
         "Checking.\n<tool",
         "_call>\n<function=get_",
@@ -1156,7 +1158,8 @@ async fn realtime_relay_forwards_a_cancel_while_the_client_is_not_reading() {
 
 #[tokio::test]
 async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
-    let model = ModelVariant::Qwen354BGguf;
+    // A model that answers without thinking by default, as the test worker does.
+    let model = ModelVariant::Qwen352BGguf;
     let deployment_id = TestWorkerConfig::default().deployment_id;
     let incarnation = |suffix: &str| TestWorkerConfig {
         worker_id: "test-worker-fleet".try_into().expect("test id valid"),
@@ -1414,7 +1417,8 @@ async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_withou
 
 #[tokio::test]
 async fn gateway_router_uses_only_the_remote_worker_and_hides_local_routes() {
-    let model = ModelVariant::Qwen354BGguf;
+    // A model that answers without thinking by default, as the test worker does.
+    let model = ModelVariant::Qwen352BGguf;
     let worker_config = TestWorkerConfig {
         public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
         ..TestWorkerConfig::default()

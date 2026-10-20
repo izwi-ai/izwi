@@ -5,7 +5,7 @@ import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
 describe("AUDIO_FILE_ACCEPT", () => {
   it("advertises every desktop-supported audio extension explicitly", () => {
     expect(AUDIO_FILE_ACCEPT.split(",")).toEqual(
-      expect.arrayContaining([".wav", ".mp3", ".m4a", ".aac"]),
+      expect.arrayContaining([".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"]),
     );
   });
 
@@ -17,8 +17,15 @@ describe("AUDIO_FILE_ACCEPT", () => {
         "audio/mpeg",
         "audio/mp4",
         "audio/aac",
+        "audio/flac",
+        "audio/ogg",
       ]),
     );
   });
-});
 
+  it("does not offer Opus, which the server cannot decode", () => {
+    const accepted = AUDIO_FILE_ACCEPT.split(",");
+    expect(accepted).not.toContain(".opus");
+    expect(accepted).not.toContain(".webm");
+  });
+});

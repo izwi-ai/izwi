@@ -27,7 +27,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DiarizationExportDialog } from "@/components/DiarizationExportDialog";
 import { DiarizationQualityPanel } from "@/components/DiarizationQualityPanel";
 import { DiarizationReviewWorkspace } from "@/components/DiarizationReviewWorkspace";
-import { DiarizationSpeakerManager } from "@/components/DiarizationSpeakerManager";
+import { DiarizationSpeakersTable } from "@/features/diarization/components/DiarizationSpeakersTable";
 import {
   formatClockDuration,
   formatHistoryDate,
@@ -82,7 +82,6 @@ export function DiarizationRecordDetail({
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [speakerUpdatePending, setSpeakerUpdatePending] = useState(false);
   const [speakerUpdateError, setSpeakerUpdateError] = useState<string | null>(
     null,
   );
@@ -151,7 +150,6 @@ export function DiarizationRecordDetail({
     setDeleteConfirmOpen(false);
     setDeletePending(false);
     setDeleteError(null);
-    setSpeakerUpdatePending(false);
     setSpeakerUpdateError(null);
     setRerunPending(false);
     setRerunError(null);
@@ -191,20 +189,18 @@ export function DiarizationRecordDetail({
   async function handleSaveSpeakerCorrections(
     speakerNameOverrides: Record<string, string>,
   ): Promise<void> {
-    if (!record || !onSaveSpeakerCorrections || speakerUpdatePending) {
+    if (!record || !onSaveSpeakerCorrections) {
       return;
     }
 
-    setSpeakerUpdatePending(true);
     setSpeakerUpdateError(null);
     try {
       await onSaveSpeakerCorrections(record.id, speakerNameOverrides);
     } catch (err) {
       setSpeakerUpdateError(
-        err instanceof Error ? err.message : "Failed to save speaker corrections.",
+        err instanceof Error ? err.message : "Failed to save speaker names.",
       );
-    } finally {
-      setSpeakerUpdatePending(false);
+      throw err;
     }
   }
 
@@ -278,8 +274,11 @@ export function DiarizationRecordDetail({
   const title =
     record?.audio_filename || record?.id || "Diarization record";
   const isReady = processingStatus === "ready";
-  // Summaries need a finished transcript; the hint only helps then.
-  const visibleSummaryGuidance = isReady ? summaryModelGuidance : null;
+  // The hint to load the summary model only helps a finished run whose
+  // summary failed: an existing summary needs nothing, and an unrequested
+  // one is asked for from the menu, which explains what to load.
+  const visibleSummaryGuidance =
+    isReady && record?.summary_status === "failed" ? summaryModelGuidance : null;
   const emptyState =
     processingStatus === "failed"
       ? {
@@ -465,25 +464,20 @@ export function DiarizationRecordDetail({
         onValueChange={setWorkspaceTab}
         className="space-y-4"
       >
-        <TabsList className="inline-flex w-auto justify-start rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-0.5">
-          <TabsTrigger
-            value="transcript"
-            className="h-9 rounded-full px-4 text-sm font-medium"
-          >
-            Transcript
-          </TabsTrigger>
-          <TabsTrigger
-            value="speakers"
-            className="h-9 rounded-full px-4 text-sm font-medium"
-          >
-            Speakers
-          </TabsTrigger>
-          <TabsTrigger
-            value="quality"
-            className="h-9 rounded-full px-4 text-sm font-medium"
-          >
-            Quality
-          </TabsTrigger>
+        <TabsList className="inline-flex h-auto w-auto justify-start gap-0.5 rounded-[10px] border border-[var(--border-subtle)] bg-transparent p-[3px]">
+          {[
+            ["transcript", "Transcript"],
+            ["speakers", "Speakers"],
+            ["quality", "Quality"],
+          ].map(([value, label]) => (
+            <TabsTrigger
+              key={value}
+              value={value}
+              className="h-[26px] rounded-[7px] px-3 text-[12.5px] font-medium text-[var(--text-muted)] shadow-none data-[state=active]:bg-[var(--surface-raised)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+            >
+              {label}
+            </TabsTrigger>
+          ))}
         </TabsList>
 
         <TabsContent value="transcript" className="mt-0">
@@ -501,13 +495,11 @@ export function DiarizationRecordDetail({
 
         <TabsContent value="speakers" className="mt-0">
           {record ? (
-            <DiarizationSpeakerManager
+            <DiarizationSpeakersTable
               record={record}
-              isSaving={speakerUpdatePending}
+              audioUrl={audioUrl}
               error={speakerUpdateError}
-              onSave={(speakerNameOverrides) =>
-                void handleSaveSpeakerCorrections(speakerNameOverrides)
-              }
+              onSave={handleSaveSpeakerCorrections}
             />
           ) : null}
         </TabsContent>

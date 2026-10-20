@@ -1261,6 +1261,11 @@ impl KokoroTtsModel {
         {
             return Ok(casefold.clone());
         }
+        if let Some(alias) = openai_voice_alias(&requested_lower) {
+            if let Some(voice) = speakers.iter().find(|s| s.as_str() == alias) {
+                return Ok(voice.clone());
+            }
+        }
         Err(Error::InvalidInput(format!(
             "Unknown Kokoro speaker '{requested}'. Available speakers: {}",
             speakers.join(", ")
@@ -1299,6 +1304,44 @@ impl KokoroTtsModel {
         }
 
         Ok(token_ids)
+    }
+}
+
+/// The Kokoro voice for an OpenAI voice name, for clients that send
+/// OpenAI's (`alloy`, `nova`…). Kokoro has five of them; the rest get a
+/// similar voice.
+fn openai_voice_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alloy" => "af_alloy",
+        "echo" => "am_echo",
+        "fable" => "bm_fable",
+        "nova" => "af_nova",
+        "onyx" => "am_onyx",
+        "ash" => "am_adam",
+        "ballad" => "bm_george",
+        "cedar" => "am_liam",
+        "coral" => "af_heart",
+        "marin" => "af_river",
+        "sage" => "af_sarah",
+        "shimmer" => "af_bella",
+        "verse" => "am_michael",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn openai_voice_names_map_to_kokoro_voices() {
+    assert_eq!(openai_voice_alias("alloy"), Some("af_alloy"));
+    assert_eq!(openai_voice_alias("shimmer"), Some("af_bella"));
+    assert_eq!(openai_voice_alias("af_heart"), None);
+    // Every alias names a Kokoro voice.
+    for name in [
+        "alloy", "echo", "fable", "nova", "onyx", "ash", "ballad", "cedar", "coral", "marin",
+        "sage", "shimmer", "verse",
+    ] {
+        let voice = openai_voice_alias(name).unwrap();
+        assert!(phonemizer::kokoro_speaker_supported(voice), "{voice}");
     }
 }
 

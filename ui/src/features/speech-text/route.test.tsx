@@ -13,9 +13,7 @@ vi.mock("@/features/transcription/route", () => ({
 }));
 
 vi.mock("@/features/diarization/route", () => ({
-  DiarizationPage: ({ routeBasePath }: { routeBasePath?: string }) => (
-    <div data-testid="diarization-page">diarization:{routeBasePath ?? ""}</div>
-  ),
+  DiarizationPage: () => <div data-testid="diarization-page">diarization</div>,
 }));
 
 const sharedProps = {
@@ -65,16 +63,12 @@ describe("SpeechTextPage", () => {
 
   it("uses diarization mode for detail routes when mode=diarization", async () => {
     renderRoute("/transcription/diar-1?mode=diarization");
-    expect(await screen.findByTestId("diarization-page")).toHaveTextContent(
-      "diarization:/transcription",
-    );
+    expect(await screen.findByTestId("diarization-page")).toBeInTheDocument();
   });
 
   it("uses diarization mode for detail routes when job_kind=diarization", async () => {
     renderRoute("/transcription/diar-1?job_kind=diarization");
-    expect(await screen.findByTestId("diarization-page")).toHaveTextContent(
-      "diarization:/transcription",
-    );
+    expect(await screen.findByTestId("diarization-page")).toBeInTheDocument();
   });
 
   it("uses SAA mode for detail routes when mode=speaker_attributed_asr", async () => {

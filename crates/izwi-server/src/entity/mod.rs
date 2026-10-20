@@ -44,6 +44,9 @@ pub mod chat_threads {
         pub system_prompt: Option<String>,
         pub created_at: i64,
         pub updated_at: i64,
+        /// The voice session whose agent memory this thread holds; such
+        /// threads are not listed in Chat.
+        pub voice_session_id: Option<String>,
     }
     empty_relation!();
 }

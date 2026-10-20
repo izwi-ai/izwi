@@ -20,13 +20,13 @@ See the [Runtime Support Matrix](/support-matrix) before choosing a build target
 ### All Platforms
 
 - **Git** — Version control
-- **Rust** — 1.83 or later (stable). CI and Docker builds use current stable
+- **Rust** — 1.88 or later (stable). CI and Docker builds use current stable
   Rust; the Docker CPU builder currently uses Rust 1.88.
 - **Node.js** — 18+ for UI development. Release CI uses Node 20, while the
   Docker UI builder currently uses Node 24.
 - **`espeak-ng`** (optional, required only for `Kokoro-82M` TTS)
 
-Treat Rust 1.83 and Node 18 as minimums. If you are reproducing release or
+Treat Rust 1.88 and Node 18 as minimums. If you are reproducing release or
 Docker behavior exactly, use the toolchain versions from the release workflow
 or Dockerfile.
 
@@ -45,7 +45,8 @@ source "$HOME/.cargo/env"
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential curl git pkg-config libssl-dev
+sudo apt install -y build-essential curl git pkg-config libssl-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -209,7 +210,7 @@ cd ui
 npm run dev
 ```
 
-The dev UI runs at `http://localhost:5173` and proxies API requests to the server.
+The dev UI runs at `http://localhost:3000` and proxies API requests to the server.
 
 ### Run with Hot Reload
 
@@ -243,11 +244,11 @@ izwi/
 ## Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (build the UI first: izwi-desktop needs ui/dist)
 cargo test
 
-# Run specific crate tests
-cargo test -p izwi-core
+# Run specific crate tests (no UI build needed)
+cargo test -p izwi-core -p izwi-cli -p izwi-server
 
 # Run with output
 cargo test -- --nocapture
@@ -278,7 +279,7 @@ cargo build --release --bin izwi --bin izwi-server &&
 cargo tauri build --bundles deb
 ```
 
-Output: `target/release/bundle/deb/izwi_*.deb`
+Output: `target/release/bundle/deb/Izwi_*_amd64.deb`
 
 ### Windows Installer
 

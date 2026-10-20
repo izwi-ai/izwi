@@ -61,6 +61,29 @@ impl OnboardingStore {
         read_state(db).await
     }
 
+    /// Show first-run setup again ("Run setup again"); the analytics
+    /// choice stays.
+    pub async fn reset(&self) -> anyhow::Result<OnboardingState> {
+        let db = self.db.connection().await?;
+        let state = onboarding_state::ActiveModel {
+            id: Set(ONBOARDING_STATE_ID.to_string()),
+            completed_at: Set(None),
+            ..Default::default()
+        };
+
+        onboarding_state::Entity::insert(state)
+            .on_conflict(
+                OnConflict::column(onboarding_state::Column::Id)
+                    .update_column(onboarding_state::Column::CompletedAt)
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .context("Failed to reset onboarding")?;
+
+        read_state(db).await
+    }
+
     pub async fn set_analytics_opt_in(
         &self,
         analytics_opt_in: bool,
@@ -225,6 +248,23 @@ mod tests {
             assert!(!opted_out.analytics_opt_in);
             assert!(opted_out.completed);
             assert!(opted_out.completed_at.is_some());
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reset_shows_setup_again_and_keeps_the_analytics_choice() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            store.set_analytics_opt_in(true).await.expect("opt in");
+            store.mark_completed().await.expect("complete");
+
+            let reset = store.reset().await.expect("reset");
+            assert!(!reset.completed);
+            assert!(reset.completed_at.is_none());
+            assert!(reset.analytics_opt_in);
+            assert!(!store.get_state().await.expect("reload").completed);
             clear_env();
         })
         .await;
