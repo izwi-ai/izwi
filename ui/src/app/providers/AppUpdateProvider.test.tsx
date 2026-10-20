@@ -51,11 +51,11 @@ const health = {
 };
 
 const availableUpdate = {
-  version: "0.1.0-beta-20",
-  currentVersion: "0.1.0-beta-19",
+  version: "0.1.1",
+  currentVersion: "0.1.0",
   notes: null,
   publishedAt: null,
-  releaseTag: "v0.1.0-beta-20",
+  releaseTag: "v0.1.1",
   manifestUrl: "https://example.com/update.json",
   platformBehavior: {
     appExitsDuringInstall: false,
@@ -74,6 +74,8 @@ function deferredPromise<T>() {
 function UpdateProbe() {
   const {
     status,
+    availableUpdate: offered,
+    downloadedVersion,
     capabilityStatus,
     updaterSupported,
     checkForUpdates,
@@ -84,6 +86,8 @@ function UpdateProbe() {
       <span>{updaterSupported ? "supported" : "unsupported"}</span>
       <span data-testid="capability-status">{capabilityStatus}</span>
       <span data-testid="update-status">{status}</span>
+      <span data-testid="offered-version">{offered?.version ?? "none"}</span>
+      <span data-testid="downloaded-version">{downloadedVersion ?? "none"}</span>
       <button type="button" onClick={() => void checkForUpdates(true)}>
         Check
       </button>
@@ -174,5 +178,96 @@ describe("AppUpdateProvider capabilities", () => {
       });
       await install.promise;
     });
+  });
+});
+
+describe("AppUpdateProvider re-checks after a download", () => {
+  const installed = { appExitsDuringInstall: false, supportsRestartLater: true };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    coreMocks.isTauri.mockReturnValue(true);
+    updateMocks.getUpdaterHealthSnapshot.mockResolvedValue(health);
+    updateMocks.checkForBetaUpdate.mockResolvedValue(availableUpdate);
+    updateMocks.installBetaUpdate.mockResolvedValue(installed);
+  });
+
+  async function renderDownloaded() {
+    renderProvider();
+    await waitFor(() =>
+      expect(screen.getByTestId("update-status")).toHaveTextContent("available"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("update-status")).toHaveTextContent("downloaded"),
+    );
+    expect(screen.getByTestId("downloaded-version")).toHaveTextContent(
+      availableUpdate.version,
+    );
+  }
+
+  async function checkAgain() {
+    const calls = updateMocks.checkForBetaUpdate.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Check" }));
+    await waitFor(() =>
+      expect(updateMocks.checkForBetaUpdate).toHaveBeenCalledTimes(calls + 1),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("update-status")).not.toHaveTextContent("checking"),
+    );
+  }
+
+  it("stays ready to restart when the downloaded version is offered again", async () => {
+    await renderDownloaded();
+
+    await checkAgain();
+
+    expect(screen.getByTestId("update-status")).toHaveTextContent("downloaded");
+    expect(screen.getByTestId("offered-version")).toHaveTextContent(
+      availableUpdate.version,
+    );
+    expect(updateMocks.installBetaUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not download the same version twice", async () => {
+    await renderDownloaded();
+
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+
+    expect(updateMocks.installBetaUpdate).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("update-status")).toHaveTextContent("downloaded");
+  });
+
+  it("stays ready when a re-check finds nothing or fails", async () => {
+    await renderDownloaded();
+
+    updateMocks.checkForBetaUpdate.mockResolvedValueOnce(null);
+    await checkAgain();
+    expect(screen.getByTestId("update-status")).toHaveTextContent("downloaded");
+    expect(screen.getByTestId("offered-version")).toHaveTextContent(
+      availableUpdate.version,
+    );
+    expect(updateMocks.notify).not.toHaveBeenCalled();
+
+    updateMocks.checkForBetaUpdate.mockRejectedValueOnce(new Error("Offline"));
+    await checkAgain();
+    expect(screen.getByTestId("update-status")).toHaveTextContent("downloaded");
+  });
+
+  it("offers a newer release over the one waiting for a restart", async () => {
+    await renderDownloaded();
+
+    updateMocks.checkForBetaUpdate.mockResolvedValueOnce({
+      ...availableUpdate,
+      version: "0.1.2",
+      releaseTag: "v0.1.2",
+    });
+    await checkAgain();
+
+    expect(screen.getByTestId("update-status")).toHaveTextContent("available");
+    expect(screen.getByTestId("offered-version")).toHaveTextContent("0.1.2");
+    expect(screen.getByTestId("downloaded-version")).toHaveTextContent(
+      availableUpdate.version,
+    );
   });
 });
