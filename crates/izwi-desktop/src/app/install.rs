@@ -180,8 +180,23 @@ fn path_contains_dir(dir: &std::path::Path) -> bool {
     std::env::split_paths(&path).any(|entry| entry == dir)
 }
 
+/// Whether `src` and `dest` are one file. A per-user Windows install puts
+/// the bundled binaries where the command line tool is installed: there is
+/// nothing to copy, and removing the destination first would delete the
+/// source (or fail on the running server).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn is_same_path(src: &std::path::Path, dest: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(src), std::fs::canonicalize(dest)) {
+        (Ok(src), Ok(dest)) => src == dest,
+        _ => false,
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn install_binary_copy(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    if is_same_path(src, dest) {
+        return Ok(());
+    }
     let existing = std::fs::symlink_metadata(dest).ok();
     if let Some(metadata) = existing {
         if metadata.file_type().is_dir() {
@@ -211,6 +226,9 @@ fn install_binary_copy(src: &std::path::Path, dest: &std::path::Path) -> Result<
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn install_dir_copy(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    if is_same_path(src, dest) {
+        return Ok(());
+    }
     let existing = std::fs::symlink_metadata(dest).ok();
     if let Some(metadata) = existing {
         if metadata.file_type().is_dir() {
@@ -575,6 +593,18 @@ fn escape_applescript(input: &str) -> String {
 mod tests {
     #[cfg(target_os = "macos")]
     use super::manual_link_command;
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn installing_a_binary_onto_itself_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("izwi-install-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("izwi");
+        std::fs::write(&binary, b"binary").unwrap();
+        super::install_binary_copy(&binary, &binary).unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), b"binary");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[cfg(target_os = "macos")]
     use std::path::Path;
 
