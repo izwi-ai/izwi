@@ -875,13 +875,38 @@ fn maybe_spawn_summary_generation(
         state,
         summary_timeout_secs,
         record.id.clone(),
-        record.transcript.clone(),
+        transcript_with_speaker_names(&record.transcript, &record.speaker_name_overrides),
         record
             .summary_model_id
             .clone()
             .unwrap_or_else(|| summary_model_id(record.llm_model_id.as_deref())),
         correlation_id,
     );
+}
+
+/// The transcript with each line's speaker label (`SPEAKER_00 [0.00s - …]:`)
+/// replaced by the name the user gave that speaker, so a summary says
+/// "Erin" instead of "Speaker 00".
+fn transcript_with_speaker_names(
+    transcript: &str,
+    speaker_names: &BTreeMap<String, String>,
+) -> String {
+    if speaker_names.is_empty() {
+        return transcript.to_string();
+    }
+    transcript
+        .lines()
+        .map(|line| {
+            let label_end = line.find([' ', ':']).unwrap_or(line.len());
+            match speaker_names.get(&line[..label_end]) {
+                Some(name) if !name.trim().is_empty() => {
+                    format!("{}{}", name.trim(), &line[label_end..])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn spawn_summary_generation_task(
@@ -1402,6 +1427,24 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "enable_llm_refinement": false }))
                 .expect("a rerun naming the removed field should parse");
         assert!(rerun.min_speakers.is_none());
+    }
+
+    #[test]
+    fn summaries_read_the_names_the_user_gave_speakers() {
+        let transcript =
+            "SPEAKER_00 [0.00s - 1.00s]: Hi\nSPEAKER_01 [1.00s - 2.00s]: Hello\nSPEAKER_10: Hey";
+        let names = BTreeMap::from([
+            ("SPEAKER_00".to_string(), "Erin".to_string()),
+            ("SPEAKER_01".to_string(), "  ".to_string()),
+        ]);
+        assert_eq!(
+            transcript_with_speaker_names(transcript, &names),
+            "Erin [0.00s - 1.00s]: Hi\nSPEAKER_01 [1.00s - 2.00s]: Hello\nSPEAKER_10: Hey"
+        );
+        assert_eq!(
+            transcript_with_speaker_names(transcript, &BTreeMap::new()),
+            transcript
+        );
     }
 
     #[test]

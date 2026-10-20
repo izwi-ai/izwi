@@ -182,6 +182,18 @@ function subtitleContent(
   return lines.join("\n\n");
 }
 
+/**
+ * The formats a record can export. Captions need timings: without them
+ * (speaker-attributed turns, a plain transcript) a caption file would be
+ * one cue spanning the whole recording.
+ */
+export function availableTranscriptionExportFormats(
+  record: ExportableTranscriptionRecord,
+): TranscriptionExportFormat[] {
+  const timed = transcriptionEntriesFromRecord(record).some((entry) => entry.timed);
+  return timed ? ["txt", "json", "srt", "vtt"] : ["txt", "json"];
+}
+
 export function buildTranscriptionExport(
   record: ExportableTranscriptionRecord,
   format: TranscriptionExportFormat,

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Download } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
+  availableTranscriptionExportFormats,
   buildTranscriptionExport,
   type ExportableTranscriptionRecord,
   type TranscriptionExportFormat,
@@ -86,10 +87,19 @@ export function TranscriptionExportDialog({
   const open = controlledOpen ?? uncontrolledOpen;
   const setOpen = controlledOnOpenChange ?? setUncontrolledOpen;
 
-  const selectedOption = useMemo(
-    () => FORMAT_OPTIONS.find((option) => option.value === format) ?? FORMAT_OPTIONS[0],
-    [format],
-  );
+  const formatOptions = useMemo(() => {
+    const available = record
+      ? availableTranscriptionExportFormats(record)
+      : ["txt", "json"];
+    return FORMAT_OPTIONS.filter((option) => available.includes(option.value));
+  }, [record]);
+  const selectedOption =
+    formatOptions.find((option) => option.value === format) ?? formatOptions[0];
+  useEffect(() => {
+    if (!formatOptions.some((option) => option.value === format)) {
+      setFormat("txt");
+    }
+  }, [format, formatOptions]);
   const canIncludeMetadata = format === "txt" || format === "json";
 
   function handleExport(): void {
@@ -138,7 +148,7 @@ export function TranscriptionExportDialog({
                 <SelectValue placeholder="Choose an export format" />
               </SelectTrigger>
               <SelectContent>
-                {FORMAT_OPTIONS.map((option) => (
+                {formatOptions.map((option) => (
                   <SelectItem key={option.value} value={option.value}>
                     {option.label}
                   </SelectItem>

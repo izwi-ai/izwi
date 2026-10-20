@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { TranscriptionRecord } from "@/api";
-import { buildTranscriptionExport } from "@/utils/transcriptionExport";
+import {
+  availableTranscriptionExportFormats,
+  buildTranscriptionExport,
+} from "@/utils/transcriptionExport";
 
 const record = {
   id: "transcription-export-1",
@@ -75,5 +78,27 @@ describe("buildTranscriptionExport", () => {
     expect(txt.content).toContain(
       "Timestamps: Enabled (Qwen3-ForcedAligner-0.6B)",
     );
+  });
+});
+
+describe("availableTranscriptionExportFormats", () => {
+  it("offers captions only when the transcript has timings", () => {
+    expect(availableTranscriptionExportFormats(record)).toEqual([
+      "txt",
+      "json",
+      "srt",
+      "vtt",
+    ]);
+    expect(
+      availableTranscriptionExportFormats({
+        ...record,
+        segments: [],
+        words: [],
+        speaker_turns: [
+          { speaker: "Speaker 1", text: "Hello there." },
+          { speaker: "Speaker 2", text: "Hi back." },
+        ],
+      } as typeof record),
+    ).toEqual(["txt", "json"]);
   });
 });
