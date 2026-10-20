@@ -22,6 +22,8 @@ pub use cuda_runtime::{
     private_cuda_runtime_candidates, private_cuda_runtime_env_key, resolve_private_cuda_runtime,
     CudaRuntimeDiagnostics,
 };
+#[cfg(test)]
+pub(crate) use device::metal_device_is_paravirtual;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) use device::metal_test_device_or_skip;
 pub use device::{
