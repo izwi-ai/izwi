@@ -397,6 +397,25 @@ fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
         && recorded_files == selected_files
 }
 
+/// The NeMo ASR families unpack their `.nemo` archive beside it on first
+/// load, so their checkpoint needs about twice the download's disk.
+fn extracts_nemo_on_load(variant: ModelVariant) -> bool {
+    matches!(
+        variant.family(),
+        ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr
+    )
+}
+
+/// Free disk a model needs for a download of `download_bytes`, counting the
+/// checkpoint a `.nemo` unpacks on first load.
+pub fn download_disk_required_bytes(variant: ModelVariant, download_bytes: u64) -> u64 {
+    if extracts_nemo_on_load(variant) {
+        download_bytes.saturating_mul(2)
+    } else {
+        download_bytes
+    }
+}
+
 /// Bytes a download still writes: every `(file, expected bytes, present)`
 /// not yet present, and for a `.nemo` the family unpacks on first load, the
 /// extracted checkpoint (about the archive's size) beside it.
@@ -492,6 +511,8 @@ impl ActiveDownload {
 #[derive(Debug, Clone, Default)]
 pub struct DownloadStateManager {
     state: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadState>>>,
+    /// Why each failed download failed, until the next attempt.
+    errors: Arc<RwLock<std::collections::HashMap<ModelVariant, String>>>,
 }
 
 /// In-memory expected-size map backed by a JSON file next to the models dir.
@@ -579,6 +600,24 @@ impl DownloadStateManager {
     pub async fn set_state(&self, variant: ModelVariant, state: DownloadState) {
         let mut map = self.state.write().await;
         map.insert(variant, state);
+        if state != DownloadState::Error {
+            self.errors.write().await.remove(&variant);
+        }
+    }
+
+    /// Mark a download failed and keep why, for the model list and the
+    /// progress stream.
+    pub async fn set_failed(&self, variant: ModelVariant, reason: String) {
+        self.state
+            .write()
+            .await
+            .insert(variant, DownloadState::Error);
+        self.errors.write().await.insert(variant, reason);
+    }
+
+    /// Why the last download of `variant` failed, if it did.
+    pub async fn error(&self, variant: ModelVariant) -> Option<String> {
+        self.errors.read().await.get(&variant).cloned()
     }
 
     pub async fn get_state(&self, variant: ModelVariant) -> DownloadState {
@@ -1140,11 +1179,7 @@ impl ModelDownloader {
                 (plan.local_file.as_str(), plan.expected_size, present)
             })
             .collect::<Vec<_>>();
-        let extracts_nemo = matches!(
-            variant.family(),
-            ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr
-        );
-        let required = download_disk_requirement(&files, extracts_nemo);
+        let required = download_disk_requirement(&files, extracts_nemo_on_load(variant));
         ensure_free_disk(
             local_dir,
             required,
@@ -1300,15 +1335,20 @@ impl ModelDownloader {
                 warn!("Background download failed for {}: {}", variant, err);
             }
 
-            // Update state based on result
-            let final_state = match &result {
-                Ok(_) => DownloadState::Downloaded,
-                Err(_) => DownloadState::Error,
-            };
-            downloader
-                .state_manager
-                .set_state(variant, final_state)
-                .await;
+            match &result {
+                Ok(_) => {
+                    downloader
+                        .state_manager
+                        .set_state(variant, DownloadState::Downloaded)
+                        .await
+                }
+                Err(err) => {
+                    downloader
+                        .state_manager
+                        .set_failed(variant, err.to_string())
+                        .await
+                }
+            }
             // The directory contents changed; drop any memoized size.
             downloader.invalidate_downloaded_size(variant).await;
 

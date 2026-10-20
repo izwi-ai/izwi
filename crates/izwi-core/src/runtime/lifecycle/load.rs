@@ -536,6 +536,20 @@ impl ModelLifecycleController {
         self.pinned_variants.lock().await.remove(&variant);
     }
 
+    /// Keep a resident loaded on request while it is idle (the idle reaper
+    /// skips it) without protecting it from eviction.
+    pub(super) async fn keep_model(&self, variant: ModelVariant) {
+        self.kept_variants.lock().await.insert(variant);
+    }
+
+    pub(super) async fn forget_kept_model(&self, variant: ModelVariant) {
+        self.kept_variants.lock().await.remove(&variant);
+    }
+
+    pub(super) async fn kept_model_variants(&self) -> HashSet<ModelVariant> {
+        self.kept_variants.lock().await.clone()
+    }
+
     pub(super) async fn pinned_model_variants(&self) -> HashSet<ModelVariant> {
         self.pinned_variants.lock().await.clone()
     }
@@ -1279,6 +1293,51 @@ impl RuntimeService {
         drop(self.load_model_for_inference(variant).await?);
         self.model_lifecycle.pin_model(variant).await;
         Ok(())
+    }
+
+    /// Load a model on request without pinning it: it stays loaded while
+    /// idle, but a load that needs its room evicts it like any idle model.
+    /// The app loads this way, so models loaded on different pages make
+    /// room for each other.
+    pub async fn load_model_unpinned(&self, variant: ModelVariant) -> Result<()> {
+        drop(self.load_model_for_inference(variant).await?);
+        self.model_lifecycle.keep_model(variant).await;
+        Ok(())
+    }
+
+    /// Pin a resident model against eviction until it is unloaded ("Keep
+    /// loaded"). False when the model is not loaded.
+    pub async fn pin_resident_model(&self, variant: ModelVariant) -> bool {
+        if !self.model_manager.is_ready(variant).await {
+            return false;
+        }
+        self.model_lifecycle.pin_model(variant).await;
+        true
+    }
+
+    /// Lift a pin: the model stays loaded while idle, and is evicted when a
+    /// load needs its room. False when the model is not loaded.
+    pub async fn unpin_resident_model(&self, variant: ModelVariant) -> bool {
+        if !self.model_manager.is_ready(variant).await {
+            return false;
+        }
+        self.model_lifecycle.unpin_model(variant).await;
+        self.model_lifecycle.keep_model(variant).await;
+        true
+    }
+
+    /// Memory a model needs to load, from the catalog: what the app shows
+    /// before the model is on disk. A load prices the checkpoint itself.
+    pub fn estimated_model_load_bytes(&self, variant: ModelVariant) -> u64 {
+        checkpoint::model_memory_estimate(variant).load_peak_bytes
+    }
+
+    /// The memory loads are planned against on this backend: the operator's
+    /// budget, else the device's capacity. `None` when it is unknown.
+    pub fn model_capacity_bytes(&self) -> Option<u64> {
+        self.coordinator
+            .resource_authority()
+            .planning_ceiling_bytes(self.backend_context().backend_kind)
     }
 
     /// Variants explicitly loaded (pinned) in this server session.

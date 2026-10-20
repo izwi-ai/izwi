@@ -8,7 +8,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api::admin::models::{
     AdminModelActionResponse, AdminModelBatchCapabilities, AdminModelDownloadProgressEvent,
     AdminModelInfo, AdminModelRouteCapabilities, AdminModelsResponse, AdminRemovedModelInfo,
-    AdminSpeechModelCapabilities,
+    AdminSpeechModelCapabilities, AdminStorageResponse,
 };
 use crate::api::openai::audio::align::{
     AlignmentJsonRequest, AlignmentMultipartRequest, AlignmentResponse, AlignmentWord,
@@ -51,6 +51,7 @@ use crate::api::openai::audio::align::{
         AdminModelsResponse,
         AdminRemovedModelInfo,
         AdminSpeechModelCapabilities,
+        AdminStorageResponse,
         AlignmentJsonRequest,
         AlignmentMultipartRequest,
         AlignmentResponse,
@@ -414,7 +415,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "post",
         "Admin",
         "Load model",
-        "Load model weights into runtime memory.",
+        "Load model weights into runtime memory. The model stays loaded until it is unloaded; with `?pin=false` it stays loaded while idle, but a load that needs its room evicts it.",
         &[("variant", "Model variant identifier")],
         json_schema_response("AdminModelActionResponse", "Model load result"),
     );
@@ -427,6 +428,35 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Unload model weights from runtime memory.",
         &[("variant", "Model variant identifier")],
         json_schema_response("AdminModelActionResponse", "Model unload result"),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/pin",
+        "post",
+        "Admin",
+        "Pin model",
+        "Keep a loaded model loaded until it is unloaded: other loads cannot evict it. 409 when it is not loaded.",
+        &[("variant", "Model variant identifier")],
+        json_schema_response("AdminModelActionResponse", "Model pin result"),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/unpin",
+        "post",
+        "Admin",
+        "Unpin model",
+        "Let other loads evict a loaded model when they need its room. 409 when it is not loaded.",
+        &[("variant", "Model variant identifier")],
+        json_schema_response("AdminModelActionResponse", "Model unpin result"),
+    );
+    add_operation(
+        paths,
+        "/v1/admin/storage",
+        "get",
+        "Admin",
+        "Get model storage",
+        "Where models are stored, the free and total space of that volume, and the disk downloaded models use.",
+        json_schema_response("AdminStorageResponse", "Model storage"),
     );
 
     add_collection(
@@ -2833,6 +2863,7 @@ mod tests {
             "Load",
             "Merge",
             "Open",
+            "Pin",
             "Regenerate",
             "Render",
             "Reorder",
@@ -2843,6 +2874,7 @@ mod tests {
             "Start",
             "Stream",
             "Unload",
+            "Unpin",
             "Update",
         ]
         .into_iter()

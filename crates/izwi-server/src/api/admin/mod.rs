@@ -30,6 +30,15 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(models::unload_model),
         )
         .route(
+            "/admin/models/{variant}/pin",
+            axum::routing::post(models::pin_model),
+        )
+        .route(
+            "/admin/models/{variant}/unpin",
+            axum::routing::post(models::unpin_model),
+        )
+        .route("/admin/storage", get(models::storage))
+        .route(
             "/admin/models/{variant}",
             get(models::get_model_info).delete(models::delete_model),
         )

@@ -3491,6 +3491,71 @@ async fn admin_models_expose_voice_app_capabilities() {
     drop(temp_dir);
 }
 
+/// What first-run setup needs before anything is downloaded: each model's
+/// memory and whether it fits this device, the disk a download needs, and
+/// the room left where models are stored.
+#[tokio::test]
+async fn admin_models_report_fit_disk_and_storage() {
+    let (app, _temp_dir) = test_api_app("admin_models_report_fit_disk_and_storage", false);
+
+    let body = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/admin/models", None),
+        )
+        .await,
+    )
+    .await;
+    let models = body["models"].as_array().expect("models");
+    let find = |variant: &str| {
+        models
+            .iter()
+            .find(|model| model["variant"].as_str() == Some(variant))
+            .unwrap_or_else(|| panic!("{variant} should be listed"))
+    };
+    let kokoro = find("Kokoro-82M");
+    assert!(kokoro["estimated_memory_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+    assert!(matches!(
+        kokoro["device_fit"].as_str(),
+        Some("fits" | "too_large" | "unknown")
+    ));
+    assert_eq!(
+        kokoro["disk_required_bytes"].as_u64(),
+        kokoro["size_bytes"].as_u64(),
+        "a model that is not downloaded needs its files"
+    );
+    // A .nemo checkpoint is unpacked beside its archive on first load.
+    let parakeet = find("Parakeet-TDT-0.6B-v3");
+    assert_eq!(
+        parakeet["disk_required_bytes"].as_u64(),
+        parakeet["size_bytes"].as_u64().map(|bytes| bytes * 2)
+    );
+
+    let storage = read_json(
+        send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/admin/storage", None),
+        )
+        .await,
+    )
+    .await;
+    assert!(storage["models_dir"]
+        .as_str()
+        .is_some_and(|dir| !dir.is_empty()));
+    assert!(storage["free_bytes"].as_u64().is_some());
+    assert_eq!(storage["models_bytes"].as_u64(), Some(0));
+
+    // "Keep loaded" applies to loaded models only.
+    let response = send_request(
+        app,
+        build_request(Method::POST, "/v1/admin/models/Kokoro-82M/pin", None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 #[tokio::test]
 async fn voice_session_rest_lifecycle_routes_work() {
     let (app, temp_dir) = test_api_app("voice_session_rest_lifecycle_routes_work", false);

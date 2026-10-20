@@ -92,6 +92,7 @@ impl ModelManager {
         let updates = stream::iter(variants)
             .map(|variant| async move {
                 let download_state = self.downloader.state_manager().get_state(variant).await;
+                let download_error = self.downloader.state_manager().error(variant).await;
                 let latest_progress = if download_state == DownloadState::Downloading {
                     self.downloader.get_latest_progress(variant).await
                 } else {
@@ -115,6 +116,7 @@ impl ModelManager {
                 (
                     variant,
                     download_state,
+                    download_error,
                     latest_progress,
                     is_downloaded,
                     size_bytes,
@@ -126,8 +128,15 @@ impl ModelManager {
             .await;
 
         let mut models = self.models.write().await;
-        for (variant, download_state, latest_progress, is_downloaded, size_bytes, residency) in
-            updates
+        for (
+            variant,
+            download_state,
+            download_error,
+            latest_progress,
+            is_downloaded,
+            size_bytes,
+            residency,
+        ) in updates
         {
             let Some(state) = models.get_mut(&variant) else {
                 continue;
@@ -164,7 +173,8 @@ impl ModelManager {
                     state.info.local_path = None;
                     state.info.size_bytes = size_bytes.or(Some(variant.estimated_size()));
                     state.info.download_progress = None;
-                    state.info.error_message = Some("Download failed".to_string());
+                    state.info.error_message =
+                        Some(download_error.unwrap_or_else(|| "Download failed".to_string()));
                 }
                 DownloadState::Downloaded | DownloadState::NotDownloaded => {
                     state.info.status = ModelStatus::NotDownloaded;
@@ -573,6 +583,11 @@ impl ModelManager {
     ) -> super::download::DownloadState {
         self.downloader.state_manager().get_state(variant).await
     }
+
+    /// Why the last download of `variant` failed, if it did.
+    pub async fn download_error(&self, variant: ModelVariant) -> Option<String> {
+        self.downloader.state_manager().error(variant).await
+    }
 }
 
 // Make downloader cloneable for async tasks
@@ -735,6 +750,45 @@ mod tests {
         assert_eq!(model.status, ModelStatus::Downloading);
         assert_eq!(model.download_progress, Some(0.0));
 
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_reports_why_until_the_next_attempt() {
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let manager = ModelManager::new(EngineConfig {
+            models_dir: PathBuf::from(&temp_dir),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let states = manager.downloader.state_manager();
+        let error_of = |models: Vec<ModelInfo>| {
+            models
+                .into_iter()
+                .find(|model| model.variant == variant)
+                .map(|model| (model.status, model.error_message))
+                .unwrap()
+        };
+
+        states
+            .set_failed(variant, "Not enough free disk space".to_string())
+            .await;
+        assert_eq!(
+            error_of(manager.list_models().await),
+            (
+                ModelStatus::Error,
+                Some("Not enough free disk space".to_string())
+            )
+        );
+        assert_eq!(
+            manager.download_error(variant).await.as_deref(),
+            Some("Not enough free disk space")
+        );
+
+        states.set_state(variant, DownloadState::Downloading).await;
+        assert_eq!(manager.download_error(variant).await, None);
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 

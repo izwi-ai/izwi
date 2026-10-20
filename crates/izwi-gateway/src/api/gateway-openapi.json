@@ -115,6 +115,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "error": {
+            "description": "Why the download failed, on an `error` event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "files_completed": {
             "minimum": 0,
             "type": "integer"
@@ -174,6 +181,16 @@
           "deployment_state": {
             "type": "string"
           },
+          "device_fit": {
+            "description": "Whether the model can load on this device at all: `fits`,\n`too_large` (it needs more memory than loads here are planned\nagainst) or `unknown`. Other loaded models may still have to make\nroom for one that fits.",
+            "type": "string"
+          },
+          "disk_required_bytes": {
+            "description": "Free disk a download of the model needs: its files, plus the\ncheckpoint a `.nemo` archive unpacks on first load. 0 once\ndownloaded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "display_name": {
             "description": "Human-readable model name from the catalog.",
             "type": "string"
@@ -193,6 +210,12 @@
               "string",
               "null"
             ]
+          },
+          "estimated_memory_bytes": {
+            "description": "Memory the model needs to load, in bytes: the catalog's estimate,\nwhich is all there is before the model is downloaded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           },
           "estimated_size_bytes": {
             "description": "Expected download size from the catalog, for models not yet on disk.",
@@ -266,6 +289,9 @@
           "task",
           "estimated_size_bytes",
           "memory_required_gb",
+          "estimated_memory_bytes",
+          "device_fit",
+          "disk_required_bytes",
           "enabled",
           "status",
           "deployment_state",
@@ -493,6 +519,42 @@
           "supports_streaming",
           "supports_speed_control",
           "supports_auto_long_form"
+        ],
+        "type": "object"
+      },
+      "AdminStorageResponse": {
+        "description": "Where models are stored and how much room is left there.",
+        "properties": {
+          "free_bytes": {
+            "description": "Free bytes on the volume holding the models; `None` when it cannot\nbe read.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "models_bytes": {
+            "description": "Disk the downloaded models use.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "models_dir": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "models_dir",
+          "models_bytes"
         ],
         "type": "object"
       },

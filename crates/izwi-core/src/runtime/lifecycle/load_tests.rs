@@ -2792,12 +2792,22 @@ async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
         .model_lifecycle
         .pin_model(ModelVariant::WhisperLargeV3Turbo)
         .await;
+    // Loaded on request without a pin: kept while idle.
+    runtime
+        .model_manager
+        .mark_loaded(ModelVariant::Kokoro82M)
+        .await;
+    runtime
+        .model_lifecycle
+        .keep_model(ModelVariant::Kokoro82M)
+        .await;
 
     let stale = now_unix_millis().saturating_sub(10_000);
     {
         let mut last_used = runtime.model_lifecycle.model_last_used.lock().await;
         last_used.insert(ModelVariant::GraniteSpeech412BPlus, stale);
         last_used.insert(ModelVariant::WhisperLargeV3Turbo, stale);
+        last_used.insert(ModelVariant::Kokoro82M, stale);
     }
 
     let reaped = runtime.reap_idle_models().await;
@@ -2806,6 +2816,38 @@ async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
     let residents = runtime.model_manager.resident_variants().await;
     assert!(!residents.contains(&ModelVariant::GraniteSpeech412BPlus));
     assert!(residents.contains(&ModelVariant::WhisperLargeV3Turbo));
+    assert!(residents.contains(&ModelVariant::Kokoro82M));
+    std::fs::remove_dir_all(models_dir).unwrap();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn pins_apply_to_loaded_models_and_unpinning_keeps_them_loaded() {
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let models_dir = std::env::temp_dir().join(format!("izwi-runtime-pin-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.clone(),
+        backend: BackendPreference::Cpu,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let variant = ModelVariant::Kokoro82M;
+
+    assert!(!runtime.pin_resident_model(variant).await, "not loaded");
+    runtime.model_manager.mark_loaded(variant).await;
+    assert!(runtime.pin_resident_model(variant).await);
+    assert!(runtime.pinned_model_variants().await.contains(&variant));
+
+    assert!(runtime.unpin_resident_model(variant).await);
+    assert!(!runtime.pinned_model_variants().await.contains(&variant));
+    assert!(runtime
+        .model_lifecycle
+        .kept_model_variants()
+        .await
+        .contains(&variant));
     std::fs::remove_dir_all(models_dir).unwrap();
 }
 
