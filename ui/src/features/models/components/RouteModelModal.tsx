@@ -22,6 +22,7 @@ import {
 import {
   formatModelBytes,
   ModelListRow,
+  revealModelActions,
 } from "@/features/models/components/ModelListRow";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { useRuntimeHealth } from "@/shared/hooks/useRuntimeHealth";
@@ -192,6 +193,7 @@ export function RouteModelModal({
       ? (variant: string, pinned: boolean) =>
           void catalog.setModelPinned(variant, pinned)
       : undefined,
+    ...revealModelActions((message) => catalog?.reportError(message)),
   };
 
   return (

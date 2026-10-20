@@ -15,6 +15,7 @@ import { RowBadge } from "@/components/history/RowBadge";
 import { RowMenu, type RowMenuItem } from "@/components/history/RowMenu";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { canRevealPaths, revealPath } from "@/shared/revealPath";
 
 const GIB = 1024 ** 3;
 
@@ -54,6 +55,30 @@ export interface ModelRowActions {
   /** Opens the model's folder in the file manager. */
   onReveal?: (model: ModelInfo) => void;
   revealLabel?: string;
+}
+
+/** "Show in Finder" in the desktop app; nothing in a browser. */
+export function revealModelActions(
+  onError: (message: string) => void,
+): Pick<ModelRowActions, "onReveal" | "revealLabel"> {
+  if (!canRevealPaths()) {
+    return {};
+  }
+  const agent = navigator.userAgent;
+  return {
+    revealLabel: /Mac/.test(agent)
+      ? "Show in Finder"
+      : /Windows/.test(agent)
+        ? "Show in Explorer"
+        : "Show in folder",
+    onReveal: (model) => {
+      if (model.local_path) {
+        revealPath(model.local_path).catch((error: unknown) =>
+          onError(error instanceof Error ? error.message : String(error)),
+        );
+      }
+    },
+  };
 }
 
 /** The status column: a pill, download progress, or why it can't load. */

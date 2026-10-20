@@ -9,7 +9,11 @@ import {
 } from "@/components/history/HistoryToolbar";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
-import { ModelListRow } from "@/features/models/components/ModelListRow";
+import { useOptionalModelCatalog } from "@/app/providers/ModelCatalogProvider";
+import {
+  ModelListRow,
+  revealModelActions,
+} from "@/features/models/components/ModelListRow";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   compareQwenVersionRank,
@@ -166,6 +170,10 @@ export function MyModelsPage({
     null,
   );
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const catalog = useOptionalModelCatalog();
+  const revealActions = revealModelActions((message) =>
+    catalog?.reportError(message),
+  );
 
   const visibleModels = useMemo(
     () => models.filter((m) => !m.variant.includes("Tokenizer")),
@@ -473,6 +481,7 @@ export function MyModelsPage({
                         onUnload,
                         onDelete: setDeleteModalVariant,
                         onSetPinned,
+                        ...revealActions,
                       }}
                     />
                   );
