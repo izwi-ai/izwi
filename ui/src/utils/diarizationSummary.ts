@@ -38,22 +38,6 @@ export function diarizationSummaryStatusLabel(
   }
 }
 
-export function diarizationSummaryStatusTone(
-  status: DiarizationSummaryStatus,
-): "neutral" | "warning" | "success" | "danger" {
-  switch (status) {
-    case "pending":
-      return "warning";
-    case "ready":
-      return "success";
-    case "failed":
-      return "danger";
-    case "not_requested":
-    default:
-      return "neutral";
-  }
-}
-
 export function buildDiarizationSummaryPreview(
   summaryText: string | null | undefined,
   maxChars = 200,

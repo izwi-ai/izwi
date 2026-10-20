@@ -126,22 +126,6 @@ export function summaryStatusLabel(status: TranscriptionSummaryStatus): string {
   }
 }
 
-export function summaryStatusTone(
-  status: TranscriptionSummaryStatus,
-): "neutral" | "warning" | "success" | "danger" {
-  switch (status) {
-    case "pending":
-      return "warning";
-    case "ready":
-      return "success";
-    case "failed":
-      return "danger";
-    case "not_requested":
-    default:
-      return "neutral";
-  }
-}
-
 export function summarizeRecord(
   record: TranscriptionRecord,
 ): TranscriptionRecordSummary {

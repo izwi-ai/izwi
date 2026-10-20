@@ -8,7 +8,6 @@ import {
 import { useAudioPlayback } from "@/components/audio/useAudioPlayback";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { StatusBadge } from "@/components/ui/status-badge";
 import type { DiarizationRecord } from "../api";
 import {
   speakerSummariesFromRecord,
@@ -16,7 +15,6 @@ import {
 } from "../utils/diarizationTranscript";
 import {
   diarizationSummaryStatusLabel,
-  diarizationSummaryStatusTone,
   normalizeDiarizationSummaryStatus,
 } from "../utils/diarizationSummary";
 
@@ -404,9 +402,11 @@ export function DiarizationReviewWorkspace({
               <h3 className="text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
                 Summary
               </h3>
-              <StatusBadge tone={diarizationSummaryStatusTone(summaryStatus)}>
-                {diarizationSummaryStatusLabel(summaryStatus)}
-              </StatusBadge>
+              {summaryStatus !== "ready" ? (
+                <span className="text-xs text-[var(--text-muted)]">
+                  {diarizationSummaryStatusLabel(summaryStatus)}
+                </span>
+              ) : null}
             </div>
             {summaryText ? (
               <p className="mt-2 text-[15px] leading-7 text-[var(--text-secondary)]">
@@ -551,7 +551,7 @@ export function DiarizationReviewWorkspace({
                       </div>
                       {active ? (
                         <span
-                          className="rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em]"
+                          className="rounded-full px-2 py-0.5 text-[11px] font-medium"
                           style={{
                             color: accent.solid,
                             backgroundColor: accent.soft,
@@ -563,7 +563,7 @@ export function DiarizationReviewWorkspace({
                     </div>
                     {confidenceFlag ? (
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                        <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-[var(--status-warning-text)]">
+                        <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--status-warning-text)]">
                           Review
                         </span>
                         <span className="text-[11px] text-[var(--status-warning-text)]">

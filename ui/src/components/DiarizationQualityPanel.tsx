@@ -233,7 +233,7 @@ export function DiarizationQualityPanel({
         <CardContent className="space-y-3">
           <div className="grid gap-2.5 sm:grid-cols-3">
             <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-subtle)]">
+              <div className="text-xs text-[var(--text-subtle)]">
                 Alignment coverage
               </div>
               <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
@@ -241,7 +241,7 @@ export function DiarizationQualityPanel({
               </div>
             </div>
             <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-subtle)]">
+              <div className="text-xs text-[var(--text-subtle)]">
                 Unattributed words
               </div>
               <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
@@ -249,7 +249,7 @@ export function DiarizationQualityPanel({
               </div>
             </div>
             <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-subtle)]">
+              <div className="text-xs text-[var(--text-subtle)]">
                 Speakers
               </div>
               <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
