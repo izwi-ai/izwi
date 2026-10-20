@@ -73,6 +73,7 @@ const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
 const DURABLE_ASR_IDEMPOTENCY_OPERATION: &str = "transcription.create";
+const TRANSCRIPTION_CANCELLED_ERROR: &str = "Cancelled by user.";
 /// The upload is ingested and canonicalized while the key is reserved.
 const DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 5 * 60 * 1_000;
 #[cfg(not(test))]
@@ -289,6 +290,110 @@ async fn cancel_active_transcription_job(
             .map_err(map_store_error)?;
     }
     Ok(())
+}
+
+/// Stop a transcription or speaker-attributed job that is still pending or
+/// processing. Its durable job is cancelled and the record fails with the
+/// reason; a job that already finished is returned as it is.
+pub async fn cancel_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+) -> Result<Json<TranscriptionRecord>, ApiError> {
+    let existing = state
+        .transcription_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    if !matches!(
+        existing.processing_status,
+        TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing
+    ) {
+        return Ok(Json(existing));
+    }
+    cancel_active_transcription_job(&state, &record_id, TRANSCRIPTION_CANCELLED_ERROR).await?;
+    let record = state
+        .transcription_store
+        .cancel_record(record_id, TRANSCRIPTION_CANCELLED_ERROR.to_string())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    Ok(Json(record))
+}
+
+/// Run a finished transcription or speaker-attributed job again on its
+/// stored audio, with the same model, language, timestamps and summary
+/// choice, as a new record (as a diarization rerun does).
+pub async fn retry_record(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    Path(record_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let source = state
+        .transcription_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
+    if matches!(
+        source.processing_status,
+        TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing
+    ) {
+        return Err(ApiError::bad_request(
+            "This job is still running. Cancel it before retrying.",
+        ));
+    }
+    let audio = state
+        .transcription_store
+        .get_audio(record_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("The job's audio is no longer stored"))?;
+    let mut parsed = retry_create_request(&source, audio.audio_bytes);
+    prepare_create_request(&mut parsed)?;
+    let placeholder = create_pending_record(&state, &mut parsed).await?;
+    if let Err(err) = enqueue_batch_transcription_job(
+        &state,
+        &placeholder,
+        &parsed,
+        Some(ctx.correlation_id),
+        None,
+    )
+    .await
+    {
+        let _ = state
+            .transcription_store
+            .update_processing_status(
+                placeholder.id.clone(),
+                TranscriptionProcessingStatus::Failed,
+                Some(err.message.clone()),
+            )
+            .await;
+        return Err(err);
+    }
+    Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response())
+}
+
+/// The create request a retry runs: the source record's settings and audio.
+fn retry_create_request(
+    source: &TranscriptionRecord,
+    audio_bytes: Vec<u8>,
+) -> ParsedTranscriptionCreateRequest {
+    ParsedTranscriptionCreateRequest {
+        audio_bytes,
+        audio_mime_type: Some(source.audio_mime_type.clone()),
+        audio_filename: source.audio_filename.clone(),
+        duration_secs: source.duration_secs,
+        record_mode: source.transcription_mode,
+        model_id: source.model_id.clone(),
+        aligner_model_id: source.aligner_model_id.clone(),
+        language: source.language.clone(),
+        include_timestamps: source.aligner_model_id.is_some(),
+        stream: false,
+        generate_summary: source.summary_status != TranscriptionSummaryStatus::NotRequested,
+        min_speakers: None,
+        max_speakers: None,
+    }
 }
 
 pub async fn regenerate_summary(

@@ -203,6 +203,9 @@ pub async fn delete_record(
     if !deleted {
         return Err(ApiError::not_found("Diarization record not found"));
     }
+    // A run still in progress stops instead of working on for a record that
+    // no longer exists.
+    state.diarization_jobs.cancel(&record_id);
 
     Ok(Json(DeleteDiarizationRecordResponse {
         id: record_id,

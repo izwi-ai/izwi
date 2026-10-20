@@ -2740,6 +2740,21 @@ export class AudioApiClient {
     return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
+  /** Stops a transcription or speaker-attributed job still waiting or running. */
+  async cancelTranscriptionRecord(recordId: string): Promise<TranscriptionRecord> {
+    const record = await this.cancelSpeechTextJob(recordId);
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  /**
+   * Runs a finished transcription or speaker-attributed job again on its
+   * stored audio with the same settings, as a new record.
+   */
+  async retryTranscriptionRecord(recordId: string): Promise<TranscriptionRecord> {
+    const record = await this.rerunSpeechTextJob(recordId, {});
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
   async deleteTranscriptionRecord(
     recordId: string,
   ): Promise<{ id: string; deleted: boolean }> {

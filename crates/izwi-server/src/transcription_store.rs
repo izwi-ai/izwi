@@ -827,6 +827,44 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
+    /// Fail a record that is still pending or processing, and drop its
+    /// runtime attempt so a stage that is still running cannot write a
+    /// result over the cancellation. Returns the record as it now is, or
+    /// `None` when it does not exist.
+    pub async fn cancel_record(
+        &self,
+        record_id: String,
+        reason: String,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        let db = self.db.connection().await?;
+        transcription_records::Entity::update_many()
+            .col_expr(
+                transcription_records::Column::ProcessingStatus,
+                Expr::value(TranscriptionProcessingStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                transcription_records::Column::ProcessingError,
+                Expr::value(sanitize_optional_text(Some(reason.as_str()), 1_000)),
+            )
+            .col_expr(
+                transcription_records::Column::RuntimeStageId,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                transcription_records::Column::RuntimeAttemptToken,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::ProcessingStatus.is_in([
+                TranscriptionProcessingStatus::Pending.as_db_value(),
+                TranscriptionProcessingStatus::Processing.as_db_value(),
+            ]))
+            .exec(db)
+            .await
+            .context("Failed to cancel transcription record")?;
+        fetch_record_without_audio(db, &record_id).await
+    }
+
     pub async fn update_processing_progress(
         &self,
         record_id: String,

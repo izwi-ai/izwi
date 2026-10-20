@@ -103,6 +103,8 @@ const audioMethodNames = [
   "createTranscriptionRecordStream",
   "regenerateTranscriptionSummary",
   "transcriptionRecordAudioUrl",
+  "cancelTranscriptionRecord",
+  "retryTranscriptionRecord",
   "deleteTranscriptionRecord",
   "listSpeakerAttributedAsrRecords",
   "listSpeakerAttributedAsrRecordPage",

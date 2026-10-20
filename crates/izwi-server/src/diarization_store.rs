@@ -27,7 +27,7 @@ use crate::{
 
 /// The error of a record whose in-process job died with the server (P1V-1).
 pub const INTERRUPTED_BY_SHUTDOWN_ERROR: &str =
-    "Interrupted by a server shutdown before it finished; rerun the job.";
+    "Interrupted because Izwi stopped before it finished. Retry it to run it again.";
 
 /// The error a pending summary gets when the server restarts under it: the
 /// summary task lived in the old process, so nothing would finish it.

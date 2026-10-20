@@ -105,6 +105,8 @@ export function TranscriptionPage({
     useState<SpeechTextCreationMode>("transcription");
   const [recordActionError, setRecordActionError] = useState<string | null>(null);
   const [recordDeletePending, setRecordDeletePending] = useState(false);
+  const [recordCancelPending, setRecordCancelPending] = useState(false);
+  const [recordRetryPending, setRecordRetryPending] = useState(false);
   const [recordSummaryRefreshPending, setRecordSummaryRefreshPending] =
     useState(false);
   const [recordSummaryRefreshError, setRecordSummaryRefreshError] = useState<
@@ -579,6 +581,49 @@ export function TranscriptionPage({
     }
   }, [navigate, recordDeletePending, recordId, refreshHistory, speechTextMode]);
 
+  const handleDetailCancel = useCallback(async () => {
+    if (!recordId || recordCancelPending) {
+      return;
+    }
+    setRecordCancelPending(true);
+    setRecordActionError(null);
+    try {
+      await api.cancelTranscriptionRecord(recordId);
+      await refreshRecord();
+      await refreshHistory();
+    } catch (err) {
+      setRecordActionError(
+        err instanceof Error ? err.message : "Failed to cancel this job.",
+      );
+    } finally {
+      setRecordCancelPending(false);
+    }
+  }, [recordCancelPending, recordId, refreshHistory, refreshRecord]);
+
+  /** A retry is a new record with the same settings: open it. */
+  const handleDetailRetry = useCallback(async () => {
+    if (!recordId || recordRetryPending) {
+      return;
+    }
+    setRecordRetryPending(true);
+    setRecordActionError(null);
+    try {
+      const retried = await api.retryTranscriptionRecord(recordId);
+      await refreshHistory();
+      navigate(
+        retried.transcription_mode === "speaker_attributed_asr"
+          ? `/transcription/${retried.id}?mode=speaker_attributed_asr`
+          : `/transcription/${retried.id}`,
+      );
+    } catch (err) {
+      setRecordActionError(
+        err instanceof Error ? err.message : "Failed to retry this job.",
+      );
+    } finally {
+      setRecordRetryPending(false);
+    }
+  }, [navigate, recordId, recordRetryPending, refreshHistory]);
+
   const handleHistoryDelete = useCallback(
     async (targetRecord: SpeechTextJobSummary) => {
       if (targetRecord.kind === "diarization") {
@@ -786,6 +831,10 @@ export function TranscriptionPage({
             deleteError={recordActionError}
             summaryModelGuidance={summaryModelReady ? null : summaryModelRequirementMessage}
             onDelete={handleDetailDelete}
+            onCancel={() => void handleDetailCancel()}
+            cancelPending={recordCancelPending}
+            onRetry={() => void handleDetailRetry()}
+            retryPending={recordRetryPending}
             onRegenerateSummary={() => void handleDetailRegenerateSummary()}
             deletePending={recordDeletePending}
             summaryRefreshPending={recordSummaryRefreshPending}

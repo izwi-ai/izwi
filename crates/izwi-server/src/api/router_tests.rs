@@ -587,6 +587,129 @@ async fn deleting_a_transcription_cancels_its_durable_job() {
     assert_eq!(job.status, RuntimeJobStatus::Cancelled);
 }
 
+/// A transcription still waiting can be cancelled: its durable job stops and
+/// the record fails with the reason. A retry runs it again on the stored
+/// audio as a new record; a job still running cannot be retried.
+#[tokio::test]
+async fn transcription_jobs_can_be_cancelled_and_retried() {
+    let (state, _temp_dir) = test_state("transcription_jobs_cancel_and_retry", false);
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+    let audio_body = tiny_audio_json_body_with_fields(r#""generate_summary":true"#);
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let record_id = read_json(created).await["id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    let job = state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            &record_id,
+        )
+        .await
+        .expect("job lookup")
+        .expect("accepted transcription has an active durable job");
+    let member = |suffix: &str| format!("/v1/speech-to-text/jobs/{record_id}{suffix}");
+
+    let early_retry = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/reruns"), Some("{}")),
+    )
+    .await;
+    assert_eq!(early_retry.status(), StatusCode::BAD_REQUEST);
+
+    for _ in 0..2 {
+        let cancelled = send_request(
+            app.clone(),
+            build_request(Method::POST, &member("/cancel"), None),
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let body = read_json(cancelled).await;
+        assert_eq!(body["processing_status"], "failed");
+        assert_eq!(body["processing_error"], "Cancelled by user.");
+    }
+    let job = state
+        .batch_runtime_store
+        .get_job(&job.id)
+        .await
+        .expect("job read")
+        .expect("job row is kept");
+    assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+
+    let retried = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/reruns"), Some("{}")),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::ACCEPTED);
+    let retried = read_json(retried).await;
+    let retried_id = retried["id"].as_str().expect("retried id");
+    assert_ne!(retried_id, record_id);
+    assert_eq!(retried["processing_status"], "pending");
+    assert_eq!(retried["transcription_mode"], "transcription");
+    assert!(state
+        .batch_runtime_store
+        .get_active_job_for_route_record(
+            RuntimeJobKind::AsrTranscription,
+            "transcription",
+            retried_id,
+        )
+        .await
+        .expect("job lookup")
+        .is_some());
+    // The source record stays, failed with its reason.
+    let source = send_request(app, build_request(Method::GET, &member(""), None)).await;
+    assert_eq!(read_json(source).await["processing_status"], "failed");
+}
+
+/// Deleting a diarization that is still running stops its pipeline.
+#[tokio::test]
+async fn deleting_a_running_diarization_cancels_it() {
+    let (state, _temp_dir) = test_state("deleting_a_running_diarization_cancels_it", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .diarization_store
+        .create_record(crate::diarization_store::tests::sample_record())
+        .await
+        .expect("record");
+    let job = state.diarization_jobs.register(&record.id);
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let deleted = send_request(
+        app,
+        build_request(
+            Method::DELETE,
+            &format!("/v1/speech-to-text/jobs/{}?job_kind=diarization", record.id),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(job.cancellation().is_cancelled());
+}
+
 #[tokio::test]
 async fn unified_transcription_job_read_routes_support_both_job_kinds() {
     let (app, temp_dir) = test_api_app(
