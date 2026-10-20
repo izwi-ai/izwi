@@ -1,6 +1,5 @@
 use crate::error::{CliError, Result};
 use crate::http;
-use crate::utils;
 use crate::OutputFormat;
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use console::style;
@@ -31,23 +30,14 @@ pub async fn execute(
     let response = client
         .get(format!("{}/v1/admin/models", server))
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     let payload: AdminModelsResponse = response.json().await?;
     let mut models = payload.models;
-    for model in &mut models {
-        reconcile_local_state(model);
-    }
 
     if local {
         models.retain(|m| m.status != "not_downloaded");
@@ -130,21 +120,4 @@ fn status_cell(status: &str) -> Cell {
         _ => Color::DarkGrey,
     };
     Cell::new(status).fg(color)
-}
-
-fn reconcile_local_state(model: &mut ModelRecord) {
-    if model.status != "not_downloaded" || model.local_path.is_some() {
-        return;
-    }
-
-    if let Some(path) = utils::model_dir_if_present(&model.variant) {
-        model.status = "downloaded".to_string();
-        if model.size_bytes.is_none() {
-            model.size_bytes = utils::directory_size_bytes(&path);
-        }
-        model.local_path = Some(path);
-        if model.download_progress.is_none() {
-            model.download_progress = Some(100.0);
-        }
-    }
 }

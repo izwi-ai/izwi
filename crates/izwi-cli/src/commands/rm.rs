@@ -30,20 +30,14 @@ pub async fn execute(model: String, yes: bool, server: &str, theme: &Theme) -> R
     let response = client
         .delete(format!("{}/v1/admin/models/{}", server, model))
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if response.status().as_u16() == 404 {
         return Err(CliError::ModelNotFound(model));
     }
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     theme.success(&format!("Model '{}' removed successfully", model));

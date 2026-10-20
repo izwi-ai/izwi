@@ -386,7 +386,7 @@ pub enum Commands {
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
 
-        /// Audio format
+        /// Audio format: WAV, or raw 16-bit mono PCM
         #[arg(short, long, value_enum, default_value = "wav")]
         format: AudioFormat,
 
@@ -403,11 +403,9 @@ pub enum Commands {
         #[arg(long)]
         stream: bool,
 
-        /// Allow the server to return WAV audio when the requested compressed format is unavailable
-        #[arg(long)]
-        allow_format_fallback: bool,
-
-        /// Play audio immediately after generation
+        /// Play the audio after saving it, with the system player (afplay on
+        /// macOS; paplay, aplay, ffplay or play on Linux; PowerShell on
+        /// Windows). WAV only.
         #[arg(short, long)]
         play: bool,
     },
@@ -454,17 +452,24 @@ pub enum Commands {
     /// Interactive chat with audio understanding capabilities.
     #[command(name = "chat")]
     Chat {
-        /// Model to use (for example Qwen3.5-4B, Qwen3.5-9B, or Qwen3.8-27B-FP8)
-        #[arg(short, long, default_value = "qwen3-0.6b-4bit")]
-        model: String,
+        /// Chat model (for example Qwen3.5-0.8B, Qwen3.5-4B or
+        /// LFM2.5-1.2B-Instruct-GGUF). Default: the chat model the server
+        /// has loaded, else Qwen3.5-0.8B.
+        #[arg(short, long)]
+        model: Option<String>,
 
         /// Initial system prompt
         #[arg(short, long)]
         system: Option<String>,
 
-        /// Voice to use for responses
-        #[arg(short, long)]
-        voice: Option<String>,
+        /// Let the model reason before it answers (models that can think);
+        /// its reasoning is shown dimmed. Default: the model's own setting.
+        #[arg(long, overrides_with = "no_thinking")]
+        thinking: bool,
+
+        /// Answer without reasoning first
+        #[arg(long, overrides_with = "thinking")]
+        no_thinking: bool,
     },
 
     /// Speaker diarization
@@ -595,13 +600,17 @@ pub enum ModelCommands {
         json: bool,
     },
 
-    /// Load a model into memory
+    /// Load a model into memory and wait until it is ready
     Load {
         /// Model variant to load
         model: String,
 
-        /// Wait for model to be fully loaded
-        #[arg(short, long)]
+        /// Seconds to wait for the model to load
+        #[arg(long, value_name = "SECS", default_value = "600")]
+        timeout: u64,
+
+        /// Kept for older scripts: loading always waits
+        #[arg(short, long, hide = true)]
         wait: bool,
     },
 
@@ -618,7 +627,7 @@ pub enum ModelCommands {
     /// Show download progress
     Progress {
         /// Model variant
-        model: Option<String>,
+        model: String,
     },
 }
 
@@ -819,22 +828,14 @@ pub enum OutputFormat {
     Json,
     /// Plain text
     Plain,
-    /// YAML format
-    Yaml,
 }
 
 #[derive(Clone, ValueEnum)]
 pub enum AudioFormat {
-    /// WAV format (PCM)
+    /// WAV (16-bit PCM)
     Wav,
-    /// MP3 format
-    Mp3,
-    /// OGG Vorbis
-    Ogg,
-    /// FLAC format
-    Flac,
-    /// AAC format
-    Aac,
+    /// Raw 16-bit little-endian mono PCM, no header
+    Pcm,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -844,6 +845,7 @@ pub enum TranscriptFormat {
     /// JSON format with metadata
     Json,
     /// Verbose JSON format with timing metadata
+    #[value(alias = "verbose_json")]
     VerboseJson,
 }
 
@@ -852,6 +854,7 @@ pub enum Shell {
     Bash,
     Zsh,
     Fish,
+    #[value(name = "powershell")]
     PowerShell,
     Elvish,
 }
@@ -979,9 +982,66 @@ mod tests {
             .expect("Qwen3.8 catalog id should parse");
 
         match cli.command {
-            Commands::Chat { model, .. } => assert_eq!(model, "Qwen3.8-27B-FP8"),
+            Commands::Chat { model, .. } => assert_eq!(model.as_deref(), Some("Qwen3.8-27B-FP8")),
             _ => panic!("expected chat command"),
         }
+    }
+
+    /// The last of --thinking / --no-thinking wins; neither leaves the
+    /// model's own default.
+    #[test]
+    fn chat_thinking_flags_override_each_other() {
+        for (args, expected) in [
+            (&["izwi", "chat"][..], (false, false)),
+            (&["izwi", "chat", "--thinking"][..], (true, false)),
+            (
+                &["izwi", "chat", "--thinking", "--no-thinking"][..],
+                (false, true),
+            ),
+            (
+                &["izwi", "chat", "--no-thinking", "--thinking"][..],
+                (true, false),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("chat parses");
+            let Commands::Chat {
+                model,
+                thinking,
+                no_thinking,
+                ..
+            } = cli.command
+            else {
+                panic!("expected chat command");
+            };
+            assert_eq!(model, None);
+            assert_eq!((thinking, no_thinking), expected, "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["izwi", "chat", "--voice", "x"]).is_err());
+    }
+
+    /// The speech formats offered are the ones the server encodes.
+    #[test]
+    fn tts_formats_are_the_ones_the_server_encodes() {
+        assert!(Cli::try_parse_from(["izwi", "tts", "hi", "--format", "pcm"]).is_ok());
+        for format in ["mp3", "ogg", "flac", "aac"] {
+            assert!(
+                Cli::try_parse_from(["izwi", "tts", "hi", "--format", format]).is_err(),
+                "{format}"
+            );
+        }
+        assert!(Cli::try_parse_from(["izwi", "--output-format", "yaml", "list"]).is_err());
+    }
+
+    /// The names the docs and the API use parse too.
+    #[test]
+    fn api_style_value_names_parse() {
+        for format in ["verbose-json", "verbose_json"] {
+            assert!(
+                Cli::try_parse_from(["izwi", "transcribe", "a.wav", "--format", format]).is_ok(),
+                "{format}"
+            );
+        }
+        assert!(Cli::try_parse_from(["izwi", "completions", "powershell"]).is_ok());
     }
 
     #[test]

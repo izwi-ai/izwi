@@ -1,7 +1,6 @@
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::http;
-use crate::style::Theme;
-use crate::utils;
+use crate::style::{self, Theme};
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use console::style;
 use serde::Deserialize;
@@ -87,7 +86,10 @@ pub async fn execute(
 
         loop {
             print!("\x1B[2J\x1B[1;1H"); // Clear screen
-            show_status(server, detailed).await?;
+            if let Err(error) = show_status(server, detailed).await {
+                // Keep watching through an outage; the next round may succeed.
+                style::print_error(&error);
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     } else {
@@ -98,111 +100,81 @@ pub async fn execute(
 async fn show_status(server: &str, detailed: bool) -> Result<()> {
     let client = http::client(Some(std::time::Duration::from_secs(10)))?;
 
-    // Health check
-    let health_resp = client.get(format!("{}/v1/health", server)).send().await;
-
-    let health_details = match health_resp {
-        Ok(resp) => {
-            let status = resp.status();
-            let health_details = resp.json::<StatusHealthResponse>().await.ok();
-
-            if status.is_success() {
-                println!(
-                    "{}  Server: {}",
-                    style("●").green(),
-                    style("Healthy").green()
-                );
-            } else {
-                println!(
-                    "{}  Server: {} (Status: {})",
-                    style("●").red(),
-                    style("Unhealthy").red(),
-                    status
-                );
-            }
-
-            health_details
-        }
-        Err(e) => {
-            println!(
-                "{}  Server: {} - {}",
-                style("●").red(),
-                style("Unreachable").red(),
-                e
-            );
-            return Ok(());
-        }
-    };
+    // Health check: an unreachable or unhealthy server fails the command.
+    let health = client.get(format!("{}/v1/health", server)).send().await?;
+    if !health.status().is_success() {
+        println!(
+            "{}  Server: {} (HTTP {})",
+            style("●").red(),
+            style("Unhealthy").red(),
+            health.status().as_u16()
+        );
+        return Err(CliError::from_response(health).await);
+    }
+    let health_details = health.json::<StatusHealthResponse>().await.ok();
+    println!(
+        "{}  Server: {}",
+        style("●").green(),
+        style("Healthy").green()
+    );
 
     // Get models status
     let models_resp = client
         .get(format!("{}/v1/admin/models", server))
         .send()
-        .await;
+        .await?;
+    if !models_resp.status().is_success() {
+        let error = CliError::from_response(models_resp).await;
+        eprintln!("Could not list models: {error}");
+    } else if let Ok(data) = models_resp.json::<serde_json::Value>().await {
+        let models = data.get("models").and_then(|d| d.as_array());
 
-    if let Ok(resp) = models_resp {
-        if let Ok(data) = resp.json::<serde_json::Value>().await {
-            let models = data.get("models").and_then(|d| d.as_array());
+        if let Some(models) = models {
+            println!("\n{}", style("Models:").bold());
 
-            if let Some(models) = models {
-                println!("\n{}", style("Models:").bold());
-
-                let mut table = Table::new();
-                if detailed {
-                    table.set_header(vec!["Model", "Status", "Size", "CUDA", "Quant"]);
-                } else {
-                    table.set_header(vec!["Model", "Status", "Size"]);
-                }
-
-                for model in models {
-                    let id = model
-                        .get("variant")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let mut status = model
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let mut size = model
-                        .get("size_bytes")
-                        .and_then(|v| v.as_u64())
-                        .map(|s| humansize::format_size(s, humansize::BINARY))
-                        .unwrap_or_else(|| "-".to_string());
-
-                    if status == "not_downloaded" {
-                        if let Some(path) = utils::model_dir_if_present(id) {
-                            status = "downloaded".to_string();
-                            if size == "-" {
-                                if let Some(bytes) = utils::directory_size_bytes(&path) {
-                                    size = humansize::format_size(bytes, humansize::BINARY);
-                                }
-                            }
-                        }
-                    }
-
-                    let status_cell = match status.as_str() {
-                        "ready" | "downloaded" => Cell::new(&status).fg(Color::Green),
-                        "downloading" => Cell::new(&status).fg(Color::Yellow),
-                        "loading" => Cell::new(&status).fg(Color::Blue),
-                        "error" => Cell::new(&status).fg(Color::Red),
-                        _ => Cell::new(&status).fg(Color::DarkGrey),
-                    };
-
-                    let mut row = vec![
-                        Cell::new(id).fg(Color::Cyan),
-                        status_cell,
-                        Cell::new(size).set_alignment(CellAlignment::Right),
-                    ];
-                    if detailed {
-                        row.push(Cell::new(model_cuda_level(model)).fg(Color::DarkGrey));
-                        row.push(Cell::new(model_cuda_quant_level(model)).fg(Color::DarkGrey));
-                    }
-                    table.add_row(row);
-                }
-
-                println!("{}", table);
+            let mut table = Table::new();
+            if detailed {
+                table.set_header(vec!["Model", "Status", "Size", "CUDA", "Quant"]);
+            } else {
+                table.set_header(vec!["Model", "Status", "Size"]);
             }
+
+            for model in models {
+                let id = model
+                    .get("variant")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let status = model
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let size = model
+                    .get("size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| humansize::format_size(s, humansize::BINARY))
+                    .unwrap_or_else(|| "-".to_string());
+
+                let status_cell = match status {
+                    "ready" | "downloaded" => Cell::new(status).fg(Color::Green),
+                    "downloading" => Cell::new(status).fg(Color::Yellow),
+                    "loading" => Cell::new(status).fg(Color::Blue),
+                    "error" => Cell::new(status).fg(Color::Red),
+                    _ => Cell::new(status).fg(Color::DarkGrey),
+                };
+
+                let mut row = vec![
+                    Cell::new(id).fg(Color::Cyan),
+                    status_cell,
+                    Cell::new(size).set_alignment(CellAlignment::Right),
+                ];
+                if detailed {
+                    row.push(Cell::new(model_cuda_level(model)).fg(Color::DarkGrey));
+                    row.push(Cell::new(model_cuda_quant_level(model)).fg(Color::DarkGrey));
+                }
+                table.add_row(row);
+            }
+
+            println!("{}", table);
         }
     }
 

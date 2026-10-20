@@ -1,20 +1,16 @@
 use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
-use crate::utils;
 use console::style;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use izwi_core::parse_model_variant;
 use serde::Deserialize;
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct ModelState {
-    variant: String,
     status: String,
-    local_path: Option<PathBuf>,
     download_progress: Option<f32>,
     error_message: Option<String>,
 }
@@ -55,14 +51,7 @@ pub async fn execute(
         if let Ok(r) = resp {
             if r.status().as_u16() == 200 {
                 if let Ok(state) = r.json::<ModelState>().await {
-                    let has_local_files = state
-                        .local_path
-                        .as_ref()
-                        .filter(|path| path.is_dir())
-                        .is_some()
-                        || utils::model_dir_if_present(&state.variant).is_some();
-
-                    if state.status != "not_downloaded" || has_local_files {
+                    if state.status != "not_downloaded" {
                         theme.info(&format!(
                             "Model '{}' is currently '{}'",
                             model, state.status
@@ -91,16 +80,10 @@ pub async fn execute(
     let response = client
         .post(format!("{}/v1/admin/models/{}/download", server, model))
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(CliError::ApiError {
-            status,
-            message: text,
-        });
+        return Err(CliError::from_response(response).await);
     }
 
     if let Ok(download_response) = response.json::<DownloadResponse>().await {
@@ -172,8 +155,7 @@ async fn wait_for_download_stream(server: &str, model: &str) -> Result<bool> {
             server, model
         ))
         .send()
-        .await
-        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+        .await?;
 
     if !response.status().is_success() {
         return Ok(false);
@@ -284,13 +266,8 @@ async fn wait_for_download_poll(server: &str, model: &str) -> Result<()> {
         }
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
             pb.abandon_with_message("Download failed");
-            return Err(CliError::ApiError {
-                status,
-                message: text,
-            });
+            return Err(CliError::from_response(response).await);
         }
 
         let state: ModelState = response.json().await?;

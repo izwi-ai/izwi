@@ -18,8 +18,6 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     #[serde(default, skip_serializing_if = "UiConfig::is_empty")]
     pub ui: UiConfig,
-    #[serde(default, skip_serializing_if = "DefaultsConfig::is_empty")]
-    pub defaults: DefaultsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -141,22 +139,6 @@ impl UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DefaultsConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
-}
-
-impl DefaultsConfig {
-    fn is_empty(&self) -> bool {
-        self.model.is_none() && self.speaker.is_none() && self.format.is_none()
-    }
-}
-
 impl Config {
     pub fn load(path: Option<&PathBuf>) -> Result<Self> {
         let config_path = config_path(path);
@@ -221,7 +203,6 @@ impl Config {
                 enabled: Some(defaults.ui_enabled),
                 dir: Some(defaults.ui_dir),
             },
-            defaults: DefaultsConfig::default(),
         }
     }
 
@@ -354,9 +335,6 @@ impl Config {
             "runtime.timeout" => self.runtime.timeout = Some(parse_u64(value)?),
             "ui.enabled" => self.ui.enabled = Some(parse_bool(value)?),
             "ui.dir" => self.ui.dir = Some(parse_path(value)?),
-            "defaults.model" => self.defaults.model = Some(parse_string(value)?),
-            "defaults.speaker" => self.defaults.speaker = Some(parse_string(value)?),
-            "defaults.format" => self.defaults.format = Some(parse_string(value)?),
             _ => return Err(anyhow!("Unsupported config key '{}'", key)),
         }
 
@@ -476,9 +454,6 @@ impl Config {
                 .dir
                 .as_ref()
                 .map(|value| toml::Value::String(value.display().to_string())),
-            "defaults.model" => self.defaults.model.clone().map(toml::Value::String),
-            "defaults.speaker" => self.defaults.speaker.clone().map(toml::Value::String),
-            "defaults.format" => self.defaults.format.clone().map(toml::Value::String),
             _ => None,
         }
     }
@@ -622,7 +597,6 @@ mod tests {
                 enabled: Some(false),
                 dir: Some(PathBuf::from("/tmp/ui")),
             },
-            defaults: DefaultsConfig::default(),
         };
 
         let overrides = config.serve_runtime_overrides();
@@ -741,6 +715,19 @@ mod tests {
             ])
         );
         assert_eq!(config.ui.enabled, Some(false));
+    }
+
+    /// The `defaults.*` keys were read by nothing and are gone; a config
+    /// that still has the table loads.
+    #[test]
+    fn retired_defaults_keys_are_refused_but_old_files_load() {
+        let mut config: Config =
+            toml::from_str("[defaults]\nmodel = \"Kokoro-82M\"\n[server]\nport = 9000\n").unwrap();
+        assert_eq!(config.server.port, Some(9000));
+        for key in ["defaults.model", "defaults.speaker", "defaults.format"] {
+            assert!(config.set_value(key, "x").is_err(), "{key}");
+            assert!(config.get_value(key).is_none(), "{key}");
+        }
     }
 
     #[test]

@@ -19,6 +19,23 @@ pub fn client(timeout: Option<Duration>) -> Result<reqwest::Client> {
         .map_err(|e| CliError::Other(format!("Failed to initialize HTTP client: {}", e)))
 }
 
+/// The base URL API commands use: surrounding spaces and trailing slashes
+/// removed, and `http://` added when no scheme is given.
+pub fn normalize_server_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let server = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    match url::Url::parse(&server) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => Ok(server),
+        _ => Err(CliError::InvalidInput(format!(
+            "Invalid server URL '{raw}': expected something like http://localhost:8080"
+        ))),
+    }
+}
+
 fn auth_headers(api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(key) = api_key.filter(|key| !key.is_empty()) {
@@ -33,6 +50,22 @@ fn auth_headers(api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_urls_lose_trailing_slashes_and_gain_a_scheme() {
+        for (raw, expected) in [
+            ("http://localhost:8080", "http://localhost:8080"),
+            ("http://localhost:8080/", "http://localhost:8080"),
+            (" https://izwi.example.com// ", "https://izwi.example.com"),
+            ("http://proxy.local/izwi/", "http://proxy.local/izwi"),
+            ("127.0.0.1:18094", "http://127.0.0.1:18094"),
+        ] {
+            assert_eq!(normalize_server_url(raw).unwrap(), expected, "{raw}");
+        }
+        for raw in ["", "/", "ftp://example.com", "http://exa mple.com"] {
+            assert!(normalize_server_url(raw).is_err(), "{raw:?}");
+        }
+    }
 
     #[test]
     fn api_key_becomes_a_sensitive_bearer_header() {
