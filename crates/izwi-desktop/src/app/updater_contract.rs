@@ -144,10 +144,13 @@ pub fn install_behavior_for_platform(target_os: &str) -> PlatformInstallBehavior
     }
 }
 
-pub fn updater_target_for_platform(target_os: &str) -> &'static str {
+/// The manifest entry a build installs from. A Linux build installed from
+/// the `.deb` updates with the `.deb` (`linux-deb`), not the AppImage.
+pub fn updater_target_for_platform(target_os: &str, deb_install: bool) -> &'static str {
     match target_os {
         "windows" => "windows",
         "macos" => "macos",
+        "linux" if deb_install => "linux-deb",
         "linux" => "linux",
         _ => "unknown",
     }
@@ -224,10 +227,11 @@ mod tests {
 
     #[test]
     fn maps_platform_to_custom_updater_target() {
-        assert_eq!(updater_target_for_platform("windows"), "windows");
-        assert_eq!(updater_target_for_platform("macos"), "macos");
-        assert_eq!(updater_target_for_platform("linux"), "linux");
-        assert_eq!(updater_target_for_platform("dragonfly"), "unknown");
+        assert_eq!(updater_target_for_platform("windows", false), "windows");
+        assert_eq!(updater_target_for_platform("macos", false), "macos");
+        assert_eq!(updater_target_for_platform("linux", false), "linux");
+        assert_eq!(updater_target_for_platform("linux", true), "linux-deb");
+        assert_eq!(updater_target_for_platform("dragonfly", false), "unknown");
     }
 
     fn newer(current: &str, update: &str) -> bool {

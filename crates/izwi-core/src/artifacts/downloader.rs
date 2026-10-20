@@ -397,6 +397,9 @@ fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
         && recorded_files == selected_files
 }
 
+/// Sent with every Hugging Face request; follows the release version.
+const USER_AGENT: &str = concat!("izwi/", env!("CARGO_PKG_VERSION"));
+
 /// The NeMo ASR families unpack their `.nemo` archive beside it on first
 /// load, so their checkpoint needs about twice the download's disk.
 fn extracts_nemo_on_load(variant: ModelVariant) -> bool {
@@ -716,7 +719,7 @@ impl ModelDownloader {
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi/0.1.0-beta-18")
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("Repo tree request failed: {}", e)))?;
@@ -767,7 +770,7 @@ impl ModelDownloader {
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi/0.1.0-beta-18")
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .map_err(|error| Error::HfHubError(format!("HTTP request failed: {error}")))?;
@@ -805,7 +808,7 @@ impl ModelDownloader {
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi/0.1.0-beta-18")
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", e)))?;
@@ -2111,7 +2114,7 @@ impl ModelDownloader {
         let response = self
             .http_client
             .head(&url)
-            .header("User-Agent", "izwi/0.1.0-beta-18")
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("HEAD request failed: {}", e)))?;

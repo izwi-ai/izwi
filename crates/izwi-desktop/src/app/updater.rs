@@ -203,7 +203,11 @@ pub async fn check_for_beta_update(
         .await?
     };
 
-    let updater_target = updater_target_for_platform(std::env::consts::OS);
+    let deb_install = matches!(
+        tauri::utils::platform::bundle_type(),
+        Some(tauri::utils::config::BundleType::Deb)
+    );
+    let updater_target = updater_target_for_platform(std::env::consts::OS, deb_install);
     let app_handle = app.clone();
     let release_manifest_url = release.manifest_url.clone();
     let update = retry_with_backoff(runtime.max_check_attempts, runtime.retry_backoff, || {
@@ -225,7 +229,12 @@ pub async fn check_for_beta_update(
                 .version_comparator(|current, release| is_newer_release(&current, &release.version))
                 .endpoints(vec![release_manifest_url])?
                 .build()?;
-            updater.check().await.map_err(UpdaterError::from)
+            match updater.check().await {
+                // A release without a .deb entry has nothing a .deb install
+                // can apply: no update, rather than an error.
+                Err(tauri_plugin_updater::Error::TargetNotFound(_)) if deb_install => Ok(None),
+                result => result.map_err(UpdaterError::from),
+            }
         }
     })
     .await?;
