@@ -40,6 +40,13 @@
           },
           "status": {
             "type": "string"
+          },
+          "warning": {
+            "description": "Why the action may be slow, when the runtime noted something (a Metal\nload larger than the host memory macOS reports available).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
