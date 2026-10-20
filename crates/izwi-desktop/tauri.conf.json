@@ -32,6 +32,8 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Izwi AI",
+    "copyright": "Copyright 2026 Izwi AI",
     "createUpdaterArtifacts": true,
     "targets": [
       "deb",

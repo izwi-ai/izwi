@@ -18,6 +18,9 @@ use url::Url;
 use super::{alerts, desktop_log, stale_server};
 
 const SERVER_LOG_FILE: &str = "izwi-server.log";
+/// A larger server log is moved to `izwi-server.old.log` when the server
+/// starts.
+const SERVER_LOG_ROTATE_AT_BYTES: u64 = 20 * 1024 * 1024;
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 const SHUTDOWN_GRACE_ENV: &str = "IZWI_HTTP_SHUTDOWN_GRACE_SECS";
 /// Drain allowed to the desktop-owned server at quit, when nothing else sets
@@ -630,6 +633,7 @@ fn open_server_log<R: tauri::Runtime>(
     })?;
 
     let log_path = log_dir.join(SERVER_LOG_FILE);
+    desktop_log::rotate_if_larger(&log_path, SERVER_LOG_ROTATE_AT_BYTES);
     let mut stdout = OpenOptions::new()
         .create(true)
         .append(true)

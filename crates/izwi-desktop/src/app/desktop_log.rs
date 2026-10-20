@@ -29,9 +29,7 @@ static SINK: Mutex<Sink> = Mutex::new(Sink {
 pub fn init(dir: &Path) -> std::io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join(DESKTOP_LOG_FILE);
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > ROTATE_AT_BYTES) {
-        let _ = fs::rename(&path, path.with_extension("old.log"));
-    }
+    rotate_if_larger(&path, ROTATE_AT_BYTES);
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let mut sink = lock();
     for line in sink.pending.drain(..) {
@@ -39,6 +37,14 @@ pub fn init(dir: &Path) -> std::io::Result<PathBuf> {
     }
     sink.file = Some(file);
     Ok(path)
+}
+
+/// Move a log larger than `limit` to `<name>.old.log`, replacing the last
+/// one, so logs written at every launch don't grow forever.
+pub fn rotate_if_larger(path: &Path, limit: u64) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > limit) {
+        let _ = fs::rename(path, path.with_extension("old.log"));
+    }
 }
 
 pub fn info(message: impl Display) {
@@ -127,6 +133,24 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn rotates_only_a_log_over_the_limit() {
+        let dir = std::env::temp_dir().join(format!("izwi-log-rotate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("izwi-server.log");
+        fs::write(&log, b"small").unwrap();
+        rotate_if_larger(&log, 100);
+        assert!(log.exists());
+        fs::write(&log, vec![b'x'; 200]).unwrap();
+        rotate_if_larger(&log, 100);
+        assert!(!log.exists());
+        assert_eq!(
+            fs::read(dir.join("izwi-server.old.log")).unwrap().len(),
+            200
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn timestamps_are_utc_dates() {

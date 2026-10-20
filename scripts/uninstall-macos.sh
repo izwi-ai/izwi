@@ -29,11 +29,24 @@ DATA_PATHS=(
   "$HOME/Library/Application Support/$IDENTIFIER"
   "$HOME/Library/Saved Application State/$IDENTIFIER.savedState"
   "$HOME/Library/Caches/$IDENTIFIER"
+  "$HOME/Library/Caches/izwi"
   "$HOME/Library/WebKit/$IDENTIFIER"
+  "$HOME/Library/HTTPStorages/$IDENTIFIER"
+  "$HOME/Library/Preferences/$IDENTIFIER.plist"
+  "$HOME/Library/Logs/$IDENTIFIER"
 )
+
+# "Open at login" (the autostart plugin's LaunchAgent, named after the app)
+LAUNCH_AGENT="$HOME/Library/LaunchAgents/Izwi.plist"
 
 echo "Stopping running Izwi processes..."
 pkill -f "izwi-server|izwi serve|izwi-desktop|/Applications/Izwi\\.app|Izwi\\.app" >/dev/null 2>&1 || true
+
+if [ -f "$LAUNCH_AGENT" ]; then
+  echo "Removing the open-at-login item..."
+  launchctl unload "$LAUNCH_AGENT" >/dev/null 2>&1 || true
+  rm -f "$LAUNCH_AGENT"
+fi
 
 if [ -d "$APP_PATH" ]; then
   echo "Removing app bundle: $APP_PATH"
