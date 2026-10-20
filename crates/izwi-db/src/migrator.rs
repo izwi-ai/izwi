@@ -45,6 +45,7 @@ impl Schema {
                     10,
                     "repair reasoning stored as summaries, titles and memories",
                 ),
+                (11, "voice session chat threads"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -203,6 +204,10 @@ async fn apply_migration<C: ConnectionTrait>(
             for statement in REASONING_DATA_REPAIR {
                 db.execute_unprepared(statement).await?;
             }
+        }
+        (Schema::App, 11) => {
+            ensure_column(db, &CHAT_THREAD_VOICE_SESSION_COLUMN).await?;
+            db.execute_unprepared(HIDE_LEGACY_VOICE_THREADS).await?;
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1135,6 +1140,20 @@ const REASONING_DATA_REPAIR: &[&str] = &[
     "DELETE FROM voice_observations",
 ];
 
+/// Migration 11: the voice session a chat thread holds the agent memory of.
+/// Chat lists only threads without one, and deleting the voice session
+/// deletes its thread.
+const CHAT_THREAD_VOICE_SESSION_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "chat_threads",
+    column: "voice_session_id",
+    definition: "TEXT NULL",
+};
+
+/// Voice threads created before migration 11 name no session; the voice
+/// agent titled them "Voice Session". They leave Chat and stay stored.
+const HIDE_LEGACY_VOICE_THREADS: &str = "UPDATE chat_threads SET voice_session_id = 'legacy' \
+     WHERE voice_session_id IS NULL AND title = 'Voice Session'";
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1668,6 +1687,8 @@ pub(crate) fn postgres_schema_sql() -> String {
         push(&add_column(column));
     }
     // Migration 10 repairs stored data: an empty schema has none.
+    // Migration 11.
+    push(&add_column(&CHAT_THREAD_VOICE_SESSION_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -2058,6 +2079,42 @@ mod tests {
             count(db, "SELECT COUNT(*) FROM voice_observations").await,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_10_hides_its_voice_threads_from_chat() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let column = &CHAT_THREAD_VOICE_SESSION_COLUMN;
+        db.execute_unprepared(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            column.table, column.column
+        ))
+        .await
+        .expect("column drops");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 11",
+        )
+        .await
+        .expect("version row deletes");
+        for (id, title) in [("voice", "Voice Session"), ("chat", "Planets")] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO chat_threads (id, title, created_at, updated_at) \
+                 VALUES ('{id}', '{title}', 1, 1)"
+            ))
+            .await
+            .expect("thread inserts");
+        }
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert!(table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+        let session =
+            |id: &str| format!("SELECT voice_session_id FROM chat_threads WHERE id = '{id}'");
+        assert_eq!(text(db, &session("voice")).await.as_deref(), Some("legacy"));
+        assert_eq!(text(db, &session("chat")).await, None);
     }
 
     fn shipped_postgres_schema_path() -> std::path::PathBuf {

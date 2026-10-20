@@ -2343,7 +2343,12 @@ fn spawn_turn_task(
                     );
 
                     let agent_session_id = agent_session
-                        .ensure(&state, &system_prompt, &config.text_model_id)
+                        .ensure(
+                            &state,
+                            &voice_session_id,
+                            &system_prompt,
+                            &config.text_model_id,
+                        )
                         .await?;
                     let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
                         .map_err(|err| format!("Invalid chat model: {err}"))?;
@@ -3406,6 +3411,7 @@ impl AgentSessionSlot {
     async fn ensure(
         &self,
         state: &AppState,
+        voice_session_id: &str,
         system_prompt: &str,
         text_model_id: &str,
     ) -> Result<String, String> {
@@ -3417,9 +3423,11 @@ impl AgentSessionSlot {
         }
 
         let model_id = resolve_chat_model_id(Some(text_model_id))?;
+        // The thread is the agent's memory for this voice session: not a
+        // Chat thread, and deleted with the session.
         let thread = state
             .chat_store
-            .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
+            .create_voice_thread(voice_session_id.to_string(), Some(model_id.clone()))
             .await
             .map_err(|err| format!("Chat storage error: {err:#}"))?;
 

@@ -43,6 +43,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "system_prompt",
             "created_at",
             "updated_at",
+            "voice_session_id",
         ],
     },
     RequiredSchemaTable {
