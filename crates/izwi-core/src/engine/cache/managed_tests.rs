@@ -1177,6 +1177,20 @@ fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
             .unwrap()
     };
     assert_eq!(fit(PortableFitHeadroom::Planning { minimum_tokens: 0 }), 4_096);
+    // S3: pre-load admission prices a floor exactly as the fit does, the
+    // page minimum included.
+    assert_eq!(
+        manager
+            .portable_state_bytes(&contract, 1_307, 64, (8, 8), 1)
+            .unwrap(),
+        Some(bytes(1_307))
+    );
+    assert_eq!(
+        manager
+            .portable_state_bytes(&contract, 0, 64, (8, 8), 1)
+            .unwrap(),
+        Some(bytes(64))
+    );
     let live = fit(PortableFitHeadroom::Live {
         minimum_tokens: 0,
         reserve: StateFitReserve::MeasuredUntracked,

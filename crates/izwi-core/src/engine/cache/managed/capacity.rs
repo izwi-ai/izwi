@@ -704,6 +704,97 @@ pub(super) fn tensor_state_resources(backend: BackendKind, bytes: u64) -> Result
 }
 
 impl ManagedKvCacheManager {
+    fn portable_state_plan(
+        &self,
+        contract: &InferenceStateContract,
+        page_tokens_hint: u32,
+    ) -> Result<ResolvedStatePlan> {
+        negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: Some(page_tokens_hint),
+                storage_dtype_hint: None,
+            },
+        )
+    }
+
+    /// What [`Self::fit_portable_logical_token_reach`] prices `state_plan`
+    /// at `tokens` per sequence, `(retained, staged)` rows and `copies`.
+    fn planned_portable_state_bytes(
+        &self,
+        state_plan: &ResolvedStatePlan,
+        model_instance: ModelInstanceId,
+        prefix_snapshot_rows: u32,
+        tokens: u64,
+        (retained_sequence_rows, staged_transaction_rows): (u32, u32),
+        portable_state_copies: u32,
+    ) -> Result<u64> {
+        let (allocation, _) = plan_managed_state_capacity_with_policy(
+            state_plan,
+            model_instance,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::MAX,
+                logical_token_reach: Some(tokens),
+                retained_sequence_rows,
+                staged_transaction_rows,
+            },
+            false,
+            prefix_snapshot_rows,
+        )?;
+        let resources = managed_state_resources(
+            self.worker_backend,
+            allocation.maximum_resources(state_plan)?,
+        )?;
+        let bytes = match self.worker_backend {
+            BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
+            BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
+            BackendKind::Cuda => {
+                return Err(Error::InvalidInput(
+                    "CUDA managed state is not priced by the portable fit".into(),
+                ))
+            }
+        }?;
+        bytes
+            .checked_mul(u64::from(portable_state_copies))
+            .ok_or_else(|| {
+                Error::ModelLoadError("aggregate managed-state byte plan overflow".into())
+            })
+    }
+
+    /// The bytes `contract`'s portable managed state takes at `tokens` per
+    /// sequence, priced exactly as the portable fit prices it, so a pre-load
+    /// floor and the fit after the load agree. `None` on CUDA, which does
+    /// not fit portable state.
+    pub(crate) fn portable_state_bytes(
+        &self,
+        contract: &InferenceStateContract,
+        tokens: u64,
+        page_tokens_hint: usize,
+        rows: (u32, u32),
+        portable_state_copies: u32,
+    ) -> Result<Option<u64>> {
+        if self.worker_backend == BackendKind::Cuda {
+            return Ok(None);
+        }
+        let page_tokens_hint = u32::try_from(page_tokens_hint)
+            .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
+        let state_plan = self.portable_state_plan(contract, page_tokens_hint)?;
+        // The page minimum, as the fit floors its minimum.
+        let tokens = u64::from(page_tokens_hint).max(tokens);
+        // The instance only labels the plan; no arena is bound for it.
+        self.planned_portable_state_bytes(
+            &state_plan,
+            ModelInstanceId::new(u64::MAX),
+            self.prefix_snapshot_rows_for(contract),
+            tokens,
+            rows,
+            portable_state_copies,
+        )
+        .map(Some)
+    }
+
     /// Resolve the largest portable logical reach whose exact managed-state
     /// plan fits the stable shared-memory envelope. CUDA deliberately bypasses
     /// this path and keeps admission-growable arenas.
@@ -771,43 +862,17 @@ impl ManagedKvCacheManager {
         .min(floor_budget_bytes);
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
-        let state_plan = negotiate_state_plan(
-            contract,
-            &StateBackendPlanRequest {
-                backend: self.worker_backend,
-                device_ordinal: self.worker_device_ordinal,
-                page_tokens_hint: Some(page_tokens_hint),
-                storage_dtype_hint: None,
-            },
-        )?;
+        let state_plan = self.portable_state_plan(contract, page_tokens_hint)?;
         let prefix_snapshot_rows = self.prefix_snapshot_rows_for(contract);
         let required_bytes = |tokens: u64| -> Result<u64> {
-            let (allocation, _) = plan_managed_state_capacity_with_policy(
+            self.planned_portable_state_bytes(
                 &state_plan,
                 model_instance,
-                ManagedStateCapacityRequest {
-                    total_paged_pages: u32::MAX,
-                    logical_token_reach: Some(tokens),
-                    retained_sequence_rows,
-                    staged_transaction_rows,
-                },
-                false,
                 prefix_snapshot_rows,
-            )?;
-            let resources = managed_state_resources(
-                self.worker_backend,
-                allocation.maximum_resources(&state_plan)?,
-            )?;
-            let bytes = match self.worker_backend {
-                BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
-                BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
-                BackendKind::Cuda => unreachable!("CUDA bypassed portable fitting"),
-            }?;
-            bytes
-                .checked_mul(u64::from(portable_state_copies))
-                .ok_or_else(|| {
-                    Error::ModelLoadError("aggregate managed-state byte plan overflow".into())
-                })
+                tokens,
+                (retained_sequence_rows, staged_transaction_rows),
+                portable_state_copies,
+            )
         };
 
         let floor_tokens = match headroom {

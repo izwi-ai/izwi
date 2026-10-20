@@ -50,13 +50,14 @@ mod qwen38_memory;
 mod state;
 #[path = "tts_memory.rs"]
 mod tts_memory;
-use admission::{
-    admit_cuda_state_floor, load_authorization_with_request_floor, reconcile_observed_growth,
-};
 #[cfg(test)]
 use admission::{
     admit_asr_request_floor, materialization_tolerance_bytes, request_envelope_resources,
     request_envelope_shortfall, CudaStateFloor,
+};
+use admission::{
+    admit_cuda_state_floor, load_authorization_with_request_floor, portable_preload_bytes,
+    reconcile_observed_growth,
 };
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
@@ -736,10 +737,30 @@ impl ModelLifecycleController {
             BackendKind::Cuda => ResourceAmount::Known(0),
         };
         if let ResourceAmount::Known(required_bytes) = portable_load_bytes {
+            let backend = self.backend_router.context().backend_kind;
+            let envelope_bytes = match super::asr_envelope::deferred_request_envelope(
+                variant,
+                backend,
+                self.coordinator.physical_execution_admission().capacity(),
+            )? {
+                Some(envelope) => envelope.total_bytes()?,
+                None => 0,
+            };
+            let state_floor_bytes = self
+                .portable_state_floor_bytes(variant, &acquired.model_path, backend)
+                .await?;
+            let preload_bytes = portable_preload_bytes(
+                &resource_plan,
+                backend,
+                required_bytes,
+                envelope_bytes,
+                state_floor_bytes,
+            )?;
             self.ensure_portable_memory_before_load(
                 variant,
-                required_bytes,
+                preload_bytes,
                 resource_plan.host_staging_bytes,
+                state_floor_bytes,
             )
             .await?;
         }

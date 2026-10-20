@@ -263,6 +263,31 @@ impl EngineCore {
         )
     }
 
+    /// What `retained_state` takes at `minimum_tokens` per sequence on the
+    /// engine's own rows, priced as the live retained fit of
+    /// [`Self::load_managed_model_state`] prices it, so pre-load admission
+    /// can hold the floor before any weight loads. `None` on CUDA.
+    pub(crate) fn portable_state_minimum_bytes(
+        &self,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        minimum_tokens: u64,
+    ) -> Result<Option<u64>> {
+        let rows = |rows: usize| {
+            u32::try_from(rows)
+                .map_err(|_| Error::InvalidInput("managed state row limit exceeds u32".into()))
+        };
+        self.managed_kv_cache.portable_state_bytes(
+            retained_state,
+            minimum_tokens,
+            self.config.block_size,
+            (
+                rows(self.config.max_retained_sequences)?,
+                rows(self.config.max_staged_transactions)?,
+            ),
+            1,
+        )
+    }
+
     /// Record a loaded model's tensor rows as reserved by the requests that
     /// create them (see `ManagedKvCacheManager::price_tensor_rows_with_requests`).
     pub(crate) fn price_tensor_rows_with_requests(

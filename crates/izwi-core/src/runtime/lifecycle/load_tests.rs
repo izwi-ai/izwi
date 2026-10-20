@@ -3449,6 +3449,51 @@ fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_hea
     }
 }
 
+/// S3: a CPU or Metal load must find its residents, its request envelope
+/// and the state its fits keep free before the weights load, or its load
+/// peak, whichever is larger. Unknown residency leaves the peak alone.
+#[test]
+fn portable_preload_holds_the_state_floor_beside_the_residents() {
+    let plan = |domain: fn(u64) -> ResourceVector| super::ModelResourcePlan {
+        resident_authorization: domain(10_000),
+        load_authorization: domain(12_000),
+        ..model_resource_plan(
+            BackendKind::Metal,
+            ModelMemoryEstimate {
+                load_peak_bytes: 0,
+                resident_bytes: 0,
+            },
+        )
+    };
+    let unified = |bytes| ResourceVector {
+        unified_bytes: ResourceAmount::Known(bytes),
+        ..ResourceVector::zero()
+    };
+    let host = |bytes| ResourceVector {
+        host_bytes: ResourceAmount::Known(bytes),
+        ..ResourceVector::zero()
+    };
+    let metal = plan(unified);
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Metal, 12_000, 0, 1_000).unwrap(),
+        12_000
+    );
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Metal, 12_000, 500, 3_000).unwrap(),
+        13_500
+    );
+    let cpu = plan(host);
+    assert_eq!(
+        super::portable_preload_bytes(&cpu, BackendKind::Cpu, 12_000, 0, 2_500).unwrap(),
+        12_500
+    );
+    // The Metal plan has no host residency to stand on.
+    assert_eq!(
+        super::portable_preload_bytes(&metal, BackendKind::Cpu, 12_000, 0, 9_999).unwrap(),
+        12_000
+    );
+}
+
 /// S2: Qwen3-TTS binds one retained arena for its Tts and StreamingTts
 /// capabilities. The second capability gets the runtime the first fit
 /// bound; refitting it against the headroom that arena had already taken
@@ -3576,6 +3621,7 @@ fn shortfall(
         live_headroom: live_gb.map(|gb| gb * GB),
         held_by_residents: held_gb * GB,
         unevictable,
+        state_floor_bytes: 0,
     }
 }
 
@@ -3625,6 +3671,19 @@ fn load_refusals_name_their_cause() {
     let message = shortfall(6, 2, None, 0, Vec::new()).message(variant);
     assert!(
         message.ends_with("held by running requests and model state: retry when they finish"),
+        "{message}"
+    );
+
+    // S3: the state a load keeps free beside its weights is named (Fish S2
+    // Pro on a 16 GB Mac: 10.74 GB of weights and a 1.07 GB reserve).
+    let mut fish = shortfall(12, 12, Some(11), 0, Vec::new());
+    fish.state_floor_bytes = 1_070_000_000;
+    let message = fish.message(ModelVariant::FishAudioS2Pro);
+    assert!(
+        message.starts_with(
+            "Cannot load Fish Audio S2 Pro: needs 12.00 GB, 11.00 GB available (of which \
+             1.07 GB is the state and safety reserve the model needs beside its weights)"
+        ),
         "{message}"
     );
 }

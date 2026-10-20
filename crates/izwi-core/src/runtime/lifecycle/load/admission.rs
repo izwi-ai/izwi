@@ -101,6 +101,30 @@ pub(super) fn admit_asr_request_floor(
     Ok(authorization)
 }
 
+/// What a CPU or Metal load must find free before its weights load: its
+/// load peak, or its residents beside the request envelope its load holds
+/// (`envelope_bytes`) and the state its fits keep after the weights
+/// (`state_floor_bytes`), whichever is larger. The state fits refuse a load
+/// whose weights leave less, so admission refuses it, or evicts for it,
+/// before 20 s of weight loading instead of after.
+pub(super) fn portable_preload_bytes(
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    load_peak_bytes: u64,
+    envelope_bytes: u64,
+    state_floor_bytes: u64,
+) -> Result<u64> {
+    let ResourceAmount::Known(resident) = load_domain_bytes(plan.resident_authorization, backend)
+    else {
+        return Ok(load_peak_bytes);
+    };
+    let beside = [envelope_bytes, state_floor_bytes]
+        .into_iter()
+        .try_fold(resident, u64::checked_add)
+        .ok_or_else(|| Error::ModelLoadError("portable state floor overflow".into()))?;
+    Ok(load_peak_bytes.max(beside))
+}
+
 /// The load authorization admission checks for `variant`: the plan's, with
 /// an ASR model's per-slot request floor folded in ([`admit_asr_request_floor`]).
 pub(super) fn load_authorization_with_request_floor(
@@ -202,6 +226,9 @@ pub(super) struct LoadShortfall {
     /// Residents the load may not evict: loaded explicitly (pinned) or
     /// serving a request.
     pub(super) unevictable: Vec<ModelVariant>,
+    /// What of `required_bytes` is the state the load's fits keep free once
+    /// the weights are resident (its safety reserve and minimum state).
+    pub(super) state_floor_bytes: u64,
 }
 
 impl LoadShortfall {
@@ -218,6 +245,13 @@ impl LoadShortfall {
             self.required_bytes,
             available,
         );
+        if self.state_floor_bytes > 0 {
+            message.push_str(&format!(
+                " (of which {:.2} GB is the state and safety reserve the model needs beside \
+                 its weights)",
+                gb(self.state_floor_bytes)
+            ));
+        }
         let freeable = available.saturating_add(self.held_by_residents);
         let live_binds = self
             .live_headroom
@@ -590,6 +624,7 @@ impl ModelLifecycleController {
         requested_variant: ModelVariant,
         required_bytes: u64,
         host_staging_bytes: u64,
+        state_floor_bytes: u64,
     ) -> Result<()> {
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
@@ -688,6 +723,7 @@ impl ModelLifecycleController {
                         &active_variants,
                         &pinned_variants,
                     ),
+                    state_floor_bytes,
                 };
                 return Err(Error::Overloaded(shortfall.message(requested_variant)));
             };
@@ -837,6 +873,62 @@ impl ModelLifecycleController {
         }))
     }
 
+    /// The memory a CPU or Metal load of `variant` must still find free once
+    /// its weights are resident: the safety reserve its state fits keep (the
+    /// measured one for a load that reconciles its device growth, else the
+    /// configured one) and, where the floor is known before load, its
+    /// minimum state (Qwen3-TTS: the retained talker at its prompt and
+    /// output budget). `0` for a model without a state fit (Kokoro, the
+    /// aligner, the diarizers), so admission refuses nothing new. The
+    /// predictor and chat floors need the loaded model and stay with the
+    /// fits.
+    pub(super) async fn portable_state_floor_bytes(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+        backend: BackendKind,
+    ) -> Result<u64> {
+        use crate::catalog::ModelFamily;
+        let fits_state = variant.is_chat()
+            || asr_memory::is_asr_variant(variant)
+            || matches!(
+                variant.family(),
+                ModelFamily::Qwen3Tts
+                    | ModelFamily::VibeVoiceTts
+                    | ModelFamily::VoxtralTts
+                    | ModelFamily::FishS2Tts
+            );
+        if backend == BackendKind::Cuda || !fits_state {
+            return Ok(0);
+        }
+        let configured = self.config.portable_context_reserve_bytes;
+        let reserve = if reconciles_device_usage(variant, backend) {
+            self.coordinator
+                .resource_authority()
+                .state_safety_reserve_bytes(backend, configured)
+        } else {
+            portable_context_reserve_bytes(variant, configured)
+        };
+        let minimum = if variant.family() == ModelFamily::Qwen3Tts {
+            let contract =
+                crate::models::architectures::qwen3::tts::qwen3_tts_retained_contract_for_load(
+                    model_path,
+                    &self.backend_router.context().device,
+                    self.config.kv_page_size,
+                    &self.config.kv_cache_dtype,
+                )?;
+            self.core_engine
+                .portable_state_minimum_bytes(&contract, tts_state_minimum_tokens(variant))
+                .await?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        reserve
+            .checked_add(minimum)
+            .ok_or_else(|| Error::ModelLoadError("portable state floor overflow".into()))
+    }
+
     /// Grows a loading slot's authorization to the precision reload plan
     /// of `variant` before a component whose load-time probe failed reloads
     /// at `request.dtype`, through the same live check as the load itself
@@ -901,7 +993,7 @@ impl ModelLifecycleController {
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
-        self.ensure_portable_memory_before_load(variant, growth, 0)
+        self.ensure_portable_memory_before_load(variant, growth, 0, 0)
             .await
             .map_err(refused)?;
         self.grow_loading_slot_authorization(variant, reload.load_authorization)

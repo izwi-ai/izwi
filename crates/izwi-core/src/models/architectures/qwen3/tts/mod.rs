@@ -1498,6 +1498,26 @@ pub(crate) fn qwen3_tts_load_layout(
     Qwen3TtsLoadLayout::resolve(&config, device)
 }
 
+/// The retained talker contract a load of `model_dir` binds, built from
+/// its config the way [`Qwen3TtsModel::load`] and
+/// [`Qwen3TtsModel::physical_state_spec`] build it, so load admission can
+/// price the state floor before any weight loads.
+pub(crate) fn qwen3_tts_retained_contract_for_load(
+    model_dir: &Path,
+    device: &DeviceProfile,
+    kv_page_size: usize,
+    kv_cache_dtype: &str,
+) -> Result<InferenceStateContract> {
+    let config: Qwen3TtsConfig =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let dtypes = Qwen3TtsLoadLayout::resolve(&config, device)?.dtypes;
+    let (talker_state, predictor_state) =
+        select_qwen3_tts_state_dtypes(device, dtypes, kv_cache_dtype)?;
+    let full =
+        qwen3_tts_inference_state_contract(&config, talker_state, predictor_state, kv_page_size)?;
+    qwen3_tts_retained_talker_contract(&full, &config, dtypes.talker)
+}
+
 /// `(custom_voice, voice_clone)`: which kind of checkpoint `config` is.
 /// VoiceDesign is neither: it ships no speakers (`spk_id: {}`) but designs
 /// its voice from an instruction, not reference audio. Only a checkpoint of

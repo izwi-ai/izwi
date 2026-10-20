@@ -3330,6 +3330,17 @@ impl Engine {
         .await
     }
 
+    pub(crate) async fn portable_state_minimum_bytes(
+        &self,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        minimum_tokens: u64,
+    ) -> Result<Option<u64>> {
+        self.core
+            .read()
+            .await
+            .portable_state_minimum_bytes(retained_state, minimum_tokens)
+    }
+
     pub(crate) async fn price_tensor_rows_with_requests(
         &self,
         model_instance: ModelInstanceId,
