@@ -169,6 +169,7 @@ const voiceMethodNames = [
 const onboardingMethodNames = [
   "getOnboardingState",
   "completeOnboarding",
+  "resetOnboarding",
 ] as const;
 
 const healthMethodNames = ["getHealth"] as const;

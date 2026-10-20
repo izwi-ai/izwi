@@ -18,4 +18,11 @@ export class OnboardingApiClient {
       method: "POST",
     });
   }
+
+  /** Marks onboarding not completed, so first run shows again. */
+  async resetOnboarding(): Promise<OnboardingStateResponse> {
+    return this.http.request("/onboarding/reset", {
+      method: "POST",
+    });
+  }
 }
