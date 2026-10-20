@@ -1,16 +1,28 @@
-//! Opt-in split of `<think>…</think>` reasoning into `reasoning_content`
-//! (`reasoning_format: "parsed"`).
+//! Split of `<think>…</think>` reasoning from a chat model's answer.
 //!
 //! Two conventions reach the server:
 //! * the model writes its own opener (LFM2.5 Thinking): `<think>r</think>a`;
 //! * the prompt already opened the block (Qwen3.5/3.6/3.8 with thinking on),
 //!   so the output is `r</think>a`.
 //!
-//! By default nothing changes: reasoning stays inside `content`, which is what
-//! the web UI parses.
+//! The OpenAI route splits only on request (`reasoning_format: "parsed"`);
+//! the server's own generations (summaries, titles, memory) always split, so
+//! reasoning never reaches stored text.
+
+use crate::catalog::{ModelFamily, ModelVariant};
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
+
+/// Whether a request's prompt opens the `<think>` block itself: chat families
+/// whose template opens it when thinking is on (Qwen3.5/3.6/3.8). The LFM2.5
+/// Thinking model writes its own opener.
+pub fn reasoning_opened_in_prompt(variant: ModelVariant, enable_thinking: Option<bool>) -> bool {
+    variant.family() != ModelFamily::Lfm2Chat
+        && variant.chat_capabilities().is_some_and(|caps| {
+            caps.supports_thinking && enable_thinking.unwrap_or(caps.default_thinking_enabled)
+        })
+}
 
 /// Split a complete output into `(reasoning, content)`.
 pub fn split_reasoning(text: &str, opened_in_prompt: bool) -> (Option<String>, String) {

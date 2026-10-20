@@ -29,6 +29,11 @@ use crate::{
 pub const INTERRUPTED_BY_SHUTDOWN_ERROR: &str =
     "Interrupted by a server shutdown before it finished; rerun the job.";
 
+/// The error a pending summary gets when the server restarts under it: the
+/// summary task lived in the old process, so nothing would finish it.
+pub const SUMMARY_INTERRUPTED_ERROR: &str =
+    "The summary was interrupted by a server restart. Regenerate it to try again.";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -746,7 +751,7 @@ impl DiarizationStore {
             )
             .col_expr(
                 diarization_records::Column::SummaryError,
-                Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
+                Expr::value(SUMMARY_INTERRUPTED_ERROR),
             )
             .filter(diarization_records::Column::SummaryStatus.eq("pending"))
             .filter(owned())
@@ -2072,7 +2077,7 @@ pub(crate) mod tests {
         assert_eq!(ready.summary_status, DiarizationSummaryStatus::Failed);
         assert_eq!(
             ready.summary_error.as_deref(),
-            Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
+            Some(SUMMARY_INTERRUPTED_ERROR)
         );
         assert_eq!(
             store.fail_interrupted_records().await.expect("rerun"),

@@ -4,6 +4,7 @@
 
 mod generation;
 mod messages;
+pub mod reasoning;
 mod sampling;
 
 pub use generation::{

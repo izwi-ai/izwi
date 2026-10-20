@@ -29,8 +29,7 @@ use crate::error::ApiError;
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmittedTenantWork};
 use crate::ids::new_prefixed_id;
 use izwi_model_catalog::{
-    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelFamily,
-    ModelVariant,
+    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -408,18 +407,10 @@ fn reasoning_split_mode(
 ) -> Result<Option<bool>, ApiError> {
     match req.reasoning_format.as_deref().map(str::trim) {
         None | Some("none") => Ok(None),
-        Some("parsed") => {
-            let variant = execution.variant;
-            let opened_in_prompt = variant.family() != ModelFamily::Lfm2Chat
-                && variant.chat_capabilities().is_some_and(|caps| {
-                    caps.supports_thinking
-                        && execution
-                            .chat_config
-                            .enable_thinking
-                            .unwrap_or(caps.default_thinking_enabled)
-                });
-            Ok(Some(opened_in_prompt))
-        }
+        Some("parsed") => Ok(Some(super::reasoning::reasoning_opened_in_prompt(
+            execution.variant,
+            execution.chat_config.enable_thinking,
+        ))),
         Some(other) => Err(ApiError::bad_request(format!(
             "Unsupported `reasoning_format` {other:?}; use \"none\" or \"parsed\""
         ))),

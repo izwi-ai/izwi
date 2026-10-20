@@ -22,6 +22,7 @@ pub(crate) mod sentence_split;
 pub mod speech_history;
 pub(crate) mod speech_text_upload;
 pub mod studio;
+pub(crate) mod summary;
 pub(crate) mod transcript_alignment;
 pub mod transcription;
 pub(crate) mod tts_long_form;

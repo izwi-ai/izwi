@@ -721,6 +721,27 @@ impl TranscriptionStore {
             )?)
             .await
             .context("Failed to fail interrupted transcription records")?;
+        // A summary runs as a task of the process that asked for it, so a
+        // pending one has nothing left to finish it after a restart.
+        db.execute_raw(raw::statement(
+            db,
+            format!(
+                r#"
+                UPDATE transcription_records
+                SET
+                    summary_status = 'failed',
+                    summary_error = ?1
+                WHERE summary_status = 'pending'
+                  AND (owner_node_id = ?2 {unowned})
+                "#
+            ),
+            vec![
+                crate::diarization_store::SUMMARY_INTERRUPTED_ERROR.into(),
+                scope.owner.clone().into(),
+            ],
+        )?)
+        .await
+        .context("Failed to fail interrupted transcription summaries")?;
         Ok(result.rows_affected())
     }
 
@@ -2191,6 +2212,49 @@ mod tests {
             TranscriptionProcessingStatus::Failed
         );
         assert_eq!(summaries[0].transcription_preview, "Runtime unavailable");
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// A summary left pending by a previous process fails at startup with a
+    /// reason, instead of staying pending (and polled) forever.
+    #[tokio::test]
+    async fn startup_fails_summaries_left_pending() {
+        let (store, root) = build_test_store();
+        let mut pending = sample_record();
+        pending.summary_status = TranscriptionSummaryStatus::Pending;
+        pending.summary_text = None;
+        let pending = store.create_record(pending).await.expect("pending summary");
+        let ready = store
+            .create_record(sample_record())
+            .await
+            .expect("ready summary");
+
+        store
+            .fail_interrupted_records()
+            .await
+            .expect("startup recovery");
+
+        let pending = store
+            .get_record(pending.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(pending.summary_status, TranscriptionSummaryStatus::Failed);
+        assert_eq!(
+            pending.summary_error.as_deref(),
+            Some(crate::diarization_store::SUMMARY_INTERRUPTED_ERROR)
+        );
+        let ready = store
+            .get_record(ready.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(ready.summary_status, TranscriptionSummaryStatus::Ready);
+        assert_eq!(
+            ready.summary_text.as_deref(),
+            Some("A short summary of the transcript.")
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::api::audio_payload::{
     decode_audio_payload_canonical_with_diagnostics, decode_base64_audio_payload,
@@ -27,19 +27,19 @@ use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
-    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
-    DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
-    JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
+    validate_diarization_speaker_limits, DiarizationConfig, DiarizationPipelineOptions,
+    DiarizationTranscriptResult, JobCancellation, ModelVariant, RuntimeService, WorkloadClass,
 };
 use tracing::{info, info_span, warn, Instrument};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
+use crate::api::summary::{
+    spawn_summary_generation, truncate_summary_error, SummaryJob, SummaryKind,
+    DEFAULT_SUMMARY_MODEL,
+};
 
 const HISTORY_LIST_LIMIT: usize = 200;
-const DEFAULT_DIARIZATION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
-const DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS: usize = 384;
-const DIARIZATION_SUMMARY_SYSTEM_PROMPT: &str = "You summarize diarized transcripts for fast review. Return only the final summary text. Do not output markdown, bullet markers, XML tags, code fences, or <think> content. Keep it concise while preserving major speaker contributions, decisions, action items, and unresolved questions.";
 
 #[derive(Debug, Serialize)]
 pub struct DiarizationRecordListResponse {
@@ -861,9 +861,7 @@ fn validate_speaker_bounds(
 
 /// The model that summarizes a record: its pipeline LLM, else the default.
 fn summary_model_id(llm_model_id: Option<&str>) -> String {
-    llm_model_id
-        .unwrap_or(DEFAULT_DIARIZATION_SUMMARY_MODEL)
-        .to_string()
+    llm_model_id.unwrap_or(DEFAULT_SUMMARY_MODEL).to_string()
 }
 
 /// A summary is generated only when the job asked for one (`summary_model`)
@@ -911,45 +909,33 @@ fn spawn_summary_generation_task(
     model_id: String,
     correlation_id: Option<String>,
 ) {
-    tokio::spawn(async move {
-        let runtime = state.runtime.clone();
-        let diarization_store = state.diarization_store.clone();
-        let permit = match state
-            .acquire_owned_workload_permit(WorkloadClass::Background)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
+    let diarization_store = state.diarization_store.clone();
+    let variant = match resolve_diarization_llm_variant(Some(&model_id)) {
+        Ok(variant) => variant,
+        Err(err) => {
+            tokio::spawn(async move {
                 persist_summary_update(
                     &diarization_store,
                     record_id.as_str(),
                     summary_failure_update(
-                        "Summary generation unavailable: request queue closed.",
+                        &format!("Invalid summary model '{model_id}': {err}"),
                         &model_id,
                     ),
                 )
                 .await;
-                return;
-            }
-        };
-
-        let summary_result = if transcript.trim().is_empty() {
-            Err("Summary generation failed: transcript is empty".to_string())
-        } else {
-            generate_diarization_summary_with_timeout(
-                runtime,
-                &model_id,
-                transcript.as_str(),
-                correlation_id.as_deref(),
-                summary_timeout_secs,
-                permit.runtime_context(),
-            )
-            .await
-        };
-
-        drop(permit);
-
-        let summary_update = match summary_result {
+            });
+            return;
+        }
+    };
+    let job = SummaryJob {
+        kind: SummaryKind::DiarizedTranscript,
+        variant,
+        transcript,
+        correlation_id,
+        timeout_secs: summary_timeout_secs,
+    };
+    spawn_summary_generation(state, job, move |result| async move {
+        let summary_update = match result {
             Ok(summary_text) => UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Ready,
                 model_id: Some(model_id),
@@ -957,82 +943,10 @@ fn spawn_summary_generation_task(
                 error: None,
                 updated_at: None,
             },
-            Err(err) => summary_failure_update(err.as_str(), &model_id),
+            Err(err) => summary_failure_update(&err, &model_id),
         };
-
         persist_summary_update(&diarization_store, record_id.as_str(), summary_update).await;
     });
-}
-
-async fn generate_diarization_summary_with_timeout(
-    runtime: Arc<RuntimeService>,
-    model_id: &str,
-    transcript: &str,
-    correlation_id: Option<&str>,
-    timeout_secs: u64,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(
-            runtime,
-            model_id,
-            transcript,
-            correlation_id,
-            runtime_context,
-        ),
-    )
-    .await
-    .map_err(|_| summary_timeout_error(timeout_secs))?
-}
-
-async fn generate_diarization_summary(
-    runtime: Arc<RuntimeService>,
-    model_id: &str,
-    transcript: &str,
-    correlation_id: Option<&str>,
-    runtime_context: RuntimeRequestContext,
-) -> Result<String, String> {
-    let variant = resolve_diarization_llm_variant(Some(model_id))
-        .map_err(|err| format!("Invalid summary model '{model_id}': {err}"))?;
-    let params = GenerationParams {
-        max_tokens: DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS,
-        temperature: 0.2,
-        top_p: 0.9,
-        ..Default::default()
-    };
-
-    let generation = runtime
-        .chat_generate_with_runtime_context(
-            variant,
-            vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: DIARIZATION_SUMMARY_SYSTEM_PROMPT.to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "Summarize the following diarized transcript.\n\nTranscript:\n{}",
-                        transcript
-                    ),
-                },
-            ],
-            params,
-            // Long transcripts keep fitting the summary model by trimming the
-            // output budget, as before D8.
-            ChatRequestConfig {
-                truncation: ChatTruncation::Auto,
-                ..ChatRequestConfig::default()
-            },
-            correlation_id,
-            runtime_context,
-        )
-        .await
-        .map_err(|err| format!("Summary generation failed: {err}"))?;
-
-    sanitize_summary_output(generation.text.as_str())
-        .ok_or_else(|| "Summary generation returned empty text".to_string())
 }
 
 fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSummary {
@@ -1043,13 +957,6 @@ fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSumma
         error: Some(truncate_summary_error(error)),
         updated_at: None,
     }
-}
-
-fn summary_timeout_error(timeout_secs: u64) -> String {
-    format!(
-        "Summary generation timed out after {} seconds.",
-        timeout_secs.max(1)
-    )
 }
 
 async fn persist_summary_update(
@@ -1076,58 +983,6 @@ async fn persist_summary_update(
             );
         }
     }
-}
-
-fn sanitize_summary_output(raw: &str) -> Option<String> {
-    let without_think = strip_think_sections(raw);
-    let without_fence_markers = strip_code_fence_markers(without_think.as_str());
-    let normalized = without_fence_markers
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn strip_think_sections(input: &str) -> String {
-    let mut out = if let Some((_, tail)) = input.rsplit_once("</think>") {
-        tail.to_string()
-    } else {
-        input.to_string()
-    };
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-
-    while let Some(start) = out.find(open_tag) {
-        if let Some(end_rel) = out[start + open_tag.len()..].find(close_tag) {
-            let end = start + open_tag.len() + end_rel;
-            let mut next = String::with_capacity(out.len());
-            next.push_str(&out[..start]);
-            next.push_str(&out[end + close_tag.len()..]);
-            out = next;
-        } else {
-            out.truncate(start);
-            break;
-        }
-    }
-
-    out.replace(open_tag, " ").replace(close_tag, " ")
-}
-
-fn strip_code_fence_markers(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn truncate_summary_error(raw: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 320;
-    raw.chars().take(MAX_ERROR_CHARS).collect::<String>()
 }
 
 async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateRequest, ApiError> {
@@ -1442,6 +1297,7 @@ mod tests {
     use axum::body::Body;
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
+    use std::time::Duration;
 
     fn wav_data_url(content_type: &str) -> String {
         let wav = AudioEncoder::new(16_000, 1)
@@ -1859,7 +1715,7 @@ mod tests {
         let (status, model_id) = initial_summary_state("   ", requested);
         assert_eq!(status, DiarizationSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
-        assert_eq!(summary_model_id(None), DEFAULT_DIARIZATION_SUMMARY_MODEL);
+        assert_eq!(summary_model_id(None), DEFAULT_SUMMARY_MODEL);
     }
 
     #[tokio::test]
@@ -1902,27 +1758,6 @@ mod tests {
         source.summary_status = DiarizationSummaryStatus::Ready;
         assert!(rerun(&source, None));
         assert!(!rerun(&source, Some(false)));
-    }
-
-    #[test]
-    fn sanitizes_summary_output_for_display_and_storage() {
-        let raw = "<think>reasoning</think>\n```text\nSummary text.\n```\n";
-        assert_eq!(
-            sanitize_summary_output(raw).as_deref(),
-            Some("Summary text.")
-        );
-    }
-
-    #[test]
-    fn summary_timeout_error_enforces_minimum_one_second() {
-        assert_eq!(
-            summary_timeout_error(0),
-            "Summary generation timed out after 1 seconds."
-        );
-        assert_eq!(
-            summary_timeout_error(12),
-            "Summary generation timed out after 12 seconds."
-        );
     }
 
     #[test]
