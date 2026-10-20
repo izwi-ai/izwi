@@ -1,10 +1,9 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { StudioPage } from "./studio/route";
-import { VoiceCloningPage } from "./voice-cloning/route";
 import { TranscriptionPage } from "./transcription/route";
 
 const apiMocks = vi.hoisted(() => ({
@@ -153,25 +152,6 @@ describe("Page header history buttons", () => {
     onError: vi.fn(),
     onRefresh: vi.fn().mockResolvedValue(true),
   };
-
-  it("VoiceCloningPage renders the history button in the page header slot", async () => {
-    render(
-      <NotificationProvider>
-        <MemoryRouter>
-          <VoiceCloningPage {...baseProps} />
-        </MemoryRouter>
-      </NotificationProvider>,
-    );
-
-    const slot = screen.getByTestId("page-header-history-slot");
-
-    await waitFor(() =>
-      expect(within(slot).getByRole("button", { name: /History/i })).toBeInTheDocument(),
-    );
-    expect(within(slot).getByRole("button", { name: /History/i })).not.toHaveClass(
-      "fixed",
-    );
-  });
 
   it("TranscriptionPage renders new transcript and model actions in the header", async () => {
     render(

@@ -18,7 +18,6 @@ import type {
   VoiceRouteProps,
 } from "@/app/router/types";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
-import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 
 // Route code loads lazily, then preloads once the app is idle so later
 // navigation does not wait on a chunk (react-router keeps the previous page
@@ -26,9 +25,6 @@ import { VOICE_STUDIO_ENABLED } from "@/shared/config/runtime";
 const ROUTE_MODULES = {
   TextToSpeechPage: () => import("@/features/text-to-speech/route"),
   StudioPage: () => import("@/features/studio/route"),
-  VoiceCloningPage: () => import("@/features/voice-cloning/route"),
-  VoiceDesignPage: () => import("@/features/voice-design/route"),
-  VoicesPage: () => import("@/features/voices/route"),
   VoiceStudioPage: () => import("@/features/voice-studio/route"),
   SpeechTextPage: () => import("@/features/speech-text/route"),
   ChatPage: () => import("@/features/chat/route"),
@@ -49,18 +45,6 @@ const TextToSpeechPage = lazy(async () => ({
 
 const StudioPage = lazy(async () => ({
   default: (await ROUTE_MODULES.StudioPage()).StudioPage,
-}));
-
-const VoiceCloningPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoiceCloningPage()).VoiceCloningPage,
-}));
-
-const VoiceDesignPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoiceDesignPage()).VoiceDesignPage,
-}));
-
-const VoicesPage = lazy(async () => ({
-  default: (await ROUTE_MODULES.VoicesPage()).VoicesPage,
 }));
 
 const VoiceStudioPage = lazy(async () => ({
@@ -235,37 +219,18 @@ export function AppRoutes() {
             path="/studio/:projectId"
             element={withSuspense(<StudioPage {...pageProps} />)}
           />
-          {VOICE_STUDIO_ENABLED ? (
-            <>
-              <Route
-                path="/voices"
-                element={withSuspense(<VoiceStudioPage {...pageProps} />)}
-              />
-              <Route
-                path="/voice-cloning"
-                element={<Navigate to="/voices?tab=clone" replace />}
-              />
-              <Route
-                path="/voice-design"
-                element={<Navigate to="/voices?tab=design" replace />}
-              />
-            </>
-          ) : (
-            <>
-              <Route
-                path="/voice-cloning"
-                element={withSuspense(<VoiceCloningPage {...pageProps} />)}
-              />
-              <Route
-                path="/voice-design"
-                element={withSuspense(<VoiceDesignPage {...pageProps} />)}
-              />
-              <Route
-                path="/voices"
-                element={withSuspense(<VoicesPage {...pageProps} />)}
-              />
-            </>
-          )}
+          <Route
+            path="/voices"
+            element={withSuspense(<VoiceStudioPage {...pageProps} />)}
+          />
+          <Route
+            path="/voice-cloning"
+            element={<Navigate to="/voices?tab=clone" replace />}
+          />
+          <Route
+            path="/voice-design"
+            element={<Navigate to="/voices?tab=design" replace />}
+          />
           <Route
             path="/transcription"
             element={withSuspense(<SpeechTextPage {...pageProps} />)}

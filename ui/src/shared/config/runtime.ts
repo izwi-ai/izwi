@@ -8,23 +8,6 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-function resolveBooleanEnv(
-  value: string | boolean | null | undefined,
-  defaultValue: boolean,
-): boolean {
-  if (typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value !== "string") {
-    return defaultValue;
-  }
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return defaultValue;
-  }
-  return !(normalized === "0" || normalized === "false" || normalized === "no");
-}
-
 export function resolveApiBaseUrl(
   options: ResolveApiBaseUrlOptions = {},
 ): string {
@@ -51,7 +34,3 @@ export const API_BASE_URL = resolveApiBaseUrl({
   envBaseUrl: import.meta.env.VITE_API_BASE_URL ?? null,
   windowServerUrl: browserServerUrl,
 });
-export const VOICE_STUDIO_ENABLED = resolveBooleanEnv(
-  import.meta.env.VITE_VOICE_STUDIO_ENABLED,
-  true,
-);
