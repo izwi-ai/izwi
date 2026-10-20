@@ -39,7 +39,6 @@ async fn parakeet_long_form_pipeline_matches_ordinary_transcription() {
             None,
             Some(PARAKEET),
             None,
-            None,
             &DiarizationConfig::default(),
             &DiarizationPipelineOptions::default(),
         )

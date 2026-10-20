@@ -140,9 +140,8 @@ export function DiarizationPage({
       },
       {
         key: "llm",
-        title: "Refiner + Summary",
-        description:
-          "LLM used for transcript refinement and diarization summaries.",
+        title: "Summary",
+        description: "LLM that writes diarization summaries.",
         models: llmPipelineModels,
       },
     ],

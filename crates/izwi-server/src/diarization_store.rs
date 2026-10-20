@@ -156,7 +156,6 @@ pub struct DiarizationRecord {
     pub max_speakers: Option<usize>,
     pub min_speech_duration_ms: Option<f64>,
     pub min_silence_duration_ms: Option<f64>,
-    pub enable_llm_refinement: bool,
     pub processing_time_ms: f64,
     pub duration_secs: Option<f64>,
     pub rtf: Option<f64>,
@@ -164,7 +163,6 @@ pub struct DiarizationRecord {
     pub corrected_speaker_count: usize,
     pub alignment_coverage: Option<f64>,
     pub unattributed_words: usize,
-    pub llm_refined: bool,
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
@@ -207,7 +205,6 @@ pub struct NewDiarizationRecord {
     pub max_speakers: Option<usize>,
     pub min_speech_duration_ms: Option<f64>,
     pub min_silence_duration_ms: Option<f64>,
-    pub enable_llm_refinement: bool,
     pub language: Option<String>,
     pub vad_gate: Option<bool>,
     pub processing_time_ms: f64,
@@ -216,7 +213,6 @@ pub struct NewDiarizationRecord {
     pub speaker_count: usize,
     pub alignment_coverage: Option<f64>,
     pub unattributed_words: usize,
-    pub llm_refined: bool,
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
@@ -253,14 +249,12 @@ pub struct CompleteDiarizationRecord {
     pub max_speakers: Option<usize>,
     pub min_speech_duration_ms: Option<f64>,
     pub min_silence_duration_ms: Option<f64>,
-    pub enable_llm_refinement: bool,
     pub processing_time_ms: f64,
     pub duration_secs: Option<f64>,
     pub rtf: Option<f64>,
     pub speaker_count: usize,
     pub alignment_coverage: Option<f64>,
     pub unattributed_words: usize,
-    pub llm_refined: bool,
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
@@ -534,18 +528,15 @@ impl DiarizationStore {
             max_speakers: Set(max_speakers),
             min_speech_duration_ms: Set(min_speech_duration_ms),
             min_silence_duration_ms: Set(min_silence_duration_ms),
-            enable_llm_refinement: Set(if record.enable_llm_refinement {
-                1_i64
-            } else {
-                0_i64
-            }),
+            // LLM refinement was removed; the column stays for older rows.
+            enable_llm_refinement: Set(0_i64),
             processing_time_ms: Set(processing_time_ms),
             duration_secs: Set(duration_secs),
             rtf: Set(rtf),
             speaker_count: Set(speaker_count),
             alignment_coverage: Set(alignment_coverage),
             unattributed_words: Set(unattributed_words),
-            llm_refined: Set(if record.llm_refined { 1_i64 } else { 0_i64 }),
+            llm_refined: Set(0_i64),
             asr_text: Set(asr_text),
             raw_transcript: Set(raw_transcript),
             transcript: Set(transcript),
@@ -899,14 +890,6 @@ impl DiarizationStore {
                 Expr::value(min_silence_duration_ms),
             )
             .col_expr(
-                diarization_records::Column::EnableLlmRefinement,
-                Expr::value(if record.enable_llm_refinement {
-                    1_i64
-                } else {
-                    0_i64
-                }),
-            )
-            .col_expr(
                 diarization_records::Column::ProcessingTimeMs,
                 Expr::value(processing_time_ms),
             )
@@ -926,10 +909,6 @@ impl DiarizationStore {
             .col_expr(
                 diarization_records::Column::UnattributedWords,
                 Expr::value(unattributed_words),
-            )
-            .col_expr(
-                diarization_records::Column::LlmRefined,
-                Expr::value(if record.llm_refined { 1_i64 } else { 0_i64 }),
             )
             .col_expr(diarization_records::Column::AsrText, Expr::value(asr_text))
             .col_expr(
@@ -1198,7 +1177,6 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         max_speakers,
         min_speech_duration_ms: row.try_get_by_index(10)?,
         min_silence_duration_ms: row.try_get_by_index(11)?,
-        enable_llm_refinement: row.try_get_by_index::<i64>(12)? > 0,
         processing_time_ms: row.try_get_by_index(13)?,
         duration_secs: row.try_get_by_index(14)?,
         rtf: row.try_get_by_index(15)?,
@@ -1206,7 +1184,6 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         corrected_speaker_count,
         alignment_coverage: row.try_get_by_index(17)?,
         unattributed_words,
-        llm_refined: row.try_get_by_index::<i64>(19)? > 0,
         asr_text: row.try_get_by_index(20)?,
         raw_transcript: row.try_get_by_index(21)?,
         transcript: row.try_get_by_index(22)?,
@@ -1562,7 +1539,6 @@ pub(crate) mod tests {
             max_speakers: Some(4),
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
-            enable_llm_refinement: true,
             language: None,
             vad_gate: None,
             processing_time_ms: 500.0,
@@ -1571,7 +1547,6 @@ pub(crate) mod tests {
             speaker_count: 2,
             alignment_coverage: Some(0.95),
             unattributed_words: 0,
-            llm_refined: true,
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
             transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
@@ -1647,14 +1622,12 @@ pub(crate) mod tests {
             max_speakers: Some(4),
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
-            enable_llm_refinement: true,
             processing_time_ms: 480.0,
             duration_secs: Some(12.0),
             rtf: Some(0.4),
             speaker_count: 2,
             alignment_coverage: Some(0.95),
             unattributed_words: 0,
-            llm_refined: true,
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
             transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
@@ -1820,7 +1793,6 @@ pub(crate) mod tests {
         pending.speaker_count = 0;
         pending.alignment_coverage = None;
         pending.unattributed_words = 0;
-        pending.llm_refined = false;
         pending.asr_text = String::new();
         pending.raw_transcript = String::new();
         pending.transcript = String::new();
@@ -1963,7 +1935,6 @@ pub(crate) mod tests {
         pending.speaker_count = 0;
         pending.alignment_coverage = None;
         pending.unattributed_words = 0;
-        pending.llm_refined = false;
         pending.asr_text = String::new();
         pending.raw_transcript = String::new();
         pending.transcript = String::new();

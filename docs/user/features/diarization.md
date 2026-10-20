@@ -90,12 +90,11 @@ POST /v1/speech-to-text/jobs?job_kind=diarization
 | `model` | String | Diarization model (`diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization`). The selected checkpoint bounds `max_speakers`: 4 for Sortformer v2.1, 8 for Nemotron-3 |
 | `asr_model` | String | Optional ASR model override (an ASR or Voxtral model; other ids return 400) |
 | `aligner_model` | String | Optional forced aligner model override (non-aligner ids return 400) |
-| `llm_model` | String | Optional chat model for transcript refinement and the summary (default `Qwen3.5-4B`; non-chat ids return 400) |
+| `llm_model` | String | Optional chat model for the summary (default `Qwen3.5-4B`; non-chat ids return 400) |
 | `min_speakers` | Integer | Optional minimum expected speakers |
 | `max_speakers` | Integer | Optional maximum expected speakers |
 | `min_speech_duration_ms` | Number | Optional VAD speech-duration tuning |
 | `min_silence_duration_ms` | Number | Optional VAD silence-duration tuning |
-| `enable_llm_refinement` | Boolean/String | Enable optional transcript refinement (in batches of utterance lines) |
 | `generate_summary` | Boolean/String | Summarize the transcript with `llm_model` once it is ready (default `false`) |
 | `language` | String | Optional ASR language hint (default: detected per chunk) |
 | `vad_gate` | Boolean/String | Clip diarizer segments to VAD speech regions (default off; helps on noisy input) |
@@ -127,7 +126,7 @@ The create response is a persisted diarization job. Poll the returned `id` with
 ```
 
 Ready job records include `segments`, `words`, `utterances`, `speaker_count`,
-`duration_secs`, `alignment_coverage`, LLM refinement status, processing metrics,
+`duration_secs`, `alignment_coverage`, processing metrics, any pipeline `warnings`,
 and the formatted `transcript`.
 
 See the [API Reference](/api#speech-text-jobs) for JSON input and exact response shapes.

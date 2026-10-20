@@ -1,9 +1,6 @@
 //! Diarization runtime methods.
 
-use crate::catalog::{
-    resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
-    resolve_diarization_model_variant,
-};
+use crate::catalog::{resolve_diarization_asr_model_variant, resolve_diarization_model_variant};
 use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
@@ -14,7 +11,6 @@ use crate::models::architectures::voxtral::realtime::VOXTRAL_REALTIME_OFFLINE_AU
 use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription, VoxtralModelLease,
 };
-use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
@@ -754,7 +750,6 @@ impl RuntimeService {
         diarization_model_id: Option<&str>,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
-        llm_model_id: Option<&str>,
         config: &DiarizationConfig,
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
@@ -763,7 +758,6 @@ impl RuntimeService {
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
-            llm_model_id,
             config,
             options,
         )
@@ -776,7 +770,6 @@ impl RuntimeService {
         diarization_model_id: Option<&str>,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
-        llm_model_id: Option<&str>,
         config: &DiarizationConfig,
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
@@ -785,7 +778,6 @@ impl RuntimeService {
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
-            llm_model_id,
             config,
             options,
         )
@@ -801,7 +793,6 @@ impl RuntimeService {
         diarization_model_id: Option<&str>,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
-        llm_model_id: Option<&str>,
         config: &DiarizationConfig,
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
@@ -810,7 +801,6 @@ impl RuntimeService {
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
-            llm_model_id,
             config,
             options,
         )
@@ -824,11 +814,9 @@ impl RuntimeService {
         diarization_model_id: Option<&str>,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
-        llm_model_id: Option<&str>,
         config: &DiarizationConfig,
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
-        let enable_llm_refinement = options.enable_llm_refinement;
         audio_input.validate()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
         // Refuse an ASR or aligner the pipeline cannot run before diarizing:
@@ -852,11 +840,10 @@ impl RuntimeService {
             Some(diarization_variant),
             false,
         )?;
-        self.record_diarization_transcript_pipeline(enable_llm_refinement);
+        self.record_diarization_transcript_pipeline();
         let (pipeline_job, audio) = self
             .admit_pipeline_audio(audio_input, &options.cancellation)
             .await?;
-        let llm_model_id = llm_model_id.map(ToOwned::to_owned);
         let config = config.clone();
 
         // Sortformer and the ASR are independent until attribution, so they
@@ -974,7 +961,7 @@ impl RuntimeService {
                 should_use_single_pass_diarization_asr(audio.duration_secs, chunk_limit);
             // Every ASR handle (residency lease, model, contract and state) moves
             // into this block and drops at its end, so the ASR is evictable before
-            // the aligner runs and the refinement LLM loads (ADM-8). Dropping only
+            // the aligner runs (ADM-8). Dropping only
             // the lease would let eviction count weights the model still pins.
             let (asr_windows, chunk_texts, single_pass_hit_budget) = {
                 let _asr_lease = asr_lease;
@@ -1136,39 +1123,8 @@ impl RuntimeService {
             format_utterance_transcript(&utterances)
         };
 
-        let raw_transcript_trimmed = raw_transcript.trim();
-        let mut transcript = raw_transcript.clone();
-        let mut llm_refined = false;
-        // Refinement runs its own chat job, outside this job's stages.
+        let transcript = raw_transcript.clone();
         pipeline_job.ensure_not_cancelled()?;
-        if enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
-            // Refinement is optional polish: an unresolvable refiner model is
-            // the same class of failure as a failed completion — return the
-            // raw speaker transcript instead of discarding the whole run.
-            match resolve_chat_variant(llm_model_id.as_deref()) {
-                Ok(llm_variant) => {
-                    let polished = self
-                        .polish_diarized_transcript(
-                            &pipeline_job,
-                            llm_variant,
-                            &raw_transcript,
-                            &mut warnings,
-                        )
-                        .await?;
-                    let polished_trimmed = polished.trim();
-                    if !polished_trimmed.is_empty() {
-                        transcript = polished_trimmed.to_string();
-                        llm_refined = polished_trimmed != raw_transcript_trimmed;
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "Refinement model {} is unavailable, returning raw speaker transcript: {err}",
-                        llm_model_id.as_deref().unwrap_or("default"),
-                    );
-                }
-            }
-        }
 
         let alignment_coverage = if words.is_empty() {
             0.0
@@ -1187,88 +1143,9 @@ impl RuntimeService {
             speaker_count: diarization.speaker_count,
             alignment_coverage,
             unattributed_words,
-            llm_refined,
             warnings,
         })
     }
-
-    /// Refine the speaker transcript in batches of whole utterance lines, each
-    /// with an output budget sized from its own length (PIPE-12): one prompt
-    /// over a long transcript ran out of budget and was always discarded.
-    /// A batch the model cannot refine faithfully keeps its raw lines; a
-    /// failed generation keeps the rest raw and adds a warning. Only a
-    /// cancel is an error.
-    async fn polish_diarized_transcript(
-        &self,
-        job: &JobLease,
-        llm_variant: ModelVariant,
-        raw_transcript: &str,
-        warnings: &mut Vec<String>,
-    ) -> Result<String> {
-        let batches = refinement_batches(raw_transcript);
-        let mut polished = Vec::with_capacity(batches.len());
-        let mut failure = None;
-        for batch in &batches {
-            job.ensure_not_cancelled()?;
-            if failure.is_some() {
-                polished.push(batch.to_string());
-                continue;
-            }
-            match self.polish_transcript_batch(llm_variant, batch).await {
-                Ok(text) => polished.push(text),
-                Err(err) => {
-                    warn!(
-                        "Transcript refinement failed, keeping the raw speaker transcript: {err}"
-                    );
-                    failure = Some(err);
-                    polished.push(batch.to_string());
-                }
-            }
-        }
-        if let Some(err) = failure {
-            warnings.push(format!(
-                "LLM refinement failed ({err}); the rest of the transcript is unrefined"
-            ));
-        }
-        Ok(polished.join("\n"))
-    }
-
-    async fn polish_transcript_batch(
-        &self,
-        llm_variant: ModelVariant,
-        raw_transcript: &str,
-    ) -> Result<String> {
-        let messages = vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "You are a diarized transcript editor. Return only final transcript lines, with no analysis or hidden reasoning. Never output tags (including <think>), markdown, code fences, or commentary. Keep speaker labels and timestamps exactly unchanged. Keep line count and line order exactly unchanged. Do not invent, repeat, or omit spoken content. Only improve punctuation and readability of spoken text after the colon on each line."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: format!(
-                    "Rewrite this diarized transcript with minimal edits.\nRules:\n- Keep exactly one output line per input line.\n- Preserve each leading speaker label + timestamp prefix exactly as-is.\n- Edit only the spoken text after the colon.\n- Do not add, remove, or merge lines.\n- Do not invent new words, drop spoken words, or repeat content not present in the line.\n- Output only the final transcript lines.\n\n{}",
-                    raw_transcript
-                ),
-            },
-        ];
-
-        let generation = self
-            .chat_generate(
-                llm_variant,
-                messages,
-                refinement_max_new_tokens(raw_transcript),
-            )
-            .await?;
-        Ok(sanitize_refined_transcript(
-            &generation.text,
-            raw_transcript,
-        ))
-    }
-}
-
-fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
-    resolve_diarization_llm_variant(model_id).map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
 fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
@@ -2007,16 +1884,6 @@ fn fallback_word_timings_with_segments(
     alignments
 }
 
-fn extract_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'' && ch != '-')
-                .to_string()
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
-}
-
 pub(super) fn alignment_is_suspicious(
     alignments: &[(String, u32, u32)],
     expected_word_count: usize,
@@ -2662,141 +2529,12 @@ fn format_utterance_transcript(utterances: &[DiarizationUtterance]) -> String {
         .join("\n")
 }
 
-/// Input bytes of one refinement batch: about 500-700 tokens of English, so
-/// the rewrite fits a modest output budget.
-const REFINEMENT_BATCH_BYTES: usize = 2_000;
-
-/// The transcript as batches of whole lines of at most
-/// [`REFINEMENT_BATCH_BYTES`] (a longer line is a batch of its own).
-fn refinement_batches(transcript: &str) -> Vec<String> {
-    let mut batches = Vec::new();
-    let mut batch = String::new();
-    for line in transcript.lines().filter(|line| !line.trim().is_empty()) {
-        if !batch.is_empty() && batch.len() + 1 + line.len() > REFINEMENT_BATCH_BYTES {
-            batches.push(std::mem::take(&mut batch));
-        }
-        if !batch.is_empty() {
-            batch.push('\n');
-        }
-        batch.push_str(line);
+fn secs_to_ms(value: f32) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        (value * 1000.0).round() as u32
     }
-    if !batch.is_empty() {
-        batches.push(batch);
-    }
-    batches
-}
-
-/// Output budget for rewriting `batch`: byte-level BPE spends at most about
-/// one token per 2 bytes of text in any script, plus room for the line
-/// headers and a short preamble the sanitizer strips.
-fn refinement_max_new_tokens(batch: &str) -> usize {
-    (batch.len() / 2 + 128).max(256)
-}
-
-fn sanitize_refined_transcript(candidate: &str, fallback: &str) -> String {
-    let fallback_trimmed = fallback.trim();
-    let stripped = strip_tagged_sections(candidate, "<think>", "</think>")
-        .replace("```text", "")
-        .replace("```", "");
-
-    let candidate_lines = stripped
-        .lines()
-        .filter_map(extract_utterance_line)
-        .collect::<Vec<_>>();
-    let fallback_lines = fallback_trimmed
-        .lines()
-        .filter_map(extract_utterance_line)
-        .collect::<Vec<_>>();
-
-    if !candidate_lines.is_empty() {
-        if fallback_lines.is_empty() {
-            return candidate_lines.join("\n");
-        }
-        // Accept refined output only when it preserves line count and line headers.
-        let structurally_consistent = candidate_lines.len() == fallback_lines.len()
-            && candidate_lines.iter().zip(fallback_lines.iter()).all(
-                |(candidate_line, fallback_line)| {
-                    utterance_prefix(candidate_line) == utterance_prefix(fallback_line)
-                        && utterance_text_similarity_ok(candidate_line, fallback_line)
-                },
-            );
-        if structurally_consistent {
-            return candidate_lines.join("\n");
-        }
-    }
-
-    if !fallback_trimmed.is_empty() {
-        return fallback_trimmed.to_string();
-    }
-
-    stripped.trim().to_string()
-}
-
-fn utterance_prefix(line: &str) -> Option<&str> {
-    let mut trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(stripped) = trimmed.strip_prefix("- ") {
-        trimmed = stripped.trim();
-    } else if let Some(stripped) = trimmed.strip_prefix("* ") {
-        trimmed = stripped.trim();
-    }
-    let header_end = trimmed.find(':')?;
-    Some(trimmed[..header_end].trim())
-}
-
-fn utterance_text_similarity_ok(candidate_line: &str, fallback_line: &str) -> bool {
-    let Some((_, candidate_text)) = candidate_line.split_once(':') else {
-        return false;
-    };
-    let Some((_, fallback_text)) = fallback_line.split_once(':') else {
-        return false;
-    };
-
-    let candidate_words = extract_words(candidate_text)
-        .into_iter()
-        .map(|word| word.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let fallback_words = extract_words(fallback_text)
-        .into_iter()
-        .map(|word| word.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    if fallback_words.is_empty() {
-        return true;
-    }
-    if candidate_words.is_empty() {
-        return false;
-    }
-
-    let (recall, precision) = bag_word_overlap(&fallback_words, &candidate_words);
-    recall >= 0.75 && precision >= 0.6
-}
-
-fn bag_word_overlap(reference_words: &[String], candidate_words: &[String]) -> (f32, f32) {
-    if reference_words.is_empty() || candidate_words.is_empty() {
-        return (0.0, 0.0);
-    }
-
-    let mut counts = HashMap::<&str, usize>::new();
-    for word in reference_words {
-        *counts.entry(word.as_str()).or_insert(0) += 1;
-    }
-
-    let mut common = 0usize;
-    for word in candidate_words {
-        if let Some(remaining) = counts.get_mut(word.as_str()) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                common += 1;
-            }
-        }
-    }
-
-    let recall = common as f32 / reference_words.len() as f32;
-    let precision = common as f32 / candidate_words.len() as f32;
-    (recall, precision)
 }
 
 pub(super) fn samples_to_ms(sample_index: usize, sample_rate: u32) -> u32 {
@@ -2804,95 +2542,6 @@ pub(super) fn samples_to_ms(sample_index: usize, sample_rate: u32) -> u32 {
         return 0;
     }
     ((sample_index as u64 * 1000) / sample_rate as u64) as u32
-}
-
-fn strip_tagged_sections(input: &str, start_tag: &str, end_tag: &str) -> String {
-    let mut output = input.to_string();
-    let start_tag = start_tag.to_ascii_lowercase();
-    let end_tag = end_tag.to_ascii_lowercase();
-    let start_len = start_tag.len();
-    let end_len = end_tag.len();
-
-    loop {
-        let lowered = output.to_ascii_lowercase();
-        let Some(start_idx) = lowered.find(&start_tag) else {
-            break;
-        };
-        let search_from = start_idx.saturating_add(start_len);
-        if let Some(end_rel) = lowered[search_from..].find(&end_tag) {
-            let end_idx = search_from + end_rel + end_len;
-            output.replace_range(start_idx..end_idx, "");
-        } else {
-            output.replace_range(start_idx..output.len(), "");
-            break;
-        }
-    }
-
-    output
-}
-
-fn extract_utterance_line(line: &str) -> Option<String> {
-    let mut candidate = line.trim();
-    if candidate.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = candidate.strip_prefix("- ") {
-        candidate = stripped.trim();
-    } else if let Some(stripped) = candidate.strip_prefix("* ") {
-        candidate = stripped.trim();
-    } else {
-        let numeric_end = candidate
-            .bytes()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        if numeric_end > 0 && candidate[numeric_end..].starts_with(". ") {
-            candidate = candidate[numeric_end + 2..].trim();
-        }
-    }
-
-    if is_utterance_line(candidate) {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-fn is_utterance_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    let Some(header_end) = trimmed.find("]:") else {
-        return false;
-    };
-    let header = &trimmed[..=header_end];
-    let Some(bracket_start) = header.rfind('[') else {
-        return false;
-    };
-    if header[..bracket_start].trim().is_empty() {
-        return false;
-    }
-    let time_range = &header[bracket_start + 1..header.len() - 1];
-    let Some((start, end)) = time_range.split_once(" - ") else {
-        return false;
-    };
-    is_seconds_token(start) && is_seconds_token(end)
-}
-
-fn is_seconds_token(token: &str) -> bool {
-    let Some(value) = token.trim().strip_suffix('s') else {
-        return false;
-    };
-    value
-        .parse::<f32>()
-        .map(|parsed| parsed.is_finite() && parsed >= 0.0)
-        .unwrap_or(false)
-}
-
-fn secs_to_ms(value: f32) -> u32 {
-    if !value.is_finite() || value <= 0.0 {
-        0
-    } else {
-        (value * 1000.0).round() as u32
-    }
 }
 
 #[cfg(test)]
@@ -3465,7 +3114,6 @@ mod tests {
                     None,
                     asr,
                     aligner,
-                    None,
                     &config,
                     &DiarizationPipelineOptions::default(),
                 )
@@ -3599,13 +3247,13 @@ mod tests {
         let wav = crate::runtime::asr_no_speech::tests::wav_bytes(&one_second, 16_000);
 
         runtime
-            .diarize_with_transcript_bytes(&wav, None, None, None, None, &config, &options)
+            .diarize_with_transcript_bytes(&wav, None, None, None, &config, &options)
             .await
             .expect_err("no Sortformer checkpoint");
         assert_eq!(runtime.diarization_audio_decodes(), 1);
 
         runtime
-            .diarize_with_transcript_samples(one_second, None, None, None, None, &config, &options)
+            .diarize_with_transcript_samples(one_second, None, None, None, &config, &options)
             .await
             .expect_err("no Sortformer checkpoint");
         assert_eq!(runtime.diarization_audio_decodes(), 1);
@@ -3613,7 +3261,6 @@ mod tests {
         let error = runtime
             .diarize_with_transcript_samples(
                 vec![0.0; MAX_PIPELINE_SAMPLES + 1],
-                None,
                 None,
                 None,
                 None,
@@ -3631,8 +3278,8 @@ mod tests {
 
     #[test]
     fn fallback_word_timings_generates_monotonic_ranges() {
-        let timings =
-            fallback_word_timings_from_words(&extract_words("hello world from test"), 2.0);
+        let words = ["hello", "world", "from", "test"].map(String::from);
+        let timings = fallback_word_timings_from_words(&words, 2.0);
         assert_eq!(timings.len(), 4);
         for (idx, (_, start, end)) in timings.iter().enumerate() {
             assert!(end > start, "word {} should have positive duration", idx);
@@ -4719,85 +4366,6 @@ mod tests {
             speaker_confidence: Some(speaker_confidence),
             overlaps_segment: true,
         }
-    }
-
-    /// PIPE-12: a transcript well past 3 minutes is refined in batches of
-    /// whole lines whose budget covers their own rewrite, instead of one
-    /// 1024-token generation that always ran out and was discarded.
-    #[test]
-    fn long_transcripts_are_refined_in_batches_their_budget_covers() {
-        let lines = (0..240)
-            .map(|index| {
-                format!(
-                    "SPEAKER_0{} [{}.00s - {}.50s]: and then we talked about the plan for line {index}",
-                    index % 2,
-                    index,
-                    index
-                )
-            })
-            .collect::<Vec<_>>();
-        let transcript = lines.join("\n");
-        assert!(transcript.len() > 5 * REFINEMENT_BATCH_BYTES);
-
-        let batches = refinement_batches(&transcript);
-        assert!(batches.len() > 1);
-        assert_eq!(batches.join("\n"), transcript, "every line once, in order");
-        for batch in &batches {
-            assert!(batch.len() <= REFINEMENT_BATCH_BYTES);
-            // The rewrite of a batch is about as long as the batch.
-            assert!(refinement_max_new_tokens(batch) >= batch.len() / 2);
-        }
-        // About one token per CJK character.
-        let cjk = format!(
-            "SPEAKER_00 [0.00s - 90.00s]: {}",
-            "我们明天下午三点在北京见面。".repeat(40)
-        );
-        assert!(refinement_max_new_tokens(&cjk) >= cjk.chars().count());
-        assert!(refinement_batches(" \n\n").is_empty());
-    }
-
-    #[test]
-    fn sanitize_refined_transcript_removes_thinking_and_keeps_lines() {
-        let fallback = "SPEAKER_00 [0.00s - 1.00s]: hello there";
-        let candidate = r#"
-<think>
-internal reasoning
-</think>
-Here is the refined transcript:
-- SPEAKER_00 [0.00s - 1.00s]: Hello there.
-"#;
-
-        let sanitized = sanitize_refined_transcript(candidate, fallback);
-        assert_eq!(sanitized, "SPEAKER_00 [0.00s - 1.00s]: Hello there.");
-    }
-
-    #[test]
-    fn sanitize_refined_transcript_falls_back_when_no_utterance_lines() {
-        let fallback = "SPEAKER_00 [0.00s - 1.00s]: hello there";
-        let candidate = "Here is the rewrite with cleaner punctuation.";
-
-        let sanitized = sanitize_refined_transcript(candidate, fallback);
-        assert_eq!(sanitized, fallback);
-    }
-
-    #[test]
-    fn sanitize_refined_transcript_falls_back_on_line_count_mismatch() {
-        let fallback = "SPEAKER_00 [0.00s - 1.00s]: hello there";
-        let candidate =
-            "SPEAKER_00 [0.00s - 1.00s]: Hello there.\nSPEAKER_01 [1.00s - 2.00s]: Extra line";
-
-        let sanitized = sanitize_refined_transcript(candidate, fallback);
-        assert_eq!(sanitized, fallback);
-    }
-
-    #[test]
-    fn sanitize_refined_transcript_falls_back_on_low_similarity() {
-        let fallback = "SPEAKER_00 [0.00s - 1.00s]: hello there from class";
-        let candidate =
-            "SPEAKER_00 [0.00s - 1.00s]: completely new invented content that was never spoken";
-
-        let sanitized = sanitize_refined_transcript(candidate, fallback);
-        assert_eq!(sanitized, fallback);
     }
 
     #[test]

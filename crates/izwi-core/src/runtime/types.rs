@@ -159,7 +159,6 @@ pub struct DiarizationTranscriptResult {
     pub speaker_count: usize,
     pub alignment_coverage: f32,
     pub unattributed_words: usize,
-    pub llm_refined: bool,
     /// Degraded steps the transcript went through (aligner windows with
     /// interval timings, a missing aligner, a truncated ASR decode).
     #[serde(default)]
@@ -186,8 +185,6 @@ pub struct DiarizationConfig {
 /// Per-job controls of the diarization transcript pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct DiarizationPipelineOptions {
-    /// Polish the speaker transcript with the pipeline LLM.
-    pub enable_llm_refinement: bool,
     /// Language hint for the pipeline ASR; `None` lets it detect the
     /// language of each chunk.
     pub language: Option<String>,

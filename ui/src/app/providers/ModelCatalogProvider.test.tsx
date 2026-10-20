@@ -331,7 +331,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     vi.clearAllMocks();
   });
 
-  it("keeps the diarization refiner resident across chat model switches", async () => {
+  it("keeps the diarization summary LLM resident across chat model switches", async () => {
     apiMocks.listModels.mockResolvedValue({
       models: [
         { ...model, status: "ready" },
@@ -497,7 +497,7 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
   });
 
   it("does not adopt a speech-pipeline model load as the selection", async () => {
-    // Qwen3.5-4B is a pipeline stack member (refiner/summary LLM): loading it
+    // Qwen3.5-4B is a pipeline stack member (summary LLM): loading it
     // is pipeline setup, not a model switch.
     apiMocks.loadModel.mockResolvedValue({
       status: "loaded",

@@ -27,7 +27,6 @@ pub(crate) enum PipelineStageKind {
     Diarization,
     ForcedAlignment,
     SpeakerAttribution,
-    LlmRefinement,
     PersistArtifact,
 }
 
@@ -169,28 +168,22 @@ impl PipelineGraph {
         }
     }
 
-    pub(crate) fn diarization_transcript(enable_llm_refinement: bool) -> Self {
-        let mut stages = vec![
-            PipelineStage::required(PipelineStageKind::DecodeAudio, "diarization.decode_audio"),
-            PipelineStage::required(PipelineStageKind::Diarization, "diarization.segment"),
-            PipelineStage::required(PipelineStageKind::Asr, "diarization.asr"),
-            PipelineStage::optional(PipelineStageKind::ForcedAlignment, "diarization.alignment"),
-            PipelineStage::required(
-                PipelineStageKind::SpeakerAttribution,
-                "diarization.speaker_attribution",
-            ),
-        ];
-
-        if enable_llm_refinement {
-            stages.push(PipelineStage::optional(
-                PipelineStageKind::LlmRefinement,
-                "diarization.llm_refinement",
-            ));
-        }
-
+    pub(crate) fn diarization_transcript() -> Self {
         Self {
             kind: PipelineKind::DiarizationTranscript,
-            stages,
+            stages: vec![
+                PipelineStage::required(PipelineStageKind::DecodeAudio, "diarization.decode_audio"),
+                PipelineStage::required(PipelineStageKind::Diarization, "diarization.segment"),
+                PipelineStage::required(PipelineStageKind::Asr, "diarization.asr"),
+                PipelineStage::optional(
+                    PipelineStageKind::ForcedAlignment,
+                    "diarization.alignment",
+                ),
+                PipelineStage::required(
+                    PipelineStageKind::SpeakerAttribution,
+                    "diarization.speaker_attribution",
+                ),
+            ],
         }
     }
 
@@ -277,8 +270,8 @@ mod tests {
     }
 
     #[test]
-    fn diarization_graph_makes_refinement_explicit_and_optional() {
-        let graph = PipelineGraph::diarization_transcript(true);
+    fn diarization_graph_has_no_llm_stage() {
+        let graph = PipelineGraph::diarization_transcript();
 
         assert_eq!(graph.kind, PipelineKind::DiarizationTranscript);
         assert_eq!(
@@ -289,16 +282,7 @@ mod tests {
                 PipelineStageKind::Asr,
                 PipelineStageKind::ForcedAlignment,
                 PipelineStageKind::SpeakerAttribution,
-                PipelineStageKind::LlmRefinement,
             ]
-        );
-        assert!(
-            !graph
-                .stages()
-                .iter()
-                .find(|stage| stage.kind == PipelineStageKind::LlmRefinement)
-                .expect("llm refinement stage")
-                .required
         );
     }
 

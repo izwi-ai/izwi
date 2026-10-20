@@ -1292,14 +1292,15 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "llm_model".to_string(),
         json!({
             "type": "string",
-            "description": "Optional diarization chat model for transcript refinement and the summary."
+            "description": "Optional diarization chat model for the summary."
         }),
     );
     properties.insert(
         "enable_llm_refinement".to_string(),
         json!({
             "type": "boolean",
-            "description": "For diarization jobs, enable optional LLM transcript refinement."
+            "deprecated": true,
+            "description": "Ignored: LLM transcript refinement was removed in 0.1.0."
         }),
     );
     properties.insert(

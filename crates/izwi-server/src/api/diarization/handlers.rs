@@ -69,8 +69,6 @@ pub struct RerunDiarizationRecordRequest {
     pub min_speech_duration_ms: Option<f64>,
     #[serde(default)]
     pub min_silence_duration_ms: Option<f64>,
-    #[serde(default)]
-    pub enable_llm_refinement: Option<bool>,
     /// Defaults to whether the source record asked for a summary.
     #[serde(default)]
     pub generate_summary: Option<bool>,
@@ -99,7 +97,6 @@ struct ParsedDiarizationCreateRequest {
     max_speakers: Option<usize>,
     min_speech_duration_ms: Option<f64>,
     min_silence_duration_ms: Option<f64>,
-    enable_llm_refinement: Option<bool>,
     /// Summarize the transcript with the pipeline LLM once it is ready (D6).
     generate_summary: bool,
     /// ASR language hint; `None` detects the language per chunk.
@@ -128,8 +125,6 @@ struct JsonCreateRequest {
     min_speech_duration_ms: Option<f64>,
     #[serde(default)]
     min_silence_duration_ms: Option<f64>,
-    #[serde(default)]
-    enable_llm_refinement: Option<bool>,
     #[serde(default)]
     generate_summary: Option<bool>,
     #[serde(default)]
@@ -392,7 +387,6 @@ async fn create_pending_record(
             max_speakers: parsed.max_speakers,
             min_speech_duration_ms: parsed.min_speech_duration_ms,
             min_silence_duration_ms: parsed.min_silence_duration_ms,
-            enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
             language: parsed.language.clone(),
             vad_gate: parsed.vad_gate,
             processing_time_ms: 0.0,
@@ -401,7 +395,6 @@ async fn create_pending_record(
             speaker_count: 0,
             alignment_coverage: None,
             unattributed_words: 0,
-            llm_refined: false,
             asr_text: String::new(),
             raw_transcript: String::new(),
             transcript: String::new(),
@@ -475,7 +468,7 @@ fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Re
     if let Some(raw) = parsed.llm_model_id.as_deref() {
         let variant = resolve_diarization_llm_variant(Some(raw)).map_err(|_| {
             ApiError::bad_request(format!(
-                "Model '{raw}' is not a chat model for diarization refinement or summaries."
+                "Model '{raw}' is not a chat model for diarization summaries."
             ))
         })?;
         parsed.llm_model_id = Some(variant.dir_name().to_string());
@@ -491,7 +484,6 @@ struct GeneratedDiarizationArtifacts {
     speaker_count: usize,
     alignment_coverage: Option<f64>,
     unattributed_words: usize,
-    llm_refined: bool,
     asr_text: String,
     raw_transcript: String,
     transcript: String,
@@ -587,14 +579,12 @@ fn spawn_diarization_processing_task(
                             max_speakers: parsed.max_speakers,
                             min_speech_duration_ms: parsed.min_speech_duration_ms,
                             min_silence_duration_ms: parsed.min_silence_duration_ms,
-                            enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
                             processing_time_ms: artifacts.processing_time_ms,
                             duration_secs: Some(artifacts.duration_secs),
                             rtf: artifacts.rtf,
                             speaker_count: artifacts.speaker_count,
                             alignment_coverage: artifacts.alignment_coverage,
                             unattributed_words: artifacts.unattributed_words,
-                            llm_refined: artifacts.llm_refined,
                             asr_text: artifacts.asr_text,
                             raw_transcript: artifacts.raw_transcript,
                             transcript: artifacts.transcript,
@@ -685,11 +675,10 @@ async fn generate_diarization_artifacts(
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let started = Instant::now();
-    let (model_id, asr_model_id, aligner_model_id, llm_model_id) = (
+    let (model_id, asr_model_id, aligner_model_id) = (
         parsed.model_id.as_deref(),
         parsed.asr_model_id.as_deref(),
         parsed.aligner_model_id.as_deref(),
-        parsed.llm_model_id.as_deref(),
     );
     let config = DiarizationConfig {
         min_speakers: parsed.min_speakers,
@@ -699,7 +688,6 @@ async fn generate_diarization_artifacts(
         vad_gate: parsed.vad_gate,
     };
     let options = DiarizationPipelineOptions {
-        enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
         language: parsed.language.clone(),
         cancellation: cancellation.clone(),
     };
@@ -712,7 +700,6 @@ async fn generate_diarization_artifacts(
                 model_id,
                 asr_model_id,
                 aligner_model_id,
-                llm_model_id,
                 &config,
                 &options,
             )
@@ -724,7 +711,6 @@ async fn generate_diarization_artifacts(
                 model_id,
                 asr_model_id,
                 aligner_model_id,
-                llm_model_id,
                 &config,
                 &options,
             )
@@ -763,7 +749,6 @@ fn diarization_artifacts(
         speaker_count: output.speaker_count,
         alignment_coverage: Some(output.alignment_coverage as f64),
         unattributed_words: output.unattributed_words,
-        llm_refined: output.llm_refined,
         asr_text: output.asr_text,
         raw_transcript: output.raw_transcript,
         transcript: output.transcript,
@@ -829,11 +814,6 @@ fn build_rerun_create_request(
         min_silence_duration_ms: rerun
             .min_silence_duration_ms
             .or(source_record.min_silence_duration_ms),
-        enable_llm_refinement: Some(
-            rerun
-                .enable_llm_refinement
-                .unwrap_or(source_record.enable_llm_refinement),
-        ),
         generate_summary: rerun
             .generate_summary
             .unwrap_or(source_record.summary_status != DiarizationSummaryStatus::NotRequested),
@@ -1027,7 +1007,6 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             max_speakers: payload.max_speakers,
             min_speech_duration_ms: payload.min_speech_duration_ms,
             min_silence_duration_ms: payload.min_silence_duration_ms,
-            enable_llm_refinement: payload.enable_llm_refinement,
             generate_summary: payload.generate_summary.unwrap_or(false),
             language: sanitize_optional(payload.language),
             vad_gate: payload.vad_gate,
@@ -1173,14 +1152,6 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     })?;
                     out.min_silence_duration_ms = text.trim().parse::<f64>().ok();
                 }
-                "enable_llm_refinement" => {
-                    let text = field.text().await.map_err(|err| {
-                        ApiError::bad_request(format!(
-                            "Failed reading multipart 'enable_llm_refinement' field: {err}"
-                        ))
-                    })?;
-                    out.enable_llm_refinement = Some(parse_truthy(text.as_str()));
-                }
                 "generate_summary" => {
                     let text = field.text().await.map_err(|err| {
                         ApiError::bad_request(format!(
@@ -1321,7 +1292,6 @@ mod tests {
             max_speakers: Some(4),
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
-            enable_llm_refinement: true,
             processing_time_ms: 120.0,
             duration_secs: Some(9.5),
             rtf: Some(0.4),
@@ -1329,7 +1299,6 @@ mod tests {
             corrected_speaker_count: 2,
             alignment_coverage: Some(0.94),
             unattributed_words: 0,
-            llm_refined: true,
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00: hello there".to_string(),
             transcript: "SPEAKER_00: hello there".to_string(),
@@ -1367,7 +1336,6 @@ mod tests {
             speaker_count: 1,
             alignment_coverage: 0.0,
             unattributed_words: 0,
-            llm_refined: false,
             warnings: vec![warning.to_string()],
         };
         let artifacts = diarization_artifacts(output, 1_500.0, None);
@@ -1409,6 +1377,30 @@ mod tests {
         );
     }
 
+    /// LLM refinement was removed in 0.1.0: older clients that still send
+    /// `enable_llm_refinement` keep working, and the field does nothing.
+    #[tokio::test]
+    async fn create_and_rerun_requests_ignore_the_removed_refinement_field() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "enable_llm_refinement": true
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        parse_create_request(request)
+            .await
+            .expect("a create naming the removed field should parse");
+
+        let rerun: RerunDiarizationRecordRequest =
+            serde_json::from_value(serde_json::json!({ "enable_llm_refinement": false }))
+                .expect("a rerun naming the removed field should parse");
+        assert!(rerun.min_speakers.is_none());
+    }
+
     #[test]
     fn rerun_request_inherits_existing_record_settings() {
         let parsed = build_rerun_create_request(
@@ -1431,7 +1423,6 @@ mod tests {
         assert_eq!(parsed.max_speakers, Some(4));
         assert_eq!(parsed.min_speech_duration_ms, Some(240.0));
         assert_eq!(parsed.min_silence_duration_ms, Some(200.0));
-        assert_eq!(parsed.enable_llm_refinement, Some(true));
         assert_eq!(parsed.audio_bytes, vec![1_u8, 2_u8, 3_u8]);
     }
 
@@ -1637,7 +1628,6 @@ mod tests {
                 max_speakers: Some(5),
                 min_speech_duration_ms: Some(180.0),
                 min_silence_duration_ms: Some(140.0),
-                enable_llm_refinement: Some(false),
                 ..Default::default()
             },
         );
@@ -1646,7 +1636,6 @@ mod tests {
         assert_eq!(parsed.max_speakers, Some(5));
         assert_eq!(parsed.min_speech_duration_ms, Some(180.0));
         assert_eq!(parsed.min_silence_duration_ms, Some(140.0));
-        assert_eq!(parsed.enable_llm_refinement, Some(false));
     }
 
     #[test]

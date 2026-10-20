@@ -66,8 +66,6 @@ struct DiarizationJobRecord {
     raw_transcript: String,
     #[serde(default)]
     transcript: String,
-    #[serde(default)]
-    llm_refined: bool,
     alignment_coverage: Option<f32>,
     #[serde(default)]
     unattributed_words: usize,
@@ -93,7 +91,6 @@ struct VerboseJsonDiarizationOutput {
     asr_text: String,
     raw_transcript: String,
     transcript: String,
-    llm_refined: bool,
     alignment_coverage: f32,
     unattributed_words: usize,
     speaker_count: usize,
@@ -320,7 +317,6 @@ fn format_diarization_output(
             asr_text: record.asr_text.clone(),
             raw_transcript: record.raw_transcript.clone(),
             transcript: record.transcript.clone(),
-            llm_refined: record.llm_refined,
             alignment_coverage: record.alignment_coverage.unwrap_or(0.0),
             unattributed_words: record.unattributed_words,
             speaker_count: record.speaker_count,
@@ -586,7 +582,6 @@ mod tests {
             asr_text: String::new(),
             raw_transcript: String::new(),
             transcript: String::new(),
-            llm_refined: false,
             alignment_coverage: None,
             unattributed_words: 0,
             speaker_count: 0,
@@ -624,7 +619,6 @@ mod tests {
             transcript: "Speaker one text".to_string(),
             asr_text: "Speaker one text".to_string(),
             raw_transcript: "speaker one text".to_string(),
-            llm_refined: true,
             alignment_coverage: Some(1.0),
             unattributed_words: 0,
             speaker_count: 1,

@@ -616,12 +616,10 @@ export interface SpeechTextDiarizationJob extends SpeechTextJobBase {
   max_speakers: number | null;
   min_speech_duration_ms: number | null;
   min_silence_duration_ms: number | null;
-  enable_llm_refinement: boolean;
   speaker_count: number;
   corrected_speaker_count?: number;
   alignment_coverage: number | null;
   unattributed_words: number;
-  llm_refined: boolean;
   asr_text: string;
   raw_transcript: string;
   transcript: string;
@@ -675,7 +673,6 @@ export interface SpeechTextDiarizationJobCreateRequest
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
 }
 
 export type SpeechTextJobCreateRequest =
@@ -914,7 +911,6 @@ export interface DiarizationRecord {
   max_speakers: number | null;
   min_speech_duration_ms: number | null;
   min_silence_duration_ms: number | null;
-  enable_llm_refinement: boolean;
   processing_time_ms: number;
   duration_secs: number | null;
   rtf: number | null;
@@ -922,7 +918,6 @@ export interface DiarizationRecord {
   corrected_speaker_count?: number;
   alignment_coverage: number | null;
   unattributed_words: number;
-  llm_refined: boolean;
   asr_text: string;
   raw_transcript: string;
   transcript: string;
@@ -954,7 +949,6 @@ export interface DiarizationRecordCreateRequest {
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
   /** Summarize the transcript with the pipeline LLM once it is ready. */
   generate_summary?: boolean;
 }
@@ -968,7 +962,6 @@ export interface DiarizationRecordRerunRequest {
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
-  enable_llm_refinement?: boolean;
   generate_summary?: boolean;
 }
 
@@ -2572,7 +2565,6 @@ export class AudioApiClient {
         max_speakers: request.max_speakers,
         min_speech_duration_ms: request.min_speech_duration_ms,
         min_silence_duration_ms: request.min_silence_duration_ms,
-        enable_llm_refinement: request.enable_llm_refinement,
       }),
     });
     const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
@@ -3251,8 +3243,6 @@ export class AudioApiClient {
   private buildDiarizationRecordRequestInit(
     request: DiarizationRecordCreateRequest,
   ): RequestInit {
-    const enableLlmRefinement = request.enable_llm_refinement ?? true;
-
     if (request.audio_file) {
       assertFirstPartyAudioUploadWithinLimit(request.audio_file);
       const form = new FormData();
@@ -3273,10 +3263,6 @@ export class AudioApiClient {
       if (request.llm_model_id) {
         form.append("llm_model", request.llm_model_id);
       }
-      form.append(
-        "enable_llm_refinement",
-        enableLlmRefinement ? "true" : "false",
-      );
       if (request.generate_summary) {
         form.append("generate_summary", "true");
       }
@@ -3320,7 +3306,6 @@ export class AudioApiClient {
         asr_model: request.asr_model_id,
         aligner_model: request.aligner_model_id,
         llm_model: request.llm_model_id,
-        enable_llm_refinement: enableLlmRefinement,
         generate_summary: Boolean(request.generate_summary),
         min_speakers: request.min_speakers,
         max_speakers: request.max_speakers,

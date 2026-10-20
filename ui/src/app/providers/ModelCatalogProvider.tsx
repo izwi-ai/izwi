@@ -723,7 +723,7 @@ export function ModelCatalogProvider({
       try {
         const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
         // Chat stays single-active, but pinned models and speech-pipeline
-        // stack members (diarization + ASR + aligner + refiner) are never
+        // stack members (diarization + ASR + aligner + summary LLM) are never
         // evicted by a chat switch: unloading one silently degrades the
         // pipeline. Unload them explicitly instead.
         const isEvictableChatModel = (model: ModelInfo) =>
@@ -758,7 +758,7 @@ export function ModelCatalogProvider({
         await api.loadModel(variant, { signal: abortController.signal });
         if (!cancelledModelLoadsRef.current.has(variant)) {
           // Loading a speech-pipeline stack member (diarization checkpoint,
-          // ASR, aligner, refiner LLM) is pipeline setup, not a model switch:
+          // ASR, aligner, summary LLM) is pipeline setup, not a model switch:
           // adopting it as the global selection overwrote — and since the
           // persistence change, permanently rewrote — whatever the user had
           // selected.

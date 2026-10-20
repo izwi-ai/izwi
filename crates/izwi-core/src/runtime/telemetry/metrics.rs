@@ -1642,7 +1642,7 @@ mod tests {
 
         telemetry.record_pipeline_graph(&PipelineGraph::modular_voice_turn());
         telemetry.record_pipeline_graph(&PipelineGraph::unified_voice_turn());
-        telemetry.record_pipeline_graph(&PipelineGraph::diarization_transcript(true));
+        telemetry.record_pipeline_graph(&PipelineGraph::diarization_transcript());
         telemetry.record_pipeline_graph(&PipelineGraph::batch_asr_transcription());
         telemetry.record_pipeline_graph(&PipelineGraph::batch_tts_speech());
 
@@ -1652,7 +1652,7 @@ mod tests {
         assert_eq!(snapshot.pipelines.diarization_transcripts, 1);
         assert_eq!(snapshot.pipelines.batch_asr_transcriptions, 1);
         assert_eq!(snapshot.pipelines.batch_tts_speech, 1);
-        assert_eq!(snapshot.pipelines.stages_recorded, 22);
+        assert_eq!(snapshot.pipelines.stages_recorded, 21);
 
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_inference_pipeline_modular_voice_turns_total 1"));
@@ -1660,7 +1660,7 @@ mod tests {
         assert!(payload.contains("izwi_inference_pipeline_diarization_transcripts_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_batch_asr_transcriptions_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_batch_tts_speech_total 1"));
-        assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 22"));
+        assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 21"));
     }
 
     #[tokio::test]

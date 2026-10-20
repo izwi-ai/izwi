@@ -83,7 +83,7 @@ export function isSpeakerAttributedAsrVariant(variant: string): boolean {
 
 /**
  * Models the speech pipelines rely on as a stack (diarization checkpoint +
- * ASR + forced aligner + refiner/summary LLM). Chat-route model switches
+ * ASR + forced aligner + summary LLM). Chat-route model switches
  * must never evict these: unloading one silently degrades the pipeline the
  * same way a too-small residency budget does.
  */
@@ -95,7 +95,7 @@ export function isSpeechPipelineManagedModel(model: ModelInfo): boolean {
   ) {
     return true;
   }
-  // The refiner/summary LLM is a chat model: capabilities cannot separate it
+  // The summary LLM is a chat model: capabilities cannot separate it
   // from switchable chat models, so the preferred stack member stays
   // protected by preference (the same effective set as the previous
   // id-based rule).

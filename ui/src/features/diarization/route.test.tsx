@@ -216,7 +216,6 @@ const fullRecord = {
   max_speakers: 4,
   min_speech_duration_ms: 240,
   min_silence_duration_ms: 200,
-  enable_llm_refinement: true,
   processing_time_ms: 120,
   duration_secs: 42,
   rtf: 0.5,
@@ -224,7 +223,6 @@ const fullRecord = {
   corrected_speaker_count: 2,
   alignment_coverage: 0.82,
   unattributed_words: 0,
-  llm_refined: true,
   asr_text: "Hello there.",
   raw_transcript: "Speaker 1: Hello there.",
   transcript: "Speaker 1: Hello there.",
@@ -421,7 +419,6 @@ describe("DiarizationPage routes", () => {
       speaker_count: 0,
       corrected_speaker_count: 0,
       alignment_coverage: null,
-      llm_refined: false,
       asr_text: "",
       raw_transcript: "",
       transcript: "",
@@ -594,7 +591,6 @@ describe("DiarizationPage routes", () => {
       speaker_count: 0,
       corrected_speaker_count: 0,
       alignment_coverage: null,
-      llm_refined: false,
       asr_text: "",
       raw_transcript: "",
       transcript: "",
@@ -876,7 +872,7 @@ describe("DiarizationPage routes", () => {
     );
     expect(modelModal.getAttribute("data-models")).toContain("Qwen3.5-4B");
     expect(modelModal.getAttribute("data-sections")).toBe(
-      "Diarization,ASR,Forced Aligner,Refiner + Summary",
+      "Diarization,ASR,Forced Aligner,Summary",
     );
     expect(props.onError).not.toHaveBeenCalled();
   });
@@ -907,7 +903,7 @@ describe("DiarizationPage routes", () => {
       "diar_streaming_sortformer_4spk-v2.1",
     );
     expect(modelModal.getAttribute("data-sections")).toBe(
-      "Diarization,ASR,Forced Aligner,Refiner + Summary",
+      "Diarization,ASR,Forced Aligner,Summary",
     );
   });
 

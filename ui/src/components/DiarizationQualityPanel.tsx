@@ -12,7 +12,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import {
   formatDraftValue,
   parseOptionalInteger,
@@ -24,8 +23,6 @@ interface DiarizationQualityPanelProps {
     DiarizationRecord,
     | "alignment_coverage"
     | "corrected_speaker_count"
-    | "enable_llm_refinement"
-    | "llm_refined"
     | "max_speakers"
     | "min_silence_duration_ms"
     | "min_speakers"
@@ -70,14 +67,12 @@ export function DiarizationQualityPanel({
   const [maxSpeakers, setMaxSpeakers] = useState("");
   const [minSpeechDurationMs, setMinSpeechDurationMs] = useState("");
   const [minSilenceDurationMs, setMinSilenceDurationMs] = useState("");
-  const [enableLlmRefinement, setEnableLlmRefinement] = useState(true);
 
   useEffect(() => {
     setMinSpeakers(formatDraftValue(record?.min_speakers));
     setMaxSpeakers(formatDraftValue(record?.max_speakers));
     setMinSpeechDurationMs(formatDraftValue(record?.min_speech_duration_ms));
     setMinSilenceDurationMs(formatDraftValue(record?.min_silence_duration_ms));
-    setEnableLlmRefinement(record?.enable_llm_refinement ?? true);
   }, [record]);
 
   const parsedMinSpeakers = useMemo(
@@ -181,12 +176,6 @@ export function DiarizationQualityPanel({
         description: `${record.unattributed_words} word${record.unattributed_words === 1 ? "" : "s"} could not be assigned to a speaker. A rerun with tighter speaker bounds can help.`,
       });
     }
-    if (!record.llm_refined && record.enable_llm_refinement) {
-      nextWarnings.push({
-        title: "LLM refinement did not apply",
-        description: "The transcript was configured to use refinement, but the saved result remained unrefined. Review the raw speaker turns before exporting.",
-      });
-    }
     for (const warning of record.warnings ?? []) {
       nextWarnings.push({
         title: "Pipeline warning",
@@ -217,7 +206,6 @@ export function DiarizationQualityPanel({
       max_speakers: parsedMaxSpeakers,
       min_speech_duration_ms: parsedMinSpeechDurationMs,
       min_silence_duration_ms: parsedMinSilenceDurationMs,
-      enable_llm_refinement: enableLlmRefinement,
     });
   }
 
@@ -229,7 +217,6 @@ export function DiarizationQualityPanel({
     setMaxSpeakers(formatDraftValue(record.max_speakers));
     setMinSpeechDurationMs(formatDraftValue(record.min_speech_duration_ms));
     setMinSilenceDurationMs(formatDraftValue(record.min_silence_duration_ms));
-    setEnableLlmRefinement(record.enable_llm_refinement);
   }
 
   return (
@@ -244,7 +231,7 @@ export function DiarizationQualityPanel({
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-2.5 sm:grid-cols-3">
             <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
               <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-subtle)]">
                 Alignment coverage
@@ -270,17 +257,6 @@ export function DiarizationQualityPanel({
               </div>
               <div className="mt-1 text-[11px] leading-5 text-[var(--text-muted)]">
                 {record.corrected_speaker_count ?? record.speaker_count} corrected
-              </div>
-            </div>
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-subtle)]">
-                Refinement
-              </div>
-              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
-                {record.llm_refined ? "Applied" : "Off"}
-              </div>
-              <div className="mt-1 text-[11px] leading-5 text-[var(--text-muted)]">
-                {record.enable_llm_refinement ? "Enabled for this run" : "Disabled"}
               </div>
             </div>
           </div>
@@ -388,27 +364,6 @@ export function DiarizationQualityPanel({
                   value={minSilenceDurationMs}
                   onChange={(event) => setMinSilenceDurationMs(event.target.value)}
                   className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
-                />
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <Label
-                    htmlFor="quality-llm-refinement"
-                    className="text-[13px] font-medium text-[var(--text-primary)]"
-                  >
-                    LLM transcript refinement
-                  </Label>
-                  <p className="text-[13px] leading-6 text-[var(--text-muted)]">
-                    Keep it on for cleaner transcript wording, or turn it off to inspect the raw diarized output.
-                  </p>
-                </div>
-                <Switch
-                  id="quality-llm-refinement"
-                  checked={enableLlmRefinement}
-                  onCheckedChange={setEnableLlmRefinement}
                 />
               </div>
             </div>
