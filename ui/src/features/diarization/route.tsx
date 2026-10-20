@@ -274,7 +274,12 @@ export function DiarizationPage({
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
   const pipelineModelsReady = asrModelReady && alignerModelReady;
-  const readyManagedModelCount = managedModels.filter(
+  // The summary model joins the dialog's stack only when a summary is asked
+  // for, so the dialog counts it separately.
+  const stackModels = managedModels.filter(
+    (model) => model.variant !== resolvedLlmModel,
+  );
+  const readyStackModelCount = stackModels.filter(
     (model) => model.status === "ready",
   ).length;
   const canUnloadAnyManagedModels = managedModels.some(
@@ -575,6 +580,7 @@ export function DiarizationPage({
             pipelineAlignerModelId={resolvedAlignerModel}
             pipelineLlmModelId={resolvedLlmModel}
             pipelineModelsReady={pipelineModelsReady}
+            summaryModelReady={summaryModelReady}
             onModelRequired={() => {
               setModalIntentModel(resolvedSelectedModel);
               setAutoCloseOnIntentReady(true);
@@ -585,8 +591,8 @@ export function DiarizationPage({
               openModelManagerForPipeline();
               onError("Load ASR and forced aligner models before diarization.");
             }}
-            managedModelCount={managedModels.length}
-            readyManagedModelCount={readyManagedModelCount}
+            managedModelCount={stackModels.length}
+            readyManagedModelCount={readyStackModelCount}
             canUnloadAnyManagedModels={canUnloadAnyManagedModels}
             isManagedModelActionBusy={isManagedModelActionBusy}
             onOpenModelManager={openModelManager}

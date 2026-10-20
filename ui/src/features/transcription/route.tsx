@@ -332,9 +332,20 @@ export function TranscriptionPage({
       resolvedDiarizationModel,
     ],
   );
-  const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
+  // The summary model joins the dialog's stack only when a summary is asked
+  // for, so the dialog counts it separately.
+  const diarizationStackModels = diarizationManagedModels.filter(
+    (model) => model.variant !== resolvedDiarizationLlmModel,
+  );
+  const readyDiarizationStackModelCount = diarizationStackModels.filter(
     (model) => model.status === "ready",
   ).length;
+  const diarizationSummaryModelReady =
+    resolvedDiarizationLlmModel != null &&
+    diarizationLlmPipelineModels.some(
+      (model) =>
+        model.variant === resolvedDiarizationLlmModel && model.status === "ready",
+    );
   const canUnloadAnyDiarizationManagedModels = diarizationManagedModels.some(
     (model) => model.status === "ready",
   );
@@ -992,6 +1003,7 @@ export function TranscriptionPage({
                       pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
                       pipelineModelsReady={diarizationPipelineModelsReady}
+                      summaryModelReady={diarizationSummaryModelReady}
                       onModelRequired={() => {
                         openDiarizationModelManager();
                         onError("Select and load a diarization model to start.");
@@ -1002,8 +1014,8 @@ export function TranscriptionPage({
                           "Load ASR and forced aligner models before diarization.",
                         );
                       }}
-                      managedModelCount={diarizationManagedModels.length}
-                      readyManagedModelCount={readyDiarizationManagedModelCount}
+                      managedModelCount={diarizationStackModels.length}
+                      readyManagedModelCount={readyDiarizationStackModelCount}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}

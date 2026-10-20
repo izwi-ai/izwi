@@ -29,9 +29,16 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
+import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
 import { diarizationSpeakerUpperBound, getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
+import {
+  AUTO_LANGUAGE,
+  GenerateSummaryOption,
+  SpeechTextLanguageField,
+  languageHint,
+} from "@/features/speech-text/components/SpeechTextOptions";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import {
   clampUploadPercent,
@@ -55,8 +62,12 @@ interface NewDiarizationModalProps {
   pipelineAlignerModelId?: string | null;
   pipelineLlmModelId?: string | null;
   pipelineModelsReady?: boolean;
+  /** Whether the summary model is loaded; it joins the stack only when a
+   * summary is requested. */
+  summaryModelReady?: boolean;
   onModelRequired: () => void;
   onPipelineModelsRequired: () => void;
+  /** The stack without the summary model. */
   managedModelCount?: number;
   readyManagedModelCount?: number;
   canUnloadAnyManagedModels?: boolean;
@@ -102,6 +113,7 @@ export function NewDiarizationModal({
   pipelineAlignerModelId = null,
   pipelineLlmModelId = null,
   pipelineModelsReady = true,
+  summaryModelReady = false,
   onModelRequired,
   onPipelineModelsRequired,
   managedModelCount = 0,
@@ -121,6 +133,8 @@ export function NewDiarizationModal({
   const [maxSpeakers, setMaxSpeakers] = useState("4");
   const [minSpeechMs, setMinSpeechMs] = useState("240");
   const [minSilenceMs, setMinSilenceMs] = useState("200");
+  const [selectedLanguage, setSelectedLanguage] = useState(AUTO_LANGUAGE);
+  const [generateSummary, setGenerateSummary] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -328,7 +342,8 @@ export function NewDiarizationModal({
                 audio_filename: uploadFilename,
                 model_id: selectedModel || undefined,
                 llm_model_id: pipelineLlmModelId || undefined,
-                generate_summary: true,
+                generate_summary: generateSummary,
+                language: languageHint(selectedLanguage),
               }
             : {
                 audio_file: uploadedBlob,
@@ -337,7 +352,8 @@ export function NewDiarizationModal({
                 asr_model_id: pipelineAsrModelId || undefined,
                 aligner_model_id: pipelineAlignerModelId || undefined,
                 llm_model_id: pipelineLlmModelId || undefined,
-                generate_summary: true,
+                generate_summary: generateSummary,
+                language: languageHint(selectedLanguage),
                 min_speakers: captureSettings.minSpeakers,
                 max_speakers: captureSettings.maxSpeakers,
                 min_speech_duration_ms: captureSettings.minSpeechMs,
@@ -401,6 +417,7 @@ export function NewDiarizationModal({
       }
     },
     [
+      generateSummary,
       normalizeSettings,
       onClose,
       onCreated,
@@ -410,6 +427,7 @@ export function NewDiarizationModal({
       pipelineLlmModelId,
       requireReadyModel,
       requireReadyPipelineModels,
+      selectedLanguage,
       selectedModel,
       updateUploadProgress,
     ],
@@ -550,8 +568,12 @@ export function NewDiarizationModal({
     }
   }, [discardActiveRecording, isRecording]);
 
+  const countsSummaryModel = generateSummary && pipelineLlmModelId != null;
+  const stackModelCount = managedModelCount + (countsSummaryModel ? 1 : 0);
+  const readyStackModelCount =
+    readyManagedModelCount + (countsSummaryModel && summaryModelReady ? 1 : 0);
   const allManagedModelsReady =
-    managedModelCount > 0 && readyManagedModelCount === managedModelCount;
+    stackModelCount > 0 && readyStackModelCount === stackModelCount;
   const readinessStatusLabel = allManagedModelsReady
     ? "Loaded"
     : isManagedModelActionBusy
@@ -615,12 +637,12 @@ export function NewDiarizationModal({
                 {isDraggingFile ? "Drop to start the run" : "Upload a recording"}
               </span>
               <span className="text-xs text-[var(--text-subtle)]">
-                Drop a file or browse · WAV, MP3, M4A, AAC
+                Drop a file or browse · {AUDIO_FILE_HINT}
               </span>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="audio/*"
+                accept={AUDIO_FILE_ACCEPT}
                 className="hidden"
                 onChange={(event) => void handleFileUpload(event)}
               />
@@ -738,6 +760,12 @@ export function NewDiarizationModal({
             }
           />
 
+          <SpeechTextLanguageField
+            value={selectedLanguage}
+            onValueChange={setSelectedLanguage}
+            disabled={isSubmitting || isRecording}
+          />
+
           {!isGranitePipeline ? (
             <>
               <CreationField label="Speakers">
@@ -798,6 +826,12 @@ export function NewDiarizationModal({
               </CreationField>
             </>
           ) : null}
+
+          <GenerateSummaryOption
+            checked={generateSummary}
+            onCheckedChange={setGenerateSummary}
+            disabled={isSubmitting || isRecording}
+          />
 
           {error ? (
             <div

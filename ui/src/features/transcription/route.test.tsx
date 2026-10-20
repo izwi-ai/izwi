@@ -1173,6 +1173,77 @@ describe("TranscriptionPage detail route", () => {
           asr_model_id: "Whisper-Large-v3-Turbo",
           aligner_model_id: "Qwen3-ForcedAligner-0.6B",
           llm_model_id: "Qwen3.5-4B",
+          // A summary is only made when asked for, as in the other modes.
+          generate_summary: false,
+          language: undefined,
+        }),
+        expect.objectContaining({
+          onUploadProgress: expect.any(Function),
+          signal: expect.any(AbortSignal),
+        }),
+      ),
+    );
+    expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
+  });
+
+  it("asks for a diarization summary and language only when chosen", async () => {
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      id: "diar-created-1",
+      created_at: 1,
+      model_id: "Parakeet-TDT-0.6B-v3",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "meeting.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+
+    await screen.findByRole("heading", { name: "New diarization" });
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const activeUploadButton = uploadButtons[uploadButtons.length - 1];
+    const fileInput = activeUploadButton?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: /Generate summary/ }));
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          audio_filename: "meeting.wav",
+          model_id: "diar_streaming_sortformer_4spk-v2.1",
+          asr_model_id: "Whisper-Large-v3-Turbo",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+          llm_model_id: "Qwen3.5-4B",
           generate_summary: true,
         }),
         expect.objectContaining({

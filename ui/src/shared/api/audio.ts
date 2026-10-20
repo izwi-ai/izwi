@@ -949,6 +949,8 @@ export interface DiarizationRecordCreateRequest {
   max_speakers?: number;
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
+  /** ASR language hint; omitted, the language is detected. */
+  language?: string;
   /** Summarize the transcript with the pipeline LLM once it is ready. */
   generate_summary?: boolean;
 }
@@ -3266,6 +3268,9 @@ export class AudioApiClient {
       if (request.generate_summary) {
         form.append("generate_summary", "true");
       }
+      if (request.language) {
+        form.append("language", request.language);
+      }
       if (typeof request.min_speakers === "number") {
         form.append("min_speakers", String(request.min_speakers));
       }
@@ -3307,6 +3312,7 @@ export class AudioApiClient {
         aligner_model: request.aligner_model_id,
         llm_model: request.llm_model_id,
         generate_summary: Boolean(request.generate_summary),
+        language: request.language,
         min_speakers: request.min_speakers,
         max_speakers: request.max_speakers,
         min_speech_duration_ms: request.min_speech_duration_ms,

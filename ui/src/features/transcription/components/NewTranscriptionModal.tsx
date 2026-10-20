@@ -19,7 +19,6 @@ import {
 } from "@/components/creation/CreationParts";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { cn } from "@/lib/utils";
-import { LANGUAGE_OPTIONS } from "@/features/transcription/playground/support";
 import {
   prepareSpeechTextUploadBlob,
   resolveSourceAudioFilename,
@@ -27,7 +26,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
-import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
+import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
 import {
   Select,
   SelectContent,
@@ -38,6 +37,12 @@ import {
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
+import {
+  AUTO_LANGUAGE,
+  GenerateSummaryOption,
+  SpeechTextLanguageField,
+  languageHint,
+} from "@/features/speech-text/components/SpeechTextOptions";
 import {
   clampUploadPercent,
   createSpeechTextUploadState,
@@ -114,7 +119,7 @@ export function NewTranscriptionModal({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
 
-  const [selectedLanguage, setSelectedLanguage] = useState("English");
+  const [selectedLanguage, setSelectedLanguage] = useState(AUTO_LANGUAGE);
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [generateSummary, setGenerateSummary] = useState(false);
@@ -277,7 +282,7 @@ export function NewTranscriptionModal({
           aligner_model_id: includeTimestamps
             ? timestampAlignerModelId || undefined
             : undefined,
-          language: selectedLanguage,
+          language: languageHint(selectedLanguage),
           include_timestamps: includeTimestamps,
           generate_summary: generateSummary,
         };
@@ -288,7 +293,7 @@ export function NewTranscriptionModal({
                 audio_file: uploadedBlob,
                 audio_filename: uploadFilename,
                 model_id: selectedModel || undefined,
-                language: selectedLanguage,
+                language: languageHint(selectedLanguage),
                 generate_summary: generateSummary,
                 min_speakers:
                   speakerExpectation === "auto"
@@ -581,7 +586,7 @@ export function NewTranscriptionModal({
                 : "Drop a recording here or browse"}
             </span>
             <span className="text-xs text-[var(--text-subtle)]">
-              WAV, MP3, M4A, AAC, FLAC
+              {AUDIO_FILE_HINT}
             </span>
             <input
               ref={fileInputRef}
@@ -607,24 +612,11 @@ export function NewTranscriptionModal({
       }
       side={
         <>
-          <CreationField label="Language">
-            <Select
-              value={selectedLanguage}
-              onValueChange={setSelectedLanguage}
-              disabled={isSubmitting}
-            >
-              <SelectTrigger aria-label="Language" className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]">
-                <SelectValue placeholder="Language" />
-              </SelectTrigger>
-              <SelectContent>
-                {LANGUAGE_OPTIONS.map((language) => (
-                  <SelectItem key={language} value={language}>
-                    {language}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </CreationField>
+          <SpeechTextLanguageField
+            value={selectedLanguage}
+            onValueChange={setSelectedLanguage}
+            disabled={isSubmitting}
+          />
 
           {isSpeakerAttributedAsrMode ? (
             <CreationField label="Expected speakers">
@@ -736,9 +728,7 @@ export function NewTranscriptionModal({
             </>
           ) : null}
 
-          <CreationOption
-            title="Generate summary"
-            description="Create an AI summary after the transcript is ready."
+          <GenerateSummaryOption
             checked={generateSummary}
             onCheckedChange={setGenerateSummary}
             disabled={isSubmitting}

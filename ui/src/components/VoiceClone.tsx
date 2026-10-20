@@ -25,6 +25,7 @@ import {
   SelectValue,
 } from "./ui/select";
 import { Button } from "./ui/button";
+import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
 
 export interface VoiceCloneReferenceState {
   mode: "upload" | "record" | "saved" | null;
@@ -823,7 +824,7 @@ export function VoiceClone({
             <input
               ref={fileInputRef}
               type="file"
-              accept="audio/*"
+              accept={AUDIO_FILE_ACCEPT}
               onChange={handleFileUpload}
               className="hidden"
             />
@@ -1235,7 +1236,7 @@ export function VoiceClone({
                     <input
                       ref={createVoiceFileInputRef}
                       type="file"
-                      accept="audio/*"
+                      accept={AUDIO_FILE_ACCEPT}
                       onChange={handleCreateVoiceFileUpload}
                       className="hidden"
                     />
