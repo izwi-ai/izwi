@@ -1405,7 +1405,7 @@ mod tests {
         );
     }
 
-    /// LLM refinement was removed in 0.1.0: older clients that still send
+    /// LLM refinement was removed in 0.1.0-beta-18: older clients that still send
     /// `enable_llm_refinement` keep working, and the field does nothing.
     #[tokio::test]
     async fn create_and_rerun_requests_ignore_the_removed_refinement_field() {

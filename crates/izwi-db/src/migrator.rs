@@ -1093,7 +1093,7 @@ const STUDIO_SEGMENT_RENDER_COLUMNS: &[CompatibilityColumn] = &[
 ];
 
 /// Migration 10: text thinking models stored before the server's own
-/// generations ran with thinking off (0.1.0). Summaries that are reasoning
+/// generations ran with thinking off (0.1.0-beta-18). Summaries that are reasoning
 /// traces become failed, so the app offers to regenerate them; thread titles
 /// that are reasoning become the first message's opening words; voice
 /// memories, all extracted with thinking on, are cleared. Portable SQL, and

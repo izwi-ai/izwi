@@ -1,7 +1,7 @@
-//! A server an older Izwi left behind. Betas before 0.1.0 started their
-//! server without an owner pipe, so after an update relaunches the app the
-//! old server keeps the port with nothing to stop it. When the process on
-//! the port runs this app's own server binary, it is ours to stop.
+//! A server an older Izwi left behind. Betas up to 0.1.0-beta-17 started
+//! their server without an owner pipe, so after an update relaunches the
+//! app the old server keeps the port with nothing to stop it. When the
+//! process on the port runs this app's own server binary, it is ours to stop.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

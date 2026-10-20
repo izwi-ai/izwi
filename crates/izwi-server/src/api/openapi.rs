@@ -1349,7 +1349,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         json!({
             "type": "boolean",
             "deprecated": true,
-            "description": "Ignored: LLM transcript refinement was removed in 0.1.0."
+            "description": "Ignored: LLM transcript refinement was removed in 0.1.0-beta-18."
         }),
     );
     properties.insert(
