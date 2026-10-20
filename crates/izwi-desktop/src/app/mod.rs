@@ -86,6 +86,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             downloads::download_audio_file,
             downloads::save_file,
             reveal::reveal_path,
+            reveal::reveal_logs,
             autostart::launch_at_login_enabled,
             autostart::set_launch_at_login_enabled,
             tray_visibility::tray_icon_visible,

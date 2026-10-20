@@ -13,3 +13,8 @@ export function canRevealPaths(): boolean {
 export async function revealPath(path: string): Promise<void> {
   await invoke("reveal_path", { path });
 }
+
+/** Show the desktop app's logs in the file manager. */
+export async function revealLogs(): Promise<void> {
+  await invoke("reveal_logs");
+}

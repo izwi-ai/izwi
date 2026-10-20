@@ -20,6 +20,22 @@ pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Show the app's logs in the file manager, for when the engine won't
+/// start ("Open the log folder").
+#[tauri::command]
+pub async fn reveal_logs(app: AppHandle) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("Izwi's log folder is unknown: {error}"))?;
+    let log = dir.join(super::desktop_log::DESKTOP_LOG_FILE);
+    let target = if log.exists() { log } else { dir };
+    tauri::async_runtime::spawn_blocking(move || show_in_file_manager(&target))
+        .await
+        .map_err(|error| format!("reveal task failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn reveal(app: &AppHandle, path: &Path) -> Result<()> {
     let server_url = app
         .try_state::<ServerEndpoint>()
