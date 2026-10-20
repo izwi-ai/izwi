@@ -1,7 +1,10 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MarkdownContent } from "@/components/ui/MarkdownContent";
+import {
+  MarkdownContent,
+  remarkPluginsFor,
+} from "@/components/ui/MarkdownContent";
 
 describe("MarkdownContent", () => {
   const writeText = vi.fn<(text: string) => Promise<void>>();
@@ -33,5 +36,15 @@ describe("MarkdownContent", () => {
     render(<MarkdownContent content={"```\nplain\n```"} />);
 
     expect(screen.getByText("code")).toBeInTheDocument();
+  });
+
+  it("uses GFM only where regex lookbehind works", () => {
+    expect(remarkPluginsFor(true)).toHaveLength(1);
+    expect(remarkPluginsFor(false)).toEqual([]);
+  });
+
+  it("renders GFM tables here", () => {
+    render(<MarkdownContent content={"| A | B |\n| - | - |\n| 1 | 2 |"} />);
+    expect(screen.getByRole("table")).toBeInTheDocument();
   });
 });
