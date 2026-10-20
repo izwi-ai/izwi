@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   getPreferences: vi.fn(),
   updateAnalyticsPreference: vi.fn(),
   notify: vi.fn(),
+  runSetupAgain: vi.fn(),
 }));
 
 const updateState = vi.hoisted(() => ({
@@ -79,6 +80,10 @@ vi.mock("@/app/providers/ThemeProvider", () => ({
     resolvedTheme: "dark",
     setThemePreference: vi.fn(),
   }),
+}));
+
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  useFirstRun: () => ({ runSetupAgain: apiMocks.runSetupAgain }),
 }));
 
 vi.mock("@/app/providers/NotificationProvider", () => ({
@@ -196,6 +201,30 @@ describe("SettingsPage capabilities", () => {
 
     await screen.findByText("This build does not include the izwi command.");
     expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
+  });
+
+  it("runs first-run setup again, and says why when it can't", async () => {
+    apiMocks.runSetupAgain
+      .mockRejectedValueOnce(new Error("Request failed"))
+      .mockResolvedValue(undefined);
+    render(<SettingsPage />);
+
+    const about = screen.getByRole("region", { name: "About" });
+    const button = within(about).getByRole("button", { name: "Run setup again" });
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(apiMocks.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Couldn't start setup",
+          description: "Request failed",
+          tone: "danger",
+        }),
+      ),
+    );
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(apiMocks.runSetupAgain).toHaveBeenCalledTimes(2);
   });
 
   it("shows the runtime and the keyboard shortcuts", async () => {
