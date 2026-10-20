@@ -14,6 +14,8 @@ const apiMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
   loadModel: vi.fn(),
   unloadModel: vi.fn(),
+  downloadModel: vi.fn(),
+  getModelInfo: vi.fn(),
 }));
 
 vi.mock("@/api", async (importOriginal) => {
@@ -25,6 +27,8 @@ vi.mock("@/api", async (importOriginal) => {
       listModels: apiMocks.listModels,
       loadModel: apiMocks.loadModel,
       unloadModel: apiMocks.unloadModel,
+      downloadModel: apiMocks.downloadModel,
+      getModelInfo: apiMocks.getModelInfo,
     },
   };
 });
@@ -722,6 +726,65 @@ describe("ModelCatalogProvider per-page choices", () => {
     });
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(screen.queryByText("Model download cancelled")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("ModelCatalogProvider download notifications", () => {
+  it("groups downloads into one row and offers Retry when one fails", async () => {
+    vi.clearAllMocks();
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      constructor(public url: string) {
+        FakeEventSource.instances.push(this);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    apiMocks.getModelInfo.mockResolvedValue({ ...model, status: "downloading" });
+    apiMocks.downloadModel.mockResolvedValue({ status: "started", message: "started" });
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "downloading", download_progress: 0 },
+        { ...model, variant: "Kokoro-82M", status: "downloading", download_progress: 0 },
+      ],
+    });
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <CatalogProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(2));
+    const [first, second] = FakeEventSource.instances;
+    act(() => {
+      first.onmessage?.({ data: JSON.stringify({ percent: 20, status: "downloading" }) });
+      second.onmessage?.({ data: JSON.stringify({ percent: 60, status: "downloading" }) });
+    });
+    expect(await screen.findByText("Downloading 2 models")).toBeInTheDocument();
+
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "downloading", download_progress: 20 },
+        { ...model, variant: "Kokoro-82M", status: "error", error_message: "Not enough free disk space" },
+      ],
+    });
+    act(() => {
+      second.onmessage?.({
+        data: JSON.stringify({ percent: 60, status: "error", error: "Not enough free disk space" }),
+      });
+    });
+    expect(await screen.findByText("Not enough free disk space")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("model-count")).toHaveTextContent("2"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(apiMocks.downloadModel).toHaveBeenCalledWith("Kokoro-82M"),
+    );
     vi.unstubAllGlobals();
   });
 });

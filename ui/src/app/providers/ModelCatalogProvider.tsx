@@ -20,6 +20,7 @@ import {
   trackModelDownloadStarted,
   trackModelLoaded,
 } from "@/app/analytics/events";
+import { Download } from "lucide-react";
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeStoredModelId } from "@/features/models/catalog/routeModelCatalog";
@@ -63,6 +64,24 @@ interface ModelCatalogContextValue {
 }
 
 const ModelCatalogContext = createContext<ModelCatalogContextValue | null>(null);
+
+/** Several downloads at once show as one notification. */
+const DOWNLOADS_GROUP = {
+  key: "model-downloads",
+  title: (count: number) => `Downloading ${count} models`,
+};
+
+const downloadNotificationId = (variant: string) => `download:${variant}`;
+
+function formatDownloadedBytes(downloaded: number, total: number): string | undefined {
+  if (!(total > 0)) {
+    return undefined;
+  }
+  const gigabytes = (bytes: number) => (bytes / 1e9).toFixed(1);
+  return total >= 1e9
+    ? `${gigabytes(downloaded)} of ${gigabytes(total)} GB`
+    : `${Math.round(downloaded / 1e6)} of ${Math.round(total / 1e6)} MB`;
+}
 
 /** The model list also refreshes on this interval and on focus, so state
  * changed elsewhere (another window, the CLI, an idle unload) shows up. */
@@ -143,7 +162,13 @@ interface ModelCatalogProviderProps {
 export function ModelCatalogProvider({
   children,
 }: ModelCatalogProviderProps) {
-  const { notify } = useNotifications();
+  const { notify, dismiss } = useNotifications();
+  // Last whole percent shown per download: progress arrives many times a
+  // second, the notification changes once per percent.
+  const notifiedPercentRef = useRef<Record<string, number>>({});
+  // Retry from a failed download's notification; set once downloadModel
+  // exists.
+  const retryDownloadRef = useRef<(variant: string) => void>(() => {});
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [residencySummary, setResidencySummary] =
     useState<ModelResidencySummary | null>(null);
@@ -450,40 +475,89 @@ export function ModelCatalogProvider({
             },
             isTerminal,
           );
+          const percent = Math.floor(Number(data.percent) || 0);
+          if (!isTerminal && notifiedPercentRef.current[variant] !== percent) {
+            notifiedPercentRef.current[variant] = percent;
+            notify({
+              id: downloadNotificationId(variant),
+              title: `Downloading ${getModelLabel(variant)}`,
+              icon: Download,
+              progress: percent,
+              detail: formatDownloadedBytes(
+                Number(data.downloaded_bytes) || 0,
+                Number(data.total_bytes) || 0,
+              ),
+              group: DOWNLOADS_GROUP,
+            });
+          }
 
           if (isTerminal) {
             const previousTerminalState =
               lastDownloadTerminalStateRef.current[variant];
             if (previousTerminalState !== data.status) {
               lastDownloadTerminalStateRef.current[variant] = data.status;
+              const id = downloadNotificationId(variant);
               if (data.status === "completed") {
                 void trackModelDownloadCompleted(variant);
                 notify({
-                  title: "Model download complete",
-                  description: `${getModelLabel(variant)} is ready to load.`,
+                  id,
+                  title: `${getModelLabel(variant)} downloaded`,
+                  description: "Ready to load.",
                   tone: "success",
                 });
-              } else if (data.status === "cancelled" && sawProgress) {
-                notify({
-                  title: "Model download cancelled",
-                  description: `${getModelLabel(variant)} download was stopped.`,
-                  tone: "info",
-                });
+              } else if (data.status === "cancelled") {
+                // A stale snapshot from before the app opened is not news.
+                if (sawProgress) {
+                  notify({
+                    id,
+                    title: `${getModelLabel(variant)} download cancelled`,
+                    tone: "info",
+                  });
+                } else {
+                  dismiss(id);
+                }
               } else if (data.status === "error") {
                 notify({
+                  id,
                   title: `${getModelLabel(variant)} didn't download`,
                   description:
                     typeof data.error === "string" && data.error.trim()
                       ? data.error
                       : "Try the download again.",
                   tone: "danger",
+                  action: {
+                    label: "Retry",
+                    onClick: () => retryDownloadRef.current(variant),
+                  },
                 });
               }
             }
+            delete notifiedPercentRef.current[variant];
             streamedProgressRef.current.delete(variant);
             closeDownloadStream(variant);
             activeDownloadsRef.current.delete(variant);
             suppressReconnectRef.current.delete(variant);
+            // Until the refresh lands the list still says "downloading",
+            // which would register the download again.
+            const settled = {
+              completed: "downloaded",
+              error: "error",
+              cancelled: "not_downloaded",
+            } as const;
+            setModels((previous) =>
+              previous.map((model) =>
+                model.variant === variant
+                  ? {
+                      ...model,
+                      status: settled[data.status as keyof typeof settled],
+                      error_message:
+                        data.status === "error" && typeof data.error === "string"
+                          ? data.error
+                          : model.error_message,
+                    }
+                  : model,
+              ),
+            );
 
             void refreshModels();
 
@@ -540,6 +614,7 @@ export function ModelCatalogProvider({
       clearDownloadProgress,
       clearReconnectTimer,
       closeDownloadStream,
+      dismiss,
       getModelLabel,
       notify,
       queueDownloadProgress,
@@ -701,9 +776,11 @@ export function ModelCatalogProvider({
 
         const response = await api.downloadModel(variant);
         notify({
-          title: "Downloading model",
-          description: `${getModelLabel(variant)} download started in the background.`,
-          tone: "info",
+          id: downloadNotificationId(variant),
+          title: `Downloading ${getModelLabel(variant)}`,
+          icon: Download,
+          progress: 0,
+          group: DOWNLOADS_GROUP,
         });
         void trackModelDownloadStarted(variant);
 
@@ -725,12 +802,15 @@ export function ModelCatalogProvider({
             : "Failed to download model. Please try again.",
         );
         notify({
-          title: "Model download failed",
+          id: downloadNotificationId(variant),
+          title: `${getModelLabel(variant)} didn't download`,
           description:
-            err instanceof Error
-              ? err.message
-              : `Izwi could not download ${getModelLabel(variant)}.`,
+            err instanceof Error ? err.message : "Try the download again.",
           tone: "danger",
+          action: {
+            label: "Retry",
+            onClick: () => retryDownloadRef.current(variant),
+          },
         });
 
         closeDownloadStream(variant);
@@ -747,6 +827,10 @@ export function ModelCatalogProvider({
     ],
   );
 
+  useEffect(() => {
+    retryDownloadRef.current = (variant) => void downloadModel(variant);
+  }, [downloadModel]);
+
   const cancelModelDownload = useCallback(
     async (variant: string) => {
       try {
@@ -757,6 +841,8 @@ export function ModelCatalogProvider({
 
         await api.cancelDownload(variant);
         lastDownloadTerminalStateRef.current[variant] = "cancelled";
+        dismiss(downloadNotificationId(variant));
+        delete notifiedPercentRef.current[variant];
 
         clearDownloadProgress(variant);
 
@@ -793,6 +879,7 @@ export function ModelCatalogProvider({
     [
       clearDownloadProgress,
       closeDownloadStream,
+      dismiss,
       getModelLabel,
       notify,
       refreshModels,
