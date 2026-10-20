@@ -31,6 +31,7 @@ import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
 import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
 import { diarizationSpeakerUpperBound, getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import {
@@ -599,18 +600,25 @@ export function NewDiarizationModal({
   const selectedModelInCatalog =
     selectedModel != null &&
     diarizationModels.some((model) => model.variant === selectedModel);
+  // Names, with the status only for a model that isn't on this device.
+  const modelOptions = diarizationModels.map((model) => {
+    const name = getModelDisplayName(model.variant, model.display_name);
+    return {
+      variant: model.variant,
+      label:
+        model.status === "not_downloaded" ||
+        model.status === "downloading" ||
+        model.status === "error"
+          ? `${name} (${getModelStatusLabel(model.status).toLowerCase()})`
+          : name,
+    };
+  });
   const pickerOptions = selectedModel != null && !selectedModelInCatalog
     ? [
         { variant: selectedModel, label: `${selectedModel} (not in catalog)` },
-        ...diarizationModels.map((model) => ({
-          variant: model.variant,
-          label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
-        })),
+        ...modelOptions,
       ]
-    : diarizationModels.map((model) => ({
-        variant: model.variant,
-        label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
-      }));
+    : modelOptions;
   const submissionStatusLabel =
     uploadState?.phase === "preparing"
       ? "Preparing"

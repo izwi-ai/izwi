@@ -273,7 +273,7 @@ describe("NewDiarizationModal diarization model picker", () => {
     const select = screen.getByLabelText("Diarization model") as HTMLSelectElement;
     expect(select.value).toBe("diar_streaming_sortformer_4spk-v2.1");
     const optionLabels = Array.from(select.options).map((option) => option.textContent);
-    expect(optionLabels).toContain("Nemotron-3-Diarization — Downloaded");
+    expect(optionLabels).toContain("Nemotron 3 Diarization");
 
     fireEvent.change(select, { target: { value: "Nemotron-3-Diarization" } });
     expect(props.onSelectModel).toHaveBeenCalledWith("Nemotron-3-Diarization");
