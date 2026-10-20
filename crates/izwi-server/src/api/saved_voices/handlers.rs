@@ -55,15 +55,31 @@ pub struct CreateSavedVoiceRequest {
     pub source_record_id: Option<String>,
 }
 
+/// Fields spelled out: `serde(flatten)` breaks numbers in query strings.
+#[derive(Debug, Default, Deserialize)]
+pub struct SavedVoiceListQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Case-insensitive search over names and reference text.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
 pub async fn list_saved_voices(
     State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
+    Query(query): Query<SavedVoiceListQuery>,
 ) -> Result<Json<SavedVoiceListResponse>, ApiError> {
-    let limit = query.resolved_limit(SAVED_VOICE_LIST_LIMIT, 1000);
-    let cursor = query.decode_cursor::<SavedVoiceListCursor>()?;
+    let page = CursorPaginationQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+    };
+    let limit = page.resolved_limit(SAVED_VOICE_LIST_LIMIT, 1000);
+    let cursor = page.decode_cursor::<SavedVoiceListCursor>()?;
     let (voices, next_cursor) = state
         .saved_voice_store
-        .list_voices_page(limit, cursor)
+        .list_voices_page(limit, cursor, query.q.as_deref())
         .await
         .map_err(map_store_error)?;
 

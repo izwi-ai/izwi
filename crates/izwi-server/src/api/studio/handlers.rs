@@ -1246,6 +1246,18 @@ pub(super) async fn validate_project_voice_state(
             if !exists {
                 return Err(ApiError::not_found("Saved voice not found"));
             }
+            // Every paragraph would fail on a voice whose recording is gone.
+            let has_audio = state
+                .saved_voice_store
+                .get_audio(voice_id.to_string())
+                .await
+                .map_err(map_saved_voice_store_error)?
+                .is_some();
+            if !has_audio {
+                return Err(ApiError::not_found(
+                    "This saved voice's recording is missing. Choose another voice or record it again.",
+                ));
+            }
         }
     }
     Ok(())

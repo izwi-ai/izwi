@@ -4048,6 +4048,82 @@ async fn studio_segment_refusals_are_bad_requests() {
 /// The server owns Studio rendering: clients queue and cancel, the
 /// worker sets every other status, and export refuses audio that doesn't
 /// match the script.
+/// A voice whose recording went missing answers 404, not 500, and saved
+/// voices are searched on the server.
+#[tokio::test]
+async fn saved_voices_report_missing_recordings_and_search_on_the_server() {
+    let (state, root) = test_state("saved_voice_recordings", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let wav = base64::engine::general_purpose::STANDARD.encode(
+        AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap(),
+    );
+    let mut ids = Vec::new();
+    for (name, source) in [("Sam", "voice_cloning"), ("Narrator", "voice_design")] {
+        let body = serde_json::json!({
+            "name": name, "reference_text": "Hello.", "audio_base64": wav,
+            "source_route_kind": source, "consent": true
+        });
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/voices", Some(&body.to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(
+            read_json(response).await["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // Remove the recording the way a user deleting files by hand would.
+    fn remove_files_named(dir: &std::path::Path, needle: &str) -> usize {
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                removed += remove_files_named(&path, needle);
+            } else if path.to_string_lossy().contains(needle) {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+        removed
+    }
+    assert!(remove_files_named(&root.0.join("media"), &ids[0]) > 0);
+    let audio = send_request(
+        app.clone(),
+        build_request(Method::GET, &format!("/v1/voices/{}/audio", ids[0]), None),
+    )
+    .await;
+    assert_eq!(audio.status(), StatusCode::NOT_FOUND);
+
+    // Search runs on the server, over every voice, not one loaded page.
+    let found = send_request(
+        app,
+        build_request(Method::GET, "/v1/voices?q=narr&limit=1", None),
+    )
+    .await;
+    assert_eq!(found.status(), StatusCode::OK);
+    let found = read_json(found).await;
+    let names: Vec<_> = found["voices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|voice| voice["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["Narrator"]);
+}
+
 /// Speed belongs to models with speed control, and a paragraph's voice to
 /// the model it was chosen with.
 #[tokio::test]
