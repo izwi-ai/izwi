@@ -79,10 +79,19 @@ installed from the `.deb` (added when the build signed the `.deb`).
 To try an update before publishing, point a build at a staged manifest:
 `IZWI_UPDATER_FORCE_MANIFEST_URL=https://…/latest.json`.
 
-Builds before 0.1.0 (the betas up to `v0.1.0-beta-17`) only look at
-`v0.1.0-beta-N` tags with `latest-beta.json`. To move them to 0.1.0, publish
-a bridge: a `v0.1.0-beta-N` release whose `latest-beta.json` points at the
-0.1.0 assets (their signatures are the same).
+### From the old betas to 0.1.0
+
+Betas up to `v0.1.0-beta-17` only look at `v0.1.0-beta-N` tags with
+`latest-beta.json`, so they never see a stable release. `v0.1.0-beta-18` is
+their bridge: a normal beta release, built with the updater above. Users
+go beta-17 → beta-18 → 0.1.0:
+
+1. Release `v0.1.0-beta-18`. Old betas update to it; it stops the server an
+   old beta left running.
+2. Release `v0.1.0`. beta-18 follows stable releases too, so it offers 0.1.0.
+
+Keep the beta-18 release published after 0.1.0 ships: it is the only way
+from an old beta to 0.1.0.
 
 ## What the release workflow builds
 
