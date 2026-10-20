@@ -27,6 +27,7 @@ use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::{ApiError, ApiJson, ErrorScope};
 use crate::ids::new_prefixed_id;
 use crate::state::{AppState, StoredFunctionCall, StoredResponseInputItem, StoredResponseRecord};
+use izwi_core::chat_reasoning::{reasoning_opened_in_prompt, PromptOpener};
 use izwi_core::{
     parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
 };
@@ -116,6 +117,8 @@ pub async fn create_response(
         media_inputs,
         req.truncation,
     )?;
+    // Unsplit output gets back the `<think>` the prompt opened.
+    let opened_in_prompt = reasoning_opened_in_prompt(model_variant, chat_config.enable_thinking);
     if req.max_output_tokens == Some(0) {
         return Err(ApiError::invalid_param(
             "max_output_tokens",
@@ -156,6 +159,7 @@ pub async fn create_response(
                 tenant_scope: ctx.tenant_scope(),
                 input_items,
                 tool_format,
+                opened_in_prompt,
             },
             event_rx,
         );
@@ -180,7 +184,10 @@ pub async fn create_response(
             cached_tokens: output.cached_prompt_tokens.unwrap_or(0),
         },
     };
-    let (output_text, function_calls) = answer_output(tool_format, output.text);
+    let (output_text, function_calls) = answer_output(
+        tool_format,
+        PromptOpener::new(opened_in_prompt).push(&output.text),
+    );
 
     let response = ResponseObject {
         id: response_id.clone(),
@@ -399,6 +406,8 @@ struct ResponseStreamRequest {
     input_items: Vec<StoredResponseInputItem>,
     /// The tool-call format to parse the answer in; `None` keeps it text.
     tool_format: Option<ToolCallFormat>,
+    /// The prompt opened the `<think>` block (Qwen3.5/3.6/3.8 with thinking on).
+    opened_in_prompt: bool,
 }
 
 /// One streamed `function_call` output item.
@@ -414,6 +423,8 @@ struct ResponseOutputStream {
     response_id: String,
     message_id: String,
     parser: Option<ToolCallParser>,
+    opened_in_prompt: bool,
+    opener: PromptOpener,
     next_output_index: usize,
     /// The message's output index once it opened.
     message_index: Option<usize>,
@@ -422,11 +433,17 @@ struct ResponseOutputStream {
 }
 
 impl ResponseOutputStream {
-    fn new(response_id: String, tool_format: Option<ToolCallFormat>) -> Self {
+    fn new(
+        response_id: String,
+        tool_format: Option<ToolCallFormat>,
+        opened_in_prompt: bool,
+    ) -> Self {
         Self {
             response_id,
             message_id: new_prefixed_id("msg_"),
             parser: tool_format.map(ToolCallParser::new),
+            opened_in_prompt,
+            opener: PromptOpener::new(opened_in_prompt),
             next_output_index: 0,
             message_index: None,
             text: String::new(),
@@ -435,6 +452,7 @@ impl ResponseOutputStream {
     }
 
     fn push(&mut self, delta: String) -> Vec<String> {
+        let delta = self.opener.push(&delta);
         let parsed = match self.parser.as_mut() {
             Some(parser) => parser.push(&delta),
             None => ParsedOutput {
@@ -558,7 +576,7 @@ impl ResponseOutputStream {
             None => Vec::new(),
         };
         if self.parser.is_none() && !final_text.is_empty() {
-            self.text = final_text.to_string();
+            self.text = PromptOpener::new(self.opened_in_prompt).push(final_text);
         }
         if self.message_index.is_none() && self.calls.is_empty() {
             self.open_message(&mut events);
@@ -684,6 +702,7 @@ fn response_event_stream(
             tenant_scope,
             input_items,
             tool_format,
+            opened_in_prompt,
         } = request;
         let record = |status: &str,
                       output_text: Option<String>,
@@ -736,7 +755,8 @@ fn response_event_stream(
             &json!({"type": "response.in_progress", "response": created_response}),
         ));
 
-        let mut output = ResponseOutputStream::new(response_id.clone(), tool_format);
+        let mut output =
+            ResponseOutputStream::new(response_id.clone(), tool_format, opened_in_prompt);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -1485,6 +1505,7 @@ mod tests {
             tenant_scope: String::new(),
             input_items: Vec::new(),
             tool_format,
+            opened_in_prompt: false,
         };
         let chunks: Vec<String> = response_event_stream(state.clone(), request, rx)
             .map(|chunk| chunk.unwrap())
@@ -1617,6 +1638,26 @@ mod tests {
         let output = &payloads.last().unwrap()["response"]["output"];
         assert_eq!(output.as_array().unwrap().len(), 1);
         assert_eq!(output[0]["content"][0]["text"], "Hello");
+    }
+
+    /// A `<think>` block the prompt opened reads `<think>…</think>` in the
+    /// deltas and the stored text alike.
+    #[test]
+    fn streamed_text_gets_back_the_opener_the_prompt_held() {
+        let mut output = ResponseOutputStream::new("resp_x".to_string(), None, true);
+        let streamed: String = ["r</think>", "A"]
+            .into_iter()
+            .flat_map(|delta| output.push(delta.to_string()))
+            .filter_map(|event| {
+                let data = event.lines().find_map(|line| line.strip_prefix("data: "))?;
+                let payload: serde_json::Value = serde_json::from_str(data).ok()?;
+                (payload["type"] == "response.output_text.delta")
+                    .then(|| payload["delta"].as_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(streamed, "<think>r</think>A");
+        let finished = output.finish("r</think>A");
+        assert_eq!(finished.text.as_deref(), Some("<think>r</think>A"));
     }
 
     #[test]

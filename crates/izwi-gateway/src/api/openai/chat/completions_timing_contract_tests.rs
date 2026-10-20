@@ -4,8 +4,11 @@ use crate::api::openai::chat::dto::OpenAiChatChunk;
 fn reasoning_mode_for(body: serde_json::Value) -> Result<Option<bool>, ApiError> {
     let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
     let ctx = RequestContext::new("reasoning".into(), izwi_hooks::Principal::local_anonymous());
-    prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
-        .map(|(_, format)| format.reasoning)
+    prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict).map(|(_, format)| {
+        format
+            .parse_reasoning
+            .then_some(format.reasoning_opened_in_prompt)
+    })
 }
 
 #[test]
@@ -67,16 +70,17 @@ async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
             .unwrap();
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     };
-    let format = |reasoning, tool_calls| AnswerFormat {
+    let format = |parse_reasoning, reasoning_opened_in_prompt, tool_calls| AnswerFormat {
         compat_profile: OpenAiCompatibilityProfile::Strict,
-        reasoning,
+        parse_reasoning,
+        reasoning_opened_in_prompt,
         tool_calls,
     };
     let text = "<think>check the tool</think>\n\n<|tool_call_start|>[now()]<|tool_call_end|>";
     let parsed = body(render_completion_response(
         ModelVariant::Lfm2512BThinkingGguf,
         generation(text),
-        format(Some(false), Some(ToolCallFormat::LfmPythonic)),
+        format(true, false, Some(ToolCallFormat::LfmPythonic)),
     ))
     .await;
     let message = &parsed["choices"][0]["message"];
@@ -88,12 +92,21 @@ async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
     let raw = body(render_completion_response(
         ModelVariant::Lfm2512BThinkingGguf,
         generation("<think>r</think>A"),
-        format(None, None),
+        format(false, false, None),
     ))
     .await;
     assert!(raw["choices"][0]["message"]
         .get("reasoning_content")
         .is_none());
+    assert_eq!(raw["choices"][0]["message"]["content"], "<think>r</think>A");
+
+    // Unparsed, a block the prompt opened reads the same way.
+    let raw = body(render_completion_response(
+        ModelVariant::Qwen354BGguf,
+        generation("r</think>A"),
+        format(false, true, None),
+    ))
+    .await;
     assert_eq!(raw["choices"][0]["message"]["content"], "<think>r</think>A");
 }
 

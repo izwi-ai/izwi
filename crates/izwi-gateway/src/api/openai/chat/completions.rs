@@ -259,8 +259,12 @@ pub async fn gateway_completions(
 #[derive(Debug, Clone, Copy)]
 pub struct AnswerFormat {
     pub compat_profile: OpenAiCompatibilityProfile,
-    /// See [`reasoning_split_mode`].
-    pub reasoning: Option<bool>,
+    /// `reasoning_format: "parsed"`: reasoning moves to `reasoning_content`.
+    pub parse_reasoning: bool,
+    /// The prompt opened the `<think>` block (Qwen3.5/3.6/3.8 with thinking
+    /// on), so the model's text starts inside it; LFM2.5 Thinking writes its
+    /// own opener.
+    pub reasoning_opened_in_prompt: bool,
     /// The tool-call format to parse; `None` leaves the answer text.
     pub tool_calls: Option<ToolCallFormat>,
 }
@@ -391,26 +395,21 @@ pub fn prepare_execution_request(
     validate_chat_request_ranges(&execution)?;
     let format = AnswerFormat {
         compat_profile: profile,
-        reasoning: reasoning_split_mode(req, &execution)?,
+        parse_reasoning: parse_reasoning(req)?,
+        reasoning_opened_in_prompt: super::reasoning::reasoning_opened_in_prompt(
+            execution.variant,
+            execution.chat_config.enable_thinking,
+        ),
         tool_calls: tool_policy.format,
     };
     Ok((execution, format))
 }
 
-/// `Some(opened_in_prompt)` when the request asked for `reasoning_format:
-/// "parsed"`. `opened_in_prompt` is true for chat families whose prompt
-/// opens the `<think>` block when thinking is on (Qwen3.5/3.6/3.8); the
-/// LFM2.5 Thinking model writes its own opener.
-fn reasoning_split_mode(
-    req: &ChatCompletionRequest,
-    execution: &ChatExecutionRequest,
-) -> Result<Option<bool>, ApiError> {
+/// Whether the request asked for `reasoning_format: "parsed"`.
+fn parse_reasoning(req: &ChatCompletionRequest) -> Result<bool, ApiError> {
     match req.reasoning_format.as_deref().map(str::trim) {
-        None | Some("none") => Ok(None),
-        Some("parsed") => Ok(Some(super::reasoning::reasoning_opened_in_prompt(
-            execution.variant,
-            execution.chat_config.enable_thinking,
-        ))),
+        None | Some("none") => Ok(false),
+        Some("parsed") => Ok(true),
         Some(other) => Err(ApiError::bad_request(format!(
             "Unsupported `reasoning_format` {other:?}; use \"none\" or \"parsed\""
         ))),
@@ -424,11 +423,11 @@ fn render_completion_response(
 ) -> Response {
     let completion_tokens = generation.tokens_generated;
     let prompt_tokens = generation.prompt_tokens;
-    let (reasoning_content, text) = match format.reasoning {
-        Some(opened_in_prompt) => {
-            super::reasoning::split_reasoning(&generation.text, opened_in_prompt)
-        }
-        None => (None, generation.text),
+    let (reasoning_content, text) = if format.parse_reasoning {
+        super::reasoning::split_reasoning(&generation.text, format.reasoning_opened_in_prompt)
+    } else {
+        let mut opener = super::reasoning::PromptOpener::new(format.reasoning_opened_in_prompt);
+        (None, opener.push(&generation.text))
     };
     let (content, tool_calls) = match format.tool_calls {
         Some(tool_format) => parse_answer(tool_format, &text),

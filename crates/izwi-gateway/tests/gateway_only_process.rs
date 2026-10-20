@@ -283,7 +283,8 @@ const SCOPED_OPS_KEY: &str = "ds05-scoped-ops-metrics-key";
 /// root key fully backward compatible.
 #[tokio::test]
 async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_store() {
-    let model = ModelVariant::Qwen354BGguf;
+    // A model that answers without thinking by default, as the test worker does.
+    let model = ModelVariant::Qwen352BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let worker_config = TestWorkerConfig {
         public_model: model_alias,

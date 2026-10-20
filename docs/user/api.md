@@ -242,7 +242,7 @@ Supported request fields:
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
-| `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
+| `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`, including the `<think>` a Qwen prompt opens when thinking is on; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
 
 Through the gateway, a chat request runs on a worker exactly as on the local

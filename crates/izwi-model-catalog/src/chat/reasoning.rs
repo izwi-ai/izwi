@@ -5,8 +5,9 @@
 //! * the prompt already opened the block (Qwen3.5/3.6/3.8 with thinking on),
 //!   so the output is `r</think>a`.
 //!
-//! The OpenAI route splits only on request (`reasoning_format: "parsed"`);
-//! the server's own generations (summaries, titles, memory) always split, so
+//! The OpenAI routes split only on request (`reasoning_format: "parsed"`);
+//! unsplit, they write back the opener the prompt held ([`PromptOpener`]).
+//! The server's own generations (summaries, titles, memory) always split, so
 //! reasoning never reaches stored text.
 
 use crate::catalog::{ModelFamily, ModelVariant};
@@ -33,6 +34,31 @@ pub fn split_reasoning(text: &str, opened_in_prompt: bool) -> (Option<String>, S
     content.push_str(&tail_content);
     let reasoning = splitter.saw_reasoning.then(|| reasoning.trim().to_string());
     (reasoning, content)
+}
+
+/// Unsplit output as a client reads it: the `<think>` the prompt opened is
+/// written back in front of the first text, so reasoning reads
+/// `<think>…</think>` whichever side opened the block.
+pub struct PromptOpener {
+    owed: bool,
+}
+
+impl PromptOpener {
+    pub fn new(opened_in_prompt: bool) -> Self {
+        Self {
+            owed: opened_in_prompt,
+        }
+    }
+
+    /// One delta, or a whole output, with the opener in front if still owed.
+    pub fn push(&mut self, delta: &str) -> String {
+        if self.owed && !delta.is_empty() {
+            self.owed = false;
+            format!("{OPEN}{delta}")
+        } else {
+            delta.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +193,21 @@ mod tests {
             split_reasoning("r</think>\n\nA", true),
             (Some("r".to_string()), "A".to_string())
         );
+    }
+
+    #[test]
+    fn unsplit_output_gets_back_the_opener_the_prompt_held() {
+        let mut opener = PromptOpener::new(true);
+        let streamed: String = ["", "r", "</think>", "A"]
+            .iter()
+            .map(|delta| opener.push(delta))
+            .collect();
+        assert_eq!(streamed, "<think>r</think>A");
+        assert_eq!(
+            PromptOpener::new(false).push("<think>r</think>A"),
+            "<think>r</think>A"
+        );
+        assert_eq!(PromptOpener::new(true).push(""), "");
     }
 
     #[test]
