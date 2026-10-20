@@ -44,7 +44,7 @@ test("shell and core route entry states have no serious axe violations", async (
   }
 });
 
-test("onboarding dialog has no serious axe violations", async ({ page }) => {
+test("first run has no serious axe violations", async ({ page }) => {
   await page.unroute("**/v1/onboarding");
   await stubBootstrapRequests(page, {
     models: READY_MODELS,
@@ -53,7 +53,13 @@ test("onboarding dialog has no serious axe violations", async ({ page }) => {
   for (const colorScheme of THEMES) {
     await page.emulateMedia({ colorScheme, reducedMotion: "reduce" });
     await page.goto("/models");
-    await expect(page.getByRole("dialog", { name: "Welcome to Izwi" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Welcome to Izwi" })).toBeVisible();
+    await expectNoSeriousViolations(page);
+    await page.getByRole("button", { name: "Get started" }).click();
+    await expect(page.getByRole("heading", { name: /^Set up Izwi for this/ })).toBeVisible();
+    await expectNoSeriousViolations(page);
+    await page.getByRole("button", { name: "Choose models myself" }).click();
+    await expect(page.getByRole("heading", { name: "Choose models" })).toBeVisible();
     await expectNoSeriousViolations(page);
   }
 });

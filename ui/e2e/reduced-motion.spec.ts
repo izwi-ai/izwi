@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
+import { stubBootstrapRequests } from "./support/api";
 
 test.use({ reducedMotion: "reduce" });
+
+test.beforeEach(async ({ page }) => {
+  await stubBootstrapRequests(page);
+});
 
 test("disables nonessential CSS movement while preserving state changes", async ({
   page,

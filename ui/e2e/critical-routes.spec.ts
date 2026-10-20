@@ -1,6 +1,10 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { READY_MODELS, stubBootstrapRequests } from "./support/api";
+import {
+  NOT_DOWNLOADED_MODELS,
+  READY_MODELS,
+  stubBootstrapRequests,
+} from "./support/api";
 
 test.beforeEach(async ({ page }) => {
   await stubBootstrapRequests(page, { models: READY_MODELS });
@@ -48,15 +52,12 @@ test("voice without its models offers setup and keeps settings reachable", async
   await expect(settings).toBeFocused();
 });
 
-test("completes quick onboarding without leaving the blocking dialog", async ({
-  page,
-}) => {
+async function stubFirstRun(page: Page, models: readonly object[]) {
   await page.unroute("**/v1/onboarding");
-  await stubBootstrapRequests(page, {
-    models: READY_MODELS,
-    onboardingCompleted: false,
-  });
+  await stubBootstrapRequests(page, { models, onboardingCompleted: false });
+  const completions: string[] = [];
   await page.route("**/v1/onboarding/complete", async (route) => {
+    completions.push(route.request().method());
     await route.fulfill({
       json: { completed: true, completed_at: 2, analytics_opt_in: false },
     });
@@ -64,59 +65,91 @@ test("completes quick onboarding without leaving the blocking dialog", async ({
   await page.route("**/v1/preferences/analytics", async (route) => {
     await route.fulfill({ json: { analytics_opt_in: false } });
   });
+  return completions;
+}
 
-  await page.goto("/models");
-  await expect(page.getByRole("dialog", { name: "Welcome to Izwi" })).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("button", { name: "Quick setup" })).toBeVisible();
-  await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "All setup" })).toBeVisible();
-  await page.getByRole("button", { name: "Go to app" }).click();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Models", level: 1 })).toBeVisible();
-});
-
-test("supports custom onboarding and model-catalog error recovery", async ({
+test("first run fills the window, downloads the picks and opens the app", async ({
   page,
 }) => {
+  const downloads: string[] = [];
+  let models: readonly object[] = NOT_DOWNLOADED_MODELS;
+  const completions = await stubFirstRun(page, models);
   await page.unroute("**/v1/admin/models");
-  await page.unroute("**/v1/onboarding");
-  // The catalog auto-retries a failed initial load before the error becomes
-  // terminal, so keep failing until the test flips this flag; the manual
-  // retry below is then the request that recovers.
-  let recovering = false;
   await page.route("**/v1/admin/models", async (route) => {
-    if (!recovering) {
-      await route.fulfill({ status: 503, json: { error: "Model service unavailable" } });
+    await route.fulfill({ json: { models } });
+  });
+  await page.route("**/v1/admin/models/*/download", async (route) => {
+    const [variant] = new URL(route.request().url()).pathname.split("/").slice(-2);
+    downloads.push(variant);
+    models = models.map((model) =>
+      (model as { variant: string }).variant === variant
+        ? { ...model, status: "downloading", download_progress: 10 }
+        : model,
+    );
+    await route.fulfill({ json: { status: "started", message: "Started" } });
+  });
+
+  await page.goto("/models");
+  await expect(page.getByRole("heading", { name: "Welcome to Izwi", level: 1 })).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Get started" })).toBeFocused();
+
+  await page.getByRole("button", { name: "Get started" }).click();
+  await expect(page.getByRole("heading", { name: /^Set up Izwi for this/ })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Talk to Izwi" })).toBeChecked();
+  await expect(page.getByText("Needs 6.3 GB of free disk space.")).toBeVisible();
+  await page.getByRole("button", { name: "Download and set up · 6.3 GB" }).click();
+
+  await expect(page.getByRole("heading", { name: "Setting up Izwi" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Skip setup" })).toHaveCount(0);
+  expect(downloads.sort()).toEqual(
+    ["Kokoro-82M", "Parakeet-TDT-0.6B-v3", "Qwen3.5-4B"],
+  );
+  await page.getByRole("button", { name: "Start using Izwi" }).click();
+
+  await expect(page.getByRole("heading", { name: "Models", level: 1 })).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toHaveCount(1);
+  expect(completions).toEqual(["POST"]);
+});
+
+test("first run says when the engine isn't responding and lets you choose models", async ({
+  page,
+}) => {
+  await stubFirstRun(page, READY_MODELS);
+  await page.unroute("**/v1/onboarding");
+  let engineUp = false;
+  await page.route("**/v1/onboarding", async (route) => {
+    if (!engineUp) {
+      await route.fulfill({ status: 503, json: { error: { message: "Starting up" } } });
       return;
     }
-    await route.fulfill({ json: { models: READY_MODELS } });
-  });
-  await page.route("**/v1/onboarding", async (route) => {
     await route.fulfill({
       json: { completed: false, completed_at: null, analytics_opt_in: false },
     });
   });
 
   await page.goto("/models");
-  const onboarding = page.getByRole("dialog", { name: "Welcome to Izwi" });
   await expect(
-    onboarding.getByText("Model service unavailable", { exact: true }),
+    page.getByRole("heading", { name: "Izwi's engine isn't responding" }),
   ).toBeVisible();
-  const retryButton = onboarding.getByRole("button", { name: "Retry models" });
-  // Enabled means the automatic retries have been exhausted and the error is
-  // the user-facing terminal state.
-  await expect(retryButton).toBeEnabled();
-  recovering = true;
-  await retryButton.click();
-  await expect(
-    onboarding.getByText("Model service unavailable", { exact: true }),
-  ).toHaveCount(0);
+  await expect(page.getByText("Starting up", { exact: true })).toBeVisible();
+  // A browser has no log folder to open.
+  await expect(page.getByRole("button", { name: "Open the log folder" })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Next" }).click();
-  await page.getByRole("button", { name: "Custom setup" }).click();
-  await expect(page.getByText("Choose your models")).toBeVisible();
-  await expect(page.getByRole("checkbox").first()).toBeVisible();
+  engineUp = true;
+  await page.getByRole("button", { name: "Try again now" }).click();
+  await page.getByRole("button", { name: "Get started" }).click();
+  await page.getByRole("button", { name: "Choose models myself" }).click();
+
+  await expect(page.getByRole("heading", { name: "Choose models", level: 1 })).toBeVisible();
+  const speech = page.getByRole("region", { name: "Speech to text" });
+  await expect(speech.getByRole("checkbox", { name: "Parakeet v3" })).toBeChecked();
+  await expect(speech.getByText("Downloaded")).toBeVisible();
+  await page.getByRole("button", { name: "Set up" }).click();
+
+  await expect(page.getByRole("heading", { name: "You're all set" })).toBeVisible();
+  await page.getByRole("link", { name: "Chat" }).click();
+  await expect(page).toHaveURL(/\/chat$/);
 });
 
 test("recovers to an idle voice entry point when microphone permission fails", async ({
