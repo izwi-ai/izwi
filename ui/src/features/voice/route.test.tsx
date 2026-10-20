@@ -153,7 +153,9 @@ class FakeAudioContext {
   }
 }
 
-const micTrack = { stop: vi.fn() };
+const micTrack: { stop: ReturnType<typeof vi.fn>; onended?: (() => void) | null } = {
+  stop: vi.fn(),
+};
 const storage = new Map<string, string>();
 
 beforeEach(() => {
@@ -392,6 +394,18 @@ describe("VoicePage failures", () => {
     expect(micTrack.stop).toHaveBeenCalled();
     expect(screen.getByRole("heading", { name: "Conversation ended" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Start again" })).toBeVisible();
+  });
+
+  it("ends the conversation when the microphone goes away", async () => {
+    renderVoicePage(standardModels("downloaded"));
+    const socket = await startConversation();
+    await act(async () => socket.emit("session_started"));
+
+    await act(async () => micTrack.onended?.());
+
+    expect(screen.getByRole("heading", { name: "Conversation ended" })).toBeVisible();
+    expect(screen.getByText(/The microphone stopped/)).toBeVisible();
+    expect(micTrack.stop).toHaveBeenCalled();
   });
 
   it("explains a blocked microphone", async () => {
