@@ -67,6 +67,8 @@ interface NewTranscriptionModalProps {
   onModelRequired: () => void;
   onTimestampAlignerRequired: () => void;
   onCreated: (record: TranscriptionRecord) => Promise<void> | void;
+  /** Told while an upload is under way, so a host dialog stays open. */
+  onBusyChange?: (busy: boolean) => void;
   onStreamingStart?: () => void;
   onStreamingDelta?: (delta: string) => void;
   onStreamingProgress?: (progress: TranscriptionProcessingProgress) => void;
@@ -109,6 +111,7 @@ export function NewTranscriptionModal({
   onModelRequired,
   onTimestampAlignerRequired,
   onCreated,
+  onBusyChange,
   onStreamingStart,
   onStreamingDelta,
   onStreamingProgress,
@@ -126,6 +129,18 @@ export function NewTranscriptionModal({
   const [speakerExpectation, setSpeakerExpectation] = useState("2");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  useEffect(() => {
+    onBusyChange?.(isSubmitting);
+  }, [isSubmitting, onBusyChange]);
+  // A dialog that goes away mid-upload stops the upload.
+  useEffect(
+    () => () => {
+      uploadAbortRef.current?.abort();
+      onBusyChange?.(false);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
   const [error, setError] = useState<string | null>(null);
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
@@ -755,6 +770,7 @@ export function NewTranscriptionModal({
       <SpeechTextModeSwitch
         selectedMode={selectedMode}
         onSelectMode={onSelectMode}
+        disabled={isSubmitting}
       />
     ),
     onClose,

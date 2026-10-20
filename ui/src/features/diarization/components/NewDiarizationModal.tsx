@@ -75,6 +75,8 @@ interface NewDiarizationModalProps {
   onOpenModelManager: () => void;
   onUnloadAllManagedModels: () => void;
   onCreated: (record: DiarizationRecord) => Promise<void> | void;
+  /** Told while an upload or recording is under way, so a host dialog stays open. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 interface SubmitAudioOptions {
@@ -123,6 +125,7 @@ export function NewDiarizationModal({
   onOpenModelManager,
   onUnloadAllManagedModels,
   onCreated,
+  onBusyChange,
 }: NewDiarizationModalProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeRecordingRef = useRef<ActiveRecording | null>(null);
@@ -142,6 +145,18 @@ export function NewDiarizationModal({
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
   const isGranitePipeline = pipelineMode === "granite";
+  useEffect(() => {
+    onBusyChange?.(isSubmitting || isRecording);
+  }, [isRecording, isSubmitting, onBusyChange]);
+  // A dialog that goes away mid-upload stops the upload.
+  useEffect(
+    () => () => {
+      uploadAbortRef.current?.abort();
+      onBusyChange?.(false);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
 
   const discardActiveRecording = useCallback(() => {
     recordingGenerationRef.current += 1;
@@ -855,6 +870,7 @@ export function NewDiarizationModal({
       <SpeechTextModeSwitch
         selectedMode={selectedMode}
         onSelectMode={onSelectMode}
+        disabled={busy}
       />
     ),
     onClose,

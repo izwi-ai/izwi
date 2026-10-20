@@ -95,6 +95,7 @@ interface SegmentedFilterProps<T extends string> {
   onChange: (value: T) => void;
   /** Shown beside the selected option (the list total). */
   selectedCount?: number | null;
+  disabled?: boolean;
 }
 
 export function SegmentedFilter<T extends string>({
@@ -103,6 +104,7 @@ export function SegmentedFilter<T extends string>({
   value,
   onChange,
   selectedCount,
+  disabled = false,
 }: SegmentedFilterProps<T>) {
   return (
     <div
@@ -120,9 +122,10 @@ export function SegmentedFilter<T extends string>({
             type="button"
             role="radio"
             aria-checked={selected}
+            disabled={disabled}
             onClick={() => onChange(option.id)}
             className={cn(
-              "inline-flex h-[26px] items-center gap-1.5 whitespace-nowrap rounded-[7px] px-2.5 text-[12.5px] font-medium transition-colors",
+              "inline-flex h-[26px] items-center gap-1.5 whitespace-nowrap rounded-[7px] px-2.5 text-[12.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60",
               selected
                 ? "bg-[var(--surface-raised)] text-[var(--text-primary)]"
                 : "text-[var(--text-muted)] hover:text-[var(--text-primary)]",

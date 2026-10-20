@@ -101,6 +101,8 @@ export function TranscriptionPage({
   const [searchParams, setSearchParams] = useSearchParams();
   const [isNewTranscriptionModalOpen, setIsNewTranscriptionModalOpen] =
     useState(false);
+  // An upload in the creation dialog keeps it open: closing would abort it.
+  const [isCreationBusy, setIsCreationBusy] = useState(false);
   const [newSpeechTextMode, setNewSpeechTextMode] =
     useState<SpeechTextCreationMode>("transcription");
   const [recordActionError, setRecordActionError] = useState<string | null>(null);
@@ -915,7 +917,7 @@ export function TranscriptionPage({
             open={isNewTranscriptionModalOpen}
             modal={!isModelModalOpen}
             onOpenChange={(open) => {
-              if (!open) {
+              if (!open && !isCreationBusy) {
                 handleCloseNewTranscriptionModal();
               }
             }}
@@ -923,17 +925,17 @@ export function TranscriptionPage({
             <DialogContent
               className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-[52rem]")}
               onEscapeKeyDown={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
               onPointerDownOutside={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
               onInteractOutside={(event) => {
-                if (isModelModalOpen) {
+                if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
                 }
               }}
@@ -977,6 +979,7 @@ export function TranscriptionPage({
                         openTranscriptionModelManager();
                         onError("Load the timestamp aligner model to enable timestamps.");
                       }}
+                      onBusyChange={setIsCreationBusy}
                       onCreated={async (createdRecord: TranscriptionRecord) => {
                         setStreamingRecord(createdRecord);
                         await refreshHistory().catch(() => undefined);
@@ -1069,6 +1072,7 @@ export function TranscriptionPage({
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}
                       onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
+                      onBusyChange={setIsCreationBusy}
                       onCreated={handleCreatedDiarizationRecord}
                     />
                   )}

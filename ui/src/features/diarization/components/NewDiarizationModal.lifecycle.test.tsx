@@ -208,6 +208,41 @@ describe("NewDiarizationModal recording lifecycle", () => {
   });
 });
 
+describe("NewDiarizationModal uploads", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("holds the dialog while uploading and aborts the upload if it goes away", async () => {
+    let uploadSignal: AbortSignal | undefined;
+    apiMocks.createDiarizationRecord.mockImplementation(
+      (_request: unknown, options: { signal?: AbortSignal }) => {
+        uploadSignal = options.signal;
+        return new Promise(() => {});
+      },
+    );
+    const onBusyChange = vi.fn();
+    const { view } = renderModal({ onBusyChange, onSelectMode: vi.fn() });
+
+    const input = screen
+      .getByRole("button", { name: "Upload audio file" })
+      .querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["audio"], "talk.wav", { type: "audio/wav" })] },
+    });
+
+    await waitFor(() => expect(uploadSignal).toBeDefined());
+    expect(onBusyChange).toHaveBeenLastCalledWith(true);
+    for (const mode of screen.getAllByRole("radio")) {
+      expect(mode).toBeDisabled();
+    }
+
+    view.unmount();
+    expect(uploadSignal?.aborted).toBe(true);
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+  });
+});
+
 describe("NewDiarizationModal diarization model picker", () => {
   beforeEach(() => {
     vi.clearAllMocks();
