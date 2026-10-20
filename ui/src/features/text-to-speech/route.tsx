@@ -584,7 +584,8 @@ export function TextToSpeechPage({
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Text-to-Speech Models"
+        title="Text to Speech models"
+        routeLabel="Text to Speech"
         description="Manage built-in voice, saved-voice, and voice-direction TTS models for this route."
         models={routeModels}
         loading={loading}

@@ -92,7 +92,7 @@ describe("MyModelsPage", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel load" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel loading / }));
     expect(onUnload).toHaveBeenCalledWith("Qwen3.5-0.8B");
   });
 

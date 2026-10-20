@@ -13,6 +13,9 @@ const modelMethodNames = [
   "downloadModel",
   "loadModel",
   "unloadModel",
+  "pinModel",
+  "unpinModel",
+  "getModelStorage",
   "deleteModel",
   "cancelDownload",
 ] as const;

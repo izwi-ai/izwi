@@ -8,7 +8,10 @@ import {
 } from "react-router-dom";
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
-import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
+import {
+  useModelCatalog,
+  type ModelRouteKey,
+} from "@/app/providers/ModelCatalogProvider";
 import { DocumentTitle } from "@/app/router/DocumentTitle";
 import { NotFoundPage } from "@/app/router/NotFoundPage";
 import { legacyDiarizationTarget } from "@/app/router/routePresentation";
@@ -115,6 +118,7 @@ export function AppRoutes() {
   const {
     models,
     selectedModel,
+    selectedModelFor,
     loading,
     catalogError,
     downloadProgress,
@@ -128,24 +132,27 @@ export function AppRoutes() {
     cancelModelDownload,
     loadModel,
     unloadModel,
+    setModelPinned,
     deleteModel,
   } = useModelCatalog();
 
-  const pageProps: SharedPageProps = {
+  // Each page keeps its own model choice: loading or picking a model on
+  // one page does not change another's.
+  const pageProps = (route: ModelRouteKey): SharedPageProps => ({
     models,
-    selectedModel,
+    selectedModel: selectedModelFor(route),
     loading,
     downloadProgress,
     residencySummary,
     onDownload: downloadModel,
     onCancelDownload: cancelModelDownload,
-    onLoad: loadModel,
+    onLoad: (variant) => void loadModel(variant, { route }),
     onUnload: unloadModel,
     onDelete: deleteModel,
-    onSelect: (variant) => selectModel(variant),
+    onSelect: (variant) => selectModel(variant, route),
     onError: reportError,
     onRefresh: refreshModels,
-  };
+  });
 
   const voicePageProps: VoiceRouteProps = {
     models,
@@ -169,6 +176,7 @@ export function AppRoutes() {
     onLoad: loadModel,
     onUnload: unloadModel,
     onDelete: deleteModel,
+    onSetPinned: (variant, pinned) => void setModelPinned(variant, pinned),
     onRefresh: refreshModels,
   };
   const selectedModelInfo = models.find(
@@ -205,23 +213,23 @@ export function AppRoutes() {
         >
           <Route
             path="/text-to-speech"
-            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+            element={withSuspense(<TextToSpeechPage {...pageProps("text-to-speech")} />)}
           />
           <Route
             path="/text-to-speech/:recordId"
-            element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+            element={withSuspense(<TextToSpeechPage {...pageProps("text-to-speech")} />)}
           />
           <Route
             path="/studio"
-            element={withSuspense(<StudioPage {...pageProps} />)}
+            element={withSuspense(<StudioPage {...pageProps("studio")} />)}
           />
           <Route
             path="/studio/:projectId"
-            element={withSuspense(<StudioPage {...pageProps} />)}
+            element={withSuspense(<StudioPage {...pageProps("studio")} />)}
           />
           <Route
             path="/voices"
-            element={withSuspense(<VoiceStudioPage {...pageProps} />)}
+            element={withSuspense(<VoiceStudioPage {...pageProps("voices")} />)}
           />
           <Route
             path="/voice-cloning"
@@ -233,11 +241,11 @@ export function AppRoutes() {
           />
           <Route
             path="/transcription"
-            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
           />
           <Route
             path="/transcription/:recordId"
-            element={withSuspense(<SpeechTextPage {...pageProps} />)}
+            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
           />
           <Route path="/diarization" element={<LegacyDiarizationRedirect />} />
           <Route
@@ -246,7 +254,7 @@ export function AppRoutes() {
           />
           <Route
             path="/chat"
-            element={withSuspense(<ChatPage {...pageProps} />)}
+            element={withSuspense(<ChatPage {...pageProps("chat")} />)}
           />
           <Route
             path="/voice"

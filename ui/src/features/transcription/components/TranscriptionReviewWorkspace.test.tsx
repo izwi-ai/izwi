@@ -143,13 +143,13 @@ describe("TranscriptionReviewWorkspace", () => {
       <TranscriptionReviewWorkspace
         record={record}
         showPlayback={false}
-        summaryModelGuidance="Download and load Qwen3.5-4B in Transcription Models to generate summaries."
+        summaryModelGuidance="Download and load Qwen3.5-4B in Transcription models to generate summaries."
       />,
     );
 
     expect(
       screen.getByText(
-        "Download and load Qwen3.5-4B in Transcription Models to generate summaries.",
+        "Download and load Qwen3.5-4B in Transcription models to generate summaries.",
       ),
     ).toBeInTheDocument();
   });

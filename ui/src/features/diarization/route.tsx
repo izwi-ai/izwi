@@ -605,7 +605,7 @@ export function DiarizationPage({
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Diarization Models"
+        title="Diarization models"
         description="Manage diarization pipeline models for /v1/diarizations."
         models={pipelineModels}
         sections={pipelineModelGroups}

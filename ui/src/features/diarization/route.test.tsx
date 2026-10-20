@@ -29,6 +29,7 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("@/api", () => ({
   api: {
+    getHealth: () => Promise.reject(new Error("offline")),
     listDiarizationRecords: apiMocks.listDiarizationRecords,
     listDiarizationRecordPage: apiMocks.listDiarizationRecordPage,
     getDiarizationRecord: apiMocks.getDiarizationRecord,
@@ -859,7 +860,7 @@ describe("DiarizationPage routes", () => {
     fireEvent.click(openModelsButton);
 
     const modelModal = await screen.findByTestId("route-model-modal");
-    expect(modelModal).toHaveTextContent("Diarization Models");
+    expect(modelModal).toHaveTextContent("Diarization models");
     expect(modelModal).toHaveAttribute("data-z-index", "z-[70]");
     expect(modelModal.getAttribute("data-models")).toContain(
       "diar_streaming_sortformer_4spk-v2.1",

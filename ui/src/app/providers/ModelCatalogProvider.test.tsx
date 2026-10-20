@@ -597,3 +597,131 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
     vi.useRealTimers();
   });
 });
+
+describe("ModelCatalogProvider per-page choices", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
+        { ...model, variant: "Kokoro-82M", status: "downloaded" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+  });
+
+  function RouteProbe() {
+    const { selectedModelFor, selectModel, loadModel } = useModelCatalog();
+    return (
+      <div>
+        <span data-testid="chat-choice">{selectedModelFor("chat") ?? "none"}</span>
+        <span data-testid="tts-choice">
+          {selectedModelFor("text-to-speech") ?? "none"}
+        </span>
+        <button type="button" onClick={() => selectModel("Qwen3.5-4B", "chat")}>
+          Pick chat
+        </button>
+        <button
+          type="button"
+          onClick={() => void loadModel("Kokoro-82M", { route: "text-to-speech" })}
+        >
+          Load speech
+        </button>
+      </div>
+    );
+  }
+
+  it("keeps a page's choice when another page loads a model", async () => {
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Pick chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load speech" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("tts-choice")).toHaveTextContent("Kokoro-82M"),
+    );
+    expect(screen.getByTestId("chat-choice")).toHaveTextContent("Qwen3.5-4B");
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("izwi.modelCatalog.routeSelections") ?? "{}",
+      ),
+    ).toEqual({ chat: "Qwen3.5-4B", "text-to-speech": "Kokoro-82M" });
+  });
+
+  it("shows why a load may be slow", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+      warning: "Needs 6.9 GB; macOS reports 4.1 GB free, so it may swap.",
+    });
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Load speech" }));
+    expect(
+      await screen.findByText(/macOS reports 4.1 GB free/),
+    ).toBeInTheDocument();
+  });
+
+  it("refreshes the model list when the window regains focus", async () => {
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await screen.findByRole("button", { name: "Pick chat" });
+    await waitFor(() => expect(apiMocks.listModels).toHaveBeenCalled());
+    const calls = apiMocks.listModels.mock.calls.length;
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(apiMocks.listModels.mock.calls.length).toBeGreaterThan(calls),
+    );
+  });
+
+  it("says nothing about a download that ended before the app opened", async () => {
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      constructor(public url: string) {
+        FakeEventSource.instances.push(this);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "downloading", download_progress: 0 }],
+    });
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RouteProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const stream = FakeEventSource.instances[FakeEventSource.instances.length - 1];
+    act(() => {
+      stream.onmessage?.({
+        data: JSON.stringify({ percent: 0, status: "cancelled" }),
+      });
+    });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(screen.queryByText("Model download cancelled")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+});

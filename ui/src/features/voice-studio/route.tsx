@@ -218,7 +218,8 @@ export function VoiceStudioPage({
       <RouteModelModal
         isOpen={isSavedVoiceModelModalOpen}
         onClose={closeSavedVoiceModelModal}
-        title="Voice Cloning Models"
+        title="Voice cloning models"
+        routeLabel="Voices"
         description="Manage the models that speak with saved and cloned voices."
         models={savedVoiceRouteModels}
         loading={loading}
@@ -238,7 +239,8 @@ export function VoiceStudioPage({
       <RouteModelModal
         isOpen={isDesignModelModalOpen}
         onClose={closeDesignModelModal}
-        title="Voice Design Models"
+        title="Voice design models"
+        routeLabel="Voices"
         description="Manage VoiceDesign models for voice creation."
         models={designRouteModels}
         loading={loading}

@@ -160,8 +160,9 @@ export function ChatPage({
       <RouteModelModal
         isOpen={isSpeechModelModalOpen}
         onClose={() => setIsSpeechModelModalOpen(false)}
-        title="Speech Models"
+        title="Speech models"
         description="Load a Text to Speech model to read replies aloud."
+        routeLabel="Chat"
         models={speechModels}
         loading={loading}
         selectedVariant={readAloudVoice?.modelId ?? null}
@@ -181,8 +182,9 @@ export function ChatPage({
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Chat Models"
-        description="Select, download, load, and unload chat models."
+        title="Chat models"
+        description="Loaded models use memory. Downloaded models use disk."
+        routeLabel="Chat"
         models={chatModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}

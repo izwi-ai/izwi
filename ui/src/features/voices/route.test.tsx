@@ -25,6 +25,7 @@ const typeMocks = vi.hoisted(() => ({
 
 vi.mock("@/api", () => ({
   api: {
+    getHealth: () => Promise.reject(new Error("offline")),
     listSavedVoices: apiMocks.listSavedVoices,
     listSavedVoicePage: apiMocks.listSavedVoicePage,
     deleteSavedVoice: apiMocks.deleteSavedVoice,
@@ -530,10 +531,10 @@ describe("VoicesPage", () => {
     );
 
     const qwenModelRow = await screen.findByTestId(
-      `route-model-row-${qwenVariant}`,
+      `model-row-${qwenVariant}`,
     );
     fireEvent.click(
-      within(qwenModelRow).getByRole("button", { name: /Use model/i }),
+      within(qwenModelRow).getByRole("button", { name: /^Use / }),
     );
     expect(onSelect).toHaveBeenCalledWith(qwenVariant);
 

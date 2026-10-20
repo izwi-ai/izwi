@@ -18,6 +18,7 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("@/api", () => ({
   api: {
+    getHealth: () => Promise.reject(new Error("offline")),
     listChatThreads: apiMocks.listChatThreads,
     createResponse: apiMocks.createResponse,
     updateChatThread: apiMocks.updateChatThread,
@@ -82,7 +83,7 @@ describe("ChatPage route model list", () => {
     );
 
     const modal = await screen.findByRole("dialog");
-    expect(modal).toHaveTextContent("Chat Models");
+    expect(modal).toHaveTextContent("Chat models");
     expect(
       screen.getByText("Qwen3.6 35B-A3B (FP8 MoE)"),
     ).toBeInTheDocument();

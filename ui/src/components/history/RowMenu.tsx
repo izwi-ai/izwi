@@ -4,6 +4,7 @@ import { Loader2, MoreHorizontal, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
@@ -20,6 +21,8 @@ export interface RowMenuItem {
   danger?: boolean;
   /** Draw a separator above this item. */
   separatorBefore?: boolean;
+  /** A setting that is on or off: shown with a check, not the icon. */
+  checked?: boolean;
 }
 
 interface RowMenuProps {
@@ -61,17 +64,27 @@ export function RowMenu({
         {items.map((item) => (
           <Fragment key={item.id}>
             {item.separatorBefore ? <DropdownMenuSeparator /> : null}
-            <DropdownMenuItem
-              disabled={item.disabled}
-              onSelect={item.onSelect}
-              className={cn(
-                item.danger &&
-                  "text-[var(--danger-text)] focus:text-[var(--danger-text)]",
-              )}
-            >
-              <item.icon className="mr-2 h-4 w-4" />
-              {item.label}
-            </DropdownMenuItem>
+            {item.checked !== undefined ? (
+              <DropdownMenuCheckboxItem
+                checked={item.checked}
+                disabled={item.disabled}
+                onSelect={item.onSelect}
+              >
+                {item.label}
+              </DropdownMenuCheckboxItem>
+            ) : (
+              <DropdownMenuItem
+                disabled={item.disabled}
+                onSelect={item.onSelect}
+                className={cn(
+                  item.danger &&
+                    "text-[var(--danger-text)] focus:text-[var(--danger-text)]",
+                )}
+              >
+                <item.icon className="mr-2 h-4 w-4" />
+                {item.label}
+              </DropdownMenuItem>
+            )}
           </Fragment>
         ))}
       </DropdownMenuContent>

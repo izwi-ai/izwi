@@ -206,7 +206,7 @@ export function TranscriptionPage({
     const modelName = resolvedSummaryModel || "Qwen3.5-4B";
     switch (summaryModelStatus) {
       case "downloaded":
-        return `Load ${modelName} in Transcription Models to generate summaries.`;
+        return `Load ${modelName} in Transcription models to generate summaries.`;
       case "downloading":
         return `${modelName} is downloading. Wait for download to complete, then generate the summary.`;
       case "loading":
@@ -214,7 +214,7 @@ export function TranscriptionPage({
       case "not_downloaded":
       case "error":
       default:
-        return `Download and load ${modelName} in Transcription Models to generate summaries.`;
+        return `Download and load ${modelName} in Transcription models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
   const resolvedSpeakerAttributedAsrModel = useMemo(
@@ -1088,10 +1088,10 @@ export function TranscriptionPage({
         onClose={closeModelModal}
         title={
           isDiarizationModelModal
-            ? "Diarization Models"
+            ? "Diarization models"
             : isSpeakerAttributedAsrModelModal
-              ? "Speaker Attributed ASR Models"
-              : "Transcription Models"
+              ? "Speaker-attributed transcription models"
+              : "Transcription models"
         }
         description={
           isDiarizationModelModal

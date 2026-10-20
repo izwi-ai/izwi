@@ -706,7 +706,7 @@ export function VoicesPage({
     <RouteModelModal
       isOpen={isModelModalOpen}
       onClose={closeModelModal}
-      title="Built-in Voice Models"
+      title="Built-in voice models"
       description="Manage the voice models that expose built-in speaker libraries."
       models={routeModels}
       loading={loading}
