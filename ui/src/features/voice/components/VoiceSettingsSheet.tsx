@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import type { ModelInfo } from "@/api";
+import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
@@ -451,17 +452,18 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
               >
                 Cancel
               </button>
-              <button
+              <Button
                 type="button"
+                variant="destructive"
                 disabled={preferences.isMemoryBusy}
                 onClick={() => {
                   setConfirmingForgetAll(false);
                   void preferences.forgetAllMemories();
                 }}
-                className="h-10 rounded-full bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                className="h-10 rounded-full px-4 font-medium"
               >
                 Forget all
-              </button>
+              </Button>
             </>
           ) : (
             <button
