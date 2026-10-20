@@ -1266,7 +1266,7 @@ fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
             Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
                 TestCapacityProvider {
                     snapshot: PhysicalCapacitySnapshot {
-                        capacity: total.clone(),
+                        capacity: total,
                         available: total,
                         source: CapacitySource::Test,
                     },
