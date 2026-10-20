@@ -36,11 +36,19 @@ fn is_closing(ch: char) -> bool {
     matches!(
         ch,
         '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}' | ')' | ']' | '}'
+            // CJK closing quotes and brackets: 」』）】》〉〕］｝〙〛
+            | '\u{300D}' | '\u{300F}' | '\u{FF09}' | '\u{3011}' | '\u{300B}' | '\u{3009}'
+            | '\u{3015}' | '\u{FF3D}' | '\u{FF5D}' | '\u{3019}' | '\u{301B}'
     )
 }
 
+/// Full stops, exclamation and question marks of CJK text, which need no
+/// space after them: 。！？．｡‼⁇⁈⁉
 fn is_cjk_terminator(ch: char) -> bool {
-    matches!(ch, '。' | '！' | '？')
+    matches!(
+        ch,
+        '。' | '！' | '？' | '\u{FF0E}' | '\u{FF61}' | '‼' | '⁇' | '⁈' | '⁉'
+    )
 }
 
 /// Byte ranges of the sentences of `text`, trimmed, in order.
@@ -291,6 +299,18 @@ mod tests {
             .into_iter()
             .map(|span| &text[span])
             .collect()
+    }
+
+    #[test]
+    fn cjk_sentences_keep_their_closing_quotes() {
+        assert_eq!(
+            sentences("「こんにちは。」次の文です！最後？"),
+            vec!["「こんにちは。」", "次の文です！", "最後？"]
+        );
+        assert_eq!(
+            sentences("他说：“好。”然后走了．再见"),
+            vec!["他说：“好。”", "然后走了．", "再见"]
+        );
     }
 
     #[test]
