@@ -13,4 +13,8 @@ pub fn router() -> Router<AppState> {
             "/onboarding/complete",
             axum::routing::post(handlers::complete_onboarding),
         )
+        .route(
+            "/onboarding/reset",
+            axum::routing::post(handlers::reset_onboarding),
+        )
 }

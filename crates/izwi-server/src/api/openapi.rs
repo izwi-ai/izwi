@@ -1106,6 +1106,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/onboarding/reset",
+        "post",
+        "Preferences",
+        "Reset onboarding",
+        "Show first-run setup again; the analytics choice stays.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
         "/v1/preferences",
         "get",
         "Preferences",
@@ -2868,6 +2877,7 @@ mod tests {
             "Render",
             "Reorder",
             "Replace",
+            "Reset",
             "Restore",
             "Rerun",
             "Split",

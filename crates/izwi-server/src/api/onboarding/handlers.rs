@@ -41,6 +41,22 @@ pub async fn complete_onboarding(
     }))
 }
 
+/// Show first-run setup on the next launch ("Run setup again").
+pub async fn reset_onboarding(
+    State(state): State<AppState>,
+) -> Result<Json<OnboardingStateResponse>, ApiError> {
+    let stored = state
+        .onboarding_store
+        .reset()
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(OnboardingStateResponse {
+        completed: stored.completed,
+        completed_at: stored.completed_at,
+        analytics_opt_in: stored.analytics_opt_in,
+    }))
+}
+
 fn map_store_error(err: anyhow::Error) -> ApiError {
     crate::error::store_api_error(err, "Onboarding storage error")
 }
