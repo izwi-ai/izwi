@@ -76,6 +76,7 @@ export function TextToSpeechPage({
   );
   const [recordDeletePending, setRecordDeletePending] = useState(false);
   const [recordCancelPending, setRecordCancelPending] = useState(false);
+  const [recordCancelError, setRecordCancelError] = useState<string | null>(null);
   const [savedVoiceNameById, setSavedVoiceNameById] = useState<
     Record<string, string>
   >({});
@@ -400,14 +401,14 @@ export function TextToSpeechPage({
     }
 
     setRecordCancelPending(true);
-    setRecordActionError(null);
+    setRecordCancelError(null);
     try {
       playback.stop(false);
       const cancelled = await api.cancelTextToSpeechRecord(recordId);
       setStreamingRecord(cancelled.record);
       await Promise.all([refreshRecord(), refreshHistory()]);
     } catch (err) {
-      setRecordActionError(
+      setRecordCancelError(
         err instanceof Error ? err.message : "Failed to cancel generation.",
       );
     } finally {
@@ -479,6 +480,7 @@ export function TextToSpeechPage({
             error={recordError}
             deleteError={recordActionError}
             deletePending={recordDeletePending}
+            actionError={recordCancelError}
             cancelPending={recordCancelPending}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}

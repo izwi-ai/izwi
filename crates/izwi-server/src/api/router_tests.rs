@@ -2315,6 +2315,137 @@ async fn durable_speech_replay_preserves_pcm_stats_and_terminal_cancel() {
     .await;
 }
 
+/// A failed attempt of a speech job that will run again reads as a pending
+/// retry, so the record page keeps polling instead of showing "Failed".
+#[tokio::test]
+async fn a_failed_speech_attempt_with_a_retry_pending_says_so() {
+    use crate::speech_history_store::{
+        NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
+    };
+    let (state, _root) = test_state("speech_retry_pending", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .speech_history_store
+        .create_record(NewSpeechHistoryRecord {
+            stop_reason: None,
+            route_kind: SpeechRouteKind::TextToSpeech,
+            processing_status: SpeechHistoryProcessingStatus::Failed,
+            processing_error: Some("Metal out of memory".into()),
+            model_id: Some("Kokoro-82M".into()),
+            speaker: None,
+            language: None,
+            saved_voice_id: None,
+            speed: None,
+            input_text: "hello".into(),
+            voice_description: None,
+            reference_text: None,
+            generation_time_ms: 0.0,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            audio_mime_type: "audio/wav".into(),
+            audio_filename: None,
+            audio_bytes: AudioEncoder::new(24000, 1)
+                .encode(&[0.0], AudioFormat::Wav)
+                .unwrap(),
+        })
+        .await
+        .unwrap();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let path = format!("/v1/text-to-speech/{}", record.id);
+    let retry_pending = |app: axum::Router| {
+        let path = path.clone();
+        async move {
+            read_json(send_request(app, build_request(Method::GET, &path, None)).await).await
+                ["retry_pending"]
+                .clone()
+        }
+    };
+    assert_eq!(retry_pending(app.clone()).await, false);
+
+    state.batch_runtime_store.create_job(NewRuntimeJob {
+        job_kind: RuntimeJobKind::TtsSpeech, status: RuntimeJobStatus::Retrying, priority: 0,
+        model_id: Some("Kokoro-82M".into()), capability: Some("tts".into()),
+        route_record_kind: Some("text_to_speech".into()), route_record_id: Some(record.id.clone()),
+        input_media_asset_id: None, input_text_asset_id: None,
+        request_json: serde_json::json!({"route_kind":"text_to_speech","model_id":"Kokoro-82M","input_text":"hello","request":{}}),
+        model_snapshot_json: serde_json::json!({"version":1}), retry_policy_json: serde_json::json!({}),
+        max_attempts: 3, idempotency_key: None, correlation_id: None,
+    }).await.unwrap();
+    assert_eq!(retry_pending(app).await, true);
+}
+
+/// A text-to-speech stream runs in this process, not as a durable job:
+/// cancelling its record aborts the stream task and says why it stopped.
+#[tokio::test]
+async fn cancelling_a_speech_stream_aborts_its_task() {
+    use crate::speech_history_store::{
+        NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
+    };
+    let (state, _root) = test_state("cancelling_a_speech_stream", false);
+    state.lifecycle.mark_ready();
+    let record = state
+        .speech_history_store
+        .create_record(NewSpeechHistoryRecord {
+            stop_reason: None,
+            route_kind: SpeechRouteKind::TextToSpeech,
+            processing_status: SpeechHistoryProcessingStatus::Processing,
+            processing_error: None,
+            model_id: Some("Kokoro-82M".into()),
+            speaker: None,
+            language: None,
+            saved_voice_id: None,
+            speed: None,
+            input_text: "hello".into(),
+            voice_description: None,
+            reference_text: None,
+            generation_time_ms: 0.0,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            audio_mime_type: "audio/wav".into(),
+            audio_filename: None,
+            audio_bytes: AudioEncoder::new(24000, 1)
+                .encode(&[0.0], AudioFormat::Wav)
+                .unwrap(),
+        })
+        .await
+        .unwrap();
+    let stream = tokio::spawn(std::future::pending::<()>());
+    state
+        .speech_stream_tasks
+        .insert(&record.id, stream.abort_handle());
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+
+    let response = send_request(
+        app,
+        build_request(
+            Method::POST,
+            &format!("/v1/text-to-speech/{}/cancel", record.id),
+            Some("{}"),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["record"]["processing_status"], "failed");
+    assert_eq!(body["record"]["processing_error"], "Cancelled by user.");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), stream)
+        .await
+        .expect("the aborted task ends");
+    assert!(outcome.unwrap_err().is_cancelled());
+}
+
 #[tokio::test]
 async fn deleting_durable_speech_removes_opaque_replay_reference() {
     let (state, _root) = test_state("durable_speech_delete_replay", false);

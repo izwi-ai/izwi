@@ -54,6 +54,8 @@ interface TextToSpeechRecordDetailProps {
   loading?: boolean;
   error?: string | null;
   deleteError?: string | null;
+  /** Why an action on the page (cancel) failed. */
+  actionError?: string | null;
   deletePending?: boolean;
   cancelPending?: boolean;
   onCancel?: () => Promise<void> | void;
@@ -71,6 +73,7 @@ export function TextToSpeechRecordDetail({
   loading = false,
   error = null,
   deleteError = null,
+  actionError = null,
   deletePending = false,
   cancelPending = false,
   onCancel,
@@ -90,8 +93,20 @@ export function TextToSpeechRecordDetail({
     [record?.processing_error, record?.processing_status],
   );
   const hasAudio = Boolean(audioUrl) && processingStatus === "ready";
-  const canCancel = processingStatus === "pending" || processingStatus === "processing";
+  // A failed attempt that will run again is still in progress.
+  const retrying = processingStatus === "failed" && Boolean(record?.retry_pending);
+  const canCancel =
+    processingStatus === "pending" || processingStatus === "processing" || retrying;
+  const truncated =
+    processingStatus === "ready" &&
+    (record?.stop_reason === "length" || record?.stop_reason === "context_length");
   const statusMessage = useMemo(() => {
+    if (retrying) {
+      return `Retrying after an error: ${record?.processing_error || "the last attempt failed"}.`;
+    }
+    if (truncated) {
+      return "The model reached its length limit before the end of the script, so the audio may stop early. Split the script or use a model with a longer limit.";
+    }
     switch (processingStatus) {
       case "pending":
         return "This generation is queued and will start shortly.";
@@ -103,7 +118,8 @@ export function TextToSpeechRecordDetail({
       default:
         return null;
     }
-  }, [processingStatus, record?.processing_error]);
+  }, [processingStatus, record?.processing_error, retrying, truncated]);
+  const statusIsError = processingStatus === "failed" && !retrying;
 
   async function handleCopyInput(): Promise<void> {
     if (!record?.input_text) {
@@ -215,32 +231,32 @@ export function TextToSpeechRecordDetail({
         </>
       }
     >
-      {error ? (
+      {error || actionError ? (
         <Card
           className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
           role="alert"
           aria-live="assertive"
         >
-          {error}
+          {error ?? actionError}
         </Card>
       ) : null}
 
       {statusMessage ? (
         <Card
-          role={processingStatus === "failed" ? "alert" : "status"}
-          aria-live={processingStatus === "failed" ? "assertive" : "polite"}
+          role={statusIsError ? "alert" : "status"}
+          aria-live={statusIsError ? "assertive" : "polite"}
           aria-atomic="true"
           className={
-            processingStatus === "failed"
+            statusIsError
               ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
               : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
           }
         >
           <div className="flex items-start gap-3">
-            {processingStatus === "failed" ? (
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            ) : (
+            {canCancel ? (
               <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+            ) : (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
             )}
             <p>{statusMessage}</p>
           </div>

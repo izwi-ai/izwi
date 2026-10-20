@@ -90,7 +90,7 @@ describe("route-owned speech stream", () => {
     expect(mocks.cancel).not.toHaveBeenCalled();
   });
 
-  it("aborts transport, cancels generation and ignores late chunks on navigation", async () => {
+  it("detaches on navigation: playback stops, the take goes on, late chunks are ignored", async () => {
     const { result, rerender } = renderHook(({ id }: { id?: string }) => useSpeechStreamPlayback(id, {}), {
       initialProps: { id: undefined as string | undefined },
     });
@@ -98,7 +98,8 @@ describe("route-owned speech stream", () => {
     rerender({ id: "record" });
     rerender({ id: "another-record" });
     expect(controller.signal.aborted).toBe(true);
-    expect(mocks.cancel).toHaveBeenCalledWith("record");
+    // The server finishes the take into history; only Stop cancels it.
+    expect(mocks.cancel).not.toHaveBeenCalled();
     await act(async () => { await events.onChunk?.({ requestId: "request", sequence: 0, sampleCount: 1, audioBase64: "AAA=" }); });
     expect(mocks.push).not.toHaveBeenCalled();
   });

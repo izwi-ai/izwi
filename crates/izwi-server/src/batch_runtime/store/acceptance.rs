@@ -276,6 +276,7 @@ impl BatchRuntimeStore {
         let text_sha256 = sha256_hex(input_text.as_bytes());
         let record = SpeechHistoryRecord {
             stop_reason: None,
+            retry_pending: false,
             id: record_id.clone(),
             created_at: now_u64,
             route_kind: SpeechRouteKind::TextToSpeech,

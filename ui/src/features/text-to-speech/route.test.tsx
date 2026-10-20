@@ -1132,6 +1132,10 @@ describe("TextToSpeechPage", () => {
         : screen.getByRole("button", { name: "Stop generation and playback" }),
     );
     expect(controller.signal.aborted).toBe(true);
+    // Leaving detaches: the server finishes the take into history.
+    if (leave) {
+      expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
+    }
     if (durable && leave) {
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
       // Returning to the record must not revive stale transport callbacks or
@@ -1142,7 +1146,8 @@ describe("TextToSpeechPage", () => {
       await act(async () => { streamEvents.onError?.("late disconnected callback"); });
       expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
       expect(screen.queryByText("late disconnected callback")).not.toBeInTheDocument();
-    } else {
+    } else if (!leave) {
+      // Stop cancels the take.
       expect(apiMocks.cancelTextToSpeechRecord).toHaveBeenCalledWith("tts-created-1");
     }
   });

@@ -373,16 +373,15 @@ impl Drop for RegisteredDiarizationJob {
     }
 }
 
-/// The in-process transcription tasks of this process (streamed jobs), by
-/// record id. A stream's task outlives its client, so a reload or a closed
-/// window does not lose the job; cancelling the record aborts the task,
-/// which drops its runtime call and stops the engine request.
+/// In-process tasks of this process by record id: streamed transcriptions
+/// and text-to-speech streams. A stream's task outlives its client, so a
+/// reload, a closed window or navigating away does not lose the job;
+/// cancelling the record aborts the task, which drops its runtime call and
+/// stops the engine request.
 #[derive(Debug, Clone, Default)]
-pub struct TranscriptionTaskRegistry(
-    Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>,
-);
+pub struct RecordTaskRegistry(Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>);
 
-impl TranscriptionTaskRegistry {
+impl RecordTaskRegistry {
     /// Track `record_id`'s task until it finishes.
     pub fn insert(&self, record_id: &str, handle: tokio::task::AbortHandle) {
         let mut tasks = self.tasks();
@@ -447,7 +446,9 @@ pub struct AppState {
     /// Diarization jobs running in this process.
     pub diarization_jobs: DiarizationJobRegistry,
     /// Streamed transcription tasks running in this process.
-    pub transcription_tasks: TranscriptionTaskRegistry,
+    pub transcription_tasks: RecordTaskRegistry,
+    /// Text-to-speech stream tasks running in this process.
+    pub speech_stream_tasks: RecordTaskRegistry,
     /// SQLite-backed speech generation history store.
     pub speech_history_store: Arc<SpeechHistoryStore>,
     /// SQLite-backed saved voice store.
@@ -546,7 +547,8 @@ impl AppState {
             transcription_store,
             diarization_store,
             diarization_jobs: DiarizationJobRegistry::default(),
-            transcription_tasks: TranscriptionTaskRegistry::default(),
+            transcription_tasks: RecordTaskRegistry::default(),
+            speech_stream_tasks: RecordTaskRegistry::default(),
             speech_history_store,
             saved_voice_store,
             onboarding_store,
@@ -653,7 +655,8 @@ impl AppState {
             transcription_store,
             diarization_store,
             diarization_jobs: DiarizationJobRegistry::default(),
-            transcription_tasks: TranscriptionTaskRegistry::default(),
+            transcription_tasks: RecordTaskRegistry::default(),
+            speech_stream_tasks: RecordTaskRegistry::default(),
             speech_history_store,
             saved_voice_store,
             onboarding_store,

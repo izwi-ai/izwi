@@ -391,6 +391,10 @@ pub struct SpeechHistoryRecord {
     /// model reported it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// A failed attempt whose durable job will run again: the record reads
+    /// "failed" with the attempt's error until the retry starts.
+    #[serde(default)]
+    pub retry_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1396,7 +1400,15 @@ const SPEECH_HISTORY_RECORD_COLUMNS: &str = r#"
     tokens_generated,
     audio_mime_type,
     audio_filename,
-    stop_reason
+    stop_reason,
+    (processing_status = 'failed' AND EXISTS (
+        SELECT 1
+        FROM runtime_jobs j
+        WHERE j.job_kind = 'tts_speech'
+          AND j.route_record_kind = speech_history_records.route_kind
+          AND j.route_record_id = speech_history_records.id
+          AND j.status IN ('queued', 'running', 'retrying')
+    )) AS retry_pending
 "#;
 
 async fn fetch_record_without_audio(
@@ -1562,6 +1574,7 @@ fn map_speech_history_record(row: &QueryResult) -> anyhow::Result<SpeechHistoryR
         audio_mime_type: row.try_get_by_index(17)?,
         audio_filename: row.try_get_by_index(18)?,
         stop_reason: row.try_get_by_index(19)?,
+        retry_pending: row.try_get_by_index::<Option<bool>>(20)?.unwrap_or(false),
     })
 }
 

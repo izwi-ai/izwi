@@ -136,6 +136,11 @@ export interface SpeechHistoryRecord {
   tokens_generated: number | null;
   audio_mime_type: string;
   audio_filename: string | null;
+  /** Why generation ended: `stop`, or `length`/`context_length` when the
+   * model ran out of room before the end of the text. */
+  stop_reason?: string | null;
+  /** A failed attempt whose job will run again. */
+  retry_pending?: boolean;
 }
 
 export interface CancelSpeechHistoryRecordResponse {

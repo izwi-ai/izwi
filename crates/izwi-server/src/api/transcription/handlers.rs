@@ -1051,7 +1051,7 @@ fn send_stream_event_lossy(
 /// Run a streamed transcription in this process. The job outlives its SSE
 /// client: a reload or a closed window stops the events, not the job, and
 /// the job page follows it by polling. Cancelling the record aborts the task
-/// (`TranscriptionTaskRegistry`), which drops the runtime call and with it
+/// (`RecordTaskRegistry`), which drops the runtime call and with it
 /// the engine request.
 fn spawn_transcription_processing_task(
     state: AppState,
@@ -2527,7 +2527,7 @@ mod tests {
 
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = DropFlag(dropped.clone());
-        let tasks = crate::state::TranscriptionTaskRegistry::default();
+        let tasks = crate::state::RecordTaskRegistry::default();
         let task = tokio::spawn(async move {
             let _flag = flag;
             std::future::pending::<()>().await;

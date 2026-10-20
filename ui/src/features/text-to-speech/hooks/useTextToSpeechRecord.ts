@@ -95,7 +95,12 @@ export function useTextToSpeechRecord(
       record.processing_status,
       record.processing_error,
     );
-    return processingStatus === "pending" || processingStatus === "processing";
+    // A failed attempt whose job will run again is still in progress.
+    return (
+      processingStatus === "pending" ||
+      processingStatus === "processing" ||
+      (processingStatus === "failed" && Boolean(record.retry_pending))
+    );
   }, [record]);
 
   useEffect(() => {

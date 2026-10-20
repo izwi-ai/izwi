@@ -42,10 +42,12 @@ export function useSpeechStreamPlayback(
     setStatus("idle");
   }, [dispose]);
 
-  useEffect(() => () => dispose(!session.current?.durable), [dispose]);
+  // Leaving the page or opening another record stops playback, not the
+  // take: the server finishes it into history. Only Stop cancels it.
+  useEffect(() => () => dispose(false), [dispose]);
   useEffect(() => {
     const current = session.current;
-    if (current && (current.recordId ?? current.originRecordId) !== recordId) stop(!current.durable);
+    if (current && (current.recordId ?? current.originRecordId) !== recordId) stop(false);
   }, [recordId, stop]);
 
   const begin = useCallback((request?: SpeechHistoryRecordCreateRequest, existingRecord?: SpeechHistoryRecord) => {

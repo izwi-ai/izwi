@@ -70,6 +70,16 @@ use izwi_hooks::Principal;
 
 const HISTORY_LIST_LIMIT: usize = 200;
 const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
+
+/// A task handle that aborts its task when dropped, so a cancelled stream
+/// does not leave its generation running detached.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 pub(crate) const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
 const REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const DURABLE_TTS_IDEMPOTENCY_OPERATION: &str = "speech.text_to_speech.create";
@@ -581,6 +591,21 @@ pub async fn cancel_text_to_speech_record(
         "Cancelled by speech history request",
     )
     .await?;
+    // A stream runs in this process, not as a durable job: abort its task,
+    // which stops the model, and say why the record stopped.
+    let record = match record {
+        None if state.speech_stream_tasks.abort(&record_id) => state
+            .speech_history_store
+            .update_processing_status(
+                SpeechRouteKind::TextToSpeech,
+                record_id.clone(),
+                SpeechHistoryProcessingStatus::Failed,
+                Some("Cancelled by user.".to_string()),
+            )
+            .await
+            .map_err(map_store_error)?,
+        other => other,
+    };
     let record = match record {
         Some(record) => record,
         None => state
@@ -2064,7 +2089,9 @@ async fn stream_record_creation(
     )
     .await;
 
-    tokio::spawn(async move {
+    let stream_tasks = state.speech_stream_tasks.clone();
+    let task_record_id = placeholder_record_id.clone();
+    let stream_task = tokio::spawn(async move {
         let mark_failed = |message: String| {
             let event_tx = event_tx.clone();
             let speech_store = speech_store.clone();
@@ -2177,6 +2204,10 @@ async fn stream_record_creation(
         let mut global_sequence = 0usize;
         let mut failed = false;
         let mut failure_message: Option<String> = None;
+        // A client that leaves (navigation, a closed window) stops the events,
+        // not the take: generation runs on into the record, which the history
+        // page shows when it is ready. Cancel stops it (`speech_stream_tasks`).
+        let mut client_gone = false;
         for (request_index, request) in planned_requests.into_iter().enumerate() {
             // A later long-form segment opens with a short pause and fades in
             // (TPIPE-5); its predecessor's PCM is already sent.
@@ -2185,7 +2216,8 @@ async fn stream_record_creation(
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
             let generation_engine = runtime.clone();
             let runner_state = admission_state.clone();
-            let generation_task = tokio::spawn(async move {
+            // Aborting this stream task (cancel) must stop the model too.
+            let mut generation_task = AbortOnDrop(tokio::spawn(async move {
                 if variant == ModelVariant::FishAudioS2Pro {
                     crate::api::tts_long_form::generate_speech_plan_stream(
                         &runner_state,
@@ -2200,21 +2232,23 @@ async fn stream_record_creation(
                         .generate_streaming(request, chunk_tx)
                         .await
                 }
-            });
+            }));
 
             let mut encoding_failed = false;
-            let mut stream_closed = false;
             loop {
-                // A client that leaves is noticed while the model is still
-                // generating, not only at the next event send (TPIPE-8).
-                let chunk = match next_stream_input(&mut chunk_rx, &event_tx.sender).await {
-                    StreamInput::Chunk(chunk) => chunk,
-                    StreamInput::Finished => break,
-                    StreamInput::Disconnected => {
-                        failure_message
-                            .get_or_insert_with(|| STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string());
-                        stream_closed = true;
-                        break;
+                let chunk = if client_gone {
+                    match chunk_rx.recv().await {
+                        Some(chunk) => chunk,
+                        None => break,
+                    }
+                } else {
+                    match next_stream_input(&mut chunk_rx, &event_tx.sender).await {
+                        StreamInput::Chunk(chunk) => chunk,
+                        StreamInput::Finished => break,
+                        StreamInput::Disconnected => {
+                            client_gone = true;
+                            continue;
+                        }
                     }
                 };
                 // Terminal-only chunks carry committed frame counts and execution
@@ -2315,6 +2349,10 @@ async fn stream_record_creation(
                     break;
                 }
 
+                if client_gone {
+                    global_sequence = global_sequence.saturating_add(1);
+                    continue;
+                }
                 if let Err(message) = send_stream_event(
                     &event_tx,
                     SpeechStreamEvent {
@@ -2346,11 +2384,9 @@ async fn stream_record_creation(
                         sequence = global_sequence,
                         elapsed_ms = stream_entry_started.elapsed().as_millis(),
                         error = message,
-                        "Speech stream PCM delivery failed"
+                        "Speech stream PCM delivery failed; the take continues"
                     );
-                    failure_message = Some(message.to_string());
-                    stream_closed = true;
-                    break;
+                    client_gone = true;
                 }
                 global_sequence = global_sequence.saturating_add(1);
             }
@@ -2360,16 +2396,13 @@ async fn stream_record_creation(
             statistics_measured &= request_statistics.measured;
             stop_reasons.push(request_statistics.stop_reason);
             drop(chunk_rx);
-            if encoding_failed || stream_closed {
-                // Nobody will receive the audio: cancel the generation rather
-                // than wait for it to finish.
-                generation_task.abort();
+            if encoding_failed {
+                // The take cannot be stored: stop the generation rather than
+                // wait for it to finish.
+                generation_task.0.abort();
             }
-            let generation_outcome = generation_task.await;
-            if encoding_failed || stream_closed {
-                if stream_closed && failure_message.is_none() {
-                    failure_message = Some(STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string());
-                }
+            let generation_outcome = (&mut generation_task.0).await;
+            if encoding_failed {
                 let _ = generation_outcome;
                 failed = true;
                 break;
@@ -2513,6 +2546,7 @@ async fn stream_record_creation(
         )
         .await;
     });
+    stream_tasks.insert(&task_record_id, stream_task.abort_handle());
 
     Ok(speech_stream_response(event_rx))
 }
