@@ -485,7 +485,7 @@ describe("ChatPlayground", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
 
-    expect(await screen.findByText("Chat History")).toBeInTheDocument();
+    expect(await screen.findByText("Chat history")).toBeInTheDocument();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Delete Royal families in Europe" }),
@@ -497,7 +497,7 @@ describe("ChatPlayground", () => {
     expect(
       await screen.findByRole("button", { name: "Cancel" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Chat History")).toBeInTheDocument();
+    expect(screen.getByText("Chat history")).toBeInTheDocument();
     expect(
       screen.getAllByText("Royal families in Europe").length,
     ).toBeGreaterThan(0);
@@ -507,7 +507,7 @@ describe("ChatPlayground", () => {
     await waitFor(() =>
       expect(screen.queryByText("Delete chat thread?")).not.toBeInTheDocument(),
     );
-    expect(screen.getByText("Chat History")).toBeInTheDocument();
+    expect(screen.getByText("Chat history")).toBeInTheDocument();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Delete Royal families in Europe" }),
@@ -1064,7 +1064,7 @@ describe("ChatPlayground", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
-    let drawer = await screen.findByRole("dialog", { name: "Chat History" });
+    let drawer = await screen.findByRole("dialog", { name: "Chat history" });
     fireEvent.click(within(drawer).getByRole("button", { name: "Thread B" }));
 
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
@@ -1091,7 +1091,7 @@ describe("ChatPlayground", () => {
 
     act(() => streamCallbacks?.onClose());
     fireEvent.click(screen.getByRole("button", { name: /History/ }));
-    drawer = await screen.findByRole("dialog", { name: "Chat History" });
+    drawer = await screen.findByRole("dialog", { name: "Chat history" });
     fireEvent.click(within(drawer).getByRole("button", { name: "Thread A" }));
 
     await waitFor(() =>

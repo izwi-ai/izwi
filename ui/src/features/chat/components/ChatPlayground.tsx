@@ -1973,7 +1973,7 @@ export function ChatPlayground({
         {showThreadColumn ? null : (
         <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
           <RouteHistoryDrawer
-            title="Chat History"
+            title="Chat history"
             countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
             open={isHistoryDrawerOpen}
             onOpenChange={handleHistoryDrawerOpenChange}

@@ -599,14 +599,14 @@ export function VoicesPage({
                 ? `No voice matches "${voiceSearch.trim()}".`
                 : activeTab === "all"
                 ? routeModels.length === 0
-                  ? "Save a voice or load a supported built-in voice model to populate the library."
-                  : "Save a voice from voice cloning or voice design to build out your library."
+                  ? "Clone or design a voice with New voice, or load a model with built-in voices."
+                  : "Clone a voice from a short recording, or design one from a description, with New voice."
                 : activeTab === "saved"
                   ? savedVoicesLoading
-                    ? "Fetching your reusable cloned and designed voices."
-                    : "Save a result from voice cloning or voice design to build a reusable voice library."
+                    ? "Fetching your cloned and designed voices."
+                    : "Clone a voice from a short recording, or design one from a description, with New voice."
                   : routeModels.length === 0
-                    ? "Load a CustomVoice, Kokoro, or Voxtral TTS model to browse built-in voices."
+                    ? "Load Kokoro, Qwen3-TTS CustomVoice or Voxtral TTS to browse their built-in voices."
                     : "Try a different built-in voice model."
             }
             className="mt-1"

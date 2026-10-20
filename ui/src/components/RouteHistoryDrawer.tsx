@@ -19,7 +19,6 @@ interface RouteHistoryDrawerControls {
 interface RouteHistoryDrawerProps {
   title: string;
   countLabel: string;
-  eyebrow?: string;
   headerIcon?: LucideIcon;
   triggerLabel?: string;
   triggerCount?: number;
@@ -34,7 +33,6 @@ interface RouteHistoryDrawerProps {
 export function RouteHistoryDrawer({
   title,
   countLabel,
-  eyebrow = "History",
   headerIcon: HeaderIcon = History,
   triggerLabel = "History",
   triggerCount,
@@ -100,19 +98,15 @@ export function RouteHistoryDrawer({
 
       <SheetContent
         side="right"
-        className="w-[min(92vw,28rem)] max-w-[28rem] gap-0 border-l border-border/70 bg-background/95 p-0"
+        className="w-[min(92vw,22rem)] max-w-[22rem] gap-0 border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] p-0"
       >
-        <SheetHeader className="gap-0 border-b border-border/70 px-5 py-5 pr-14 sm:px-6">
+        <SheetHeader className="gap-0 border-b border-[var(--border-subtle)] px-5 py-4 pr-14">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0 flex-1">
-              <div className="inline-flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                <HeaderIcon className="h-3.5 w-3.5" />
-                {eyebrow}
-              </div>
-              <SheetTitle className="mt-2 text-base tracking-tight">
+              <SheetTitle className="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
                 {title}
               </SheetTitle>
-              <SheetDescription className="mt-1 text-xs">
+              <SheetDescription className="mt-0.5 text-xs text-[var(--text-muted)]">
                 {countLabel}
               </SheetDescription>
             </div>
@@ -124,7 +118,7 @@ export function RouteHistoryDrawer({
 
         <div
           className={cn(
-            "flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-5 py-4 sm:px-6 sm:py-5",
+            "flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-4 py-4",
             bodyClassName,
           )}
         >
