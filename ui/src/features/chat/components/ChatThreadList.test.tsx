@@ -78,4 +78,34 @@ describe("ChatThreadList", () => {
       ).not.toBeInTheDocument(),
     );
   });
+
+  it("finds chats by what was said, using the server's search", async () => {
+    const now = Date.now();
+    const searchThreads = vi.fn(async () => [thread("b", "Podcast intro", now)]);
+    render(
+      <ChatThreadList
+        threads={[thread("a", "Monstera care", now), thread("b", "Podcast intro", now)]}
+        activeThreadId={null}
+        loading={false}
+        busy={false}
+        onSelect={vi.fn()}
+        onDelete={vi.fn()}
+        onNewChat={vi.fn()}
+        searchThreads={searchThreads}
+      />,
+    );
+    const chats = screen.getByRole("navigation", { name: "Chats" });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search chats" }), {
+      target: { value: "watering" },
+    });
+    // No title says "watering"; the reply in "Podcast intro" does.
+    await waitFor(() => expect(searchThreads).toHaveBeenCalledWith("watering"));
+    expect(
+      await within(chats).findByRole("button", { name: "Podcast intro" }),
+    ).toBeInTheDocument();
+    expect(
+      within(chats).queryByRole("button", { name: "Monstera care" }),
+    ).not.toBeInTheDocument();
+  });
 });

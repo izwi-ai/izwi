@@ -76,7 +76,10 @@ describe("ChatPage route model list", () => {
     ]);
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Chat model" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Manage chat models…" }),
+    );
 
     const modal = await screen.findByRole("dialog");
     expect(modal).toHaveTextContent("Chat Models");

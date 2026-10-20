@@ -109,6 +109,7 @@ describe("ChatPlayground", () => {
   });
 
   it("opens the composer model dropdown and keeps the send action icon-only", async () => {
+    const onOpenModelManager = vi.fn();
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
@@ -124,14 +125,22 @@ describe("ChatPlayground", () => {
               isReady: true,
             },
             {
+              value: "Qwen3.5-2B",
+              label: "Qwen3.5 2B",
+              statusLabel: "Downloaded",
+              isReady: false,
+              status: "downloaded",
+            },
+            {
               value: "Qwen3.8-27B-FP8",
               label: "Qwen3.8 27B (FP8)",
-              statusLabel: "Not loaded",
+              statusLabel: "Not downloaded",
               isReady: false,
+              status: "not_downloaded",
             },
           ]}
           onSelectModel={vi.fn()}
-          onOpenModelManager={vi.fn()}
+          onOpenModelManager={onOpenModelManager}
           onModelRequired={vi.fn()}
         />
       </MemoryRouter>,
@@ -146,16 +155,23 @@ describe("ChatPlayground", () => {
         name: "Chat model",
       }),
     ).toBe(modelPicker);
+    expect(screen.queryByRole("button", { name: "Models" })).not.toBeInTheDocument();
     fireEvent.click(modelPicker);
 
-    const qwen38Option = await screen.findByRole("option", {
-      name: /Qwen3.8 27B/,
-    });
-    expect(qwen38Option).toBeInTheDocument();
-    fireEvent.keyDown(document.activeElement ?? qwen38Option, { key: "Escape" });
+    // Models on this device, by name; the rest are in the model manager.
+    const listbox = await screen.findByRole("listbox");
+    expect(
+      within(listbox).getAllByRole("option").map((option) => option.textContent),
+    ).toEqual(["Qwen3.5 4B GGUF (Q4_K_M)", "Qwen3.5 2B", "Manage chat models…"]);
+    expect(
+      within(listbox).getByRole("option", { name: "Qwen3.5 4B GGUF (Q4_K_M)" }),
+    ).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(within(listbox).getByRole("option", { name: "Manage chat models…" }));
+    expect(onOpenModelManager).toHaveBeenCalledOnce();
     await waitFor(() =>
       expect(screen.queryByRole("listbox")).not.toBeInTheDocument(),
     );
+    expect(modelPicker).toHaveTextContent("Qwen3.5 4B GGUF (Q4_K_M)");
 
     const sendButton = screen.getByRole("button", { name: "Send message" });
     expect(sendButton).toBeInTheDocument();
@@ -611,7 +627,6 @@ describe("ChatPlayground", () => {
 
     const composerActions = screen.getByTestId("chat-composer-actions");
     const attachImageButton = screen.getByRole("button", { name: "Attach image" });
-    const modelsButton = screen.getByRole("button", { name: "Models" });
     const thinkingButton = screen.getByRole("button", {
       name: "Disable thinking mode",
     });
@@ -620,8 +635,7 @@ describe("ChatPlayground", () => {
 
     const actionButtons = within(composerActions).getAllByRole("button");
     expect(actionButtons[0]).toBe(attachImageButton);
-    expect(actionButtons[1]).toBe(modelsButton);
-    expect(actionButtons[2]).toBe(thinkingButton);
+    expect(actionButtons[1]).toBe(thinkingButton);
 
     const imageInput = screen.getByTestId("chat-image-input");
     const imageFile = new File(["image"], "sample.png", { type: "image/png" });
@@ -2307,6 +2321,8 @@ describe("ChatPlayground", () => {
       await screen.findByText("Hello there");
       const callbacks = await send("Tell me a story");
       act(() => callbacks.onDelta("Once upon"));
+      // The model a reply streams from does not change under it.
+      expect(screen.getByRole("combobox", { name: "Chat model" })).toBeDisabled();
 
       act(() => void router.navigate?.("/chat?threadId=other-thread"));
       expect(await screen.findByText("Other answer")).toBeInTheDocument();

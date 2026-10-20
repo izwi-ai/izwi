@@ -395,9 +395,11 @@ export class ChatApiClient {
     };
   }
 
-  async listChatThreads(): Promise<ChatThread[]> {
+  /** Threads, newest first; `q` matches titles and message text. */
+  async listChatThreads(options?: { q?: string }): Promise<ChatThread[]> {
+    const query = options?.q ? `?q=${encodeURIComponent(options.q)}` : "";
     const payload = await this.http.request<{ threads: ChatThread[] }>(
-      "/chat/threads",
+      `/chat/threads${query}`,
     );
     return payload.threads;
   }

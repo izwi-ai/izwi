@@ -16,7 +16,6 @@ import {
   Send,
   Square,
   Loader2,
-  Settings2,
   Plus,
   Trash2,
   AlertTriangle,
@@ -77,7 +76,7 @@ import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
-import { RouteModelSelect } from "@/components/RouteModelSelect";
+import { ChatModelPicker } from "@/features/chat/components/ChatModelPicker";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
 
@@ -475,10 +474,13 @@ export function ChatPlayground({
     : false;
   const chatSecondaryButtonClass =
     "rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]";
-  const chatSecondaryButtonActiveClass =
-    "rounded-lg border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-primary)] shadow-none";
   const chatAccentButtonClass =
     "rounded-lg bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-none hover:opacity-90";
+  // The composer's controls are pills, like its model picker.
+  const composerPillClass =
+    "h-9 rounded-full border border-[var(--border-default)] bg-transparent text-[13.5px] text-[var(--text-primary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--accent-soft)]";
+  const composerPillActiveClass =
+    "border-[var(--border-strong)] bg-[var(--accent-soft)]";
   const chatComposerSendButtonClass =
     "chat-composer-send-button rounded-full border-transparent text-[var(--text-primary)] shadow-none";
 
@@ -918,6 +920,11 @@ export function ChatPlayground({
     textareaRef.current?.focus();
   }, [activeThreadId, isPreparingThread, isStreaming, setActiveThreadInUrl]);
 
+  const searchThreads = useCallback(
+    (query: string) => api.listChatThreads({ q: query }),
+    [],
+  );
+
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
     setDeleteTargetThreadId(threadId);
   }, []);
@@ -1094,6 +1101,8 @@ export function ChatPlayground({
         });
         setThreads((previous) => [createdThread, ...previous]);
         setActiveThreadInUrl(createdThread.id);
+        // The stream can answer before the new URL renders.
+        activeThreadIdRef.current = createdThread.id;
         setMessages([]);
         setExpandedThoughts({});
         targetThreadId = createdThread.id;
@@ -1639,20 +1648,14 @@ export function ChatPlayground({
     }
   };
 
-  const handleOpenModels = () => {
-    onOpenModelManager();
-  };
-
   const renderModelSelector = (menuPlacement: "top" | "bottom") => (
-    <RouteModelSelect
+    <ChatModelPicker
       value={selectedModel}
       options={modelOptions}
       onSelect={onSelectModel}
+      onManage={onOpenModelManager}
       disabled={busy}
       menuPlacement={menuPlacement}
-      aria-label="Chat model"
-      className="w-[180px] max-w-[calc(100vw-12rem)] sm:w-[220px]"
-      triggerClassName="h-8 text-xs"
     />
   );
 
@@ -1791,7 +1794,7 @@ export function ChatPlayground({
               size="icon"
               onClick={openImagePicker}
               disabled={isStreaming || isPreparingThread || isReadingImages}
-              className={cn("h-8 w-8 border p-0", chatSecondaryButtonClass)}
+              className={cn("w-9 p-0", composerPillClass)}
               title="Attach image"
               aria-label="Attach image"
             >
@@ -1803,20 +1806,12 @@ export function ChatPlayground({
             </Button>
           )}
           {renderModelSelector(centered ? "bottom" : "top")}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleOpenModels}
-            className={cn("h-8 gap-1.5 border text-xs", chatSecondaryButtonClass)}
-          >
-            <Settings2 className="w-3.5 h-3.5" />
-            Models
-          </Button>
           {supportsThinking && !thinkingToggleable && (
             <span
               className={cn(
-                "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium",
-                chatSecondaryButtonActiveClass,
+                "inline-flex items-center gap-1.5 px-3.5",
+                composerPillClass,
+                composerPillActiveClass,
               )}
               title="This model always thinks before it answers"
             >
@@ -1831,10 +1826,9 @@ export function ChatPlayground({
               onClick={() => setIsThinkingEnabled((previous) => !previous)}
               disabled={isStreaming || isPreparingThread}
               className={cn(
-                "h-8 gap-1.5 border text-xs shadow-none",
-                thinkingEnabledForModel
-                  ? chatSecondaryButtonActiveClass
-                  : chatSecondaryButtonClass,
+                "gap-1.5 px-3.5",
+                composerPillClass,
+                thinkingEnabledForModel && composerPillActiveClass,
               )}
               title={
                 thinkingEnabledForModel
@@ -1862,7 +1856,7 @@ export function ChatPlayground({
               <SelectTrigger
                 aria-label="Reasoning effort"
                 title="Reasoning effort"
-                className="h-8 w-[7.25rem] border bg-[var(--bg-surface-2)] px-2.5 text-xs shadow-none"
+                className={cn("w-[7.5rem] px-3.5", composerPillClass)}
               >
                 <SelectValue />
               </SelectTrigger>
@@ -1931,6 +1925,7 @@ export function ChatPlayground({
   };
   const renderThreadList = (onAfterSelect?: () => void) => (
     <ChatThreadList
+      searchThreads={searchThreads}
       threads={threads}
       activeThreadId={activeThreadId}
       loading={threadsLoading}
