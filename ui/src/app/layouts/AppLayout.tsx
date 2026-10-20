@@ -7,7 +7,7 @@ import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { RouteErrorBoundary } from "@/app/router/RouteErrorBoundary";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { FirstRunOnboarding } from "@/app/onboarding/FirstRunOnboarding";
+import { FirstRunGate } from "@/app/onboarding/FirstRunGate";
 import {
   NAV_GROUPS,
   SETTINGS_NAV_ITEM,
@@ -119,7 +119,16 @@ function SidebarLink({
   );
 }
 
-export function AppLayout({
+/** The app, or first run in its place while that's due. */
+export function AppLayout(props: LayoutProps) {
+  return (
+    <FirstRunGate>
+      <AppShell {...props} />
+    </FirstRunGate>
+  );
+}
+
+function AppShell({
   readyModelsCount,
   catalogError,
   onRetryModelCatalog,
@@ -288,7 +297,6 @@ export function AppLayout({
 
   return (
     <div className="h-dvh flex overflow-hidden bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
-      <FirstRunOnboarding />
       <CommandPalette
         open={isCommandPaletteOpen}
         onOpenChange={setIsCommandPaletteOpen}

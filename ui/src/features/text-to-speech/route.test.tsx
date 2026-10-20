@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   act,
   fireEvent,
@@ -59,8 +60,8 @@ const componentMocks = vi.hoisted(() => ({
   ),
 }));
 
-vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
-  FirstRunOnboarding: () => null,
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  FirstRunGate: ({ children }: { children: ReactNode }) => children,
 }));
 vi.mock("@/app/providers/AppUpdateProvider", () => ({
   useAppUpdates: () => ({ availableUpdate: null, isPromptOpen: false }),

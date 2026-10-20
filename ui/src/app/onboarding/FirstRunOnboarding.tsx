@@ -1,924 +1,795 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AudioLines,
-  CheckCircle2,
-  FileText,
-  Loader2,
-  MessageSquare,
-  Sparkles,
-  TriangleAlert,
-} from "lucide-react";
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { Link } from "react-router-dom";
+import { Check, ChevronRight, Cpu, Loader2 } from "lucide-react";
 
-import { api, type ModelInfo } from "@/api";
+import { api, type ModelInfo, type ModelStorage } from "@/api";
 import { setAnalyticsEnabled } from "@/app/analytics/client";
 import {
   trackAnalyticsConsentChanged,
   trackOnboardingCompleted,
   trackOnboardingViewed,
 } from "@/app/analytics/events";
+import { NAV_GROUPS } from "@/app/layouts/navigation";
+import { EngineOffline } from "@/app/onboarding/EngineOffline";
+import {
+  BackButton,
+  OnboardingFrame,
+  OnboardingStage,
+  PrimaryButton,
+  StageHeading,
+  deviceNoun,
+  linkButtonClass,
+} from "@/app/onboarding/OnboardingFrame";
+import {
+  DEFAULT_UNCHECKED_TASKS,
+  buildTaskRows,
+  downloadBytes,
+  downloadPlan,
+  fitsDevice,
+  groupModels,
+  hardwareLabel,
+  isOnDisk,
+  modelDescriptor,
+  modelName,
+  modelRole,
+  pageChoices,
+  readyTasks,
+  taskDetail,
+  taskSizeLabels,
+  uniqueModels,
+  type DownloadPlan,
+  type SizeLabel,
+  type TaskId,
+} from "@/app/onboarding/firstRunPlan";
 import { useModelCatalog } from "@/app/providers/ModelCatalogProvider";
 import { useNotifications } from "@/app/providers/NotificationProvider";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { StatePanel } from "@/components/ui/state-panel";
+import { SetupRow, downloadPercent, type SetupRowTone } from "@/components/SetupRow";
 import { Switch } from "@/components/ui/switch";
 import {
-  MODEL_DETAILS,
-  type ModelDetail,
-} from "@/features/models/catalog/modelMetadata";
-import { getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
+  formatModelBytes,
+  neededMemoryLabel,
+} from "@/features/models/components/ModelListRow";
 import { cn } from "@/lib/utils";
 import { APP_ICON_URL } from "@/shared/config/runtime";
+import { useRuntimeHealth } from "@/shared/hooks/useRuntimeHealth";
 
-const QUICK_SETUP_VARIANTS = [
-  "Parakeet-TDT-0.6B-v3",
-  "Kokoro-82M",
-  "Qwen3.5-4B",
-] as const;
+type Step = "welcome" | "setup" | "choose" | "progress" | "done";
 
-const FEATURE_ITEMS = [
-  {
-    icon: AudioLines,
-    title: "Realtime voice sessions",
-    description: "Low-latency speech input and playback for live interaction.",
-  },
-  {
-    icon: MessageSquare,
-    title: "Local chat models",
-    description: "Run Qwen and other chat models with full local control.",
-  },
-  {
-    icon: FileText,
-    title: "Transcription and diarization",
-    description:
-      "One shared workspace for speech-to-text, timestamps, and speaker separation.",
-  },
-  {
-    icon: Sparkles,
-    title: "Voice Studio",
-    description: "Clone, design, and manage reusable voices in one workspace.",
-  },
-];
+const STEP_BARS: Record<Step, 1 | 2 | 3> = {
+  welcome: 1,
+  setup: 2,
+  choose: 2,
+  progress: 3,
+  done: 3,
+};
 
-const STEP_COPY = [
-  {
-    title: "Welcome to Izwi",
-    description: "Local voice and chat tooling. Three short steps to get set.",
-  },
-  {
-    title: "Set up your models",
-    description:
-      "Start with a recommended starter pack or pick exactly what you want.",
-  },
-  {
-    title: "All setup",
-    description:
-      "You can always adjust models later from the Models workspace.",
-  },
-];
+function sizeText(label: SizeLabel | undefined): string {
+  switch (label?.kind) {
+    case "bytes":
+      return formatModelBytes(label.bytes);
+    case "included":
+      return "Included";
+    case "downloading":
+      return "Downloading";
+    case "downloaded":
+      return "Downloaded";
+    default:
+      return "";
+  }
+}
 
-const GETTING_STARTED_ITEMS = [
-  "Review the feature list",
-  "Choose quick or custom setup",
-  "Start using Izwi",
-] as const;
-
-type SetupMode = "quick" | "custom";
-type OnboardingCategoryKey =
-  | "chat"
-  | "text-to-speech"
-  | "voice-cloning"
-  | "voice-design"
-  | "transcription"
-  | "diarization";
-
-const CATEGORY_CONFIGS: Array<{
-  key: OnboardingCategoryKey;
+/** A checkbox row: a task, or one model on "Choose models". */
+function ChoiceRow({
+  title,
+  detail,
+  trailing,
+  checked,
+  disabled = false,
+  dimmed = false,
+  onToggle,
+}: {
   title: string;
-  description: string;
-}> = [
-  {
-    key: "chat",
-    title: "Chat",
-    description: "Text models for chat and voice sessions.",
-  },
-  {
-    key: "text-to-speech",
-    title: "Text to Speech",
-    description: "Built-in voices for fast speech synthesis.",
-  },
-  {
-    key: "voice-cloning",
-    title: "Voice Studio: Cloning",
-    description: "Base models for reference voice cloning workflows.",
-  },
-  {
-    key: "voice-design",
-    title: "Voice Studio: Design",
-    description: "Models for text-prompt voice design workflows.",
-  },
-  {
-    key: "transcription",
-    title: "Transcription",
-    description: "ASR models for speech-to-text.",
-  },
-  {
-    key: "diarization",
-    title: "Diarization",
-    description: "Speaker segmentation models.",
-  },
-];
-
-function parseSize(sizeStr: string): number {
-  const match = sizeStr.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
-  if (!match) return 0;
-  const value = parseFloat(match[1]);
-  const unit = (match[2] || "B").toUpperCase();
-  const multipliers: Record<string, number> = {
-    B: 1,
-    KB: 1024,
-    MB: 1024 * 1024,
-    GB: 1024 * 1024 * 1024,
-  };
-  return value * (multipliers[unit] || 1);
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024)
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-function resolveModelSizeBytes(model: ModelInfo): number {
-  if (model.size_bytes && model.size_bytes > 0) {
-    return model.size_bytes;
-  }
-  const metadata = MODEL_DETAILS[model.variant];
-  return metadata ? parseSize(metadata.size) : 0;
-}
-
-function resolveModelSizeLabel(model: ModelInfo): string {
-  const bytes = resolveModelSizeBytes(model);
-  return bytes > 0 ? formatBytes(bytes) : "Size unknown";
-}
-
-function isDownloadable(model: ModelInfo): boolean {
-  return model.status === "not_downloaded" || model.status === "error";
-}
-
-function resolveCategory(
-  model: ModelInfo,
-  metadata?: ModelDetail,
-): OnboardingCategoryKey | null {
-  if (!metadata) return null;
-
-  if (metadata.category === "chat") {
-    return "chat";
-  }
-
-  if (metadata.category === "tts") {
-    if (model.variant.includes("VoiceDesign")) return "voice-design";
-    if (model.variant.includes("Base")) return "voice-cloning";
-    return "text-to-speech";
-  }
-
-  if (metadata.category === "asr") {
-    const hasDiarization = metadata.capabilities.some(
-      (capability) => capability.toLowerCase() === "diarization",
-    );
-    if (hasDiarization || model.variant.includes("diar_")) {
-      return "diarization";
-    }
-    return "transcription";
-  }
-
-  return null;
-}
-
-export function FirstRunOnboarding() {
-  const { models, loading, catalogError, downloadModel, refreshModels } =
-    useModelCatalog();
-  const { notify } = useNotifications();
-  const [isOpen, setIsOpen] = useState(false);
-  const [step, setStep] = useState(0);
-  const [setupMode, setSetupMode] = useState<SetupMode>("quick");
-  const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
-  const [selectedVariants, setSelectedVariants] = useState<Set<string>>(
-    new Set(),
+  detail: string;
+  trailing: string;
+  checked: boolean;
+  disabled?: boolean;
+  /** Can't be used on this device. */
+  dimmed?: boolean;
+  onToggle: () => void;
+}) {
+  const id = useId();
+  return (
+    <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3.5 border-b border-[var(--border-muted)] py-3 [@media(max-height:760px)]:py-2">
+      <input
+        id={id}
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={onToggle}
+        aria-labelledby={`${id}-title`}
+        aria-describedby={`${id}-detail`}
+        className={cn(
+          "app-checkbox h-4 w-4",
+          disabled && "cursor-not-allowed",
+          dimmed && "opacity-40",
+        )}
+      />
+      <label
+        htmlFor={id}
+        className={cn(
+          "flex min-w-0 flex-col gap-0.5",
+          disabled ? "cursor-default" : "cursor-pointer",
+        )}
+      >
+        <span
+          id={`${id}-title`}
+          className={cn(
+            "text-sm font-medium",
+            dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-primary)]",
+          )}
+        >
+          {title}
+        </span>
+        <span
+          id={`${id}-detail`}
+          className={cn(
+            "truncate text-[13px]",
+            dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-muted)]",
+          )}
+        >
+          {detail}
+        </span>
+      </label>
+      <span
+        className={cn(
+          "whitespace-nowrap text-[13px] tabular-nums",
+          dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-muted)]",
+        )}
+      >
+        {trailing}
+      </span>
+    </li>
   );
-  const [isApplying, setIsApplying] = useState(false);
-  const hasCompletedRef = useRef(false);
-  const hasTrackedOnboardingViewRef = useRef(false);
+}
 
-  const stepCopy = STEP_COPY[Math.min(step, STEP_COPY.length - 1)];
+function LoadingModels() {
+  return (
+    <div
+      role="status"
+      className="flex items-center gap-2 border-y border-[var(--border-muted)] py-6 text-[13px] text-[var(--text-muted)]"
+    >
+      <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+      Loading models…
+    </div>
+  );
+}
 
-  const modelLookup = useMemo(() => {
-    const map = new Map<string, ModelInfo>();
-    models.forEach((model) => {
-      map.set(model.variant, model);
-    });
-    return map;
-  }, [models]);
+/** "Needs 8.8 GB of free disk space.", once both numbers are known. */
+function diskLine(
+  plan: DownloadPlan,
+  storage: ModelStorage | null,
+): { text: string; short: boolean } | null {
+  const free = storage?.free_bytes;
+  if (plan.fetch.length === 0 || plan.diskBytes === null || free == null) {
+    return null;
+  }
+  const needs = `Needs ${formatModelBytes(plan.diskBytes)} of free disk space.`;
+  return plan.diskBytes > free
+    ? { text: `${needs} ${formatModelBytes(free)} is free.`, short: true }
+    : { text: needs, short: false };
+}
 
-  const quickModels = useMemo(() => {
-    return QUICK_SETUP_VARIANTS.map((variant) => modelLookup.get(variant)).filter(
-      (model): model is ModelInfo => Boolean(model),
-    );
-  }, [modelLookup]);
+function progressStatus(
+  model: ModelInfo,
+  percent: number,
+  cancelled: boolean,
+): { text: string; tone: SetupRowTone; percent?: number; failed?: boolean } {
+  if (isOnDisk(model)) return { text: "Ready", tone: "done" };
+  if (model.status === "downloading") {
+    return { text: `Downloading · ${percent}%`, tone: "active", percent };
+  }
+  if (cancelled && model.status === "not_downloaded") {
+    return { text: "Cancelled", tone: "muted", failed: true };
+  }
+  return { text: "Couldn't download", tone: "error", failed: true };
+}
 
-  const quickDownloadTargets = useMemo(() => {
-    return quickModels.filter((model) => isDownloadable(model));
-  }, [quickModels]);
+/**
+ * First run, in the whole window: Welcome, Set up Izwi for this Mac (tasks,
+ * or Choose models), Setting up and You're all set. Setup counts as done when
+ * downloads start or on Skip; there's no going back after that.
+ */
+export function FirstRunOnboarding({
+  initialAnalyticsOptIn,
+  onComplete,
+  onExit,
+}: {
+  initialAnalyticsOptIn: boolean;
+  /** Records that first run is done; safe to call more than once. */
+  onComplete: () => void;
+  /** Leaves first run for the app, optionally on a page. */
+  onExit: (path?: string) => void;
+}) {
+  const {
+    models,
+    loading,
+    catalogError,
+    downloadProgress,
+    downloadModel,
+    cancelModelDownload,
+    refreshModels,
+    selectModel,
+  } = useModelCatalog();
+  const { notify } = useNotifications();
+  const healthState = useRuntimeHealth();
+  const device = deviceNoun();
 
-  const quickTotalBytes = useMemo(() => {
-    return quickModels.reduce((total, model) => {
-      return total + resolveModelSizeBytes(model);
-    }, 0);
-  }, [quickModels]);
+  const [step, setStep] = useState<Step>("welcome");
+  const [analyticsOptIn, setAnalyticsOptIn] = useState(initialAnalyticsOptIn);
+  const [busy, setBusy] = useState<"start" | "skip" | null>(null);
+  const [uncheckedTasks, setUncheckedTasks] = useState<ReadonlySet<TaskId>>(
+    DEFAULT_UNCHECKED_TASKS,
+  );
+  const [pickedModels, setPickedModels] = useState<ReadonlySet<string> | null>(
+    null,
+  );
+  const [started, setStarted] = useState<string[]>([]);
+  const [cancelled, setCancelled] = useState<ReadonlySet<string>>(new Set());
+  const [storage, setStorage] = useState<ModelStorage | null>(null);
+  const savedOptInRef = useRef(initialAnalyticsOptIn);
+  const trackedViewRef = useRef(false);
+  const trackedCompletionRef = useRef(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const firstStepRef = useRef(true);
 
-  const categorizedModels = useMemo(() => {
-    const buckets: Record<OnboardingCategoryKey, ModelInfo[]> = {
-      chat: [],
-      "text-to-speech": [],
-      "voice-cloning": [],
-      "voice-design": [],
-      transcription: [],
-      diarization: [],
-    };
+  const trackViewed = useCallback(() => {
+    if (!trackedViewRef.current) {
+      trackedViewRef.current = true;
+      void trackOnboardingViewed();
+    }
+  }, []);
 
-    models
-      .filter((model) => !model.variant.includes("Tokenizer"))
-      .forEach((model) => {
-        const metadata = MODEL_DETAILS[model.variant];
-        const category = resolveCategory(model, metadata);
-        if (!category) {
-          return;
-        }
-        buckets[category].push(model);
-      });
-
-    Object.values(buckets).forEach((bucket) => {
-      bucket.sort((left, right) => {
-        return resolveModelSizeBytes(left) - resolveModelSizeBytes(right);
-      });
-    });
-
-    return buckets;
-  }, [models]);
-
-  const selectedModels = useMemo(() => {
-    return Array.from(selectedVariants)
-      .map((variant) => modelLookup.get(variant))
-      .filter((model): model is ModelInfo => Boolean(model));
-  }, [modelLookup, selectedVariants]);
-
-  const selectedDownloadTargets = useMemo(() => {
-    return selectedModels.filter((model) => isDownloadable(model));
-  }, [selectedModels]);
-
-  const selectedTotalBytes = useMemo(() => {
-    return selectedModels.reduce((total, model) => {
-      return total + resolveModelSizeBytes(model);
-    }, 0);
-  }, [selectedModels]);
-
-  const activeModelCount =
-    setupMode === "quick" ? quickModels.length : selectedModels.length;
-  const activeDownloadCount =
-    setupMode === "quick"
-      ? quickDownloadTargets.length
-      : selectedDownloadTargets.length;
-  const activeTotalBytes =
-    setupMode === "quick" ? quickTotalBytes : selectedTotalBytes;
+  // With usage data already on (setup run again), the view counts now; on a
+  // first run it counts once the person turns it on.
+  useEffect(() => {
+    if (initialAnalyticsOptIn) {
+      trackViewed();
+    }
+  }, [initialAnalyticsOptIn, trackViewed]);
 
   useEffect(() => {
+    if (firstStepRef.current) {
+      firstStepRef.current = false;
+      return;
+    }
+    headingRef.current?.focus();
+  }, [step]);
+
+  const choosing = step === "setup" || step === "choose";
+  useEffect(() => {
+    if (!choosing) {
+      return;
+    }
     let active = true;
-
     api
-      .getOnboardingState()
-      .then((state) => {
-        if (!active) {
-          return;
-        }
-        if (!state.completed) {
-          setStep(0);
-          setSetupMode("quick");
-          setAnalyticsOptIn(Boolean(state.analytics_opt_in));
-          setAnalyticsEnabled(Boolean(state.analytics_opt_in));
-          if (!hasTrackedOnboardingViewRef.current) {
-            hasTrackedOnboardingViewRef.current = true;
-            void trackOnboardingViewed();
-          }
-          setIsOpen(true);
-        } else {
-          setAnalyticsEnabled(Boolean(state.analytics_opt_in));
-          setIsOpen(false);
-        }
+      .getModelStorage()
+      .then((next) => {
+        if (active) setStorage(next);
       })
-      .catch((err) => {
-        console.error("Failed to load onboarding state:", err);
+      .catch(() => {
+        // The disk line stays hidden.
       });
-
     return () => {
       active = false;
     };
-  }, []);
+  }, [choosing]);
 
-  const markCompleted = useCallback(async () => {
-    if (hasCompletedRef.current) {
+  const modelsByVariant = useMemo(
+    () => new Map(models.map((model) => [model.variant, model])),
+    [models],
+  );
+  const taskRows = useMemo(() => buildTaskRows(models), [models]);
+  const checkedTasks = useMemo(
+    () =>
+      new Set(
+        taskRows
+          .filter((row) => !row.tooLarge && !uncheckedTasks.has(row.id))
+          .map((row) => row.id),
+      ),
+    [taskRows, uncheckedTasks],
+  );
+  const taskModels = useMemo(
+    () =>
+      uniqueModels(
+        taskRows.filter((row) => checkedTasks.has(row.id)).map((row) => row.models),
+      ),
+    [checkedTasks, taskRows],
+  );
+  const taskSizes = useMemo(
+    () => taskSizeLabels(taskRows, checkedTasks),
+    [checkedTasks, taskRows],
+  );
+  const taskPlan = useMemo(() => downloadPlan(taskModels), [taskModels]);
+
+  const recommended = useMemo(
+    () =>
+      new Set(
+        taskRows
+          .filter((row) => !DEFAULT_UNCHECKED_TASKS.has(row.id))
+          .flatMap((row) => row.models.map((model) => model.variant)),
+      ),
+    [taskRows],
+  );
+  const modelGroups = useMemo(
+    () => groupModels(models, recommended),
+    [models, recommended],
+  );
+  const chosenModels = useMemo(
+    () =>
+      [...(pickedModels ?? [])]
+        .map((variant) => modelsByVariant.get(variant))
+        .filter((model): model is ModelInfo => Boolean(model)),
+    [modelsByVariant, pickedModels],
+  );
+  const choosePlan = useMemo(() => downloadPlan(chosenModels), [chosenModels]);
+
+  const catalogUnavailable = models.length === 0;
+  const engineDown = catalogUnavailable && !loading && Boolean(catalogError);
+  const health = healthState.status === "ready" ? healthState.health : null;
+  const hardware = hardwareLabel(health);
+
+  const trackCompleted = useCallback(
+    (mode: "quick" | "custom" | "skip") => {
+      if (!trackedCompletionRef.current) {
+        trackedCompletionRef.current = true;
+        void trackOnboardingCompleted(mode);
+      }
+    },
+    [],
+  );
+
+  const saveAnalytics = useCallback(async () => {
+    if (analyticsOptIn === savedOptInRef.current) {
       return;
     }
     try {
-      await api.completeOnboarding();
-      hasCompletedRef.current = true;
-    } catch (err) {
-      console.error("Failed to persist onboarding completion:", err);
-      notify({
-        title: "Could not save onboarding status",
-        description: "We will retry later. You can continue using Izwi.",
-        tone: "warning",
-      });
-    }
-  }, [notify]);
-
-  const persistAnalyticsPreference = useCallback(async () => {
-    try {
       await api.updateAnalyticsPreference({ opt_in: analyticsOptIn });
+      savedOptInRef.current = analyticsOptIn;
       setAnalyticsEnabled(analyticsOptIn);
-      await trackAnalyticsConsentChanged(
+      if (analyticsOptIn) {
+        trackViewed();
+      }
+      void trackAnalyticsConsentChanged(
         analyticsOptIn ? "opted_in" : "opted_out",
         "onboarding",
       );
-    } catch (err) {
-      console.error("Failed to persist analytics preference:", err);
+    } catch (error) {
+      console.error("Failed to save the usage data choice:", error);
       notify({
-        title: "Could not save analytics preference",
-        description:
-          "Your app setup will continue. You can retry later in Settings.",
+        title: "Couldn't save your usage data choice",
+        description: "You can change it any time in Settings.",
         tone: "warning",
       });
     }
-  }, [analyticsOptIn, notify]);
+  }, [analyticsOptIn, notify, trackViewed]);
 
-  const handleSkip = useCallback(async () => {
-    await persistAnalyticsPreference();
-    await markCompleted();
-    await trackOnboardingCompleted("skip");
-    setIsOpen(false);
-  }, [markCompleted, persistAnalyticsPreference]);
+  const getStarted = async () => {
+    setBusy("start");
+    await saveAnalytics();
+    setBusy(null);
+    setStep("setup");
+  };
 
-  const toggleVariant = useCallback((variant: string) => {
-    setSelectedVariants((prev) => {
-      const next = new Set(prev);
-      if (next.has(variant)) {
-        next.delete(variant);
-      } else {
-        next.add(variant);
-      }
+  const skip = async () => {
+    setBusy("skip");
+    if (step === "welcome") {
+      await saveAnalytics();
+    }
+    onComplete();
+    trackCompleted("skip");
+    onExit();
+  };
+
+  const start = (mode: "quick" | "custom", chosen: ModelInfo[]) => {
+    const plan = downloadPlan(chosen);
+    onComplete();
+    trackCompleted(mode);
+    pageChoices(plan.fetch).forEach(([route, variant]) =>
+      selectModel(variant, route),
+    );
+    plan.fetch.forEach((model) => void downloadModel(model.variant));
+    setStarted(uniqueModels([chosen]).map((model) => model.variant));
+    setCancelled(new Set());
+    setStep(chosen.every(isOnDisk) ? "done" : "progress");
+  };
+
+  const openChooser = () => {
+    setPickedModels(
+      (current) => current ?? new Set(taskModels.map((model) => model.variant)),
+    );
+    setStep("choose");
+  };
+
+  const toggleTask = (id: TaskId) =>
+    setUncheckedTasks((current) => {
+      const next = new Set(current);
+      if (!next.delete(id)) next.add(id);
       return next;
     });
-  }, []);
 
-  const handleApplySetup = useCallback(async () => {
-    if (isApplying) {
-      return;
+  const toggleModel = (variant: string) =>
+    setPickedModels((current) => {
+      const next = new Set(current);
+      if (!next.delete(variant)) next.add(variant);
+      return next;
+    });
+
+  const startedModels = useMemo(
+    () =>
+      started
+        .map((variant) => modelsByVariant.get(variant))
+        .filter((model): model is ModelInfo => Boolean(model)),
+    [modelsByVariant, started],
+  );
+  const downloading = startedModels.filter(
+    (model) => model.status === "downloading",
+  );
+
+  useEffect(() => {
+    if (
+      step === "progress" &&
+      startedModels.length > 0 &&
+      startedModels.every(isOnDisk)
+    ) {
+      setStep("done");
     }
-    setIsApplying(true);
+  }, [startedModels, step]);
 
-    const chosenModels = setupMode === "quick" ? quickModels : selectedModels;
-    const downloadTargets = chosenModels.filter((model) => isDownloadable(model));
+  const cancelDownloads = () => {
+    setCancelled(new Set(downloading.map((model) => model.variant)));
+    downloading.forEach((model) => void cancelModelDownload(model.variant));
+  };
 
-    try {
-      if (downloadTargets.length > 0) {
-        await Promise.all(
-          downloadTargets.map((model) => downloadModel(model.variant)),
-        );
-      }
-    } catch (err) {
-      console.error("Onboarding download failed:", err);
-      notify({
-        title: "Some downloads did not start",
-        description: "You can retry from the Models page at any time.",
-        tone: "warning",
-      });
-    } finally {
-      await persistAnalyticsPreference();
-      await markCompleted();
-      await trackOnboardingCompleted(setupMode);
-      setStep(2);
-      setIsApplying(false);
-    }
-  }, [
-    downloadModel,
-    isApplying,
-    markCompleted,
-    notify,
-    quickModels,
-    selectedModels,
-    setupMode,
-    persistAnalyticsPreference,
-  ]);
+  const retryDownload = (variant: string) => {
+    setCancelled((current) => {
+      const next = new Set(current);
+      next.delete(variant);
+      return next;
+    });
+    void downloadModel(variant);
+  };
 
-  const handleBack = useCallback(() => {
-    setStep((current) => Math.max(0, current - 1));
-  }, []);
-
-  const handleNext = useCallback(() => {
-    if (step === 0) {
-      setStep(1);
-      return;
-    }
-    if (step === 1) {
-      void handleApplySetup();
-      return;
-    }
-    if (step === 2) {
-      setIsOpen(false);
-    }
-  }, [handleApplySetup, step]);
-
-  if (!isOpen) {
-    return null;
+  let stage: ReactNode;
+  if (engineDown && step !== "welcome") {
+    stage = (
+      <EngineOffline
+        detail={catalogError}
+        onRetry={() => refreshModels()}
+      />
+    );
+  } else if (step === "welcome") {
+    stage = (
+      <OnboardingStage>
+        <img src={APP_ICON_URL} alt="" className="h-12 w-12 rounded-[12px]" />
+        <StageHeading
+          headingRef={headingRef}
+          title="Welcome to Izwi"
+          description={`Talk, transcribe, read aloud and chat on this ${device}. What you say and type stays on it.`}
+        />
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-y border-[var(--border-muted)] py-3.5">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <label htmlFor="first-run-usage-data" className="text-sm font-medium">
+              Share anonymous usage data
+            </label>
+            <span
+              id="first-run-usage-data-detail"
+              className="text-[13px] text-[var(--text-muted)]"
+            >
+              Which features and models you use. Never your audio, text or files.
+            </span>
+          </div>
+          <Switch
+            id="first-run-usage-data"
+            checked={analyticsOptIn}
+            onCheckedChange={setAnalyticsOptIn}
+            aria-describedby="first-run-usage-data-detail"
+          />
+        </div>
+        <PrimaryButton
+          autoFocus
+          busy={busy === "start"}
+          onClick={() => void getStarted()}
+        >
+          Get started
+        </PrimaryButton>
+      </OnboardingStage>
+    );
+  } else if (step === "setup") {
+    const disk = diskLine(taskPlan, storage);
+    stage = (
+      <OnboardingStage width="wide">
+        <StageHeading
+          headingRef={headingRef}
+          before={<BackButton onClick={() => setStep("welcome")} />}
+          title={`Set up Izwi for this ${device}`}
+          description="Pick what to use first. You can add more any time in Models."
+          after={
+            hardware ? (
+              <p className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-subtle)]">
+                <Cpu aria-hidden="true" className="h-3.5 w-3.5" />
+                {hardware}
+              </p>
+            ) : null
+          }
+        />
+        {catalogUnavailable ? (
+          <LoadingModels />
+        ) : (
+          <ul aria-label="Tasks" className="border-t border-[var(--border-muted)]">
+            {taskRows.map((row) => (
+              <ChoiceRow
+                key={row.id}
+                title={row.title}
+                detail={
+                  (row.tooLarge ? neededMemoryLabel(row.tooLarge) : null) ??
+                  taskDetail(row)
+                }
+                trailing={row.tooLarge ? "" : sizeText(taskSizes.get(row.id))}
+                checked={checkedTasks.has(row.id)}
+                disabled={Boolean(row.tooLarge)}
+                dimmed={Boolean(row.tooLarge)}
+                onToggle={() => toggleTask(row.id)}
+              />
+            ))}
+          </ul>
+        )}
+        <div className="flex flex-col gap-3.5">
+          <PrimaryButton
+            disabled={checkedTasks.size === 0}
+            onClick={() => start("quick", taskModels)}
+          >
+            {taskPlan.fetch.length > 0
+              ? `Download and set up · ${formatModelBytes(taskPlan.bytes)}`
+              : "Set up"}
+          </PrimaryButton>
+          <p className="text-[13px] text-[var(--text-muted)]">
+            {disk ? (
+              <span className={cn(disk.short && "text-[var(--danger-text)]")}>
+                {disk.text}{" "}
+              </span>
+            ) : null}
+            <button
+              type="button"
+              className={linkButtonClass}
+              disabled={catalogUnavailable}
+              onClick={openChooser}
+            >
+              Choose models myself
+            </button>
+          </p>
+        </div>
+      </OnboardingStage>
+    );
+  } else if (step === "choose") {
+    const disk = diskLine(choosePlan, storage);
+    const fetchCount = choosePlan.fetch.length;
+    stage = (
+      <div className="mx-auto flex min-h-0 w-full max-w-[520px] flex-1 flex-col gap-5 pb-8 pt-4">
+        <StageHeading
+          headingRef={headingRef}
+          before={
+            <BackButton onClick={() => setStep("setup")}>
+              Recommended setup
+            </BackButton>
+          }
+          title="Choose models"
+          description={`Models that need more memory than this ${device} has can't be picked.`}
+        />
+        {catalogUnavailable ? (
+          <LoadingModels />
+        ) : (
+          <div className="min-h-0 overflow-y-auto pr-2">
+            {modelGroups.map((group, index) => (
+              <section key={group.id} aria-labelledby={`first-run-group-${group.id}`}>
+                <h2
+                  id={`first-run-group-${group.id}`}
+                  className={cn(
+                    "pb-1.5 text-[13px] font-medium text-[var(--text-muted)]",
+                    index > 0 && "pt-6",
+                  )}
+                >
+                  {group.title}
+                </h2>
+                <ul className="border-t border-[var(--border-muted)]">
+                  {group.models.map((model) => {
+                    const onDisk = isOnDisk(model);
+                    const settled = onDisk || model.status === "downloading";
+                    const tooLarge = !settled && !fitsDevice(model);
+                    return (
+                      <ChoiceRow
+                        key={model.variant}
+                        title={modelName(model)}
+                        detail={
+                          (tooLarge ? neededMemoryLabel(model) : null) ??
+                          modelDescriptor(model)
+                        }
+                        trailing={
+                          onDisk
+                            ? "Downloaded"
+                            : settled
+                              ? "Downloading"
+                              : formatModelBytes(downloadBytes(model))
+                        }
+                        checked={settled || (pickedModels?.has(model.variant) ?? false)}
+                        disabled={settled || tooLarge}
+                        dimmed={tooLarge}
+                        onToggle={() => toggleModel(model.variant)}
+                      />
+                    );
+                  })}
+                </ul>
+              </section>
+            ))}
+          </div>
+        )}
+        <div className="flex shrink-0 flex-col gap-3 border-t border-[var(--border-muted)] pt-4">
+          <PrimaryButton
+            disabled={chosenModels.length === 0}
+            onClick={() => start("custom", chosenModels)}
+          >
+            {fetchCount > 0
+              ? `Download ${fetchCount} model${fetchCount === 1 ? "" : "s"} · ${formatModelBytes(choosePlan.bytes)}`
+              : "Set up"}
+          </PrimaryButton>
+          {disk ? (
+            <p
+              className={cn(
+                "text-center text-[13px]",
+                disk.short ? "text-[var(--danger-text)]" : "text-[var(--text-muted)]",
+              )}
+            >
+              {disk.text}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    );
+  } else if (step === "progress") {
+    stage = (
+      <OnboardingStage>
+        <StageHeading
+          headingRef={headingRef}
+          title="Setting up Izwi"
+          description="You can start using Izwi now. Downloads keep going in the background."
+        />
+        <ul aria-label="Downloads" className="border-t border-[var(--border-muted)]">
+          {startedModels.map((model) => {
+            const status = progressStatus(
+              model,
+              downloadPercent(model, downloadProgress),
+              cancelled.has(model.variant),
+            );
+            const name = modelName(model);
+            return (
+              <SetupRow
+                key={model.variant}
+                title={modelRole(model)}
+                model={name}
+                status={status.text}
+                tone={status.tone}
+                percent={status.percent}
+                action={
+                  status.failed ? (
+                    <button
+                      type="button"
+                      className={cn(linkButtonClass, "text-[13px]")}
+                      aria-label={`Retry ${name}`}
+                      onClick={() => retryDownload(model.variant)}
+                    >
+                      Retry
+                    </button>
+                  ) : null
+                }
+                detail={
+                  model.status === "error" ? model.error_message : null
+                }
+              />
+            );
+          })}
+        </ul>
+        <div className="flex flex-col gap-3.5">
+          <PrimaryButton onClick={() => onExit()}>Start using Izwi</PrimaryButton>
+          <p className="text-[13px] text-[var(--text-muted)]">
+            Progress also shows in Models.
+            {downloading.length > 0 ? (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  className={linkButtonClass}
+                  onClick={cancelDownloads}
+                >
+                  Cancel downloads
+                </button>
+              </>
+            ) : null}
+          </p>
+        </div>
+      </OnboardingStage>
+    );
+  } else {
+    const destinations = readyTasks(taskRows, models).filter(
+      (row, index, rows) =>
+        rows.findIndex((other) => other.path === row.path) === index,
+    );
+    stage = (
+      <OnboardingStage>
+        <StageHeading
+          headingRef={headingRef}
+          before={
+            <span className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]">
+              <Check aria-hidden="true" className="h-[18px] w-[18px]" strokeWidth={2.5} />
+            </span>
+          }
+          title="You're all set"
+          description={
+            destinations.length > 0
+              ? `Everything below is ready on this ${device}.`
+              : undefined
+          }
+        />
+        {destinations.length > 0 ? (
+          <nav aria-label="Start with" className="border-t border-[var(--border-muted)]">
+            {destinations.map((row) => {
+              const Icon = NAV_GROUPS.flatMap((group) => group.items).find(
+                (item) => item.path === row.path,
+              )?.icon;
+              return (
+                <Link
+                  key={row.id}
+                  to={row.path}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    onExit(row.path);
+                  }}
+                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-[var(--border-muted)] py-3.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--sidebar-link-hover-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+                >
+                  {Icon ? (
+                    <Icon aria-hidden="true" className="h-4 w-4 text-[var(--text-muted)]" />
+                  ) : (
+                    <span />
+                  )}
+                  <span className="text-sm font-medium">{row.doneTitle}</span>
+                  <ChevronRight
+                    aria-hidden="true"
+                    className="h-4 w-4 text-[var(--text-subtle)]"
+                  />
+                </Link>
+              );
+            })}
+          </nav>
+        ) : null}
+        <PrimaryButton onClick={() => onExit()}>Open Izwi</PrimaryButton>
+      </OnboardingStage>
+    );
   }
 
+  const canSkip = step === "welcome" || step === "setup" || step === "choose";
   return (
-    <Dialog open={isOpen}>
-      <DialogContent
-        className="max-w-[min(94vw,980px)] p-0 [&>button]:hidden"
-        onEscapeKeyDown={(event) => event.preventDefault()}
-        onPointerDownOutside={(event) => event.preventDefault()}
-        onInteractOutside={(event) => event.preventDefault()}
-      >
-        <div className="flex flex-col">
-          <div className="overflow-hidden border-b border-border/70 bg-[var(--bg-surface-1)] px-6 py-4 sm:px-8 sm:py-5">
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="relative h-10 w-10 overflow-hidden rounded-[var(--radius-md)] border border-border/70 bg-[var(--bg-surface-2)] shadow-[var(--shadow-soft)]">
-                    <img
-                      src={APP_ICON_URL}
-                      alt="Izwi logo"
-                      className="h-full w-full object-cover p-1 brightness-110 contrast-110"
-                    />
-                  </div>
-                  <DialogTitle className="text-xl font-semibold tracking-tight">
-                    {stepCopy.title}
-                  </DialogTitle>
-                </div>
-                <div className="text-xs text-[var(--text-muted)]">
-                  Step {step + 1} of 3
-                </div>
-              </div>
-              <DialogDescription className="text-sm text-[var(--text-muted)]">
-                {stepCopy.description}
-              </DialogDescription>
-            </div>
-          </div>
-
-          <div className="space-y-6 px-6 py-6 sm:px-8 sm:py-8">
-            {catalogError ? (
-              <div role="alert">
-                <StatePanel
-                  title="Model service unavailable"
-                  description={catalogError}
-                  icon={TriangleAlert}
-                  tone="danger"
-                  actions={
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={loading}
-                      onClick={() => void refreshModels()}
-                    >
-                      Retry models
-                    </Button>
-                  }
-                />
-              </div>
-            ) : null}
-            {step === 0 ? (
-              <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-                <div className="space-y-4">
-                  <div>
-                    <div className="text-lg font-semibold tracking-tight">
-                      Core capabilities
-                    </div>
-                    <div className="mt-1 text-sm text-[var(--text-muted)]">
-                      Everything below is available locally with full control.
-                    </div>
-                  </div>
-                  <div className="grid gap-2.5">
-                    {FEATURE_ITEMS.map((feature) => {
-                      const Icon = feature.icon;
-                      return (
-                        <div
-                          key={feature.title}
-                          className="flex items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] px-3.5 py-3"
-                        >
-                          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-3)]">
-                            <Icon className="h-4 w-4 text-[var(--text-primary)]" />
-                          </div>
-                          <div className="min-w-0">
-                            <div className="text-base font-semibold leading-5 text-[var(--text-primary)]">
-                              {feature.title}
-                            </div>
-                            <div className="mt-1 text-sm text-[var(--text-muted)]">
-                              {feature.description}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="border-t border-border/70 pt-6 lg:border-l lg:border-t-0 lg:pl-8">
-                  <div className="space-y-5">
-                    <div>
-                      <div className="text-lg font-semibold tracking-tight">
-                        Getting started
-                      </div>
-                      <div className="mt-1 text-sm text-[var(--text-muted)]">
-                        Setup takes a minute and can be changed later.
-                      </div>
-                    </div>
-
-                    <div className="space-y-2.5">
-                      {GETTING_STARTED_ITEMS.map((item, index) => (
-                        <div key={item} className="flex items-center gap-2.5 text-sm">
-                          <CheckCircle2
-                            className={cn(
-                              "h-4 w-4 shrink-0",
-                              index === 0
-                                ? "text-[var(--text-primary)]"
-                                : "text-[var(--text-subtle)]",
-                            )}
-                          />
-                          <span
-                            className={cn(
-                              index === 0
-                                ? "text-[var(--text-primary)]"
-                                : "text-[var(--text-secondary)]",
-                            )}
-                          >
-                            {item}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="border-t border-border/70 pt-4">
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                        <span className="whitespace-nowrap text-base font-semibold leading-5 text-[var(--text-primary)]">
-                          Share anonymous usage data
-                        </span>
-                        <div className="flex items-center gap-2 self-start sm:self-auto">
-                          <span className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--text-muted)]">
-                            {analyticsOptIn ? "On" : "Off"}
-                          </span>
-                          <Switch
-                            checked={analyticsOptIn}
-                            onCheckedChange={setAnalyticsOptIn}
-                            aria-label="Share anonymous usage data"
-                            className="border-border/70 data-[state=checked]:bg-[var(--checkbox-checked-bg)] data-[state=unchecked]:bg-[var(--bg-surface-3)]"
-                          />
-                        </div>
-                      </div>
-                      <div className="mt-2 text-sm leading-6 text-[var(--text-muted)]">
-                        Help us improve Izwi with anonymous feature and model
-                        usage metrics. We never collect prompts, transcripts,
-                        audio, or personal data.
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : null}
-
-            {step === 1 ? (
-              <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-                <div className="space-y-4">
-                  <div>
-                    <div className="text-lg font-semibold tracking-tight">
-                      Choose model setup
-                    </div>
-                    <div className="mt-1 text-sm text-[var(--text-muted)]">
-                      Start with a recommended pack or handpick models by
-                      category.
-                    </div>
-                  </div>
-
-                  <div className="inline-flex items-center gap-2 rounded-[var(--radius-pill)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] p-1">
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="h-8 px-3"
-                      variant={setupMode === "quick" ? "default" : "ghost"}
-                      onClick={() => setSetupMode("quick")}
-                    >
-                      Quick setup
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="h-8 px-3"
-                      variant={setupMode === "custom" ? "default" : "ghost"}
-                      onClick={() => setSetupMode("custom")}
-                    >
-                      Custom setup
-                    </Button>
-                  </div>
-
-                  {setupMode === "quick" ? (
-                    <div className="space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2 text-base font-semibold leading-5 text-[var(--text-primary)]">
-                          <Sparkles className="h-4 w-4 text-[var(--text-primary)]" />
-                          Recommended starter pack
-                        </div>
-                        <div className="text-xs uppercase tracking-[0.2em] text-[var(--text-subtle)]">
-                          {quickTotalBytes > 0
-                            ? `~${formatBytes(quickTotalBytes)}`
-                            : "Size varies"}
-                        </div>
-                      </div>
-
-                      <div className="grid gap-2.5">
-                        {quickModels.map((model) => {
-                          const details = MODEL_DETAILS[model.variant];
-                          return (
-                            <div
-                              key={model.variant}
-                              className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] px-3.5 py-3"
-                            >
-                              <div className="min-w-0">
-                                <div className="text-base font-semibold leading-5 text-[var(--text-primary)]">
-                                  {details?.shortName ?? model.variant}
-                                </div>
-                                <div className="mt-1 text-sm text-[var(--text-muted)]">
-                                  {details?.description ?? "Recommended model"}
-                                </div>
-                              </div>
-                              <div className="whitespace-nowrap text-right text-xs text-[var(--text-muted)]">
-                                {resolveModelSizeLabel(model)}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      {quickModels.length === 0 ? (
-                        <div className="rounded-[var(--radius-md)] border border-dashed border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_60%,transparent)] px-3 py-4 text-sm text-[var(--text-muted)]">
-                          No recommended models are available yet.
-                        </div>
-                      ) : null}
-
-                      <div className="text-sm text-[var(--text-muted)]">
-                        Downloads run in the background. You can manage models
-                        at any time from Models.
-                      </div>
-
-                      {quickDownloadTargets.length === 0 &&
-                      quickModels.length > 0 ? (
-                        <div className="flex items-center gap-2 text-sm text-[var(--status-positive-text)]">
-                          <CheckCircle2 className="h-4 w-4" />
-                          Starter models already downloaded.
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div>
-                          <div className="text-base font-semibold leading-5">
-                            Choose your models
-                          </div>
-                          <div className="mt-1 text-sm text-[var(--text-muted)]">
-                            Select as many as you want. You can change later.
-                          </div>
-                        </div>
-                        <div className="text-xs uppercase tracking-[0.2em] text-[var(--text-subtle)]">
-                          {selectedVariants.size} selected
-                        </div>
-                      </div>
-
-                      <ScrollArea className="h-[min(46vh,360px)] pr-2">
-                        <div className="space-y-5">
-                          {CATEGORY_CONFIGS.map((category) => {
-                            const modelsForCategory = categorizedModels[category.key];
-                            if (!modelsForCategory || modelsForCategory.length === 0) {
-                              return null;
-                            }
-                            return (
-                              <div key={category.key} className="space-y-3">
-                                <div>
-                                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--text-subtle)]">
-                                    {category.title}
-                                  </div>
-                                  <div className="text-sm text-[var(--text-muted)]">
-                                    {category.description}
-                                  </div>
-                                </div>
-                                <div className="grid gap-2">
-                                  {modelsForCategory.map((model) => {
-                                    const metadata = MODEL_DETAILS[model.variant];
-                                    const statusLabel = getModelStatusLabel(
-                                      model.status,
-                                    );
-                                    const isDisabled = !isDownloadable(model);
-                                    return (
-                                      <label
-                                        key={model.variant}
-                                        className={cn(
-                                          "flex gap-3 rounded-[var(--radius-md)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_75%,transparent)] p-3",
-                                          isDisabled && "opacity-60",
-                                        )}
-                                      >
-                                        <input
-                                          type="checkbox"
-                                          className="app-checkbox mt-1 h-4 w-4"
-                                          checked={selectedVariants.has(model.variant)}
-                                          onChange={() => toggleVariant(model.variant)}
-                                          disabled={isDisabled}
-                                        />
-                                        <div className="min-w-0 flex-1">
-                                          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-2">
-                                            <div className="text-base font-semibold leading-5 text-[var(--text-primary)]">
-                                              {metadata?.shortName ?? model.variant}
-                                            </div>
-                                            <div className="whitespace-nowrap text-right text-xs text-[var(--text-muted)]">
-                                              {resolveModelSizeLabel(model)}
-                                            </div>
-                                          </div>
-                                          <div className="mt-1 text-sm text-[var(--text-muted)]">
-                                            {metadata?.description ?? "Model option"}
-                                          </div>
-                                          <div className="mt-2 text-xs uppercase tracking-[0.2em] text-[var(--text-subtle)]">
-                                            {statusLabel}
-                                          </div>
-                                        </div>
-                                      </label>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </ScrollArea>
-
-                      {loading ? (
-                        <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          Loading model catalog...
-                        </div>
-                      ) : null}
-                    </div>
-                  )}
-                </div>
-
-                <div className="border-t border-border/70 pt-6 lg:border-l lg:border-t-0 lg:pl-8">
-                  <div className="space-y-5">
-                    <div>
-                      <div className="text-lg font-semibold tracking-tight">
-                        Setup summary
-                      </div>
-                      <div className="mt-1 text-sm text-[var(--text-muted)]">
-                        Review your selection before starting downloads.
-                      </div>
-                    </div>
-
-                    <div className="grid gap-2">
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
-                        <span className="text-[var(--text-muted)]">Mode</span>
-                        <span className="font-semibold text-[var(--text-primary)]">
-                          {setupMode === "quick" ? "Quick setup" : "Custom setup"}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
-                        <span className="text-[var(--text-muted)]">Models</span>
-                        <span className="font-semibold text-[var(--text-primary)]">
-                          {activeModelCount}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
-                        <span className="text-[var(--text-muted)]">
-                          To download
-                        </span>
-                        <span className="font-semibold text-[var(--text-primary)]">
-                          {activeDownloadCount}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm">
-                        <span className="text-[var(--text-muted)]">
-                          Estimated size
-                        </span>
-                        <span className="font-semibold text-[var(--text-primary)]">
-                          {activeTotalBytes > 0
-                            ? formatBytes(activeTotalBytes)
-                            : "Size varies"}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="border-t border-border/70 pt-4">
-                      <div className="space-y-2.5 text-sm">
-                        <div className="flex items-center gap-2.5 text-[var(--text-secondary)]">
-                          <CheckCircle2 className="h-4 w-4 text-[var(--text-primary)]" />
-                          Review your model selections
-                        </div>
-                        <div className="flex items-center gap-2.5 text-[var(--text-secondary)]">
-                          <CheckCircle2 className="h-4 w-4 text-[var(--text-subtle)]" />
-                          Start downloads in the background
-                        </div>
-                        <div className="flex items-center gap-2.5 text-[var(--text-secondary)]">
-                          <CheckCircle2 className="h-4 w-4 text-[var(--text-subtle)]" />
-                          Continue to the app while setup completes
-                        </div>
-                      </div>
-                    </div>
-
-                    {setupMode === "custom" && selectedVariants.size === 0 ? (
-                      <div className="rounded-[var(--radius-sm)] border border-border/70 bg-[color-mix(in_srgb,var(--bg-surface-2)_70%,transparent)] px-3 py-2 text-sm text-[var(--text-muted)]">
-                        Select at least one model to queue downloads from custom
-                        setup.
-                      </div>
-                    ) : null}
-
-                  </div>
-                </div>
-              </div>
-            ) : null}
-
-            {step === 2 ? (
-              <div className="mx-auto w-full max-w-2xl space-y-6">
-                <div className="flex items-start gap-3">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)]">
-                    <CheckCircle2 className="h-5 w-5 text-[var(--status-positive-solid)]" />
-                  </div>
-                  <div>
-                    <div className="text-lg font-semibold tracking-tight text-[var(--text-primary)]">
-                      Setup complete
-                    </div>
-                    <div className="mt-1 text-sm text-[var(--text-muted)]">
-                      You are ready to use Izwi. Downloads continue in the
-                      background.
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid gap-2.5">
-                  <div className="flex items-center gap-2.5 text-sm text-[var(--text-secondary)]">
-                    <CheckCircle2 className="h-4 w-4 text-[var(--text-primary)]" />
-                    Continue to the app now
-                  </div>
-                  <div className="flex items-center gap-2.5 text-sm text-[var(--text-secondary)]">
-                    <CheckCircle2 className="h-4 w-4 text-[var(--text-subtle)]" />
-                    Track download progress in Models
-                  </div>
-                  <div className="flex items-center gap-2.5 text-sm text-[var(--text-secondary)]">
-                    <CheckCircle2 className="h-4 w-4 text-[var(--text-subtle)]" />
-                    Update model choices any time later
-                  </div>
-                </div>
-
-                <div className="border-t border-border/70 pt-4 text-sm text-[var(--text-muted)]">
-                  Open the Models workspace later to pause downloads, add more
-                  models, or retry any manual installs.
-                </div>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/70 bg-[var(--bg-surface-1)] px-6 py-4 sm:px-8">
-            <Button type="button" variant="ghost" onClick={handleSkip}>
-              Skip setup
-            </Button>
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={handleBack}
-                disabled={step === 0 || isApplying}
-              >
-                Back
-              </Button>
-              <Button type="button" onClick={handleNext} disabled={isApplying}>
-                {step === 2 ? "Go to app" : "Next"}
-              </Button>
-            </div>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+    <OnboardingFrame
+      step={STEP_BARS[step]}
+      onSkip={canSkip ? () => void skip() : undefined}
+      skipping={busy === "skip"}
+    >
+      {stage}
+    </OnboardingFrame>
   );
 }

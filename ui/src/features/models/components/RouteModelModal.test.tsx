@@ -353,7 +353,7 @@ describe("RouteModelModal", () => {
     );
 
     const tooLarge = screen.getByTestId("model-row-Qwen3.8-27B-FP8");
-    expect(within(tooLarge).getByText("Needs 80 GB memory")).toBeInTheDocument();
+    expect(within(tooLarge).getByText("Needs 80 GB of memory")).toBeInTheDocument();
     expect(within(tooLarge).queryByRole("button", { name: /^Download/ })).toBeNull();
 
     const failed = screen.getByTestId("model-row-Qwen3.5-9B");

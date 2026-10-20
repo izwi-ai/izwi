@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,8 +13,8 @@ vi.mock("@/api", () => ({
   api: { getHealth: vi.fn(() => new Promise(() => {})) },
 }));
 
-vi.mock("@/app/onboarding/FirstRunOnboarding", () => ({
-  FirstRunOnboarding: () => null,
+vi.mock("@/app/onboarding/FirstRunGate", () => ({
+  FirstRunGate: ({ children }: { children: ReactNode }) => children,
 }));
 
 vi.mock("@/app/providers/AppUpdateProvider", () => ({

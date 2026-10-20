@@ -35,7 +35,7 @@ export function neededMemoryLabel(model: ModelInfo): string | null {
   const bytes =
     model.estimated_memory_bytes ?? (model.memory_required_gb ?? 0) * GIB;
   return bytes > 0
-    ? `Needs ${Math.ceil(bytes / GIB)} GB memory`
+    ? `Needs ${Math.ceil(bytes / GIB)} GB of memory`
     : "Too large for this device";
 }
 
