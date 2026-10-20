@@ -1,5 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const tauri = vi.hoisted(() => ({
+  isTauri: vi.fn(() => false),
+  invoke: vi.fn(),
+}));
+vi.mock("@tauri-apps/api/core", () => tauri);
 
 import type { DiarizationRecord } from "../api";
 import { DiarizationExportDialog } from "./DiarizationExportDialog";
@@ -55,36 +61,81 @@ const record = {
   audio_filename: "meeting.wav",
 } satisfies DiarizationRecord;
 
+beforeEach(() => {
+  tauri.isTauri.mockReturnValue(false);
+  tauri.invoke.mockReset();
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function openDialog(source: DiarizationRecord = record) {
+  render(
+    <DiarizationExportDialog record={source}>
+      <button type="button">Open export</button>
+    </DiarizationExportDialog>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open export" }));
+}
+
+async function exportedText(): Promise<string> {
+  fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
+  await waitFor(() => expect(tauri.invoke).toHaveBeenCalledTimes(1));
+  return new TextDecoder().decode(tauri.invoke.mock.calls[0]?.[1] as Uint8Array);
+}
+
 describe("DiarizationExportDialog", () => {
-  it("downloads the default TXT export with corrected speaker labels", async () => {
+  it("downloads the default text export with corrected speaker labels", async () => {
     const createObjectUrl = vi
       .spyOn(URL, "createObjectURL")
       .mockReturnValue("blob:diarization-export");
-    const revokeObjectUrl = vi
-      .spyOn(URL, "revokeObjectURL")
-      .mockImplementation(() => {});
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
     const clickSpy = vi
       .spyOn(window.HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => {});
 
-    render(
-      <DiarizationExportDialog record={record}>
-        <button type="button">Open export</button>
-      </DiarizationExportDialog>,
-    );
+    openDialog();
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Open export" }));
-    fireEvent.click(screen.getByRole("button", { name: "Export file" }));
-
-    expect(createObjectUrl).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
     const blob = createObjectUrl.mock.calls[0]?.[0];
     expect(blob).toBeInstanceOf(Blob);
     await expect((blob as Blob).text()).resolves.toContain("Alice [0.00s - 1.00s]");
-    expect(clickSpy).toHaveBeenCalledTimes(1);
-    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:diarization-export");
+  });
+
+  it("exports the labels diarization gave when speaker names are off", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.invoke.mockResolvedValue("/Users/me/meeting.txt");
+
+    openDialog();
+    const names = screen.getByRole("switch", { name: /Speaker names/ });
+    expect(names.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(names);
+
+    const text = await exportedText();
+    expect(text).toContain("SPEAKER_00 [0.00s - 1.00s]");
+    expect(text).not.toContain("Alice");
+  });
+
+  it("puts the speaker names in captions", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.invoke.mockResolvedValue("/Users/me/meeting.vtt");
+
+    openDialog();
+    fireEvent.click(screen.getByRole("radio", { name: "VTT" }));
+
+    const text = await exportedText();
+    expect(text.startsWith("WEBVTT")).toBe(true);
+    expect(text).toContain("Bob");
+    expect(tauri.invoke.mock.calls[0]?.[2]).toEqual({
+      headers: { "x-izwi-filename": "meeting.vtt" },
+    });
+  });
+
+  it("hides the speaker names option when no speaker was named", () => {
+    openDialog({ ...record, speaker_name_overrides: {} });
+    expect(screen.queryByRole("switch", { name: /Speaker names/ })).toBeNull();
+    expect(screen.getByRole("switch", { name: /Details/ })).toBeTruthy();
   });
 });

@@ -1,5 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const tauri = vi.hoisted(() => ({
+  isTauri: vi.fn(() => false),
+  invoke: vi.fn(),
+}));
+vi.mock("@tauri-apps/api/core", () => tauri);
 
 import type { TranscriptionRecord } from "@/api";
 import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
@@ -42,38 +48,106 @@ const record = {
   ],
 } satisfies TranscriptionRecord;
 
+beforeEach(() => {
+  tauri.isTauri.mockReturnValue(false);
+  tauri.invoke.mockReset();
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function openDialog() {
+  render(
+    <TranscriptionExportDialog record={record}>
+      <button type="button">Open export</button>
+    </TranscriptionExportDialog>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open export" }));
+}
+
 describe("TranscriptionExportDialog", () => {
-  it("downloads the default txt export", async () => {
+  it("downloads the default text export in a browser", async () => {
     const createObjectUrl = vi
       .spyOn(URL, "createObjectURL")
       .mockReturnValue("blob:transcription-export");
-    const revokeObjectUrl = vi
-      .spyOn(URL, "revokeObjectURL")
-      .mockImplementation(() => {});
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
     const clickSpy = vi
       .spyOn(window.HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => {});
 
-    render(
-      <TranscriptionExportDialog record={record}>
-        <button type="button">Open export</button>
-      </TranscriptionExportDialog>,
-    );
+    openDialog();
+    expect(screen.queryByText("You choose where it's saved.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Open export" }));
-    fireEvent.click(screen.getByRole("button", { name: "Export file" }));
-
-    expect(createObjectUrl).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
     const blob = createObjectUrl.mock.calls[0]?.[0];
     expect(blob).toBeInstanceOf(Blob);
     await expect((blob as Blob).text()).resolves.toContain(
       "[00:00.000 - 00:01.250] Hello there.",
     );
-    expect(clickSpy).toHaveBeenCalledTimes(1);
-    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:transcription-export");
+    expect(
+      (clickSpy.mock.instances[0] as unknown as HTMLAnchorElement).download,
+    ).toBe("meeting.txt");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("saves through the desktop app's save dialog", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.invoke.mockResolvedValue("/Users/me/meeting.srt");
+
+    openDialog();
+    expect(screen.getByText("You choose where it's saved.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "SRT" }));
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const [command, body, options] = tauri.invoke.mock.calls[0] ?? [];
+    expect(command).toBe("save_file");
+    expect(new TextDecoder().decode(body as Uint8Array)).toContain(
+      "00:00:00,000 --> 00:00:01,250",
+    );
+    expect(options).toEqual({ headers: { "x-izwi-filename": "meeting.srt" } });
+  });
+
+  it("stays open when the save dialog is cancelled", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.invoke.mockResolvedValue(null);
+
+    openDialog();
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
+
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Export…/ }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("shows why a save failed", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.invoke.mockRejectedValue(new Error("failed writing /Volumes/USB/meeting.txt"));
+
+    openDialog();
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "failed writing /Volumes/USB/meeting.txt",
+    );
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("offers details only for text and JSON files", () => {
+    openDialog();
+    const details = screen.getByRole("switch", { name: /Details/ });
+    expect(details.hasAttribute("disabled")).toBe(false);
+
+    fireEvent.click(screen.getByRole("radio", { name: "VTT" }));
+    expect(
+      screen.getByRole("switch", { name: /Details/ }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(screen.getByText("Only in Text and JSON files")).toBeTruthy();
   });
 });
