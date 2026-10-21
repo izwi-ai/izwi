@@ -38,9 +38,9 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 
 # Rich terminal UI
-console = "0.15"
+console = "0.16"
 indicatif = { workspace = true }
-dialoguer = "0.11"
+dialoguer = "0.12"
 comfy-table = "7.1"
 
 # Progress and streaming

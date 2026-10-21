@@ -94,7 +94,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 # makes rustls' default-provider lookups panic. Keep default features off.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-indicatif = "0.17"
+indicatif = "0.18"
 dirs = "5.0"
 sha2 = "0.10"
 hmac = "0.12"
