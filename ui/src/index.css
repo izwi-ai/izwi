@@ -4,11 +4,11 @@
 
 :root {
   --space-unit: 0.5rem;
-  --radius-xs: 0.5rem;
-  --radius-sm: 0.75rem;
-  --radius-md: 0.95rem;
-  --radius-lg: 1.15rem;
-  --radius-pill: 999px;
+  --app-radius-xs: 0.5rem;
+  --app-radius-sm: 0.75rem;
+  --app-radius-md: 0.95rem;
+  --app-radius-lg: 1.15rem;
+  --app-radius-pill: 999px;
   --surface-canvas: #09090b;
   --surface-panel: #101114;
   --surface-panel-alt: #17181d;
@@ -76,7 +76,7 @@
   --app-shadow-soft: var(--shadow-soft);
   --app-shadow-hard: var(--shadow-raised);
   --font-ui: "Inter Variable", "Inter", "Segoe UI Variable", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "SFMono-Regular", monospace;
+  --app-font-mono: "JetBrains Mono", "SFMono-Regular", monospace;
   --type-size-page-title: 1.75rem;
   --type-size-section-title: 1.125rem;
   --type-size-body: 0.875rem;
@@ -223,61 +223,6 @@ body {
   background: var(--scroll-thumb-hover);
 }
 
-.input::placeholder {
-  color: var(--text-subtle);
-}
-
-.textarea {
-  @apply w-full border px-3 py-3 resize-none;
-  border-radius: var(--radius-md);
-  background-color: var(--bg-surface-1);
-  border-color: var(--border-muted);
-  color: var(--text-primary);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
-  @apply focus:outline-none focus:ring-2 focus:ring-ring/35;
-  caret-color: var(--text-primary);
-  @apply transition-all duration-150;
-}
-
-.textarea::placeholder {
-  color: var(--text-subtle);
-}
-
-/* Progress bar */
-.progress-bar {
-  @apply h-1 rounded-sm overflow-hidden;
-  background-color: var(--bg-surface-3);
-}
-
-.progress-bar-fill {
-  @apply h-full rounded-sm;
-  background-color: var(--accent-solid);
-  @apply transition-all duration-300 ease-out;
-}
-
-/* Status indicator - monochrome with different fills */
-.status-dot {
-  @apply w-1.5 h-1.5 rounded-full;
-}
-
-.status-dot-ready {
-  background-color: var(--status-positive-solid);
-}
-
-.status-dot-downloading {
-  background-color: var(--status-warning-text);
-  @apply animate-pulse;
-}
-
-.status-dot-loading {
-  background-color: var(--status-info-text);
-  @apply animate-pulse;
-}
-
-.status-dot-error {
-  background-color: var(--danger-text);
-}
-
 /* Sidebar nav interaction states */
 .sidebar-link {
   background-color: var(--sidebar-link-bg);
@@ -299,18 +244,18 @@ body {
 .app-surface {
   background-color: var(--bg-surface-1);
   border: 1px solid var(--border-muted);
-  border-radius: var(--radius-lg);
+  border-radius: var(--app-radius-lg);
   box-shadow: var(--shadow-soft);
 }
 
 .app-surface-subtle {
   background-color: var(--bg-surface-2);
   border: 1px solid var(--border-muted);
-  border-radius: var(--radius-md);
+  border-radius: var(--app-radius-md);
 }
 
 .app-workspace-frame {
-  border-radius: calc(var(--radius-lg) + 0.2rem);
+  border-radius: calc(var(--app-radius-lg) + 0.2rem);
   border: 1px solid var(--border-muted);
   background:
     radial-gradient(circle at top left, var(--bg-glow-1), transparent 30%),
@@ -321,7 +266,7 @@ body {
 .app-kbd {
   display: inline-flex;
   align-items: center;
-  border-radius: var(--radius-xs);
+  border-radius: var(--app-radius-xs);
   border: 1px solid var(--border-muted);
   background-color: var(--bg-surface-1);
   padding: 0.1rem 0.4rem;
@@ -331,7 +276,7 @@ body {
 }
 
 .app-state-panel {
-  border-radius: var(--radius-lg);
+  border-radius: var(--app-radius-lg);
   border: 1px solid var(--border-muted);
   background-color: color-mix(in srgb, var(--bg-surface-1) 92%, transparent);
 }

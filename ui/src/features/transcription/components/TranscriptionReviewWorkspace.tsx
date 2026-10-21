@@ -223,10 +223,10 @@ export function TranscriptionReviewWorkspace({
     ? "relative flex min-h-0 flex-col"
     : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
   const contentClassName = fixedPlaybackFooter
-    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr),260px]"
+    ? "grid gap-5 pb-32 xl:grid-cols-[minmax(0,1fr)_260px]"
     : stickyPlaybackFooter
-    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr),260px]"
-    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),260px]";
+    ? "grid gap-5 pb-20 xl:grid-cols-[minmax(0,1fr)_260px]"
+    : "grid flex-1 min-h-0 gap-5 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr)_260px]";
   const playbackClassName = fixedPlaybackFooter
     ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
     : stickyPlaybackFooter

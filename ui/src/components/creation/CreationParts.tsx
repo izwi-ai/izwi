@@ -13,7 +13,7 @@ export function CreationBody({
   side: ReactNode;
 }) {
   return (
-    <div className="grid lg:grid-cols-[minmax(0,1fr),19rem]">
+    <div className="grid lg:grid-cols-[minmax(0,1fr)_19rem]">
       <div className="flex min-w-0 flex-col gap-3 px-5 py-4 sm:px-6">{main}</div>
       <div className="flex flex-col gap-4 border-t border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] px-5 py-4 lg:border-l lg:border-t-0">
         {side}

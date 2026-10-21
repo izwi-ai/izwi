@@ -106,7 +106,7 @@ export function EngineOffline({
             : `Trying again in ${seconds} second${seconds === 1 ? "" : "s"}`}
         </span>
         {detail ? (
-          <code className="break-words font-[family-name:var(--font-mono)] text-[12px] text-[var(--text-subtle)]">
+          <code className="break-words font-[family-name:var(--app-font-mono)] text-[12px] text-[var(--text-subtle)]">
             {detail}
           </code>
         ) : null}

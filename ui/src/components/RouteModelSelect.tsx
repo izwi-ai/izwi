@@ -158,7 +158,7 @@ export function RouteModelSelect({
           aria-label={ariaLabel ?? selectedOption?.label ?? placeholder}
           aria-describedby={descriptionId}
           className={cn(
-            "w-full rounded-[var(--radius-md)] border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 font-normal text-[var(--text-primary)] shadow-[var(--shadow-soft)] transition-[border-color,background-color,box-shadow] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)] data-[state=open]:border-ring/50 data-[state=open]:ring-2 data-[state=open]:ring-ring/35",
+            "w-full rounded-[var(--app-radius-md)] border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 font-normal text-[var(--text-primary)] shadow-[var(--shadow-soft)] transition-[border-color,background-color,box-shadow] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)] data-[state=open]:border-ring/50 data-[state=open]:ring-2 data-[state=open]:ring-ring/35",
             triggerClassName ?? "h-10",
           )}
         >
@@ -196,7 +196,7 @@ export function RouteModelSelect({
               disabled={option.disabled}
               textValue={option.label}
               className={cn(
-                "relative flex min-w-[18rem] cursor-default select-none items-start rounded-[var(--radius-sm)] py-2.5 pl-3 pr-9 text-left outline-none transition-colors focus:bg-[var(--bg-surface-1)] focus:text-[var(--text-primary)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+                "relative flex min-w-[18rem] cursor-default select-none items-start rounded-[var(--app-radius-sm)] py-2.5 pl-3 pr-9 text-left outline-none transition-colors focus:bg-[var(--bg-surface-1)] focus:text-[var(--text-primary)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
                 selectedOption?.value === option.value &&
                   "bg-[var(--bg-surface-1)]",
               )}

@@ -263,7 +263,7 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr),280px]">
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
         <div className="space-y-5">
     <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
             <h3 className="text-sm font-semibold text-[var(--text-primary)]">

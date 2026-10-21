@@ -378,10 +378,10 @@ export function DiarizationReviewWorkspace({
     ? "relative flex min-h-0 flex-col"
     : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
   const contentClassName = fixedPlaybackFooter
-    ? "grid gap-6 pb-32 xl:grid-cols-[minmax(0,1fr),248px]"
+    ? "grid gap-6 pb-32 xl:grid-cols-[minmax(0,1fr)_248px]"
     : stickyPlaybackFooter
-      ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr),248px]"
-      : "grid gap-6 xl:grid-cols-[minmax(0,1fr),248px] pb-20";
+      ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr)_248px]"
+      : "grid gap-6 xl:grid-cols-[minmax(0,1fr)_248px] pb-20";
   const playbackClassName = fixedPlaybackFooter
     ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
     : stickyPlaybackFooter

@@ -54,7 +54,7 @@ export function StatePanel({
       {Icon ? (
         <div
           className={cn(
-            "flex h-12 w-12 shrink-0 items-center justify-center rounded-[var(--radius-lg)] border border-border/70 bg-background/55",
+            "flex h-12 w-12 shrink-0 items-center justify-center rounded-[var(--app-radius-lg)] border border-border/70 bg-background/55",
             align === "center" && "mx-auto",
           )}
         >
