@@ -127,7 +127,8 @@ For each OS runner, the workflow builds:
 GitHub Releases currently publish:
 
 1. macOS assets as the Metal-capable path on Apple Silicon with macOS 15+;
-   those same assets fall back to CPU on macOS 12-14.
+   those same assets fall back to CPU on older macOS. The desktop app needs
+   macOS 13.3+ (its bundle floor); the terminal binaries keep a 12.0 floor.
 2. Linux and Windows assets as CPU-only native artifacts with CPU-safe public entrypoints.
 
 Linux and Windows public binary names must remain unchanged:

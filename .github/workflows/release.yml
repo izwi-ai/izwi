@@ -188,20 +188,26 @@ jobs:
 
       - name: Build desktop binary
         env:
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          MACOSX_DEPLOYMENT_TARGET: "13.3"
         run: |
           cargo build --release --bin izwi-desktop
 
       - name: Verify macOS binary deployment floor
         if: runner.os == 'macOS'
         run: |
-          for binary in target/release/izwi target/release/izwi-server target/release/izwi-gateway target/release/izwi-serving-supervisor target/release/izwi-serving-worker target/release/izwi-desktop; do
-            minos="$(otool -l "$binary" | awk '/LC_BUILD_VERSION/ { found=1; next } found && /minos/ { print $2; exit }')"
-            if [[ "$minos" != "12.0" ]]; then
-              echo "::error::$binary has deployment floor '$minos', expected 12.0."
+          # The terminal binaries run on macOS 12. The desktop app needs
+          # macOS 13.3: its UI requires WebKit (Safari) 16.4.
+          verify_floor() {
+            minos="$(otool -l "$1" | awk '/LC_BUILD_VERSION/ { found=1; next } found && /minos/ { print $2; exit }')"
+            if [[ "$minos" != "$2" ]]; then
+              echo "::error::$1 has deployment floor '$minos', expected $2."
               exit 1
             fi
+          }
+          for binary in target/release/izwi target/release/izwi-server target/release/izwi-gateway target/release/izwi-serving-supervisor target/release/izwi-serving-worker; do
+            verify_floor "$binary" 12.0
           done
+          verify_floor target/release/izwi-desktop 13.3
 
       - name: Package terminal binaries (Linux/macOS)
         if: runner.os != 'Windows'
@@ -267,7 +273,7 @@ jobs:
           CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          MACOSX_DEPLOYMENT_TARGET: "13.3"
         run: |
           echo "::warning::No Apple signing secrets: this macOS build is not signed with a Developer ID or notarized."
           env -u APPLE_SIGNING_IDENTITY \
@@ -286,7 +292,7 @@ jobs:
           CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          MACOSX_DEPLOYMENT_TARGET: "13.3"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -307,8 +313,8 @@ jobs:
             exit 1
           fi
           minos="$(plutil -extract LSMinimumSystemVersion raw -o - "$app_path/Contents/Info.plist")"
-          if [[ "$minos" != "12.0" ]]; then
-            echo "::error::$app_path has LSMinimumSystemVersion '$minos', expected 12.0."
+          if [[ "$minos" != "13.3" ]]; then
+            echo "::error::$app_path has LSMinimumSystemVersion '$minos', expected 13.3."
             exit 1
           fi
 
@@ -482,7 +488,7 @@ jobs:
           cat > release-support.md <<'EOF'
           ## Runtime Support
 
-          - macOS native artifacts use Metal on Apple Silicon with macOS 15 or later and fall back to CPU on macOS 12-14.
+          - macOS native artifacts use Metal on Apple Silicon with macOS 15 or later and fall back to CPU on older macOS. The desktop app needs macOS 13.3 or later; terminal archives run on macOS 12 or later.
           - Linux and Windows native artifacts are CPU-only and intentionally do not bundle CUDA runtime libraries.
           - Terminal archives include `izwi-server`, the standalone `izwi-gateway` (the preferred gateway: it links no inference engine; `izwi-server --role gateway` still works), the CPU-only `izwi-serving-supervisor`, one backend-appropriate `izwi-serving-worker`, and a bounded single-node configuration example.
           - The packaged supervisor accepts explicit CPU inventory only. Metal/CUDA supervisor inventory and launch profiles remain fail-closed and are release blockers for those supervised lanes.

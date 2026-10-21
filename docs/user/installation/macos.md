@@ -4,14 +4,16 @@ description: "Install Izwi on macOS with the DMG, optional CLI tools, and Apple 
 sidebarTitle: "macOS"
 icon: "apple"
 ---
-Izwi supports macOS 12 and later. Apple Silicon Macs use Metal acceleration on
-macOS 15+; macOS 12-14 remain supported with the CPU backend.
+The Izwi desktop app supports macOS 13.3 and later, and the terminal bundle
+supports macOS 12 and later. Apple Silicon Macs use Metal acceleration on
+macOS 15+; older versions remain supported with the CPU backend.
 
 ---
 
 ## Requirements
 
-- **macOS 12.0** (Monterey) or later
+- **macOS 13.3** (Ventura) or later for the desktop app; **macOS 12.0**
+  (Monterey) or later for the terminal bundle
 - **8 GB RAM** minimum (16 GB recommended)
 - **10 GB** free disk space (more for models)
 

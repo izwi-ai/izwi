@@ -52,7 +52,8 @@ the app and select **Install** (the `.deb` installs it for you).
 Runtime support depends on the artifact:
 
 - macOS Apple Silicon release builds use Metal on macOS 15+ and fall back to
-  CPU on macOS 12-14.
+  CPU on older macOS. The desktop app needs macOS 13.3 or later; the terminal
+  bundle runs on macOS 12 or later.
 - Linux and Windows release builds are CPU-only.
 - CUDA is supported through the Docker CUDA profile or source builds on
   compatible NVIDIA hosts.
