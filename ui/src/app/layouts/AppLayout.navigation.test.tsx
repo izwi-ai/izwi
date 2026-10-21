@@ -125,7 +125,7 @@ describe("AppLayout compact navigation accessibility", () => {
     // The search button opens the drawer's Tab order; focus starts on the
     // first page link.
     const search = within(drawer).getByRole("button", {
-      name: "Search or jump to",
+      name: /^Search or jump to/,
     });
     search.focus();
     fireEvent.keyDown(search, { key: "Tab", shiftKey: true });

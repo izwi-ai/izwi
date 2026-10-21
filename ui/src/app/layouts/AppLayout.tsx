@@ -404,7 +404,9 @@ function AppShell({
             type="button"
             onClick={() => setIsCommandPaletteOpen(true)}
             tabIndex={sidebarInteractive ? undefined : -1}
-            aria-label="Search or jump to"
+            // Expanded, the visible label (shortcut included) is the name, so
+            // the name contains what sighted users see (WCAG 2.5.3).
+            aria-label={isSidebarCollapsed ? "Search or jump to" : undefined}
             aria-keyshortcuts={isMacPlatform() ? "Meta+K" : "Control+K"}
             title={isSidebarCollapsed ? "Search or jump to" : undefined}
             className={cn(

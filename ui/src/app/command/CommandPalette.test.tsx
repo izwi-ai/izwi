@@ -84,7 +84,7 @@ describe("CommandPalette", () => {
   it("opens from the sidebar and switches theme", () => {
     renderLayout();
 
-    fireEvent.click(screen.getByRole("button", { name: "Search or jump to" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Search or jump to/ }));
     fireEvent.click(screen.getByRole("option", { name: "Light theme" }));
 
     expect(themeMocks.setThemePreference).toHaveBeenCalledWith("light");
