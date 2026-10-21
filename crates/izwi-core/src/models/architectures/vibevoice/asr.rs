@@ -2611,7 +2611,7 @@ fn validate_vibevoice_artifact_model_identity(
 
 fn next_vibevoice_asr_state_id() -> Result<u64> {
     NEXT_VIBEVOICE_ASR_STATE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::InferenceError("VibeVoice ASR state identity overflow".into()))
@@ -2619,7 +2619,7 @@ fn next_vibevoice_asr_state_id() -> Result<u64> {
 
 fn next_vibevoice_asr_model_load_nonce() -> Result<u64> {
     NEXT_VIBEVOICE_ASR_MODEL_LOAD_NONCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::ModelLoadError("VibeVoice ASR load nonce overflow".into()))

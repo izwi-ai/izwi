@@ -3936,7 +3936,7 @@ struct ModelUseState {
 impl ModelUseState {
     fn acquire(self: &Arc<Self>) -> Option<Arc<ModelUseGuard>> {
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 active.checked_add(1)
             })
             .ok()?;

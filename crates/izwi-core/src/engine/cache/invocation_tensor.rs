@@ -392,7 +392,7 @@ impl<A: InvocationSlotArena> InvocationSlotPoolOwner<A> {
             allocation_generation,
         };
         let instance_nonce = NEXT_POOL_INSTANCE_NONCE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |nonce| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |nonce| {
                 nonce.checked_add(1)
             })
             .map_err(|_| invalid("invocation slot pool instance nonce exhausted"))?;

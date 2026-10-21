@@ -1053,7 +1053,7 @@ fn validate_selected_staging(
 
 fn allocate_arena_nonce(counter: &AtomicU64) -> Result<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             (current != 0).then(|| current.checked_add(1)).flatten()
         })
         .map_err(|_| invalid("tensor state arena nonce space is exhausted"))

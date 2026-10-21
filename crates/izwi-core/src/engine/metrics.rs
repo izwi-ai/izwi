@@ -1080,7 +1080,7 @@ fn duration_snapshot(
 }
 
 fn saturating_atomic_add(value: &AtomicU64, amount: u64) -> u64 {
-    match value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    match value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
     }) {
         Ok(previous) => previous.saturating_add(amount),
@@ -1089,7 +1089,7 @@ fn saturating_atomic_add(value: &AtomicU64, amount: u64) -> u64 {
 }
 
 fn saturating_atomic_sub(value: &AtomicU64, amount: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
 }

@@ -147,7 +147,7 @@ impl SpeechSpool {
 
     fn new_tempfile(self: &Arc<Self>) -> anyhow::Result<SpeechTempFile> {
         self.active_tempfiles
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_PROCESS_TEMPFILES).then_some(active + 1)
             })
             .map_err(|_| {

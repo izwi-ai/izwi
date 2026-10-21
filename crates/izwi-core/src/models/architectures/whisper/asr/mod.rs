@@ -740,7 +740,7 @@ fn restart_whisper_temperature_attempt(
 
 fn next_whisper_decode_state_id() -> Result<u64> {
     NEXT_WHISPER_DECODE_STATE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| Error::InferenceError("Whisper decode-state identity overflow".into()))

@@ -529,11 +529,8 @@ run_hygiene() {
         crates/izwi-core/src/engine/cache/managed_stress.rs \
         crates/izwi-core/examples/kv-cache-bench.rs \
         crates/izwi-core/tests/kv_public_compatibility.rs
-    # The workspace MSRV is 1.88 (the Dockerfile CUDA builder pins it), so
-    # std deprecations like Atomic::fetch_update -> try_update (stable 1.95)
-    # are forward-looking renames the pinned code must not chase yet.
     TAURI_CONFIG="${tauri_check_config}" \
-        cargo clippy --locked --workspace --all-targets -- -D warnings -A deprecated
+        cargo clippy --locked --workspace --all-targets -- -D warnings
     TAURI_CONFIG="${tauri_check_config}" \
         cargo check --locked --workspace --all-targets
     # The gateway, transport, launch contract and supervisor stay
