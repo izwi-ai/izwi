@@ -63,20 +63,19 @@ const vendorChunkRules = [
   },
 ] as const;
 
-function resolveVendorChunk(id: string): string | undefined {
-  const normalizedId = id.replaceAll("\\", "/");
-  if (!normalizedId.includes("/node_modules/")) {
-    return undefined;
-  }
-
-  for (const rule of vendorChunkRules) {
-    if (rule.paths.some((path) => normalizedId.includes(path))) {
-      return rule.chunk;
-    }
-  }
-
-  return "vendor";
-}
+// Each rule's group outranks the catch-all "vendor" group, so a module goes
+// to its rule's chunk along with the dependencies only it pulls in.
+const vendorChunkGroups = [
+  ...vendorChunkRules.map((rule) => ({
+    name: rule.chunk,
+    test: (id: string) => {
+      const normalizedId = id.replaceAll("\\", "/");
+      return rule.paths.some((path) => normalizedId.includes(path));
+    },
+    priority: 20,
+  })),
+  { name: "vendor", test: /[\\/]node_modules[\\/]/, priority: 10 },
+];
 
 export default defineConfig({
   plugins: [react()],
@@ -100,9 +99,9 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks: resolveVendorChunk,
+        codeSplitting: { groups: vendorChunkGroups },
       },
     },
   },
