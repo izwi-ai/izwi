@@ -168,10 +168,10 @@
           "chat_capabilities": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AdminChatModelCapabilities"
               },
               {
-                "$ref": "#/components/schemas/AdminChatModelCapabilities"
+                "type": "null"
               }
             ]
           },
@@ -265,10 +265,10 @@
           "speech_capabilities": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AdminSpeechModelCapabilities"
               },
               {
-                "$ref": "#/components/schemas/AdminSpeechModelCapabilities"
+                "type": "null"
               }
             ]
           },
@@ -767,10 +767,10 @@
           "usage": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Usage"
               },
               {
-                "$ref": "#/components/schemas/Usage"
+                "type": "null"
               }
             ]
           }
@@ -830,10 +830,10 @@
           "chat_template_kwargs": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatTemplateKwargs"
               },
               {
-                "$ref": "#/components/schemas/ChatTemplateKwargs"
+                "type": "null"
               }
             ]
           },
@@ -882,10 +882,10 @@
           "reasoning_effort": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatReasoningEffort"
               },
               {
-                "$ref": "#/components/schemas/ChatReasoningEffort"
+                "type": "null"
               }
             ]
           },
@@ -920,10 +920,10 @@
           "stream_options": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatCompletionStreamOptions"
               },
               {
-                "$ref": "#/components/schemas/ChatCompletionStreamOptions"
+                "type": "null"
               }
             ]
           },
@@ -996,11 +996,11 @@
           "izwi_timing": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChatTiming",
                 "description": "Engine request phases; absent under strict OpenAI compatibility."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1060,10 +1060,10 @@
           "reasoning_effort": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatReasoningEffort"
               },
               {
-                "$ref": "#/components/schemas/ChatReasoningEffort"
+                "type": "null"
               }
             ]
           }
@@ -1366,10 +1366,10 @@
           "batch_runtime": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RuntimeQueueHealthSnapshot"
               },
               {
-                "$ref": "#/components/schemas/RuntimeQueueHealthSnapshot"
+                "type": "null"
               }
             ]
           },
@@ -1549,10 +1549,10 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ApiErrorBody"
               },
               {
-                "$ref": "#/components/schemas/ApiErrorBody"
+                "type": "null"
               }
             ]
           },
@@ -1619,10 +1619,10 @@
           "chat_template_kwargs": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatTemplateKwargs"
               },
               {
-                "$ref": "#/components/schemas/ChatTemplateKwargs"
+                "type": "null"
               }
             ]
           },
@@ -1666,10 +1666,10 @@
           "reasoning_effort": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatReasoningEffort"
               },
               {
-                "$ref": "#/components/schemas/ChatReasoningEffort"
+                "type": "null"
               }
             ]
           },
