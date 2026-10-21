@@ -56,7 +56,17 @@ pub fn read_single_tensor_info(path: &Path, logical_name: &str) -> Result<(Tenso
         ))
     })?;
 
-    let file_names = zip.file_names().map(str::to_string).collect::<Vec<_>>();
+    let file_names = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to list PyTorch tensor archive {} entries: {}",
+                path.display(),
+                err
+            ))
+        })?;
     for file_name in &file_names {
         if !file_name.ends_with("data.pkl") {
             continue;

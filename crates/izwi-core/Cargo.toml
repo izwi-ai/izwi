@@ -45,7 +45,9 @@ symphonia = { workspace = true, default-features = false, features = [
 ] }
 rubato = { workspace = true }
 rustfft = { workspace = true }
-zip = "7"
+# PyTorch .pt/.pth archives (Kokoro voices, weights) are read by member name and
+# store their entries uncompressed; deflate is the only codec kept.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 rand = "0.8"
