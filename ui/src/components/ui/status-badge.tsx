@@ -9,26 +9,26 @@ const subtleToneClasses: Record<StatusTone, string> = {
   neutral:
     "border-border/80 bg-muted/60 text-muted-foreground",
   info:
-    "border-[var(--status-info-border)] bg-[var(--status-info-bg)] text-[var(--status-info-text)]",
+    "border-(--status-info-border) bg-(--status-info-bg) text-(--status-info-text)",
   success:
-    "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]",
+    "border-(--status-positive-border) bg-(--status-positive-bg) text-(--status-positive-text)",
   warning:
-    "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
+    "border-(--status-warning-border) bg-(--status-warning-bg) text-(--status-warning-text)",
   danger:
-    "border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)]",
+    "border-(--danger-border) bg-(--danger-bg) text-(--danger-text)",
 };
 
 const solidToneClasses: Record<StatusTone, string> = {
   neutral:
     "border-border bg-foreground text-background",
   info:
-    "border-[var(--status-info-text)] bg-[var(--status-info-text)] text-[var(--bg-surface-0)]",
+    "border-(--status-info-text) bg-(--status-info-text) text-(--bg-surface-0)",
   success:
-    "border-[var(--status-positive-solid)] bg-[var(--status-positive-solid)] text-[var(--bg-surface-0)]",
+    "border-(--status-positive-solid) bg-(--status-positive-solid) text-(--bg-surface-0)",
   warning:
-    "border-[var(--status-warning-text)] bg-[var(--status-warning-text)] text-[var(--bg-surface-0)]",
+    "border-(--status-warning-text) bg-(--status-warning-text) text-(--bg-surface-0)",
   danger:
-    "border-[var(--danger-text)] bg-[var(--danger-text)] text-[var(--bg-surface-0)]",
+    "border-(--danger-text) bg-(--danger-text) text-(--bg-surface-0)",
 };
 
 interface StatusBadgeProps extends HTMLAttributes<HTMLSpanElement> {

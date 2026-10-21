@@ -88,7 +88,7 @@ export function ReasoningBlock({
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="-ml-0.5 inline-flex h-[26px] items-center gap-1.5 self-start rounded-md pr-2 text-[13px] leading-none text-[var(--text-subtle)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+        className="-ml-0.5 inline-flex h-[26px] items-center gap-1.5 self-start rounded-md pr-2 text-[13px] leading-none text-(--text-subtle) transition-colors hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)"
       >
         <Lightbulb className="h-3.5 w-3.5" aria-hidden="true" />
         <span className={cn(active && "chat-shimmer")}>{label}</span>
@@ -101,13 +101,13 @@ export function ReasoningBlock({
         />
       </button>
       {expanded ? (
-        <div className="whitespace-pre-wrap border-l-2 border-[var(--border-default)] pl-3.5 text-[13.5px] leading-[1.65] text-[var(--text-muted)]">
+        <div className="whitespace-pre-wrap border-l-2 border-(--border-default) pl-3.5 text-[13.5px] leading-[1.65] text-(--text-muted)">
           {thinking}
         </div>
       ) : active && thinking ? (
         <div
           aria-hidden="true"
-          className="chat-reasoning-tail flex max-h-[4.8em] flex-col justify-end overflow-hidden border-l-2 border-[var(--border-default)] pl-3.5 text-[13px] leading-[1.6] text-[var(--text-subtle)]"
+          className="chat-reasoning-tail flex max-h-[4.8em] flex-col justify-end overflow-hidden border-l-2 border-(--border-default) pl-3.5 text-[13px] leading-[1.6] text-(--text-subtle)"
         >
           <div className="whitespace-pre-wrap">{thinking}</div>
         </div>

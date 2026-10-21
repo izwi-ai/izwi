@@ -13,7 +13,7 @@ export function NotFoundPage() {
       description={
         <>
           Nothing lives at{" "}
-          <code className="break-all font-mono text-[13px] text-[var(--text-secondary)]">
+          <code className="break-all font-mono text-[13px] text-(--text-secondary)">
             {requestedPath}
           </code>
           .

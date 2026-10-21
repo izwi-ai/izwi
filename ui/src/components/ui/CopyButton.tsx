@@ -83,7 +83,7 @@ export function CopyButton({
         aria-label={showLabel ? undefined : copied ? "Copied" : label}
         title={showLabel ? undefined : label}
         className={cn(
-          "inline-flex items-center justify-center gap-1.5 rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]",
+          "inline-flex items-center justify-center gap-1.5 rounded-lg text-(--text-subtle) transition-colors hover:bg-(--surface-raised) hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)",
           showLabel ? "h-7 px-2 text-xs" : "h-7 w-7",
           className,
         )}
@@ -94,7 +94,7 @@ export function CopyButton({
       {copied && !showLabel ? (
         <span
           role="status"
-          className="pointer-events-none absolute bottom-full left-1/2 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md bg-[var(--text-primary)] px-2 py-1 text-[11.5px] font-medium text-[var(--bg-app)]"
+          className="pointer-events-none absolute bottom-full left-1/2 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md bg-(--text-primary) px-2 py-1 text-[11.5px] font-medium text-(--bg-app)"
         >
           Copied
         </span>

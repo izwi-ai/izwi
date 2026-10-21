@@ -250,7 +250,7 @@ describe("DiarizationReviewWorkspace", () => {
 
     expect(screen.getByTestId("diarization-review-player")).toHaveClass("fixed");
     expect(screen.getByTestId("diarization-review-player")).toHaveClass(
-      "lg:left-[var(--app-shell-left)]",
+      "lg:left-(--app-shell-left)",
     );
   });
 

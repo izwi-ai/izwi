@@ -78,7 +78,7 @@ function StudioProjectRoute({
   }
   if (state.load === "loading") {
     return (
-      <div className="flex min-h-[50vh] items-center justify-center text-sm text-[var(--text-muted)]">
+      <div className="flex min-h-[50vh] items-center justify-center text-sm text-(--text-muted)">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
         Opening project…
       </div>
@@ -86,12 +86,12 @@ function StudioProjectRoute({
   }
   return (
     <div className="mx-auto flex min-h-[50vh] max-w-md flex-col items-center justify-center gap-4 text-center">
-      <AlertTriangle className="h-5 w-5 text-[var(--text-muted)]" />
+      <AlertTriangle className="h-5 w-5 text-(--text-muted)" />
       <div className="flex flex-col gap-1.5">
-        <h1 className="text-base font-semibold text-[var(--text-primary)]">
+        <h1 className="text-base font-semibold text-(--text-primary)">
           {state.load === "missing" ? "This project doesn't exist" : "Couldn't open this project"}
         </h1>
-        <p className="text-sm text-[var(--text-muted)]">
+        <p className="text-sm text-(--text-muted)">
           {state.load === "missing"
             ? "It may have been deleted."
             : (state.loadError ?? "Try again in a moment.")}

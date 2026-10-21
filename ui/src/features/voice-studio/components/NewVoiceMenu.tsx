@@ -63,7 +63,7 @@ export function NewVoiceMenu({ open, onOpenChange, onSelect }: NewVoiceMenuProps
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
-        className="w-[300px] rounded-[12px] border-[var(--border-default)] bg-[var(--bg-surface-1)] p-1"
+        className="w-[300px] rounded-[12px] border-(--border-default) bg-(--bg-surface-1) p-1"
         // The menu finishes closing after the dialog has opened; it must not
         // pull focus out of the dialog.
         onCloseAutoFocus={(event) => {
@@ -79,17 +79,17 @@ export function NewVoiceMenu({ open, onOpenChange, onSelect }: NewVoiceMenuProps
             onSelect={() => {
               chosenRef.current = item.kind;
             }}
-            className="items-start gap-3 rounded-[8px] px-2.5 py-2.5 focus:bg-[var(--accent-soft)]"
+            className="items-start gap-3 rounded-[8px] px-2.5 py-2.5 focus:bg-(--accent-soft)"
           >
             <item.icon
               aria-hidden="true"
-              className="mt-0.5 h-4 w-4 shrink-0 text-[var(--text-muted)]"
+              className="mt-0.5 h-4 w-4 shrink-0 text-(--text-muted)"
             />
             <span className="flex min-w-0 flex-col">
-              <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
+              <span className="text-[13.5px] font-medium text-(--text-primary)">
                 {item.title}
               </span>
-              <span className="text-[12.5px] text-[var(--text-subtle)]">
+              <span className="text-[12.5px] text-(--text-subtle)">
                 {item.detail}
               </span>
             </span>

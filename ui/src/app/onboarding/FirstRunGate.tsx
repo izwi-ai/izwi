@@ -142,7 +142,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
   switch (state.status) {
     case "checking":
       content = (
-        <div className="h-dvh bg-[var(--surface-canvas)]">
+        <div className="h-dvh bg-(--surface-canvas)">
           <span role="status" className="sr-only">
             Starting Izwi…
           </span>

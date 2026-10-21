@@ -15,7 +15,7 @@ const ON_DEVICE = new Set<ModelOption["status"]>([
 ]);
 
 const itemClass =
-  "relative flex h-8 cursor-default select-none items-center rounded-md pl-2.5 pr-8 text-[13.5px] outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-[var(--accent-soft)] data-[state=checked]:bg-[var(--accent-soft)]";
+  "relative flex h-8 cursor-default select-none items-center rounded-md pl-2.5 pr-8 text-[13.5px] outline-hidden data-disabled:pointer-events-none data-disabled:opacity-50 data-highlighted:bg-(--accent-soft) data-[state=checked]:bg-(--accent-soft)";
 
 interface ChatModelPickerProps {
   value: string | null;
@@ -57,12 +57,12 @@ export function ChatModelPicker({
     >
       <SelectPrimitive.Trigger
         aria-label="Chat model"
-        className="inline-flex h-9 min-w-0 max-w-[16rem] items-center gap-1.5 rounded-full border border-[var(--border-default)] px-3.5 text-[13.5px] font-medium text-[var(--text-primary)] outline-none transition-colors hover:border-[var(--border-strong)] focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] disabled:cursor-not-allowed disabled:opacity-50 data-[state=open]:border-[var(--border-strong)] data-[state=open]:bg-[var(--accent-soft)]"
+        className="inline-flex h-9 min-w-0 max-w-[16rem] items-center gap-1.5 rounded-full border border-(--border-default) px-3.5 text-[13.5px] font-medium text-(--text-primary) outline-hidden transition-colors hover:border-(--border-strong) focus-visible:ring-2 focus-visible:ring-(--border-strong) disabled:cursor-not-allowed disabled:opacity-50 data-[state=open]:border-(--border-strong) data-[state=open]:bg-(--accent-soft)"
       >
         <span className="truncate">{selected?.label ?? "Choose a model"}</span>
         <ChevronDown
           aria-hidden="true"
-          className="h-4 w-4 shrink-0 text-[var(--text-muted)]"
+          className="h-4 w-4 shrink-0 text-(--text-muted)"
         />
       </SelectPrimitive.Trigger>
       <SelectContent
@@ -70,7 +70,7 @@ export function ChatModelPicker({
         side={menuPlacement}
         align="start"
         sideOffset={8}
-        className="z-[90] w-[16.5rem] rounded-[12px] border-[var(--border-default)] bg-[var(--surface-panel)] p-1"
+        className="z-90 w-66 rounded-[12px] border-(--border-default) bg-(--surface-panel) p-1"
       >
         {shown.map((option) => (
           <SelectPrimitive.Item
@@ -92,12 +92,12 @@ export function ChatModelPicker({
           </SelectPrimitive.Item>
         ))}
         {shown.length > 0 && (
-          <SelectPrimitive.Separator className="my-1 h-px bg-[var(--border-subtle)]" />
+          <SelectPrimitive.Separator className="my-1 h-px bg-(--border-subtle)" />
         )}
         <SelectPrimitive.Item
           value={MANAGE_VALUE}
           textValue="Manage chat models…"
-          className={cn(itemClass, "text-[13px] text-[var(--text-muted)]")}
+          className={cn(itemClass, "text-[13px] text-(--text-muted)")}
         >
           <SelectPrimitive.ItemText>Manage chat models…</SelectPrimitive.ItemText>
         </SelectPrimitive.Item>

@@ -240,7 +240,7 @@ export function DesignVoiceDialog({
       <CreationDialog
         open={open}
         onClose={onClose}
-        className="max-w-[32rem]"
+        className="max-w-lg"
         title="Voice saved"
         onSubmit={
           onUseInTextToSpeech
@@ -266,7 +266,7 @@ export function DesignVoiceDialog({
       onClose={onClose}
       modal={!isModelManagerOpen}
       blockDismiss={isModelManagerOpen || saving}
-      className="max-w-[52rem]"
+      className="max-w-208"
       title="Design a voice"
       onSubmit={() => void save()}
       submitLabel={picked ? `Save option ${picked.number}` : "Save option"}
@@ -299,7 +299,7 @@ export function DesignVoiceDialog({
                 aria-expanded={examplesOpen}
                 aria-controls="design-voice-examples"
                 onClick={() => setExamplesOpen((current) => !current)}
-                className="col-start-2 row-start-1 text-[12.5px] text-[var(--text-muted)] underline-offset-[3px] hover:text-[var(--text-primary)] hover:underline"
+                className="col-start-2 row-start-1 text-[12.5px] text-(--text-muted) underline-offset-[3px] hover:text-(--text-primary) hover:underline"
               >
                 Examples
               </button>
@@ -314,7 +314,7 @@ export function DesignVoiceDialog({
                         setExamplesOpen(false);
                       }}
                       disabled={saving}
-                      className="h-7 rounded-full border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-2.5 text-[12.5px] text-[var(--text-muted)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+                      className="h-7 rounded-full border border-(--border-subtle) bg-(--surface-panel) px-2.5 text-[12.5px] text-(--text-muted) transition-colors hover:border-(--border-strong) hover:text-(--text-primary)"
                     >
                       {example.name}
                     </button>
@@ -330,7 +330,7 @@ export function DesignVoiceDialog({
                 </label>
                 <span
                   id="design-voice-preview-count"
-                  className="text-xs tabular-nums text-[var(--text-subtle)]"
+                  className="text-xs tabular-nums text-(--text-subtle)"
                 >
                   {previewLine.length} / {PREVIEW_LINE_MAX_CHARS}
                 </span>
@@ -373,8 +373,8 @@ export function DesignVoiceDialog({
                 ) : null}
               </div>
               {options.length === 0 && !generating ? (
-                <div className="flex flex-col items-center gap-3 rounded-[12px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-panel)] px-4 py-5 text-center">
-                  <span className="text-[13px] text-[var(--text-subtle)]">
+                <div className="flex flex-col items-center gap-3 rounded-[12px] border border-dashed border-(--border-strong) bg-(--surface-panel) px-4 py-5 text-center">
+                  <span className="text-[13px] text-(--text-subtle)">
                     Describe the voice, then compare three takes on it.
                   </span>
                   <Button
@@ -393,7 +393,7 @@ export function DesignVoiceDialog({
                 <div
                   role="radiogroup"
                   aria-labelledby="design-voice-options-label"
-                  className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]"
+                  className="overflow-hidden rounded-[12px] border border-(--border-subtle) bg-(--surface-panel)"
                 >
                   {options.map(({ number, record }) => {
                     const selected = record.id === selectedId;
@@ -401,8 +401,8 @@ export function DesignVoiceDialog({
                       <label
                         key={record.id}
                         className={cn(
-                          "grid cursor-pointer grid-cols-[auto_auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-[var(--border-subtle)] px-3 py-2.5 last:border-b-0",
-                          selected && "bg-[var(--accent-soft)]",
+                          "grid cursor-pointer grid-cols-[auto_auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-(--border-subtle) px-3 py-2.5 last:border-b-0",
+                          selected && "bg-(--accent-soft)",
                         )}
                       >
                         <input
@@ -413,7 +413,7 @@ export function DesignVoiceDialog({
                           onChange={() => setSelectedId(record.id)}
                           disabled={saving}
                           aria-label={`Option ${number}`}
-                          className="h-4 w-4 cursor-pointer appearance-none rounded-full border border-[var(--border-strong)] checked:border-[5px] checked:border-[var(--accent-solid)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+                          className="h-4 w-4 cursor-pointer appearance-none rounded-full border border-(--border-strong) checked:border-[5px] checked:border-(--accent-solid) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring/45"
                         />
                         <PlayButton
                           small
@@ -425,13 +425,13 @@ export function DesignVoiceDialog({
                         />
                         <span
                           className={cn(
-                            "text-[13.5px] text-[var(--text-primary)]",
+                            "text-[13.5px] text-(--text-primary)",
                             selected && "font-medium",
                           )}
                         >
                           Option {number}
                         </span>
-                        <span className="text-[12px] tabular-nums text-[var(--text-subtle)]">
+                        <span className="text-[12px] tabular-nums text-(--text-subtle)">
                           {formatClockDuration(record.audio_duration_secs)}
                         </span>
                       </label>
@@ -440,12 +440,12 @@ export function DesignVoiceDialog({
                   {Array.from({ length: pendingCount }, (_, index) => (
                     <div
                       key={`pending-${index}`}
-                      className="flex items-center gap-3 border-b border-[var(--border-subtle)] px-3 py-3 text-[13px] text-[var(--text-subtle)] last:border-b-0"
+                      className="flex items-center gap-3 border-b border-(--border-subtle) px-3 py-3 text-[13px] text-(--text-subtle) last:border-b-0"
                     >
                       {index === 0 ? (
                         <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
                       ) : (
-                        <span aria-hidden="true" className="h-4 w-4 rounded-full border border-dashed border-[var(--border-strong)]" />
+                        <span aria-hidden="true" className="h-4 w-4 rounded-full border border-dashed border-(--border-strong)" />
                       )}
                       Option {options.length + index + 1}
                       {index === 0 ? " · generating…" : ""}
@@ -473,7 +473,7 @@ export function DesignVoiceDialog({
               <Select value={language} onValueChange={setLanguage} disabled={generating || saving}>
                 <SelectTrigger
                   aria-label="Language"
-                  className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+                  className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
                 >
                   <SelectValue />
                 </SelectTrigger>

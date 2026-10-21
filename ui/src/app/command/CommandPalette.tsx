@@ -48,10 +48,10 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-[80] bg-background/60 backdrop-blur-[2px]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-80 bg-background/60 backdrop-blur-[2px]" />
         <DialogPrimitive.Content
           aria-describedby={undefined}
-          className="fixed left-1/2 top-[14vh] z-[80] w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 overflow-hidden rounded-2xl border border-[var(--border-default)] bg-[var(--surface-panel)] shadow-[0_24px_70px_-24px_rgba(0,0,0,0.6)]"
+          className="fixed left-1/2 top-[14vh] z-80 w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 overflow-hidden rounded-2xl border border-(--border-default) bg-(--surface-panel) shadow-[0_24px_70px_-24px_rgba(0,0,0,0.6)]"
         >
           <DialogPrimitive.Title className="sr-only">
             Command palette
@@ -196,8 +196,8 @@ function CommandPaletteBody({ onDone }: { onDone: () => void }) {
 
   return (
     <>
-      <div className="flex items-center gap-2.5 border-b border-[var(--border-subtle)] px-4">
-        <Search className="h-4 w-4 shrink-0 text-[var(--text-subtle)]" />
+      <div className="flex items-center gap-2.5 border-b border-(--border-subtle) px-4">
+        <Search className="h-4 w-4 shrink-0 text-(--text-subtle)" />
         <input
           autoFocus
           value={query}
@@ -214,7 +214,7 @@ function CommandPaletteBody({ onDone }: { onDone: () => void }) {
             visible[active] ? optionId(visible[active]) : undefined
           }
           aria-label="Search pages and actions"
-          className="h-12 flex-1 bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-subtle)]"
+          className="h-12 flex-1 bg-transparent text-sm text-(--text-primary) outline-hidden placeholder:text-(--text-subtle)"
         />
       </div>
       <div
@@ -224,7 +224,7 @@ function CommandPaletteBody({ onDone }: { onDone: () => void }) {
         className="max-h-[min(24rem,60vh)] overflow-y-auto p-1.5"
       >
         {visible.length === 0 ? (
-          <p className="px-3 py-6 text-center text-sm text-[var(--text-muted)]">
+          <p className="px-3 py-6 text-center text-sm text-(--text-muted)">
             No matching pages or actions.
           </p>
         ) : (
@@ -236,7 +236,7 @@ function CommandPaletteBody({ onDone }: { onDone: () => void }) {
                 {startsGroup ? (
                   <div
                     aria-hidden="true"
-                    className="px-2.5 pb-1 pt-2 text-[11px] font-medium text-[var(--text-subtle)]"
+                    className="px-2.5 pb-1 pt-2 text-[11px] font-medium text-(--text-subtle)"
                   >
                     {command.group}
                   </div>
@@ -248,12 +248,12 @@ function CommandPaletteBody({ onDone }: { onDone: () => void }) {
                   onMouseMove={() => setActiveIndex(index)}
                   onClick={() => runCommand(command)}
                   className={cn(
-                    "flex h-9 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 text-[13.5px] text-[var(--text-secondary)]",
+                    "flex h-9 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 text-[13.5px] text-(--text-secondary)",
                     index === active &&
-                      "bg-[var(--sidebar-link-active-bg)] text-[var(--text-primary)]",
+                      "bg-(--sidebar-link-active-bg) text-(--text-primary)",
                   )}
                 >
-                  <command.icon className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />
+                  <command.icon className="h-4 w-4 shrink-0 text-(--text-muted)" />
                   {command.label}
                 </div>
               </div>

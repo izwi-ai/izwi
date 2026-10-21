@@ -82,13 +82,13 @@ export function RouteHistoryDrawer({
             variant="outline"
             size="sm"
             className={cn(
-              "h-9 shrink-0 gap-2 rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]",
+              "h-9 shrink-0 gap-2 rounded-lg border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) shadow-none hover:border-(--border-strong) hover:bg-(--bg-surface-3) hover:text-(--text-primary)",
             )}
           >
             <HeaderIcon className="h-4 w-4 shrink-0" />
             <span>{triggerLabel}</span>
             {triggerBadge ? (
-              <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
+              <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-(--border-muted) bg-(--bg-surface-3) px-1.5 py-0.5 text-[10px] font-semibold text-(--text-primary)">
                 {triggerBadge}
               </span>
             ) : null}
@@ -98,15 +98,15 @@ export function RouteHistoryDrawer({
 
       <SheetContent
         side="right"
-        className="w-[min(92vw,22rem)] max-w-[22rem] gap-0 border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] p-0"
+        className="w-[min(92vw,22rem)] max-w-88 gap-0 border-l border-(--border-subtle) bg-(--surface-panel) p-0"
       >
-        <SheetHeader className="gap-0 border-b border-[var(--border-subtle)] px-5 py-4 pr-14">
+        <SheetHeader className="gap-0 border-b border-(--border-subtle) px-5 py-4 pr-14">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0 flex-1">
-              <SheetTitle className="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+              <SheetTitle className="text-[15px] font-semibold tracking-tight text-(--text-primary)">
                 {title}
               </SheetTitle>
-              <SheetDescription className="mt-0.5 text-xs text-[var(--text-muted)]">
+              <SheetDescription className="mt-0.5 text-xs text-(--text-muted)">
                 {countLabel}
               </SheetDescription>
             </div>

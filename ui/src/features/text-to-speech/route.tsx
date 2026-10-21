@@ -599,7 +599,7 @@ export function TextToSpeechPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage="Load a compatible TTS model with built-in voices, saved voices, or voice-direction prompts to generate speech."
-        zIndexClassName={isNewTextToSpeechModalOpen ? "z-[70]" : "z-50"}
+        zIndexClassName={isNewTextToSpeechModalOpen ? "z-70" : "z-50"}
       />
     </PageShell>
   );

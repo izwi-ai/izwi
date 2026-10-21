@@ -976,7 +976,7 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByTestId("route-model-modal")).toHaveAttribute(
       "data-z-index",
-      "z-[70]",
+      "z-70",
     );
   });
 

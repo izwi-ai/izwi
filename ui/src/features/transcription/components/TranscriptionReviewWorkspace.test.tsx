@@ -181,7 +181,7 @@ describe("TranscriptionReviewWorkspace", () => {
       "fixed",
     );
     expect(screen.getByTestId("transcription-review-player")).toHaveClass(
-      "lg:left-[var(--app-shell-left)]",
+      "lg:left-(--app-shell-left)",
     );
   });
 

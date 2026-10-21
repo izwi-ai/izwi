@@ -577,7 +577,7 @@ describe("ChatPlayground", () => {
     const threadTitle = within(dialog).getByText(longTitle);
 
     expect(threadTitle).toHaveClass("whitespace-normal");
-    expect(threadTitle).toHaveClass("break-words");
+    expect(threadTitle).toHaveClass("wrap-break-word");
     expect(threadTitle).not.toHaveClass("truncate");
   });
 

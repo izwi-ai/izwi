@@ -30,17 +30,17 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
   } = project;
   if (pending > 0) {
     return (
-      <span className="flex items-center gap-2.5 text-[var(--text-secondary)]">
+      <span className="flex items-center gap-2.5 text-(--text-secondary)">
         <span
           role="progressbar"
           aria-label="Rendered paragraphs"
           aria-valuemin={0}
           aria-valuemax={total}
           aria-valuenow={rendered}
-          className="h-1 w-16 overflow-hidden rounded-full bg-[var(--surface-raised)]"
+          className="h-1 w-16 overflow-hidden rounded-full bg-(--surface-raised)"
         >
           <span
-            className="block h-full bg-[var(--text-primary)]"
+            className="block h-full bg-(--text-primary)"
             style={{ width: `${total > 0 ? (rendered / total) * 100 : 0}%` }}
           />
         </span>
@@ -51,7 +51,7 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
   }
   if (failed > 0) {
     return (
-      <span className="flex items-center gap-2 text-[var(--danger-text)]">
+      <span className="flex items-center gap-2 text-(--danger-text)">
         <AlertCircle aria-hidden="true" className="h-3.5 w-3.5" />
         {failed === 1 ? "1 paragraph failed" : `${failed} paragraphs failed`}
       </span>
@@ -59,7 +59,7 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
   }
   if (stale > 0) {
     return (
-      <span className="flex items-center gap-2 text-[var(--status-warning-text)]">
+      <span className="flex items-center gap-2 text-(--status-warning-text)">
         <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
         {stale === 1 ? "1 change to render" : `${stale} changes to render`}
       </span>
@@ -67,7 +67,7 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
   }
   if (total > 0 && rendered === total) {
     return (
-      <span className="flex items-center gap-2 text-[var(--status-positive-text)]">
+      <span className="flex items-center gap-2 text-(--status-positive-text)">
         <Check aria-hidden="true" className="h-3.5 w-3.5" strokeWidth={2.5} />
         Ready
       </span>
@@ -75,7 +75,7 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
   }
   if (rendered === 0) {
     return (
-      <span className="flex items-center gap-2 text-[var(--text-muted)]">
+      <span className="flex items-center gap-2 text-(--text-muted)">
         <span
           aria-hidden="true"
           className="h-1.5 w-1.5 rounded-full border border-current"
@@ -85,7 +85,7 @@ export function ProjectStatus({ project }: { project: StudioProjectSummary }) {
     );
   }
   return (
-    <span className="text-[var(--text-muted)]">
+    <span className="text-(--text-muted)">
       {rendered} of {total} rendered
     </span>
   );
@@ -108,7 +108,7 @@ export function StudioProjectList({
       header: "Project",
       className: "max-w-0",
       cell: (project) => (
-        <span className="block truncate font-medium text-[var(--text-primary)]">
+        <span className="block truncate font-medium text-(--text-primary)">
           {project.name}
         </span>
       ),
@@ -116,15 +116,15 @@ export function StudioProjectList({
     {
       id: "status",
       header: "Status",
-      className: "w-[15rem]",
+      className: "w-60",
       cellClassName: "whitespace-nowrap",
       cell: (project) => <ProjectStatus project={project} />,
     },
     {
       id: "length",
       header: "Length",
-      className: "w-[6rem]",
-      cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+      className: "w-24",
+      cellClassName: "whitespace-nowrap tabular-nums text-(--text-muted)",
       cell: (project) =>
         project.audio_duration_secs > 0
           ? formatClockDuration(project.audio_duration_secs)
@@ -133,8 +133,8 @@ export function StudioProjectList({
     {
       id: "voice",
       header: "Voice",
-      className: "hidden w-[9rem] md:table-cell",
-      cellClassName: "truncate text-[var(--text-muted)]",
+      className: "hidden w-36 md:table-cell",
+      cellClassName: "truncate text-(--text-muted)",
       cell: (project) =>
         voiceName(
           {
@@ -149,8 +149,8 @@ export function StudioProjectList({
     {
       id: "edited",
       header: "Edited",
-      className: "hidden w-[9rem] sm:table-cell",
-      cellClassName: "whitespace-nowrap text-[var(--text-muted)]",
+      className: "hidden w-36 sm:table-cell",
+      cellClassName: "whitespace-nowrap text-(--text-muted)",
       cell: (project) => formatHistoryDate(project.updated_at),
     },
   ];

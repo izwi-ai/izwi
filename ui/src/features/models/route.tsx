@@ -126,9 +126,9 @@ function SummaryCard({
   meter?: number | null;
 }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1 rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4 py-3.5">
-      <div className="text-xs text-[var(--text-subtle)]">{label}</div>
-      <div className="truncate text-[15px] text-[var(--text-muted)]">{value}</div>
+    <div className="flex min-w-0 flex-col gap-1 rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-4 py-3.5">
+      <div className="text-xs text-(--text-subtle)">{label}</div>
+      <div className="truncate text-[15px] text-(--text-muted)">{value}</div>
       {meter != null ? (
         <div
           role="meter"
@@ -136,15 +136,15 @@ function SummaryCard({
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={Math.round(meter * 100)}
-          className="mt-1.5 h-1 overflow-hidden rounded-full bg-[var(--surface-raised)]"
+          className="mt-1.5 h-1 overflow-hidden rounded-full bg-(--surface-raised)"
         >
           <div
-            className="h-full rounded-full bg-[var(--status-positive-solid)]"
+            className="h-full rounded-full bg-(--status-positive-solid)"
             style={{ width: `${Math.max(meter * 100, 2)}%` }}
           />
         </div>
       ) : (
-        <div className="truncate text-xs text-[var(--text-subtle)]">{detail}</div>
+        <div className="truncate text-xs text-(--text-subtle)">{detail}</div>
       )}
     </div>
   );
@@ -276,7 +276,7 @@ export function MyModelsPage({
   if (loading) {
     return (
       <PageShell>
-        <div className="flex items-center justify-center gap-2 py-24 text-[var(--text-muted)]">
+        <div className="flex items-center justify-center gap-2 py-24 text-(--text-muted)">
           <Loader2 className="w-4 h-4 animate-spin" />
           <p className="text-sm">Loading models...</p>
         </div>
@@ -327,7 +327,7 @@ export function MyModelsPage({
           value={
             memory ? (
               <>
-                <span className="text-xl font-semibold text-[var(--text-primary)]">
+                <span className="text-xl font-semibold text-(--text-primary)">
                   {memory.reserved_bytes > 0
                     ? formatBytes(memory.reserved_bytes)
                     : "None"}
@@ -343,7 +343,7 @@ export function MyModelsPage({
                 ) : null}
               </>
             ) : (
-              <span className="text-xl font-semibold text-[var(--text-primary)]">
+              <span className="text-xl font-semibold text-(--text-primary)">
                 —
               </span>
             )
@@ -354,7 +354,7 @@ export function MyModelsPage({
         <SummaryCard
           label="Disk used"
           value={
-            <span className="text-xl font-semibold text-[var(--text-primary)]">
+            <span className="text-xl font-semibold text-(--text-primary)">
               {formatBytes(stats.totalSize)}
             </span>
           }
@@ -364,7 +364,7 @@ export function MyModelsPage({
           label="Loaded"
           value={
             <>
-              <span className="text-xl font-semibold text-[var(--text-primary)]">
+              <span className="text-xl font-semibold text-(--text-primary)">
                 {stats.loaded.length}
               </span>
               {stats.loaded.length > 0 ? (
@@ -404,12 +404,12 @@ export function MyModelsPage({
           value={statusFilter}
           onChange={setStatusFilter}
         />
-        <label className="ml-auto flex items-center gap-2 text-[12.5px] text-[var(--text-subtle)]">
+        <label className="ml-auto flex items-center gap-2 text-[12.5px] text-(--text-subtle)">
           Group by
           <select
             value={groupBy}
             onChange={(event) => setGroupBy(event.target.value as GroupBy)}
-            className="h-[30px] rounded-[8px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-2 text-[12.5px] text-[var(--text-secondary)] outline-none"
+            className="h-[30px] rounded-[8px] border border-(--border-default) bg-(--surface-panel) px-2 text-[12.5px] text-(--text-secondary) outline-hidden"
           >
             <option value="task">Task</option>
             <option value="provider">Provider</option>
@@ -418,11 +418,11 @@ export function MyModelsPage({
       </HistoryToolbar>
 
       {filteredModels.length === 0 ? (
-        <div className="rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-6 py-12 text-center">
-          <h3 className="text-base font-semibold text-[var(--text-primary)]">
+        <div className="rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-6 py-12 text-center">
+          <h3 className="text-base font-semibold text-(--text-primary)">
             No models found
           </h3>
-          <p className="mt-1.5 text-sm text-[var(--text-muted)]">
+          <p className="mt-1.5 text-sm text-(--text-muted)">
             {hasActiveFilters
               ? "Try a different search or filter."
               : "Download a model to get started."}
@@ -434,21 +434,21 @@ export function MyModelsPage({
             <section key={section.id} aria-label={section.label}>
               <div className="mb-2 flex items-center gap-2 px-0.5">
                 {section.icon ? (
-                  <section.icon className="h-4 w-4 text-[var(--text-subtle)]" />
+                  <section.icon className="h-4 w-4 text-(--text-subtle)" />
                 ) : null}
-                <h3 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
+                <h3 className="text-[13.5px] font-semibold text-(--text-primary)">
                   {section.label}
                 </h3>
-                <span className="text-xs text-[var(--text-subtle)]">
+                <span className="text-xs text-(--text-subtle)">
                   {section.models.length}
                 </span>
                 {section.usedBy ? (
-                  <span className="ml-auto text-xs text-[var(--text-subtle)]">
+                  <span className="ml-auto text-xs text-(--text-subtle)">
                     Used by {section.usedBy}
                   </span>
                 ) : null}
               </div>
-              <ul className="overflow-hidden rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+              <ul className="overflow-hidden rounded-[14px] border border-(--border-subtle) bg-(--surface-panel)">
                 {section.models.map((model) => {
                   const details = resolveModelDetail(model);
                   const displayName = getModelDisplayName(
@@ -495,32 +495,32 @@ export function MyModelsPage({
       {removedModels.length > 0 && (
         <section
           aria-label="Removed models"
-          className="mt-5 space-y-2 rounded-[14px] border border-[var(--status-warning-border)] bg-[var(--surface-panel)] p-4"
+          className="mt-5 space-y-2 rounded-[14px] border border-(--status-warning-border) bg-(--surface-panel) p-4"
         >
           <div>
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+            <h3 className="text-sm font-semibold text-(--text-primary)">
               Removed models still on disk
             </h3>
-            <p className="mt-1 text-xs text-[var(--text-muted)]">
+            <p className="mt-1 text-xs text-(--text-muted)">
               Izwi no longer runs these downloads and never deletes them for
               you. Delete them to reclaim the space.
             </p>
           </div>
-          <ul className="divide-y divide-[var(--border-subtle)]">
+          <ul className="divide-y divide-(--border-subtle)">
             {removedModels.map((model) => (
               <li
                 key={model.variant}
                 className="flex flex-col gap-2 py-2 sm:flex-row sm:items-center sm:justify-between"
               >
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-[var(--text-primary)]">
+                  <p className="truncate text-sm font-medium text-(--text-primary)">
                     {model.display_name}
                   </p>
-                  <p className="text-xs text-[var(--text-muted)]">
+                  <p className="text-xs text-(--text-muted)">
                     {formatBytes(model.size_bytes)} · use {model.replacement}{" "}
                     instead
                   </p>
-                  <p className="text-xs text-[var(--text-subtle)]">
+                  <p className="text-xs text-(--text-subtle)">
                     {model.reason}
                   </p>
                 </div>
@@ -529,7 +529,7 @@ export function MyModelsPage({
                   variant="outline"
                   size="sm"
                   onClick={() => setDeleteModalVariant(model.variant)}
-                  className="h-8 shrink-0 gap-1.5 self-start text-[var(--danger-text)] sm:self-auto"
+                  className="h-8 shrink-0 gap-1.5 self-start text-(--danger-text) sm:self-auto"
                   aria-label={`Delete ${model.display_name}`}
                 >
                   <Trash2 className="h-3.5 w-3.5" />

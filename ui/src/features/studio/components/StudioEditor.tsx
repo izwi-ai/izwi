@@ -49,8 +49,8 @@ import { cn } from "@/lib/utils";
 
 const pillButton =
   "inline-flex h-9 items-center gap-2 rounded-full px-3.5 text-[13px] font-medium transition-colors disabled:opacity-50";
-const outlineButton = `${pillButton} border border-[var(--border-default)] text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)]`;
-const primaryButton = `${pillButton} bg-[var(--accent-solid)] text-[var(--text-on-accent)] hover:opacity-90`;
+const outlineButton = `${pillButton} border border-(--border-default) text-(--text-primary) hover:bg-(--bg-surface-2)`;
+const primaryButton = `${pillButton} bg-(--accent-solid) text-(--text-on-accent) hover:opacity-90`;
 
 interface StudioEditorProps {
   state: StudioProjectState & { project: StudioProjectRecord };
@@ -301,7 +301,7 @@ export function StudioEditor({
     <div className="flex min-h-full flex-col">
       <PageHeader
         className="mb-6 sm:flex-wrap"
-        titleClassName="min-w-[12rem]"
+        titleClassName="min-w-48"
         breadcrumbs={[{ label: "Studio", to: "/studio" }, { label: project.name }]}
         title={
           renaming ? (
@@ -323,7 +323,7 @@ export function StudioEditor({
                 if (event.key === "Enter") event.currentTarget.blur();
                 if (event.key === "Escape") setRenaming(false);
               }}
-              className="w-full rounded-[8px] bg-transparent text-[length:inherit] font-[inherit] text-[var(--text-primary)] outline-none ring-1 ring-[var(--border-strong)]"
+              className="w-full rounded-[8px] bg-transparent text-[length:inherit] font-[inherit] text-(--text-primary) outline-hidden ring-1 ring-(--border-strong)"
             />
           ) : (
             <button
@@ -342,16 +342,16 @@ export function StudioEditor({
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
-              className="inline-flex h-9 items-center gap-2 rounded-full border border-[var(--border-default)] pl-1.5 pr-3 text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)]"
+              className="inline-flex h-9 items-center gap-2 rounded-full border border-(--border-default) pl-1.5 pr-3 text-[13px] text-(--text-primary) transition-colors hover:bg-(--bg-surface-2)"
             >
-              <span className="flex h-6 w-6 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[11px] font-semibold">
+              <span className="flex h-6 w-6 items-center justify-center rounded-full border border-(--border-default) bg-(--surface-panel-alt) text-[11px] font-semibold">
                 {projectVoiceName.charAt(0).toUpperCase()}
               </span>
               {projectVoiceName}
-              <span className="hidden text-[var(--text-subtle)] lg:inline">
+              <span className="hidden text-(--text-subtle) lg:inline">
                 · {modelName(project.model_id, models)}
               </span>
-              <ChevronDown className="h-3.5 w-3.5 text-[var(--text-subtle)]" />
+              <ChevronDown className="h-3.5 w-3.5 text-(--text-subtle)" />
             </button>
             {action.kind !== "export" ? (
               <button type="button" onClick={() => setExportIds(null)} className={outlineButton}>
@@ -360,14 +360,14 @@ export function StudioEditor({
               </button>
             ) : null}
             {action.kind === "rendering" ? (
-              <span className="inline-flex h-9 items-center gap-2.5 rounded-full border border-[var(--border-subtle)] bg-[var(--surface-panel)] pl-3.5 pr-1.5 text-[13px] text-[var(--text-primary)]">
+              <span className="inline-flex h-9 items-center gap-2.5 rounded-full border border-(--border-subtle) bg-(--surface-panel) pl-3.5 pr-1.5 text-[13px] text-(--text-primary)">
                 <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
                 Rendering {action.current} of {action.total}
                 <button
                   type="button"
                   aria-label="Stop rendering"
                   onClick={() => void cancelRender()}
-                  className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--surface-raised)] transition-colors hover:bg-[var(--surface-strong)]"
+                  className="flex h-6 w-6 items-center justify-center rounded-full bg-(--surface-raised) transition-colors hover:bg-(--surface-strong)"
                 >
                   <Square className="h-2.5 w-2.5 fill-current" />
                 </button>
@@ -387,7 +387,7 @@ export function StudioEditor({
                 <button
                   type="button"
                   aria-label="More project actions"
-                  className="flex h-9 w-9 items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+                  className="flex h-9 w-9 items-center justify-center rounded-full border border-(--border-default) text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
                 >
                   <MoreHorizontal className="h-4 w-4" />
                 </button>
@@ -404,7 +404,7 @@ export function StudioEditor({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() => setDeleteTarget({ kind: "project" })}
-                  className="text-[var(--danger-text)] focus:text-[var(--danger-text)]"
+                  className="text-(--danger-text) focus:text-(--danger-text)"
                 >
                   <Trash2 className="mr-2 h-4 w-4" />
                   Delete project
@@ -497,7 +497,7 @@ export function StudioEditor({
           <button
             type="button"
             onClick={() => setComposer({ afterId: null, text: "" })}
-            className="mt-2 inline-flex h-9 items-center gap-2 self-start rounded-full px-3 text-[13px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+            className="mt-2 inline-flex h-9 items-center gap-2 self-start rounded-full px-3 text-[13px] text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
           >
             <Plus className="h-4 w-4" />
             Add paragraph
@@ -506,19 +506,19 @@ export function StudioEditor({
       </div>
 
       {selected.length > 0 ? (
-        <div className="sticky bottom-[76px] z-20 mx-auto mt-4 flex items-center gap-1 rounded-full border border-[var(--border-default)] bg-[var(--bg-surface-1)] py-1.5 pl-4 pr-1.5 text-[13px] shadow-[var(--shadow-raised)]">
-          <span className="mr-2 text-[var(--text-primary)]">{selected.length} selected</span>
-          <button type="button" onClick={() => void renderParagraphs(selected)} className="h-8 rounded-full px-3 text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)]">
+        <div className="sticky bottom-[76px] z-20 mx-auto mt-4 flex items-center gap-1 rounded-full border border-(--border-default) bg-(--bg-surface-1) py-1.5 pl-4 pr-1.5 text-[13px] shadow-(--shadow-raised)">
+          <span className="mr-2 text-(--text-primary)">{selected.length} selected</span>
+          <button type="button" onClick={() => void renderParagraphs(selected)} className="h-8 rounded-full px-3 text-(--text-primary) hover:bg-(--bg-surface-2)">
             Render
           </button>
-          <button type="button" onClick={() => setExportIds(selected)} className="h-8 rounded-full px-3 text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)]">
+          <button type="button" onClick={() => setExportIds(selected)} className="h-8 rounded-full px-3 text-(--text-primary) hover:bg-(--bg-surface-2)">
             Export
           </button>
           <button
             type="button"
             disabled={selected.length >= project.segments.length}
             onClick={() => setDeleteTarget({ kind: "paragraphs", ids: selected })}
-            className="h-8 rounded-full px-3 text-[var(--danger-text)] hover:bg-[var(--danger-bg)] disabled:opacity-40"
+            className="h-8 rounded-full px-3 text-(--danger-text) hover:bg-(--danger-bg) disabled:opacity-40"
           >
             Delete
           </button>
@@ -526,7 +526,7 @@ export function StudioEditor({
             type="button"
             aria-label="Clear selection"
             onClick={() => setSelected([])}
-            className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--surface-raised)] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            className="flex h-8 w-8 items-center justify-center rounded-full bg-(--surface-raised) text-(--text-muted) hover:text-(--text-primary)"
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -587,16 +587,16 @@ export function StudioEditor({
 function InsertDivider({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <div className="group/insert flex h-3 items-center gap-2.5 pl-[54px] pr-3">
-      <span className="h-px flex-1 bg-[var(--border-subtle)] opacity-0 transition-opacity group-hover/insert:opacity-100" />
+      <span className="h-px flex-1 bg-(--border-subtle) opacity-0 transition-opacity group-hover/insert:opacity-100" />
       <button
         type="button"
         aria-label={label}
         onClick={onClick}
-        className="flex h-5 w-5 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-canvas)] text-[var(--text-muted)] opacity-0 transition-opacity hover:text-[var(--text-primary)] focus-visible:opacity-100 group-hover/insert:opacity-100"
+        className="flex h-5 w-5 items-center justify-center rounded-full border border-(--border-default) bg-(--surface-canvas) text-(--text-muted) opacity-0 transition-opacity hover:text-(--text-primary) focus-visible:opacity-100 group-hover/insert:opacity-100"
       >
         <Plus className="h-3 w-3" />
       </button>
-      <span className="h-px flex-1 bg-[var(--border-subtle)] opacity-0 transition-opacity group-hover/insert:opacity-100" />
+      <span className="h-px flex-1 bg-(--border-subtle) opacity-0 transition-opacity group-hover/insert:opacity-100" />
     </div>
   );
 }
@@ -621,7 +621,7 @@ function ParagraphComposer({
     else onCancel();
   };
   return (
-    <div className={cn("my-1 rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 py-3 pl-[54px]")}>
+    <div className={cn("my-1 rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-3 py-3 pl-[54px]")}>
       <textarea
         autoFocus
         rows={2}
@@ -637,7 +637,7 @@ function ParagraphComposer({
           }
           if (event.key === "Escape") finish(false);
         }}
-        className="w-full resize-none bg-transparent text-[15px] leading-[1.65] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-subtle)]"
+        className="w-full resize-none bg-transparent text-[15px] leading-[1.65] text-(--text-primary) outline-hidden placeholder:text-(--text-subtle)"
       />
     </div>
   );

@@ -477,16 +477,16 @@ export function ChatPlayground({
     ? writesImplicitThink(renderModelId)
     : false;
   const chatSecondaryButtonClass =
-    "rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]";
+    "rounded-lg border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) shadow-none hover:border-(--border-strong) hover:bg-(--bg-surface-3) hover:text-(--text-primary)";
   const chatAccentButtonClass =
-    "rounded-lg bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-none hover:opacity-90";
+    "rounded-lg bg-(--accent-solid) text-(--text-on-accent) shadow-none hover:opacity-90";
   // The composer's controls are pills, like its model picker.
   const composerPillClass =
-    "h-9 rounded-full border border-[var(--border-default)] bg-transparent text-[13.5px] text-[var(--text-primary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--accent-soft)]";
+    "h-9 rounded-full border border-(--border-default) bg-transparent text-[13.5px] text-(--text-primary) shadow-none hover:border-(--border-strong) hover:bg-(--accent-soft)";
   const composerPillActiveClass =
-    "border-[var(--border-strong)] bg-[var(--accent-soft)]";
+    "border-(--border-strong) bg-(--accent-soft)";
   const chatComposerSendButtonClass =
-    "chat-composer-send-button rounded-full border-transparent text-[var(--text-primary)] shadow-none";
+    "chat-composer-send-button rounded-full border-transparent text-(--text-primary) shadow-none";
 
   const setActiveThreadInUrl = useCallback(
     (threadId: string | null, replace = false) => {
@@ -1676,11 +1676,11 @@ export function ChatPlayground({
       )}
     >
       {pendingImages.length > 0 && (
-        <div className="border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
+        <div className="border-b border-(--border-muted) px-4 pb-3 pt-4">
           {hasUnsupportedImages && (
             <p
               role="status"
-              className="mb-3 text-xs text-[var(--status-warning-text)]"
+              className="mb-3 text-xs text-(--status-warning-text)"
             >
               {unsupportedImagesMessage}
             </p>
@@ -1690,7 +1690,7 @@ export function ChatPlayground({
               <div
                 key={image.id}
                 className={cn(
-                  "group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]",
+                  "group relative h-20 w-20 overflow-hidden rounded-xl border border-(--border-muted) bg-(--bg-surface-2)",
                   hasUnsupportedImages && "opacity-50",
                 )}
               >
@@ -1720,7 +1720,7 @@ export function ChatPlayground({
                 >
                   <Trash2 className="h-3 w-3" />
                 </button>
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-linear-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
                   <span className="block truncate">{image.label}</span>
                 </div>
               </div>
@@ -1774,7 +1774,7 @@ export function ChatPlayground({
                   ? "Ask anything or attach an image..."
                   : "Ask anything..."
         }
-        className="chat-composer-input w-full resize-none bg-transparent px-5 pt-5 pb-2 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
+        className="chat-composer-input w-full resize-none bg-transparent px-5 pt-5 pb-2 text-[0.9375rem] focus:outline-hidden placeholder:text-(--text-muted)"
         disabled={isStreaming || isPreparingThread || isReadingImages}
       />
 
@@ -1863,7 +1863,7 @@ export function ChatPlayground({
               <SelectTrigger
                 aria-label="Reasoning effort"
                 title="Reasoning effort"
-                className={cn("w-[7.5rem] px-3.5", composerPillClass)}
+                className={cn("w-30 px-3.5", composerPillClass)}
               >
                 <SelectValue />
               </SelectTrigger>
@@ -1955,7 +1955,7 @@ export function ChatPlayground({
       {showThreadColumn ? (
         <aside
           aria-label="Chat history"
-          className="flex w-[15rem] shrink-0 border-r border-[var(--border-subtle)] pr-4"
+          className="flex w-60 shrink-0 border-r border-(--border-subtle) pr-4"
         >
           {renderThreadList()}
         </aside>
@@ -1969,7 +1969,7 @@ export function ChatPlayground({
       >
         <div className="min-w-0 flex-1">
           {hasConversation && (
-            <h2 className="truncate text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+            <h2 className="truncate text-[15px] font-semibold tracking-tight text-(--text-primary)">
               {activeThread
                 ? displayThreadTitle(activeThread.title)
                 : "Conversation"}
@@ -1993,7 +1993,7 @@ export function ChatPlayground({
               >
                 <History className="h-4 w-4" />
                 <span>History</span>
-                <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
+                <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-(--border-muted) bg-(--bg-surface-3) px-1.5 py-0.5 text-[10px] font-semibold text-(--text-primary)">
                   {historyBadgeLabel}
                 </span>
               </Button>
@@ -2025,7 +2025,7 @@ export function ChatPlayground({
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.22 }}
               >
-                <h2 className="mb-6 text-center text-[1.75rem] font-semibold tracking-tight text-[var(--text-primary)]">
+                <h2 className="mb-6 text-center text-[1.75rem] font-semibold tracking-tight text-(--text-primary)">
                   What can I help with?
                 </h2>
                 {renderComposer(true)}
@@ -2066,7 +2066,7 @@ export function ChatPlayground({
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
-                    className="mt-3 mx-auto max-w-3xl rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-xs text-[var(--danger-text)]"
+                    className="mt-3 mx-auto max-w-3xl rounded-lg border border-(--danger-border) bg-(--danger-bg) p-2 text-xs text-(--danger-text)"
                   >
                     {error}
                   </motion.div>
@@ -2237,13 +2237,13 @@ export function ChatPlayground({
                 )}
               </div>
 
-              <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 bg-[var(--bg-app)] px-4 pb-4 pt-4 sm:px-6">
+              <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-30 bg-(--bg-app) px-4 pb-4 pt-4 sm:px-6">
                 <div className="relative max-w-3xl mx-auto pointer-events-auto">
                   {showJumpToLatest && (
                     <button
                       type="button"
                       onClick={jumpToLatest}
-                      className="absolute -top-12 left-1/2 inline-flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[12.5px] text-[var(--text-secondary)] shadow-[var(--shadow-soft)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+                      className="absolute -top-12 left-1/2 inline-flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-(--border-default) bg-(--surface-panel) px-3 text-[12.5px] text-(--text-secondary) shadow-(--shadow-soft) transition-colors hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)"
                     >
                       <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
                       Jump to latest
@@ -2268,7 +2268,7 @@ export function ChatPlayground({
                   {showHistoryImageNotice && (
                     <div
                       role="note"
-                      className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[var(--status-info-border)] bg-[var(--status-info-bg)] px-3 py-2 text-xs text-[var(--status-info-text)]"
+                      className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-(--status-info-border) bg-(--status-info-bg) px-3 py-2 text-xs text-(--status-info-text)"
                     >
                       <span>
                         This chat has images. {modelLabel ?? "This model"} reads
@@ -2286,7 +2286,7 @@ export function ChatPlayground({
                     </div>
                   )}
                   {renderComposer(false)}
-                  <p className="mt-2 text-center text-[11.5px] text-[var(--text-subtle)]">
+                  <p className="mt-2 text-center text-[11.5px] text-(--text-subtle)">
                     Runs on this device. Enter to send, Shift+Enter for a new
                     line.
                   </p>
@@ -2319,21 +2319,21 @@ export function ChatPlayground({
         }}
       >
         {deleteTargetThread ? (
-          <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+          <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
             <DialogTitle className="sr-only">Delete chat thread?</DialogTitle>
             <div className="flex items-start gap-3">
-              <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+              <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
                 <AlertTriangle className="h-4 w-4" />
               </div>
               <div className="min-w-0 flex-1">
-                <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                <h3 className="text-sm font-semibold text-(--text-primary)">
                   Delete chat thread?
                 </h3>
-                <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+                <DialogDescription className="mt-1 text-sm text-(--text-muted)">
                   This permanently removes the selected conversation and all of
                   its messages.
                 </DialogDescription>
-                <p className="mt-2 max-w-full whitespace-normal break-words text-xs text-[var(--text-subtle)] [overflow-wrap:anywhere]">
+                <p className="mt-2 max-w-full whitespace-normal wrap-break-word text-xs text-(--text-subtle) wrap-anywhere">
                   {displayThreadTitle(deleteTargetThread.title)}
                 </p>
               </div>
@@ -2376,12 +2376,12 @@ export function ChatPlayground({
           }
         }}
       >
-        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/95 border-[var(--border-muted)]">
+        <DialogContent className="max-w-[min(92vw,1100px)] p-3 sm:p-4 bg-background/95 border-(--border-muted)">
           <DialogTitle className="sr-only">
             {imagePreview?.label || "Image preview"}
           </DialogTitle>
           {imagePreview && (
-            <div className="flex max-h-[80vh] items-center justify-center overflow-auto rounded-lg border border-[var(--border-muted)] bg-muted/20 p-2">
+            <div className="flex max-h-[80vh] items-center justify-center overflow-auto rounded-lg border border-(--border-muted) bg-muted/20 p-2">
               <img
                 src={imagePreview.source}
                 alt={imagePreview.label}

@@ -55,7 +55,7 @@ export function PageHeader({
       <div className="min-w-0 flex-1">
         {breadcrumbs && breadcrumbs.length > 0 ? (
           <nav aria-label="Breadcrumb" className="mb-2.5">
-            <ol className="flex min-w-0 items-center gap-1.5 text-[13px] text-[var(--text-subtle)]">
+            <ol className="flex min-w-0 items-center gap-1.5 text-[13px] text-(--text-subtle)">
               {breadcrumbs.map((crumb, index) => (
                 <li
                   key={index}
@@ -70,7 +70,7 @@ export function PageHeader({
                   {crumb.to ? (
                     <Link
                       to={crumb.to}
-                      className="shrink-0 text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+                      className="shrink-0 text-(--text-muted) transition-colors hover:text-(--text-primary)"
                     >
                       {crumb.label}
                     </Link>
@@ -86,14 +86,14 @@ export function PageHeader({
         ) : null}
         <h1
           className={cn(
-            "app-page-title truncate text-[var(--text-primary)] tracking-tight",
+            "app-page-title truncate text-(--text-primary) tracking-tight",
             titleClassName,
           )}
         >
           {title}
         </h1>
         {description ? (
-          <p className="mt-1.5 app-page-description text-[var(--text-muted)] max-w-3xl leading-relaxed">
+          <p className="mt-1.5 app-page-description text-(--text-muted) max-w-3xl leading-relaxed">
             {description}
           </p>
         ) : null}

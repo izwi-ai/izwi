@@ -212,14 +212,14 @@ function PreviewCell({ record }: { record: SpeechTextJobSummary }) {
   const preview = rowPreview(record);
   if (presentation.status === "failed") {
     return (
-      <span className="text-[13px] text-[var(--danger-text)]">
+      <span className="text-[13px] text-(--danger-text)">
         {record.processing_error?.trim() || presentation.description}
       </span>
     );
   }
   if (presentation.status === "queued" || presentation.status === "processing") {
     return (
-      <span className="text-[13px] text-[var(--text-subtle)]">
+      <span className="text-[13px] text-(--text-subtle)">
         {preview ||
           (presentation.status === "queued"
             ? "Waiting to start…"
@@ -230,13 +230,13 @@ function PreviewCell({ record }: { record: SpeechTextJobSummary }) {
   if (presentation.status !== "ready") {
     // Never present output from an unknown or cancelled job as finished.
     return (
-      <span className="text-[13px] text-[var(--text-subtle)]">
+      <span className="text-[13px] text-(--text-subtle)">
         {presentation.description}
       </span>
     );
   }
   return (
-    <span className="text-[13px] text-[var(--text-muted)]">
+    <span className="text-[13px] text-(--text-muted)">
       {preview || "No speech recognised."}
     </span>
   );
@@ -246,21 +246,21 @@ const COLUMNS: HistoryColumn<SpeechTextJobSummary>[] = [
   {
     id: "file",
     header: "File",
-    className: "w-[15rem] max-w-[15rem]",
+    className: "w-60 max-w-60",
     cell: (record) => {
       const active =
         record.processing_status === "pending" ||
         record.processing_status === "processing";
       return (
         <div className="flex min-w-0 items-center gap-2.5">
-          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] border border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] text-[var(--text-muted)]">
+          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] border border-(--border-subtle) bg-(--surface-panel-alt) text-(--text-muted)">
             {active ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <AudioLines className="h-4 w-4" />
             )}
           </span>
-          <span className="truncate font-medium text-[var(--text-primary)]">
+          <span className="truncate font-medium text-(--text-primary)">
             {record.audio_filename || "Audio input"}
           </span>
         </div>
@@ -280,21 +280,21 @@ const COLUMNS: HistoryColumn<SpeechTextJobSummary>[] = [
   {
     id: "length",
     header: "Length",
-    className: "hidden w-[5.5rem] lg:table-cell",
-    cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+    className: "hidden w-22 lg:table-cell",
+    cellClassName: "whitespace-nowrap tabular-nums text-(--text-muted)",
     cell: (record) => formatClockDuration(record.duration_secs),
   },
   {
     id: "status",
     header: "Status",
-    className: "w-[10rem]",
+    className: "w-40",
     cell: (record) => <StatusCell record={record} />,
   },
   {
     id: "created",
     header: "Created",
-    className: "hidden w-[8rem] lg:table-cell",
-    cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
+    className: "hidden w-32 lg:table-cell",
+    cellClassName: "whitespace-nowrap text-[13px] text-(--text-subtle)",
     cell: (record) => formatHistoryDate(record.created_at),
   },
 ];

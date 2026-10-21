@@ -9,13 +9,13 @@ type StatePanelTone = "neutral" | "info" | "success" | "warning" | "danger";
 const toneClasses: Record<StatePanelTone, string> = {
   neutral: "border-border/80 bg-card/80 text-card-foreground",
   info:
-    "border-[var(--status-info-border)] bg-[color-mix(in_srgb,var(--status-info-bg)_70%,transparent)] text-[var(--status-info-text)]",
+    "border-(--status-info-border) bg-[color-mix(in_srgb,var(--status-info-bg)_70%,transparent)] text-(--status-info-text)",
   success:
-    "border-[var(--status-positive-border)] bg-[color-mix(in_srgb,var(--status-positive-bg)_70%,transparent)] text-[var(--status-positive-text)]",
+    "border-(--status-positive-border) bg-[color-mix(in_srgb,var(--status-positive-bg)_70%,transparent)] text-(--status-positive-text)",
   warning:
-    "border-[var(--status-warning-border)] bg-[color-mix(in_srgb,var(--status-warning-bg)_70%,transparent)] text-[var(--status-warning-text)]",
+    "border-(--status-warning-border) bg-[color-mix(in_srgb,var(--status-warning-bg)_70%,transparent)] text-(--status-warning-text)",
   danger:
-    "border-[var(--danger-border)] bg-[color-mix(in_srgb,var(--danger-bg)_75%,transparent)] text-[var(--danger-text)]",
+    "border-(--danger-border) bg-[color-mix(in_srgb,var(--danger-bg)_75%,transparent)] text-(--danger-text)",
 };
 
 interface StatePanelProps {
@@ -54,7 +54,7 @@ export function StatePanel({
       {Icon ? (
         <div
           className={cn(
-            "flex h-12 w-12 shrink-0 items-center justify-center rounded-[var(--app-radius-lg)] border border-border/70 bg-background/55",
+            "flex h-12 w-12 shrink-0 items-center justify-center rounded-(--app-radius-lg) border border-border/70 bg-background/55",
             align === "center" && "mx-auto",
           )}
         >
@@ -71,11 +71,11 @@ export function StatePanel({
             {eyebrow}
           </StatusBadge>
         ) : null}
-        <div className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
+        <div className="text-sm font-semibold tracking-tight text-(--text-primary)">
           {title}
         </div>
         {description ? (
-          <div className="mt-1.5 text-sm leading-6 text-[var(--text-secondary)]">
+          <div className="mt-1.5 text-sm leading-6 text-(--text-secondary)">
             {description}
           </div>
         ) : null}

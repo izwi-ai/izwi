@@ -62,9 +62,9 @@ interface VoiceSettingsSheetProps {
   isConversationActive: boolean;
 }
 
-const sectionTitle = "mb-1.5 text-[13px] font-medium text-[var(--text-muted)]";
+const sectionTitle = "mb-1.5 text-[13px] font-medium text-(--text-muted)";
 const rowLink =
-  "flex min-h-[52px] w-full items-center justify-between gap-4 text-left text-sm text-[var(--text-primary)] transition-colors hover:text-[var(--text-secondary)]";
+  "flex min-h-[52px] w-full items-center justify-between gap-4 text-left text-sm text-(--text-primary) transition-colors hover:text-(--text-secondary)";
 
 /** Voice settings in one side sheet: no tabs, two sub-views. */
 export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
@@ -80,22 +80,22 @@ export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
       <SheetContent
         side="right"
         aria-describedby={undefined}
-        className="flex w-full max-w-[420px] flex-col gap-0 border-l border-[var(--border-default)] bg-[var(--bg-surface-1)] p-0 sm:max-w-[420px] [&>button:last-child]:hidden"
+        className="flex w-full max-w-[420px] flex-col gap-0 border-l border-(--border-default) bg-(--bg-surface-1) p-0 sm:max-w-[420px] [&>button:last-child]:hidden"
       >
-        <div className="flex h-16 shrink-0 items-center gap-1 border-b border-[var(--border-muted)] px-3">
+        <div className="flex h-16 shrink-0 items-center gap-1 border-b border-(--border-muted) px-3">
           {view !== "main" && (
             <button
               type="button"
               onClick={() => onViewChange("main")}
               aria-label="Back to voice settings"
-              className="flex h-10 w-10 items-center justify-center rounded-[10px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+              className="flex h-10 w-10 items-center justify-center rounded-[10px] text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
             >
               <ChevronLeft className="h-[18px] w-[18px]" />
             </button>
           )}
           <SheetTitle
             className={cn(
-              "flex-1 text-base font-semibold text-[var(--text-primary)]",
+              "flex-1 text-base font-semibold text-(--text-primary)",
               view === "main" && "pl-3",
             )}
           >
@@ -105,7 +105,7 @@ export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
             type="button"
             onClick={() => onOpenChange(false)}
             aria-label="Close"
-            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
           >
             <X className="h-4 w-4" />
           </button>
@@ -204,7 +204,7 @@ function MainView({
           Voice
         </h3>
         {speakers.length === 0 ? (
-          <p className="text-sm text-[var(--text-muted)]">
+          <p className="text-sm text-(--text-muted)">
             This engine has no built-in voices.
           </p>
         ) : (
@@ -217,7 +217,7 @@ function MainView({
                   key={item.id}
                   className={cn(
                     "flex items-center gap-2 rounded-[10px] pl-2.5 pr-2",
-                    checked && "bg-[var(--accent-soft)]",
+                    checked && "bg-(--accent-soft)",
                   )}
                 >
                   <button
@@ -232,15 +232,15 @@ function MainView({
                       className={cn(
                         "h-4 w-4 shrink-0 rounded-full",
                         checked
-                          ? "border-[5px] border-[var(--accent-solid)]"
-                          : "border-[1.5px] border-[var(--border-strong)]",
+                          ? "border-[5px] border-(--accent-solid)"
+                          : "border-[1.5px] border-(--border-strong)",
                       )}
                     />
                     <span className="flex min-w-0 flex-col">
-                      <span className="text-sm font-medium text-[var(--text-primary)]">
+                      <span className="text-sm font-medium text-(--text-primary)">
                         {item.name}
                       </span>
-                      <span className="truncate text-xs text-[var(--text-muted)]">
+                      <span className="truncate text-xs text-(--text-muted)">
                         {voiceSpeakerMeta(item)}
                       </span>
                     </span>
@@ -260,7 +260,7 @@ function MainView({
                             },
                           )
                     }
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)]"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-(--border-default) text-(--text-primary) transition-colors hover:bg-(--bg-surface-2)"
                   >
                     {previewing && preview.state?.status === "loading" ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -280,7 +280,7 @@ function MainView({
             type="button"
             onClick={() => setShowAllVoices((current) => !current)}
             aria-expanded={showAllVoices}
-            className="flex h-10 items-center gap-1.5 px-2.5 text-[13px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+            className="flex h-10 items-center gap-1.5 px-2.5 text-[13px] text-(--text-muted) transition-colors hover:text-(--text-primary)"
           >
             {showAllVoices ? "Show fewer voices" : `Show all ${speakers.length} voices`}
             <ChevronDown
@@ -301,9 +301,9 @@ function MainView({
           disabled={preferences.isProfileLoading}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={() => void preferences.savePrompt(draft)}
-          className="w-full resize-y rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface-2)] px-3.5 py-3 text-sm leading-relaxed text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)] disabled:opacity-60"
+          className="w-full resize-y rounded-xl border border-(--border-default) bg-(--bg-surface-2) px-3.5 py-3 text-sm leading-relaxed text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong) disabled:opacity-60"
         />
-        <div className="flex items-center justify-between gap-3 text-xs text-[var(--text-subtle)]">
+        <div className="flex items-center justify-between gap-3 text-xs text-(--text-subtle)">
           <span className="flex items-center gap-1.5">
             {preferences.promptSaveState === "saved" && !isConversationActive && (
               <Check className="h-[13px] w-[13px]" strokeWidth={2.5} />
@@ -317,7 +317,7 @@ function MainView({
                 setDraft(preferences.defaultPrompt);
                 void preferences.savePrompt(preferences.defaultPrompt);
               }}
-              className="py-1.5 text-[var(--text-muted)] underline underline-offset-[3px] hover:text-[var(--text-primary)]"
+              className="py-1.5 text-(--text-muted) underline underline-offset-[3px] hover:text-(--text-primary)"
             >
               Reset to default
             </button>
@@ -329,10 +329,10 @@ function MainView({
         <h3 className={sectionTitle}>Memory</h3>
         <div className="flex min-h-[52px] items-center justify-between gap-4">
           <label htmlFor={memoryId} className="flex flex-col gap-0.5">
-            <span className="text-sm font-medium text-[var(--text-primary)]">
+            <span className="text-sm font-medium text-(--text-primary)">
               Remember what I tell you
             </span>
-            <span className="text-xs text-[var(--text-muted)]">
+            <span className="text-xs text-(--text-muted)">
               Keeps preferences and facts between conversations
             </span>
           </label>
@@ -346,10 +346,10 @@ function MainView({
         <button
           type="button"
           onClick={() => onViewChange("memories")}
-          className={cn(rowLink, "border-t border-[var(--border-muted)]")}
+          className={cn(rowLink, "border-t border-(--border-muted)")}
         >
           <span>Manage memories</span>
-          <span className="flex items-center gap-1.5 text-[var(--text-muted)]">
+          <span className="flex items-center gap-1.5 text-(--text-muted)">
             {preferences.memories?.length ?? ""}
             <ChevronRight className="h-4 w-4" />
           </span>
@@ -361,18 +361,18 @@ function MainView({
         <button type="button" onClick={() => onViewChange("engine")} className={rowLink}>
           <span className="flex min-w-0 flex-col gap-0.5">
             <span className="font-medium">{VOICE_ENGINES[preferences.engine].label}</span>
-            <span className="truncate text-xs text-[var(--text-muted)]">
+            <span className="truncate text-xs text-(--text-muted)">
               {engineRows.map((row) => row.label).join(" · ")}
             </span>
           </span>
-          <span className="flex shrink-0 items-center gap-2 text-[13px] text-[var(--text-muted)]">
+          <span className="flex shrink-0 items-center gap-2 text-[13px] text-(--text-muted)">
             <span
               aria-hidden="true"
               className={cn(
                 "h-[7px] w-[7px] rounded-full",
                 status.loaded
-                  ? "bg-[var(--status-positive-solid)]"
-                  : "border-[1.5px] border-[var(--border-strong)]",
+                  ? "bg-(--status-positive-solid)"
+                  : "border-[1.5px] border-(--border-strong)",
               )}
             />
             {status.label}
@@ -399,14 +399,14 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
   return (
     <>
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 pb-6 pt-4">
-        <p className="text-[13px] leading-relaxed text-[var(--text-muted)]">
+        <p className="text-[13px] leading-relaxed text-(--text-muted)">
           Izwi remembers lasting preferences and facts from your voice
           conversations. Forget anything you don’t want kept.
         </p>
         {memories === null ? (
-          <p className="text-sm text-[var(--text-muted)]">Loading…</p>
+          <p className="text-sm text-(--text-muted)">Loading…</p>
         ) : memories.length === 0 ? (
-          <p className="border-t border-[var(--border-muted)] pt-4 text-sm text-[var(--text-muted)]">
+          <p className="border-t border-(--border-muted) pt-4 text-sm text-(--text-muted)">
             Nothing remembered yet.
           </p>
         ) : (
@@ -414,13 +414,13 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
             {memories.map((memory) => (
               <li
                 key={memory.id}
-                className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-[var(--border-muted)] py-3"
+                className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-(--border-muted) py-3"
               >
                 <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="text-sm leading-snug text-[var(--text-primary)]">
+                  <span className="text-sm leading-snug text-(--text-primary)">
                     {memory.summary}
                   </span>
-                  <span className="text-xs text-[var(--text-subtle)]">
+                  <span className="text-xs text-(--text-subtle)">
                     {formatMemoryDate(memory.updated_at)}
                   </span>
                 </div>
@@ -429,7 +429,7 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
                   aria-label={`Forget: ${memory.summary}`}
                   disabled={preferences.isMemoryBusy}
                   onClick={() => void preferences.forgetMemory(memory.id)}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary) disabled:opacity-50"
                 >
                   <X className="h-[15px] w-[15px]" />
                 </button>
@@ -439,16 +439,16 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
         )}
       </div>
       {memories && memories.length > 0 && (
-        <div className="flex shrink-0 items-center gap-3 border-t border-[var(--border-muted)] px-6 py-3.5">
+        <div className="flex shrink-0 items-center gap-3 border-t border-(--border-muted) px-6 py-3.5">
           {confirmingForgetAll ? (
             <>
-              <span className="flex-1 text-sm text-[var(--text-primary)]">
+              <span className="flex-1 text-sm text-(--text-primary)">
                 Forget all {memories.length} memories?
               </span>
               <button
                 type="button"
                 onClick={() => setConfirmingForgetAll(false)}
-                className="h-10 rounded-full px-3 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                className="h-10 rounded-full px-3 text-sm text-(--text-muted) hover:text-(--text-primary)"
               >
                 Cancel
               </button>
@@ -469,7 +469,7 @@ function MemoriesView({ preferences }: { preferences: VoicePreferences }) {
             <button
               type="button"
               onClick={() => setConfirmingForgetAll(true)}
-              className="h-10 px-1 text-sm text-[var(--danger-text)] hover:underline"
+              className="h-10 px-1 text-sm text-(--danger-text) hover:underline"
             >
               Forget all memories…
             </button>
@@ -568,8 +568,8 @@ function EngineView({
                 className={cn(
                   "flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left transition-colors",
                   checked
-                    ? "border-[var(--border-strong)] bg-[var(--accent-soft)]"
-                    : "border-[var(--border-muted)] hover:border-[var(--border-default)]",
+                    ? "border-(--border-strong) bg-(--accent-soft)"
+                    : "border-(--border-muted) hover:border-(--border-default)",
                 )}
               >
                 <span
@@ -577,22 +577,22 @@ function EngineView({
                   className={cn(
                     "mt-0.5 h-4 w-4 shrink-0 rounded-full",
                     checked
-                      ? "border-[5px] border-[var(--accent-solid)]"
-                      : "border-[1.5px] border-[var(--border-strong)]",
+                      ? "border-[5px] border-(--accent-solid)"
+                      : "border-[1.5px] border-(--border-strong)",
                   )}
                 />
                 <span className="flex min-w-0 flex-1 flex-col gap-1">
                   <span className="flex justify-between gap-3">
-                    <span className="text-sm font-medium text-[var(--text-primary)]">
+                    <span className="text-sm font-medium text-(--text-primary)">
                       {VOICE_ENGINES[id].label}
                     </span>
                     {bytes > 0 && (
-                      <span className="whitespace-nowrap text-[13px] text-[var(--text-muted)]">
+                      <span className="whitespace-nowrap text-[13px] text-(--text-muted)">
                         {formatBytes(bytes)}
                       </span>
                     )}
                   </span>
-                  <span className="text-[13px] leading-snug text-[var(--text-muted)]">
+                  <span className="text-[13px] leading-snug text-(--text-muted)">
                     {VOICE_ENGINES[id].description}
                   </span>
                 </span>
@@ -607,22 +607,22 @@ function EngineView({
             {rows.map((row) => (
               <li
                 key={row.variant}
-                className="grid min-h-[52px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-[var(--border-muted)]"
+                className="grid min-h-[52px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-(--border-muted)"
               >
                 <span className="flex min-w-0 flex-col gap-0.5">
-                  <span className="truncate text-sm font-medium text-[var(--text-primary)]">
+                  <span className="truncate text-sm font-medium text-(--text-primary)">
                     {row.label}
                   </span>
-                  <span className="text-xs text-[var(--text-muted)]">{row.role}</span>
+                  <span className="text-xs text-(--text-muted)">{row.role}</span>
                 </span>
-                <span className="flex items-center gap-2 whitespace-nowrap text-[13px] text-[var(--text-muted)]">
+                <span className="flex items-center gap-2 whitespace-nowrap text-[13px] text-(--text-muted)">
                   <span
                     aria-hidden="true"
                     className={cn(
                       "h-[7px] w-[7px] rounded-full",
                       row.model?.status === "ready"
-                        ? "bg-[var(--status-positive-solid)]"
-                        : "border-[1.5px] border-[var(--border-strong)]",
+                        ? "bg-(--status-positive-solid)"
+                        : "border-[1.5px] border-(--border-strong)",
                     )}
                   />
                   {modelStatusLabel(row.model, downloadProgress)}
@@ -632,8 +632,8 @@ function EngineView({
           </ul>
         </section>
       </div>
-      <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border-muted)] px-6 py-3.5">
-        <span className="text-xs text-[var(--text-subtle)]">{note}</span>
+      <div className="flex shrink-0 items-center justify-between gap-3 border-t border-(--border-muted) px-6 py-3.5">
+        <span className="text-xs text-(--text-subtle)">{note}</span>
         {action && (
           <button
             type="button"
@@ -641,8 +641,8 @@ function EngineView({
             className={cn(
               "h-10 shrink-0 rounded-full px-4 text-sm",
               action.primary
-                ? "bg-[var(--accent-solid)] font-medium text-[var(--text-on-accent)] hover:opacity-90"
-                : "border border-[var(--border-default)] text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)]",
+                ? "bg-(--accent-solid) font-medium text-(--text-on-accent) hover:opacity-90"
+                : "border border-(--border-default) text-(--text-primary) hover:bg-(--bg-surface-2)",
             )}
           >
             {action.label}

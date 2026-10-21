@@ -28,12 +28,12 @@ export function StudioPlayerBar({
     event.preventDefault();
   };
   const control =
-    "flex h-8 w-8 items-center justify-center rounded-full text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)] disabled:opacity-40";
+    "flex h-8 w-8 items-center justify-center rounded-full text-(--text-muted) transition-colors hover:text-(--text-primary) disabled:opacity-40";
 
   return (
     <footer
       aria-label="Player"
-      className="sticky bottom-0 z-10 -mx-4 mt-6 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-[var(--border-subtle)] bg-[var(--surface-canvas)]/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:px-6"
+      className="sticky bottom-0 z-10 -mx-4 mt-6 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-(--border-subtle) bg-(--surface-canvas)/95 px-4 py-3 backdrop-blur-sm sm:-mx-6 sm:px-6"
     >
       <div className="flex items-center gap-1">
         <button type="button" aria-label="Previous paragraph" onClick={player.previous} disabled={!player.hasAudio} className={control}>
@@ -44,7 +44,7 @@ export function StudioPlayerBar({
           aria-label={player.playing ? "Pause" : "Play"}
           onClick={player.toggle}
           disabled={!player.hasAudio}
-          className="flex h-9 w-9 items-center justify-center rounded-full bg-[var(--accent-solid)] text-[var(--text-on-accent)] transition-opacity hover:opacity-90 disabled:opacity-40"
+          className="flex h-9 w-9 items-center justify-center rounded-full bg-(--accent-solid) text-(--text-on-accent) transition-opacity hover:opacity-90 disabled:opacity-40"
         >
           {player.playing ? (
             <Pause className="h-3.5 w-3.5 fill-current" />
@@ -56,7 +56,7 @@ export function StudioPlayerBar({
           <SkipForward className="h-4 w-4 fill-current" />
         </button>
       </div>
-      <span className="text-xs tabular-nums text-[var(--text-muted)]">
+      <span className="text-xs tabular-nums text-(--text-muted)">
         {formatClockDuration(player.position)}
       </span>
       <div
@@ -69,24 +69,24 @@ export function StudioPlayerBar({
         aria-valuetext={`${formatClockDuration(player.position)} of ${formatClockDuration(player.total)}`}
         onClick={player.hasAudio ? seekFromPointer : undefined}
         onKeyDown={seekFromKeys}
-        className="relative h-4 min-w-[8rem] flex-1 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+        className="relative h-4 min-w-32 flex-1 cursor-pointer outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)"
       >
-        <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--surface-raised)]">
-          <div className="h-full rounded-full bg-[var(--text-primary)]" style={{ width: `${fraction * 100}%` }} />
+        <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-(--surface-raised)">
+          <div className="h-full rounded-full bg-(--text-primary)" style={{ width: `${fraction * 100}%` }} />
         </div>
         {player.marks.map((mark) => (
           <span
             key={mark}
             aria-hidden="true"
-            className="absolute top-1/2 h-2 w-px -translate-y-1/2 bg-[var(--border-strong)]"
+            className="absolute top-1/2 h-2 w-px -translate-y-1/2 bg-(--border-strong)"
             style={{ left: `${mark * 100}%` }}
           />
         ))}
       </div>
-      <span className="text-xs tabular-nums text-[var(--text-subtle)]">
+      <span className="text-xs tabular-nums text-(--text-subtle)">
         {formatClockDuration(player.total)}
       </span>
-      <span className="hidden text-xs text-[var(--text-subtle)] md:inline">
+      <span className="hidden text-xs text-(--text-subtle) md:inline">
         {currentNumber
           ? `Paragraph ${currentNumber} of ${paragraphCount}`
           : `${paragraphCount} ${paragraphCount === 1 ? "paragraph" : "paragraphs"}`}
@@ -95,7 +95,7 @@ export function StudioPlayerBar({
         type="button"
         onClick={player.cycleSpeed}
         aria-label={`Playback speed ${player.speed}×`}
-        className="h-7 rounded-full border border-[var(--border-subtle)] px-2.5 text-xs tabular-nums text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+        className="h-7 rounded-full border border-(--border-subtle) px-2.5 text-xs tabular-nums text-(--text-muted) transition-colors hover:text-(--text-primary)"
       >
         {player.speed}×
       </button>

@@ -233,7 +233,7 @@ export function VoiceStudioPage({
         onDelete={onDelete}
         onUseModel={handleSavedVoiceModelSelect}
         emptyMessage={VIEW_CONFIGS["voice-clone"].emptyStateDescription}
-        zIndexClassName="z-[70]"
+        zIndexClassName="z-70"
       />
 
       <RouteModelModal
@@ -254,7 +254,7 @@ export function VoiceStudioPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage={designViewConfig.emptyStateDescription}
-        zIndexClassName="z-[70]"
+        zIndexClassName="z-70"
       />
     </PageShell>
   );

@@ -81,7 +81,7 @@ function initials(label: string): string {
 }
 
 const QUICK_ACTION_CLASS =
-  "h-7 w-7 rounded-lg text-[var(--text-subtle)] opacity-0 transition-opacity hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] focus-visible:opacity-100 disabled:opacity-0 group-hover:opacity-100 group-hover:disabled:opacity-40 group-focus-within:opacity-100";
+  "h-7 w-7 rounded-lg text-(--text-subtle) opacity-0 transition-opacity hover:bg-(--bg-surface-2) hover:text-(--text-primary) focus-visible:opacity-100 disabled:opacity-0 group-hover:opacity-100 disabled:group-hover:opacity-40 group-focus-within:opacity-100";
 
 export function TextToSpeechHistoryTable({
   records,
@@ -248,7 +248,7 @@ export function TextToSpeechHistoryTable({
     {
       id: "play",
       header: <span className="sr-only">Play</span>,
-      className: "w-[3.25rem] pr-0",
+      className: "w-13 pr-0",
       cell: (record) => {
         const ready =
           normalizeSpeechProcessingStatus(
@@ -266,8 +266,8 @@ export function TextToSpeechHistoryTable({
             }
             aria-label={`${playing ? "Pause" : "Play"} ${rowLabel(record, voiceLabelFor(record))}`}
             className={cn(
-              "inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[var(--text-primary)] transition-colors hover:border-[var(--border-strong)] disabled:cursor-not-allowed disabled:opacity-40",
-              playing && "border-[var(--text-primary)]",
+              "inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-(--border-default) bg-(--surface-panel-alt) text-(--text-primary) transition-colors hover:border-(--border-strong) disabled:cursor-not-allowed disabled:opacity-40",
+              playing && "border-(--text-primary)",
             )}
           >
             {playing ? (
@@ -290,10 +290,10 @@ export function TextToSpeechHistoryTable({
         );
         return (
           <div className="min-w-0">
-            <div className="truncate text-[var(--text-primary)]">
+            <div className="truncate text-(--text-primary)">
               {record.input_preview || "Untitled generation"}
             </div>
-            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--text-subtle)]">
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-(--text-subtle)">
               {status === "failed" ? (
                 <RowBadge tone="danger" className="h-[18px] text-[11px]">
                   Failed
@@ -314,14 +314,14 @@ export function TextToSpeechHistoryTable({
     {
       id: "voice",
       header: "Voice",
-      className: "hidden w-[10rem] md:table-cell",
+      className: "hidden w-40 md:table-cell",
       cell: (record) => {
         const label = voiceLabelFor(record);
         return (
-          <span className="inline-flex max-w-full items-center gap-2 text-[13px] text-[var(--text-secondary)]">
+          <span className="inline-flex max-w-full items-center gap-2 text-[13px] text-(--text-secondary)">
             <span
               aria-hidden="true"
-              className="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-[var(--speaker-avatar-border)] bg-[var(--speaker-avatar-bg)] text-[10px] font-semibold text-[var(--speaker-avatar-text)]"
+              className="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-(--speaker-avatar-border) bg-(--speaker-avatar-bg) text-[10px] font-semibold text-(--speaker-avatar-text)"
             >
               {initials(label)}
             </span>
@@ -333,15 +333,15 @@ export function TextToSpeechHistoryTable({
     {
       id: "length",
       header: "Length",
-      className: "hidden w-[5.5rem] lg:table-cell",
-      cellClassName: "whitespace-nowrap tabular-nums text-[var(--text-muted)]",
+      className: "hidden w-22 lg:table-cell",
+      cellClassName: "whitespace-nowrap tabular-nums text-(--text-muted)",
       cell: (record) => formatClockDuration(record.audio_duration_secs),
     },
     {
       id: "created",
       header: "Created",
-      className: "hidden w-[8rem] lg:table-cell",
-      cellClassName: "whitespace-nowrap text-[13px] text-[var(--text-subtle)]",
+      className: "hidden w-32 lg:table-cell",
+      cellClassName: "whitespace-nowrap text-[13px] text-(--text-subtle)",
       cell: (record) => formatHistoryDate(record.created_at),
     },
   ];

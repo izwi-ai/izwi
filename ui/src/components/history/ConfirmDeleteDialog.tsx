@@ -38,20 +38,20 @@ export function ConfirmDeleteDialog({
         }
       }}
     >
-      <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+      <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
         <div className="flex items-start gap-3">
-          <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+          <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
             <AlertTriangle className="h-4 w-4" />
           </div>
           <div className="min-w-0 flex-1">
-            <DialogTitle className="text-sm font-semibold text-[var(--text-primary)]">
+            <DialogTitle className="text-sm font-semibold text-(--text-primary)">
               Delete {noun}?
             </DialogTitle>
-            <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+            <DialogDescription className="mt-1 text-sm text-(--text-muted)">
               {description}
             </DialogDescription>
             {itemLabel ? (
-              <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+              <p className="mt-2 truncate text-xs text-(--text-subtle)">
                 {itemLabel}
               </p>
             ) : null}
@@ -59,7 +59,7 @@ export function ConfirmDeleteDialog({
         </div>
 
         {error ? (
-          <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
+          <div className="mt-4 rounded-md border border-(--danger-border) bg-(--danger-bg) px-3 py-2 text-xs text-(--danger-text)">
             {error}
           </div>
         ) : null}

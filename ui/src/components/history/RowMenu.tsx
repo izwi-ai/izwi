@@ -48,7 +48,7 @@ export function RowMenu({
           variant="ghost"
           size="icon"
           className={cn(
-            "h-7 w-7 rounded-lg text-[var(--text-subtle)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]",
+            "h-7 w-7 rounded-lg text-(--text-subtle) hover:bg-(--bg-surface-2) hover:text-(--text-primary)",
             triggerClassName,
           )}
           aria-label={`More actions for ${label}`}
@@ -78,7 +78,7 @@ export function RowMenu({
                 onSelect={item.onSelect}
                 className={cn(
                   item.danger &&
-                    "text-[var(--danger-text)] focus:text-[var(--danger-text)]",
+                    "text-(--danger-text) focus:text-(--danger-text)",
                 )}
               >
                 <item.icon className="mr-2 h-4 w-4" />

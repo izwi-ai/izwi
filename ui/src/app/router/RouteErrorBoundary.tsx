@@ -81,11 +81,11 @@ function RouteErrorFallback({
         </>
       }
     >
-      <details open className="border-t border-[var(--border-muted)] pt-4">
-        <summary className="cursor-pointer text-[13px] text-[var(--text-muted)]">
+      <details open className="border-t border-(--border-muted) pt-4">
+        <summary className="cursor-pointer text-[13px] text-(--text-muted)">
           Details
         </summary>
-        <pre className="mt-3 whitespace-pre-wrap break-words rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-3 font-mono text-[12px] leading-5 text-[var(--text-subtle)]">
+        <pre className="mt-3 whitespace-pre-wrap wrap-break-word rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) p-3 font-mono text-[12px] leading-5 text-(--text-subtle)">
           {details}
         </pre>
       </details>

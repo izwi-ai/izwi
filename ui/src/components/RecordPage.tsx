@@ -45,7 +45,7 @@ export function RecordPage({
         className="mb-5"
         description={
           meta.length > 0 ? (
-            <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[13px] text-[var(--text-muted)]">
+            <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[13px] text-(--text-muted)">
               {meta.map((item) => (
                 <span
                   key={`${item.title ?? ""}${item.label}`}
@@ -54,7 +54,7 @@ export function RecordPage({
                 >
                   <item.icon
                     aria-hidden="true"
-                    className="h-3.5 w-3.5 text-[var(--text-subtle)]"
+                    className="h-3.5 w-3.5 text-(--text-subtle)"
                   />
                   {item.title ? (
                     <span className="sr-only">{item.title}: </span>
@@ -73,7 +73,7 @@ export function RecordPage({
                 <RowMenu
                   label={title}
                   items={menuItems}
-                  triggerClassName="h-9 w-9 rounded-[10px] border border-[var(--border-default)]"
+                  triggerClassName="h-9 w-9 rounded-[10px] border border-(--border-default)"
                 />
               ) : null}
             </>

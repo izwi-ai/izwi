@@ -133,7 +133,7 @@ function ProcessingProgressCard({
 
   return (
     <Card
-      className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+      className="border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
       role="status"
       aria-live="polite"
       aria-atomic="true"
@@ -145,13 +145,13 @@ function ProcessingProgressCard({
             <p className="font-medium">{progressPhaseLabel(progress)}</p>
             <div className="flex shrink-0 items-center gap-3">
               {detail ? (
-                <span className="text-xs text-[var(--text-muted)]">{detail}</span>
+                <span className="text-xs text-(--text-muted)">{detail}</span>
               ) : null}
               {action}
             </div>
           </div>
           <div
-            className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--border-muted)]"
+            className="mt-3 h-2 overflow-hidden rounded-full bg-(--border-muted)"
             role="progressbar"
             aria-label="ASR processing progress"
             aria-valuemin={0}
@@ -161,8 +161,8 @@ function ProcessingProgressCard({
             <div
               className={
                 percent === null
-                  ? "h-full w-1/3 animate-pulse rounded-full bg-[var(--status-warning-text)]"
-                  : "h-full rounded-full bg-[var(--status-warning-text)] transition-[width] duration-300"
+                  ? "h-full w-1/3 animate-pulse rounded-full bg-(--status-warning-text)"
+                  : "h-full rounded-full bg-(--status-warning-text) transition-[width] duration-300"
               }
               style={percent === null ? undefined : { width: `${percent}%` }}
             />
@@ -343,7 +343,7 @@ export function TranscriptionRecordDetail({
         <>
           {error ? (
             <Card
-              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
               role="alert"
               aria-live="assertive"
             >
@@ -373,7 +373,7 @@ export function TranscriptionRecordDetail({
 
           {statusMessage ? (
             <Card
-              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
               role="alert"
               aria-live="assertive"
             >
@@ -399,7 +399,7 @@ export function TranscriptionRecordDetail({
 
           {saaWarning ? (
             <Card
-              className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              className="border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
               role="status"
               aria-live="polite"
             >
@@ -412,7 +412,7 @@ export function TranscriptionRecordDetail({
 
           {alignmentWarning ? (
             <Card
-              className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              className="border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
               role="status"
               aria-live="polite"
             >
@@ -425,7 +425,7 @@ export function TranscriptionRecordDetail({
 
           {summaryRefreshError ? (
             <Card
-              className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+              className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
               role="alert"
               aria-live="assertive"
             >
@@ -466,21 +466,21 @@ export function TranscriptionRecordDetail({
           }
         }}
       >
-        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+        <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
           <DialogTitle className="sr-only">Delete transcription?</DialogTitle>
           <div className="flex items-start gap-3">
-            <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+            <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
               <AlertTriangle className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              <h3 className="text-sm font-semibold text-(--text-primary)">
                 Delete transcription?
               </h3>
-              <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+              <DialogDescription className="mt-1 text-sm text-(--text-muted)">
                 This permanently removes the saved audio and transcript from
                 history.
               </DialogDescription>
-              <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+              <p className="mt-2 truncate text-xs text-(--text-subtle)">
                 {record?.audio_filename ||
                   record?.model_id ||
                   record?.id ||
@@ -491,7 +491,7 @@ export function TranscriptionRecordDetail({
 
           {deleteError ? (
             <div
-              className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]"
+              className="mt-4 rounded-md border border-(--danger-border) bg-(--danger-bg) px-3 py-2 text-xs text-(--danger-text)"
               role="alert"
               aria-live="assertive"
             >
@@ -505,7 +505,7 @@ export function TranscriptionRecordDetail({
               variant="outline"
               onClick={() => setDeleteConfirmOpen(false)}
               size="sm"
-              className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
+              className="h-8 border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) hover:bg-(--bg-surface-3)"
               disabled={deletePending}
             >
               Cancel

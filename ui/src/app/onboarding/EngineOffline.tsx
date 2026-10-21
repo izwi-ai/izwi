@@ -89,7 +89,7 @@ export function EngineOffline({
       <div role="alert">
         <StageHeading
           before={
-            <span className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-[var(--danger-bg)] text-[var(--danger-text)]">
+            <span className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-(--danger-bg) text-(--danger-text)">
               <TriangleAlert aria-hidden="true" className="h-[18px] w-[18px]" />
             </span>
           }
@@ -98,15 +98,15 @@ export function EngineOffline({
         />
       </div>
 
-      <div className="flex flex-col gap-2 border-y border-[var(--border-muted)] py-3.5">
-        <span className="flex items-center gap-2 text-[13px] text-[var(--text-muted)]">
+      <div className="flex flex-col gap-2 border-y border-(--border-muted) py-3.5">
+        <span className="flex items-center gap-2 text-[13px] text-(--text-muted)">
           <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
           {retryAt === null
             ? "Trying again…"
             : `Trying again in ${seconds} second${seconds === 1 ? "" : "s"}`}
         </span>
         {detail ? (
-          <code className="break-words font-[family-name:var(--app-font-mono)] text-[12px] text-[var(--text-subtle)]">
+          <code className="wrap-break-word font-(family-name:--app-font-mono) text-[12px] text-(--text-subtle)">
             {detail}
           </code>
         ) : null}
@@ -117,7 +117,7 @@ export function EngineOffline({
           Try again now
         </PrimaryButton>
         {canRevealPaths() ? (
-          <p className="text-[13px] text-[var(--text-muted)]">
+          <p className="text-[13px] text-(--text-muted)">
             Still stuck?{" "}
             <button
               type="button"

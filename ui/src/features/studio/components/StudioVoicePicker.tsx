@@ -40,19 +40,19 @@ export function ModelDownloadNotice({
   const progress = downloads.downloadProgress[model.variant];
   const downloading = model.status === "downloading" || Boolean(progress);
   return (
-    <div className="flex items-center gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-2.5 text-[13px]">
-      <span className="min-w-0 flex-1 text-[var(--text-secondary)]">
+    <div className="flex items-center gap-3 rounded-[12px] border border-(--border-subtle) bg-(--surface-panel) px-3.5 py-2.5 text-[13px]">
+      <span className="min-w-0 flex-1 text-(--text-secondary)">
         {downloading
           ? `Downloading ${modelName(model.variant, [model])}…${progress ? ` ${Math.round(progress.percent)}%` : ""}`
           : `${modelName(model.variant, [model])} isn't downloaded yet. Paragraphs render once it is.`}
       </span>
       {downloading ? (
-        <Loader2 aria-hidden="true" className="h-4 w-4 shrink-0 animate-spin text-[var(--text-muted)]" />
+        <Loader2 aria-hidden="true" className="h-4 w-4 shrink-0 animate-spin text-(--text-muted)" />
       ) : (
         <button
           type="button"
           onClick={() => downloads.onDownload(model.variant)}
-          className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-[var(--accent-solid)] px-3.5 text-[13px] font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
+          className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-(--accent-solid) px-3.5 text-[13px] font-medium text-(--text-on-accent) transition-opacity hover:opacity-90"
         >
           <Download className="h-3.5 w-3.5" />
           Download
@@ -122,7 +122,7 @@ export function StudioVoicePicker({
       >
         <SelectTrigger
           aria-label="Model"
-          className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+          className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
         >
           <SelectValue placeholder="Choose a model" />
         </SelectTrigger>
@@ -139,7 +139,7 @@ export function StudioVoicePicker({
       {model && !onDevice ? <ModelDownloadNotice model={model} downloads={downloads} /> : null}
 
       {options.length === 0 ? (
-        <p className="text-[13px] text-[var(--text-muted)]">
+        <p className="text-[13px] text-(--text-muted)">
           {model?.speech_capabilities?.supports_reference_voice
             ? "Save a designed or cloned voice in Voices to use this model."
             : "This model has no voices to choose from."}
@@ -149,7 +149,7 @@ export function StudioVoicePicker({
           role="radiogroup"
           aria-label="Voice"
           id={groupId}
-          className="flex flex-col overflow-hidden rounded-[12px] border border-[var(--border-subtle)]"
+          className="flex flex-col overflow-hidden rounded-[12px] border border-(--border-subtle)"
         >
           {visible.map((option) => {
             const checked = option.key === selectedKey;
@@ -162,8 +162,8 @@ export function StudioVoicePicker({
               <div
                 key={option.key}
                 className={cn(
-                  "flex items-center gap-2 border-b border-[var(--border-subtle)] pl-3 pr-2 last:border-b-0",
-                  checked && "bg-[var(--accent-soft)]",
+                  "flex items-center gap-2 border-b border-(--border-subtle) pl-3 pr-2 last:border-b-0",
+                  checked && "bg-(--accent-soft)",
                 )}
               >
                 <button
@@ -188,15 +188,15 @@ export function StudioVoicePicker({
                     className={cn(
                       "h-4 w-4 shrink-0 rounded-full",
                       checked
-                        ? "border-[5px] border-[var(--accent-solid)]"
-                        : "border-[1.5px] border-[var(--border-strong)]",
+                        ? "border-[5px] border-(--accent-solid)"
+                        : "border-[1.5px] border-(--border-strong)",
                     )}
                   />
                   <span className="flex min-w-0 flex-col">
-                    <span className="truncate text-[13.5px] font-medium text-[var(--text-primary)]">
+                    <span className="truncate text-[13.5px] font-medium text-(--text-primary)">
                       {option.name}
                     </span>
-                    <span className="truncate text-xs text-[var(--text-muted)]">
+                    <span className="truncate text-xs text-(--text-muted)">
                       {option.detail}
                     </span>
                   </span>
@@ -221,7 +221,7 @@ export function StudioVoicePicker({
                       });
                     }
                   }}
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)] disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-(--border-default) text-(--text-primary) transition-colors hover:bg-(--bg-surface-2) disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {loadingPreview ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -242,7 +242,7 @@ export function StudioVoicePicker({
           onClick={() => setShowAll((current) => !current)}
           aria-expanded={showAll}
           aria-controls={groupId}
-          className="flex h-8 items-center gap-1.5 self-start text-[13px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+          className="flex h-8 items-center gap-1.5 self-start text-[13px] text-(--text-muted) transition-colors hover:text-(--text-primary)"
         >
           {showAll ? "Show fewer voices" : `Show all ${options.length} voices`}
           <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", showAll && "rotate-180")} />

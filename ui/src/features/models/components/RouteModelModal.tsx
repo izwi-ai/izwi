@@ -221,49 +221,49 @@ export function RouteModelModal({
           returnFocusRef.current = null;
         }}
         className={clsx(
-          "flex max-h-[min(46rem,calc(100vh-3rem))] max-w-[46rem] flex-col gap-0 overflow-hidden rounded-2xl border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0",
+          "flex max-h-[min(46rem,calc(100vh-3rem))] max-w-184 flex-col gap-0 overflow-hidden rounded-2xl border-(--border-strong) bg-(--bg-surface-0) p-0",
           zIndexClassName,
         )}
       >
-        <header className="border-b border-[var(--border-subtle)] px-6 py-5 pr-14">
-          <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+        <header className="border-b border-(--border-subtle) px-6 py-5 pr-14">
+          <DialogTitle className="text-xl font-semibold tracking-tight text-(--text-primary)">
             {title}
           </DialogTitle>
-          <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+          <DialogDescription className="mt-1 text-sm text-(--text-muted)">
             {description}
           </DialogDescription>
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
           {loading ? (
-            <div className="flex items-center gap-2 py-4 text-sm text-[var(--text-muted)]">
+            <div className="flex items-center gap-2 py-4 text-sm text-(--text-muted)">
               <Loader2 className="h-4 w-4 animate-spin" />
               Loading models…
             </div>
           ) : orderedModels.length === 0 ? (
-            <p className="py-4 text-sm text-[var(--text-muted)]">{emptyMessage}</p>
+            <p className="py-4 text-sm text-(--text-muted)">{emptyMessage}</p>
           ) : (
             <div className="space-y-5">
               {modalSections.map((section) => (
                 <section key={section.key} aria-label={section.title}>
                   {section.title ? (
                     <div className="mb-2 px-0.5">
-                      <h3 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
+                      <h3 className="text-[13.5px] font-semibold text-(--text-primary)">
                         {section.title}
                       </h3>
                       {section.description ? (
-                        <p className="mt-0.5 text-xs text-[var(--text-subtle)]">
+                        <p className="mt-0.5 text-xs text-(--text-subtle)">
                           {section.description}
                         </p>
                       ) : null}
                     </div>
                   ) : null}
                   {section.models.length === 0 ? (
-                    <p className="rounded-[14px] border border-[var(--border-subtle)] px-4 py-3 text-xs text-[var(--text-subtle)]">
+                    <p className="rounded-[14px] border border-(--border-subtle) px-4 py-3 text-xs text-(--text-subtle)">
                       No models in this group.
                     </p>
                   ) : (
-                    <ul className="overflow-hidden rounded-[14px] border border-[var(--border-subtle)] bg-[var(--bg-surface-1)]">
+                    <ul className="overflow-hidden rounded-[14px] border border-(--border-subtle) bg-(--bg-surface-1)">
                       {section.models.map((model) => {
                         const label = labelFor(model.variant);
                         const selectable =
@@ -320,10 +320,10 @@ export function RouteModelModal({
           )}
         </div>
 
-        <footer className="flex items-center justify-between gap-3 border-t border-[var(--border-subtle)] px-6 py-3.5">
+        <footer className="flex items-center justify-between gap-3 border-t border-(--border-subtle) px-6 py-3.5">
           <span
             data-testid="route-model-residency-summary"
-            className="text-xs text-[var(--text-subtle)]"
+            className="text-xs text-(--text-subtle)"
           >
             <MemoryInUse
               readyCount={readyCount}

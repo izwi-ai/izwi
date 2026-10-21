@@ -201,7 +201,7 @@ function RuntimeRows() {
   }
   const { runtime, version } = health.health;
   const value = (text: string) => (
-    <span className="text-[13px] text-[var(--text-secondary)]">{text}</span>
+    <span className="text-[13px] text-(--text-secondary)">{text}</span>
   );
   return (
     <>
@@ -241,7 +241,7 @@ function ThemeSwatch({ theme }: { theme: "system" | "light" | "dark" }) {
   return (
     <div
       aria-hidden="true"
-      className="flex h-12 overflow-hidden rounded-[8px] border border-[var(--border-subtle)]"
+      className="flex h-12 overflow-hidden rounded-[8px] border border-(--border-subtle)"
     >
       {theme === "system" ? (
         <>
@@ -271,16 +271,16 @@ function SettingsSection({
     <section id={id} aria-labelledby={headingId} className="scroll-mt-6">
       <h2
         id={headingId}
-        className="text-[15px] font-semibold text-[var(--text-primary)]"
+        className="text-[15px] font-semibold text-(--text-primary)"
       >
         {title}
       </h2>
       {description ? (
-        <p className="mt-0.5 text-[13px] text-[var(--text-muted)]">
+        <p className="mt-0.5 text-[13px] text-(--text-muted)">
           {description}
         </p>
       ) : null}
-      <div className="mt-3 rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4">
+      <div className="mt-3 rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-4">
         {children}
       </div>
     </section>
@@ -305,7 +305,7 @@ function SettingsRow({
   return (
     <div
       className={cn(
-        "border-b border-[var(--border-subtle)] py-3.5 last:border-b-0",
+        "border-b border-(--border-subtle) py-3.5 last:border-b-0",
         className,
       )}
     >
@@ -319,14 +319,14 @@ function SettingsRow({
           {hasHeaderCopy ? (
             <div className="min-w-0 max-w-2xl">
               {title ? (
-                <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
+                <div className="text-[13.5px] font-medium text-(--text-primary)">
                   {title}
                 </div>
               ) : null}
               {description ? (
                 <div
                   className={cn(
-                    "text-[12.5px] leading-5 text-[var(--text-subtle)]",
+                    "text-[12.5px] leading-5 text-(--text-subtle)",
                     title ? "mt-0.5" : undefined,
                   )}
                 >
@@ -431,7 +431,7 @@ function CommandLineToolRow() {
         ) : installed ? (
           <>
             Installed at{" "}
-            <code className="font-mono text-xs text-[var(--text-secondary)]">
+            <code className="font-mono text-xs text-(--text-secondary)">
               {status?.location}
             </code>
           </>
@@ -809,9 +809,9 @@ export function SettingsPage() {
                       .getElementById(section.id)
                       ?.scrollIntoView({ behavior: "smooth", block: "start" })
                   }
-                  className="flex h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-[13.5px] text-[var(--sidebar-link-title)] transition-colors hover:bg-[var(--sidebar-link-hover-bg)] hover:text-[var(--text-primary)]"
+                  className="flex h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-[13.5px] text-(--sidebar-link-title) transition-colors hover:bg-(--sidebar-link-hover-bg) hover:text-(--text-primary)"
                 >
-                  <section.icon className="h-4 w-4 text-[var(--text-subtle)]" />
+                  <section.icon className="h-4 w-4 text-(--text-subtle)" />
                   {section.label}
                 </button>
               </li>
@@ -839,17 +839,17 @@ export function SettingsPage() {
                       onClick={() => handleThemePreferenceChange(option.id)}
                       aria-pressed={isActive}
                       className={cn(
-                        "flex w-[7.5rem] flex-col gap-2 rounded-[12px] border p-1.5 pb-2 text-[13px] transition-colors",
+                        "flex w-30 flex-col gap-2 rounded-[12px] border p-1.5 pb-2 text-[13px] transition-colors",
                         isActive
-                          ? "border-[var(--text-primary)] text-[var(--text-primary)]"
-                          : "border-[var(--border-default)] text-[var(--text-muted)] hover:border-[var(--border-strong)]",
+                          ? "border-(--text-primary) text-(--text-primary)"
+                          : "border-(--border-default) text-(--text-muted) hover:border-(--border-strong)",
                       )}
                     >
                       <ThemeSwatch theme={option.id} />
                       <span className="flex items-center justify-center gap-1.5">
                         {option.title}
                         {option.id === "system" && isActive ? (
-                          <span className="text-[11px] text-[var(--text-subtle)]">
+                          <span className="text-[11px] text-(--text-subtle)">
                             ({resolvedTheme === "dark" ? "Dark" : "Light"})
                           </span>
                         ) : null}
@@ -891,7 +891,7 @@ export function SettingsPage() {
                   }
                   action={
                     <div className="flex items-center gap-3">
-                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                      <span className="text-sm font-medium text-(--text-secondary)">
                         {trayIconReadStatus === "ready"
                           ? trayIconVisible
                             ? "On"
@@ -923,7 +923,7 @@ export function SettingsPage() {
                     </Button>
                   ) : null}
                   {isSavingTrayIconVisibility ? (
-                    <p className="text-sm text-[var(--text-muted)]">
+                    <p className="text-sm text-(--text-muted)">
                       Saving tray visibility...
                     </p>
                   ) : null}
@@ -947,7 +947,7 @@ export function SettingsPage() {
                   }
                   action={
                     <div className="flex items-center gap-3">
-                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                      <span className="text-sm font-medium text-(--text-secondary)">
                         {launchAtLoginReadStatus === "ready"
                           ? launchAtLoginEnabled
                             ? "On"
@@ -979,7 +979,7 @@ export function SettingsPage() {
                     </Button>
                   ) : null}
                   {isSavingLaunchAtLogin ? (
-                    <p className="text-sm text-[var(--text-muted)]">
+                    <p className="text-sm text-(--text-muted)">
                       Saving startup preference...
                     </p>
                   ) : null}
@@ -1009,7 +1009,7 @@ export function SettingsPage() {
                 title={shortcut.label}
                 description={shortcut.detail}
                 action={
-                  <kbd className="rounded-[6px] border border-[var(--border-default)] px-1.5 py-0.5 font-sans text-xs text-[var(--text-secondary)]">
+                  <kbd className="rounded-[6px] border border-(--border-default) px-1.5 py-0.5 font-sans text-xs text-(--text-secondary)">
                     {isMacPlatform() ? shortcut.mac : shortcut.other}
                   </kbd>
                 }
@@ -1040,7 +1040,7 @@ export function SettingsPage() {
               }
               action={
                 <div className="flex items-center gap-3">
-                  <span className="text-sm font-medium text-[var(--text-secondary)]">
+                  <span className="text-sm font-medium text-(--text-secondary)">
                     {preferencesReadStatus === "ready"
                       ? analyticsOptIn
                         ? "On"
@@ -1069,7 +1069,7 @@ export function SettingsPage() {
                 </Button>
               ) : null}
               {isSavingPreference ? (
-                <p className="text-sm text-[var(--text-muted)]">
+                <p className="text-sm text-(--text-muted)">
                   Saving your preference...
                 </p>
               ) : null}
@@ -1092,7 +1092,7 @@ export function SettingsPage() {
                 ) : availableUpdate ? (
                   <>
                     Version{" "}
-                    <span className="font-medium text-[var(--text-secondary)]">
+                    <span className="font-medium text-(--text-secondary)">
                       {availableUpdate.version}
                     </span>{" "}
                     is available.
@@ -1100,7 +1100,7 @@ export function SettingsPage() {
                 ) : unsupportedUpdate ? (
                   <>
                     Version{" "}
-                    <span className="font-medium text-[var(--text-secondary)]">
+                    <span className="font-medium text-(--text-secondary)">
                       {unsupportedUpdate.version}
                     </span>{" "}
                     needs {unsupportedUpdate.requiredSystem} or later. The version
@@ -1112,9 +1112,9 @@ export function SettingsPage() {
               }
               action={
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-[var(--bg-surface-0)] px-2.5 py-1 text-xs text-[var(--text-secondary)] whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-(--bg-surface-0) px-2.5 py-1 text-xs text-(--text-secondary) whitespace-nowrap">
                     <span>Version</span>
-                    <span className="font-mono font-semibold text-[var(--text-primary)]">
+                    <span className="font-mono font-semibold text-(--text-primary)">
                       v{APP_VERSION}
                     </span>
                   </span>
@@ -1160,12 +1160,12 @@ export function SettingsPage() {
               {updaterSupported &&
               updaterCapabilityStatus === "ready" &&
               !updatesEnabled ? (
-                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
+                <p className="text-sm leading-6 text-(--status-warning-text)">
                   {updaterHealth?.disableReason ?? "Updates are disabled."}
                 </p>
               ) : null}
               {updateErrorMessage ? (
-                <p className="text-sm leading-6 text-[var(--status-warning-text)]">
+                <p className="text-sm leading-6 text-(--status-warning-text)">
                   Last error: {updateErrorMessage}
                 </p>
               ) : null}
@@ -1177,7 +1177,7 @@ export function SettingsPage() {
               title="Izwi"
               description="Local speech, transcription and chat."
               action={
-                <span className="font-mono text-[13px] text-[var(--text-secondary)]">
+                <span className="font-mono text-[13px] text-(--text-secondary)">
                   v{APP_VERSION}
                 </span>
               }
@@ -1190,7 +1190,7 @@ export function SettingsPage() {
                   href="https://github.com/izwi-ai/izwi"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 text-[13px] text-[var(--text-secondary)] underline underline-offset-4 hover:text-[var(--text-primary)]"
+                  className="inline-flex items-center gap-1.5 text-[13px] text-(--text-secondary) underline underline-offset-4 hover:text-(--text-primary)"
                 >
                   github.com/izwi-ai/izwi
                   <ExternalLink className="h-3.5 w-3.5" />

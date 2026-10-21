@@ -109,7 +109,7 @@ export function NewStudioProjectDialog({
     <CreationDialog
       open={open}
       onClose={onClose}
-      className="max-w-[52rem]"
+      className="max-w-208"
       title="New project"
       onSubmit={() => void submit()}
       submitLabel="Create project"
@@ -132,7 +132,7 @@ export function NewStudioProjectDialog({
             <div className="flex items-baseline justify-between">
               <label
                 htmlFor="studio-project-script"
-                className="text-[12.5px] font-medium text-[var(--text-muted)]"
+                className="text-[12.5px] font-medium text-(--text-muted)"
               >
                 Script
               </label>
@@ -140,7 +140,7 @@ export function NewStudioProjectDialog({
                 type="button"
                 onClick={() => fileInput.current?.click()}
                 disabled={submitting}
-                className="inline-flex items-center gap-1.5 text-[12.5px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)]"
+                className="inline-flex items-center gap-1.5 text-[12.5px] text-(--text-muted) transition-colors hover:text-(--text-primary)"
               >
                 <Upload className="h-3.5 w-3.5" />
                 Import a file
@@ -161,7 +161,7 @@ export function NewStudioProjectDialog({
               rows={12}
               autoFocus
               placeholder="Paste a chapter, an article or a podcast script…"
-              className="min-h-[17rem] w-full flex-1 resize-y rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-4 py-3 text-[14.5px] leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)]"
+              className="min-h-68 w-full flex-1 resize-y rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
             />
           </>
         }
@@ -181,7 +181,7 @@ export function NewStudioProjectDialog({
             {error ? (
               <div
                 role="alert"
-                className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+                className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
               >
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <span>{error}</span>

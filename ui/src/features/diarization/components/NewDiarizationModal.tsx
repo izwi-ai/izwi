@@ -647,19 +647,19 @@ export function NewDiarizationModal({
               disabled={isSubmitting || isRecording}
               aria-label="Upload audio file"
               className={cn(
-                "flex min-h-[11rem] flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 border-dashed",
+                "flex min-h-44 flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60 border-dashed",
                 isDraggingFile
-                  ? "border-[var(--text-primary)] bg-[var(--surface-raised)]"
-                  : "border-[var(--border-strong)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+                  ? "border-(--text-primary) bg-(--surface-raised)"
+                  : "border-(--border-strong) bg-(--surface-panel) hover:bg-(--surface-raised)",
               )}
             >
-              <span className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)]">
-                <Upload className="h-[18px] w-[18px] text-[var(--text-primary)]" />
+              <span className="flex h-11 w-11 items-center justify-center rounded-full border border-(--border-default) bg-(--surface-panel-alt)">
+                <Upload className="h-[18px] w-[18px] text-(--text-primary)" />
               </span>
-              <span className="text-[14px] font-medium text-[var(--text-primary)]">
+              <span className="text-[14px] font-medium text-(--text-primary)">
                 {isDraggingFile ? "Drop to start the run" : "Upload a recording"}
               </span>
-              <span className="text-xs text-[var(--text-subtle)]">
+              <span className="text-xs text-(--text-subtle)">
                 Drop a file or browse · {AUDIO_FILE_HINT}
               </span>
               <input
@@ -682,18 +682,18 @@ export function NewDiarizationModal({
               }}
               disabled={isSubmitting}
               className={cn(
-                "flex min-h-[11rem] flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                "flex min-h-44 flex-col items-center justify-center gap-2.5 rounded-[12px] border p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
                 isRecording
-                  ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
-                  : "border-[var(--border-default)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+                  ? "border-(--status-warning-border) bg-(--status-warning-bg) text-(--status-warning-text)"
+                  : "border-(--border-default) bg-(--surface-panel) hover:bg-(--surface-raised)",
               )}
             >
               <span
                 className={cn(
                   "flex h-11 w-11 items-center justify-center rounded-full",
                   isRecording
-                    ? "bg-[var(--status-warning-text)] text-white"
-                    : "border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[var(--text-primary)]",
+                    ? "bg-(--status-warning-text) text-white"
+                    : "border border-(--border-default) bg-(--surface-panel-alt) text-(--text-primary)",
                 )}
               >
                 {isRecording ? (
@@ -705,7 +705,7 @@ export function NewDiarizationModal({
               <span className="text-[14px] font-medium">
                 {isRecording ? "Stop recording" : "Record audio"}
               </span>
-              <span className="text-xs text-[var(--text-subtle)]">
+              <span className="text-xs text-(--text-subtle)">
                 {isRecording
                   ? "Stop to submit the recording."
                   : "Capture a conversation with your microphone."}
@@ -735,7 +735,7 @@ export function NewDiarizationModal({
               value={selectedModel ?? ""}
               onChange={(event) => onSelectModel(event.target.value)}
               disabled={isSubmitting || isRecording}
-              className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+              className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
             >
               {pickerOptions.map((option) => (
                 <option key={option.variant} value={option.variant}>
@@ -793,7 +793,7 @@ export function NewDiarizationModal({
             <>
               <CreationField label="Speakers">
                 <div className="grid grid-cols-2 gap-2">
-                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
                   Min speakers
                   <input
                     aria-label="Min speakers"
@@ -802,10 +802,10 @@ export function NewDiarizationModal({
                     value={minSpeakers}
                     onChange={(event) => setMinSpeakers(event.target.value)}
                     onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
                   />
                 </label>
-                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
                   Max speakers
                   <input
                     aria-label="Max speakers"
@@ -814,14 +814,14 @@ export function NewDiarizationModal({
                     value={maxSpeakers}
                     onChange={(event) => setMaxSpeakers(event.target.value)}
                     onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
                   />
                 </label>
                 </div>
               </CreationField>
               <CreationField label="Timing">
                 <div className="grid grid-cols-2 gap-2">
-                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
                   Min speech (ms)
                   <input
                     aria-label="Min speech (ms)"
@@ -830,10 +830,10 @@ export function NewDiarizationModal({
                     value={minSpeechMs}
                     onChange={(event) => setMinSpeechMs(event.target.value)}
                     onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
                   />
                 </label>
-                <label className="flex flex-col gap-1 text-xs text-[var(--text-subtle)]">
+                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
                   Min silence (ms)
                   <input
                     aria-label="Min silence (ms)"
@@ -842,7 +842,7 @@ export function NewDiarizationModal({
                     value={minSilenceMs}
                     onChange={(event) => setMinSilenceMs(event.target.value)}
                     onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] text-[var(--text-primary)]"
+                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
                   />
                 </label>
                 </div>
@@ -859,7 +859,7 @@ export function NewDiarizationModal({
           {error ? (
             <div
               role="alert"
-              className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+              className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
             >
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <p>{error}</p>
@@ -902,7 +902,7 @@ export function NewDiarizationModal({
       {...frameProps}
       open={isOpen}
       blockDismiss={busy}
-      className="max-w-[52rem]"
+      className="max-w-208"
     >
       {modalBody}
     </CreationDialog>

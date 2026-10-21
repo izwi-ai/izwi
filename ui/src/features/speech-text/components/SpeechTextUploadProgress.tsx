@@ -82,10 +82,10 @@ export function SpeechTextUploadProgress({
   return (
     <div
       className={cn(
-        "rounded-lg border bg-[var(--bg-surface-1)] p-3.5",
+        "rounded-lg border bg-(--bg-surface-1) p-3.5",
         isFailed
-          ? "border-[var(--danger-border)]"
-          : "border-[var(--border-muted)]",
+          ? "border-(--danger-border)"
+          : "border-(--border-muted)",
       )}
     >
       <div className="flex items-start gap-3">
@@ -93,10 +93,10 @@ export function SpeechTextUploadProgress({
           className={cn(
             "flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border",
             isFailed
-              ? "border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)]"
+              ? "border-(--danger-border) bg-(--danger-bg) text-(--danger-text)"
               : isAccepted
-                ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
-                : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-primary)]",
+                ? "border-(--status-positive-border) bg-(--status-positive-bg) text-(--status-positive-text)"
+                : "border-(--border-muted) bg-(--bg-surface-0) text-(--text-primary)",
           )}
         >
           {isFailed ? (
@@ -114,12 +114,12 @@ export function SpeechTextUploadProgress({
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <div
-                className="truncate text-sm font-semibold text-[var(--text-primary)]"
+                className="truncate text-sm font-semibold text-(--text-primary)"
                 title={fileName}
               >
                 {fileName}
               </div>
-              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-[var(--text-muted)]">
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-(--text-muted)">
                 <span>{fileKind}</span>
                 <span aria-hidden="true">·</span>
                 <span>{formatUploadFileSize(fileSizeBytes)}</span>
@@ -141,7 +141,7 @@ export function SpeechTextUploadProgress({
           </div>
 
           <div
-            className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--bg-surface-0)]"
+            className="mt-3 h-2 overflow-hidden rounded-full bg-(--bg-surface-0)"
             role="progressbar"
             aria-label="Upload progress"
             aria-valuemin={0}
@@ -153,7 +153,7 @@ export function SpeechTextUploadProgress({
           >
             <div
               className={cn(
-                "h-full rounded-full bg-[var(--status-info-text)] transition-[width] duration-200",
+                "h-full rounded-full bg-(--status-info-text) transition-[width] duration-200",
                 normalizedPercent === null && !isAccepted ? "animate-pulse" : null,
               )}
               style={{ width: `${barWidth}%` }}
@@ -163,7 +163,7 @@ export function SpeechTextUploadProgress({
           <div
             className={cn(
               "mt-2 flex items-center justify-between gap-3 text-xs",
-              isFailed ? "text-[var(--danger-text)]" : "text-[var(--text-muted)]",
+              isFailed ? "text-(--danger-text)" : "text-(--text-muted)",
             )}
           >
             <span

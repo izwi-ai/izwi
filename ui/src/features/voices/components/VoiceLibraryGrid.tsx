@@ -23,7 +23,7 @@ function initials(name: string): string {
 }
 
 const RANGE_CLASS =
-  "relative z-10 m-0 h-5 w-full cursor-pointer appearance-none bg-transparent focus-visible:outline-none disabled:cursor-default [&::-moz-range-thumb]:h-2.5 [&::-moz-range-thumb]:w-2.5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-[var(--text-primary)] [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:h-2.5 [&::-webkit-slider-thumb]:w-2.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[var(--text-primary)] disabled:[&::-webkit-slider-thumb]:opacity-0";
+  "relative z-10 m-0 h-5 w-full cursor-pointer appearance-none bg-transparent focus-visible:outline-hidden disabled:cursor-default [&::-moz-range-thumb]:h-2.5 [&::-moz-range-thumb]:w-2.5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-(--text-primary) [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:h-2.5 [&::-webkit-slider-thumb]:w-2.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-(--text-primary) disabled:[&::-webkit-slider-thumb]:opacity-0";
 
 function VoicePreview({
   item,
@@ -78,7 +78,7 @@ function VoicePreview({
           }
         }}
         aria-label={`${isPlaying ? "Pause" : "Play"} preview for ${item.name}`}
-        className="inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)] text-[var(--text-primary)] transition-colors hover:border-[var(--border-strong)] disabled:cursor-not-allowed disabled:opacity-40"
+        className="inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full border border-(--border-default) bg-(--surface-panel-alt) text-(--text-primary) transition-colors hover:border-(--border-strong) disabled:cursor-not-allowed disabled:opacity-40"
       >
         {item.previewLoading ? (
           <Loader2 className="h-3 w-3 animate-spin" />
@@ -89,9 +89,9 @@ function VoicePreview({
         )}
       </button>
       <div className="relative flex h-5 flex-1 items-center">
-        <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--surface-raised)]" />
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-(--surface-raised)" />
         <div
-          className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--text-muted)]"
+          className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-(--text-muted)"
           style={{
             width: `${playback.duration > 0 ? Math.min(playback.currentTime / playback.duration, 1) * 100 : 0}%`,
           }}
@@ -108,7 +108,7 @@ function VoicePreview({
           className={RANGE_CLASS}
         />
       </div>
-      <span className="w-9 text-right font-mono text-[11px] tabular-nums text-[var(--text-subtle)]">
+      <span className="w-9 text-right font-mono text-[11px] tabular-nums text-(--text-subtle)">
         {item.previewLoading
           ? "…"
           : item.previewUrl
@@ -159,21 +159,21 @@ export function VoiceLibraryGrid({
         <li
           key={item.id}
           data-testid={`voice-card-${item.id}`}
-          className="flex min-w-0 flex-col gap-3 rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-3.5"
+          className="flex min-w-0 flex-col gap-3 rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) p-3.5"
         >
           <div className="flex items-start gap-3">
             <span
               aria-hidden="true"
-              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] border border-[var(--speaker-avatar-border)] bg-[var(--speaker-avatar-bg)] text-[13px] font-semibold text-[var(--speaker-avatar-text)]"
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] border border-(--speaker-avatar-border) bg-(--speaker-avatar-bg) text-[13px] font-semibold text-(--speaker-avatar-text)"
             >
               {initials(item.name)}
             </span>
             <div className="min-w-0 flex-1">
-              <h3 className="truncate text-[14px] font-semibold text-[var(--text-primary)]">
+              <h3 className="truncate text-[14px] font-semibold text-(--text-primary)">
                 {item.name}
               </h3>
               {item.meta ? (
-                <p className="truncate text-xs text-[var(--text-subtle)]">
+                <p className="truncate text-xs text-(--text-subtle)">
                   {item.meta}
                 </p>
               ) : null}
@@ -183,13 +183,13 @@ export function VoiceLibraryGrid({
             ) : null}
           </div>
 
-          <p className="line-clamp-2 min-h-[2.5rem] text-[13px] leading-5 text-[var(--text-muted)]">
+          <p className="line-clamp-2 min-h-10 text-[13px] leading-5 text-(--text-muted)">
             {item.description || "No notes saved for this voice."}
           </p>
 
           <VoicePreview item={item} activeId={activeId} onActivate={setActiveId} />
 
-          <div className="flex items-center gap-2 border-t border-[var(--border-subtle)] pt-3">
+          <div className="flex items-center gap-2 border-t border-(--border-subtle) pt-3">
             {item.primaryAction ? (
               <Button
                 type="button"

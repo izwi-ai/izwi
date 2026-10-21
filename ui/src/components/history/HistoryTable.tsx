@@ -72,7 +72,7 @@ export function HistoryTable<T>({
 }: HistoryTableProps<T>) {
   if (loading && rows.length === 0) {
     return (
-      <div className="flex min-h-[16rem] items-center justify-center rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] text-sm text-[var(--text-muted)]">
+      <div className="flex min-h-64 items-center justify-center rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) text-sm text-(--text-muted)">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
         Loading {noun}…
       </div>
@@ -83,7 +83,7 @@ export function HistoryTable<T>({
     return (
       <div
         role="alert"
-        className="flex items-start justify-between gap-3 rounded-[14px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+        className="flex items-start justify-between gap-3 rounded-[14px] border border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
       >
         <div className="flex items-start gap-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -100,11 +100,11 @@ export function HistoryTable<T>({
 
   if (rows.length === 0) {
     return (
-      <div className="rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-6 py-12 text-center">
-        <h3 className="text-base font-semibold text-[var(--text-primary)]">
+      <div className="rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-6 py-12 text-center">
+        <h3 className="text-base font-semibold text-(--text-primary)">
           {filtered ? `No matching ${noun}` : empty.title}
         </h3>
-        <p className="mx-auto mt-1.5 max-w-md text-sm text-[var(--text-muted)]">
+        <p className="mx-auto mt-1.5 max-w-md text-sm text-(--text-muted)">
           {filtered
             ? "Try a different search or filter."
             : empty.description}
@@ -119,13 +119,13 @@ export function HistoryTable<T>({
   return (
     <div
       className={cn(
-        "overflow-hidden rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] transition-opacity",
+        "overflow-hidden rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) transition-opacity",
         loading && "opacity-60",
       )}
       aria-busy={loading || undefined}
     >
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[32rem] border-separate border-spacing-0 text-[13.5px]">
+        <table className="w-full min-w-lg border-separate border-spacing-0 text-[13.5px]">
           <thead>
             <tr>
               {columns.map((column) => (
@@ -133,7 +133,7 @@ export function HistoryTable<T>({
                   key={column.id}
                   scope="col"
                   className={cn(
-                    "border-b border-[var(--border-subtle)] px-3.5 py-2.5 text-left text-xs font-medium text-[var(--text-subtle)]",
+                    "border-b border-(--border-subtle) px-3.5 py-2.5 text-left text-xs font-medium text-(--text-subtle)",
                     column.className,
                   )}
                 >
@@ -143,7 +143,7 @@ export function HistoryTable<T>({
               {rowActions ? (
                 <th
                   scope="col"
-                  className="w-[1%] border-b border-[var(--border-subtle)] px-3.5 py-2.5"
+                  className="w-[1%] border-b border-(--border-subtle) px-3.5 py-2.5"
                 >
                   <span className="sr-only">Actions</span>
                 </th>
@@ -157,7 +157,7 @@ export function HistoryTable<T>({
                 tabIndex={0}
                 aria-label={`Open ${getRowLabel(row)}`}
                 className={cn(
-                  "group cursor-pointer outline-none transition-colors hover:bg-[var(--bg-surface-1)] focus-visible:bg-[var(--bg-surface-1)] [&:last-child>td]:border-b-0",
+                  "group cursor-pointer outline-hidden transition-colors hover:bg-(--bg-surface-1) focus-visible:bg-(--bg-surface-1) [&:last-child>td]:border-b-0",
                   rowClassName?.(row),
                 )}
                 onClick={(event) => {
@@ -179,7 +179,7 @@ export function HistoryTable<T>({
                   <td
                     key={column.id}
                     className={cn(
-                      "border-b border-[var(--border-subtle)] px-3.5 py-2.5 align-middle",
+                      "border-b border-(--border-subtle) px-3.5 py-2.5 align-middle",
                       column.className,
                       column.cellClassName,
                     )}
@@ -188,7 +188,7 @@ export function HistoryTable<T>({
                   </td>
                 ))}
                 {rowActions ? (
-                  <td className="border-b border-[var(--border-subtle)] px-2.5 py-2 align-middle">
+                  <td className="border-b border-(--border-subtle) px-2.5 py-2 align-middle">
                     <div
                       data-row-action
                       className="flex items-center justify-end gap-0.5"
@@ -202,14 +202,14 @@ export function HistoryTable<T>({
           </tbody>
         </table>
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-subtle)] px-3.5 py-2.5 text-[12.5px] text-[var(--text-subtle)]">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-(--border-subtle) px-3.5 py-2.5 text-[12.5px] text-(--text-subtle)">
         <span>
           {total !== null && total >= rows.length
             ? `Showing ${rows.length} of ${total} ${noun}`
             : `Showing ${rows.length} ${noun}`}
         </span>
         {error ? (
-          <span role="alert" className="text-[var(--danger-text)]">
+          <span role="alert" className="text-(--danger-text)">
             {error}
           </span>
         ) : null}
