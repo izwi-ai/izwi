@@ -64,4 +64,4 @@ tempfile = "3.10"
 tokenizers = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
