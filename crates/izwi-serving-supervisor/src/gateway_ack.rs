@@ -38,6 +38,8 @@ impl std::fmt::Debug for GatewayAck {
 
 impl GatewayAck {
     pub fn new(config: &GatewayAckConfig, admin_key: String) -> Result<Self, reqwest::Error> {
+        // reqwest's rustls has no built-in crypto provider in this workspace.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
             urls: config
                 .admin_urls

@@ -15,6 +15,7 @@ izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-fence = { path = "../izwi-serving-fence" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

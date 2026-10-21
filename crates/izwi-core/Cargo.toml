@@ -60,6 +60,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 indicatif = { workspace = true }
 dirs = { workspace = true }
 base64 = { workspace = true }

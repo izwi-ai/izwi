@@ -97,4 +97,5 @@ izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-suppo
 izwi-test-process = { path = "../izwi-test-process" }
 izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }

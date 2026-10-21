@@ -34,6 +34,13 @@ const GATEWAY_ADMIN_KEY: &str = "rollout-rig-admin-key-0123456789";
 const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
 const DEPLOYMENT_ID: &str = "test-chat-v1";
 
+/// A reqwest client. reqwest's rustls has no built-in crypto provider in this
+/// workspace, so ring is installed first.
+fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 async fn reserve_port() -> u16 {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -177,7 +184,7 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
         // gateway binds it. Poll until the gateway is ready or has died on
         // that race, instead of checking once after a fixed wait that a slow
         // boot outlasts.
-        let client = reqwest::Client::new();
+        let client = http_client();
         let ready_url = format!("{}/readyz", gateway.base);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut address_in_use = false;
@@ -259,7 +266,7 @@ async fn wait_adopted(
 }
 
 async fn wait_ready(gateway: &GatewayProcess) {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match client.get(format!("{}/readyz", gateway.base)).send().await {
@@ -355,6 +362,7 @@ async fn rollout_views_cut_over_generations_with_zero_dropped_requests() {
     let mut gateway = spawn_gateway(&approvals_path).await;
     wait_ready(&gateway).await;
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()

@@ -24,6 +24,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn blocking_client_works_inside_a_runtime_context() {
         // Building a reqwest blocking client directly here would panic.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let built = run_off_runtime(|| reqwest::blocking::Client::builder().build().is_ok());
         assert!(built);
     }

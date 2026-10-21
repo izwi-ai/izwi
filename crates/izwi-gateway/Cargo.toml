@@ -66,5 +66,6 @@ izwi-db = { path = "../izwi-db", features = ["test-support"] }
 izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-support"] }
 izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 tempfile = "3.10"
 tokio = { workspace = true, features = ["test-util"] }

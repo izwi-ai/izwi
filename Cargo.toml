@@ -78,11 +78,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 bytes = "1.9"
 base64 = "0.22"
-reqwest = { version = "0.11", default-features = false, features = [
+# rustls without reqwest's built-in aws-lc-rs provider (see `rustls` below):
+# every process installs ring before it builds a client, or hands reqwest a
+# ready rustls config. HTTP/2 and charset decoding stopped being implied in
+# reqwest 0.12, so they are listed.
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
     "blocking",
-    "rustls-tls",
+    "http2",
+    "charset",
+    "rustls-no-provider",
 ] }
 # ring is the only rustls crypto provider in the tree: aws-lc-rs next to it
 # makes rustls' default-provider lookups panic. Keep default features off.

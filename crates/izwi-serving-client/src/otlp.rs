@@ -208,6 +208,8 @@ fn export_loop(
     interval: Duration,
     queued: Receiver<Value>,
 ) {
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let client = match reqwest::blocking::Client::builder()
         .timeout(EXPORT_TIMEOUT)
         .build()

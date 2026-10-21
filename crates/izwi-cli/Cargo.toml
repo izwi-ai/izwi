@@ -30,6 +30,7 @@ futures = { workspace = true }
 
 # HTTP client for API calls
 reqwest = { workspace = true, features = ["json", "stream", "multipart"] }
+rustls = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

@@ -575,6 +575,8 @@ impl RecreationPolicy {
 
 fn poll_livez_runtime_poisoned(server_url: &Url) -> Option<bool> {
     let live_url = server_url.join("/livez").ok()?;
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let body = reqwest::blocking::Client::builder()
         .timeout(POISON_PROBE_TIMEOUT)
         .build()
@@ -667,6 +669,8 @@ fn fetch_liveness(server_url: &Url, timeout: Duration) -> Result<(bool, String)>
         .join("/livez")
         .context("failed to construct izwi-server liveness URL")?;
     super::blocking::run_off_runtime(move || -> Result<(bool, String)> {
+        // reqwest's rustls has no built-in crypto provider in this workspace.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let response = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .build()

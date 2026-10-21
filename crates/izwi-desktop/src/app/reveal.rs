@@ -57,6 +57,8 @@ async fn models_dir(server_url: &Url) -> Result<PathBuf> {
     let storage_url = server_url
         .join("/v1/admin/storage")
         .context("failed to build the storage URL")?;
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let storage: serde_json::Value = reqwest::Client::builder()
         .timeout(STORAGE_TIMEOUT)
         .build()

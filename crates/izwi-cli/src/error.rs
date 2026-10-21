@@ -177,6 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_server_is_named_with_a_hint() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let error: CliError = reqwest::Client::builder()
             .no_proxy()
             .build()

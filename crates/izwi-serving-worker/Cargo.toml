@@ -59,6 +59,7 @@ izwi-server = { path = "../izwi-server" }
 izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
 izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 safetensors = { workspace = true }
 tempfile = "3.10"
 tokenizers = { workspace = true }

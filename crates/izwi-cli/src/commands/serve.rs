@@ -538,6 +538,8 @@ fn open_in_browser(url: &str) -> Result<()> {
 }
 
 async fn wait_for_server_ready(api_endpoint: &str, timeout: Duration) -> Result<()> {
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
