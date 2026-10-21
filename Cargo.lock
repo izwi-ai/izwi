@@ -3762,7 +3762,6 @@ dependencies = [
  "futures",
  "izwi-serving-protocol",
  "reqwest",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3849,7 +3848,6 @@ dependencies = [
  "izwi-test-process",
  "reqwest",
  "rustls",
- "rustls-pemfile",
  "safetensors 0.4.5",
  "serde_json",
  "sha2 0.10.9",
@@ -6106,15 +6104,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c74cae0a4cf6ccbbf5f359f08efdf8ee7e1dc532573bf0db71968cb56b1448c"
-dependencies = [
- "base64 0.21.7",
 ]
 
 [[package]]

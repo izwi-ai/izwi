@@ -16,7 +16,8 @@ use izwi_serving_protocol::{
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
-use std::{collections::VecDeque, fmt, io::Cursor, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, pin::Pin, sync::Arc, time::Duration};
+use tokio_rustls::rustls::pki_types::pem::{PemObject, SectionKind};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
 pub mod otlp;
@@ -83,7 +84,7 @@ impl WorkerClientTlsConfig {
             if items.is_empty()
                 || items
                     .iter()
-                    .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+                    .any(|item| !matches!(item, (SectionKind::Certificate, _)))
             {
                 return Err(WorkerClientError::InvalidConfiguration(
                     "private CA root must contain only certificate PEM blocks",
@@ -112,7 +113,7 @@ impl WorkerClientTlsConfig {
                 if certificate_items.is_empty()
                     || certificate_items
                         .iter()
-                        .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+                        .any(|item| !matches!(item, (SectionKind::Certificate, _)))
                 {
                     return Err(WorkerClientError::InvalidConfiguration(
                         "mTLS client certificate must contain only certificate PEM blocks",
@@ -124,9 +125,12 @@ impl WorkerClientTlsConfig {
                     || !private_key_items.iter().all(|item| {
                         matches!(
                             item,
-                            rustls_pemfile::Item::RSAKey(_)
-                                | rustls_pemfile::Item::PKCS8Key(_)
-                                | rustls_pemfile::Item::ECKey(_)
+                            (
+                                SectionKind::RsaPrivateKey
+                                    | SectionKind::PrivateKey
+                                    | SectionKind::EcPrivateKey,
+                                _
+                            )
                         )
                     })
                 {
@@ -165,11 +169,14 @@ impl WorkerClientTlsConfig {
     }
 }
 
+/// Every PEM section `pem` holds, labelled by kind. Sections with labels
+/// rustls does not know are skipped.
 fn parse_pem_items(
     pem: &[u8],
     error: &'static str,
-) -> Result<Vec<rustls_pemfile::Item>, WorkerClientError> {
-    rustls_pemfile::read_all(&mut Cursor::new(pem))
+) -> Result<Vec<(SectionKind, Vec<u8>)>, WorkerClientError> {
+    <(SectionKind, Vec<u8>)>::pem_slice_iter(pem)
+        .collect::<Result<_, _>>()
         .map_err(|_| WorkerClientError::InvalidConfiguration(error))
 }
 
@@ -178,7 +185,7 @@ fn pem_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, WorkerClientError> {
     Ok(parse_pem_items(pem, "certificate PEM is invalid")?
         .into_iter()
         .filter_map(|item| match item {
-            rustls_pemfile::Item::X509Certificate(der) => Some(der),
+            (SectionKind::Certificate, der) => Some(der),
             _ => None,
         })
         .collect())
@@ -201,16 +208,16 @@ fn pem_identity(
     let mut key = None;
     for item in parse_pem_items(pem, "mTLS identity is not valid PEM")? {
         match item {
-            rustls_pemfile::Item::X509Certificate(der) => {
+            (SectionKind::Certificate, der) => {
                 certificates.push(CertificateDer::from(der));
             }
-            rustls_pemfile::Item::PKCS8Key(der) => {
+            (SectionKind::PrivateKey, der) => {
                 key = Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)));
             }
-            rustls_pemfile::Item::RSAKey(der) => {
+            (SectionKind::RsaPrivateKey, der) => {
                 key = Some(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)));
             }
-            rustls_pemfile::Item::ECKey(der) => {
+            (SectionKind::EcPrivateKey, der) => {
                 key = Some(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)));
             }
             _ => {}

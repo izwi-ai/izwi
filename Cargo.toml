@@ -93,7 +93,6 @@ reqwest = { version = "0.13", default-features = false, features = [
 # ring is the only rustls crypto provider in the tree: aws-lc-rs next to it
 # makes rustls' default-provider lookups panic. Keep default features off.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "1.0"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 indicatif = "0.17"
 dirs = "5.0"
