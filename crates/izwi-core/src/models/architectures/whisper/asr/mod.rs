@@ -21,8 +21,10 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self, Config as WhisperConfig};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+// ChaCha12 is what StdRng runs, but it stays Clone (samplers snapshot their
+// RNG) and its seeded stream is stable across releases.
+use rand_chacha::ChaCha12Rng;
+use rand::{Rng, RngExt, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -280,7 +282,7 @@ pub(crate) struct WhisperDecodeState {
     attempt_generation: u32,
     max_steps: usize,
     finished: bool,
-    rng: StdRng,
+    rng: ChaCha12Rng,
     /// Language resolved once before the prompt was built.
     language: WhisperLanguageResolution,
     /// Every finished temperature attempt, kept across fallback restarts.
@@ -389,7 +391,7 @@ struct WhisperDecodeCheckpointPayload {
     attempt_generation: u32,
     max_steps: usize,
     finished: bool,
-    rng: StdRng,
+    rng: ChaCha12Rng,
     attempts: Vec<WhisperAttemptRecord>,
     published_attempt: Option<(WhisperDecodeAttempt, f32)>,
     managed_completions_drained: bool,
@@ -517,7 +519,7 @@ impl WhisperDecodeState {
         })?;
 
         let checkpoint = self.activate_managed_checkpoint(cache)?;
-        let retry_seed = self.rng.gen::<u64>();
+        let retry_seed = self.rng.random::<u64>();
         self.prefill_progress = 0;
         self.pending_logits = None;
         self.generated_tokens.clear();
@@ -531,7 +533,7 @@ impl WhisperDecodeState {
         self.temperature = pending.next_temperature;
         self.attempt_generation = pending.next_attempt_generation;
         self.finished = false;
-        self.rng = StdRng::seed_from_u64(retry_seed);
+        self.rng = ChaCha12Rng::seed_from_u64(retry_seed);
         self.pending_retry = None;
         self.current_managed_generation = new_generation;
         self.managed_completions_drained = true;
@@ -662,7 +664,7 @@ struct WhisperDecodeStepSnapshot {
     decode_steps: usize,
     best_attempt: Option<(WhisperDecodeAttempt, f32)>,
     finished: bool,
-    rng: StdRng,
+    rng: ChaCha12Rng,
     managed_completions_drained: bool,
 }
 
@@ -1746,7 +1748,7 @@ impl WhisperTurboAsrModel {
             attempt_generation: 1,
             max_steps,
             finished: false,
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng::<ChaCha12Rng>(),
             language,
             attempts: Vec::new(),
             published_attempt: None,
@@ -3097,7 +3099,7 @@ impl WhisperTurboAsrModel {
         cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<WhisperDecodeAttempt> {
         self_kv.reset_invocation()?;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
         let mut generated_tokens = Vec::<u32>::new();
@@ -3257,7 +3259,7 @@ impl WhisperTurboAsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<WhisperDecodeAttempt> {
         self_kv.reset_invocation()?;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
         let mut generated_tokens = Vec::<u32>::new();
@@ -3883,7 +3885,7 @@ fn sample_token_from_log_probs<R: Rng + ?Sized>(
         return (fallback_token, f32::NEG_INFINITY);
     }
 
-    let mut threshold = rng.gen_range(0.0..sum);
+    let mut threshold = rng.random_range(0.0..sum);
     for (idx, logprob) in log_probs.iter().enumerate() {
         if !logprob.is_finite() {
             continue;
@@ -4367,7 +4369,8 @@ mod tests {
     use std::sync::Arc;
 
     use candle_core::{DType, Device, Tensor};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
+    use rand_chacha::ChaCha12Rng;
 
     use super::{
         acquire_whisper_cross_sequence_owner, adaptive_decode_budget,
@@ -4692,7 +4695,7 @@ mod tests {
         let special = decode_test_special_tokens();
         let mut logits = vec![0.0, -1.0, 3.0, 8.0, 2.0, 4.0, 1.0, 7.0, 0.0, 5.0, 6.0, 9.0];
         apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, true, &[]);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(1);
         let (host_next, host_logprob) = select_token_from_filtered_logits(
             &logits,
             true,
@@ -4716,7 +4719,7 @@ mod tests {
         let special = decode_test_special_tokens();
         let mut logits = vec![0.0, -1.0, 3.0, 8.0, 2.0, 4.0, 1.0, 7.0, 0.0, 5.0, 6.0, 9.0];
         apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, true, &[]);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(3);
         let mut buffer = Vec::new();
 
         // Greedy (T = 0): the chosen token keeps its real log-probability
@@ -4806,7 +4809,7 @@ mod tests {
         // The decoder is unsure what to say: near-flat filtered logits.
         let mut logits = vec![0.0, 0.2, 0.1, 0.3, 0.0, 0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0];
         apply_whisper_decode_constraints(&mut logits, false, &[4], &[], &[], &special, true, &[]);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(5);
         let (_, logprob) = select_token_from_filtered_logits(
             &logits,
             true,
@@ -5564,7 +5567,7 @@ mod tests {
             attempt_generation: 1,
             max_steps: 3,
             finished: false,
-            rng: rand::rngs::StdRng::seed_from_u64(7),
+            rng: ChaCha12Rng::seed_from_u64(7),
             language: super::WhisperLanguageResolution {
                 resolved: Some((20, "en".into())),
                 hint_used: false,
@@ -5834,10 +5837,10 @@ mod tests {
             .to_vec1::<f32>()
             .expect("host logits");
         let mut expected_rng = state.rng.clone();
-        let expected_sample = expected_rng.gen::<u32>();
+        let expected_sample = expected_rng.random::<u32>();
 
         let error = with_whisper_decode_step_transaction(&mut state, |state| {
-            let sampled = state.rng.gen::<u32>();
+            let sampled = state.rng.random::<u32>();
             append_test_decode_token(state, sampled)?;
             state.finished = true;
             Err::<(), _>(Error::InferenceError(
@@ -5863,7 +5866,7 @@ mod tests {
         );
 
         let retried_sample = with_whisper_decode_step_transaction(&mut state, |state| {
-            let sampled = state.rng.gen::<u32>();
+            let sampled = state.rng.random::<u32>();
             append_test_decode_token(state, sampled)?;
             Ok(sampled)
         })
@@ -5895,7 +5898,7 @@ mod tests {
         state.attempt_generation = 9;
         state.max_steps = 1;
         state.finished = true;
-        let _ = state.rng.gen::<u32>();
+        let _ = state.rng.random::<u32>();
         state
             .rollback_managed_quantum(&mut checkpoint)
             .expect("rollback managed quantum");

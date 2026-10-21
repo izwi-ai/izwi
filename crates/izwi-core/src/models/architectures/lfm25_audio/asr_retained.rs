@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn retained_text_streams_whole_characters_with_linear_detokenize_work() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
         let words = [
@@ -840,7 +840,7 @@ mod tests {
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_7);
         let text = (0..2_000)
-            .map(|_| words[rng.gen_range(0..words.len())])
+            .map(|_| words[rng.random_range(0..words.len())])
             .collect::<Vec<_>>()
             .join(" ");
         let (deltas, state) = stream(&bytes(&text), true);

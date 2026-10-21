@@ -98,7 +98,7 @@ indicatif = "0.18"
 dirs = "5.0"
 sha2 = "0.10"
 hmac = "0.12"
-rand = "0.8"
+rand = "0.10"
 subtle = "2.6"
 memmap2 = "0.9.10"
 

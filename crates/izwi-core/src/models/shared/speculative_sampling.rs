@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use rand::RngCore;
+use rand::Rng;
 
 use crate::{Error, Result};
 
@@ -44,7 +44,7 @@ pub struct SpeculativeDraft {
 ///
 /// `history` and `rng` are transactional: neither changes when constructing or
 /// sampling the proposal fails.
-pub fn propose_speculative_draft<R: RngCore + Clone>(
+pub fn propose_speculative_draft<R: Rng + Clone>(
     draft_logits: &[f32],
     config: &ChatGenerationConfig,
     history: &mut Vec<u32>,
@@ -81,7 +81,7 @@ impl SpeculativeVerification {
 /// policies use lossless rejection sampling against a greedy, one-hot draft
 /// distribution. `target_logits` must contain one row per draft token plus one
 /// bonus-token row.
-pub fn verify_speculative_prefix<R: RngCore + Clone>(
+pub fn verify_speculative_prefix<R: Rng + Clone>(
     draft_tokens: &[u32],
     target_logits: &[Vec<f32>],
     config: &ChatGenerationConfig,
@@ -100,7 +100,7 @@ pub fn verify_speculative_prefix<R: RngCore + Clone>(
 /// Greedy requests use exact prefix matching. Stochastic requests use the
 /// standard lossless acceptance probability `min(1, p(d) / q(d))` and sample
 /// a correction from normalized `max(p - q, 0)` after rejection.
-pub fn verify_speculative_proposals<R: RngCore + Clone>(
+pub fn verify_speculative_proposals<R: Rng + Clone>(
     drafts: &[SpeculativeDraft],
     target_logits: &[Vec<f32>],
     config: &ChatGenerationConfig,
@@ -273,7 +273,7 @@ pub fn verify_greedy_token_prefix(
 /// from normalized `max(p - q, 0)`. A fully accepted block receives a sample
 /// from the final target row. RNG and history are cloned up front and committed
 /// together only on success.
-pub fn verify_rejection_sampled_prefix<R: RngCore + Clone>(
+pub fn verify_rejection_sampled_prefix<R: Rng + Clone>(
     draft_tokens: &[u32],
     target_logits: &[Vec<f32>],
     config: &ChatGenerationConfig,
@@ -586,7 +586,7 @@ fn sample_weighted(
     Ok(candidates.last().expect("non-empty candidates").0)
 }
 
-fn next_unit_f32(rng: &mut impl RngCore) -> f32 {
+fn next_unit_f32(rng: &mut impl Rng) -> f32 {
     ((rng.next_u32() >> 8) as f32) * F32_UNIT_SCALE
 }
 
@@ -596,8 +596,6 @@ fn no_finite_logits_error() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use rand::{Error as RandError, RngCore};
-
     use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -622,26 +620,24 @@ mod tests {
         }
     }
 
-    impl RngCore for ScriptedRng {
-        fn next_u32(&mut self) -> u32 {
+    impl rand::TryRng for ScriptedRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
             let value = self.draws.get(self.cursor).copied().unwrap_or(0);
             self.cursor += 1;
-            value
+            Ok(value)
         }
 
-        fn next_u64(&mut self) -> u64 {
-            (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            Ok((u64::from(self.next_u32()) << 32) | u64::from(self.next_u32()))
         }
 
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), Self::Error> {
             for chunk in dest.chunks_mut(std::mem::size_of::<u32>()) {
                 let bytes = self.next_u32().to_le_bytes();
                 chunk.copy_from_slice(&bytes[..chunk.len()]);
             }
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), RandError> {
-            self.fill_bytes(dest);
             Ok(())
         }
     }

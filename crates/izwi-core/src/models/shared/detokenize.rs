@@ -156,7 +156,7 @@ pub(crate) fn stream_deltas<T: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use tokenizers::Tokenizer as HfTokenizer;
 
@@ -249,7 +249,7 @@ mod tests {
 
     fn random_text(rng: &mut ChaCha8Rng, chars: usize) -> String {
         (0..chars)
-            .map(|_| TEXT_CHARS[rng.gen_range(0..TEXT_CHARS.len())])
+            .map(|_| TEXT_CHARS[rng.random_range(0..TEXT_CHARS.len())])
             .collect()
     }
 
@@ -273,7 +273,7 @@ mod tests {
         let tokenizer = byte_level_tokenizer();
         let mut rng = ChaCha8Rng::seed_from_u64(0x8_3);
         for _ in 0..200 {
-            let chars = rng.gen_range(0..60);
+            let chars = rng.random_range(0..60);
             let text = random_text(&mut rng, chars);
             let ids = tokenizer
                 .encode(text.as_str(), false)
@@ -296,8 +296,8 @@ mod tests {
         let vocab = tokenizer.get_vocab_size(true) as u32;
         let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_1);
         for _ in 0..300 {
-            let ids = (0..rng.gen_range(0..80))
-                .map(|_| rng.gen_range(0..vocab))
+            let ids = (0..rng.random_range(0..80))
+                .map(|_| rng.random_range(0..vocab))
                 .collect::<Vec<_>>();
             let (deltas, _) = stream_deltas(&ids, hf_decode(&tokenizer));
             assert_eq!(
@@ -316,11 +316,11 @@ mod tests {
             // Pieces, plus characters outside the vocabulary spelled as
             // byte-fallback tokens the way a SentencePiece model emits them.
             let mut ids = Vec::new();
-            for _ in 0..rng.gen_range(0..60) {
-                if rng.gen_bool(0.6) {
-                    ids.push(rng.gen_range(0..first_byte));
+            for _ in 0..rng.random_range(0..60) {
+                if rng.random_bool(0.6) {
+                    ids.push(rng.random_range(0..first_byte));
                 } else {
-                    let ch = TEXT_CHARS[rng.gen_range(0..TEXT_CHARS.len())];
+                    let ch = TEXT_CHARS[rng.random_range(0..TEXT_CHARS.len())];
                     ids.extend(ch.bytes().map(|byte| first_byte + u32::from(byte)));
                 }
             }

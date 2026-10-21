@@ -3377,7 +3377,7 @@ mod tests {
 
     #[test]
     fn repeated_phrase_tail_scan_of_the_tail_matches_the_whole_text() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
         let whole =
@@ -3397,13 +3397,13 @@ mod tests {
         for _ in 0..400 {
             // A random prefix, then a phrase repeated 0–40 times: runs that
             // stay inside the scanned tail and runs that cross its start.
-            let mut words = (0..rng.gen_range(0..300))
-                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+            let mut words = (0..rng.random_range(0..300))
+                .map(|_| vocabulary[rng.random_range(0..vocabulary.len())])
                 .collect::<Vec<_>>();
-            let phrase = (0..rng.gen_range(1..=9))
-                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+            let phrase = (0..rng.random_range(1..=9))
+                .map(|_| vocabulary[rng.random_range(0..vocabulary.len())])
                 .collect::<Vec<_>>();
-            for _ in 0..rng.gen_range(0..40) {
+            for _ in 0..rng.random_range(0..40) {
                 words.extend(&phrase);
             }
             let text = words.join(" ");

@@ -18,7 +18,7 @@ use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
 };
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::Distribution;
@@ -1693,7 +1693,7 @@ fn sinegen_f02sine(
         rad_values[i] = v.rem_euclid(1.0);
     }
     for h in 0..dim {
-        let init = if h == 0 { 0.0 } else { rng.gen::<f32>() };
+        let init = if h == 0 { 0.0 } else { rng.random::<f32>() };
         rad_values[h] += init;
     }
 
