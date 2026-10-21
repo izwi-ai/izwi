@@ -843,7 +843,6 @@ fn with_reserved_write_lock<T>(
     write_id: &str,
     operation: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    use fs2::FileExt as _;
     let write_uuid = uuid::Uuid::parse_str(write_id)?;
     let lock_root = media_root.join(".reserved-write-locks");
     std::fs::create_dir_all(&lock_root)?;
@@ -856,7 +855,7 @@ fn with_reserved_write_lock<T>(
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    lock.lock_exclusive()?;
+    lock.lock()?;
     let result = operation();
     let unlock = lock.unlock();
     drop(lock);

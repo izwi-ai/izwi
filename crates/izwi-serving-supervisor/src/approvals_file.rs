@@ -17,7 +17,6 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use fs2::FileExt;
 use izwi_serving_protocol::{
     GatewayWorkerApproval, GatewayWorkerApprovalIdentity, NodeId, MAX_APPROVALS_FILE_BYTES,
     MAX_APPROVALS_FILE_ENTRIES,
@@ -209,7 +208,7 @@ where
         .write(true)
         .open(&lock_path)
         .map_err(|error| SharedApprovalsError::io(&lock_path, error))?;
-    lock.lock_exclusive()
+    lock.lock()
         .map_err(|error| SharedApprovalsError::io(&lock_path, error))?;
     // Dropping the file releases the lock; the sidecar itself stays.
     let current = read_text(path)?;

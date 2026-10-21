@@ -29,7 +29,8 @@ db-postgres = [
 [dependencies]
 izwi-env = { path = "../izwi-env" }
 tempfile = "3.10"
-fs2 = "0.4.3"
+# Free and total disk space (std has no statvfs).
+fs4 = { version = "1.1", default-features = false }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

@@ -4,8 +4,7 @@
 //! not infer liveness from a PID, timestamp or lease.
 
 use anyhow::{anyhow, Context};
-use fs2::FileExt;
-use std::fs::{DirEntry, File, OpenOptions};
+use std::fs::{DirEntry, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -247,10 +246,10 @@ fn try_remove_stale_owner(owner_dir: &Path) -> anyhow::Result<bool> {
         Ok(file) => file,
         Err(_) => return Ok(false),
     };
-    match FileExt::try_lock_exclusive(&lock_file) {
+    match lock_file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-        Err(_) => return Ok(false),
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Error(_)) => return Ok(false),
     }
 
     for path in temp_paths {
@@ -263,7 +262,7 @@ fn try_remove_stale_owner(owner_dir: &Path) -> anyhow::Result<bool> {
     // The exact lock established that no owner is live. Release the handle
     // before unlinking it so cleanup also works on platforms that prohibit
     // deleting open files. UUID directories are never adopted by a process.
-    if FileExt::unlock(&lock_file).is_err() {
+    if lock_file.unlock().is_err() {
         return Ok(false);
     }
     drop(lock_file);
@@ -287,7 +286,7 @@ fn create_and_lock_owner(owner_dir: &Path) -> anyhow::Result<File> {
         .create_new(true)
         .open(&lock_path)
         .with_context(|| format!("Create speech spool lock '{}'", lock_path.display()))?;
-    FileExt::try_lock_exclusive(&file)
+    file.try_lock()
         .with_context(|| format!("Lock speech spool owner '{}'", lock_path.display()))?;
     Ok(file)
 }
@@ -505,7 +504,7 @@ mod tests {
         let root = private_root();
         let (stale, stale_lock) = create_owner(root.path());
         std::fs::write(stale.join("speech-abcdefghijkl.tmp"), b"partial").unwrap();
-        FileExt::unlock(&stale_lock).unwrap();
+        stale_lock.unlock().unwrap();
         drop(stale_lock);
 
         let (live, live_lock) = create_owner(root.path());
@@ -515,7 +514,7 @@ mod tests {
         assert!(!stale.exists());
         assert!(live.exists());
         assert!(owner.owner_dir.exists());
-        FileExt::unlock(&live_lock).unwrap();
+        live_lock.unlock().unwrap();
     }
 
     #[cfg(unix)]
@@ -531,14 +530,14 @@ mod tests {
         symlink(&target, &linked_uuid).unwrap();
 
         let (unexpected, unexpected_lock) = create_owner(root.path());
-        FileExt::unlock(&unexpected_lock).unwrap();
+        unexpected_lock.unlock().unwrap();
         drop(unexpected_lock);
         std::fs::write(unexpected.join("do-not-delete"), b"valuable").unwrap();
 
         let outside_file = root.path().join("outside-file");
         std::fs::write(&outside_file, b"outside").unwrap();
         let (linked_entry, linked_entry_lock) = create_owner(root.path());
-        FileExt::unlock(&linked_entry_lock).unwrap();
+        linked_entry_lock.unlock().unwrap();
         drop(linked_entry_lock);
         symlink(&outside_file, linked_entry.join("speech-abcdefghijkl.tmp")).unwrap();
 
@@ -563,7 +562,7 @@ mod tests {
 
         let bounded_root = private_root();
         let (stale, stale_lock) = create_owner(bounded_root.path());
-        FileExt::unlock(&stale_lock).unwrap();
+        stale_lock.unlock().unwrap();
         drop(stale_lock);
         for index in 0..MAX_OWNER_ENTRIES {
             std::fs::write(stale.join(format!("speech-{index:012}.tmp")), b"").unwrap();

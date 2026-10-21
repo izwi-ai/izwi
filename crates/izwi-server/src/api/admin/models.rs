@@ -722,8 +722,8 @@ pub async fn storage(
             .map(std::path::Path::to_path_buf)
             .unwrap_or(probe_dir);
         (
-            fs2::available_space(&volume).ok(),
-            fs2::total_space(&volume).ok(),
+            fs4::available_space(&volume).ok(),
+            fs4::total_space(&volume).ok(),
         )
     })
     .await

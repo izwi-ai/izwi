@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fs2 = "0.4.3"
 serde_json = { workspace = true }
 izwi-env = { path = "../izwi-env" }
 izwi-serving-client = { path = "../izwi-serving-client" }
