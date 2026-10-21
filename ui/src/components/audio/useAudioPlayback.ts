@@ -27,7 +27,7 @@ export interface AudioPlayback {
   setPlaybackRate: (rate: number) => void;
   /** Spread onto the (hidden) <audio> element. */
   audioProps: {
-    ref: React.RefObject<HTMLAudioElement>;
+    ref: React.RefObject<HTMLAudioElement | null>;
     src: string | undefined;
     preload: "none" | "metadata";
     onLoadedMetadata: (event: React.SyntheticEvent<HTMLAudioElement>) => void;
@@ -50,7 +50,7 @@ export function useAudioPlayback(
     preload = "metadata",
   }: UseAudioPlaybackOptions = {},
 ): AudioPlayback {
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -129,7 +129,8 @@ export function useAudioPlayback(
     setPlaybackRate,
     audioProps: {
       ref: audioRef,
-      src: src ?? undefined,
+      // React 19 warns on src="", which would refetch the page.
+      src: src || undefined,
       preload,
       onLoadedMetadata: (event) => {
         const value = event.currentTarget.duration;
