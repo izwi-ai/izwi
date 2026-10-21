@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 import { AnimatePresence, motion } from "framer-motion";
-import { CircleAlert, Github, Menu, PanelLeft, Search } from "lucide-react";
+import {
+  CircleAlert,
+  createLucideIcon,
+  Menu,
+  PanelLeft,
+  Search,
+} from "lucide-react";
 import { APP_ICON_URL } from "@/shared/config/runtime";
 import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { RouteErrorBoundary } from "@/app/router/RouteErrorBoundary";
@@ -23,6 +29,18 @@ const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";
 const SIDEBAR_WIDTH = "15rem";
 const SIDEBAR_COLLAPSED_WIDTH = "72px";
 const SIDEBAR_COLLAPSED_KEY = "izwi.sidebar.collapsed";
+
+// Lucide 1.0 dropped its brand icons; this is its former Github glyph (ISC).
+const GithubIcon = createLucideIcon("Github", [
+  [
+    "path",
+    {
+      d: "M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4",
+      key: "tonef",
+    },
+  ],
+  ["path", { d: "M9 18c-4.51 2-5-2-7-2", key: "9comsn" }],
+]);
 
 function readSidebarPreference(): boolean {
   try {
@@ -492,7 +510,7 @@ function AppShell({
               tabIndex={sidebarInteractive ? undefined : -1}
               className="mt-2 inline-flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[11px] text-[var(--text-subtle)] transition-colors hover:text-foreground"
             >
-              <Github className="h-3.5 w-3.5" />
+              <GithubIcon className="h-3.5 w-3.5" />
               GitHub
             </a>
           ) : null}
