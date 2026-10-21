@@ -796,7 +796,6 @@ mod tests {
     fn cacheless_audio_models_report_no_paged_or_state_provider() {
         for variant in [
             ModelVariant::Qwen3ForcedAligner06B,
-            ModelVariant::Qwen3ForcedAligner06B4Bit,
             ModelVariant::DiarStreamingSortformer4SpkV21,
         ] {
             for capability in variant.cuda_operator_capabilities() {
@@ -873,12 +872,6 @@ mod tests {
             .reason
             .contains("QMatMul"));
         assert_eq!(
-            ModelVariant::Qwen3ForcedAligner06B4Bit
-                .cuda_quantization()
-                .level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
-        );
-        assert_eq!(
             ModelVariant::Voxtral4BTts2603.cuda_quantization().level,
             CudaQuantizationSupportLevel::Dense
         );
@@ -907,7 +900,10 @@ mod tests {
         assert!(dense.is_allowed_for_cuda());
         assert!(!dense.uses_dense_dequantized_fallback());
 
-        let dequant = ModelVariant::Qwen3ForcedAligner06B4Bit.cuda_quantization();
+        let dequant = CudaQuantizationInfo::new(
+            CudaQuantizationSupportLevel::DenseDequantizedFallback,
+            "quantized safetensors are dequantized into dense tensors before CUDA execution",
+        );
         assert!(dequant.is_allowed_for_cuda());
         assert!(dequant.uses_dense_dequantized_fallback());
 

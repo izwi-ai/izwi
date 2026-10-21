@@ -2373,7 +2373,6 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
                     ModelVariant::Qwen3ForcedAligner06B => 1_835_544_544,
-                    ModelVariant::Qwen3ForcedAligner06B4Bit => 971_305_827,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Qwen3508BGguf => 685_000_000,
                     ModelVariant::Qwen352BGguf => 1_850_000_000,

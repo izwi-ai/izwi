@@ -242,6 +242,7 @@ pub async fn transcriptions(
     let mut req = parse_transcription_request(req).await?;
     validate_transcription_model(req.model.as_deref())?;
     validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
+    crate::api::transcript_alignment::reject_removed_aligner(req.aligner_model.as_deref())?;
     let audio = req
         .audio
         .take()

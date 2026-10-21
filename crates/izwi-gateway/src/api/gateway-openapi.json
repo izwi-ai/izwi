@@ -2395,7 +2395,7 @@
       "name": "Apache-2.0"
     },
     "title": "Izwi API",
-    "version": "0.1.0-beta-18"
+    "version": "0.1.0"
   },
   "openapi": "3.1.0",
   "paths": {

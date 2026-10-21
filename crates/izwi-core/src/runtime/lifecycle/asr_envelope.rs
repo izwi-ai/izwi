@@ -714,10 +714,7 @@ mod tests {
         }
     }
 
-    const ALIGNER_VARIANTS: [ModelVariant; 2] = [
-        ModelVariant::Qwen3ForcedAligner06B,
-        ModelVariant::Qwen3ForcedAligner06B4Bit,
-    ];
+    const ALIGNER_VARIANTS: [ModelVariant; 1] = [ModelVariant::Qwen3ForcedAligner06B];
 
     /// A window's envelope follows its words and seconds; the 180 s window
     /// at its word bound prices the slice-bounded convolution stem, the

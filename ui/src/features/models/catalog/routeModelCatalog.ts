@@ -21,7 +21,8 @@ export const VOICE_DESIGN_PREFERRED_MODELS = [
 /**
  * Variants whose support was removed, with the supported counterpart a
  * stored selection is normalized to on read. The mlx 4-bit Qwen3-TTS
- * conversions never reach end of speech and produce unintelligible audio.
+ * conversions never reach end of speech and produce unintelligible audio;
+ * the mlx 4-bit forced aligner saved download size but no memory.
  */
 export const REMOVED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
   "Qwen3-TTS-12Hz-0.6B-Base-4bit": "Qwen3-TTS-12Hz-0.6B-Base",
@@ -29,6 +30,7 @@ export const REMOVED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
   "Qwen3-TTS-12Hz-1.7B-Base-4bit": "Qwen3-TTS-12Hz-1.7B-Base",
   "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
   "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit": "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "Qwen3-ForcedAligner-0.6B-4bit": "Qwen3-ForcedAligner-0.6B",
 };
 
 /** A stored model id with a removed variant replaced by its counterpart. */

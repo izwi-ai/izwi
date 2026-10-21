@@ -57,7 +57,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | Task | Model |
 |------|-------|
 | Speaker diarization | `diar_streaming_sortformer_4spk-v2.1`, `Nemotron-3-Diarization` (8 speakers) |
-| Forced alignment | `Qwen3-ForcedAligner-0.6B`, `Qwen3-ForcedAligner-0.6B-4bit` |
+| Forced alignment | `Qwen3-ForcedAligner-0.6B` |
 
 ### Chat
 
@@ -93,11 +93,15 @@ The five mlx 4-bit Qwen3-TTS conversions (`Qwen3-TTS-12Hz-0.6B-Base-4bit`,
 are no longer supported: they never reach the end of speech and produce
 unintelligible audio. Use the dense variant of the same name without `-4bit`.
 
+The mlx 4-bit forced aligner (`Qwen3-ForcedAligner-0.6B-4bit`) is no longer
+supported: it was dequantized at load, so it saved download size but no
+memory. Use `Qwen3-ForcedAligner-0.6B`.
+
 - Requests and `izwi pull` naming a removed ID return HTTP 400 naming its
-  replacement. The replacement needs more memory, so it is not substituted
-  automatically.
-- Studio projects, queued jobs and the remembered model selection that name a
-  removed ID use its replacement.
+  replacement. The replacement is not substituted automatically: the Qwen3-TTS
+  replacements need more memory, and the aligner's is a larger download.
+- Studio projects, queued jobs, transcription and diarization reruns, and the
+  remembered model selection that name a removed ID use its replacement.
 - A removed variant already downloaded stays on disk until you delete it. The
   admin model list reports it under `removed_models` with its size, and
   `DELETE /v1/admin/models/<id>` removes it.

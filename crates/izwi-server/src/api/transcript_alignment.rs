@@ -9,6 +9,19 @@ use std::future::Future;
 
 use izwi_core::{AlignmentSource, AlignmentWindow, WindowedAlignment};
 
+use crate::error::ApiError;
+
+/// Refuse a removed aligner when the request is made, naming its
+/// replacement, rather than losing the word timings after the ASR ran.
+pub(crate) fn reject_removed_aligner(aligner_model: Option<&str>) -> Result<(), ApiError> {
+    match aligner_model.map(izwi_core::parse_model_variant) {
+        Some(Err(error)) if error.removed_variant().is_some() => {
+            Err(ApiError::bad_request(error.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Alignment windows for `text` heard in `duration_secs` of audio: one per
 /// long-form chunk when the chunks' committed texts make up the transcript,
 /// otherwise the whole transcript over the whole audio.

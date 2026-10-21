@@ -175,10 +175,11 @@ impl fmt::Display for ParseModelVariantError {
         match self.removed {
             Some(removed) => write!(
                 f,
-                "Model {} is no longer supported: {}. Use {} instead; it needs more memory, so it is not substituted automatically",
+                "Model {} is no longer supported: {}. Use {} instead; {}",
                 removed.id,
                 removed.reason,
-                removed.replacement.dir_name()
+                removed.replacement.dir_name(),
+                removed.not_substituted
             ),
             None => write!(
                 f,
@@ -202,11 +203,18 @@ pub struct RemovedModelVariant {
     /// The supported variant that serves the same purpose.
     pub replacement: ModelVariant,
     pub reason: &'static str,
+    /// Why a request naming it is refused rather than served by the
+    /// replacement.
+    pub not_substituted: &'static str,
 }
 
 const MLX_4BIT_QWEN3_TTS_REMOVAL_REASON: &str = "the mlx 4-bit Qwen3-TTS conversions never reach end of speech and produce unintelligible audio";
 
-/// The five mlx 4-bit Qwen3-TTS conversions (QTTS-22, decision 7).
+const MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED: &str =
+    "it needs more memory, so it is not substituted automatically";
+
+/// The five mlx 4-bit Qwen3-TTS conversions (QTTS-22, decision 7) and the
+/// mlx 4-bit forced aligner.
 pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
     RemovedModelVariant {
         id: "Qwen3-TTS-12Hz-0.6B-Base-4bit",
@@ -214,6 +222,7 @@ pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
         display_name: "Qwen3-TTS 0.6B Base 4-bit",
         replacement: ModelVariant::Qwen3Tts12Hz06BBase,
         reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+        not_substituted: MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED,
     },
     RemovedModelVariant {
         id: "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
@@ -221,6 +230,7 @@ pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
         display_name: "Qwen3-TTS 0.6B CustomVoice 4-bit",
         replacement: ModelVariant::Qwen3Tts12Hz06BCustomVoice,
         reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+        not_substituted: MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED,
     },
     RemovedModelVariant {
         id: "Qwen3-TTS-12Hz-1.7B-Base-4bit",
@@ -228,6 +238,7 @@ pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
         display_name: "Qwen3-TTS 1.7B Base 4-bit",
         replacement: ModelVariant::Qwen3Tts12Hz17BBase,
         reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+        not_substituted: MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED,
     },
     RemovedModelVariant {
         id: "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
@@ -235,6 +246,7 @@ pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
         display_name: "Qwen3-TTS 1.7B CustomVoice 4-bit",
         replacement: ModelVariant::Qwen3Tts12Hz17BCustomVoice,
         reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+        not_substituted: MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED,
     },
     RemovedModelVariant {
         id: "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
@@ -242,11 +254,20 @@ pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
         display_name: "Qwen3-TTS 1.7B VoiceDesign 4-bit",
         replacement: ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
         reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+        not_substituted: MLX_4BIT_QWEN3_TTS_NOT_SUBSTITUTED,
+    },
+    RemovedModelVariant {
+        id: "Qwen3-ForcedAligner-0.6B-4bit",
+        repo_id: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
+        display_name: "Qwen3-ForcedAligner 0.6B 4-bit",
+        replacement: ModelVariant::Qwen3ForcedAligner06B,
+        reason: "the mlx 4-bit forced aligner is dequantized at load, so it saves download size but no memory over the full-precision aligner",
+        not_substituted: "it is a larger download, so it is not substituted automatically",
     },
 ];
 
 /// The removed variant `input` names: an exact former id, repo id or
-/// display name, or any 4-bit Qwen3-TTS spelling.
+/// display name, or any 4-bit Qwen3-TTS or forced-aligner spelling.
 pub fn removed_model_variant(input: &str) -> Option<&'static RemovedModelVariant> {
     let normalized = normalize_identifier(input.trim());
     if normalized.is_empty() {
@@ -259,10 +280,16 @@ pub fn removed_model_variant(input: &str) -> Option<&'static RemovedModelVariant
     }) {
         return Some(removed);
     }
+    let is_4bit = normalized.contains("4bit") || normalized.contains("int4");
+    if normalized.contains("forcedaligner") && is_4bit {
+        return REMOVED_MODEL_VARIANTS
+            .iter()
+            .find(|removed| removed.replacement == ModelVariant::Qwen3ForcedAligner06B);
+    }
     let qwen_tts_4bit = normalized.contains("qwen3")
         && normalized.contains("tts")
         && !normalized.contains("tokenizer")
-        && (normalized.contains("4bit") || normalized.contains("int4"));
+        && is_4bit;
     if !qwen_tts_4bit {
         return None;
     }
@@ -350,7 +377,7 @@ impl ModelVariant {
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma34BIt => ModelFamily::Gemma3Chat,
-            Qwen3ForcedAligner06B | Qwen3ForcedAligner06B4Bit => ModelFamily::Qwen3ForcedAligner,
+            Qwen3ForcedAligner06B => ModelFamily::Qwen3ForcedAligner,
             VoxtralMini4BRealtime2602 => ModelFamily::Voxtral,
         }
     }
@@ -625,9 +652,6 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     }
 
     if normalized.contains("forcedaligner") {
-        if normalized.contains("4bit") || normalized.contains("int4") {
-            return Some(Qwen3ForcedAligner06B4Bit);
-        }
         return Some(Qwen3ForcedAligner06B);
     }
 
@@ -1060,17 +1084,45 @@ mod tests {
         }
         for removed in REMOVED_MODEL_VARIANTS {
             assert!(parse_model_variant(removed.id).is_err());
-            assert!(removed.replacement.is_enabled() && removed.replacement.is_tts());
+            assert!(removed.replacement.is_enabled());
         }
         assert!(ModelVariant::all().iter().all(|variant| {
             !(variant.family() == ModelFamily::Qwen3Tts && variant.dir_name().contains("4bit"))
                 && removed_model_variant(variant.dir_name()).is_none()
         }));
-        // Supported ids are untouched, including the 4-bit forced aligner.
+        // Supported ids are untouched.
         assert_eq!(normalize_stored_model_id("Kokoro-82M"), "Kokoro-82M");
+    }
+
+    /// The mlx 4-bit forced aligner is removed: every spelling is refused
+    /// with the full-precision aligner named (without the TTS memory
+    /// note), and stored ids normalize to it.
+    #[test]
+    fn removed_4bit_forced_aligner_ids_are_refused_with_the_full_aligner() {
+        for input in [
+            "Qwen3-ForcedAligner-0.6B-4bit",
+            "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
+            "Qwen3-ForcedAligner 0.6B 4-bit",
+            "qwen3-forcedaligner-0.6b-int4",
+        ] {
+            let error = parse_model_variant(input).expect_err(input);
+            assert_eq!(
+                error.removed_variant().unwrap().replacement,
+                ModelVariant::Qwen3ForcedAligner06B,
+                "{input}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("Use Qwen3-ForcedAligner-0.6B instead"), "{message}");
+            assert!(!message.contains("needs more memory"), "{message}");
+            assert_eq!(normalize_stored_model_id(input), "Qwen3-ForcedAligner-0.6B");
+        }
         assert_eq!(
-            parse_model_variant("Qwen3-ForcedAligner-0.6B-4bit").unwrap(),
-            ModelVariant::Qwen3ForcedAligner06B4Bit
+            parse_model_variant("Qwen3-ForcedAligner-0.6B").unwrap(),
+            ModelVariant::Qwen3ForcedAligner06B
+        );
+        assert_eq!(
+            normalize_stored_model_id("Qwen/Qwen3-ForcedAligner-0.6B"),
+            "Qwen/Qwen3-ForcedAligner-0.6B"
         );
     }
 
@@ -1515,12 +1567,6 @@ mod tests {
     fn parse_kokoro_by_display_name() {
         let parsed = parse_model_variant("Kokoro 82M").unwrap();
         assert_eq!(parsed, ModelVariant::Kokoro82M);
-    }
-
-    #[test]
-    fn parse_forced_aligner_4bit() {
-        let parsed = parse_model_variant("Qwen3-ForcedAligner-0.6B-4bit").unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen3ForcedAligner06B4Bit);
     }
 
     #[test]

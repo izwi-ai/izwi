@@ -94,10 +94,7 @@ const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
 ];
 const LFM25_AUDIO_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm25Audio15BGguf];
 const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma34BIt];
-const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[
-    ModelVariant::Qwen3ForcedAligner06B,
-    ModelVariant::Qwen3ForcedAligner06B4Bit,
-];
+const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3ForcedAligner06B];
 const VOXTRAL_VARIANTS: &[ModelVariant] = &[ModelVariant::VoxtralMini4BRealtime2602];
 const TOKENIZER_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3TtsTokenizer12Hz];
 

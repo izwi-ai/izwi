@@ -136,7 +136,6 @@ izwi align recording.wav "The quick brown fox" --format verbose-json
 |-------|-------------|
 | `qwen3-forcedaligner-0.6b` | CLI default alias |
 | `Qwen3-ForcedAligner-0.6B` | Canonical forced aligner model ID |
-| `Qwen3-ForcedAligner-0.6B-4bit` | Smaller download (about 0.98 GB); dequantized at load, so it needs the same memory as the full-precision model |
 
 ---
 

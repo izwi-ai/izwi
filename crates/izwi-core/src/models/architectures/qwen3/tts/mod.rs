@@ -1795,6 +1795,17 @@ fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
     frames_generated >= MIN_QWEN_TTS_TOKENS_BEFORE_EOS
 }
 
+/// The target text the talker reads one token per frame after the prefilled
+/// first token: the reference's `input_id[:, 4:-5]` of
+/// `[role(3), first_text(1), trailing_text(...), trailer(5)]`. A one-token
+/// text has none; it must not read the chat-template trailer
+/// (`<|im_end|>\n<|im_start|>assistant\n`) as text to speak.
+fn trailing_text_ids(prompt_ids: &[u32]) -> &[u32] {
+    prompt_ids
+        .get(4..prompt_ids.len().saturating_sub(5))
+        .unwrap_or(&[])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TtsSessionCacheLayout {
     prefill_tokens: usize,
@@ -4002,15 +4013,7 @@ impl Qwen3TtsModel {
         prompt_ids: &[u32],
         max_frames: usize,
     ) -> Result<(Tensor, usize, Tensor)> {
-        // Upstream uses prompt layout:
-        // [role(3), first_text(1), trailing_text(...), trailer(5)]
-        let trailing_ids: &[u32] = if prompt_ids.len() > 9 {
-            &prompt_ids[4..prompt_ids.len() - 5]
-        } else if prompt_ids.len() > 4 {
-            &prompt_ids[4..]
-        } else {
-            &[]
-        };
+        let trailing_ids = trailing_text_ids(prompt_ids);
 
         let trailing = if !trailing_ids.is_empty() {
             let trailing_end = max_frames.min(trailing_ids.len());
@@ -6071,6 +6074,25 @@ pub(crate) mod tests {
         ));
         assert!(qwen_tts_allows_eos(MIN_QWEN_TTS_TOKENS_BEFORE_EOS));
         assert!(qwen_tts_allows_eos(MIN_QWEN_TTS_TOKENS_BEFORE_EOS + 1));
+    }
+
+    /// The trailing text is the reference's `input_id[:, 4:-5]`: a one-word
+    /// prompt ("Hello", "Yes") has none, where it used to read the five
+    /// chat-template trailer tokens as text to speak.
+    #[test]
+    fn trailing_text_excludes_the_chat_template_trailer() {
+        let trailer = [151645, 198, 151644, 77091, 198];
+        let prompt = |text: &[u32]| {
+            let mut ids = vec![151644, 77091, 198];
+            ids.extend_from_slice(text);
+            ids.extend_from_slice(&trailer);
+            ids
+        };
+        assert!(trailing_text_ids(&prompt(&[9707])).is_empty());
+        assert_eq!(trailing_text_ids(&prompt(&[9707, 13])), &[13]);
+        assert_eq!(trailing_text_ids(&prompt(&[1, 2, 3, 4])), &[2, 3, 4]);
+        assert!(trailing_text_ids(&prompt(&[])).is_empty());
+        assert!(trailing_text_ids(&[151644, 77091]).is_empty());
     }
 
     #[test]

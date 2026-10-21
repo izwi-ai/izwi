@@ -14,7 +14,15 @@ matches both before it builds anything:
    downloader's User-Agent all follow it.
 2. `ui/package.json` and the root of `ui/package-lock.json`: the same version.
 
-Then run `cargo check --workspace` so `Cargo.lock` picks it up.
+Then run `cargo check --workspace` so `Cargo.lock` picks it up, and refresh
+the checked-in gateway OpenAPI document
+(`crates/izwi-gateway/src/api/gateway-openapi.json`), which carries the
+version too. The first run rewrites it and fails; the second confirms it:
+
+```bash
+IZWI_UPDATE_GATEWAY_OPENAPI=1 cargo test -p izwi-server --lib gateway_openapi_document_is_current
+cargo test -p izwi-server --lib gateway_openapi_document_is_current
+```
 
 Version numbers are semver. Stable releases are `0.1.0`, `0.1.1`…;
 prereleases add a label, `0.2.0-beta-1`. Beta numbers compare as numbers
@@ -34,7 +42,8 @@ npm --prefix ui run build
 3. Commit the release prep changes:
 
 ```bash
-git add Cargo.toml Cargo.lock ui/package.json ui/package-lock.json
+git add Cargo.toml Cargo.lock ui/package.json ui/package-lock.json \
+  crates/izwi-gateway/src/api/gateway-openapi.json
 git commit -m "Prepare release v0.1.1"
 ```
 
