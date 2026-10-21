@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Check, ChevronRight, Cpu, Loader2 } from "lucide-react";
 
 import { api, type ModelInfo, type ModelStorage } from "@/api";

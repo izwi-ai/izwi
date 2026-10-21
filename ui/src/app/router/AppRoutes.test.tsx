@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Outlet, useLocation } from "react-router-dom";
+import { MemoryRouter, Outlet, useLocation } from "react-router";
 import { describe, expect, it, vi } from "vitest";
 
 import { AppRoutes } from "@/app/router/AppRoutes";

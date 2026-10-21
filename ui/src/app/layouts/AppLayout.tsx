@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router";
 import { AnimatePresence, motion } from "framer-motion";
 import { CircleAlert, Github, Menu, PanelLeft, Search } from "lucide-react";
 import { APP_ICON_URL } from "@/shared/config/runtime";

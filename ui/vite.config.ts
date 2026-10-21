@@ -16,8 +16,7 @@ const vendorChunkRules = [
       "/node_modules/react/",
       "/node_modules/react-dom/",
       "/node_modules/scheduler/",
-      "/node_modules/react-router",
-      "/node_modules/@remix-run/",
+      "/node_modules/react-router/",
     ],
   },
   {

@@ -9,7 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import { api, type OnboardingStateResponse } from "@/api";
 import { setAnalyticsEnabled } from "@/app/analytics/client";

@@ -5,7 +5,7 @@ import {
   Routes,
   useLocation,
   useParams,
-} from "react-router-dom";
+} from "react-router";
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
 import {

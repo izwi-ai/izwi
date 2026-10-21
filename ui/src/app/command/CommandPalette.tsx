@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import {
   AudioWaveform,

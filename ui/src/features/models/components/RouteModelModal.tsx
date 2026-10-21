@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import { Loader2 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
-import { Link, useInRouterContext } from "react-router-dom";
+import { Link, useInRouterContext } from "react-router";
 
 import type { ModelInfo, ModelResidencySummary } from "@/api";
 import { useOptionalModelCatalog } from "@/app/providers/ModelCatalogProvider";

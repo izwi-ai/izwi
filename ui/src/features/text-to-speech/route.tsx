@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 import { Settings2 } from "lucide-react";
 
 import { api, type ModelInfo, type SpeechHistoryRecord } from "@/api";

@@ -9,7 +9,7 @@ import {
 import { useState, type ComponentProps } from "react";
 import type { ModelInfo } from "@/api";
 import type { ModelRouteCapabilities } from "@/shared/api/models";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
 import type { SharedPageProps } from "@/app/router/types";
