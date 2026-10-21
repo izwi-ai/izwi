@@ -187,8 +187,7 @@ impl CodePredictor {
         num_code_groups: usize,
         f16: Option<&Device>,
     ) -> Result<Self> {
-        // Use text_hidden_size for codec embeddings if specified, otherwise hidden_size
-        let codec_embed_dim = cfg.text_hidden_size.unwrap_or(cfg.hidden_size);
+        let codec_embed_dim = cfg.input_hidden_size();
 
         // Load codec embeddings (one per codebook, but weights only have 15)
         // The model has embeddings 0-14 (15 total), not 16
@@ -491,6 +490,9 @@ impl CodePredictor {
         caches: &mut [&mut CodePredictorPhysicalCache],
         selections: &mut [CodeSelection<'_>],
     ) -> Result<Vec<Vec<u32>>> {
+        // Inputs arrive at the talker's width; `small_to_mtp_projection`
+        // narrows them to the predictor's `hidden_size` below.
+        let input_hidden_size = self.cfg.input_hidden_size();
         let (batch_size, talker_tokens, talker_dim) = talker_hidden.dims3()?;
         let (semantic_batch, semantic_tokens, semantic_dim) = semantic_embeds.dims3()?;
         if batch_size == 0
@@ -498,13 +500,12 @@ impl CodePredictor {
             || semantic_batch != batch_size
             || semantic_tokens != 1
             || talker_dim != semantic_dim
-            || talker_dim != self.cfg.hidden_size
+            || talker_dim != input_hidden_size
             || caches.len() != batch_size
             || selections.len() != batch_size
         {
             return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS predictor batch expects matching [batch,1,{}] inputs and caches, got {:?}, {:?}, and {} caches",
-                self.cfg.hidden_size,
+                "Qwen3-TTS predictor batch expects matching [batch,1,{input_hidden_size}] inputs and caches, got {:?}, {:?}, and {} caches",
                 talker_hidden.dims(),
                 semantic_embeds.dims(),
                 caches.len()
@@ -1443,6 +1444,12 @@ mod tests {
     }
 
     fn tiny_predictor(device: &Device) -> CodePredictor {
+        tiny_predictor_with_input_width(4, device)
+    }
+
+    /// A wider `input_width` than the hidden size of 4 adds
+    /// `small_to_mtp_projection`, as the 1.7B checkpoints do.
+    fn tiny_predictor_with_input_width(input_width: usize, device: &Device) -> CodePredictor {
         let cfg = CodePredictorConfig {
             model_type: "test-predictor".into(),
             hidden_size: 4,
@@ -1459,7 +1466,7 @@ mod tests {
             hidden_act: "silu".into(),
             use_cache: true,
             layer_types: Vec::new(),
-            text_hidden_size: None,
+            text_hidden_size: (input_width != 4).then_some(input_width),
         };
         let attention = Attention {
             q_proj: test_linear(4, 4, 1, device).into(),
@@ -1488,21 +1495,22 @@ mod tests {
         };
         let codec_embeddings = (0..3)
             .map(|group| {
-                let values = (0..32)
+                let values = (0..8 * input_width)
                     .map(|index| {
                         let value = (index * 5 + group * 3) % 19;
                         (value as f32 - 9.0) / 16.0
                     })
                     .collect::<Vec<_>>();
                 CodecEmbedding::Dense(Embedding::new(
-                    Tensor::from_vec(values, (8, 4), device).unwrap(),
-                    4,
+                    Tensor::from_vec(values, (8, input_width), device).unwrap(),
+                    input_width,
                 ))
             })
             .collect();
         CodePredictor {
             codec_embeddings,
-            small_to_mtp_projection: None,
+            small_to_mtp_projection: (input_width != 4)
+                .then(|| test_linear(4, input_width, 13, device)),
             layers: vec![layer],
             norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
             lm_heads: (0..3)
@@ -1567,13 +1575,17 @@ mod tests {
     }
 
     fn frame_input(seed: usize, device: &Device) -> Tensor {
-        let values = (0..4)
+        frame_input_with_width(seed, 4, device)
+    }
+
+    fn frame_input_with_width(seed: usize, width: usize, device: &Device) -> Tensor {
+        let values = (0..width)
             .map(|index| {
                 let value = (index * 11 + seed) % 23;
                 (value as f32 - 11.0) / 16.0
             })
             .collect::<Vec<_>>();
-        Tensor::from_vec(values, (1, 1, 4), device).unwrap()
+        Tensor::from_vec(values, (1, 1, width), device).unwrap()
     }
 
     #[test]
@@ -1682,6 +1694,52 @@ mod tests {
                     .slots()
                     .iter()
                     .all(|slot| !right.slots().contains(slot))));
+    }
+
+    /// The 1.7B checkpoints feed the predictor at the talker's width (2048)
+    /// and project to its hidden size (1024). A batch takes inputs at the
+    /// talker's width, as the scalar path does, and matches its codes.
+    #[test]
+    fn projected_predictor_batch_takes_talker_width_inputs() {
+        let device = Device::Cpu;
+        let model = tiny_predictor_with_input_width(6, &device);
+        let (scalar_arena, scalar_bindings) = test_arena(716);
+        let (batch_arena, batch_bindings) = test_arena(717);
+        let mut scalar_a = test_cache(scalar_arena.clone(), &scalar_bindings, 0, 0);
+        let mut scalar_b = test_cache(scalar_arena, &scalar_bindings, 6, 0);
+        let mut batch_a = test_cache(batch_arena.clone(), &batch_bindings, 0, 0);
+        let mut batch_b = test_cache(batch_arena, &batch_bindings, 6, 0);
+        let talker_a = frame_input_with_width(3, 6, &device);
+        let talker_b = frame_input_with_width(5, 6, &device);
+        let semantic_a = frame_input_with_width(7, 6, &device);
+        let semantic_b = frame_input_with_width(9, 6, &device);
+        let scalar_codes_a = model
+            .generate_acoustic_codes_physical(
+                &talker_a,
+                &semantic_a,
+                &mut scalar_a,
+                &mut CodeSelection::Greedy,
+            )
+            .unwrap();
+        let scalar_codes_b = model
+            .generate_acoustic_codes_physical(
+                &talker_b,
+                &semantic_b,
+                &mut scalar_b,
+                &mut CodeSelection::Greedy,
+            )
+            .unwrap();
+        let batch_codes = model
+            .generate_acoustic_codes_physical_batch(
+                &Tensor::cat(&[&talker_a, &talker_b], 0).unwrap(),
+                &Tensor::cat(&[&semantic_a, &semantic_b], 0).unwrap(),
+                &mut [&mut batch_a, &mut batch_b],
+                &mut [CodeSelection::Greedy, CodeSelection::Greedy],
+            )
+            .unwrap();
+
+        assert_eq!(batch_codes, vec![scalar_codes_a, scalar_codes_b]);
+        assert_eq!((batch_a.context_len(), batch_b.context_len()), (4, 4));
     }
 
     #[test]

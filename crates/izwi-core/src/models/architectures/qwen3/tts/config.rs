@@ -154,6 +154,13 @@ impl CodePredictorConfig {
     pub fn num_kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }
+
+    /// Width of the predictor's inputs (talker hidden state and codec
+    /// embeddings) before `small_to_mtp_projection` maps them to
+    /// `hidden_size`: 2048 on the 1.7B checkpoints, `hidden_size` on 0.6B.
+    pub fn input_hidden_size(&self) -> usize {
+        self.text_hidden_size.unwrap_or(self.hidden_size)
+    }
 }
 
 #[cfg(test)]
