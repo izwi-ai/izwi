@@ -28,7 +28,6 @@ db-postgres = [
 
 [dependencies]
 izwi-env = { path = "../izwi-env" }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tempfile = "3.10"
 fs2 = "0.4.3"
 tokio = { workspace = true }
@@ -37,20 +36,13 @@ futures = { workspace = true }
 async-stream = { workspace = true }
 
 axum = { workspace = true }
-axum-extra = { workspace = true }
-http-body = "1"
-http-body-util = "0.1"
 tower = { workspace = true }
 tower-http = { workspace = true }
 utoipa = { workspace = true }
-scalar_api_reference = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 sha2 = { workspace = true }
-hmac = { workspace = true }
-rand = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -71,8 +63,6 @@ izwi-gateway = { path = "../izwi-gateway" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 
-config = { workspace = true }
-dirs = { workspace = true }
 sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
     "macros",
     "runtime-tokio",

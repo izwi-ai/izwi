@@ -30,7 +30,6 @@ tauri-plugin-single-instance = "~2.4.5"
 tauri-plugin-updater = "2.9.0"
 # Keep the Aptabase reqwest proxy stack on a sandbox-safe macOS line.
 hyper-util = "0.1.20"
-dirs = { workspace = true }
 reqwest = { workspace = true }
 semver = "1.0"
 tokio = { workspace = true }

@@ -20,7 +20,7 @@ clap = { version = "4.5", features = [
     "wrap_help",
     "unicode",
 ] }
-clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
+clap_complete = "4.5"
 
 # Async runtime
 tokio = { workspace = true }
@@ -41,22 +41,12 @@ console = "0.15"
 indicatif = { workspace = true }
 dialoguer = "0.11"
 comfy-table = "7.1"
-ansi_term = "0.12"
-term_size = "0.3"
 
 # Progress and streaming
 bytes = { workspace = true }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
-
-# Configuration and paths
-dirs = { workspace = true }
-config = { workspace = true }
-shellexpand = "3.1"
 
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-miette = { version = "7.2", features = ["fancy"] }
 
 # Logging
 tracing = { workspace = true }
@@ -65,12 +55,9 @@ tracing-subscriber = { workspace = true }
 # Utilities
 base64 = "0.22"
 rustc_version_runtime = "0.3"
-uuid = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
-humantime = "2.1"
 humansize = "2.1"
-colored_json = "5.0"
 
 [features]
 default = []
