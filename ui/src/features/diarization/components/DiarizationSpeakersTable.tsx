@@ -169,29 +169,35 @@ export function DiarizationSpeakersTable({
   const savedRef = useRef(namesToSave(record.speaker_name_overrides ?? {}));
   const savingRef = useRef(false);
   const latestRef = useRef(names);
-  latestRef.current = names;
   const flush = useCallback(async () => {
     if (savingRef.current) {
       return;
     }
-    const next = namesToSave(latestRef.current);
-    if (sameNames(next, savedRef.current)) {
-      return;
-    }
     savingRef.current = true;
     try {
-      await onSave(next);
-      savedRef.current = next;
-    } catch {
-      // The page shows the error; the next edit sends the names again.
-      return;
+      // Until the names stop changing under the save.
+      for (;;) {
+        const next = namesToSave(latestRef.current);
+        if (sameNames(next, savedRef.current)) {
+          return;
+        }
+        try {
+          await onSave(next);
+        } catch {
+          // The page shows the error; the next edit sends the names again.
+          return;
+        }
+        savedRef.current = next;
+      }
     } finally {
       savingRef.current = false;
     }
-    if (!sameNames(namesToSave(latestRef.current), savedRef.current)) {
-      void flush();
-    }
   }, [onSave]);
+
+  // Declared before the save timer so the flush it schedules sees these names.
+  useEffect(() => {
+    latestRef.current = names;
+  }, [names]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void flush(), SAVE_DELAY_MS);

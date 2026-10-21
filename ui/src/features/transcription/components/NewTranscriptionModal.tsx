@@ -324,7 +324,6 @@ export function NewTranscriptionModal({
             ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
               let createdRecordId: string | null = null;
-              let streamController: AbortController | null = null;
               const handleCreated = (createdRecord: TranscriptionRecord) => {
                 if (settled) {
                   return;
@@ -348,7 +347,7 @@ export function NewTranscriptionModal({
                 reject(createUploadAbortError());
               };
 
-              streamController = api.createTranscriptionRecordStream(request, {
+              const streamController = api.createTranscriptionRecordStream(request, {
                 onUploadProgress: updateUploadProgress,
                 onStart: () => {
                   onStreamingStart?.();

@@ -68,7 +68,9 @@ export class ApiHttpClient {
       });
     } catch (err) {
       if (isAbortError(err)) {
-        throw new Error("The local model service took too long to respond.");
+        throw new Error("The local model service took too long to respond.", {
+          cause: err,
+        });
       }
       throw err;
     } finally {

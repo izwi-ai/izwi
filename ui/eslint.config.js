@@ -1,10 +1,11 @@
 import js from "@eslint/js";
+import { defineConfig } from "eslint/config";
 import globals from "globals";
 import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
-export default tseslint.config(
+export default defineConfig(
   {
     ignores: ["dist", "coverage", "node_modules"],
   },
@@ -34,6 +35,9 @@ export default tseslint.config(
         },
       ],
       "react-hooks/set-state-in-effect": "off",
+      // Whether the React Compiler can keep a manual useCallback/useMemo;
+      // this app doesn't use the compiler.
+      "react-hooks/preserve-manual-memoization": "off",
       "react-refresh/only-export-components": "off",
     },
   },

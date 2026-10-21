@@ -283,7 +283,9 @@ export function ChatPlayground({
   const input = activeDraft?.input ?? "";
   const pendingImages = activeDraft?.pendingImages ?? [];
 
-  composerDraftsRef.current = composerDrafts;
+  useEffect(() => {
+    composerDraftsRef.current = composerDrafts;
+  }, [composerDrafts]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -442,7 +444,9 @@ export function ChatPlayground({
   );
   const supportsImageAttachments = acceptsImages(selectedModel);
   const supportsImageAttachmentsRef = useRef(supportsImageAttachments);
-  supportsImageAttachmentsRef.current = supportsImageAttachments;
+  useEffect(() => {
+    supportsImageAttachmentsRef.current = supportsImageAttachments;
+  }, [supportsImageAttachments]);
   // Attachments survive a switch to a text-only model so the user can switch
   // back; sending is blocked until they are removed or the model changes.
   const hasUnsupportedImages =
@@ -1131,6 +1135,7 @@ export function ChatPlayground({
       images: submittedDraft.pendingImages,
     });
 
+    // eslint-disable-next-line react-hooks/purity -- runs on send, not during render
     const timestamp = Date.now();
     const userTempId = `tmp-user-${timestamp}`;
     const optimisticUserMessage: ChatThreadMessageRecord = {
@@ -1561,6 +1566,7 @@ export function ChatPlayground({
     const thinking = thinkingFor(modelId);
     startTurnStream({
       threadId,
+      // eslint-disable-next-line react-hooks/purity -- runs on retry, not during render
       startedAt: Date.now(),
       modelId,
       thinking,
@@ -1603,6 +1609,7 @@ export function ChatPlayground({
     const thinking = thinkingFor(selectedModel);
     startTurnStream({
       threadId,
+      // eslint-disable-next-line react-hooks/purity -- runs on edit, not during render
       startedAt: Date.now(),
       modelId: selectedModel,
       thinking,
