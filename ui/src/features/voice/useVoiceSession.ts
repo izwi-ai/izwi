@@ -360,7 +360,8 @@ export function useVoiceSession({
     [],
   );
 
-  const sendVoiceRealtimeBinary = useCallback((data: Uint8Array) => {
+  // WebSocket.send takes buffers backed by a plain ArrayBuffer only.
+  const sendVoiceRealtimeBinary = useCallback((data: Uint8Array<ArrayBuffer>) => {
     const socket = voiceWsRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error("Voice realtime websocket is not connected");

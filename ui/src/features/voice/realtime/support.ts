@@ -496,7 +496,7 @@ export function encodeVoiceRealtimeClientPcm16Frame(
   pcm16Bytes: Uint8Array,
   sampleRate: number,
   frameSeq: number,
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
   const frame = new Uint8Array(
     VOICE_WS_BIN_CLIENT_HEADER_LEN + pcm16Bytes.length,
   );
