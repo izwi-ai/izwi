@@ -119,7 +119,7 @@ For CLI/server installs, use the project install script:
 ./scripts/install-cli.sh
 ```
 
-It needs Node.js 18+ (it installs Rust if missing), and on Linux the Tauri
+It needs Node.js 24.15+ or 22.22+ (it installs Rust if missing), and on Linux the Tauri
 system packages (see
 [From Source](https://izwiai.com/docs/installation/from-source)).
 

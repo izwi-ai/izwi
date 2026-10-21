@@ -97,7 +97,7 @@ check_requirements() {
 
     # Check Node/npm for desktop UI build
     if ! command -v npm &> /dev/null; then
-        echo -e "${RED}npm is required to build desktop assets (ui/dist). Install Node.js 18+ and retry.${NC}"
+        echo -e "${RED}npm is required to build desktop assets (ui/dist). Install Node.js 24.15+ or 22.22+ and retry.${NC}"
         exit 1
     fi
 
