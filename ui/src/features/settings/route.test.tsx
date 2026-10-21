@@ -384,6 +384,24 @@ describe("SettingsPage capabilities", () => {
     await screen.findByText("Disabled for this device.");
   });
 
+  it("says what a release needs when this system is too old to install it", async () => {
+    updateState.value = {
+      ...updateState.value,
+      unsupportedUpdate: {
+        ...availableUpdate,
+        version: "0.2.0",
+        requiredSystem: "macOS 13.3",
+      },
+    };
+
+    render(<SettingsPage />);
+
+    expect(screen.getByText("Needs macOS 13.3")).toBeVisible();
+    expect(screen.getByText(/needs macOS 13\.3 or later/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^View / })).not.toBeInTheDocument();
+    await screen.findByText("Disabled for this device.");
+  });
+
   it("offers capability retry instead of an updater action when support is unknown", () => {
     updateState.value = {
       ...updateState.value,

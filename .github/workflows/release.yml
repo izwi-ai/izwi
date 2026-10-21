@@ -534,17 +534,26 @@ jobs:
             echo "::warning::No signed .deb in dist/: .deb installs get no in-app update for this release."
           fi
 
+          # Desktop builds from this release refuse to update a Mac older than
+          # the bundle's floor, instead of installing an app it can't open.
+          macos_floor="$(jq -r '.bundle.macOS.minimumSystemVersion // empty' crates/izwi-desktop/tauri.conf.json)"
+          if [ -z "$macos_floor" ]; then
+            echo "::error::crates/izwi-desktop/tauri.conf.json has no bundle.macOS.minimumSystemVersion."
+            exit 1
+          fi
+
           jq -n \
             --arg version "${{ github.ref_name }}" \
             --arg notes "Izwi ${{ github.ref_name }}" \
             --arg pub_date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
             --argjson platforms "$platforms" \
-            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' > "$manifest"
+            --arg macos_floor "$macos_floor" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms, minimum_system_version: {macos: $macos_floor}}' > "$manifest"
           cat "$manifest"
 
       - name: Validate updater manifest
         run: |
-          jq -e '.version and .platforms.linux.url and .platforms.linux.signature and .platforms.macos.url and .platforms.macos.signature and .platforms.windows.url and .platforms.windows.signature' "$UPDATER_MANIFEST" > /dev/null
+          jq -e '.version and .platforms.linux.url and .platforms.linux.signature and .platforms.macos.url and .platforms.macos.signature and .platforms.windows.url and .platforms.windows.signature and .minimum_system_version.macos' "$UPDATER_MANIFEST" > /dev/null
 
       - name: Enforce updater asset matrix consistency
         run: |

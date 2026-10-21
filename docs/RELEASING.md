@@ -85,6 +85,13 @@ that carries the right manifest, and installs the entry for its platform:
 `macos`, `windows`, `linux` (the AppImage) or `linux-deb` for an app
 installed from the `.deb` (added when the build signed the `.deb`).
 
+The manifest also records the desktop bundle's macOS floor
+(`"minimum_system_version": {"macos": "…"}`, from `bundle.macOS.minimumSystemVersion`
+in `crates/izwi-desktop/tauri.conf.json`). An app on an older macOS reports
+the release (for example "needs macOS 13.3 or later") but doesn't install it, since macOS
+would refuse to open the result. Apps from before this field install every
+release, so ship a release that has it before one that raises the floor.
+
 To try an update before publishing, point a build at a staged manifest:
 `IZWI_UPDATER_FORCE_MANIFEST_URL=https://…/latest.json`.
 

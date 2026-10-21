@@ -85,6 +85,7 @@ function formatDateTime(value: number | string | null): string {
 function getUpdateBadge(
   status: UpdateStatus,
   hasAvailableUpdate: boolean,
+  requiredSystem: string | null,
   updatesEnabled: boolean,
   updaterSupported: boolean,
   capabilityStatus: "unsupported" | "loading" | "ready" | "error",
@@ -123,6 +124,10 @@ function getUpdateBadge(
 
   if (status === "available" || hasAvailableUpdate) {
     return { label: "Update available", tone: "info" };
+  }
+
+  if (requiredSystem) {
+    return { label: `Needs ${requiredSystem}`, tone: "warning" };
   }
 
   return { label: "Current", tone: "success" };
@@ -506,6 +511,7 @@ export function SettingsPage() {
   const desktopRuntime = isTauri();
   const {
     availableUpdate,
+    unsupportedUpdate,
     status: updateStatus,
     lastCheckedAt,
     health: updaterHealth,
@@ -542,12 +548,14 @@ export function SettingsPage() {
       getUpdateBadge(
         updateStatus,
         Boolean(availableUpdate),
+        unsupportedUpdate?.requiredSystem ?? null,
         updatesEnabled,
         updaterSupported,
         updaterCapabilityStatus,
       ),
     [
       availableUpdate,
+      unsupportedUpdate,
       updateStatus,
       updatesEnabled,
       updaterSupported,
@@ -1088,6 +1096,15 @@ export function SettingsPage() {
                       {availableUpdate.version}
                     </span>{" "}
                     is available.
+                  </>
+                ) : unsupportedUpdate ? (
+                  <>
+                    Version{" "}
+                    <span className="font-medium text-[var(--text-secondary)]">
+                      {unsupportedUpdate.version}
+                    </span>{" "}
+                    needs {unsupportedUpdate.requiredSystem} or later. The version
+                    you have keeps working.
                   </>
                 ) : (
                   `Last checked ${formatDateTime(lastCheckedAt)}.`

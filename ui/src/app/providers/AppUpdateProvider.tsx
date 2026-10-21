@@ -45,6 +45,8 @@ export type UpdaterCapabilityStatus =
 
 interface AppUpdateContextValue {
   availableUpdate: AppUpdateMetadata | null;
+  /** The newest release when this system is too old to install it; never offered. */
+  unsupportedUpdate: AppUpdateMetadata | null;
   status: UpdateStatus;
   /** Version installed and waiting for a restart; it stays ready through re-checks. */
   downloadedVersion: string | null;
@@ -75,6 +77,8 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateMetadata | null>(
     null,
   );
+  const [unsupportedUpdate, setUnsupportedUpdate] =
+    useState<AppUpdateMetadata | null>(null);
   const [status, setStatus] = useState<UpdateStatus>("idle");
   const [downloadedVersion, setDownloadedVersion] = useState<string | null>(null);
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
@@ -160,8 +164,12 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
 
       const downloaded = downloadedVersionRef.current;
       try {
-        const update = await checkForBetaUpdate();
+        const checked = await checkForBetaUpdate();
         setLastCheckedAt(Date.now());
+        // A release this system is too old to open is reported, never offered.
+        const tooNew = checked?.requiredSystem ? checked : null;
+        const update = tooNew ? null : checked;
+        setUnsupportedUpdate(tooNew);
 
         // An update waiting for a restart stays ready unless a newer one is out.
         if (downloaded && (!update || update.version === downloaded)) {
@@ -184,9 +192,25 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
           setAvailableUpdate(null);
           statusRef.current = "idle";
           setStatus("idle");
-          void trackUpdateCheckCompleted("no_update");
+          if (tooNew) {
+            void trackUpdateCheckCompleted(
+              "system_too_old",
+              tooNew.version,
+              tooNew.requiredSystem ?? undefined,
+            );
+          } else {
+            void trackUpdateCheckCompleted("no_update");
+          }
           if (manual) {
-            notify({ title: "Izwi is up to date", tone: "success" });
+            notify(
+              tooNew
+                ? {
+                    title: `Izwi ${tooNew.version} needs ${tooNew.requiredSystem} or later`,
+                    description: "The version you have keeps working.",
+                    tone: "info",
+                  }
+                : { title: "Izwi is up to date", tone: "success" },
+            );
           }
           return;
         }
@@ -328,6 +352,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
   const value = useMemo<AppUpdateContextValue>(
     () => ({
       availableUpdate,
+      unsupportedUpdate,
       status,
       downloadedVersion,
       lastCheckedAt,
@@ -346,6 +371,7 @@ export function AppUpdateProvider({ children }: AppUpdateProviderProps) {
     }),
     [
       availableUpdate,
+      unsupportedUpdate,
       status,
       downloadedVersion,
       lastCheckedAt,

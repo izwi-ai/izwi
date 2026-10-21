@@ -9,8 +9,8 @@ use url::Url;
 
 use super::updater_contract::{
     github_manifest_url, github_releases_api_url, install_behavior_for_platform, is_newer_release,
-    manifest_asset_name, parse_release_tag, updater_target_for_platform, PlatformInstallBehavior,
-    UpdaterContract,
+    manifest_asset_name, parse_release_tag, unmet_system_floor, updater_target_for_platform,
+    PlatformInstallBehavior, UpdaterContract,
 };
 use super::ServerControl;
 
@@ -28,6 +28,9 @@ pub struct UpdateMetadata {
     pub release_tag: String,
     pub manifest_url: String,
     pub platform_behavior: PlatformInstallBehavior,
+    /// The system the update needs, as "macOS 13.3", when this one is
+    /// older. Such an update is reported but can't be installed.
+    pub required_system: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,6 +242,17 @@ pub async fn check_for_beta_update(
     })
     .await?;
 
+    // A release can need a newer system than this one. Installing it would
+    // leave an app the system refuses to open, so it is reported without
+    // being kept installable.
+    let required_system = update.as_ref().and_then(|update| {
+        unmet_system_floor(
+            &update.raw_json,
+            updater_target,
+            running_system_version().as_deref(),
+        )
+    });
+
     let update_metadata = update.as_ref().map(|update| {
         let platform_behavior = install_behavior_for_platform(std::env::consts::OS);
         UpdateMetadata {
@@ -249,6 +263,7 @@ pub async fn check_for_beta_update(
             release_tag: release.tag_name.clone(),
             manifest_url: release.manifest_url.to_string(),
             platform_behavior,
+            required_system: required_system.clone(),
         }
     });
 
@@ -256,7 +271,11 @@ pub async fn check_for_beta_update(
         .pending_update
         .lock()
         .expect("poisoned updater state mutex");
-    *pending_slot = update;
+    *pending_slot = if required_system.is_some() {
+        None
+    } else {
+        update
+    };
 
     Ok(update_metadata)
 }
@@ -404,6 +423,26 @@ pub fn configured_pubkey() -> Option<String> {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+}
+
+/// This system's version where releases set a floor for it: macOS, read
+/// from `sw_vers` since no Tauri API exposes it. `None` elsewhere.
+fn running_system_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn env_bool_true(name: &str) -> bool {
