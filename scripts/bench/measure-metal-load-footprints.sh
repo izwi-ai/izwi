@@ -48,7 +48,7 @@ if ((${#models[@]} == 0)); then
         Parakeet-TDT-0.6B-v3
         Nemotron-3.5-ASR-Streaming-0.6B
         LFM2.5-Audio-1.5B-GGUF
-        Qwen3-ForcedAligner-0.6B Qwen3-ForcedAligner-0.6B-4bit
+        Qwen3-ForcedAligner-0.6B
         diar_streaming_sortformer_4spk-v2.1 Nemotron-3-Diarization
         Qwen3-TTS-12Hz-0.6B-Base Qwen3-TTS-12Hz-0.6B-CustomVoice
         Qwen3-TTS-12Hz-1.7B-Base Qwen3-TTS-12Hz-1.7B-CustomVoice

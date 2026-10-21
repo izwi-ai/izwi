@@ -460,12 +460,18 @@ fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Re
         parsed.asr_model_id = Some(variant.dir_name().to_string());
     }
     if let Some(raw) = parsed.aligner_model_id.as_deref() {
-        let variant = parse_model_variant(raw)
-            .ok()
-            .filter(ModelVariant::is_forced_aligner)
-            .ok_or_else(|| {
-                ApiError::bad_request(format!("Model '{raw}' is not a forced aligner model."))
-            })?;
+        let variant = match parse_model_variant(raw) {
+            Ok(variant) if variant.is_forced_aligner() => variant,
+            // A removed aligner is refused with its replacement named.
+            Err(error) if error.removed_variant().is_some() => {
+                return Err(ApiError::bad_request(error.to_string()));
+            }
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "Model '{raw}' is not a forced aligner model."
+                )));
+            }
+        };
         parsed.aligner_model_id = Some(variant.dir_name().to_string());
     }
     if let Some(raw) = parsed.llm_model_id.as_deref() {
@@ -807,7 +813,10 @@ fn build_rerun_create_request(
         audio_filename: source_audio.audio_filename,
         model_id: source_record.model_id.clone(),
         asr_model_id: source_record.asr_model_id.clone(),
-        aligner_model_id: source_record.aligner_model_id.clone(),
+        aligner_model_id: source_record
+            .aligner_model_id
+            .as_deref()
+            .map(|id| izwi_core::normalize_stored_model_id(id).into_owned()),
         llm_model_id: source_record.llm_model_id.clone(),
         min_speakers: rerun.min_speakers.or(source_record.min_speakers),
         max_speakers: rerun.max_speakers.or(source_record.max_speakers),
@@ -1444,6 +1453,31 @@ mod tests {
         assert_eq!(
             transcript_with_speaker_names(transcript, &BTreeMap::new()),
             transcript
+        );
+    }
+
+    /// A record made with the removed 4-bit aligner reruns on the
+    /// full-precision one, while a new request naming it is refused with
+    /// the replacement named.
+    #[test]
+    fn rerun_of_a_removed_aligner_record_uses_its_replacement() {
+        let mut source = sample_record();
+        source.aligner_model_id = Some("Qwen3-ForcedAligner-0.6B-4bit".to_string());
+        let mut parsed =
+            build_rerun_create_request(&source, sample_audio(), Default::default());
+        assert_eq!(
+            parsed.aligner_model_id.as_deref(),
+            Some("Qwen3-ForcedAligner-0.6B")
+        );
+        resolve_pipeline_model_ids(&mut parsed).expect("the replacement resolves");
+
+        parsed.aligner_model_id = Some("Qwen3-ForcedAligner-0.6B-4bit".to_string());
+        let error = resolve_pipeline_model_ids(&mut parsed).expect_err("removed aligner");
+        assert!(
+            error.message.contains("no longer supported")
+                && error.message.contains("Use Qwen3-ForcedAligner-0.6B instead"),
+            "{}",
+            error.message
         );
     }
 

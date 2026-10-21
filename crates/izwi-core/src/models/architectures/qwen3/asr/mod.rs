@@ -6578,12 +6578,11 @@ mod tests {
     }
 
     /// fox.wav gives a 77-token prompt (77 % 32 = 13), which hit Candle's
-    /// causal Metal SDPA over-read in the dense text model; the 4-bit audio
-    /// tower's OHWI conv kernels hit the strided-kernel conv bug. Metal must
-    /// match CPU per word boundary.
+    /// causal Metal SDPA over-read in the dense text model. Metal must match
+    /// CPU per word boundary.
     #[cfg(feature = "metal")]
     #[test]
-    #[ignore = "requires local Qwen3-ForcedAligner checkpoints and a Metal device (~5 GB)"]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and a Metal device"]
     fn forced_aligner_metal_matches_cpu() {
         let _lease = crate::backends::metal_test_device_or_skip("forced_aligner_metal_matches_cpu");
         const MAX_BOUNDARY_DRIFT_MS: u32 = 80;
@@ -6598,10 +6597,6 @@ mod tests {
             (
                 "Qwen3-ForcedAligner-0.6B",
                 ModelVariant::Qwen3ForcedAligner06B,
-            ),
-            (
-                "Qwen3-ForcedAligner-0.6B-4bit",
-                ModelVariant::Qwen3ForcedAligner06B4Bit,
             ),
         ] {
             let model_dir = local_models_root().join(dir_name);
@@ -6861,54 +6856,6 @@ mod precision_tests {
         assert!(matches!(aligner, InferenceStateCapability::Stateless));
         let asr = tiny_model(false).inference_state_contract().unwrap();
         assert!(matches!(asr, InferenceStateCapability::Managed(_)));
-    }
-
-    /// The published 4-bit aligner on Metal: the F16 text tier really runs
-    /// its probe, and the loaded model is stateless.
-    #[cfg(feature = "metal")]
-    #[test]
-    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B-4bit checkpoint and a Metal device"]
-    fn forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe() {
-        let _lease = crate::backends::metal_test_device_or_skip(
-            "forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe",
-        );
-        use std::io::Write;
-        let model_dir = super::tests::local_models_root().join("Qwen3-ForcedAligner-0.6B-4bit");
-        if !model_dir.join("model.safetensors").exists() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "skipped: no checkpoint at {}",
-                model_dir.display()
-            );
-            return;
-        }
-        let device = crate::backends::DeviceSelector::detect_with_preference(Some("metal"))
-            .expect("metal device");
-        let model = Qwen3AsrModel::load(
-            &model_dir,
-            crate::model::ModelVariant::Qwen3ForcedAligner06B4Bit,
-            device,
-        )
-        .expect("load");
-        let _ = writeln!(
-            std::io::stderr(),
-            "text: {:?} -> {:?} ({}); probe {:?}",
-            model.text_precision.requested,
-            model.text_precision.loaded,
-            model.text_precision.reason,
-            model
-                .text_precision
-                .self_check
-                .as_ref()
-                .map(|r| (r.passed, &r.reason)),
-        );
-        assert_eq!(model.text_precision.requested, DType::F16);
-        assert!(model.text_precision.self_check.is_some());
-        assert!(model.audio_precision.self_check.is_none());
-        assert!(matches!(
-            model.inference_state_contract().unwrap(),
-            InferenceStateCapability::Stateless
-        ));
     }
 
     #[test]

@@ -426,7 +426,10 @@ fn retry_create_request(
         duration_secs: source.duration_secs,
         record_mode: source.transcription_mode,
         model_id: source.model_id.clone(),
-        aligner_model_id: source.aligner_model_id.clone(),
+        aligner_model_id: source
+            .aligner_model_id
+            .as_deref()
+            .map(|id| izwi_core::normalize_stored_model_id(id).into_owned()),
         language: source.language.clone(),
         include_timestamps: source.aligner_model_id.is_some(),
         stream: false,
@@ -1865,6 +1868,9 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
     if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
         validate_batch_transcription_model(parsed.model_id.as_deref())?;
         validate_transcription_language(parsed.model_id.as_deref(), parsed.language.as_deref())?;
+        crate::api::transcript_alignment::reject_removed_aligner(
+            parsed.aligner_model_id.as_deref(),
+        )?;
         return Ok(());
     }
 
@@ -2301,6 +2307,20 @@ mod tests {
         );
         let mut parakeet = request(TranscriptionRecordMode::Transcription, None, "Chinese");
         prepare_create_request(&mut parakeet).unwrap();
+
+        // A removed aligner is refused when the job is made, its
+        // replacement named; the supported aligner is accepted.
+        let mut removed_aligner = request(TranscriptionRecordMode::Transcription, None, "English");
+        removed_aligner.aligner_model_id = Some("Qwen3-ForcedAligner-0.6B-4bit".to_string());
+        let error = prepare_create_request(&mut removed_aligner).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.message.contains("Use Qwen3-ForcedAligner-0.6B instead"),
+            "{}",
+            error.message
+        );
+        removed_aligner.aligner_model_id = Some("Qwen3-ForcedAligner-0.6B".to_string());
+        prepare_create_request(&mut removed_aligner).unwrap();
     }
 
     #[test]

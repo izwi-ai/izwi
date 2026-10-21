@@ -399,14 +399,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Forced Alignment", "Word timestamps"],
     size: "1.7 GB",
   },
-  "Qwen3-ForcedAligner-0.6B-4bit": {
-    shortName: "ForcedAligner 0.6B 4-bit",
-    fullName: "Qwen3-ForcedAligner 0.6B (MLX 4-bit)",
-    description: "Quantized forced aligner for low-memory alignment workflows",
-    category: "asr",
-    capabilities: ["Forced Alignment", "Word timestamps", "4-bit"],
-    size: "0.7 GB",
-  },
   "Parakeet-TDT-0.6B-v3": {
     shortName: "Parakeet v3",
     fullName: "Parakeet-TDT 0.6B v3",

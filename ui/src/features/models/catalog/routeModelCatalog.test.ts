@@ -196,6 +196,9 @@ describe("route model catalog", () => {
     expect(normalizeStoredModelId("Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit")).toBe(
       "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     );
+    expect(normalizeStoredModelId("Qwen3-ForcedAligner-0.6B-4bit")).toBe(
+      "Qwen3-ForcedAligner-0.6B",
+    );
     expect(normalizeStoredModelId("Kokoro-82M")).toBe("Kokoro-82M");
     for (const replacement of Object.values(REMOVED_MODEL_REPLACEMENTS)) {
       expect(MODEL_DETAILS[replacement]).toBeDefined();

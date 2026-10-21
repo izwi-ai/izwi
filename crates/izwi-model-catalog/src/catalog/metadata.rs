@@ -240,9 +240,6 @@ pub enum ModelVariant {
     /// Qwen3-ForcedAligner 0.6B model
     #[serde(rename = "Qwen3-ForcedAligner-0.6B")]
     Qwen3ForcedAligner06B,
-    /// Qwen3-ForcedAligner 0.6B model (MLX 4-bit)
-    #[serde(rename = "Qwen3-ForcedAligner-0.6B-4bit")]
-    Qwen3ForcedAligner06B4Bit,
     /// Voxtral Mini 4B Realtime model from Mistral AI
     #[serde(rename = "Voxtral-Mini-4B-Realtime-2602")]
     VoxtralMini4BRealtime2602,
@@ -396,7 +393,6 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => "Qwen/Qwen3.6-35B-A3B-FP8",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
-            Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "mistralai/Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
@@ -447,7 +443,6 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => "Qwen3.6 35B-A3B FP8",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
-            Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral Mini 4B Realtime",
             Self::Voxtral4BTts2603 => "Voxtral 4B TTS",
             Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
@@ -498,7 +493,6 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => "Qwen3.6-35B-A3B-FP8",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
-            Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "VibeVoice-1.5B",
@@ -549,7 +543,6 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
-            Self::Qwen3ForcedAligner06B4Bit => 975_853_671, // ~0.91 GB
             Self::VoxtralMini4BRealtime2602 => 8_874_376_007, // resolved download total, Oct 2026
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
@@ -610,9 +603,9 @@ impl ModelVariant {
             // the qwen3_5_moe representation plan replaces it per backend.
             Self::Qwen36Moe35BA3BFp8 => 140.0,
             Self::Gemma34BIt => 11.0,
-            // Both aligners dequantize to F32 on the CPU (3.42 GiB); Metal
-            // (F16 text) holds 2.69 GiB and CUDA (BF16 text) 2.30 GiB.
-            Self::Qwen3ForcedAligner06B | Self::Qwen3ForcedAligner06B4Bit => 3.5,
+            // The aligner expands to F32 on the CPU (3.42 GiB); Metal (F16
+            // text) holds 2.69 GiB and CUDA (BF16 text) 2.30 GiB.
+            Self::Qwen3ForcedAligner06B => 3.5,
             Self::VoxtralMini4BRealtime2602 => 16.0,
             Self::Voxtral4BTts2603 => 16.0,
             Self::VibeVoice15BTts => 12.0,
@@ -971,7 +964,6 @@ impl ModelVariant {
                 | Self::Qwen359BGguf
                 | Self::Qwen3827BFp8
                 | Self::Qwen36Moe35BA3BFp8
-                | Self::Qwen3ForcedAligner06B4Bit
         )
     }
 
@@ -1067,7 +1059,6 @@ impl ModelVariant {
             // checkpoint remains an exact-SHA hardware handoff gate.
             | Self::Qwen36Moe35BA3BFp8
             | Self::Qwen3827BFp8
-            | Self::Qwen3ForcedAligner06B4Bit
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Lfm25Audio15BGguf
@@ -1132,7 +1123,6 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
-            Self::Qwen3ForcedAligner06B4Bit,
             Self::VoxtralMini4BRealtime2602,
             Self::Voxtral4BTts2603,
             Self::VibeVoice15BTts,
@@ -1356,16 +1346,6 @@ mod tests {
         assert_eq!(variant.tts_max_output_frames_hint(), None);
         assert_eq!(variant.tts_output_frame_rate_hz_hint(), None);
         assert_eq!(variant.tts_max_output_seconds_hint(), None);
-    }
-
-    #[test]
-    fn forced_aligner_4bit_variant_is_enabled() {
-        let variant = ModelVariant::Qwen3ForcedAligner06B4Bit;
-        assert_eq!(
-            variant.repo_id(),
-            "mlx-community/Qwen3-ForcedAligner-0.6B-4bit"
-        );
-        assert!(variant.is_enabled());
     }
 
     #[test]

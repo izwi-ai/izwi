@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_selection_reports_dense_dequantized_quantization_fallbacks() {
+    fn cuda_selection_reports_quantization_policy_in_its_reason() {
         let context = BackendContext::new(
             BackendPreference::Cuda,
             BackendSelectionSource::Config,
@@ -498,14 +498,14 @@ mod tests {
             "Selected cuda backend",
         );
         let router = BackendRouter::from_context(context);
-        let plan = router.select(ModelVariant::Qwen3ForcedAligner06B4Bit);
+        let plan = router.select(ModelVariant::Qwen306B4Bit);
 
         assert_eq!(
             plan.cuda_quantization.level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
+            CudaQuantizationSupportLevel::Disabled
         );
         assert!(
-            plan.reason.contains("dense dequantized fallback"),
+            plan.reason.contains("is not allowed by policy (disabled)"),
             "reason should carry CUDA quantization diagnostics: {}",
             plan.reason
         );
