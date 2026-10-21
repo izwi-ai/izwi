@@ -481,7 +481,7 @@ impl RolloutPlan {
         hasher.update([self.strategy as u8]);
         hasher.update([0]);
         hasher.update(target_config_bytes);
-        format!("sha256:{:x}", hasher.finalize())
+        format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
     /// Validates the plan against the running and target node configs and

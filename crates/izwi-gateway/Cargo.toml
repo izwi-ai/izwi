@@ -50,6 +50,7 @@ sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

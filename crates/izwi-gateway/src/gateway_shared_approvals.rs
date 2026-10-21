@@ -226,7 +226,7 @@ fn read_approvals_file(
 /// `sha256:<hex>`, the digest form the supervisor's rollout uses too.
 fn text_digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+    format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())))
 }
 
 fn read_approvals_text(path: &std::path::Path) -> Result<String, SharedApprovalsError> {

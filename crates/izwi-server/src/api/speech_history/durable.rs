@@ -775,7 +775,7 @@ async fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
         }
         hasher.update(&buffer[..length]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(super) async fn cleanup_expired_replay(state: &AppState) -> anyhow::Result<()> {

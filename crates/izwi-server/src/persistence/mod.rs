@@ -697,7 +697,7 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
             drop(output);
             // The temporary owner removes incomplete output on every error/cancellation.
             persist_local_tempfile_noclobber(temporary, &target)?;
-            Ok::<_, anyhow::Error>((key, format!("{:x}", hash.finalize())))
+            Ok::<_, anyhow::Error>((key, hex::encode(hash.finalize())))
         }
         .await
         .map_err(|err| HookError::Failed(err.to_string()))?;
@@ -897,7 +897,7 @@ fn reserved_write_fingerprint(
     }
     digest.update(content_length.to_be_bytes());
     update_fingerprint_field(&mut digest, content_sha256.as_bytes());
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn update_fingerprint_field(digest: &mut sha2::Sha256, value: &[u8]) {
@@ -1077,7 +1077,7 @@ fn copy_reader_with_digest<R: std::io::Read, W: std::io::Write>(
         "Reserved media source length does not match its declaration"
     );
     anyhow::ensure!(
-        format!("{:x}", digest.finalize()) == expected_digest,
+        hex::encode(digest.finalize()) == expected_digest,
         "Reserved media source digest does not match its declaration"
     );
     Ok(())
@@ -1108,7 +1108,7 @@ fn file_matches_digest(
         }
         digest.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", digest.finalize()) == expected_digest)
+    Ok(hex::encode(digest.finalize()) == expected_digest)
 }
 
 fn tenant_id_from_metadata(metadata: &HookMetadata) -> Option<String> {
@@ -1225,7 +1225,7 @@ mod tests {
 
     fn sha256_hex_bytes(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     }
 
     #[test]
@@ -1562,7 +1562,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored.metadata.sha256,
-            Some(format!("{:x}", Sha256::digest(&bytes)))
+            Some(hex::encode(Sha256::digest(&bytes)))
         );
         assert!(!stored.key.key.contains(".."));
         let mut stream = provider

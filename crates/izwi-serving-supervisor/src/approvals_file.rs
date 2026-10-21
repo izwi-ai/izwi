@@ -268,7 +268,7 @@ pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 fn parent_directory(path: &Path) -> Result<&Path, SharedApprovalsError> {

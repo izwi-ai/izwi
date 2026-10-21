@@ -17,6 +17,7 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

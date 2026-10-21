@@ -1056,6 +1056,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1376,6 +1382,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 
 [[package]]
+name = "ctutils"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
 name = "cudaforge"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1664,6 +1679,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -2982,7 +2998,7 @@ version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
 dependencies = [
- "hmac",
+ "hmac 0.12.1",
 ]
 
 [[package]]
@@ -2992,6 +3008,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3482,6 +3507,7 @@ dependencies = [
  "fs4",
  "futures",
  "half",
+ "hex",
  "hound",
  "image",
  "indicatif",
@@ -3506,7 +3532,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "symphonia",
  "tar",
  "tekken-rs",
@@ -3580,7 +3606,8 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "hmac",
+ "hex",
+ "hmac 0.13.0",
  "http-body",
  "http-body-util",
  "izwi-db",
@@ -3599,7 +3626,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3649,6 +3676,7 @@ dependencies = [
  "clap",
  "fs4",
  "futures",
+ "hex",
  "hound",
  "izwi-agent",
  "izwi-core",
@@ -3668,7 +3696,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3707,7 +3735,7 @@ version = "0.1.0"
 dependencies = [
  "izwi-serving-protocol",
  "libc",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -3719,7 +3747,7 @@ dependencies = [
  "izwi-env",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
  "uuid",
@@ -3729,6 +3757,7 @@ dependencies = [
 name = "izwi-serving-supervisor"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "izwi-env",
  "izwi-serving-client",
  "izwi-serving-fence",
@@ -3739,7 +3768,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3776,7 +3805,7 @@ dependencies = [
  "rustls",
  "safetensors 0.4.5",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers",
@@ -6883,7 +6912,7 @@ dependencies = [
  "generic-array",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.12.1",
  "itoa",
  "log",
  "md-5",
@@ -6922,7 +6951,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.12.1",
  "home",
  "itoa",
  "log",

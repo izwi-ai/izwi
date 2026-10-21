@@ -250,7 +250,7 @@ async fn wait_adopted(
     text: &str,
 ) -> izwi_serving_protocol::GatewayApprovalsStatus {
     use sha2::{Digest, Sha256};
-    let digest = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())));
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let status = approvals_status(client, gateway).await;
