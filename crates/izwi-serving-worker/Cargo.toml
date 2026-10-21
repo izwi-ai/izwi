@@ -3,6 +3,7 @@ name = "izwi-serving-worker"
 description = "Private inference worker HTTP service for Izwi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

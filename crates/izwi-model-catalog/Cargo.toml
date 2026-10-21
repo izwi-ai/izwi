@@ -3,6 +3,7 @@ name = "izwi-model-catalog"
 description = "Accelerator-free model catalog for Izwi: model identities, families, their published metadata and the shared chat API types"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

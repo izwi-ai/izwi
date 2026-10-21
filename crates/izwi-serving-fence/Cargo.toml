@@ -3,6 +3,7 @@ name = "izwi-serving-fence"
 description = "Worker launch contract shared by the Izwi supervisor and worker: lock and fence primitives and the environment that hands them over"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

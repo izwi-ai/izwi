@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/izwi-asr-toolkit",
     "crates/izwi-agent",
@@ -25,6 +25,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/izwi-ai/izwi"
 authors = ["Izwi <hi@izwiai.com>"]

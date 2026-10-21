@@ -3,6 +3,7 @@ name = "izwi-asr-toolkit"
 description = "Model-agnostic long-form ASR chunking and transcript assembly helpers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

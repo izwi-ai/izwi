@@ -3,6 +3,7 @@ name = "izwi-cli"
 description = "World-class CLI for Izwi audio inference engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

@@ -3,6 +3,7 @@ name = "izwi-serving-client"
 description = "Bounded HTTP transport client for Izwi serving"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

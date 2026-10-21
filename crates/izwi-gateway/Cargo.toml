@@ -3,6 +3,7 @@ name = "izwi-gateway"
 description = "Izwi public API gateway: OpenAI-compatible authentication, admission and routing to approved inference workers, with no inference engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

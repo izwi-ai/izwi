@@ -3,6 +3,7 @@ name = "izwi-serving-supervisor"
 description = "Accelerator-free local worker assignment and supervision primitives for Izwi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

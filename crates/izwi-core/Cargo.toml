@@ -3,7 +3,7 @@ name = "izwi-core"
 description = "Core TTS inference engine for Qwen3-TTS models on Apple Silicon"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.88"
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
