@@ -4204,58 +4204,47 @@ pub(super) mod tests {
     fn aligner_admission_and_the_oom_retry_price_the_checkpoint() {
         let _env = env_lock();
         let performance = crate::performance::PerformanceConfig::default();
-        for variant in [ModelVariant::Qwen3ForcedAligner06B] {
-            assert!(!is_asr_variant(variant));
-            let dir = temp_dir("aligner");
-            write_aligner_checkpoint(&dir);
-            for backend in BACKENDS {
-                let device = profile(backend);
-                let plan = super::super::checkpoint_resource_plan(
-                    variant,
-                    &dir,
-                    &device,
-                    &Default::default(),
-                )
-                .unwrap()
-                .expect("the aligner has a residency plan");
-                let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
-                let retry = super::super::retry_load_peak_bytes(
-                    variant,
-                    backend,
-                    &performance,
-                    Some((&dir, &device, &Default::default())),
-                );
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        assert!(!is_asr_variant(variant));
+        let dir = temp_dir("aligner");
+        write_aligner_checkpoint(&dir);
+        for backend in BACKENDS {
+            let device = profile(backend);
+            let plan =
+                super::super::checkpoint_resource_plan(variant, &dir, &device, &Default::default())
+                    .unwrap()
+                    .expect("the aligner has a residency plan");
+            let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
+            let retry = super::super::retry_load_peak_bytes(
+                variant,
+                backend,
+                &performance,
+                Some((&dir, &device, &Default::default())),
+            );
+            assert_eq!(
+                admitted,
+                ResourceAmount::Known(retry),
+                "{variant} {backend:?}"
+            );
+            // The 32 x 64 embedding dequantizes to F32 on the CPU.
+            let embedding = 32 * 64 * 4;
+            if backend == BackendKind::Cpu {
                 assert_eq!(
-                    admitted,
-                    ResourceAmount::Known(retry),
-                    "{variant} {backend:?}"
+                    plan.resident_authorization.host_bytes,
+                    ResourceAmount::Known(embedding + 8 * 4 + 1500 * 8 * 4),
+                    "{variant}"
                 );
-                // The 32 x 64 embedding dequantizes to F32 on the CPU.
-                let embedding = 32 * 64 * 4;
-                if backend == BackendKind::Cpu {
-                    assert_eq!(
-                        plan.resident_authorization.host_bytes,
-                        ResourceAmount::Known(embedding + 8 * 4 + 1500 * 8 * 4),
-                        "{variant}"
-                    );
-                }
             }
-            std::fs::remove_dir_all(dir).unwrap();
         }
+        std::fs::remove_dir_all(dir).unwrap();
         // The catalog figure is the largest residency over the backends (CPU
         // F32 text), not the Metal load peak (F16 text, held uploads and
         // dequantization scratch), so a retry judged by it would misjudge a
         // Metal load.
-        for (variant, files) in [
-            (
-                ModelVariant::Qwen3ForcedAligner06B,
-                census!("qwen3_forced_aligner_0_6b.json"),
-            ),
-        ] {
-            let catalog = super::super::model_memory_estimate(variant).load_peak_bytes;
-            let metal = aligner(&files, BackendKind::Metal).load_peak_bytes;
-            assert_ne!(metal, catalog, "{variant}");
-        }
+        let files = census!("qwen3_forced_aligner_0_6b.json");
+        let catalog = super::super::model_memory_estimate(variant).load_peak_bytes;
+        let metal = aligner(&files, BackendKind::Metal).load_peak_bytes;
+        assert_ne!(metal, catalog);
     }
 
     /// ADM-7: aligner loads are reconciled against the device observer now
@@ -4273,52 +4262,43 @@ pub(super) mod tests {
         };
         // The generic estimate prices stored bytes: the dense aligner loads
         // more than that.
-        for (variant, files, generic_peak, generic_covers) in [(
-            ModelVariant::Qwen3ForcedAligner06B,
-            census!("qwen3_forced_aligner_0_6b.json"),
-            2_769_739_008,
-            false,
-        )] {
-            assert!(super::super::reconciles_device_usage(
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let files = census!("qwen3_forced_aligner_0_6b.json");
+        assert!(super::super::reconciles_device_usage(
+            variant,
+            BackendKind::Metal
+        ));
+        // `IZWI_METAL_DTYPE=f32` keeps the dense text at F32 (D8).
+        let f32_text = AlignerLoad {
+            text_dtype: DType::F32,
+            audio_dtype: DType::F32,
+            mlx_bits: None,
+            fused_projections: true,
+            mlx_q4_1: true,
+        };
+        let plan = price_qwen3_aligner(&files, BackendKind::Metal, f32_text).unwrap();
+        let observed = plan.resident_bytes;
+        let reconcile = |authorized| {
+            super::super::reconcile_observed_growth(
                 variant,
-                BackendKind::Metal
-            ));
-            // `IZWI_METAL_DTYPE=f32` keeps the dense text at F32 (D8).
-            let f32_text = AlignerLoad {
-                text_dtype: DType::F32,
-                audio_dtype: DType::F32,
-                mlx_bits: None,
-                fused_projections: true,
-                mlx_q4_1: true,
-            };
-            let plan = price_qwen3_aligner(&files, BackendKind::Metal, f32_text).unwrap();
-            let observed = plan.resident_bytes;
-            let reconcile = |authorized| {
-                super::super::reconcile_observed_growth(
-                    variant,
-                    "weight load",
-                    sample(0),
-                    sample(observed),
-                    authorized,
-                )
-            };
-            assert_eq!(reconcile(plan.load_peak_bytes).unwrap(), observed);
-            let census = super::super::CheckpointCensus {
-                files,
-                container_fallback_bytes: 0,
-            };
-            let generic = super::super::estimate_from_tensor_inventory(
-                super::super::model_memory_estimate(variant),
-                census.inventory(),
+                "weight load",
+                sample(0),
+                sample(observed),
+                authorized,
             )
-            .unwrap();
-            assert_eq!(generic.load_peak_bytes, generic_peak, "{variant}");
-            assert_eq!(
-                reconcile(generic.load_peak_bytes).is_ok(),
-                generic_covers,
-                "{variant}"
-            );
-        }
+        };
+        assert_eq!(reconcile(plan.load_peak_bytes).unwrap(), observed);
+        let census = super::super::CheckpointCensus {
+            files,
+            container_fallback_bytes: 0,
+        };
+        let generic = super::super::estimate_from_tensor_inventory(
+            super::super::model_memory_estimate(variant),
+            census.inventory(),
+        )
+        .unwrap();
+        assert_eq!(generic.load_peak_bytes, 2_769_739_008);
+        assert!(reconcile(generic.load_peak_bytes).is_err());
         // The ASR and TTS families keep their reconciliation, as do Qwen3.5
         // chat and Fish, whose plans match their measured Metal loads;
         // families without a plan (or one not yet measured) are not
@@ -4356,30 +4336,29 @@ pub(super) mod tests {
     #[test]
     fn aligner_metal_f16_tier_prices_its_f32_reload_separately() {
         let _env = env_lock();
-        for (fixture, mlx_bits) in [(census!("qwen3_forced_aligner_0_6b.json"), None)] {
-            let tiered = aligner(&fixture, BackendKind::Metal);
-            let load = |dtype| AlignerLoad {
-                text_dtype: dtype,
-                audio_dtype: dtype,
-                mlx_bits,
-                fused_projections: true,
-                mlx_q4_1: true,
-            };
-            let f16 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F16)).unwrap();
-            let f32 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F32)).unwrap();
-            assert_eq!(tiered, f16);
-            assert!(f32.load_peak_bytes > f16.load_peak_bytes);
-            let reload = aligner_precision_reload(BackendKind::Metal, load(DType::F16));
-            assert_eq!(reload, Some(load(DType::F32)));
-            assert_eq!(
-                aligner_precision_reload(BackendKind::Metal, load(DType::F32)),
-                None
-            );
-            assert_eq!(
-                aligner_precision_reload(BackendKind::Cpu, load(DType::F16)),
-                None
-            );
-        }
+        let fixture = census!("qwen3_forced_aligner_0_6b.json");
+        let tiered = aligner(&fixture, BackendKind::Metal);
+        let load = |dtype| AlignerLoad {
+            text_dtype: dtype,
+            audio_dtype: dtype,
+            mlx_bits: None,
+            fused_projections: true,
+            mlx_q4_1: true,
+        };
+        let f16 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F16)).unwrap();
+        let f32 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F32)).unwrap();
+        assert_eq!(tiered, f16);
+        assert!(f32.load_peak_bytes > f16.load_peak_bytes);
+        let reload = aligner_precision_reload(BackendKind::Metal, load(DType::F16));
+        assert_eq!(reload, Some(load(DType::F32)));
+        assert_eq!(
+            aligner_precision_reload(BackendKind::Metal, load(DType::F32)),
+            None
+        );
+        assert_eq!(
+            aligner_precision_reload(BackendKind::Cpu, load(DType::F16)),
+            None
+        );
     }
 
     /// ADM-4 / NDZ-7: the diarizers are priced from their checkpoints at F32

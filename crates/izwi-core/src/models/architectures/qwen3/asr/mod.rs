@@ -6593,41 +6593,36 @@ mod tests {
         let text = std::fs::read_to_string(data.join("fox.md")).expect("fox.md");
         let text = text.trim();
 
-        for (dir_name, variant) in [
-            (
-                "Qwen3-ForcedAligner-0.6B",
-                ModelVariant::Qwen3ForcedAligner06B,
-            ),
-        ] {
-            let model_dir = local_models_root().join(dir_name);
-            if !model_dir.join("model.safetensors").exists() {
-                eprintln!("Skipping {dir_name}: not found at {}", model_dir.display());
-                continue;
-            }
-            // One model resident at a time.
-            let align_on = |device: &str| {
-                let device = DeviceSelector::detect_with_preference(Some(device)).expect(device);
-                let model = Qwen3AsrModel::load(&model_dir, variant, device).expect("load");
-                model
-                    .force_align(&audio, sample_rate, text, None)
-                    .expect("force_align")
-            };
-            let cpu = align_on("cpu");
-            let metal = align_on("metal");
-            eprintln!("{dir_name} cpu:   {cpu:?}\n{dir_name} metal: {metal:?}");
+        let dir_name = "Qwen3-ForcedAligner-0.6B";
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let model_dir = local_models_root().join(dir_name);
+        if !model_dir.join("model.safetensors").exists() {
+            eprintln!("Skipping {dir_name}: not found at {}", model_dir.display());
+            return;
+        }
+        // One model resident at a time.
+        let align_on = |device: &str| {
+            let device = DeviceSelector::detect_with_preference(Some(device)).expect(device);
+            let model = Qwen3AsrModel::load(&model_dir, variant, device).expect("load");
+            model
+                .force_align(&audio, sample_rate, text, None)
+                .expect("force_align")
+        };
+        let cpu = align_on("cpu");
+        let metal = align_on("metal");
+        eprintln!("{dir_name} cpu:   {cpu:?}\n{dir_name} metal: {metal:?}");
 
-            assert_eq!(cpu.len(), metal.len(), "{dir_name}: word count");
-            for (c, m) in cpu.iter().zip(&metal) {
-                assert_eq!(c.0, m.0, "{dir_name}: word order");
-                let drift = c.1.abs_diff(m.1).max(c.2.abs_diff(m.2));
-                assert!(
-                    drift <= MAX_BOUNDARY_DRIFT_MS,
-                    "{dir_name}: '{}' Metal {:?} vs CPU {:?}",
-                    c.0,
-                    (m.1, m.2),
-                    (c.1, c.2)
-                );
-            }
+        assert_eq!(cpu.len(), metal.len(), "{dir_name}: word count");
+        for (c, m) in cpu.iter().zip(&metal) {
+            assert_eq!(c.0, m.0, "{dir_name}: word order");
+            let drift = c.1.abs_diff(m.1).max(c.2.abs_diff(m.2));
+            assert!(
+                drift <= MAX_BOUNDARY_DRIFT_MS,
+                "{dir_name}: '{}' Metal {:?} vs CPU {:?}",
+                c.0,
+                (m.1, m.2),
+                (c.1, c.2)
+            );
         }
     }
 }
