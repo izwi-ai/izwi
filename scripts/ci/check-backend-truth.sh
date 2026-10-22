@@ -22,8 +22,9 @@ Commands:
   cargo-cuda    Compatibility alias for cargo-cuda-compile
   cargo-cuda-device
                 Require NVIDIA hardware and run native/FA2 numerical certification
-  docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
-  docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
+  docker-cpu    Validate the compose files, lint, build the CPU and gateway images,
+                run them in development and production mode, and scan them
+  docker-cuda   Validate the CUDA Docker Compose profile, build, audit and scan the CUDA image
   test-cuda-feature-mapping
                 Validate wrapper-to-core CUDA feature translation without running Cargo
 EOF
@@ -252,14 +253,86 @@ smoke_cuda_device_if_available() {
 
 smoke_docker_server() {
     local image="$1"
-
-    echo "Smoke-checking ${image}"
-    docker run --rm \
-        --entrypoint /usr/local/bin/izwi-server \
-        "${image}" \
-        --help >/dev/null
+    local name="izwi-ci-smoke"
+    local port="${IZWI_CI_SMOKE_PORT:-18080}"
+    local key="ci-smoke-api-key-0123456789abcdef"
 
     assert_docker_runtime_commands "${image}"
+
+    echo "Checking ${image} runs as uid 1000"
+    test "$(docker run --rm --entrypoint id "${image}" -u)" = "1000"
+
+    echo "Checking ${image} refuses a 0.0.0.0 bind without a key"
+    local refusal
+    if refusal="$(docker run --rm "${image}" 2>&1)"; then
+        echo "izwi-server started on 0.0.0.0 without an API key" >&2
+        return 1
+    fi
+    grep -q "IZWI_API_KEY" <<<"${refusal}"
+
+    echo "Development mode: published on loopback, no key, Host check on"
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+    docker run -d --name "${name}" -p "127.0.0.1:${port}:8080" \
+        -e IZWI_LOOPBACK_PUBLISHED=1 \
+        --init --cap-drop ALL --security-opt no-new-privileges:true \
+        "${image}" >/dev/null
+    wait_for_healthy "${name}"
+    expect_status 200 "http://127.0.0.1:${port}/v1/models"
+    expect_status 403 "http://127.0.0.1:${port}/v1/models" -H "Host: attacker.example:${port}"
+    docker rm -f "${name}" >/dev/null
+
+    echo "Production mode: key required, read-only root filesystem"
+    docker run -d --name "${name}" -p "127.0.0.1:${port}:8080" \
+        -e IZWI_API_KEY="${key}" -e IZWI_SPEECH_SPOOL_DIR=/app/data/spool \
+        --read-only --tmpfs /tmp:size=256m,mode=1777 \
+        --init --cap-drop ALL --security-opt no-new-privileges:true \
+        "${image}" >/dev/null
+    wait_for_healthy "${name}"
+    expect_status 401 "http://127.0.0.1:${port}/v1/models"
+    expect_status 200 "http://127.0.0.1:${port}/v1/models" \
+        -H "Authorization: Bearer ${key}"
+
+    echo "Checking SIGTERM drains and exits 0"
+    docker stop --time 45 "${name}" >/dev/null
+    test "$(docker inspect --format '{{.State.ExitCode}}' "${name}")" = "0"
+    docker rm "${name}" >/dev/null
+}
+
+smoke_docker_gateway() {
+    local image="$1"
+
+    echo "Smoke-checking ${image}"
+    test "$(docker inspect --format '{{.Config.User}}' "${image}")" = "1000:1000"
+    docker run --rm "${image}" izwi-gateway --version
+}
+
+wait_for_healthy() {
+    local name="$1"
+    local status=""
+
+    for _ in $(seq 1 90); do
+        status="$(docker inspect --format '{{.State.Health.Status}}' "${name}")"
+        case "${status}" in
+            healthy) return 0 ;;
+            unhealthy) break ;;
+        esac
+        sleep 2
+    done
+    echo "${name} did not become healthy (${status})" >&2
+    docker logs "${name}" >&2 || true
+    return 1
+}
+
+expect_status() {
+    local expected="$1"
+    local url="$2"
+    shift 2
+    local actual
+    actual="$(curl -s -o /dev/null -w '%{http_code}' "$@" "${url}")"
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "GET ${url} $* returned ${actual}, expected ${expected}" >&2
+        return 1
+    fi
 }
 
 assert_docker_runtime_commands() {
@@ -272,10 +345,48 @@ assert_docker_runtime_commands() {
         -c '
             set -eu
 
-            for cmd in espeak-ng tar unzip zip which; do
+            for cmd in espeak-ng unzip zip which; do
                 command -v "${cmd}" >/dev/null
             done
         '
+}
+
+check_compose_configs() {
+    local key="ci-compose-api-key-0123456789abcdef"
+
+    docker compose config -q
+    IZWI_API_KEY="${key}" docker compose \
+        -f docker-compose.yml -f docker-compose.prod.yml --profile tls config -q
+    if IZWI_API_KEY="" docker compose \
+        -f docker-compose.yml -f docker-compose.prod.yml config -q 2>/dev/null; then
+        echo "docker-compose.prod.yml must refuse to start without IZWI_API_KEY" >&2
+        exit 1
+    fi
+    GATEWAY_API_KEY="${key}" WORKER_BEARER_TOKEN="${key}-worker" ADMIN_API_KEY="${key}-admin" \
+        docker compose -f config/serving/docker-compose.serving.yml config -q
+}
+
+# Linter and scanner images for the Docker lane, pinned by digest. Dependabot
+# does not read this script: bump them with the base images.
+HADOLINT_IMAGE="hadolint/hadolint:v2.12.0@sha256:30a8fd2e785ab6176eed53f74769e04f125afb2f74a6c52aef7d463583b6d45e"
+GRYPE_IMAGE="anchore/grype:v0.120.1@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe"
+
+lint_dockerfile() {
+    docker build --check .
+    docker run --rm -i \
+        -v "${PWD}/.hadolint.yaml:/.hadolint.yaml:ro" \
+        "${HADOLINT_IMAGE}" hadolint --config /.hadolint.yaml - <Dockerfile
+}
+
+# Fails on any critical vulnerability with a fixed version available; the
+# full report (every severity) stays in the job log.
+scan_docker_image() {
+    local image="$1"
+
+    echo "Scanning ${image}"
+    docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        "${GRYPE_IMAGE}" "docker:${image}" --only-fixed --fail-on critical
 }
 
 cuda_features_include() {
@@ -656,10 +767,16 @@ run_cargo_cuda_device() {
 
 run_docker_cpu() {
     require_command docker
+    require_command curl
 
-    docker compose config >/dev/null
+    check_compose_configs
+    lint_dockerfile
     docker build --target production -t izwi-ci:production .
+    docker build --target production-gateway -t izwi-ci:production-gateway .
     smoke_docker_server izwi-ci:production
+    smoke_docker_gateway izwi-ci:production-gateway
+    scan_docker_image izwi-ci:production
+    scan_docker_image izwi-ci:production-gateway
 }
 
 run_docker_cuda() {
@@ -684,6 +801,7 @@ run_docker_cuda() {
         -t izwi-ci:production-cuda \
         .
     audit_cuda_docker_server izwi-ci:production-cuda "${wrapper_features}"
+    scan_docker_image izwi-ci:production-cuda
 }
 
 main() {
