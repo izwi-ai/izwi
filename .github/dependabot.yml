@@ -1,0 +1,62 @@
+# Dependabot keeps every pinned dependency moving: base images (tag and
+# digest), GitHub Actions (commit SHA), Cargo and npm. Each ecosystem opens at
+# most one grouped pull request a week. The cooldown skips releases younger
+# than a week, so a compromised release is usually pulled before it lands
+# here; security updates ignore the cooldown.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories:
+      - "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directories:
+      - "/"
+      - "/config/serving"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      compose-images:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Majors (candle, tauri, axum) need their own planned upgrade.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

@@ -9,16 +9,20 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Read-only by default; only the publish job writes the release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   versions:
     name: Check versions
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # The tag, the workspace version and the UI package must agree: the
       # updater compares them, and the desktop app takes Cargo's version
@@ -71,6 +75,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # Every release is signed for the updater: stable builds follow
       # latest.json, prereleases latest-beta.json.
@@ -154,7 +160,7 @@ jobs:
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -218,7 +224,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p release-assets
-          tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
+          tar -czf "release-assets/izwi-cli-${GITHUB_REF_NAME}-${{ matrix.asset_suffix }}.tar.gz" \
             -C "${{ github.workspace }}/target/release" \
             izwi izwi-server izwi-gateway izwi-serving-supervisor izwi-serving-worker izwi-desktop \
             -C "${{ github.workspace }}/config/serving" \
@@ -237,7 +243,7 @@ jobs:
             target/release/izwi-serving-worker.exe, `
             config/serving/izwi-serving-node.example.toml, `
             target/release/izwi-desktop.exe `
-            -DestinationPath "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip" `
+            -DestinationPath "release-assets/izwi-cli-$($env:GITHUB_REF_NAME)-${{ matrix.asset_suffix }}.zip" `
             -Force
 
       - name: Include macOS uninstall helper
@@ -473,9 +479,14 @@ jobs:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Download built artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -506,7 +517,7 @@ jobs:
       - name: Generate updater manifest
         run: |
           # Stable tags publish latest.json; prereleases latest-beta.json.
-          if [[ "${{ github.ref_name }}" == *-* ]]; then
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             manifest="dist/latest-beta.json"
           else
             manifest="dist/latest.json"
@@ -530,7 +541,7 @@ jobs:
             fi
           done
 
-          base_url="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          base_url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
           entry() {
             jq -n --arg url "${base_url}/$(basename "$1")" --arg signature "$(tr -d '\r\n' < "$1.sig")" \
               '{url: $url, signature: $signature}'
@@ -556,8 +567,8 @@ jobs:
           fi
 
           jq -n \
-            --arg version "${{ github.ref_name }}" \
-            --arg notes "Izwi ${{ github.ref_name }}" \
+            --arg version "${GITHUB_REF_NAME}" \
+            --arg notes "Izwi ${GITHUB_REF_NAME}" \
             --arg pub_date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
             --argjson platforms "$platforms" \
             --arg macos_floor "$macos_floor" \
@@ -571,8 +582,8 @@ jobs:
       - name: Enforce updater asset matrix consistency
         run: |
           version="$(jq -r '.version' "$UPDATER_MANIFEST")"
-          if [ "$version" != "${{ github.ref_name }}" ]; then
-            echo "::error::$(basename "$UPDATER_MANIFEST") version ($version) does not match tag (${{ github.ref_name }})."
+          if [ "$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::$(basename "$UPDATER_MANIFEST") version ($version) does not match tag (${GITHUB_REF_NAME})."
             exit 1
           fi
 
