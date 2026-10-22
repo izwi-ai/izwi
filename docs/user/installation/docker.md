@@ -10,9 +10,9 @@ One image and one Compose setup serve both development and production. Plain `do
 
 ## Requirements
 
-- **Docker Engine 28.0 or newer** on Linux, or Docker Desktop on macOS and Windows. Older Linux engines let other machines on the same network reach ports published on `127.0.0.1`, which the development setup relies on to stay private.
+- **Docker Engine 28.3.3 or newer** on Linux, or Docker Desktop on macOS and Windows. Older Linux engines could let other machines on the same network reach ports published on `127.0.0.1`, which the development setup relies on to stay private. See [Keep the host patched](#keep-the-host-patched).
 - **Docker Compose v2** with support for the `!override` merge tag (used by the production overlay).
-- **For CUDA**: an NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The CUDA image targets Ampere (compute capability 8.0) or newer GPUs.
+- **For CUDA**: NVIDIA driver 580 or newer and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The CUDA image targets Ampere (compute capability 8.0) or newer GPUs.
 
 ---
 
@@ -32,7 +32,23 @@ For an NVIDIA GPU, start the CUDA service instead. Name it: both services publis
 docker compose --profile cuda up -d izwi-cuda
 ```
 
-After changing the source, rebuild and restart with `docker compose up -d --build`.
+After changing the source, rebuild and restart with `docker compose up -d --build`, or leave `docker compose watch` running to do that whenever a file under `crates/` or `ui/` changes. The build caches compiled dependencies, so a rebuild recompiles only what changed.
+
+### Using a published image
+
+Releases after 0.1.0 also ship signed images on the GitHub Container Registry, so you can skip the build. Verify the signature, then tag the image as the one Compose uses:
+
+```bash
+VERSION=0.1.1   # the release you want, from the Releases page
+docker pull "ghcr.io/izwi-ai/izwi:${VERSION}"
+cosign verify "ghcr.io/izwi-ai/izwi:${VERSION}" \
+  --certificate-identity-regexp '^https://github.com/izwi-ai/izwi/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+docker tag "ghcr.io/izwi-ai/izwi:${VERSION}" izwi:latest
+docker compose up -d
+```
+
+For the CUDA service, use the `${VERSION}-cuda` tag and tag it `izwi:cuda`. The release notes list every image and the matching `gh attestation verify` command.
 
 ### What the development setup allows
 
@@ -70,19 +86,44 @@ The overlay (`docker-compose.prod.yml`) changes these settings and nothing else:
 |---------|-------------|------------|
 | API key | Optional | Required; `docker compose` refuses to start without it |
 | Published on | `127.0.0.1` | `IZWI_PUBLISH_ADDR` (default `127.0.0.1`) |
+| Root filesystem | Writable | Read-only, with a small `/tmp` |
+| Limits | None | 4096 processes and threads; memory from `IZWI_MEM_LIMIT` (for example `24g`) when set |
 | Restart policy | None | `unless-stopped` |
 | Log format | Text | JSON |
 
+Both modes run as the unprivileged `izwi` user (uid 1000) with every Linux capability dropped and privilege escalation disabled, and on an exposed server the public `/livez` and `/readyz` answer with a status only. Version, capacity and startup warnings are on `/v1/health`, which needs the key.
+
 ### Reaching the server from other machines
 
-The server speaks plain HTTP, so anything that crosses a network should go through a TLS-terminating reverse proxy:
+The server speaks plain HTTP, so anything that crosses a network should go through a TLS-terminating reverse proxy. The production overlay includes one: Caddy, which gets and renews a certificate automatically. Point a DNS name at the host, open ports 80 and 443, and add to `.env`:
 
-- Run the proxy on the same host and keep the default `IZWI_PUBLISH_ADDR=127.0.0.1`.
-- Set `IZWI_ALLOWED_HOSTS` to the public host name, so the server answers only that name and `localhost`.
+```bash
+IZWI_DOMAIN=izwi.example.com
+IZWI_ALLOWED_HOSTS=izwi.example.com
+```
+
+Then start it with the `tls` profile:
+
+```bash
+docker compose --profile tls up -d
+```
+
+For the CUDA service, also set `IZWI_TLS_UPSTREAM=izwi-cuda:8080`. To use your own proxy instead, run it on the same host, keep the default `IZWI_PUBLISH_ADDR=127.0.0.1`, and set `IZWI_ALLOWED_HOSTS` to the public host name, so the server answers only that name and `localhost`. Per-client rate limits belong in the proxy.
 
 Setting `IZWI_PUBLISH_ADDR=0.0.0.0` publishes the port on every interface, and the API key then travels unencrypted. Docker's port rules bypass host firewalls such as UFW, so do this only on a network you trust.
 
 Never set `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` in a container. It removes the API key requirement for every client that can reach the port.
+
+### Keeping the key out of the environment
+
+A key in `.env` reaches the container as an environment variable, which `docker inspect` shows to anyone who can use Docker on the host. Orchestrators that mount secrets as files (Docker Swarm, Kubernetes, systemd) can pass the file instead: set `IZWI_API_KEY_FILE` to its absolute path, such as `/run/secrets/izwi_api_key`, and leave `IZWI_API_KEY` unset. The file must be readable by uid 1000.
+
+### Offline and proxied networks
+
+- `IZWI_OFFLINE=1` stops the server from contacting Hugging Face at all: model downloads are refused and sizes come from built-in estimates. Copy model files into the `izwi-models` volume yourself.
+- Downloads use `HTTPS_PROXY` (with `NO_PROXY` exceptions) when it is set.
+
+Add either under `environment:` in a compose file of your own, listed after the others in `COMPOSE_FILE`.
 
 ---
 
@@ -92,6 +133,44 @@ Never set `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` in a container. It removes the AP
 - History (the database) and media live in `izwi-data`.
 
 Both survive `docker compose down` and `docker compose up --force-recreate`. `docker compose down -v` **deletes them**.
+
+### Upgrading
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+The new container mounts the same volumes, and the server migrates the database when it starts. Back up `izwi-data` first.
+
+### Backup and restore
+
+Stop the server so the database is consistent, archive the volume, then start it again:
+
+```bash
+docker compose stop
+docker run --rm -v izwi-data:/data:ro -v "$PWD":/backup debian:trixie-slim \
+  tar czf /backup/izwi-data-backup.tgz -C /data .
+docker compose start
+```
+
+To restore, stop the server, then unpack the archive into the volume:
+
+```bash
+docker compose stop
+docker run --rm -v izwi-data:/data -v "$PWD":/backup debian:trixie-slim \
+  sh -c 'find /data -mindepth 1 -delete && tar xzf /backup/izwi-data-backup.tgz -C /data'
+docker compose start
+```
+
+## Keep the host patched
+
+Container isolation is only as strong as the host's container runtime. Keep Docker Engine (or Docker Desktop), runc, containerd and, for CUDA, the NVIDIA Container Toolkit up to date. In particular:
+
+- **Docker Engine 28.3.3 or newer** on Linux. Older engines could expose ports published on `127.0.0.1` to the local network.
+- **runc 1.2.8, 1.3.3 or newer**, which fix the November 2025 container-escape vulnerabilities (CVE-2025-31133, CVE-2025-52565, CVE-2025-52881).
+- **NVIDIA Container Toolkit 1.17.8 or newer** (CVE-2025-23266).
+- **NVIDIA driver 580 or newer** for the CUDA image, which is built with CUDA 13.0.
 
 ## Without Compose
 
