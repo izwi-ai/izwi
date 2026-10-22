@@ -849,6 +849,7 @@ impl ModelDownloader {
         progress_tx: Option<broadcast::Sender<DownloadProgress>>,
         progress_template: Option<DownloadProgress>,
     ) -> Result<u64> {
+        self.ensure_online()?;
         let url = format!(
             "{}/{}/resolve/{}/{}",
             HF_BASE_URL, repo_id, revision, filename
@@ -1242,11 +1243,7 @@ impl ModelDownloader {
 
     /// Download a model with multi-progress bar display
     pub async fn download(&self, variant: ModelVariant) -> Result<PathBuf> {
-        if self.offline {
-            return Err(Error::HfHubError(format!(
-                "IZWI_OFFLINE is set: {variant} cannot be downloaded; copy its files into the models directory"
-            )));
-        }
+        self.ensure_download_allowed(variant)?;
         let local_dir = self.model_path(variant);
 
         tokio::fs::create_dir_all(&local_dir).await?;
@@ -1372,6 +1369,7 @@ impl ModelDownloader {
         &self,
         variant: ModelVariant,
     ) -> Result<broadcast::Receiver<DownloadProgress>> {
+        self.ensure_download_allowed(variant)?;
         // Set initial state
         self.clear_latest_progress(variant).await;
         self.state_manager
@@ -1449,6 +1447,16 @@ impl ModelDownloader {
         }
     }
 
+    /// `IZWI_OFFLINE` refuses every download, whichever path started it.
+    fn ensure_download_allowed(&self, variant: ModelVariant) -> Result<()> {
+        if self.offline {
+            return Err(Error::HfHubError(format!(
+                "IZWI_OFFLINE is set: {variant} cannot be downloaded; copy its files into the models directory"
+            )));
+        }
+        Ok(())
+    }
+
     /// Every request to Hugging Face goes through here first.
     fn ensure_online(&self) -> Result<()> {
         if self.offline {
@@ -1487,6 +1495,7 @@ impl ModelDownloader {
         variant: ModelVariant,
         progress_tx: broadcast::Sender<DownloadProgress>,
     ) -> Result<PathBuf> {
+        self.ensure_download_allowed(variant)?;
         let local_dir = self.model_path(variant);
 
         tokio::fs::create_dir_all(&local_dir).await?;
@@ -2676,6 +2685,35 @@ mod tests {
             std::env::temp_dir().join(format!("izwi-downloader-test-{}", Uuid::new_v4()));
         let downloader = ModelDownloader::new(temp_dir.clone()).expect("downloader");
         (downloader, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn offline_mode_refuses_every_download_path_without_network() {
+        let (mut downloader, temp_dir) = test_downloader();
+        downloader.offline = true;
+        let variant = *ModelVariant::all()
+            .iter()
+            .find(|variant| variant.is_enabled())
+            .expect("an enabled model");
+
+        for refused in [
+            downloader.download(variant).await.err(),
+            downloader.spawn_download(variant).await.err(),
+        ] {
+            let message = refused.expect("offline downloads are refused").to_string();
+            assert!(message.contains("IZWI_OFFLINE"), "{message}");
+        }
+        let (progress, _) = broadcast::channel(4);
+        assert!(downloader
+            .download_with_progress(variant, progress)
+            .await
+            .is_err());
+        // Sizes fall back to the built-in estimate instead of asking the hub.
+        assert_eq!(
+            downloader.expected_size_bytes(variant).await,
+            variant.estimated_size()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn synthetic_qwen38_index() -> Vec<u8> {
