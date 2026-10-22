@@ -1,87 +1,26 @@
 # =============================================================================
-# Izwi Audio - Docker Ignore
+# Izwi Audio - Docker build context
 # =============================================================================
+# An allowlist: the context holds only what the Dockerfile copies. Anything
+# else in the checkout (local tools' state, task notes, models, credentials)
+# never leaves the machine, whichever builder or COPY is used.
 
-# Git
-.git
-.gitignore
-.gitattributes
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!ui/
+!LICENSE
+!NOTICE
 
-# Build artifacts
-target/
-*.pdb
-*.log
-
-# Language/runtime caches
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.venv/
-venv/
-ENV/
-.eggs/
-*.egg-info/
-*.egg
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-
-# Node.js
+# Inside the allowed directories: build output and local state.
+**/target/
 ui/node_modules/
-ui/.pnp/
-ui/.pnp.js
+ui/dist/
 ui/coverage/
-ui/.next/
-ui/out/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Environment files (but not example)
-.env
-.env.local
-.env.*.local
-!.env.example
-
-# Documentation
-docs/
-CHANGELOG.md
-CONTRIBUTING.md
-LICENSE.md
-
-# Test files
-tests/
-*_test.py
-*_test.rs
-
-# Development files
-.editorconfig
-.pre-commit-config.yaml
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-*.temp
-
-# Model cache (use volumes instead)
-models/
-*.safetensors
-*.bin
-*.onnx
-
-# Logs
-logs/
-*.log
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-.coverage.*
+ui/test-results/
+ui/playwright-report/
+**/.env
+**/.env.*
+**/*.log
+**/.DS_Store
