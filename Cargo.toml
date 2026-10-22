@@ -62,7 +62,7 @@ half = "2.7"
 
 # Audio processing
 hound = "3.5"
-symphonia = { version = "0.5", default-features = false }
+symphonia = { version = "0.6", default-features = false }
 rubato = "0.15"
 rustfft = "6.2"
 

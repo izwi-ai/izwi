@@ -736,12 +736,12 @@ fn decode_audio_bytes_symphonia_with_metadata(
     limits: AudioDecodeLimits,
     output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
-    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
     use symphonia::default::{get_codecs, get_probe};
 
     let container = detect_audio_container(audio_bytes).to_string();
@@ -750,12 +750,12 @@ fn decode_audio_bytes_symphonia_with_metadata(
         Default::default(),
     );
     let hint = Hint::new();
-    let probed = get_probe()
-        .format(
+    let mut format = get_probe()
+        .probe(
             &hint,
             media_source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| {
             Error::InferenceError(format!(
@@ -763,27 +763,38 @@ fn decode_audio_bytes_symphonia_with_metadata(
             ))
         })?;
 
-    let mut format = probed.format;
     let (track_id, codec_params) = {
         let track = format
-            .default_track()
+            .default_track(TrackType::Audio)
             .ok_or_else(|| Error::InferenceError("No default audio track found".to_string()))?;
-        (track.id, track.codec_params.clone())
+        let codec_params = track
+            .codec_params
+            .as_ref()
+            .and_then(|params| params.audio())
+            .cloned()
+            .ok_or_else(|| {
+                Error::InferenceError("Default audio track has no audio codec".to_string())
+            })?;
+        (track.id, codec_params)
     };
     let codec = get_codecs()
-        .get_codec(codec_params.codec)
-        .map(|descriptor| descriptor.short_name.to_string())
+        .get_audio_decoder(codec_params.codec)
+        .map(|registered| registered.codec.info.short_name.to_string())
         .unwrap_or_else(|| format!("{:?}", codec_params.codec));
     let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
     let mut channel_count = codec_params
         .channels
+        .as_ref()
         .map(|channels| u16::try_from(channels.count()).unwrap_or(u16::MAX))
         .unwrap_or(0);
     if sample_rate > 0 && channel_count > 0 {
         limits.validate_format(sample_rate, channel_count)?;
     }
+    // Decoding is gapless (symphonia 0.6's default): encoder delay and padding
+    // frames are trimmed, so samples and timestamps line up with the source
+    // (an MP3 no longer starts with ~1105 frames of LAME/decoder delay).
     let mut decoder = get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
         .map_err(|e| Error::InferenceError(format!("Failed to create audio decoder: {e}")))?;
 
     let mut samples = Vec::new();
@@ -796,7 +807,8 @@ fn decode_audio_bytes_symphonia_with_metadata(
     };
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -825,7 +837,7 @@ fn decode_audio_bytes_symphonia_with_metadata(
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -855,14 +867,14 @@ fn decode_audio_bytes_symphonia_with_metadata(
         };
 
         if sample_rate == 0 {
-            sample_rate = decoded.spec().rate;
-        } else if error_mode.is_strict() && sample_rate != decoded.spec().rate {
+            sample_rate = decoded.spec().rate();
+        } else if error_mode.is_strict() && sample_rate != decoded.spec().rate() {
             return Err(Error::InferenceError(format!(
                 "Audio sample rate changed while decoding {container}/{codec} ({sample_rate} -> {})",
-                decoded.spec().rate
+                decoded.spec().rate()
             )));
         }
-        let channels = decoded.spec().channels.count().max(1);
+        let channels = decoded.spec().channels().count().max(1);
         let decoded_channel_count = u16::try_from(channels).unwrap_or(u16::MAX);
         if channel_count == 0 {
             channel_count = decoded_channel_count;
@@ -921,7 +933,7 @@ fn decode_audio_bytes_symphonia_with_metadata(
 }
 
 fn append_decoded_packet(
-    decoded: symphonia::core::audio::AudioBufferRef<'_>,
+    decoded: symphonia::core::audio::GenericAudioBufferRef<'_>,
     channels: usize,
     out: &mut Vec<f32>,
     max_mono_samples: usize,
@@ -936,37 +948,37 @@ fn append_decoded_packet(
             "Decoded audio would exceed the {max_mono_samples}-sample production limit"
         )));
     }
-    use symphonia::core::audio::AudioBufferRef;
+    use symphonia::core::audio::GenericAudioBufferRef;
     match decoded {
-        AudioBufferRef::U8(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::U8(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::U16(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::U16(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::U24(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::U24(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::U32(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::U32(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::S8(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::S8(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::S16(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::S16(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::S24(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::S24(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::S32(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::S32(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::F32(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::F32(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
-        AudioBufferRef::F64(buffer) => {
-            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        GenericAudioBufferRef::F64(buffer) => {
+            append_planar_packet(buffer, channels, out, max_decoded_bytes)
         }
     }
 }
@@ -975,22 +987,22 @@ fn append_decoded_packet(
 /// the bounded accumulation machinery. Used by the canonical-rate path, which
 /// enforces its limits against the resampled projection.
 fn downmix_decoded_packet(
-    decoded: &symphonia::core::audio::AudioBufferRef<'_>,
+    decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
     channels: usize,
     out: &mut Vec<f32>,
 ) -> Result<()> {
-    use symphonia::core::audio::AudioBufferRef;
+    use symphonia::core::audio::GenericAudioBufferRef;
     match decoded {
-        AudioBufferRef::U8(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::U16(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::U24(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::U32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::S8(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::S16(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::S24(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::S32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::F32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
-        AudioBufferRef::F64(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        GenericAudioBufferRef::U8(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::U16(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::U24(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::U32(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::S8(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::S16(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::S24(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::S32(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::F32(buffer) => downmix_planar_packet(buffer, channels, out),
+        GenericAudioBufferRef::F64(buffer) => downmix_planar_packet(buffer, channels, out),
     }
 }
 
@@ -1001,9 +1013,9 @@ fn append_planar_packet<S>(
     max_decoded_bytes: usize,
 ) -> Result<()>
 where
-    S: symphonia::core::sample::Sample + symphonia::core::conv::IntoSample<f32>,
+    S: symphonia::core::audio::sample::Sample + symphonia::core::audio::conv::IntoSample<f32>,
 {
-    use symphonia::core::audio::Signal;
+    use symphonia::core::audio::Audio;
 
     let packet_bytes = decoded
         .capacity()
@@ -1036,21 +1048,25 @@ fn downmix_planar_packet<S>(
     out: &mut Vec<f32>,
 ) -> Result<()>
 where
-    S: symphonia::core::sample::Sample + symphonia::core::conv::IntoSample<f32>,
+    S: symphonia::core::audio::sample::Sample + symphonia::core::audio::conv::IntoSample<f32>,
 {
-    use symphonia::core::audio::Signal;
-    use symphonia::core::conv::IntoSample;
+    use symphonia::core::audio::conv::IntoSample;
+    use symphonia::core::audio::Audio;
 
-    if channels == 0 || channels > decoded.spec().channels.count() {
+    if channels == 0 || channels > decoded.spec().channels().count() {
         return Err(Error::InvalidInput(
             "Decoded audio packet has an invalid channel count".to_string(),
         ));
     }
+    let plane = |channel| {
+        decoded.plane(channel).ok_or_else(|| {
+            Error::InvalidInput("Decoded audio packet is missing a channel plane".to_string())
+        })
+    };
 
     if channels == 1 {
         out.extend(
-            decoded
-                .chan(0)
+            plane(0)?
                 .iter()
                 .copied()
                 .map(IntoSample::<f32>::into_sample),
@@ -1058,10 +1074,11 @@ where
         return Ok(());
     }
 
+    let planes = (0..channels).map(plane).collect::<Result<Vec<_>>>()?;
     for frame in 0..decoded.frames() {
         let mut sum = 0.0f32;
-        for channel in 0..channels {
-            sum += decoded.chan(channel)[frame].into_sample();
+        for plane in &planes {
+            sum += plane[frame].into_sample();
         }
         out.push(sum / channels as f32);
     }
