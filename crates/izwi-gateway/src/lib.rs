@@ -39,6 +39,7 @@ pub mod gateway_security;
 pub mod gateway_shared_approvals;
 pub mod gateway_tenant_concurrency;
 pub mod gateway_worker_tls;
+pub mod http_serve;
 pub mod ids;
 pub mod lifecycle;
 pub mod logging;

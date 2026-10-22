@@ -170,11 +170,7 @@ where
     S: std::future::Future<Output = ()> + Send + 'static,
 {
     let finished = serve_with_shutdown_plan(
-        |signal| async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .await
-        },
+        |signal| crate::http_serve::serve_router(listener, app, signal),
         state,
         shutdown_requested,
         plan,

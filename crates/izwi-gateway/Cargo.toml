@@ -30,6 +30,8 @@ futures = { workspace = true }
 hmac = { workspace = true }
 http-body = "1"
 http-body-util = "0.1"
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 izwi-db = { path = "../izwi-db" }
 izwi-env = { path = "../izwi-env" }
 izwi-hooks = { path = "../izwi-hooks" }

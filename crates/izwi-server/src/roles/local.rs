@@ -253,11 +253,7 @@ where
 
     info!("Server accepting connections. Press Ctrl+C to stop.");
     let server_result = serve_with_shutdown_plan(
-        |signal| async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .await
-        },
+        |signal| izwi_gateway::http_serve::serve_router(listener, app, signal),
         LocalShutdown {
             state: state.clone(),
             batch_worker_drain,
