@@ -291,6 +291,10 @@ smoke_docker_server() {
     expect_status 401 "http://127.0.0.1:${port}/v1/models"
     expect_status 200 "http://127.0.0.1:${port}/v1/models" \
         -H "Authorization: Bearer ${key}"
+    if curl -s "http://127.0.0.1:${port}/readyz" | grep -q '"request_admission"'; then
+        echo "A keyed server's public /readyz must not report its capacity" >&2
+        return 1
+    fi
 
     echo "Checking SIGTERM drains and exits 0"
     docker stop --time 45 "${name}" >/dev/null
@@ -368,7 +372,7 @@ check_compose_configs() {
 
 # Linter and scanner images for the Docker lane, pinned by digest. Dependabot
 # does not read this script: bump them with the base images.
-HADOLINT_IMAGE="hadolint/hadolint:v2.12.0@sha256:30a8fd2e785ab6176eed53f74769e04f125afb2f74a6c52aef7d463583b6d45e"
+HADOLINT_IMAGE="hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d"
 GRYPE_IMAGE="anchore/grype:v0.120.1@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe"
 
 lint_dockerfile() {
