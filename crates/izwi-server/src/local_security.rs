@@ -27,9 +27,12 @@ use izwi_core::ServeRuntimeConfig;
 use izwi_hooks::{
     AuthProvider, EnterpriseHooks, HookError, HookResult, Principal, RequestEnvelope,
 };
+use izwi_serving_protocol::secret_file::{read_secret_file, SecretFileError};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::api::DESKTOP_CORS_ORIGINS;
@@ -37,6 +40,10 @@ use crate::error::ApiError;
 use crate::gateway_security::{constant_time_eq, is_loopback_host, validate_secret};
 
 pub(crate) const API_KEY_ENV: &str = "IZWI_API_KEY";
+/// A file holding the key instead (a Docker or systemd secret).
+pub(crate) const API_KEY_FILE_ENV: &str = "IZWI_API_KEY_FILE";
+/// The key's 4096-byte maximum plus a trailing CRLF.
+const MAX_API_KEY_FILE_BYTES: u64 = 4098;
 const API_KEY_HEADER: &str = "x-api-key";
 /// Same-site cookie the web UI sets after asking for the key, so browser
 /// requests that cannot carry headers (EventSource, WebSocket, media URLs)
@@ -58,6 +65,10 @@ const PUBLIC_PROBE_PATHS: &[&str] = &[
 pub(crate) enum LocalSecurityError {
     #[error("IZWI_API_KEY must be 16-4096 printable ASCII characters without spaces")]
     InvalidApiKey,
+    #[error("set IZWI_API_KEY or IZWI_API_KEY_FILE, not both")]
+    ConflictingApiKeySources,
+    #[error("IZWI_API_KEY_FILE {0}: {1}")]
+    ApiKeyFile(String, SecretFileError),
     #[error(
         "refusing to bind {0} without an API key: set IZWI_API_KEY, bind 127.0.0.1, set \
          IZWI_LOOPBACK_PUBLISHED=1 if a container publishes the port on the host's loopback \
@@ -86,11 +97,37 @@ pub(crate) struct LocalApiKey {
 }
 
 impl LocalApiKey {
+    /// `IZWI_API_KEY`, or the file `IZWI_API_KEY_FILE` names. Empty values
+    /// count as unset.
     pub(crate) fn from_env() -> Result<Option<Self>, LocalSecurityError> {
-        match std::env::var(API_KEY_ENV) {
-            Ok(value) if !value.is_empty() => Self::new(&value).map(Some),
-            _ => Ok(None),
+        Self::from_sources(
+            std::env::var(API_KEY_ENV).ok(),
+            std::env::var_os(API_KEY_FILE_ENV),
+        )
+    }
+
+    fn from_sources(
+        value: Option<String>,
+        file: Option<OsString>,
+    ) -> Result<Option<Self>, LocalSecurityError> {
+        match (
+            value.filter(|value| !value.is_empty()),
+            file.filter(|path| !path.is_empty()),
+        ) {
+            (Some(_), Some(_)) => Err(LocalSecurityError::ConflictingApiKeySources),
+            (Some(value), None) => Self::new(&value).map(Some),
+            (None, Some(path)) => Self::from_file(Path::new(&path)).map(Some),
+            (None, None) => Ok(None),
         }
+    }
+
+    fn from_file(path: &Path) -> Result<Self, LocalSecurityError> {
+        let file = read_secret_file(path, MAX_API_KEY_FILE_BYTES)
+            .map_err(|error| LocalSecurityError::ApiKeyFile(path.display().to_string(), error))?;
+        let text =
+            std::str::from_utf8(&file.bytes).map_err(|_| LocalSecurityError::InvalidApiKey)?;
+        // `echo key > file` and most secret stores end the file with a newline.
+        Self::new(text.trim_end_matches(['\r', '\n']))
     }
 
     pub(crate) fn new(secret: &str) -> Result<Self, LocalSecurityError> {
@@ -453,6 +490,44 @@ mod tests {
         );
         let debug = format!("{:?}", LocalApiKey::new(KEY).unwrap());
         assert!(!debug.contains(KEY));
+    }
+
+    #[test]
+    fn api_key_can_come_from_a_secret_file() {
+        let dir = std::env::temp_dir().join(format!("izwi-api-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("izwi_api_key");
+        std::fs::write(&file, format!("{KEY}\n")).unwrap();
+        let path = || Some(file.clone().into_os_string());
+
+        let key = LocalApiKey::from_sources(None, path()).unwrap().unwrap();
+        assert!(key.matches(KEY));
+        assert_eq!(
+            LocalApiKey::from_sources(Some(String::new()), path())
+                .unwrap()
+                .map(|key| key.matches(KEY)),
+            Some(true)
+        );
+        assert_eq!(
+            LocalApiKey::from_sources(Some(KEY.to_string()), path()).unwrap_err(),
+            LocalSecurityError::ConflictingApiKeySources
+        );
+        assert!(LocalApiKey::from_sources(None, Some(OsString::new()))
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            LocalApiKey::from_sources(None, Some("relative/key".into())),
+            Err(LocalSecurityError::ApiKeyFile(
+                _,
+                SecretFileError::NotAbsolute
+            ))
+        ));
+        std::fs::write(&file, "short\n").unwrap();
+        assert_eq!(
+            LocalApiKey::from_sources(None, path()).unwrap_err(),
+            LocalSecurityError::InvalidApiKey
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

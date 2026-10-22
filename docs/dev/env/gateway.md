@@ -10,9 +10,9 @@ The gateway (`izwi-gateway`, or `izwi-server --role gateway`) reads these variab
 | `IZWI_CORS` | `false` | Allow cross-origin browser requests from IZWI_CORS_ORIGINS. |
 | `IZWI_CORS_ORIGINS` | `*` | Comma-separated allowed origins; the gateway refuses a wildcard while CORS is on. |
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
-| `IZWI_GATEWAY_API_KEY_REF` | `env:IZWI_GATEWAY_API_KEY` | `env:VARIABLE` naming the public inference API key (16-4096 printable bytes). |
-| `IZWI_GATEWAY_METRICS_API_KEY_REF` | unset | `env:VARIABLE` naming the /metrics key; unset turns /metrics off. Must differ from the inference key. |
-| `IZWI_GATEWAY_ADMIN_API_KEY_REF` | unset | `env:VARIABLE` naming the admin API key; unset turns the admin API off. Must differ from the inference key. |
+| `IZWI_GATEWAY_API_KEY_REF` | `env:IZWI_GATEWAY_API_KEY` | `env:VARIABLE` or `file:/absolute/path` naming the public inference API key (16-4096 printable bytes). |
+| `IZWI_GATEWAY_METRICS_API_KEY_REF` | unset | `env:VARIABLE` or `file:/absolute/path` naming the /metrics key; unset turns /metrics off. Must differ from the inference key. |
+| `IZWI_GATEWAY_ADMIN_API_KEY_REF` | unset | `env:VARIABLE` or `file:/absolute/path` naming the admin API key; unset turns the admin API off. Must differ from the inference key. |
 | `IZWI_GATEWAY_API_PRINCIPAL_ID` | `gateway-api-key` | Principal id of the perimeter key. |
 | `IZWI_GATEWAY_TENANT_ID` | `default` | Tenant of the perimeter key. |
 | `IZWI_GATEWAY_MAX_CHAT_BODY_BYTES` | `1048576` | Largest chat request body (1 KiB to 32 MiB). |

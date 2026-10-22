@@ -75,6 +75,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "API key required on /v1 and /internal routes (16-4096 printable bytes). Required for a non-loopback bind.",
     ),
     var(
+        "IZWI_API_KEY_FILE",
+        "",
+        "Absolute path of a file holding the API key instead (a Docker or systemd secret; one trailing newline is ignored). Setting both is an error.",
+    ),
+    var(
         "IZWI_ALLOW_UNAUTHENTICATED_NETWORK",
         "false",
         "Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network).",
