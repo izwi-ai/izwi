@@ -248,7 +248,7 @@ izwi serve --backend metal
 
 Linux (Docker CUDA):
 ```bash
-IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up -d izwi-cuda
+docker compose --profile cuda up -d izwi-cuda   # see /installation/docker for production
 ```
 
 Linux/Windows source build (CUDA):

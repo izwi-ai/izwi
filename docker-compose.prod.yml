@@ -1,0 +1,35 @@
+# =============================================================================
+# Izwi Audio - Production overlay for docker-compose.yml
+# =============================================================================
+#
+# Enable it with two lines in .env (see .env.example):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#   COMPOSE_PATH_SEPARATOR=:
+# or pass both files to every command:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# On top of the development defaults it:
+#   - requires IZWI_API_KEY (clients send "Authorization: Bearer <key>"),
+#   - publishes on IZWI_PUBLISH_ADDR (default 127.0.0.1, for a reverse proxy on
+#     this host); set 0.0.0.0 only behind TLS, since the server speaks plain HTTP,
+#   - restarts the server and logs JSON.
+#
+# Needs a Docker Compose v2 release that supports the !override merge tag.
+#
+# =============================================================================
+
+x-izwi-production: &izwi-production
+  ports: !override
+    - "${IZWI_PUBLISH_ADDR:-127.0.0.1}:${IZWI_PORT:-8080}:8080"
+  environment:
+    IZWI_LOOPBACK_PUBLISHED: "false"
+    IZWI_API_KEY: ${IZWI_API_KEY:?set IZWI_API_KEY in .env (generate one with openssl rand -hex 32)}
+    IZWI_LOG_FORMAT: json
+  restart: unless-stopped
+
+services:
+  izwi:
+    <<: *izwi-production
+
+  izwi-cuda:
+    <<: *izwi-production

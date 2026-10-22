@@ -136,12 +136,12 @@ Native Linux GitHub Release artifacts are CPU-only. For CUDA-capable binaries on
 nvidia-smi
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
-IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up -d izwi-cuda
+docker compose --profile cuda up -d izwi-cuda
 ```
 
-The container listens on `0.0.0.0`, so the server requires `IZWI_API_KEY` and refuses to start without it. Clients send the key as `Authorization: Bearer <key>`.
+This is the development setup: the server is reachable at `http://localhost:8080` from this machine only and needs no API key. For production (an API key, publishing beyond loopback), see [Docker](/installation/docker).
 
-Adjust `CUDA_COMPUTE_CAP` for the target GPU architecture if you build on a machine without `nvidia-smi`.
+The image targets Ampere (compute capability 8.0) and newer GPUs. To build for another architecture, set `CUDA_COMPUTE_CAP` (for example `CUDA_COMPUTE_CAP=90`) when you build.
 
 ### Source Build CUDA Path
 

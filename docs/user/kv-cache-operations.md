@@ -246,7 +246,7 @@ Examples:
 
 ```bash
 cargo build --release -p izwi-server --features cuda,cudnn
-IZWI_API_KEY="$(openssl rand -hex 32)" docker compose --profile cuda up -d izwi-cuda
+docker compose --profile cuda up -d izwi-cuda
 ```
 
 CUDA compilation does not guarantee that an optimized provider will be used.

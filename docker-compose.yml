@@ -1,23 +1,61 @@
 # =============================================================================
-# Izwi Audio - Production Docker Compose
+# Izwi Audio - Docker Compose (development by default, production by overlay)
 # =============================================================================
 #
-# Usage (set IZWI_API_KEY first, e.g. in .env; clients send it as
-# "Authorization: Bearer <key>"):
-#   CPU:  IZWI_API_KEY=... docker compose up -d
-#   CUDA: IZWI_API_KEY=... docker compose --profile cuda up -d izwi-cuda
-#         (name the service: both publish port 8080 and share the volumes)
+# Development (the default):
+#   CPU:  docker compose up -d
+#   CUDA: docker compose --profile cuda up -d izwi-cuda
+#         (name the service: both publish the same port and share the volumes)
+#   Then open http://localhost:8080.
+#
+#   The port is published on the host's 127.0.0.1 only, and the server runs as
+#   a loopback-only server (IZWI_LOOPBACK_PUBLISHED): no API key, and only
+#   loopback Host names are answered, as when Izwi runs natively. Other
+#   machines cannot reach it. Containers on this network that call it by
+#   service name need IZWI_ALLOWED_HOSTS=izwi.
+#
+# Production: add docker-compose.prod.yml, which requires an API key, can
+# publish beyond loopback, restarts the server and logs JSON. Either put
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#   COMPOSE_PATH_SEPARATOR=:
+#   IZWI_API_KEY=...   (openssl rand -hex 32)
+# in .env (see .env.example) and keep running the commands above, or pass
+# both files: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
 # Models live in the izwi-models volume; history (the database) and media in
 # izwi-data, so both survive `docker compose up --force-recreate`.
 #
 # =============================================================================
 
+x-izwi-environment: &izwi-environment
+  # The container binds 0.0.0.0, but the port below is published on loopback
+  # only, so the server may treat itself as loopback-only.
+  IZWI_LOOPBACK_PUBLISHED: "true"
+  # Optional in development; enforced on /v1 and /internal when set.
+  IZWI_API_KEY: ${IZWI_API_KEY:-}
+  IZWI_ALLOWED_HOSTS: ${IZWI_ALLOWED_HOSTS:-}
+  RUST_LOG: ${RUST_LOG:-izwi_server=info,izwi_gateway=info,izwi_db=info,izwi_core=info,tower_http=warn}
+
+x-izwi-service: &izwi-service
+  ports:
+    - "127.0.0.1:${IZWI_PORT:-8080}:8080"
+  volumes:
+    - izwi-models:/app/models
+    - izwi-data:/app/data
+  # The server drains HTTP requests (20 s) and then batch jobs (20 s).
+  stop_grace_period: 45s
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   # ---------------------------------------------------------------------------
   # Main application (CPU)
   # ---------------------------------------------------------------------------
   izwi:
+    <<: *izwi-service
     build:
       context: .
       dockerfile: Dockerfile
@@ -25,37 +63,14 @@ services:
     image: izwi:latest
     pull_policy: never
     container_name: izwi
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - izwi-models:/app/models
-      - izwi-data:/app/data
     environment:
-      # Required: the container binds 0.0.0.0, so the server needs an API key.
-      - IZWI_API_KEY=${IZWI_API_KEY:-}
-      - IZWI_UI_DIR=/app/ui/dist
-      - IZWI_MODELS_DIR=/app/models
-      - IZWI_DB_PATH=/app/data/izwi.sqlite3
-      - IZWI_MEDIA_DIR=/app/data/media
-      - HF_HOME=/app/models/huggingface
-      - TRANSFORMERS_CACHE=/app/models/huggingface
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      <<: *izwi-environment
 
   # ---------------------------------------------------------------------------
   # Main application (CUDA) - activated with --profile cuda
   # ---------------------------------------------------------------------------
   izwi-cuda:
+    <<: *izwi-service
     build:
       context: .
       dockerfile: Dockerfile
@@ -68,30 +83,8 @@ services:
     container_name: izwi-cuda
     profiles:
       - cuda
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - izwi-models:/app/models
-      - izwi-data:/app/data
     environment:
-      # Required: the container binds 0.0.0.0, so the server needs an API key.
-      - IZWI_API_KEY=${IZWI_API_KEY:-}
-      - IZWI_UI_DIR=/app/ui/dist
-      - IZWI_MODELS_DIR=/app/models
-      - IZWI_DB_PATH=/app/data/izwi.sqlite3
-      - IZWI_MEDIA_DIR=/app/data/media
-      - IZWI_BACKEND=cuda
-      - IZWI_LFM2_DIAGNOSTICS=${IZWI_LFM2_DIAGNOSTICS:-0}
-      # Candidate native Fish batching stays opt-in until this GPU is qualified.
-      - IZWI_FISH_NATIVE_BATCHING=${IZWI_FISH_NATIVE_BATCHING:-false}
-      - IZWI_TTS_TOTAL_SPOOL_BYTES=${IZWI_TTS_TOTAL_SPOOL_BYTES:-1073741824}
-      - IZWI_TTS_TOTAL_UPLOAD_BYTES=${IZWI_TTS_TOTAL_UPLOAD_BYTES:-268435456}
-      - IZWI_AUDIO_STREAM_TOTAL_EVENT_BYTES=${IZWI_AUDIO_STREAM_TOTAL_EVENT_BYTES:-67108864}
-      - HF_HOME=/app/models/huggingface
-      - TRANSFORMERS_CACHE=/app/models/huggingface
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      <<: *izwi-environment
     deploy:
       resources:
         reservations:
@@ -99,17 +92,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
   izwi-models:
