@@ -52,7 +52,7 @@ toml = "1"
 
 # Model loading
 safetensors = "0.8"
-tokenizers = "0.22.2"
+tokenizers = "0.23"
 
 # Candle (native inference)
 candle-core = "0.11.0"
