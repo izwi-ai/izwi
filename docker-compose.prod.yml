@@ -9,7 +9,8 @@
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
 # On top of the development defaults it:
-#   - requires IZWI_API_KEY (clients send "Authorization: Bearer <key>"),
+#   - requires IZWI_API_KEY, or IZWI_API_KEY_FILE for a mounted secret (clients
+#     send "Authorization: Bearer <key>"),
 #   - publishes on IZWI_PUBLISH_ADDR (default 127.0.0.1, for a reverse proxy on
 #     this host); set 0.0.0.0 only behind TLS, since the server speaks plain HTTP,
 #   - runs on a read-only root filesystem with a pids limit and an optional
@@ -24,12 +25,17 @@
 #
 # =============================================================================
 
+# `docker compose` refuses to start without a key: IZWI_API_KEY, or
+# IZWI_API_KEY_FILE naming a mounted secret file (see the Docker docs).
+x-require-api-key: ${IZWI_API_KEY_FILE:-${IZWI_API_KEY:?set IZWI_API_KEY in .env (generate one with openssl rand -hex 32), or IZWI_API_KEY_FILE}}
+
 x-izwi-production: &izwi-production
   ports: !override
     - "${IZWI_PUBLISH_ADDR:-127.0.0.1}:${IZWI_PORT:-8080}:8080"
   environment:
     IZWI_LOOPBACK_PUBLISHED: "false"
-    IZWI_API_KEY: ${IZWI_API_KEY:?set IZWI_API_KEY in .env (generate one with openssl rand -hex 32)}
+    IZWI_API_KEY: ${IZWI_API_KEY:-}
+    IZWI_API_KEY_FILE: ${IZWI_API_KEY_FILE:-}
     IZWI_LOG_FORMAT: json
     # The root filesystem is read-only: the speech spool lives on the data
     # volume (the server clears stale entries at start) and /tmp is small.

@@ -43,7 +43,9 @@ pub struct GatewayCli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub enum GatewayCommand {
     /// Exit 0 when this gateway's listener answers /readyz with 2xx (the
-    /// container HEALTHCHECK); reads the same --host/--port and environment.
+    /// container HEALTHCHECK). It finds the listener through IZWI_HOST and
+    /// IZWI_PORT; flags given to the gateway's own command line are not
+    /// visible to it.
     Healthcheck,
 }
 

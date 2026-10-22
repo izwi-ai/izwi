@@ -127,14 +127,14 @@ services:
       - IZWI_GATEWAY_WORKER_CREDENTIAL_ID=gateway-worker-key-1
       - IZWI_GATEWAY_WORKER_BEARER_TOKEN=${WORKER_BEARER_TOKEN:?set WORKER_BEARER_TOKEN}
       - IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1
+      # Set here rather than as --host/--port, so the healthcheck finds the
+      # same listener.
+      - IZWI_HOST=0.0.0.0
+      - IZWI_PORT=8080
       - IZWI_GATEWAY_PRESTOP_SECS=0
       - IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
     command:
       - "izwi-gateway"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8080"
       - "--public-model"
       - "LFM2.5-1.2B-Instruct-GGUF"
       - "--gateway-worker-approval"

@@ -86,9 +86,10 @@ pub(crate) struct ServerArgs {
 /// One-shot commands run instead of serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub(crate) enum ServerCommand {
-    /// Exit 0 when this server's listener answers /readyz with 2xx. The
-    /// container HEALTHCHECK; it reads the same flags and environment as
-    /// the server to find the port.
+    /// Exit 0 when this server's listener answers /readyz with 2xx (the
+    /// container HEALTHCHECK). It finds the listener through IZWI_HOST,
+    /// IZWI_PORT and the config file, as the server does; flags given to the
+    /// server's own command line are not visible to it.
     Healthcheck,
 }
 
