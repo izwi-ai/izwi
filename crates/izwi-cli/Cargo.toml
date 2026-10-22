@@ -41,7 +41,7 @@ toml = { workspace = true }
 console = "0.16"
 indicatif = { workspace = true }
 dialoguer = "0.12"
-comfy-table = "7.1"
+comfy-table = "8"
 
 # Progress and streaming
 bytes = { workspace = true }
@@ -54,7 +54,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # Utilities
-base64 = "0.22"
+base64 = "0.23"
 rustc_version_runtime = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"

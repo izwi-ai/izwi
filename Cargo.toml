@@ -77,7 +77,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 bytes = "1.9"
-base64 = "0.22"
+base64 = "0.23"
 # rustls without reqwest's built-in aws-lc-rs provider (see `rustls` below):
 # every process installs ring before it builds a client, or hands reqwest a
 # ready rustls config. HTTP/2 and charset decoding stopped being implied in
@@ -95,7 +95,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 indicatif = "0.18"
-dirs = "5.0"
+dirs = "7"
 sha2 = "0.11"
 # Lowercase hex of digests: digest 0.11 outputs have no `{:x}` formatting.
 hex = "0.4"
