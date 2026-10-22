@@ -686,7 +686,7 @@ jobs:
           - `ghcr.io/@OWNER@/izwi:@VERSION@-cuda`: CUDA 13.0 (NVIDIA driver 580 or newer), linux/amd64
           - `ghcr.io/@OWNER@/izwi-gateway:@VERSION@`: API gateway, linux/amd64 and linux/arm64
 
-          Verify an image before running it:
+          Verify an image before running it (cosign 3 or newer):
 
           ```bash
           cosign verify ghcr.io/@OWNER@/izwi:@VERSION@ \

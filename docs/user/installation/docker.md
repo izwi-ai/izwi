@@ -36,7 +36,7 @@ After changing the source, rebuild and restart with `docker compose up -d --buil
 
 ### Using a published image
 
-Releases after 0.1.0 also ship signed images on the GitHub Container Registry, so you can skip the build. Verify the signature, then tag the image as the one Compose uses:
+Releases after 0.1.0 also ship signed images on the GitHub Container Registry, so you can skip the build. Verify the signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or newer, then tag the image as the one Compose uses:
 
 ```bash
 VERSION=0.1.1   # the release you want, from the Releases page
@@ -84,14 +84,14 @@ The overlay (`docker-compose.prod.yml`) changes these settings and nothing else:
 
 | Setting | Development | Production |
 |---------|-------------|------------|
-| API key | Optional | Required; `docker compose` refuses to start without it |
+| API key | Optional | Required (`IZWI_API_KEY` or `IZWI_API_KEY_FILE`); `docker compose` refuses to start without it |
 | Published on | `127.0.0.1` | `IZWI_PUBLISH_ADDR` (default `127.0.0.1`) |
 | Root filesystem | Writable | Read-only, with a small `/tmp` |
 | Limits | None | 4096 processes and threads; memory from `IZWI_MEM_LIMIT` (for example `24g`) when set |
 | Restart policy | None | `unless-stopped` |
 | Log format | Text | JSON |
 
-Both modes run as the unprivileged `izwi` user (uid 1000) with every Linux capability dropped and privilege escalation disabled, and on an exposed server the public `/livez` and `/readyz` answer with a status only. Version, capacity and startup warnings are on `/v1/health`, which needs the key.
+Both modes run as the unprivileged `izwi` user (uid 1000) with every Linux capability dropped and privilege escalation disabled, and on a server with a key the public `/livez` and `/readyz` answer with only the status and version. Capacity, queues and startup warnings are on `/v1/health`, which needs the key.
 
 ### Reaching the server from other machines
 
@@ -116,7 +116,18 @@ Never set `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` in a container. It removes the AP
 
 ### Keeping the key out of the environment
 
-A key in `.env` reaches the container as an environment variable, which `docker inspect` shows to anyone who can use Docker on the host. Orchestrators that mount secrets as files (Docker Swarm, Kubernetes, systemd) can pass the file instead: set `IZWI_API_KEY_FILE` to its absolute path, such as `/run/secrets/izwi_api_key`, and leave `IZWI_API_KEY` unset. The file must be readable by uid 1000.
+A key in `.env` reaches the container as an environment variable, which `docker inspect` shows to anyone who can use Docker on the host. The server can read the key from a file instead: set `IZWI_API_KEY_FILE` to its absolute path inside the container and leave `IZWI_API_KEY` unset. Orchestrators that mount secrets (Docker Swarm, Kubernetes, systemd) do this directly. With Compose, add a file of your own, for example `docker-compose.secret.yml`:
+
+```yaml
+services:
+  izwi:
+    secrets: [izwi_api_key]
+secrets:
+  izwi_api_key:
+    file: ./secrets/izwi_api_key
+```
+
+Then write the key to `./secrets/izwi_api_key` and, in `.env`, replace the `IZWI_API_KEY` line with `IZWI_API_KEY_FILE=/run/secrets/izwi_api_key` and append `:docker-compose.secret.yml` to `COMPOSE_FILE`. The file must be readable by uid 1000.
 
 ### Offline and proxied networks
 
@@ -142,6 +153,12 @@ docker compose up -d --build
 ```
 
 The new container mounts the same volumes, and the server migrates the database when it starts. Back up `izwi-data` first.
+
+The server runs as uid 1000 with no capabilities, so it cannot write files that another user owns. If models were downloaded by the development container from Izwi 0.1.0 or earlier, which ran as root, hand the volume to uid 1000 once:
+
+```bash
+docker run --rm -v izwi-models:/models debian:trixie-slim chown -R 1000:1000 /models
+```
 
 ### Backup and restore
 
