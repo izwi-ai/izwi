@@ -55,6 +55,7 @@ pub(crate) async fn run_local(
         api_key.as_ref(),
         args.allow_unauthenticated_network || tuning.allow_unauthenticated_network,
     )?;
+    local_security::validate_local_cors(&serve_config, api_key.as_ref())?;
     let loopback_bind = gateway_security::is_loopback_host(&serve_config.host);
     if api_key.is_some() {
         info!("Local API key required on /v1 and /internal routes");

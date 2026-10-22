@@ -67,6 +67,11 @@ pub(crate) enum LocalSecurityError {
     InvalidApiKey,
     #[error("set IZWI_API_KEY or IZWI_API_KEY_FILE, not both")]
     ConflictingApiKeySources,
+    #[error(
+        "CORS allows every origin, which would let any web page read this server's API \
+         without a key: list the origins in IZWI_CORS_ORIGINS, or set IZWI_API_KEY"
+    )]
+    UnauthenticatedWildcardCors,
     #[error("IZWI_API_KEY_FILE {0}: {1}")]
     ApiKeyFile(String, SecretFileError),
     #[error(
@@ -167,6 +172,29 @@ pub(crate) fn validate_local_bind(
     Err(LocalSecurityError::UnauthenticatedNetworkBind(
         host.to_string(),
     ))
+}
+
+/// Wildcard CORS lets any web page read API responses. Without a key that
+/// stays allowed only on a native loopback bind (the documented `--cors`);
+/// a container's or the opt-out's network bind needs listed origins.
+pub(crate) fn validate_local_cors(
+    serve_config: &ServeRuntimeConfig,
+    api_key: Option<&LocalApiKey>,
+) -> Result<(), LocalSecurityError> {
+    if api_key.is_none() && !is_loopback_host(&serve_config.host) && allows_any_origin(serve_config)
+    {
+        return Err(LocalSecurityError::UnauthenticatedWildcardCors);
+    }
+    Ok(())
+}
+
+fn allows_any_origin(serve_config: &ServeRuntimeConfig) -> bool {
+    serve_config.cors_enabled
+        && (serve_config.cors_origins.is_empty()
+            || serve_config
+                .cors_origins
+                .iter()
+                .any(|origin| origin.trim() == "*"))
 }
 
 /// Install the API key check in front of the build's auth provider.
@@ -270,12 +298,7 @@ pub(crate) struct LocalRequestGuard {
 
 impl LocalRequestGuard {
     pub(crate) fn new(serve_config: &ServeRuntimeConfig, exposure: &LocalExposure) -> Self {
-        let any_origin = serve_config.cors_enabled
-            && (serve_config.cors_origins.is_empty()
-                || serve_config
-                    .cors_origins
-                    .iter()
-                    .any(|origin| origin.trim() == "*"));
+        let any_origin = allows_any_origin(serve_config);
         let allowed_origins = if serve_config.cors_enabled {
             serve_config
                 .cors_origins
@@ -476,6 +499,35 @@ mod tests {
             assert_eq!(validate_local_bind(host, &network, None, true), Ok(()));
             assert_eq!(validate_local_bind(host, &published, None, false), Ok(()));
         }
+    }
+
+    #[test]
+    fn wildcard_cors_needs_a_key_off_loopback() {
+        let key = LocalApiKey::new(KEY).unwrap();
+        let config = |host: &str, origins: &[&str]| ServeRuntimeConfig {
+            host: host.to_string(),
+            cors_enabled: true,
+            cors_origins: origins.iter().map(|origin| origin.to_string()).collect(),
+            ..ServeRuntimeConfig::default()
+        };
+        for origins in [&[][..], &["*"][..]] {
+            assert_eq!(
+                validate_local_cors(&config("0.0.0.0", origins), None),
+                Err(LocalSecurityError::UnauthenticatedWildcardCors)
+            );
+            assert_eq!(
+                validate_local_cors(&config("0.0.0.0", origins), Some(&key)),
+                Ok(())
+            );
+            assert_eq!(
+                validate_local_cors(&config("127.0.0.1", origins), None),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_local_cors(&config("0.0.0.0", &["http://localhost:3000"]), None),
+            Ok(())
+        );
     }
 
     #[test]

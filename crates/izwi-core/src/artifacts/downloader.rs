@@ -439,6 +439,26 @@ fn download_disk_requirement(files: &[(&str, u64, bool)], extracts_nemo: bool) -
 /// `error` and its causes, without repeating a cause its parent already
 /// quotes. reqwest's `Display` leaves out the cause (refused connection, DNS or
 /// TLS failure), which is the useful part of a failed download.
+/// The proxy from `HTTPS_PROXY` (or `https_proxy`, `ALL_PROXY`), with the
+/// `NO_PROXY` exceptions; `None` when none is set.
+fn https_proxy_from_env() -> Result<Option<reqwest::Proxy>> {
+    let Some(url) = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    else {
+        return Ok(None);
+    };
+    // The URL may carry credentials, so the error does not repeat it.
+    let proxy = reqwest::Proxy::https(url.trim())
+        .map_err(|_| Error::HfHubError("HTTPS_PROXY is not a valid proxy URL".to_string()))?
+        .no_proxy(reqwest::NoProxy::from_env());
+    Ok(Some(proxy))
+}
+
 fn error_chain(error: &dyn std::error::Error) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
@@ -666,6 +686,8 @@ pub struct ModelDownloader {
     downloaded_sizes: Arc<RwLock<HashMap<ModelVariant, u64>>>,
     multi_progress: MultiProgress,
     state_manager: DownloadStateManager,
+    /// `IZWI_OFFLINE`: no request ever goes to Hugging Face.
+    offline: bool,
 }
 
 impl ModelDownloader {
@@ -675,14 +697,20 @@ impl ModelDownloader {
 
         // reqwest's rustls has no built-in crypto provider in this workspace.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http_client = reqwest::Client::builder()
+        let mut http_client = reqwest::Client::builder()
             // Large model files can take significant time on slower links.
             .timeout(std::time::Duration::from_secs(6 * 3600))
             // Avoid macOS SystemConfiguration proxy lookups which can fail in
             // restricted runtime environments (sandboxed agents/CI).
-            .no_proxy()
-            .build()
-            .map_err(|e| Error::HfHubError(format!("Failed to create HTTP client: {}", error_chain(&e))))?;
+            .no_proxy();
+        // An explicit HTTPS_PROXY (a corporate or container egress proxy)
+        // still applies, with NO_PROXY exceptions.
+        if let Some(proxy) = https_proxy_from_env()? {
+            http_client = http_client.proxy(proxy);
+        }
+        let http_client = http_client.build().map_err(|e| {
+            Error::HfHubError(format!("Failed to create HTTP client: {}", error_chain(&e)))
+        })?;
 
         let multi_progress = MultiProgress::new();
         multi_progress.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(10));
@@ -698,6 +726,7 @@ impl ModelDownloader {
             downloaded_sizes: Arc::new(RwLock::new(HashMap::new())),
             multi_progress,
             state_manager: DownloadStateManager::new(),
+            offline: crate::env::flag_or("IZWI_OFFLINE", false),
         })
     }
 
@@ -726,6 +755,7 @@ impl ModelDownloader {
         repo_id: &str,
         revision: &str,
     ) -> Result<HashMap<String, u64>> {
+        self.ensure_online()?;
         let cache_key = format!("{repo_id}@{revision}");
         if let Some(cached) = self.repo_tree_cache.read().await.get(&cache_key).cloned() {
             return Ok(cached);
@@ -782,6 +812,7 @@ impl ModelDownloader {
         revision: &str,
         filename: &str,
     ) -> Result<Vec<u8>> {
+        self.ensure_online()?;
         let url = format!(
             "{}/{}/resolve/{}/{}",
             HF_BASE_URL, repo_id, revision, filename
@@ -1211,6 +1242,11 @@ impl ModelDownloader {
 
     /// Download a model with multi-progress bar display
     pub async fn download(&self, variant: ModelVariant) -> Result<PathBuf> {
+        if self.offline {
+            return Err(Error::HfHubError(format!(
+                "IZWI_OFFLINE is set: {variant} cannot be downloaded; copy its files into the models directory"
+            )));
+        }
         let local_dir = self.model_path(variant);
 
         tokio::fs::create_dir_all(&local_dir).await?;
@@ -1409,7 +1445,18 @@ impl ModelDownloader {
             downloaded_sizes: Arc::clone(&self.downloaded_sizes),
             multi_progress: MultiProgress::new(), // Each spawned task gets its own multi-progress
             state_manager: self.state_manager.clone(),
+            offline: self.offline,
         }
+    }
+
+    /// Every request to Hugging Face goes through here first.
+    fn ensure_online(&self) -> Result<()> {
+        if self.offline {
+            return Err(Error::HfHubError(
+                "IZWI_OFFLINE is set: Hugging Face is not contacted".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Check if a download is active
@@ -2125,6 +2172,7 @@ impl ModelDownloader {
         revision: &str,
         filename: &str,
     ) -> Result<u64> {
+        self.ensure_online()?;
         let url = format!(
             "{}/{}/resolve/{}/{}",
             HF_BASE_URL, repo_id, revision, filename
@@ -2469,6 +2517,9 @@ impl ModelDownloader {
             return size;
         }
 
+        if self.offline {
+            return variant.estimated_size();
+        }
         let resolved = match self.get_file_download_plans(variant).await {
             Ok(plans) => plans.iter().map(|plan| plan.expected_size).sum::<u64>(),
             Err(err) => {

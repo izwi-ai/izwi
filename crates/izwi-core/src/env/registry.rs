@@ -1201,6 +1201,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Number of compute threads (0 or invalid ignored; floor 1).",
     ),
     CoreEnvVar::new(
+        "IZWI_OFFLINE",
+        Flag,
+        "false",
+        Startup,
+        "Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates.",
+    ),
+    CoreEnvVar::new(
         "IZWI_PARAKEET_ASR_DTYPE",
         Choice,
         "F16 encoder projections on Metal, else F32",
