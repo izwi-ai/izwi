@@ -1,0 +1,18 @@
+# cargo-audit configuration (.github/workflows/dependency-audit.yml).
+# `cargo audit` fails on any RustSec vulnerability not listed here;
+# unmaintained and unsound crates are reported without failing. Recheck each
+# entry when candle-core or tauri-plugin-updater ships a release.
+[advisories]
+ignore = [
+    # zip below 9: extract() keeps SUID/SGID bits (0367), creates symlinks that
+    # point outside the destination (0368) and applies permissions through
+    # symlinks (0369). Our own zip is 9.x. The affected copies come from crates
+    # with no fixed release:
+    # - zip 8 in candle-core 0.11, which opens .npz/.pth archives and reads
+    #   entries by name; it never calls extract().
+    # - zip 4 in tauri-plugin-updater 2.14 (requires zip ^4), which extracts
+    #   only Windows update packages, after their minisign signature verifies.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]

@@ -1,0 +1,55 @@
+name: Dependency Audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - ".cargo/audit.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - ".cargo/audit.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+  schedule:
+    # Advisories are published without any repository change.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: RustSec Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup Rust toolchain
+        # Pinned like the Backend Truth lanes.
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      # Before checkout, so the workspace .cargo/config.toml (a python
+      # rustc-wrapper) does not apply to this build.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Audit Cargo.lock against the RustSec advisory database
+        # Fails on vulnerabilities. Accepted advisories, each with its
+        # reason, are in .cargo/audit.toml.
+        run: cargo audit
