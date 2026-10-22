@@ -751,22 +751,25 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1]);
     }
 
-    #[tokio::test]
-    async fn lanes_share_the_device_by_weight() {
-        let thread = test_thread();
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let release = block(&thread);
-        let busy = Duration::from_millis(5);
-        let mut jobs = queue_flow(&thread, 1, 1, 12, busy, &order);
-        jobs.extend(queue_flow(&thread, 2, 6, 12, busy, &order));
-        release.send(()).unwrap();
-        for job in jobs {
-            job.await.expect("job");
+    #[test]
+    fn lanes_share_the_device_by_weight() {
+        // Charged with a fixed time: a slept job's measured time varies on a
+        // loaded host, and so would the order.
+        let mut arbiter = Arbiter::default();
+        for (flow, weight) in [(1, 1), (2, 6)] {
+            for _ in 0..12 {
+                arbiter.push(Box::new(|| {}), Some(DeviceJobTag { flow, weight }));
+            }
         }
-        // Equal jobs at weights 1 and 6: about one light job per six heavy.
-        let order = order.lock().unwrap();
-        let light = order[..14].iter().filter(|flow| **flow == 1).count();
-        assert!((2..=3).contains(&light), "{order:?}");
+        let mut order = Vec::new();
+        while let Some((_, charge)) = arbiter.pop() {
+            let (flow, weight) = charge.expect("tagged job");
+            arbiter.charge(flow, weight, Duration::from_millis(5));
+            order.push(flow);
+        }
+        // Equal jobs at weights 1 and 6: one light job per six heavy.
+        let round = [1, 2, 2, 2, 2, 2, 2];
+        assert_eq!(order, [&round[..], &round, &[1; 10]].concat());
     }
 
     #[test]
