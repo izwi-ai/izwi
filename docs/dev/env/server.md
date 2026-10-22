@@ -15,6 +15,8 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_NODE_ID` | `local` | This node's id on a shared database (1-128 ASCII letters, digits, `-`, `_`); startup fails only the in-process jobs it owns. |
 | `IZWI_API_KEY` | unset | API key required on /v1 and /internal routes (16-4096 printable bytes). Required for a non-loopback bind. |
 | `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` | `false` | Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network). |
+| `IZWI_LOOPBACK_PUBLISHED` | `false` | The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served. |
+| `IZWI_ALLOWED_HOSTS` | unset | Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on. |
 | `IZWI_PRELOAD_MODELS` | unset | Comma-separated model ids loaded at start-up; readiness waits for them. |
 | `IZWI_WARMUP_PRELOADED_MODELS` | `true` | Run a warm-up request on each preloaded model. |
 | `IZWI_ASR_WARMUP_DURATION_MS` | `800` | Length of the ASR warm-up clip (100-5000). |

@@ -2,19 +2,21 @@
 //!
 //! The local role binds loopback by default. Binding any other address needs
 //! the built-in API key (`IZWI_API_KEY`) unless the operator explicitly opts
-//! out with `--allow-unauthenticated-network`. Like the gateway credentials,
-//! the key is read only from the environment so it never appears in argv, and
-//! only its SHA-256 digest is kept in memory.
+//! out with `--allow-unauthenticated-network`, or declares with
+//! `IZWI_LOOPBACK_PUBLISHED` that a container publishes the port on the
+//! host's loopback only, in which case the bind is treated as loopback. Like
+//! the gateway credentials, the key is read only from the environment so it
+//! never appears in argv, and only its SHA-256 digest is kept in memory.
 //!
 //! The key is enforced through the enterprise `AuthProvider` seam: it wraps
 //! whatever provider the build supplies, so the principal (and therefore the
 //! tenant) still comes from that provider.
 //!
 //! Independently of the key, [`guard_local_request`] protects browsers'
-//! access to the server: a loopback-bound server only answers loopback `Host`
-//! names (DNS rebinding), and writes and WebSocket upgrades from another
-//! site's page are rejected by `Origin`, plus form content types that a
-//! cross-site form can send without a CORS preflight.
+//! access to the server: a loopback-only server only answers loopback `Host`
+//! names and `IZWI_ALLOWED_HOSTS` (DNS rebinding), and writes and WebSocket
+//! upgrades from another site's page are rejected by `Origin`, plus form
+//! content types that a cross-site form can send without a CORS preflight.
 
 use async_trait::async_trait;
 use axum::extract::{Request, State};
@@ -57,10 +59,24 @@ pub(crate) enum LocalSecurityError {
     #[error("IZWI_API_KEY must be 16-4096 printable ASCII characters without spaces")]
     InvalidApiKey,
     #[error(
-        "refusing to bind {0} without an API key: set IZWI_API_KEY, bind 127.0.0.1, or pass \
-         --allow-unauthenticated-network to expose the server without authentication"
+        "refusing to bind {0} without an API key: set IZWI_API_KEY, bind 127.0.0.1, set \
+         IZWI_LOOPBACK_PUBLISHED=1 if a container publishes the port on the host's loopback \
+         only, or pass --allow-unauthenticated-network to expose the server without \
+         authentication"
     )]
     UnauthenticatedNetworkBind(String),
+}
+
+/// How clients reach the port, beyond what the bind address says
+/// (`IZWI_LOOPBACK_PUBLISHED`, `IZWI_ALLOWED_HOSTS`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LocalExposure {
+    /// A container publishes the port on the host's loopback only, so a
+    /// non-loopback bind is treated as a loopback one.
+    pub(crate) loopback_published: bool,
+    /// Extra lower-cased `Host` names to answer. On a network bind, a
+    /// non-empty list turns the Host check on.
+    pub(crate) allowed_hosts: Vec<String>,
 }
 
 /// Digest of the configured local API key.
@@ -96,13 +112,19 @@ impl fmt::Debug for LocalApiKey {
     }
 }
 
-/// Refuse a non-loopback bind without a key unless explicitly allowed.
+/// Refuse a non-loopback bind without a key unless it is published on
+/// loopback only or explicitly allowed.
 pub(crate) fn validate_local_bind(
     host: &str,
+    exposure: &LocalExposure,
     api_key: Option<&LocalApiKey>,
     allow_unauthenticated_network: bool,
 ) -> Result<(), LocalSecurityError> {
-    if is_loopback_host(host) || api_key.is_some() || allow_unauthenticated_network {
+    if is_loopback_host(host)
+        || exposure.loopback_published
+        || api_key.is_some()
+        || allow_unauthenticated_network
+    {
         return Ok(());
     }
     Err(LocalSecurityError::UnauthenticatedNetworkBind(
@@ -201,14 +223,16 @@ fn percent_decode(value: &str) -> Option<String> {
 /// Host and Origin policy for browser-reachable local requests.
 #[derive(Clone, Debug)]
 pub(crate) struct LocalRequestGuard {
-    loopback_bind: bool,
+    /// Bound to loopback, or published on loopback only.
+    loopback_only: bool,
     bound_host: String,
+    allowed_hosts: Arc<[String]>,
     any_origin: bool,
     allowed_origins: Arc<[String]>,
 }
 
 impl LocalRequestGuard {
-    pub(crate) fn new(serve_config: &ServeRuntimeConfig) -> Self {
+    pub(crate) fn new(serve_config: &ServeRuntimeConfig, exposure: &LocalExposure) -> Self {
         let any_origin = serve_config.cors_enabled
             && (serve_config.cors_origins.is_empty()
                 || serve_config
@@ -225,11 +249,27 @@ impl LocalRequestGuard {
             Arc::from([])
         };
         Self {
-            loopback_bind: is_loopback_host(&serve_config.host),
+            loopback_only: is_loopback_host(&serve_config.host) || exposure.loopback_published,
             bound_host: host_name(&serve_config.host).to_ascii_lowercase(),
+            allowed_hosts: exposure.allowed_hosts.iter().cloned().collect(),
             any_origin,
             allowed_origins,
         }
+    }
+
+    /// Loopback-only servers check every `Host`; network binds only once
+    /// `IZWI_ALLOWED_HOSTS` names the hosts they serve.
+    fn host_allowed(&self, host: &str) -> bool {
+        if !self.loopback_only && self.allowed_hosts.is_empty() {
+            return true;
+        }
+        let name = host_name(host);
+        is_loopback_name(name)
+            || name.eq_ignore_ascii_case(&self.bound_host)
+            || self
+                .allowed_hosts
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed))
     }
 
     fn check(
@@ -242,14 +282,9 @@ impl LocalRequestGuard {
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
             .or(authority);
-        if self.loopback_bind
-            && host.is_some_and(|host| {
-                let name = host_name(host);
-                !is_loopback_name(name) && !name.eq_ignore_ascii_case(&self.bound_host)
-            })
-        {
+        if host.is_some_and(|host| !self.host_allowed(host)) {
             return Err(ApiError::forbidden(
-                "Host header is not allowed for a loopback-bound server",
+                "Host header is not allowed; add the name to IZWI_ALLOWED_HOSTS",
             ));
         }
 
@@ -311,11 +346,11 @@ pub(crate) async fn guard_local_request(
     if let Err(err) = guard.check(req.method(), req.headers(), authority) {
         return err.into_response();
     }
-    crate::error::showing_server_faults(guard.loopback_bind, next.run(req)).await
+    crate::error::showing_server_faults(guard.loopback_only, next.run(req)).await
 }
 
 /// Host name without port or IPv6 brackets.
-fn host_name(host: &str) -> &str {
+pub(crate) fn host_name(host: &str) -> &str {
     let host = host.trim();
     if let Some(rest) = host.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
@@ -380,16 +415,29 @@ mod tests {
     #[test]
     fn non_loopback_bind_requires_a_key_or_explicit_opt_out() {
         let key = LocalApiKey::new(KEY).unwrap();
+        let network = LocalExposure::default();
+        let published = LocalExposure {
+            loopback_published: true,
+            ..LocalExposure::default()
+        };
         for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
-            assert_eq!(validate_local_bind(host, None, false), Ok(()), "{host}");
+            assert_eq!(
+                validate_local_bind(host, &network, None, false),
+                Ok(()),
+                "{host}"
+            );
         }
         for host in ["0.0.0.0", "::", "192.168.1.20", "my-mac.local"] {
             assert!(matches!(
-                validate_local_bind(host, None, false),
+                validate_local_bind(host, &network, None, false),
                 Err(LocalSecurityError::UnauthenticatedNetworkBind(_))
             ));
-            assert_eq!(validate_local_bind(host, Some(&key), false), Ok(()));
-            assert_eq!(validate_local_bind(host, None, true), Ok(()));
+            assert_eq!(
+                validate_local_bind(host, &network, Some(&key), false),
+                Ok(())
+            );
+            assert_eq!(validate_local_bind(host, &network, None, true), Ok(()));
+            assert_eq!(validate_local_bind(host, &published, None, false), Ok(()));
         }
     }
 
@@ -469,15 +517,27 @@ mod tests {
     }
 
     fn guard_for(host: &str, cors_enabled: bool, cors_origins: &[&str]) -> LocalRequestGuard {
-        LocalRequestGuard::new(&ServeRuntimeConfig {
-            host: host.to_string(),
-            cors_enabled,
-            cors_origins: cors_origins
-                .iter()
-                .map(|origin| origin.to_string())
-                .collect(),
-            ..ServeRuntimeConfig::default()
-        })
+        guard_exposed(host, cors_enabled, cors_origins, &LocalExposure::default())
+    }
+
+    fn guard_exposed(
+        host: &str,
+        cors_enabled: bool,
+        cors_origins: &[&str],
+        exposure: &LocalExposure,
+    ) -> LocalRequestGuard {
+        LocalRequestGuard::new(
+            &ServeRuntimeConfig {
+                host: host.to_string(),
+                cors_enabled,
+                cors_origins: cors_origins
+                    .iter()
+                    .map(|origin| origin.to_string())
+                    .collect(),
+                ..ServeRuntimeConfig::default()
+            },
+            exposure,
+        )
     }
 
     fn check(
@@ -529,6 +589,77 @@ mod tests {
                 &[(header::HOST, "my-mac.local:8080")]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn loopback_published_container_keeps_the_loopback_host_check() {
+        // A container binds 0.0.0.0 but publishes 127.0.0.1 only: DNS
+        // rebinding must still fail, while compose service names can opt in.
+        let guard = guard_exposed(
+            "0.0.0.0",
+            false,
+            &[],
+            &LocalExposure {
+                loopback_published: true,
+                allowed_hosts: vec!["izwi".to_string()],
+            },
+        );
+        for host in [
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "IZWI:8080",
+        ] {
+            assert_eq!(
+                check(&guard, Method::GET, &[(header::HOST, host)]),
+                None,
+                "{host}"
+            );
+        }
+        for host in ["attacker.example:8080", "192.168.1.5:8080", "izwi.example"] {
+            assert_eq!(
+                check(&guard, Method::GET, &[(header::HOST, host)]),
+                Some(StatusCode::FORBIDDEN),
+                "{host}"
+            );
+        }
+        // The rebinding page's Origin matches its Host, so the Host check is
+        // what stops it.
+        assert_eq!(
+            check(
+                &guard,
+                Method::POST,
+                &[
+                    (header::HOST, "attacker.example:8080"),
+                    (header::ORIGIN, "http://attacker.example:8080"),
+                ]
+            ),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_turn_the_host_check_on_for_a_network_bind() {
+        let guard = guard_exposed(
+            "0.0.0.0",
+            false,
+            &[],
+            &LocalExposure {
+                loopback_published: false,
+                allowed_hosts: vec!["izwi.example.com".to_string()],
+            },
+        );
+        for host in ["izwi.example.com", "izwi.example.com:443", "127.0.0.1:8080"] {
+            assert_eq!(
+                check(&guard, Method::GET, &[(header::HOST, host)]),
+                None,
+                "{host}"
+            );
+        }
+        assert_eq!(
+            check(&guard, Method::GET, &[(header::HOST, "attacker.example")]),
+            Some(StatusCode::FORBIDDEN)
         );
     }
 

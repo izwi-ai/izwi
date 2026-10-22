@@ -123,7 +123,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
             attach_enterprise_request_context,
         ))
         .layer(middleware::from_fn_with_state(
-            LocalRequestGuard::new(serve_config),
+            LocalRequestGuard::new(serve_config, &crate::env_config::tuning().local_exposure),
             guard_local_request,
         ));
     // CORS is the outermost layer so browser preflights are answered before

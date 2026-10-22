@@ -19,6 +19,7 @@ use izwi_serving_protocol::env::{EnvSnapshot, EnvVar};
 
 use crate::api::openai::compat::OpenAiCompatibilityProfile;
 use crate::batch_runtime::store::{QuotaLimits, RetentionPolicy};
+use crate::local_security::LocalExposure;
 
 const fn var(name: &'static str, default: &'static str, description: &'static str) -> EnvVar {
     EnvVar {
@@ -77,6 +78,16 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "IZWI_ALLOW_UNAUTHENTICATED_NETWORK",
         "false",
         "Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network).",
+    ),
+    var(
+        "IZWI_LOOPBACK_PUBLISHED",
+        "false",
+        "The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served.",
+    ),
+    var(
+        "IZWI_ALLOWED_HOSTS",
+        "",
+        "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",
     ),
     var(
         "IZWI_PRELOAD_MODELS",
@@ -362,6 +373,7 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ServerTuning {
     pub(crate) allow_unauthenticated_network: bool,
+    pub(crate) local_exposure: LocalExposure,
     pub(crate) openai_compat_profile: OpenAiCompatibilityProfile,
     /// `None` takes the profile's default.
     pub(crate) openai_audio_upload_limit_mb: Option<usize>,
@@ -408,6 +420,10 @@ impl ServerTuning {
         Ok(Self {
             allow_unauthenticated_network: env
                 .flag_or("IZWI_ALLOW_UNAUTHENTICATED_NETWORK", false)?,
+            local_exposure: LocalExposure {
+                loopback_published: env.flag_or("IZWI_LOOPBACK_PUBLISHED", false)?,
+                allowed_hosts: allowed_hosts(env.get("IZWI_ALLOWED_HOSTS")?.unwrap_or(""))?,
+            },
             openai_compat_profile: match env
                 .get("IZWI_OPENAI_COMPAT_PROFILE")?
                 .map(|value| value.trim().to_ascii_lowercase())
@@ -543,6 +559,25 @@ where
     T::Err: std::fmt::Display,
 {
     Ok(optional_at_least(env, name, min)?.unwrap_or(default))
+}
+
+/// `IZWI_ALLOWED_HOSTS`: lower-cased host names, ports and blanks dropped.
+fn allowed_hosts(value: &str) -> anyhow::Result<Vec<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let name = crate::local_security::host_name(entry);
+            if name.is_empty()
+                || name.contains(['/', '*', '@'])
+                || name.chars().any(char::is_whitespace)
+            {
+                bail!("IZWI_ALLOWED_HOSTS entries must be host names, not {entry:?}");
+            }
+            Ok(name.to_ascii_lowercase())
+        })
+        .collect()
 }
 
 fn optional_at_least<T>(env: &EnvSnapshot, name: &str, min: T) -> anyhow::Result<Option<T>>

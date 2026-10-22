@@ -48,15 +48,25 @@ pub(crate) async fn run_local(
     );
 
     let api_key = local_security::LocalApiKey::from_env()?;
+    let tuning = crate::env_config::tuning();
     local_security::validate_local_bind(
         &serve_config.host,
+        &tuning.local_exposure,
         api_key.as_ref(),
-        args.allow_unauthenticated_network
-            || crate::env_config::tuning().allow_unauthenticated_network,
+        args.allow_unauthenticated_network || tuning.allow_unauthenticated_network,
     )?;
+    let loopback_bind = gateway_security::is_loopback_host(&serve_config.host);
     if api_key.is_some() {
         info!("Local API key required on /v1 and /internal routes");
-    } else if !gateway_security::is_loopback_host(&serve_config.host) {
+    } else if !loopback_bind && tuning.local_exposure.loopback_published {
+        info!(
+            host = %serve_config.host,
+            allowed_hosts = ?tuning.local_exposure.allowed_hosts,
+            "IZWI_LOOPBACK_PUBLISHED: serving without an API key as a loopback-only server; \
+             only loopback and IZWI_ALLOWED_HOSTS Host names are answered. Publish the port \
+             on 127.0.0.1 only, or set IZWI_API_KEY."
+        );
+    } else if !loopback_bind {
         warn!(
             host = %serve_config.host,
             "SECURITY WARNING: serving a non-loopback address WITHOUT authentication \

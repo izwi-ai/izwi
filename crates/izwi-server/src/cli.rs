@@ -30,7 +30,8 @@ pub(crate) struct ServerArgs {
     pub(crate) performance: Vec<izwi_core::PerformanceConfigOverrides>,
 
     /// Host to bind to (default 127.0.0.1). A non-loopback bind on the local
-    /// role requires IZWI_API_KEY unless --allow-unauthenticated-network.
+    /// role requires IZWI_API_KEY unless IZWI_LOOPBACK_PUBLISHED or
+    /// --allow-unauthenticated-network.
     #[arg(short = 'H', long)]
     pub(crate) host: Option<String>,
 
