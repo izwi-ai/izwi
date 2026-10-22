@@ -1,7 +1,7 @@
 //! The `izwi-server` command line: arguments, roles and how they resolve to the runtime
 //! configuration.
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use izwi_core::backends::BackendPreference;
 use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 pub(crate) use izwi_gateway::cli::{BackendArg, GatewayArgs, GatewayTopology};
@@ -78,6 +78,18 @@ pub(crate) struct ServerArgs {
     /// `izwi-gateway` binary takes the same ones.
     #[command(flatten)]
     pub(crate) gateway: GatewayArgs,
+
+    #[command(subcommand)]
+    pub(crate) command: Option<ServerCommand>,
+}
+
+/// One-shot commands run instead of serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub(crate) enum ServerCommand {
+    /// Exit 0 when this server's listener answers /readyz with 2xx. The
+    /// container HEALTHCHECK; it reads the same flags and environment as
+    /// the server to find the port.
+    Healthcheck,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -65,10 +65,32 @@ pub use gateway_tenant_concurrency::{
 };
 pub use roles::gateway::run_gateway;
 
+/// The `healthcheck` subcommand of `izwi-gateway` and `izwi-server`: GET
+/// /readyz from the listener bound to `host:port`, an error unless it
+/// answers 2xx.
+pub fn healthcheck(host: &str, port: u16) -> anyhow::Result<()> {
+    use izwi_serving_protocol::health_probe::{probe_address, probe_http, HEALTH_PROBE_TIMEOUT};
+    let addr = probe_address(host, port).with_context(|| format!("cannot resolve {host}"))?;
+    let status = probe_http(addr, "/readyz", &[], HEALTH_PROBE_TIMEOUT)
+        .with_context(|| format!("GET http://{addr}/readyz failed"))?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "GET http://{addr}/readyz returned {status}"
+    );
+    Ok(())
+}
+
 /// Runs the gateway from the command line on a Tokio runtime of its own:
 /// the entry point for a synchronous `main`.
 pub fn run_from_cli_blocking(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     let cli = cli::GatewayCli::parse();
+    if let Some(cli::GatewayCommand::Healthcheck) = cli.command {
+        let defaults = GatewayServeConfig::default();
+        return healthcheck(
+            cli.host.as_deref().unwrap_or(&defaults.host),
+            cli.port.unwrap_or(defaults.port),
+        );
+    }
     let log_format = cli.log_format;
     let config = GatewayConfig::from_cli(cli)?;
     tokio::runtime::Builder::new_multi_thread()

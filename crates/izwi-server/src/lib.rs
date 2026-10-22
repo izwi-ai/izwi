@@ -50,7 +50,9 @@ mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
 
-use cli::{resolve_serve_runtime_config, validate_role_topology, ServerArgs, ServerRole};
+use cli::{
+    resolve_serve_runtime_config, validate_role_topology, ServerArgs, ServerCommand, ServerRole,
+};
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
 // The durable store lives in izwi-db, shared with the gateway; these aliases
 // keep its `crate::db`, `crate::storage_layout` and `crate::voice_defaults`
@@ -114,6 +116,9 @@ pub const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
 pub fn run_from_cli_blocking(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     start_with_serving_allocator();
     let (args, serve_config) = resolve_cli()?;
+    if let Some(ServerCommand::Healthcheck) = args.command {
+        return izwi_gateway::healthcheck(&serve_config.host, serve_config.port);
+    }
     if matches!(args.role, ServerRole::Local) {
         // SAFETY: no runtime or other thread has started yet.
         unsafe { izwi_core::env::configure_process_threads(serve_config.num_threads) };
@@ -155,6 +160,9 @@ fn run_with_bounded_exit<T>(
 pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     start_with_serving_allocator();
     let (args, serve_config) = resolve_cli()?;
+    if let Some(ServerCommand::Healthcheck) = args.command {
+        return izwi_gateway::healthcheck(&serve_config.host, serve_config.port);
+    }
     if matches!(args.role, ServerRole::Local) {
         // SAFETY: not guaranteed (see above); this path has always written
         // the hints after the runtime started, so it is no worse than before.

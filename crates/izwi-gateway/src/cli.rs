@@ -2,7 +2,7 @@
 //! gateway` also takes, and the standalone `izwi-gateway` binary's own
 //! listener and logging flags.
 
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::gateway_deployments;
 use crate::logging::LogFormat;
@@ -34,6 +34,17 @@ pub struct GatewayCli {
 
     #[command(flatten)]
     pub gateway: GatewayArgs,
+
+    #[command(subcommand)]
+    pub command: Option<GatewayCommand>,
+}
+
+/// One-shot commands run instead of serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum GatewayCommand {
+    /// Exit 0 when this gateway's listener answers /readyz with 2xx (the
+    /// container HEALTHCHECK); reads the same --host/--port and environment.
+    Healthcheck,
 }
 
 /// The gateway role's flags.

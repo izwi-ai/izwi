@@ -86,7 +86,8 @@ services:
       - IZWI_WORKER_STREAMING=true
       - IZWI_MODELS_DIR=/app/models
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$IZWI_WORKER_BEARER_TOKEN\" -H \"x-izwi-service-credential-id: $$IZWI_WORKER_CREDENTIAL_ID\" http://127.0.0.1:9470/internal/v1/status"]
+      # Reads the bearer token from the environment, never argv.
+      test: ["CMD", "izwi-serving-worker", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -132,7 +133,7 @@ services:
       worker:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      test: ["CMD", "izwi-gateway", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 3
