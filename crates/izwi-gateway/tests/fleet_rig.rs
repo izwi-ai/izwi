@@ -40,6 +40,13 @@ const WORKER_ONE_MARKER: &str = "fleet-rig-worker-one-response";
 const WORKER_TWO_MARKER: &str = "fleet-rig-worker-two-response";
 const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
 
+/// A reqwest client. reqwest's rustls has no built-in crypto provider in this
+/// workspace, so ring is installed first.
+fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 async fn reserve_port() -> u16 {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -97,7 +104,7 @@ async fn spawn_gateway(
     approvals: &[String],
     extra_env: Vec<(&'static str, String)>,
 ) -> GatewayProcess {
-    let client = reqwest::Client::new();
+    let client = http_client();
     // The bind-learn-release port probe can lose its port to an unrelated
     // ephemeral connection when many processes spawn concurrently; retry the
     // spawn on the resulting address-in-use boot failure.
@@ -193,7 +200,7 @@ async fn spawn_gateway_once(
 }
 
 async fn wait_ready(gateway: &GatewayProcess) {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match client.get(format!("{}/readyz", gateway.base)).send().await {
@@ -333,7 +340,7 @@ async fn fleet_gateways_share_atomic_admission_across_processes() {
         max_live
     });
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut statuses = Vec::new();
     let mut handles = Vec::new();
     for index in 0..6u32 {
@@ -426,7 +433,7 @@ async fn fleet_partition_keeps_combined_quota_within_the_configured_budget() {
     wait_ready(&gateway_a).await;
     wait_ready(&gateway_b).await;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut accepted_a = 0u32;
     let mut rejected_a = 0u32;
     for _ in 0..40 {
@@ -516,7 +523,7 @@ async fn fleet_gateways_share_the_approvals_file() {
     wait_ready(&gateway_b).await;
 
     // Both gateways adopted the shared approvals and each serves chat.
-    let client = reqwest::Client::new();
+    let client = http_client();
     for gateway in [&gateway_a, &gateway_b] {
         let (status, body) = chat(&client, &gateway.base).await;
         assert_eq!(status, 200, "gateway must serve through a shared approval");
@@ -559,7 +566,7 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
     // every served request must avoid the claimed worker; only a shed (a
     // status poll that still shows the previous request holding the peer's
     // single credit) may be retried.
-    let client = reqwest::Client::new();
+    let client = http_client();
     chat_until(
         &client,
         &gateway.base,
@@ -645,7 +652,7 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
         .expect("forged claim")
         .expect("the crashed gateway's claim holds");
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     chat_until(
         &client,
         &gateway_b.base,
@@ -767,7 +774,7 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
         }
         max_live
     });
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut handles = Vec::new();
     for index in 0..6u32 {
         let client = client.clone();

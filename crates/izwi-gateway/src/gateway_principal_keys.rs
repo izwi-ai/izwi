@@ -17,7 +17,7 @@ use crate::db::sqlite::StoreDatabase;
 use crate::gateway_security::{
     bearer_token, constant_time_eq, valid_env_name, valid_identity, validate_secret,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use izwi_hooks::Principal;
 use izwi_serving_protocol::secret_file::{
     file_reference_path, read_secret_file, SecretFileError, FILE_REFERENCE_PREFIX,

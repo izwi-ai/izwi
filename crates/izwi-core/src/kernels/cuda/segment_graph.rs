@@ -196,7 +196,7 @@ mod device {
     use candle_core::cuda_backend::cudarc::driver::{
         result,
         sys::{
-            self, CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            self, CUgraphInstantiate_flags,
             CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         },
         CudaContext,
@@ -389,7 +389,7 @@ mod device {
                 match unsafe {
                     result::graph::instantiate(
                         graph,
-                        CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                        CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
                     )
                 } {
                     Ok(exec) => (

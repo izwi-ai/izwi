@@ -769,7 +769,7 @@ impl ModelLifecycleController {
     pub(super) fn maybe_panic_during_load(&self) {
         if self
             .load_test_panics
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -792,7 +792,7 @@ impl ModelLifecycleController {
     pub(super) fn maybe_fail_load_with_metal_oom(&self) -> crate::error::Result<()> {
         if self
             .load_test_metal_oom_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -835,7 +835,7 @@ impl ModelLifecycleController {
     pub(super) fn maybe_panic_during_unload_cleanup(&self) {
         if self
             .unload_test_panics
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

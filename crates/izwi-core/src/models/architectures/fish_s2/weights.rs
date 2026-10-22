@@ -544,7 +544,7 @@ mod tests {
             let view = TensorView::new(SafeDType::F32, shape.clone(), data).unwrap();
             views.insert(name.clone(), view);
         }
-        safetensors::serialize_to_file(&views, &None, path).unwrap();
+        safetensors::serialize_to_file(&views, None, path).unwrap();
     }
 
     fn write_minimal_index(dir: &Path) {

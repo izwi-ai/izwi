@@ -12,7 +12,8 @@
 //! stage the 7.3-8 kHz band of 16 kHz speech passed whole where soxr removes
 //! it, which moved forced-alignment word boundaries by up to 800 ms.
 
-use rubato::{FftFixedInOut, Resampler};
+use rubato::audioadapter_buffers::direct::{SequentialSlice, SequentialSliceOfVecs};
+use rubato::{Fft, FixedSync, Indexing, Resampler, WindowFunction};
 
 use crate::error::{Error, Result};
 
@@ -130,6 +131,47 @@ fn dot(taps: &[f32], window: &[f32]) -> f32 {
     lanes.iter().sum::<f32>() + tail
 }
 
+/// rubato's FFT resampler with both chunk sizes fixed, one FFT block per
+/// chunk and the BlackmanHarris2 anti-alias window: the resampler rubato
+/// 0.15's `FftFixedInOut` built.
+fn fixed_fft_resampler(src_rate: u32, dst_rate: u32, chunk_frames: usize) -> Result<Fft<f32>> {
+    Fft::<f32>::new_custom(
+        src_rate as usize,
+        dst_rate as usize,
+        chunk_frames,
+        1,
+        1,
+        WindowFunction::BlackmanHarris2,
+        FixedSync::Both,
+    )
+    .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))
+}
+
+/// Resample one chunk of mono `input` into `outbuffer`, reading only its
+/// first `partial_len` frames when set (the rest of the chunk is silence).
+/// Returns the input frames consumed and the output frames written.
+fn process_mono_chunk(
+    resampler: &mut Fft<f32>,
+    input: &[f32],
+    outbuffer: &mut [Vec<f32>],
+    partial_len: Option<usize>,
+) -> Result<(usize, usize)> {
+    let failed = |err: &dyn std::fmt::Display| {
+        Error::AudioError(format!("Failed to resample audio: {err}"))
+    };
+    let input = SequentialSlice::new(input, 1, input.len()).map_err(|err| failed(&err))?;
+    let frames = outbuffer.first().map_or(0, Vec::len);
+    let mut output =
+        SequentialSliceOfVecs::new_mut(outbuffer, 1, frames).map_err(|err| failed(&err))?;
+    let indexing = partial_len.map(|partial_len| Indexing {
+        partial_len: Some(partial_len),
+        ..Indexing::default()
+    });
+    resampler
+        .process_into_buffer(&input, &mut output, indexing.as_ref())
+        .map_err(|err| failed(&err))
+}
+
 /// Incremental high-quality mono resampler.
 ///
 /// Feed native-rate mono samples through [`Self::push`] and collect
@@ -139,7 +181,7 @@ fn dot(taps: &[f32], window: &[f32]) -> f32 {
 /// contract: the caller aligns the final buffer with
 /// [`align_resampled_length`] once the total input length is known.
 pub(crate) struct HighQualityResampler {
-    resampler: FftFixedInOut<f32>,
+    resampler: Fft<f32>,
     outbuffer: Vec<Vec<f32>>,
     input_tail: Vec<f32>,
     delay_holdback: Vec<f32>,
@@ -158,13 +200,8 @@ impl HighQualityResampler {
                 "Resampling sample rates must be greater than zero".to_string(),
             ));
         }
-        let resampler = FftFixedInOut::<f32>::new(
-            src_rate as usize,
-            dst_rate as usize,
-            DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES,
-            1,
-        )
-        .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))?;
+        let resampler =
+            fixed_fft_resampler(src_rate, dst_rate, DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES)?;
         Ok(Self {
             outbuffer: vec![vec![0.0f32; resampler.output_frames_max()]; 1],
             resampler,
@@ -186,11 +223,12 @@ impl HighQualityResampler {
         }
         self.input_tail.extend_from_slice(samples);
         while self.input_tail.len() >= self.resampler.input_frames_next() {
-            let input = [&self.input_tail[..]];
-            let (consumed, written) = self
-                .resampler
-                .process_into_buffer(&input, &mut self.outbuffer, None)
-                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            let (consumed, written) = process_mono_chunk(
+                &mut self.resampler,
+                &self.input_tail,
+                &mut self.outbuffer,
+                None,
+            )?;
             if consumed == 0 {
                 break;
             }
@@ -204,7 +242,7 @@ impl HighQualityResampler {
     ///
     /// `target_len` is the expected total canonical output length for the
     /// whole input stream (see [`target_sample_count`]). rubato keeps
-    /// returning buffered frames from `process_partial(None)`, so the flush
+    /// returning buffered frames for chunks of silence, so the flush
     /// must be bounded by the expected output length exactly like the
     /// whole-buffer implementation — an unbounded drain spins forever.
     pub(crate) fn finish(&mut self, out: &mut Vec<f32>, target_len: usize) -> Result<()> {
@@ -219,19 +257,18 @@ impl HighQualityResampler {
         // ends, as in a whole-buffer filter of the aligned signal.
         let mut tail = Vec::new();
         if !self.input_tail.is_empty() {
-            let input = [&self.input_tail[..]];
-            let (_consumed, written) = self
-                .resampler
-                .process_partial_into_buffer(Some(&input), &mut self.outbuffer, None)
-                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            let (_consumed, written) = process_mono_chunk(
+                &mut self.resampler,
+                &self.input_tail,
+                &mut self.outbuffer,
+                Some(self.input_tail.len()),
+            )?;
             self.hold_back_delay(written, &mut tail);
             self.input_tail.clear();
         }
         while self.produced_total < flush_limit {
-            let (_consumed, written) = self
-                .resampler
-                .process_partial_into_buffer::<Vec<f32>, Vec<f32>>(None, &mut self.outbuffer, None)
-                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            let (_consumed, written) =
+                process_mono_chunk(&mut self.resampler, &[], &mut self.outbuffer, Some(0))?;
             if written == 0 {
                 break;
             }
@@ -528,13 +565,14 @@ mod tests {
 
     fn resample_one_fft_chunk_for_test(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         let target_len = target_sample_count(samples.len(), src_rate, dst_rate);
-        let mut resampler =
-            FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, samples.len(), 1)
-                .unwrap();
+        let mut resampler = fixed_fft_resampler(src_rate, dst_rate, samples.len()).unwrap();
         let input_frames = resampler.input_frames_next();
         let mut input = samples.to_vec();
         input.resize(input_frames, 0.0);
-        let mut output = resampler.process(&[input], None).unwrap().remove(0);
+        let mut output = vec![vec![0.0f32; resampler.output_frames_max()]];
+        let (_, written) = process_mono_chunk(&mut resampler, &input, &mut output, None).unwrap();
+        let mut output = output.remove(0);
+        output.truncate(written);
         output.truncate(target_len);
         output
     }

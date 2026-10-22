@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/izwi-asr-toolkit",
     "crates/izwi-agent",
@@ -25,6 +25,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/izwi-ai/izwi"
 authors = ["Izwi <hi@izwiai.com>"]
@@ -39,25 +40,19 @@ async-trait = "0.1"
 
 # Web framework
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
-axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5.3"
-tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
-utoipa = { version = "5.4.0", features = ["preserve_path_order"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+utoipa = { version = "6", features = ["preserve_path_order"] }
 scalar_api_reference = { version = "0.2.2", features = ["axum"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1"
 
 # Model loading
-hf-hub = { version = "0.5", default-features = false, features = [
-    "rustls-tls",
-    "tokio",
-    "ureq",
-] }
-safetensors = "0.4"
-tokenizers = "0.22.2"
+safetensors = "0.8"
+tokenizers = "0.23"
 
 # Candle (native inference)
 candle-core = "0.11.0"
@@ -67,40 +62,50 @@ half = "2.7"
 
 # Audio processing
 hound = "3.5"
-symphonia = { version = "0.5", default-features = false }
-rubato = "0.15"
+symphonia = { version = "0.6", default-features = false }
+rubato = "5"
 rustfft = "6.2"
 
 # MLX bindings (Apple Silicon ML framework)
 # Note: mlx-rs is still experimental, we'll use FFI bindings
 # mlx-rs = { git = "https://github.com/oxideai/mlx-rs" }
 
+# Database (SQLite and PostgreSQL through sqlx); members choose the features.
+sea-orm = { version = "2.0.4", default-features = false }
+
 # Utilities
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 bytes = "1.9"
-base64 = "0.22"
-reqwest = { version = "0.11", default-features = false, features = [
+base64 = "0.23"
+# rustls without reqwest's built-in aws-lc-rs provider (see `rustls` below):
+# every process installs ring before it builds a client, or hands reqwest a
+# ready rustls config. HTTP/2 and charset decoding stopped being implied in
+# reqwest 0.12, so they are listed.
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
     "blocking",
-    "rustls-tls",
+    "http2",
+    "charset",
+    "rustls-no-provider",
 ] }
-rustls-pemfile = "1.0"
+# ring is the only rustls crypto provider in the tree: aws-lc-rs next to it
+# makes rustls' default-provider lookups panic. Keep default features off.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-indicatif = "0.17"
-dirs = "5.0"
-sha2 = "0.10"
-hmac = "0.12"
-rand = "0.8"
+indicatif = "0.18"
+dirs = "7"
+sha2 = "0.11"
+# Lowercase hex of digests: digest 0.11 outputs have no `{:x}` formatting.
+hex = "0.4"
+hmac = "0.13"
+rand = "0.10"
 subtle = "2.6"
 memmap2 = "0.9.10"
-
-# Configuration
-config = "0.14"
 
 # With fp16 disabled for Candle on Apple Silicon, gemm-f16's inline fp16
 # assembly needs enough optimization to remain in its target-feature context.

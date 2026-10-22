@@ -134,10 +134,15 @@ jobs:
       - name: Setup Rust toolchain
         # Pinned: a new stable release can add clippy lints that fail
         # `-D warnings` with no repo change. Bump deliberately, together
-        # with the version the lanes are verified with locally. No
-        # rust-toolchain.toml: it would override the 1.88.0 (MSRV) CUDA
-        # compile lanes, which install that version as the rustup default.
+        # with the workspace rust-version, the Dockerfile builders and the
+        # CUDA compile lanes, which all use this same version.
         uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+        with:
+          # macOS release builds strip with rust-objcopy, which since 1.98
+          # loads libLLVM.dylib from a directory only llvm-tools populates
+          # (rust-lang/rust#164063). Without it stripping fails with a
+          # warning and the binaries ship with their debuginfo.
+          components: llvm-tools
 
       # The workspace .cargo/config.toml sets an extensionless python
       # rustc-wrapper that only matters to Apple's linker. Windows cannot
@@ -242,7 +247,9 @@ jobs:
           cp scripts/uninstall-macos.sh "release-assets/uninstall-izwi-macos.sh"
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked --version "^2.0"
+        # At least the tauri crate's minor. rust-cache restores ~/.cargo/bin,
+        # and an older cached CLI that still satisfies the range is kept.
+        run: cargo install tauri-cli --locked --version "^2.12"
 
       - name: Build desktop bundle (Linux)
         if: runner.os == 'Linux'

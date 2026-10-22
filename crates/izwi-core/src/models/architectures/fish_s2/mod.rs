@@ -421,7 +421,7 @@ fn fish_s2_numeric_probe(
 
 fn next_fish_s2_model_identity() -> Result<u64> {
     NEXT_FISH_S2_MODEL_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::ModelLoadError("Fish S2 model identity space exhausted".into()))

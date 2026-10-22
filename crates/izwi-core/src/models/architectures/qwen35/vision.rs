@@ -945,6 +945,8 @@ fn fetch_media_bytes(source: &str) -> Result<Vec<u8>> {
 
 fn fetch_remote_media_bytes(source: &str) -> Result<Vec<u8>> {
     let validated = validate_remote_media_url_with(source, resolve_media_host)?;
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(MEDIA_CONNECT_TIMEOUT)
         .timeout(MEDIA_REQUEST_TIMEOUT)

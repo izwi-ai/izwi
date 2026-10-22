@@ -223,9 +223,17 @@ fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)
         .map_err(|e| Error::ModelLoadError(format!("Failed opening {}: {}", path.display(), e)))?;
     let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)
-        .map_err(|e| Error::ModelLoadError(format!("Failed hashing {}: {}", path.display(), e)))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let length = file.read(&mut buffer).map_err(|e| {
+            Error::ModelLoadError(format!("Failed hashing {}: {}", path.display(), e))
+        })?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn extract_required_entries(nemo_path: &Path, entries: &[(&str, &Path)]) -> Result<()> {

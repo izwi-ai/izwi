@@ -252,7 +252,9 @@ impl Tokenizer {
         let byte_level = if qwen2 {
             // As transformers builds Qwen2TokenizerFast from these files
             // (`Qwen2Converter`): NFC, then the Qwen2 split regex.
-            inner.with_normalizer(Some(NFC));
+            inner.with_normalizer(Some(NFC)).map_err(|e| {
+                Error::TokenizationError(format!("Setting the normalizer failed: {}", e))
+            })?;
             qwen_split_pre_tokenizer(&mut inner, QWEN2_HF_PRETOKENIZER_REGEX, add_prefix_space)?
         } else {
             let byte_level = ByteLevel::new(add_prefix_space, true, true);
@@ -295,13 +297,19 @@ impl Tokenizer {
                             false,
                         ));
                     }
-                    inner.add_tokens(&fillers);
+                    inner.add_tokens(fillers).map_err(|e| {
+                        Error::TokenizationError(format!("Adding tokens failed: {}", e))
+                    })?;
                 }
 
                 if is_special {
-                    inner.add_special_tokens(&[token]);
+                    inner.add_special_tokens([token]).map_err(|e| {
+                        Error::TokenizationError(format!("Adding tokens failed: {}", e))
+                    })?;
                 } else {
-                    inner.add_tokens(&[token]);
+                    inner.add_tokens([token]).map_err(|e| {
+                        Error::TokenizationError(format!("Adding tokens failed: {}", e))
+                    })?;
                 }
             }
         }
@@ -314,7 +322,9 @@ impl Tokenizer {
                 for byte in 0..missing {
                     byte_tokens.push(AddedToken::from(format!("<0x{:02X}>", byte), false));
                 }
-                inner.add_tokens(&byte_tokens);
+                inner.add_tokens(byte_tokens).map_err(|e| {
+                    Error::TokenizationError(format!("Adding tokens failed: {}", e))
+                })?;
             }
         }
 
@@ -448,7 +458,9 @@ impl Tokenizer {
             atomic_tokens.push(AddedToken::from(token.clone(), special).normalized(false));
         }
 
-        self.inner.add_tokens(&atomic_tokens);
+        self.inner
+            .add_tokens(atomic_tokens)
+            .map_err(|e| Error::TokenizationError(format!("Adding tokens failed: {}", e)))?;
         if self.inner.get_vocab_size(true) != original_vocab_size {
             return Err(Error::TokenizationError(format!(
                 "Registering GGUF atomic tokens changed vocab size from {original_vocab_size} to {}",

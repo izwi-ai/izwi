@@ -350,6 +350,8 @@ async fn resolve_latest_release(
     contract: &UpdaterContract,
     request_timeout: Duration,
 ) -> Result<ResolvedRelease> {
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(request_timeout)
         .build()?;

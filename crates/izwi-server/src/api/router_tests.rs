@@ -166,30 +166,42 @@ async fn enabled_ui_serves_index_as_fallback() {
     std::fs::write(ui_dir.join("index.html"), "<html>ui</html>")
         .expect("index should be written");
 
-    let app = apply_ui_fallback(
-        Router::new().route("/hello", get(|| async { "ok" })),
-        &ServeRuntimeConfig {
-            ui_enabled: true,
-            ui_dir: ui_dir.clone(),
-            ..ServeRuntimeConfig::default()
-        },
-    );
+    std::fs::write(ui_dir.join("app.js"), "console.log('ui')").expect("asset should be written");
 
-    let response = send_request(
-        app,
-        Request::builder()
-            .uri("/missing")
-            .body(Body::empty())
-            .expect("request should build"),
-    )
-    .await;
+    // Unknown routes, deep links with a trailing slash and a file path with a
+    // trailing slash (a 404 to ServeDir since tower-http 0.7) all reach the
+    // UI's index; real files are served as themselves.
+    for (uri, expected) in [
+        ("/missing", "<html>ui</html>"),
+        ("/models/", "<html>ui</html>"),
+        ("/app.js/", "<html>ui</html>"),
+        ("/app.js", "console.log('ui')"),
+    ] {
+        let app = apply_ui_fallback(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                ui_enabled: true,
+                ui_dir: ui_dir.clone(),
+                ..ServeRuntimeConfig::default()
+            },
+        );
 
-    assert_eq!(response.status(), StatusCode::OK);
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body should read");
-    assert_eq!(body, "<html>ui</html>");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(body, expected, "{uri}");
+    }
 
     std::fs::remove_dir_all(ui_dir).expect("ui dir should be removed");
 }

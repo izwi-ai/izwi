@@ -3505,24 +3505,22 @@ impl SimpleRng {
     }
 }
 
-impl rand::RngCore for SimpleRng {
-    fn next_u32(&mut self) -> u32 {
-        SimpleRng::next_u32(self)
+impl rand::TryRng for SimpleRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        Ok(SimpleRng::next_u32(self))
     }
 
-    fn next_u64(&mut self) -> u64 {
-        (u64::from(SimpleRng::next_u32(self)) << 32) | u64::from(SimpleRng::next_u32(self))
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        Ok((u64::from(SimpleRng::next_u32(self)) << 32) | u64::from(SimpleRng::next_u32(self)))
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), Self::Error> {
         for chunk in dest.chunks_mut(std::mem::size_of::<u32>()) {
             let bytes = SimpleRng::next_u32(self).to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }

@@ -202,7 +202,7 @@ impl SpeechTextPlan {
         }
         Ok(Self {
             version: 1,
-            text_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+            text_sha256: hex::encode(Sha256::digest(text.as_bytes())),
             segments,
             max_output_frames: (max_output_frames > 0).then_some(max_output_frames),
         })

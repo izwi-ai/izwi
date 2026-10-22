@@ -994,7 +994,7 @@ pub(crate) mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, &dir.join(shard)).unwrap();
+        safetensors::serialize_to_file(&views, None, &dir.join(shard)).unwrap();
         let weight_map = tensors
             .iter()
             .map(|tensor| (tensor.name.clone(), json!(shard)))
@@ -1320,7 +1320,7 @@ pub(crate) mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, &dir.join("mtp.safetensors")).unwrap();
+        safetensors::serialize_to_file(&views, None, &dir.join("mtp.safetensors")).unwrap();
         let weight_map = tensors
             .iter()
             .map(|tensor| (tensor.name.clone(), json!("mtp.safetensors")))

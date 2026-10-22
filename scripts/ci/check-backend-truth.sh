@@ -529,13 +529,24 @@ run_hygiene() {
         crates/izwi-core/src/engine/cache/managed_stress.rs \
         crates/izwi-core/examples/kv-cache-bench.rs \
         crates/izwi-core/tests/kv_public_compatibility.rs
-    # The workspace MSRV is 1.88 (the Dockerfile CUDA builder pins it), so
-    # std deprecations like Atomic::fetch_update -> try_update (stable 1.95)
-    # are forward-looking renames the pinned code must not chase yet.
     TAURI_CONFIG="${tauri_check_config}" \
-        cargo clippy --locked --workspace --all-targets -- -D warnings -A deprecated
+        cargo clippy --locked --workspace --all-targets -- -D warnings
     TAURI_CONFIG="${tauri_check_config}" \
         cargo check --locked --workspace --all-targets
+    # ring is the only rustls crypto provider: reqwest is built without its
+    # aws-lc-rs default and every process installs ring. With a second
+    # provider compiled in, rustls' process-default lookups (the worker's TLS
+    # server, sqlx, tungstenite) panic at runtime.
+    local aws_lc_tree
+    if aws_lc_tree="$(cargo tree --locked --workspace --all-features --target all \
+        -e normal,build -i aws-lc-rs 2>&1)"; then
+        echo "aws-lc-rs is in the dependency graph; keep ring the only rustls provider:" >&2
+        echo "${aws_lc_tree}" >&2
+        exit 1
+    elif ! grep -q "did not match any packages" <<<"${aws_lc_tree}"; then
+        echo "${aws_lc_tree}" >&2
+        exit 1
+    fi
     # The gateway, transport, launch contract and supervisor stay
     # accelerator-free, and the worker's backend features match the server's.
     bash scripts/ci/check-serving-boundary.sh

@@ -611,7 +611,7 @@ pub fn write_tiny_qwen38_hybrid_fixture(models_dir: &Path) -> PathBuf {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, path).unwrap();
+        safetensors::serialize_to_file(&views, None, path).unwrap();
     };
     write_shard(&model_dir.join("mtp.safetensors"), &mtp_tensors);
     write_shard(&model_dir.join("target.safetensors"), &target_tensors);
@@ -1131,7 +1131,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, path).unwrap();
+        safetensors::serialize_to_file(&views, None, path).unwrap();
     };
     write_shard(&model_dir.join("layers.safetensors"), &tensors);
 

@@ -296,7 +296,7 @@ impl AsyncRead for VerifiedArtifactReader {
                             "artifact stream verifier lost its digest state",
                         )));
                     };
-                    let actual_digest = format!("{:x}", digest.finalize());
+                    let actual_digest = hex::encode(digest.finalize());
                     if actual_digest != this.expected_digest {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -716,7 +716,7 @@ impl ArtifactStore {
         if total != asset.size_bytes {
             return Err(ArtifactStoreError::Integrity("size mismatch"));
         }
-        let actual_digest = format!("{:x}", hash.finalize());
+        let actual_digest = hex::encode(hash.finalize());
         if actual_digest != expected_digest {
             return Err(ArtifactStoreError::Integrity("digest mismatch"));
         }
@@ -1527,7 +1527,7 @@ fn validate_digest(value: Option<&str>) -> Result<String, ArtifactStoreError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn map_provider_read_error(error: HookError) -> ArtifactStoreError {

@@ -217,12 +217,6 @@ impl Error {
     }
 }
 
-impl From<hf_hub::api::sync::ApiError> for Error {
-    fn from(e: hf_hub::api::sync::ApiError) -> Self {
-        Error::HfHubError(e.to_string())
-    }
-}
-
 impl From<safetensors::SafeTensorError> for Error {
     fn from(e: safetensors::SafeTensorError) -> Self {
         Error::SafetensorsError(e.to_string())

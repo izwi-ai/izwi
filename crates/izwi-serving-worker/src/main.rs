@@ -24,6 +24,8 @@ use std::{
     collections::BTreeSet, net::SocketAddr, path::Path, path::PathBuf, sync::Arc, time::Duration,
 };
 use tokio::io::AsyncReadExt;
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 mod env_config;
 
@@ -922,63 +924,32 @@ impl WorkerTlsConfig {
                     );
                 }
                 let key_bytes = key_file.bytes;
-                let cert_items = rustls_pemfile::read_all(&mut cert_bytes.as_slice())
+                let certs = CertificateDer::pem_slice_iter(&cert_bytes)
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| anyhow::anyhow!("server certificate PEM is invalid"))?;
-                let key_items = rustls_pemfile::read_all(&mut key_bytes.as_slice())
-                    .map_err(|_| anyhow::anyhow!("server private key PEM is invalid"))?;
-                let certs: Vec<_> = cert_items
-                    .into_iter()
-                    .filter_map(|item| match item {
-                        rustls_pemfile::Item::X509Certificate(der) => {
-                            Some(tokio_rustls::rustls::pki_types::CertificateDer::from(der))
-                        }
-                        _ => None,
-                    })
-                    .collect();
                 if certs.is_empty() {
                     bail!("server certificate file contains no certificate PEM blocks");
                 }
-                let key = key_items
-                    .into_iter()
-                    .filter_map(|item| match item {
-                        rustls_pemfile::Item::PKCS8Key(der) => {
-                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
-                                tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(der),
-                            ))
-                        }
-                        rustls_pemfile::Item::RSAKey(der) => {
-                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs1(
-                                tokio_rustls::rustls::pki_types::PrivatePkcs1KeyDer::from(der),
-                            ))
-                        }
-                        rustls_pemfile::Item::ECKey(der) => {
-                            Some(tokio_rustls::rustls::pki_types::PrivateKeyDer::Sec1(
-                                tokio_rustls::rustls::pki_types::PrivateSec1KeyDer::from(der),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .next()
-                    .context("server private key file contains no key PEM blocks")?;
+                // The first PKCS#8, PKCS#1 or SEC1 key block.
+                let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|error| match error {
+                    pem::Error::NoItemsFound => {
+                        anyhow::anyhow!("server private key file contains no key PEM blocks")
+                    }
+                    _ => anyhow::anyhow!("server private key PEM is invalid"),
+                })?;
 
                 let mut config = if let Some(ca_ref) = client_ca_ref {
                     let ca_bytes = load_pem_file(ca_ref, "client CA")?.bytes;
-                    let ca_items = rustls_pemfile::read_all(&mut ca_bytes.as_slice())
+                    let client_certs = CertificateDer::pem_slice_iter(&ca_bytes)
+                        .collect::<Result<Vec<_>, _>>()
                         .map_err(|_| anyhow::anyhow!("client CA PEM is invalid"))?;
-                    let client_certs: Vec<_> = ca_items
-                        .into_iter()
-                        .filter_map(|item| match item {
-                            rustls_pemfile::Item::X509Certificate(der) => Some(der),
-                            _ => None,
-                        })
-                        .collect();
                     if client_certs.is_empty() {
                         bail!("client CA file contains no certificate PEM blocks");
                     }
                     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
                     for cert in client_certs {
                         roots
-                            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert))
+                            .add(cert)
                             .map_err(|e| anyhow::anyhow!("invalid client CA certificate: {e}"))?;
                     }
                     let verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(
@@ -1865,10 +1836,8 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
         let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
 
         let mut roots = rustls::RootCertStore::empty();
-        for der in rustls_pemfile::certs(&mut TEST_TLS_CA_PEM.as_bytes()).unwrap() {
-            roots
-                .add(rustls::pki_types::CertificateDer::from(der))
-                .unwrap();
+        for der in CertificateDer::pem_slice_iter(TEST_TLS_CA_PEM.as_bytes()) {
+            roots.add(der.unwrap()).unwrap();
         }
         let connector = tokio_rustls::TlsConnector::from(Arc::new(
             rustls::ClientConfig::builder()

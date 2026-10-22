@@ -23,7 +23,7 @@ impl ByteBudget {
 
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> anyhow::Result<ByteReservation> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.limit)
             })
             .map_err(|_| anyhow::anyhow!("Aggregate speech persistence byte capacity exhausted"))?;

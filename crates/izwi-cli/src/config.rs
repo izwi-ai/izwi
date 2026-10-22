@@ -520,10 +520,9 @@ fn parse_backend(value: &str) -> Result<BackendPreference> {
 fn parse_string_list(value: &str) -> Result<Vec<String>> {
     let trimmed = value.trim();
     if trimmed.starts_with('[') {
-        let parsed: toml::Value = format!("value = {trimmed}").parse()?;
+        let parsed: toml::Value = trimmed.parse()?;
         return parsed
-            .get("value")
-            .and_then(toml::Value::as_array)
+            .as_array()
             .map(|values| {
                 values
                     .iter()
@@ -715,6 +714,26 @@ mod tests {
             ])
         );
         assert_eq!(config.ui.enabled, Some(false));
+    }
+
+    #[test]
+    fn cors_origins_accept_a_toml_string_array() {
+        let mut config = Config::default();
+        config
+            .set_value(
+                "server.cors_origins",
+                r#"["http://localhost:3000", "https://example.com"]"#,
+            )
+            .expect("a TOML string array should parse");
+        assert_eq!(
+            config.server.cors_origins,
+            Some(vec![
+                "http://localhost:3000".to_string(),
+                "https://example.com".to_string()
+            ])
+        );
+        assert!(config.set_value("server.cors_origins", "[1, 2]").is_err());
+        assert!(config.set_value("server.cors_origins", "[]").is_err());
     }
 
     /// The `defaults.*` keys were read by nothing and are gone; a config

@@ -3,6 +3,7 @@ name = "izwi-db"
 description = "Izwi's durable store: SQLite/PostgreSQL connections, schema migrations, raw statement helpers and the storage layout"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -15,7 +16,7 @@ test-support = ["dep:tempfile"]
 [dependencies]
 anyhow = { workspace = true }
 dirs = { workspace = true }
-sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+sea-orm = { workspace = true, features = [
     "macros",
     "runtime-tokio",
     "sqlx-sqlite",

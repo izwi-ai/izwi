@@ -94,8 +94,7 @@ mod device {
     use super::*;
     use candle_core::cuda_backend::cudarc::driver::{
         sys::{
-            CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            CUgraphInstantiate_flags, CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         },
         CudaGraph,
     };
@@ -346,7 +345,9 @@ mod device {
                 }
                 let computation = f(&live.inputs);
                 // Never short circuit end_capture, even on closure failure.
-                let captured = stream.end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+                let captured = stream.end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                );
                 let (result, graph) = match (computation, captured) {
                     (Ok(result), Ok(Some(graph))) => (result, graph),
                     _ => {

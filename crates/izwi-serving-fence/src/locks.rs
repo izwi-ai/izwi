@@ -1,7 +1,6 @@
-use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -171,17 +170,15 @@ impl LockNamespace {
             source,
         })?;
         let lock_result = match (mode, wait) {
-            (LockMode::Exclusive, true) => FileExt::lock_exclusive(&file),
-            (LockMode::Exclusive, false) => FileExt::try_lock_exclusive(&file),
-            (LockMode::Shared, true) => FileExt::lock_shared(&file),
-            (LockMode::Shared, false) => FileExt::try_lock_shared(&file),
+            (LockMode::Exclusive, true) => file.lock().map_err(TryLockError::Error),
+            (LockMode::Exclusive, false) => file.try_lock(),
+            (LockMode::Shared, true) => file.lock_shared().map_err(TryLockError::Error),
+            (LockMode::Shared, false) => file.try_lock_shared(),
         };
         match lock_result {
             Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(LockError::Contended(path.to_path_buf()))
-            }
-            Err(source) => {
+            Err(TryLockError::WouldBlock) => return Err(LockError::Contended(path.to_path_buf())),
+            Err(TryLockError::Error(source)) => {
                 return Err(LockError::Io {
                     operation: "acquire lock",
                     path: path.to_path_buf(),
@@ -279,7 +276,7 @@ impl std::fmt::Debug for LockLease {
 
 impl Drop for LockLease {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 

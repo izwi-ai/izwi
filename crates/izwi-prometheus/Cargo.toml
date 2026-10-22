@@ -3,6 +3,7 @@ name = "izwi-prometheus"
 description = "Prometheus histograms, labelled counters and the text exposition shared by Izwi's engine and gateway"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

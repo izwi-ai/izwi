@@ -114,9 +114,7 @@ impl DerivedCache {
                 .open(self.dir.join("writer.lock"))?;
             // The writer is retained for this entire load; competing loaders
             // proceed with conversion/read hits instead of waiting.
-            // Use the portable extension API: std file locks require Rust 1.89,
-            // while both Docker builders intentionally support Rust 1.88.
-            if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            if lock.try_lock().is_err() {
                 return Ok(());
             }
             let mut files = Vec::new();
@@ -310,7 +308,7 @@ mod tests {
             .write(true)
             .open(d.path().join("writer.lock"))
             .unwrap();
-        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        lock.lock().unwrap();
         c.publish(&[99; 32], &words);
         assert!(c.read(&[99; 32], 17).is_none());
         drop(lock);

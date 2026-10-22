@@ -2045,7 +2045,7 @@ fn validate_vibevoice_tts_inputs(text: &str, reference: &VibeVoiceSpeakerReferen
 
 fn next_vibevoice_tts_state_id() -> Result<u64> {
     NEXT_VIBEVOICE_TTS_STATE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::InferenceError("VibeVoice TTS state identity overflow".into()))
@@ -2053,7 +2053,7 @@ fn next_vibevoice_tts_state_id() -> Result<u64> {
 
 fn next_vibevoice_tts_model_load_nonce() -> Result<u64> {
     NEXT_VIBEVOICE_TTS_MODEL_LOAD_NONCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::ModelLoadError("VibeVoice TTS load nonce overflow".into()))

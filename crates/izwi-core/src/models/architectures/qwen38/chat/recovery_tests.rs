@@ -109,7 +109,7 @@ pub(crate) fn model_fixture(hybrid: bool) -> Qwen38ChatModel {
         "model.language_model.norm.weight".into(),
         TensorView::new(Dtype::BF16, vec![4], &norm).unwrap(),
     );
-    safetensors::serialize_to_file(&views, &None, &dir.path().join("target.safetensors")).unwrap();
+    safetensors::serialize_to_file(&views, None, &dir.path().join("target.safetensors")).unwrap();
     let index_path = dir.path().join("model.safetensors.index.json");
     let mut index: serde_json::Value =
         serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();

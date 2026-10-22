@@ -3,6 +3,7 @@ name = "izwi-serving-worker"
 description = "Private inference worker HTTP service for Izwi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -33,7 +34,6 @@ futures = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-fence = { path = "../izwi-serving-fence" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
-rustls-pemfile = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -58,9 +58,10 @@ izwi-server = { path = "../izwi-server" }
 izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
 izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 safetensors = { workspace = true }
 tempfile = "3.10"
 tokenizers = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"

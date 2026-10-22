@@ -134,7 +134,17 @@ fn read_single_tensor_info(path: &Path) -> Result<(TensorInfo, String)> {
         ))
     })?;
 
-    let file_names = zip.file_names().map(|s| s.to_string()).collect::<Vec<_>>();
+    let file_names = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Failed to list Kokoro voice pack {} entries: {}",
+                path.display(),
+                e
+            ))
+        })?;
     for file_name in &file_names {
         if !file_name.ends_with("data.pkl") {
             continue;

@@ -3,6 +3,7 @@ name = "izwi-agent"
 description = "Minimal agent framework primitives and engine for Izwi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

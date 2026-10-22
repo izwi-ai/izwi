@@ -123,7 +123,7 @@ impl FishS2ArtifactManifest {
                 digest.update(&buffer[..length]);
             }
         }
-        Ok(format!("{:x}", digest.finalize()))
+        Ok(hex::encode(digest.finalize()))
     }
 
     pub fn shard_paths(&self) -> Vec<PathBuf> {
