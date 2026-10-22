@@ -143,6 +143,7 @@ fn unset_variables_keep_the_previous_defaults() {
     let tuning = tuning_with(&[]).unwrap();
     assert!(!tuning.allow_unauthenticated_network);
     assert_eq!(tuning.local_exposure, LocalExposure::default());
+    assert!(tuning.public_probe_details);
     assert_eq!(
         tuning.openai_compat_profile,
         OpenAiCompatibilityProfile::Strict
@@ -189,6 +190,14 @@ fn booleans_use_the_shared_vocabulary_and_fail_closed() {
     ] {
         let error = tuning_with(&[(name, "fasle")]).unwrap_err().to_string();
         assert!(error.contains(name), "{error}");
+    }
+}
+
+#[test]
+fn a_keyed_server_keeps_probe_details_private() {
+    for name in ["IZWI_API_KEY", "IZWI_API_KEY_FILE"] {
+        assert!(!tuning_with(&[(name, "set")]).unwrap().public_probe_details);
+        assert!(tuning_with(&[(name, "")]).unwrap().public_probe_details);
     }
 }
 

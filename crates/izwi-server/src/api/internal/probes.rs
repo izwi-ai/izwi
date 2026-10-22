@@ -56,6 +56,30 @@ pub struct ReadyResponse {
     pub startup_warnings: Vec<String>,
 }
 
+/// A probe body for a caller without a key on a key-protected server: the
+/// HTTP status plus one word. Version, uptime, capacity, queues and startup
+/// warnings (which can name models, paths and database errors) stay on the
+/// keyed `/internal/health` and `/v1/health`.
+#[derive(Debug, Serialize)]
+pub struct PublicProbeResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
+}
+
+fn probe_response(
+    status: StatusCode,
+    detailed: bool,
+    full: impl Serialize,
+    public: PublicProbeResponse,
+) -> Response {
+    if detailed {
+        (status, Json(full)).into_response()
+    } else {
+        (status, Json(public)).into_response()
+    }
+}
+
 pub async fn live_check(State(state): State<AppState>) -> Response {
     let lifecycle = state.lifecycle.snapshot();
     // Liveness is polled aggressively (the desktop app every 200ms during
@@ -86,7 +110,16 @@ pub async fn live_check(State(state): State<AppState>) -> Response {
         runtime_poisoned: !health.is_healthy(),
         runtime_failure,
     };
-    (status, Json(response)).into_response()
+    let public = PublicProbeResponse {
+        status: response.status,
+        ready: None,
+    };
+    probe_response(
+        status,
+        crate::env_config::tuning().public_probe_details,
+        response,
+        public,
+    )
 }
 
 pub async fn ready_check(State(state): State<AppState>) -> Response {
@@ -96,7 +129,16 @@ pub async fn ready_check(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(response)).into_response()
+    let public = PublicProbeResponse {
+        status: response.status,
+        ready: Some(response.ready),
+    };
+    probe_response(
+        status,
+        crate::env_config::tuning().public_probe_details,
+        response,
+        public,
+    )
 }
 
 async fn readiness_response(state: &AppState) -> ReadyResponse {
@@ -296,6 +338,37 @@ mod tests {
     use crate::state::AppState;
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
+
+    #[tokio::test]
+    async fn keyed_servers_answer_public_probes_with_status_only() {
+        let full = LiveResponse {
+            status: "alive",
+            version: "9.9.9",
+            uptime_secs: 7,
+            runtime_poisoned: false,
+            runtime_failure: None,
+        };
+        let public = || PublicProbeResponse {
+            status: "ready",
+            ready: Some(true),
+        };
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let detailed = body(probe_response(StatusCode::OK, true, &full, public())).await;
+        assert_eq!(detailed["version"], "9.9.9");
+
+        let response = probe_response(StatusCode::SERVICE_UNAVAILABLE, false, &full, public());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body(response).await,
+            serde_json::json!({"status": "ready", "ready": true})
+        );
+    }
 
     #[tokio::test]
     async fn readiness_reports_ready_after_lifecycle_mark_ready() {

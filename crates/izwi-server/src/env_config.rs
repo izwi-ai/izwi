@@ -379,6 +379,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
 pub(crate) struct ServerTuning {
     pub(crate) allow_unauthenticated_network: bool,
     pub(crate) local_exposure: LocalExposure,
+    /// Unauthenticated probes carry version, capacity and startup warnings
+    /// only while no API key protects the server (loopback, the desktop
+    /// app, development); a keyed server keeps them on its keyed health
+    /// routes.
+    pub(crate) public_probe_details: bool,
     pub(crate) openai_compat_profile: OpenAiCompatibilityProfile,
     /// `None` takes the profile's default.
     pub(crate) openai_audio_upload_limit_mb: Option<usize>,
@@ -429,6 +434,9 @@ impl ServerTuning {
                 loopback_published: env.flag_or("IZWI_LOOPBACK_PUBLISHED", false)?,
                 allowed_hosts: allowed_hosts(env.get("IZWI_ALLOWED_HOSTS")?.unwrap_or(""))?,
             },
+            public_probe_details: ["IZWI_API_KEY", "IZWI_API_KEY_FILE"]
+                .iter()
+                .all(|name| env.get_os(name).is_none_or(|value| value.is_empty())),
             openai_compat_profile: match env
                 .get("IZWI_OPENAI_COMPAT_PROFILE")?
                 .map(|value| value.trim().to_ascii_lowercase())

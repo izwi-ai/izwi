@@ -186,12 +186,51 @@ pub async fn get_media(
         .unwrap_or_else(|| content_type_from_path(trimmed).to_string());
     let bytes = stored.bytes;
 
-    Response::builder()
+    // The content type comes from the uploader, and the response shares the
+    // web UI's origin: anything that could run script (HTML, SVG, XML, ...)
+    // downloads instead of rendering, and the sandbox CSP covers a page
+    // opened directly. Media needs a key, so shared caches must not keep it.
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type.as_str())
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; sandbox",
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if !renders_inline(&content_type) {
+        response = response.header(header::CONTENT_DISPOSITION, "attachment");
+    }
+    response
         .body(Body::from(bytes))
         .map_err(|err| ApiError::internal(format!("Failed building media response: {err}")))
+}
+
+/// Audio, video and raster images, which browsers never run script from.
+fn renders_inline(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence.starts_with("audio/")
+        || essence.starts_with("video/")
+        || matches!(
+            essence.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "image/avif"
+                | "image/bmp"
+                | "image/heic"
+                | "image/heif"
+        )
 }
 
 pub async fn delete_media(
@@ -427,5 +466,30 @@ mod tests {
         let api_error = map_media_error(error);
 
         assert_eq!(api_error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn only_media_that_cannot_run_script_renders_inline() {
+        for content_type in [
+            "audio/wav",
+            "audio/mpeg; codecs=mp3",
+            "video/mp4",
+            "image/PNG",
+            "image/webp",
+        ] {
+            assert!(renders_inline(content_type), "{content_type}");
+        }
+        for content_type in [
+            "image/svg+xml",
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+            "application/xml",
+            "application/pdf",
+            "application/octet-stream",
+            "",
+        ] {
+            assert!(!renders_inline(content_type), "{content_type}");
+        }
     }
 }
