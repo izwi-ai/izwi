@@ -39,7 +39,7 @@ izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 rand = { workspace = true }
 scalar_api_reference = { workspace = true }
-sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+sea-orm = { workspace = true, features = [
     "macros",
     "runtime-tokio",
     "sqlx-sqlite",

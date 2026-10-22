@@ -70,6 +70,9 @@ rustfft = "6.2"
 # Note: mlx-rs is still experimental, we'll use FFI bindings
 # mlx-rs = { git = "https://github.com/oxideai/mlx-rs" }
 
+# Database (SQLite and PostgreSQL through sqlx); members choose the features.
+sea-orm = { version = "2.0.4", default-features = false }
+
 # Utilities
 anyhow = "1.0"
 thiserror = "2"
