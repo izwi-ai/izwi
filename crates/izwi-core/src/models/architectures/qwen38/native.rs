@@ -1775,16 +1775,18 @@ fn tensor_payload_bytes(name: &str, shape: &[usize], dtype: SafeDType) -> Result
             ))
         })
     })?;
-    let element_bytes = u64::try_from(dtype.size()).map_err(|_| {
+    // Bits, not bytes: safetensors 0.6+ has sub-byte dtypes (F4, F6).
+    let element_bits = u64::try_from(dtype.bitsize()).map_err(|_| {
         Error::ModelLoadError(format!(
             "Native Qwen3.8 MTP tensor `{name}` dtype size does not fit u64"
         ))
     })?;
-    elements.checked_mul(element_bytes).ok_or_else(|| {
+    let payload_bits = elements.checked_mul(element_bits).ok_or_else(|| {
         Error::ModelLoadError(format!(
             "Native Qwen3.8 MTP tensor `{name}` payload byte count overflow"
         ))
-    })
+    })?;
+    Ok(payload_bits.div_ceil(8))
 }
 
 fn required_text_tensor_names(config: &Qwen38NativeConfig) -> HashSet<String> {
@@ -2169,7 +2171,7 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, path).unwrap();
+        safetensors::serialize_to_file(&views, None, path).unwrap();
     }
 
     pub(super) fn bf16_bytes(values: &[f32]) -> Vec<u8> {

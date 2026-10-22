@@ -51,7 +51,7 @@ serde_json = "1.0"
 toml = "1"
 
 # Model loading
-safetensors = "0.4"
+safetensors = "0.8"
 tokenizers = "0.22.2"
 
 # Candle (native inference)

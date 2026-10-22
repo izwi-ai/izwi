@@ -3697,7 +3697,7 @@ mod tests {
                 )
             })
             .collect::<StdBTreeMap<_, _>>();
-        safetensors::serialize_to_file(&views, &None, path).unwrap();
+        safetensors::serialize_to_file(&views, None, path).unwrap();
     }
 
     fn bf16_bytes(values: &[f32]) -> Vec<u8> {
