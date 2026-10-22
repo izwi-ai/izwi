@@ -241,7 +241,9 @@ jobs:
           cp scripts/uninstall-macos.sh "release-assets/uninstall-izwi-macos.sh"
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked --version "^2.0"
+        # At least the tauri crate's minor. rust-cache restores ~/.cargo/bin,
+        # and an older cached CLI that still satisfies the range is kept.
+        run: cargo install tauri-cli --locked --version "^2.12"
 
       - name: Build desktop bundle (Linux)
         if: runner.os == 'Linux'
