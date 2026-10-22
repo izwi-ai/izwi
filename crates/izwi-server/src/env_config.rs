@@ -379,10 +379,10 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
 pub(crate) struct ServerTuning {
     pub(crate) allow_unauthenticated_network: bool,
     pub(crate) local_exposure: LocalExposure,
-    /// Unauthenticated probes carry version, capacity and startup warnings
-    /// only while no API key protects the server (loopback, the desktop
-    /// app, development); a keyed server keeps them on its keyed health
-    /// routes.
+    /// Unauthenticated probes carry uptime, capacity, queues and startup
+    /// warnings only while no API key protects the server (loopback, the
+    /// desktop app, development); a keyed server keeps them on its keyed
+    /// health routes.
     pub(crate) public_probe_details: bool,
     pub(crate) openai_compat_profile: OpenAiCompatibilityProfile,
     /// `None` takes the profile's default.

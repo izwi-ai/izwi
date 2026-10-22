@@ -56,15 +56,19 @@ pub struct ReadyResponse {
     pub startup_warnings: Vec<String>,
 }
 
-/// A probe body for a caller without a key on a key-protected server: the
-/// HTTP status plus one word. Version, uptime, capacity, queues and startup
-/// warnings (which can name models, paths and database errors) stay on the
-/// keyed `/internal/health` and `/v1/health`.
+/// A probe body for any caller of a key-protected server: the status, the
+/// version (public anyway in /openapi.json; the desktop app matches on it)
+/// and the runtime-poison flag the desktop app watches. Uptime, capacity,
+/// queues and startup warnings (which can name models, paths and database
+/// errors) stay on the keyed `/internal/health` and `/v1/health`.
 #[derive(Debug, Serialize)]
 pub struct PublicProbeResponse {
     pub status: &'static str,
+    pub version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_poisoned: bool,
 }
 
 fn probe_response(
@@ -112,7 +116,9 @@ pub async fn live_check(State(state): State<AppState>) -> Response {
     };
     let public = PublicProbeResponse {
         status: response.status,
+        version: response.version,
         ready: None,
+        runtime_poisoned: response.runtime_poisoned,
     };
     probe_response(
         status,
@@ -131,7 +137,9 @@ pub async fn ready_check(State(state): State<AppState>) -> Response {
     };
     let public = PublicProbeResponse {
         status: response.status,
+        version: response.version,
         ready: Some(response.ready),
+        runtime_poisoned: false,
     };
     probe_response(
         status,
@@ -350,7 +358,9 @@ mod tests {
         };
         let public = || PublicProbeResponse {
             status: "ready",
+            version: "9.9.9",
             ready: Some(true),
+            runtime_poisoned: false,
         };
         let body = |response: Response| async move {
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -366,7 +376,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             body(response).await,
-            serde_json::json!({"status": "ready", "ready": true})
+            serde_json::json!({"status": "ready", "version": "9.9.9", "ready": true})
         );
     }
 
