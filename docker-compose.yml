@@ -6,7 +6,8 @@
 #   CPU:  docker compose up -d
 #   CUDA: docker compose --profile cuda up -d izwi-cuda
 #         (name the service: both publish the same port and share the volumes)
-#   Then open http://localhost:8080.
+#   Then open http://localhost:8080. `docker compose watch` rebuilds and
+#   restarts the server whenever the source changes.
 #
 #   The port is published on the host's 127.0.0.1 only, and the server runs as
 #   a loopback-only server (IZWI_LOOPBACK_PUBLISHED): no API key, and only
@@ -42,6 +43,14 @@ x-izwi-service: &izwi-service
   volumes:
     - izwi-models:/app/models
     - izwi-data:/app/data
+  # Hardening that never gets in a developer's way, so development runs
+  # exactly what production runs: no Linux capabilities, no privilege gain
+  # through setuid binaries, and an init that reaps child processes.
+  init: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - "no-new-privileges:true"
   # The server drains HTTP requests (20 s) and then batch jobs (20 s).
   stop_grace_period: 45s
   logging:
@@ -49,6 +58,21 @@ x-izwi-service: &izwi-service
     options:
       max-size: "10m"
       max-file: "3"
+  # `docker compose watch` rebuilds and restarts the server when the source
+  # changes; the Dockerfile's cache mounts recompile only what changed.
+  develop:
+    watch:
+      - action: rebuild
+        path: ./crates
+      - action: rebuild
+        path: ./ui
+        ignore:
+          - node_modules/
+          - dist/
+      - action: rebuild
+        path: ./Cargo.toml
+      - action: rebuild
+        path: ./Cargo.lock
 
 services:
   # ---------------------------------------------------------------------------
@@ -60,6 +84,8 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        IZWI_BUILD_GIT_SHA: ${IZWI_BUILD_GIT_SHA:-}
     image: izwi:latest
     pull_policy: never
     container_name: izwi
@@ -78,6 +104,7 @@ services:
       args:
         CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-80}
         IZWI_CUDA_FEATURES: ${IZWI_CUDA_FEATURES:-cuda,cudnn}
+        IZWI_BUILD_GIT_SHA: ${IZWI_BUILD_GIT_SHA:-}
     image: izwi:cuda
     pull_policy: never
     container_name: izwi-cuda

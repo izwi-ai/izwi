@@ -61,6 +61,13 @@ services:
     container_name: izwi-worker-cpu
     restart: unless-stopped
     command: ["izwi-serving-worker"]
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # Lets in-flight inference finish before SIGKILL (Compose's default is 10 s).
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -106,6 +113,11 @@ services:
     container_name: izwi-gateway
     restart: unless-stopped
     network_mode: "service:worker"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     # Above IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS (Compose's default is 10 s).
     stop_grace_period: 30s
     environment:
