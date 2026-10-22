@@ -24,7 +24,7 @@ export function exportFooterNote(): string | null {
 /** The bordered list of export settings, one row each. */
 export function ExportSettings({ children }: { children: ReactNode }) {
   return (
-    <div className="divide-y divide-[var(--border-subtle)] overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+    <div className="divide-y divide-(--border-subtle) overflow-hidden rounded-[12px] border border-(--border-subtle) bg-(--surface-panel)">
       {children}
     </div>
   );
@@ -49,7 +49,7 @@ export function ExportChoiceRow<T extends string>({
   return (
     <div className="flex flex-col gap-1 px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-        <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
+        <span className="text-[13.5px] font-medium text-(--text-primary)">
           {label}
         </span>
         <SegmentedFilter
@@ -61,7 +61,7 @@ export function ExportChoiceRow<T extends string>({
         />
       </div>
       {hint ? (
-        <p className="text-xs leading-4 text-[var(--text-subtle)]">{hint}</p>
+        <p className="text-xs leading-4 text-(--text-subtle)">{hint}</p>
       ) : null}
     </div>
   );
@@ -80,7 +80,7 @@ export function ExportError({ message }: { message: string }) {
   return (
     <div
       role="alert"
-      className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+      className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
     >
       <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
       <span>{message}</span>

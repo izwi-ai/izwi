@@ -45,10 +45,10 @@ export function SetupRow({
     <span
       className={cn(
         "flex items-center gap-1.5 whitespace-nowrap text-[13px]",
-        tone === "done" && "text-[var(--status-positive-text)]",
-        tone === "active" && "text-[var(--text-primary)]",
-        tone === "muted" && "text-[var(--text-muted)]",
-        tone === "error" && "text-[var(--danger-text)]",
+        tone === "done" && "text-(--status-positive-text)",
+        tone === "active" && "text-(--text-primary)",
+        tone === "muted" && "text-(--text-muted)",
+        tone === "error" && "text-(--danger-text)",
       )}
     >
       {tone === "done" && (
@@ -61,16 +61,16 @@ export function SetupRow({
   return (
     <li
       className={cn(
-        "flex flex-col border-b border-[var(--border-muted)] py-3.5",
+        "flex flex-col border-b border-(--border-muted) py-3.5",
         percent !== undefined ? "gap-2.5" : "gap-1.5",
       )}
     >
       <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4">
         <div className="flex min-w-0 flex-col gap-0.5">
-          <span className="text-sm font-medium text-[var(--text-primary)]">
+          <span className="text-sm font-medium text-(--text-primary)">
             {title}
           </span>
-          <span className="truncate text-[13px] text-[var(--text-muted)]">
+          <span className="truncate text-[13px] text-(--text-muted)">
             {model}
           </span>
         </div>
@@ -90,16 +90,16 @@ export function SetupRow({
           aria-valuenow={percent}
           aria-valuemin={0}
           aria-valuemax={100}
-          className="h-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]"
+          className="h-1 overflow-hidden rounded-full bg-(--bg-surface-3)"
         >
           <div
-            className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+            className="h-full rounded-full bg-(--accent-solid) transition-[width] duration-300"
             style={{ width: `${percent}%` }}
           />
         </div>
       )}
       {detail ? (
-        <p className="text-[12.5px] text-[var(--text-subtle)]">{detail}</p>
+        <p className="text-[12.5px] text-(--text-subtle)">{detail}</p>
       ) : null}
     </li>
   );

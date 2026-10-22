@@ -10,14 +10,14 @@ import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { cn } from "@/lib/utils";
 
 export const FIELD_LABEL_CLASS =
-  "text-[12.5px] font-medium text-[var(--text-muted)]";
+  "text-[12.5px] font-medium text-(--text-muted)";
 
 /** Overrides for Input so a one-line field matches the dialog's controls. */
 export const TEXT_INPUT_CLASS =
-  "h-9 rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] px-3 text-[13.5px] shadow-none";
+  "h-9 rounded-[10px] border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] shadow-none";
 
 export const TEXTAREA_CLASS =
-  "w-full resize-none rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-4 py-3 text-[14.5px] leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)] disabled:opacity-60";
+  "w-full resize-none rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong) disabled:opacity-60";
 
 /** Round play/pause button; `label` names what plays ("option 2"). */
 export function PlayButton({
@@ -43,8 +43,8 @@ export function PlayButton({
         "flex shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
         small ? "h-7 w-7" : "h-8 w-8",
         playing
-          ? "bg-[var(--accent-solid)] text-[var(--text-on-accent)]"
-          : "bg-[var(--accent-soft)] text-[var(--text-primary)] hover:bg-[var(--surface-raised)]",
+          ? "bg-(--accent-solid) text-(--text-on-accent)"
+          : "bg-(--accent-soft) text-(--text-primary) hover:bg-(--surface-raised)",
       )}
     >
       {playing ? (
@@ -113,7 +113,7 @@ export function FormError({ message }: { message: string | null }) {
   return (
     <div
       role="alert"
-      className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+      className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
     >
       <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
       <span>{message}</span>
@@ -127,13 +127,13 @@ export function VoiceSavedBody({ name }: { name: string }) {
     <div className="flex items-start gap-3 px-5 py-5 sm:px-6">
       <CheckCircle2
         aria-hidden="true"
-        className="mt-0.5 h-5 w-5 shrink-0 text-[var(--status-positive-text)]"
+        className="mt-0.5 h-5 w-5 shrink-0 text-(--status-positive-text)"
       />
       <div className="min-w-0">
-        <p className="text-[14px] font-medium text-[var(--text-primary)]">
+        <p className="text-[14px] font-medium text-(--text-primary)">
           “{name}” is in My voices.
         </p>
-        <p className="mt-1 text-[13px] leading-5 text-[var(--text-muted)]">
+        <p className="mt-1 text-[13px] leading-5 text-(--text-muted)">
           Use it in Text to Speech and Studio.
         </p>
       </div>

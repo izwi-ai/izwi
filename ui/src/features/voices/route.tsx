@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import {
   AlertTriangle,
   Loader2,
@@ -613,7 +613,7 @@ export function VoicesPage({
           />
 
           {showSavedVoiceLoadMore ? (
-            <div className="mt-3 flex justify-center rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2">
+            <div className="mt-3 flex justify-center rounded-xl border border-(--border-muted) bg-(--bg-surface-0) px-3 py-2">
               <Button
                 type="button"
                 variant="outline"
@@ -644,27 +644,27 @@ export function VoicesPage({
         }
       }}
     >
-      <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+      <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
         <DialogTitle className="sr-only">Delete voice?</DialogTitle>
         <div className="flex items-start gap-3">
-          <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+          <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
             <AlertTriangle className="h-4 w-4" />
           </div>
           <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+            <h3 className="text-sm font-semibold text-(--text-primary)">
               Delete voice?
             </h3>
-            <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+            <DialogDescription className="mt-1 text-sm text-(--text-muted)">
               This permanently removes the saved voice from your library.
             </DialogDescription>
-            <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+            <p className="mt-2 truncate text-xs text-(--text-subtle)">
               {deleteTargetVoice?.name || deleteConfirmVoiceId}
             </p>
           </div>
         </div>
 
         {deleteConfirmError ? (
-          <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
+          <div className="mt-4 rounded-md border border-(--danger-border) bg-(--danger-bg) px-3 py-2 text-xs text-(--danger-text)">
             {deleteConfirmError}
           </div>
         ) : null}
@@ -675,7 +675,7 @@ export function VoicesPage({
             variant="outline"
             onClick={() => setDeleteConfirmVoiceId(null)}
             size="sm"
-            className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
+            className="h-8 border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) hover:bg-(--bg-surface-3)"
             disabled={deletingVoiceId !== null}
           >
             Cancel

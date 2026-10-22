@@ -187,8 +187,8 @@ export function DiarizationQualityPanel({
 
   if (!record) {
     return (
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
-        <CardContent className="py-12 text-center text-sm text-[var(--text-muted)]">
+      <Card className="border-(--border-muted) bg-(--bg-surface-1)">
+        <CardContent className="py-12 text-center text-sm text-(--text-muted)">
           No quality data is available yet.
         </CardContent>
       </Card>
@@ -221,54 +221,54 @@ export function DiarizationQualityPanel({
 
   return (
     <div className="space-y-3">
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
+      <Card className="border-(--border-muted) bg-(--bg-surface-1)">
         <CardHeader className="space-y-1 pb-3">
-          <CardTitle className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--text-primary)]">
+          <CardTitle className="text-[15px] font-semibold tracking-[-0.01em] text-(--text-primary)">
             Quality Signals
           </CardTitle>
-          <CardDescription className="text-sm leading-6 text-[var(--text-muted)]">
+          <CardDescription className="text-sm leading-6 text-(--text-muted)">
             Review diarization confidence indicators before exporting or saving speaker corrections.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="grid gap-2.5 sm:grid-cols-3">
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-xs text-[var(--text-subtle)]">
+            <div className="rounded-lg border border-(--border-muted) bg-(--bg-surface-0) px-4 py-3">
+              <div className="text-xs text-(--text-subtle)">
                 Alignment coverage
               </div>
-              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
+              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-(--text-primary)">
                 {formatCoverage(record.alignment_coverage)}
               </div>
             </div>
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-xs text-[var(--text-subtle)]">
+            <div className="rounded-lg border border-(--border-muted) bg-(--bg-surface-0) px-4 py-3">
+              <div className="text-xs text-(--text-subtle)">
                 Unattributed words
               </div>
-              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
+              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-(--text-primary)">
                 {record.unattributed_words}
               </div>
             </div>
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-              <div className="text-xs text-[var(--text-subtle)]">
+            <div className="rounded-lg border border-(--border-muted) bg-(--bg-surface-0) px-4 py-3">
+              <div className="text-xs text-(--text-subtle)">
                 Speakers
               </div>
-              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-[var(--text-primary)]">
+              <div className="mt-1 text-[1.5rem] font-semibold leading-none text-(--text-primary)">
                 {record.speaker_count}
               </div>
-              <div className="mt-1 text-[11px] leading-5 text-[var(--text-muted)]">
+              <div className="mt-1 text-[11px] leading-5 text-(--text-muted)">
                 {record.corrected_speaker_count ?? record.speaker_count} corrected
               </div>
             </div>
           </div>
 
-          <Separator className="bg-[var(--border-muted)]" />
+          <Separator className="bg-(--border-muted)" />
 
           {warnings.length > 0 ? (
             <div className="grid gap-2.5">
               {warnings.map((warning) => (
                 <div
                   key={`${warning.title}:${warning.description}`}
-                  className="rounded-lg border border-[var(--warning-border)] bg-[var(--warning-bg)] px-4 py-3 text-[var(--warning-text)]"
+                  className="rounded-lg border border-(--warning-border) bg-(--warning-bg) px-4 py-3 text-(--warning-text)"
                 >
                   <div className="flex items-start gap-3">
                     <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -283,19 +283,19 @@ export function DiarizationQualityPanel({
               ))}
             </div>
           ) : (
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3 text-sm text-[var(--text-secondary)]">
+            <div className="rounded-lg border border-(--border-muted) bg-(--bg-surface-0) px-4 py-3 text-sm text-(--text-secondary)">
               No major diarization warnings surfaced for this run.
             </div>
           )}
         </CardContent>
       </Card>
 
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
+      <Card className="border-(--border-muted) bg-(--bg-surface-1)">
         <CardHeader className="space-y-1 pb-3">
-          <CardTitle className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--text-primary)]">
+          <CardTitle className="text-[15px] font-semibold tracking-[-0.01em] text-(--text-primary)">
             Rerun Saved Audio
           </CardTitle>
-          <CardDescription className="text-sm leading-6 text-[var(--text-muted)]">
+          <CardDescription className="text-sm leading-6 text-(--text-muted)">
             Adjust speaker bounds or segmentation thresholds, then rerun without re-uploading the file.
           </CardDescription>
         </CardHeader>
@@ -305,7 +305,7 @@ export function DiarizationQualityPanel({
               <div className="space-y-1.5">
                 <Label
                   htmlFor="quality-min-speakers"
-                  className="text-[13px] font-medium text-[var(--text-primary)]"
+                  className="text-[13px] font-medium text-(--text-primary)"
                 >
                   Min speakers
                 </Label>
@@ -315,13 +315,13 @@ export function DiarizationQualityPanel({
                   inputMode="numeric"
                   value={minSpeakers}
                   onChange={(event) => setMinSpeakers(event.target.value)}
-                  className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                  className="h-9 border-(--border-muted) bg-(--bg-surface-0) text-sm"
                 />
               </div>
               <div className="space-y-1.5">
                 <Label
                   htmlFor="quality-max-speakers"
-                  className="text-[13px] font-medium text-[var(--text-primary)]"
+                  className="text-[13px] font-medium text-(--text-primary)"
                 >
                   Max speakers
                 </Label>
@@ -331,13 +331,13 @@ export function DiarizationQualityPanel({
                   inputMode="numeric"
                   value={maxSpeakers}
                   onChange={(event) => setMaxSpeakers(event.target.value)}
-                  className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                  className="h-9 border-(--border-muted) bg-(--bg-surface-0) text-sm"
                 />
               </div>
               <div className="space-y-1.5">
                 <Label
                   htmlFor="quality-min-speech"
-                  className="text-[13px] font-medium text-[var(--text-primary)]"
+                  className="text-[13px] font-medium text-(--text-primary)"
                 >
                   Min speech (ms)
                 </Label>
@@ -347,13 +347,13 @@ export function DiarizationQualityPanel({
                   inputMode="decimal"
                   value={minSpeechDurationMs}
                   onChange={(event) => setMinSpeechDurationMs(event.target.value)}
-                  className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                  className="h-9 border-(--border-muted) bg-(--bg-surface-0) text-sm"
                 />
               </div>
               <div className="space-y-1.5">
                 <Label
                   htmlFor="quality-min-silence"
-                  className="text-[13px] font-medium text-[var(--text-primary)]"
+                  className="text-[13px] font-medium text-(--text-primary)"
                 >
                   Min silence (ms)
                 </Label>
@@ -363,19 +363,19 @@ export function DiarizationQualityPanel({
                   inputMode="decimal"
                   value={minSilenceDurationMs}
                   onChange={(event) => setMinSilenceDurationMs(event.target.value)}
-                  className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
+                  className="h-9 border-(--border-muted) bg-(--bg-surface-0) text-sm"
                 />
               </div>
             </div>
 
             {validationError ? (
-              <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-xs text-[var(--danger-text)]">
+              <div className="rounded-lg border border-(--danger-border) bg-(--danger-bg) px-4 py-3 text-xs text-(--danger-text)">
                 {validationError}
               </div>
             ) : null}
 
             {error ? (
-              <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-xs text-[var(--danger-text)]">
+              <div className="rounded-lg border border-(--danger-border) bg-(--danger-bg) px-4 py-3 text-xs text-(--danger-text)">
                 {error}
               </div>
             ) : null}
@@ -385,7 +385,7 @@ export function DiarizationQualityPanel({
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 rounded-full gap-2 px-3 text-[12px] font-medium text-[var(--text-secondary)]"
+                className="h-8 rounded-full gap-2 px-3 text-[12px] font-medium text-(--text-secondary)"
                 onClick={resetToCurrentSettings}
                 disabled={isRerunning}
               >

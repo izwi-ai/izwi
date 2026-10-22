@@ -90,7 +90,7 @@ interface ScriptParagraphProps {
 }
 
 const iconButton =
-  "flex h-[30px] w-[30px] items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "flex h-[30px] w-[30px] items-center justify-center rounded-full transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 
 export function ScriptParagraph({
   segment,
@@ -233,7 +233,7 @@ export function ScriptParagraph({
   const gutter = (() => {
     if (state === "rendering") {
       return (
-        <span role="img" aria-label="Rendering" className={cn(iconButton, "text-[var(--text-primary)]")}>
+        <span role="img" aria-label="Rendering" className={cn(iconButton, "text-(--text-primary)")}>
           <Loader2 className="h-[18px] w-[18px] animate-spin" />
         </span>
       );
@@ -241,7 +241,7 @@ export function ScriptParagraph({
     if (state === "queued") {
       return (
         <span role="img" aria-label="Queued" className={iconButton}>
-          <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-dashed border-[var(--text-subtle)]" />
+          <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-dashed border-(--text-subtle)" />
         </span>
       );
     }
@@ -255,8 +255,8 @@ export function ScriptParagraph({
           className={cn(
             iconButton,
             active
-              ? "bg-[var(--accent-solid)] text-[var(--text-on-accent)]"
-              : "border border-[var(--border-default)] text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)]",
+              ? "bg-(--accent-solid) text-(--text-on-accent)"
+              : "border border-(--border-default) text-(--text-primary) hover:bg-(--bg-surface-2)",
           )}
         >
           {active ? <Pause className="h-3 w-3 fill-current" /> : <Play className="ml-px h-3 w-3 fill-current" />}
@@ -273,10 +273,10 @@ export function ScriptParagraph({
         className={cn(
           iconButton,
           failed
-            ? "border border-[var(--danger-border)] text-[var(--danger-text)] hover:bg-[var(--danger-bg)]"
+            ? "border border-(--danger-border) text-(--danger-text) hover:bg-(--danger-bg)"
             : changed
-              ? "border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
-              : "border border-[var(--border-default)] text-[var(--text-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]",
+              ? "border border-(--status-warning-border) bg-(--status-warning-bg) text-(--status-warning-text)"
+              : "border border-(--border-default) text-(--text-muted) hover:bg-(--bg-surface-2) hover:text-(--text-primary)",
         )}
       >
         <RotateCw className="h-[13px] w-[13px]" />
@@ -285,20 +285,20 @@ export function ScriptParagraph({
   })();
 
   const status = (() => {
-    if (saving) return <span className="text-[var(--text-subtle)]">Saving…</span>;
-    if (state === "rendering") return <span className="text-[var(--text-muted)]">Rendering…</span>;
-    if (state === "queued") return <span className="text-[var(--text-subtle)]">Queued</span>;
-    if (state === "failed") return <span className="text-[var(--danger-text)]">Failed</span>;
-    if (state === "stale" || dirty) return <span className="text-[var(--status-warning-text)]">Changed</span>;
+    if (saving) return <span className="text-(--text-subtle)">Saving…</span>;
+    if (state === "rendering") return <span className="text-(--text-muted)">Rendering…</span>;
+    if (state === "queued") return <span className="text-(--text-subtle)">Queued</span>;
+    if (state === "failed") return <span className="text-(--danger-text)">Failed</span>;
+    if (state === "stale" || dirty) return <span className="text-(--status-warning-text)">Changed</span>;
     if (playback.current && duration) {
       return (
-        <span className="tabular-nums text-[var(--text-muted)]">
+        <span className="tabular-nums text-(--text-muted)">
           {formatClockDuration(playback.time)} / {formatClockDuration(duration)}
         </span>
       );
     }
     return hasAudio ? (
-      <span className="tabular-nums text-[var(--text-subtle)]">{formatClockDuration(duration)}</span>
+      <span className="tabular-nums text-(--text-subtle)">{formatClockDuration(duration)}</span>
     ) : null;
   })();
 
@@ -308,10 +308,10 @@ export function ScriptParagraph({
       onDrop={onDrop}
       className={cn(
         "group relative grid grid-cols-[30px_minmax(0,1fr)_auto] items-start gap-3 rounded-[12px] px-3 py-3 transition-colors",
-        playback.current && "bg-[var(--accent-soft)]",
-        selected && "bg-[var(--accent-strong)]",
-        state === "failed" && "bg-[var(--danger-bg)]",
-        "focus-within:bg-[var(--surface-panel)]",
+        playback.current && "bg-(--accent-soft)",
+        selected && "bg-(--accent-strong)",
+        state === "failed" && "bg-(--danger-bg)",
+        "focus-within:bg-(--surface-panel)",
       )}
       data-segment-id={segment.id}
     >
@@ -319,7 +319,7 @@ export function ScriptParagraph({
         <span
           aria-hidden="true"
           className={cn(
-            "pointer-events-none absolute inset-x-3 h-0.5 rounded-full bg-[var(--text-primary)]",
+            "pointer-events-none absolute inset-x-3 h-0.5 rounded-full bg-(--text-primary)",
             dropIndicator === "before" ? "-top-px" : "-bottom-px",
           )}
         />
@@ -330,7 +330,7 @@ export function ScriptParagraph({
         onDragEnd={onDragEnd}
         aria-hidden="true"
         title="Drag to reorder"
-        className="absolute -left-6 top-[18px] hidden cursor-grab text-[var(--text-subtle)] opacity-0 transition-opacity group-hover:opacity-100 sm:block"
+        className="absolute -left-6 top-[18px] hidden cursor-grab text-(--text-subtle) opacity-0 transition-opacity group-hover:opacity-100 sm:block"
       >
         <GripVertical className="h-4 w-4" />
       </span>
@@ -352,16 +352,16 @@ export function ScriptParagraph({
             else void save(draft);
           }}
           onKeyDown={(event) => void handleKeyDown(event)}
-          className="w-full resize-none overflow-hidden bg-transparent pt-[3px] text-[15px] leading-[1.65] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-subtle)]"
+          className="w-full resize-none overflow-hidden bg-transparent pt-[3px] text-[15px] leading-[1.65] text-(--text-primary) outline-hidden placeholder:text-(--text-subtle)"
         />
         {state === "failed" && segment.render_error ? (
-          <p className="flex items-start gap-1.5 text-xs text-[var(--danger-text)]">
+          <p className="flex items-start gap-1.5 text-xs text-(--danger-text)">
             <AlertCircle aria-hidden="true" className="mt-px h-3.5 w-3.5 shrink-0" />
             {segment.render_error}
           </p>
         ) : null}
         {ownVoiceName ? (
-          <span className="inline-flex items-center gap-1.5 self-start rounded-full border border-[var(--border-subtle)] px-2 py-0.5 text-xs text-[var(--text-muted)]">
+          <span className="inline-flex items-center gap-1.5 self-start rounded-full border border-(--border-subtle) px-2 py-0.5 text-xs text-(--text-muted)">
             <UserRound aria-hidden="true" className="h-3 w-3" />
             {ownVoiceName}
           </span>
@@ -369,9 +369,9 @@ export function ScriptParagraph({
         {playback.current ? (
           <div
             aria-hidden="true"
-            className="h-[3px] overflow-hidden rounded-full bg-[var(--surface-raised)]"
+            className="h-[3px] overflow-hidden rounded-full bg-(--surface-raised)"
           >
-            <div className="h-full bg-[var(--text-primary)]" style={{ width: `${progress * 100}%` }} />
+            <div className="h-full bg-(--text-primary)" style={{ width: `${progress * 100}%` }} />
           </div>
         ) : null}
       </div>
@@ -385,7 +385,7 @@ export function ScriptParagraph({
               aria-label={`More actions for paragraph ${number}`}
               className={cn(
                 iconButton,
-                "rounded-[8px] text-[var(--text-muted)] opacity-0 hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                "rounded-[8px] text-(--text-muted) opacity-0 hover:bg-(--bg-surface-2) hover:text-(--text-primary) focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
               )}
             >
               <MoreHorizontal className="h-4 w-4" />
@@ -415,7 +415,7 @@ export function ScriptParagraph({
                   <DropdownMenuItem onSelect={() => onVoice(null)}>
                     <span className="flex min-w-0 flex-1 flex-col">
                       <span>Project voice</span>
-                      <span className="text-xs text-[var(--text-muted)]">{projectVoiceName}</span>
+                      <span className="text-xs text-(--text-muted)">{projectVoiceName}</span>
                     </span>
                     {ownVoiceName === null ? <Check className="h-4 w-4" /> : null}
                   </DropdownMenuItem>
@@ -458,7 +458,7 @@ export function ScriptParagraph({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={onDelete}
-                  className="text-[var(--danger-text)] focus:text-[var(--danger-text)]"
+                  className="text-(--danger-text) focus:text-(--danger-text)"
                 >
                   <Trash2 className="mr-2 h-4 w-4" />
                   Delete

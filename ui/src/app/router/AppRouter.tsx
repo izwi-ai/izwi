@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { BrowserRouter, useNavigate } from "react-router-dom";
+import { BrowserRouter, useNavigate } from "react-router";
 import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { AppRoutes } from "@/app/router/AppRoutes";
 

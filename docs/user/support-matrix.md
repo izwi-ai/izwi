@@ -22,7 +22,7 @@ If another page says something different, this page should win.
 | Surface | OS / Hardware | Backend status | Support level | Notes |
 |---------|----------------|----------------|---------------|-------|
 | **Desktop app from GitHub Releases** | Apple Silicon, macOS 15+ | `metal` | Stable | The release selects Metal automatically when the runtime is eligible. |
-| **Desktop app from GitHub Releases** | macOS 12-14 | `cpu` | Stable | The same release remains launchable and deliberately avoids Candle's Metal constructor. |
+| **Desktop app from GitHub Releases** | macOS 13.3-14 | `cpu` | Stable | The same release remains launchable and deliberately avoids Candle's Metal constructor. The desktop app needs macOS 13.3+ (WebKit 16.4) for its UI. |
 | **Desktop app from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Native Linux installers are CPU-only and do not bundle CUDA runtime libraries. |
 | **Desktop app from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Native Windows installers are CPU-only and do not bundle CUDA runtime DLLs. |
 | **Terminal bundle from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Linux terminal tarballs contain the public CPU-only CLI, server, and desktop shell binaries. |

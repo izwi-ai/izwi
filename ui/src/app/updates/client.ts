@@ -13,6 +13,8 @@ export interface AppUpdateMetadata {
   releaseTag: string;
   manifestUrl: string;
   platformBehavior: PlatformInstallBehavior;
+  /** Set to the system it needs ("macOS 13.3") when this one is too old to install it. */
+  requiredSystem: string | null;
 }
 
 export interface InstallResult {

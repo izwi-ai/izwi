@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 import {
   api,
   type DiarizationRecord,
@@ -923,7 +923,7 @@ export function TranscriptionPage({
             }}
           >
             <DialogContent
-              className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-[52rem]")}
+              className={cn(CREATION_DIALOG_CONTENT_CLASS, "max-w-208")}
               onEscapeKeyDown={(event) => {
                 if (isModelModalOpen || isCreationBusy) {
                   event.preventDefault();
@@ -1154,7 +1154,7 @@ export function TranscriptionPage({
         }
         selectionMode={isDiarizationModelModal ? "manage" : "route"}
         zIndexClassName={
-          isNewTranscriptionModalOpen ? "z-[70]" : "z-50"
+          isNewTranscriptionModalOpen ? "z-70" : "z-50"
         }
       />
     </PageShell>

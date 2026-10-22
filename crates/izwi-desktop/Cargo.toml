@@ -19,8 +19,8 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 url = "2.5"
 percent-encoding = "2.3"
-# Keep the minor version in step with @tauri-apps/api in ui/package-lock.json:
-# `cargo tauri build` fails when they differ.
+# Keep the minor version in step with @tauri-apps/api, pinned with ~ in
+# ui/package.json: `cargo tauri build` fails when they differ.
 tauri = { version = "2.12.5", features = ["tray-icon"] }
 # Its default TLS feature turns on reqwest's aws-lc-rs provider next to ring.
 # Without it the plugin shares the reqwest rustls stack, with the ring provider

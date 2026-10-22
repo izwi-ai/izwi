@@ -156,12 +156,58 @@ pub fn updater_target_for_platform(target_os: &str, deb_install: bool) -> &'stat
     }
 }
 
+/// The system a release's `target` build needs, as "macOS 13.3", when the
+/// `running` system is older: installing that build would leave an app the
+/// system refuses to open. The release manifest sets the floor per target
+/// (`"minimum_system_version": {"macos": "13.3"}`); a manifest without one,
+/// or a version that can't be read, sets no floor.
+pub fn unmet_system_floor(
+    manifest: &serde_json::Value,
+    target: &str,
+    running: Option<&str>,
+) -> Option<String> {
+    let required = manifest
+        .get("minimum_system_version")?
+        .get(target)?
+        .as_str()?;
+    let too_old = compare_system_versions(running?, required)?.is_lt();
+    too_old.then(|| format!("{} {}", system_name(target), required.trim()))
+}
+
+/// Dotted numeric versions compared part by part, a missing part as 0:
+/// "13" equals "13.0", and "12.7.6" is older than "13.3".
+fn compare_system_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let parts = |text: &str| -> Option<Vec<u64>> {
+        text.trim()
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    };
+    let (left, right) = (parts(left)?, parts(right)?);
+    let part = |parts: &[u64], index: usize| parts.get(index).copied().unwrap_or(0);
+    Some(
+        (0..left.len().max(right.len()))
+            .map(|index| part(&left, index).cmp(&part(&right, index)))
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal),
+    )
+}
+
+fn system_name(target: &str) -> &'static str {
+    match target {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" | "linux-deb" => "Linux",
+        _ => "this system",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         github_manifest_url, github_releases_api_url, install_behavior_for_platform,
-        is_newer_release, manifest_asset_name, parse_release_tag, updater_target_for_platform,
-        UpdateChannel, UpdaterContract,
+        is_newer_release, manifest_asset_name, parse_release_tag, unmet_system_floor,
+        updater_target_for_platform, UpdateChannel, UpdaterContract,
     };
 
     fn version(text: &str) -> semver::Version {
@@ -232,6 +278,42 @@ mod tests {
         assert_eq!(updater_target_for_platform("linux", false), "linux");
         assert_eq!(updater_target_for_platform("linux", true), "linux-deb");
         assert_eq!(updater_target_for_platform("dragonfly", false), "unknown");
+    }
+
+    #[test]
+    fn reports_a_system_floor_the_running_system_misses() {
+        let manifest = serde_json::json!({
+            "version": "v0.2.0",
+            "minimum_system_version": { "macos": "13.3" },
+        });
+        let floor = |running| unmet_system_floor(&manifest, "macos", running);
+
+        assert_eq!(floor(Some("12.7.6")), Some("macOS 13.3".into()));
+        assert_eq!(floor(Some("13.2.1")), Some("macOS 13.3".into()));
+        assert_eq!(floor(Some("13.3")), None);
+        assert_eq!(floor(Some("13.3.0")), None);
+        assert_eq!(floor(Some("15.1")), None);
+        // An unreadable system version keeps the update on offer.
+        assert_eq!(floor(None), None);
+        assert_eq!(floor(Some("")), None);
+        // Other targets, and manifests from before floors, set none.
+        assert_eq!(unmet_system_floor(&manifest, "windows", Some("10.0")), None);
+        assert_eq!(
+            unmet_system_floor(
+                &serde_json::json!({"version": "v0.1.0"}),
+                "macos",
+                Some("12.0")
+            ),
+            None
+        );
+        assert_eq!(
+            unmet_system_floor(
+                &serde_json::json!({"minimum_system_version": {"macos": "thirteen"}}),
+                "macos",
+                Some("12.0")
+            ),
+            None
+        );
     }
 
     fn newer(current: &str, update: &str) -> bool {

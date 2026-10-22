@@ -68,12 +68,12 @@ export function CreationDialogFrame({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" onKeyDown={handleKeyDown}>
-      <div className="shrink-0 border-b border-[var(--border-muted)] px-5 py-5 pr-14 sm:px-6 sm:pr-14">
-        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+      <div className="shrink-0 border-b border-(--border-muted) px-5 py-5 pr-14 sm:px-6 sm:pr-14">
+        <DialogTitle className="text-xl font-semibold tracking-tight text-(--text-primary)">
           {title}
         </DialogTitle>
         {description ? (
-          <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
+          <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-(--text-muted)">
             {description}
           </DialogDescription>
         ) : null}
@@ -84,8 +84,8 @@ export function CreationDialogFrame({
         {children}
       </div>
 
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-3.5 sm:px-6">
-        <div className="min-w-0 text-xs text-[var(--text-muted)]">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-(--border-muted) bg-(--bg-surface-0) px-5 py-3.5 sm:px-6">
+        <div className="min-w-0 text-xs text-(--text-muted)">
           {footerStart}
         </div>
         <div className="flex items-center gap-2">
@@ -130,7 +130,7 @@ export function CreationDialogFrame({
 
 /** DialogContent classes a CreationDialogFrame needs. */
 export const CREATION_DIALOG_CONTENT_CLASS =
-  "flex flex-col gap-0 overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0";
+  "flex flex-col gap-0 overflow-hidden border-(--border-strong) bg-(--bg-surface-0) p-0";
 
 interface CreationDialogProps
   extends Omit<CreationDialogFrameProps, "cancelDisabled"> {

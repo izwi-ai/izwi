@@ -13,9 +13,9 @@ export function CreationBody({
   side: ReactNode;
 }) {
   return (
-    <div className="grid lg:grid-cols-[minmax(0,1fr),19rem]">
+    <div className="grid lg:grid-cols-[minmax(0,1fr)_19rem]">
       <div className="flex min-w-0 flex-col gap-3 px-5 py-4 sm:px-6">{main}</div>
-      <div className="flex flex-col gap-4 border-t border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] px-5 py-4 lg:border-l lg:border-t-0">
+      <div className="flex flex-col gap-4 border-t border-(--border-subtle) bg-(--surface-panel-alt) px-5 py-4 lg:border-l lg:border-t-0">
         {side}
       </div>
     </div>
@@ -38,13 +38,13 @@ export function CreationField({
     <div className="flex flex-col gap-1.5">
       <label
         htmlFor={htmlFor}
-        className="text-[12.5px] font-medium text-[var(--text-muted)]"
+        className="text-[12.5px] font-medium text-(--text-muted)"
       >
         {label}
       </label>
       {children}
       {hint ? (
-        <p className="text-xs leading-4 text-[var(--text-subtle)]">{hint}</p>
+        <p className="text-xs leading-4 text-(--text-subtle)">{hint}</p>
       ) : null}
     </div>
   );
@@ -72,11 +72,11 @@ export function CreationOption({
       )}
     >
       <span className="min-w-0 flex-1">
-        <span className="block text-[13.5px] font-medium text-[var(--text-primary)]">
+        <span className="block text-[13.5px] font-medium text-(--text-primary)">
           {title}
         </span>
         {description ? (
-          <span className="mt-0.5 block text-xs leading-4 text-[var(--text-subtle)]">
+          <span className="mt-0.5 block text-xs leading-4 text-(--text-subtle)">
             {description}
           </span>
         ) : null}
@@ -106,11 +106,11 @@ export function ModelRow({
   actions?: ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-2.5 py-2 text-[13px]">
+    <div className="flex items-center gap-2 rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) px-2.5 py-2 text-[13px]">
       {status === "busy" ? (
         <Loader2
           aria-hidden="true"
-          className="h-3 w-3 shrink-0 animate-spin text-[var(--status-warning-text)]"
+          className="h-3 w-3 shrink-0 animate-spin text-(--status-warning-text)"
         />
       ) : (
         <span
@@ -118,16 +118,16 @@ export function ModelRow({
           className={cn(
             "h-1.5 w-1.5 shrink-0 rounded-full",
             status === "ready"
-              ? "bg-[var(--status-positive-solid)]"
+              ? "bg-(--status-positive-solid)"
               : status === "not_ready"
-                ? "bg-[var(--status-warning-text)]"
-                : "bg-[var(--text-subtle)]",
+                ? "bg-(--status-warning-text)"
+                : "bg-(--text-subtle)",
           )}
         />
       )}
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-[var(--text-primary)]">{name}</span>
-        <span className="block text-[11.5px] text-[var(--text-subtle)]">
+        <span className="block truncate text-(--text-primary)">{name}</span>
+        <span className="block text-[11.5px] text-(--text-subtle)">
           {statusLabel}
         </span>
       </span>
@@ -158,7 +158,7 @@ export function ModelRowAction({
       onClick={onClick}
       disabled={disabled}
       aria-label={ariaLabel}
-      className="inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[12.5px] text-[var(--text-muted)] underline-offset-[3px] hover:text-[var(--text-primary)] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+      className="inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[12.5px] text-(--text-muted) underline-offset-[3px] hover:text-(--text-primary) hover:underline disabled:cursor-not-allowed disabled:opacity-50"
     >
       {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
       {children}

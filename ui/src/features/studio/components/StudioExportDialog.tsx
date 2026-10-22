@@ -153,7 +153,7 @@ export function StudioExportDialog({
     >
       <div className="flex flex-col gap-3 px-5 py-4 sm:px-6">
         {waiting.length > 0 && phase !== "rendering" ? (
-          <p className="flex items-start gap-2.5 rounded-[12px] border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3.5 py-3 text-[13px] leading-5 text-[var(--status-warning-text)]">
+          <p className="flex items-start gap-2.5 rounded-[12px] border border-(--status-warning-border) bg-(--status-warning-bg) px-3.5 py-3 text-[13px] leading-5 text-(--status-warning-text)">
             <AlertCircle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
             {waiting.length === 1
               ? "1 paragraph isn't rendered yet. Izwi renders it first, then saves the file."
@@ -161,7 +161,7 @@ export function StudioExportDialog({
           </p>
         ) : null}
         {phase === "rendering" ? (
-          <p className="flex items-center gap-2.5 rounded-[12px] border border-[var(--border-subtle)] px-3.5 py-3 text-[13px] text-[var(--text-secondary)]">
+          <p className="flex items-center gap-2.5 rounded-[12px] border border-(--border-subtle) px-3.5 py-3 text-[13px] text-(--text-secondary)">
             <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
             Rendering, {remaining} left…
           </p>

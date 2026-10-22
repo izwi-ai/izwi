@@ -67,10 +67,10 @@ export function VoiceSetup({
   return (
     <div className="flex w-full max-w-[440px] flex-col gap-7">
       <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-medium tracking-[-0.02em] text-[var(--text-primary)]">
+        <h1 className="text-2xl font-medium tracking-[-0.02em] text-(--text-primary)">
           Set up voice
         </h1>
-        <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+        <p className="text-sm leading-relaxed text-(--text-muted)">
           {isDownloading
             ? "Voice runs entirely on this device. You can leave this page while it sets up."
             : rows.length === 1
@@ -79,7 +79,7 @@ export function VoiceSetup({
         </p>
       </div>
 
-      <ul className="border-t border-[var(--border-muted)]">
+      <ul className="border-t border-(--border-muted)">
         {rows.map((row) => {
           const status = rowStatus(row, downloadProgress);
           return (
@@ -101,7 +101,7 @@ export function VoiceSetup({
             <button
               type="button"
               disabled
-              className="h-11 flex-1 rounded-full bg-[var(--bg-surface-3)] px-5 text-sm font-medium text-[var(--text-muted)]"
+              className="h-11 flex-1 rounded-full bg-(--bg-surface-3) px-5 text-sm font-medium text-(--text-muted)"
             >
               Setting up… {formatBytes(doneBytes)} of {formatBytes(totalBytes)}
             </button>
@@ -110,7 +110,7 @@ export function VoiceSetup({
               type="button"
               onClick={onDownload}
               disabled={unavailable}
-              className="h-11 flex-1 rounded-full bg-[var(--accent-solid)] px-5 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 disabled:opacity-50"
+              className="h-11 flex-1 rounded-full bg-(--accent-solid) px-5 text-sm font-medium text-(--text-on-accent) transition-opacity hover:opacity-90 disabled:opacity-50"
             >
               {downloadBytes > 0
                 ? `Download and set up · ${formatBytes(downloadBytes)}`
@@ -121,19 +121,19 @@ export function VoiceSetup({
             <button
               type="button"
               onClick={onCancel}
-              className="h-11 rounded-full border border-[var(--border-default)] px-4 text-sm text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)]"
+              className="h-11 rounded-full border border-(--border-default) px-4 text-sm text-(--text-primary) transition-colors hover:bg-(--bg-surface-2)"
             >
               Cancel
             </button>
           )}
         </div>
         {onUseCompact && (
-          <p className="text-[13px] text-[var(--text-muted)]">
+          <p className="text-[13px] text-(--text-muted)">
             Prefer a smaller download?{" "}
             <button
               type="button"
               onClick={onUseCompact}
-              className="text-[var(--text-primary)] underline decoration-[var(--border-strong)] underline-offset-[3px] hover:text-[var(--text-muted)]"
+              className="text-(--text-primary) underline decoration-(--border-strong) underline-offset-[3px] hover:text-(--text-muted)"
             >
               Use the compact engine
             </button>{" "}

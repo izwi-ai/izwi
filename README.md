@@ -52,7 +52,8 @@ the app and select **Install** (the `.deb` installs it for you).
 Runtime support depends on the artifact:
 
 - macOS Apple Silicon release builds use Metal on macOS 15+ and fall back to
-  CPU on macOS 12-14.
+  CPU on older macOS. The desktop app needs macOS 13.3 or later; the terminal
+  bundle runs on macOS 12 or later.
 - Linux and Windows release builds are CPU-only.
 - CUDA is supported through the Docker CUDA profile or source builds on
   compatible NVIDIA hosts.
@@ -119,7 +120,7 @@ For CLI/server installs, use the project install script:
 ./scripts/install-cli.sh
 ```
 
-It needs Node.js 18+ (it installs Rust if missing), and on Linux the Tauri
+It needs Node.js 24.15+ or 22.22+ (it installs Rust if missing), and on Linux the Tauri
 system packages (see
 [From Source](https://izwiai.com/docs/installation/from-source)).
 

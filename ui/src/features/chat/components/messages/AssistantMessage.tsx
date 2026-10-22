@@ -36,7 +36,7 @@ import {
 } from "@/features/chat/playground/support";
 
 const footerButtonClass =
-  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-(--text-subtle) transition-colors hover:bg-(--surface-raised) hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 
 function speedTitle(stats: ReturnType<typeof summarizeChatStats>): string {
   const parts = [
@@ -170,7 +170,7 @@ export function AssistantMessage({
     <article
       aria-label="Reply"
       className={cn(
-        "group flex flex-col gap-2.5 break-words text-[0.9375rem] leading-[1.7] text-[var(--text-primary)]",
+        "group flex flex-col gap-2.5 wrap-break-word text-[0.9375rem] leading-[1.7] text-(--text-primary)",
         showInlineCaret && "chat-streaming-answer",
       )}
     >
@@ -220,7 +220,7 @@ export function AssistantMessage({
       {!isStreamingReply && (
         <footer
           className={cn(
-            "-ml-1.5 flex h-7 items-center gap-0.5 text-[11.5px] text-[var(--text-subtle)] transition-opacity",
+            "-ml-1.5 flex h-7 items-center gap-0.5 text-[11.5px] text-(--text-subtle) transition-opacity",
             !isLatestReply &&
               "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
           )}
@@ -312,7 +312,7 @@ export function AssistantMessage({
                 {onDelete ? (
                   <DropdownMenuItem
                     onSelect={onDelete}
-                    className="gap-2 text-[var(--danger-text)] focus:text-[var(--danger-text)]"
+                    className="gap-2 text-(--danger-text) focus:text-(--danger-text)"
                   >
                     <Trash2 className="h-4 w-4" aria-hidden="true" />
                     Delete reply
@@ -324,7 +324,7 @@ export function AssistantMessage({
           {answerText ? (
             <span
               aria-hidden="true"
-              className="mx-1.5 h-3.5 w-px shrink-0 bg-[var(--border-subtle)]"
+              className="mx-1.5 h-3.5 w-px shrink-0 bg-(--border-subtle)"
             />
           ) : null}
           <span className="flex min-w-0 items-center gap-1.5 px-1">

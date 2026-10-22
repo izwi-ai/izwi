@@ -20,7 +20,7 @@ import {
   type StudioVoice,
 } from "@/features/studio/studio";
 
-const sectionTitle = "text-[13px] font-semibold text-[var(--text-primary)]";
+const sectionTitle = "text-[13px] font-semibold text-(--text-primary)";
 
 function sameVoice(left: StudioVoice, right: StudioVoice): boolean {
   return left.modelId === right.modelId && voiceOptionKey(left) === voiceOptionKey(right);
@@ -97,24 +97,24 @@ export function ProjectSettingsSheet({
   };
 
   const input =
-    "h-8 min-w-0 rounded-[8px] border border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] px-2 text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)]";
+    "h-8 min-w-0 rounded-[8px] border border-(--border-subtle) bg-(--surface-panel-alt) px-2 text-[13px] text-(--text-primary) outline-hidden placeholder:text-(--text-subtle) focus:border-(--border-strong)";
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
         aria-describedby={undefined}
-        className="flex w-full max-w-[420px] flex-col gap-0 border-l border-[var(--border-default)] bg-[var(--bg-surface-1)] p-0 sm:max-w-[420px] [&>button:last-child]:hidden"
+        className="flex w-full max-w-[420px] flex-col gap-0 border-l border-(--border-default) bg-(--bg-surface-1) p-0 sm:max-w-[420px] [&>button:last-child]:hidden"
       >
-        <div className="flex h-16 shrink-0 items-center justify-between border-b border-[var(--border-muted)] pl-6 pr-3">
-          <SheetTitle className="text-base font-semibold text-[var(--text-primary)]">
+        <div className="flex h-16 shrink-0 items-center justify-between border-b border-(--border-muted) pl-6 pr-3">
+          <SheetTitle className="text-base font-semibold text-(--text-primary)">
             Project settings
           </SheetTitle>
           <button
             type="button"
             onClick={() => onOpenChange(false)}
             aria-label="Close"
-            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
           >
             <X className="h-4 w-4" />
           </button>
@@ -140,7 +140,7 @@ export function ProjectSettingsSheet({
                 <h3 id="studio-speed" className={sectionTitle}>
                   Speed
                 </h3>
-                <span className="text-xs tabular-nums text-[var(--text-muted)]">
+                <span className="text-xs tabular-nums text-(--text-muted)">
                   {speed.toFixed(2)}×
                 </span>
               </div>
@@ -159,24 +159,24 @@ export function ProjectSettingsSheet({
           <section className="flex flex-col gap-3">
             <div className="flex flex-col gap-1">
               <h3 className={sectionTitle}>Pronunciation</h3>
-              <p className="text-xs text-[var(--text-muted)]">
+              <p className="text-xs text-(--text-muted)">
                 Whole words, in any letter case, in every paragraph.
               </p>
             </div>
-            <div className="flex flex-col overflow-hidden rounded-[12px] border border-[var(--border-subtle)]">
+            <div className="flex flex-col overflow-hidden rounded-[12px] border border-(--border-subtle)">
               {pronunciations.map((rule) => (
                 <div
                   key={rule.id}
-                  className="grid grid-cols-[minmax(0,1fr)_14px_minmax(0,1fr)_28px] items-center gap-2.5 border-b border-[var(--border-subtle)] py-1.5 pl-3 pr-1.5 text-[13px]"
+                  className="grid grid-cols-[minmax(0,1fr)_14px_minmax(0,1fr)_28px] items-center gap-2.5 border-b border-(--border-subtle) py-1.5 pl-3 pr-1.5 text-[13px]"
                 >
-                  <span className="truncate text-[var(--text-primary)]">{rule.source_text}</span>
-                  <ArrowRight aria-hidden="true" className="h-3.5 w-3.5 text-[var(--text-subtle)]" />
-                  <span className="truncate text-[var(--text-muted)]">{rule.replacement_text}</span>
+                  <span className="truncate text-(--text-primary)">{rule.source_text}</span>
+                  <ArrowRight aria-hidden="true" className="h-3.5 w-3.5 text-(--text-subtle)" />
+                  <span className="truncate text-(--text-muted)">{rule.replacement_text}</span>
                   <button
                     type="button"
                     aria-label={`Remove ${rule.source_text}`}
                     onClick={() => onRemoveRule(rule.id)}
-                    className="flex h-7 w-7 items-center justify-center rounded-[8px] text-[var(--text-subtle)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+                    className="flex h-7 w-7 items-center justify-center rounded-[8px] text-(--text-subtle) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -193,7 +193,7 @@ export function ProjectSettingsSheet({
                   onChange={(event) => setWord(event.target.value)}
                   className={input}
                 />
-                <ArrowRight aria-hidden="true" className="h-3.5 w-3.5 text-[var(--text-subtle)]" />
+                <ArrowRight aria-hidden="true" className="h-3.5 w-3.5 text-(--text-subtle)" />
                 <input
                   aria-label="Say it as"
                   placeholder="Say it as"
@@ -205,7 +205,7 @@ export function ProjectSettingsSheet({
                   type="submit"
                   aria-label="Add rule"
                   disabled={!word.trim() || !sayAs.trim()}
-                  className="flex h-7 w-7 items-center justify-center rounded-[8px] border border-[var(--border-default)] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)] disabled:opacity-40"
+                  className="flex h-7 w-7 items-center justify-center rounded-[8px] border border-(--border-default) text-(--text-primary) transition-colors hover:bg-(--bg-surface-2) disabled:opacity-40"
                 >
                   <Plus className="h-3.5 w-3.5" />
                 </button>
@@ -214,9 +214,9 @@ export function ProjectSettingsSheet({
           </section>
         </div>
 
-        <div className="flex shrink-0 flex-col gap-3 border-t border-[var(--border-muted)] px-6 py-4">
+        <div className="flex shrink-0 flex-col gap-3 border-t border-(--border-muted) px-6 py-4">
           {affected > 0 ? (
-            <p className="flex items-start gap-2 text-xs text-[var(--status-warning-text)]">
+            <p className="flex items-start gap-2 text-xs text-(--status-warning-text)">
               <AlertCircle aria-hidden="true" className="mt-px h-3.5 w-3.5 shrink-0" />
               {`Saving marks ${affected} ${affected === 1 ? "paragraph" : "paragraphs"} to render again.`}
               {voiceChanged && !speedChanged && ownVoices > 0
@@ -228,7 +228,7 @@ export function ProjectSettingsSheet({
             <button
               type="button"
               onClick={() => onOpenChange(false)}
-              className="h-9 rounded-full border border-[var(--border-default)] px-4 text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)]"
+              className="h-9 rounded-full border border-(--border-default) px-4 text-[13px] text-(--text-primary) transition-colors hover:bg-(--bg-surface-2)"
             >
               Cancel
             </button>
@@ -236,7 +236,7 @@ export function ProjectSettingsSheet({
               type="button"
               onClick={() => void save()}
               disabled={saving || (!voiceChanged && !speedChanged)}
-              className="h-9 rounded-full bg-[var(--accent-solid)] px-4 text-[13px] font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 disabled:opacity-50"
+              className="h-9 rounded-full bg-(--accent-solid) px-4 text-[13px] font-medium text-(--text-on-accent) transition-opacity hover:opacity-90 disabled:opacity-50"
             >
               {saving ? "Saving…" : "Save"}
             </button>

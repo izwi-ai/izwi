@@ -63,10 +63,10 @@ export function RuntimeCard({
       className={cn(
         "h-[7px] w-[7px] shrink-0 rounded-full",
         offline
-          ? "bg-[var(--danger-text)]"
+          ? "bg-(--danger-text)"
           : state.status === "ready"
-            ? "bg-[var(--status-positive-solid)] shadow-[0_0_0_3px_var(--status-positive-bg)]"
-            : "bg-[var(--text-subtle)]",
+            ? "bg-(--status-positive-solid) shadow-[0_0_0_3px_var(--status-positive-bg)]"
+            : "bg-(--text-subtle)",
       )}
     />
   );
@@ -89,20 +89,20 @@ export function RuntimeCard({
     <div
       role="status"
       data-testid="runtime-card"
-      className="flex flex-col gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2.5"
+      className="flex flex-col gap-2 rounded-xl border border-(--border-subtle) bg-(--surface-panel) px-3 py-2.5"
     >
-      <div className="flex items-center gap-2 text-[12.5px] text-[var(--text-primary)]">
+      <div className="flex items-center gap-2 text-[12.5px] text-(--text-primary)">
         {dot}
         <span className="truncate">{statusLabel}</span>
         {backend && !offline ? (
-          <span className="ml-auto text-[11.5px] text-[var(--text-subtle)]">
+          <span className="ml-auto text-[11.5px] text-(--text-subtle)">
             {backend}
           </span>
         ) : null}
       </div>
       {usedFraction !== null && !offline ? (
         <div
-          className="h-1 overflow-hidden rounded-full bg-[var(--surface-raised)]"
+          className="h-1 overflow-hidden rounded-full bg-(--surface-raised)"
           title={memoryTitle}
           role="meter"
           aria-label="Memory reserved by models"
@@ -111,12 +111,12 @@ export function RuntimeCard({
           aria-valuenow={Math.round(usedFraction * 100)}
         >
           <div
-            className="h-full rounded-full bg-[var(--text-muted)]"
+            className="h-full rounded-full bg-(--text-muted)"
             style={{ width: `${Math.max(usedFraction * 100, 2)}%` }}
           />
         </div>
       ) : null}
-      <div className="flex justify-between gap-2 text-[11px] text-[var(--text-subtle)]">
+      <div className="flex justify-between gap-2 text-[11px] text-(--text-subtle)">
         <span className="truncate">
           {modelsLabel}
           {memoryLabel ? ` · ${memoryLabel}` : ""}

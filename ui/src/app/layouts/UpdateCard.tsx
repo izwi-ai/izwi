@@ -6,13 +6,13 @@ import { NotificationSlot } from "@/app/providers/NotificationProvider";
 import { cn } from "@/lib/utils";
 
 const focusRing =
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 const primaryButton = cn(
-  "inline-flex h-8 items-center rounded-full bg-[var(--accent-solid)] px-3.5 text-[13px] font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 disabled:opacity-50",
+  "inline-flex h-8 items-center rounded-full bg-(--accent-solid) px-3.5 text-[13px] font-medium text-(--text-on-accent) transition-opacity hover:opacity-90 disabled:opacity-50",
   focusRing,
 );
 const secondaryButton = cn(
-  "inline-flex h-8 items-center rounded-full border border-[var(--border-default)] px-3.5 text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)]",
+  "inline-flex h-8 items-center rounded-full border border-(--border-default) px-3.5 text-[13px] text-(--text-primary) transition-colors hover:bg-(--bg-surface-2)",
   focusRing,
 );
 
@@ -58,10 +58,10 @@ export function UpdateCard() {
     <NotificationSlot>
       <section
         aria-labelledby={titleId}
-        className="pointer-events-auto flex flex-col gap-3.5 rounded-[14px] border border-[var(--border-default)] bg-[var(--surface-panel)] p-4 text-[var(--text-primary)] shadow-[var(--shadow-raised)]"
+        className="pointer-events-auto flex flex-col gap-3.5 rounded-[14px] border border-(--border-default) bg-(--surface-panel) p-4 text-(--text-primary) shadow-(--shadow-raised)"
       >
         <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
-          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent-soft)]">
+          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-(--accent-soft)">
             <Download aria-hidden="true" className="h-4 w-4" />
           </span>
           <div className="flex min-w-0 flex-col gap-0.5">
@@ -76,11 +76,11 @@ export function UpdateCard() {
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={progressPercent ?? undefined}
-                  className="h-[3px] flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]"
+                  className="h-[3px] flex-1 overflow-hidden rounded-full bg-(--bg-surface-3)"
                 >
                   <div
                     className={cn(
-                      "h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-200",
+                      "h-full rounded-full bg-(--accent-solid) transition-[width] duration-200",
                       progressPercent === null && "w-1/3 animate-pulse",
                     )}
                     style={
@@ -90,17 +90,17 @@ export function UpdateCard() {
                     }
                   />
                 </div>
-                <span className="text-[12.5px] tabular-nums text-[var(--text-muted)]">
+                <span className="text-[12.5px] tabular-nums text-(--text-muted)">
                   {progressPercent !== null ? `${progressPercent}%` : "Starting…"}
                 </span>
               </div>
             ) : (
-              <p className="text-[12.5px] leading-[1.45] text-[var(--text-muted)]">
+              <p className="text-[12.5px] leading-[1.45] text-(--text-muted)">
                 {summary}
               </p>
             )}
             {errorMessage && !ready ? (
-              <p className="text-[12.5px] leading-[1.45] text-[var(--danger-text)]">
+              <p className="text-[12.5px] leading-[1.45] text-(--danger-text)">
                 {errorMessage}
               </p>
             ) : null}
@@ -111,7 +111,7 @@ export function UpdateCard() {
                 aria-controls={showNotes ? notesId : undefined}
                 onClick={() => setShowNotes((shown) => !shown)}
                 className={cn(
-                  "mt-1 w-fit rounded-sm text-[12.5px] underline decoration-[var(--border-strong)] underline-offset-[3px] transition-colors hover:decoration-[var(--text-primary)]",
+                  "mt-1 w-fit rounded-sm text-[12.5px] underline decoration-(--border-strong) underline-offset-[3px] transition-colors hover:decoration-(--text-primary)",
                   focusRing,
                 )}
               >
@@ -124,7 +124,7 @@ export function UpdateCard() {
             onClick={dismissPrompt}
             aria-label="Dismiss update"
             className={cn(
-              "flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-subtle)] transition-colors hover:bg-[var(--accent-soft)] hover:text-[var(--text-primary)]",
+              "flex h-6 w-6 items-center justify-center rounded-md text-(--text-subtle) transition-colors hover:bg-(--accent-soft) hover:text-(--text-primary)",
               focusRing,
             )}
           >
@@ -135,7 +135,7 @@ export function UpdateCard() {
         {notes && showNotes ? (
           <p
             id={notesId}
-            className="max-h-32 overflow-y-auto whitespace-pre-line rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel-alt)] px-3 py-2 text-[12.5px] leading-[1.5] text-[var(--text-muted)]"
+            className="max-h-32 overflow-y-auto whitespace-pre-line rounded-[10px] border border-(--border-subtle) bg-(--surface-panel-alt) px-3 py-2 text-[12.5px] leading-normal text-(--text-muted)"
           >
             {notes}
           </p>

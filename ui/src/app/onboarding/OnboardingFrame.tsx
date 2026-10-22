@@ -15,7 +15,7 @@ export const primaryButtonClass = cn(pageStateButtonClass.primary, "h-11 w-full 
 
 /** An inline action inside a sentence ("Choose models myself"). */
 export const linkButtonClass =
-  "rounded-sm text-[var(--text-primary)] underline decoration-[var(--border-strong)] underline-offset-[3px] hover:text-[var(--text-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "rounded-sm text-(--text-primary) underline decoration-(--border-strong) underline-offset-[3px] hover:text-(--text-muted) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 
 export function PrimaryButton({
   busy = false,
@@ -48,7 +48,7 @@ export function BackButton({
     <button
       type="button"
       onClick={onClick}
-      className="-ml-1 flex w-fit items-center gap-1 rounded-md px-1 py-0.5 text-[13px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+      className="-ml-1 flex w-fit items-center gap-1 rounded-md px-1 py-0.5 text-[13px] text-(--text-muted) transition-colors hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)"
     >
       <ChevronLeft aria-hidden="true" className="h-3.5 w-3.5" />
       {children}
@@ -73,7 +73,7 @@ export function OnboardingFrame({
   children: ReactNode;
 }) {
   return (
-    <div className="flex h-dvh flex-col bg-[var(--surface-canvas)] text-[var(--text-primary)]">
+    <div className="flex h-dvh flex-col bg-(--surface-canvas) text-(--text-primary)">
       <header className="grid h-14 shrink-0 grid-cols-3 items-center px-6">
         <div className="flex items-center gap-2.5">
           <img src={APP_ICON_URL} alt="" className="h-6 w-6 rounded-md" />
@@ -91,9 +91,9 @@ export function OnboardingFrame({
                   key={bar}
                   className={cn(
                     "h-1 w-6 rounded-full",
-                    bar < step && "bg-[var(--text-subtle)]",
-                    bar === step && "bg-[var(--accent-solid)]",
-                    bar > step && "bg-[var(--surface-raised)]",
+                    bar < step && "bg-(--text-subtle)",
+                    bar === step && "bg-(--accent-solid)",
+                    bar > step && "bg-(--surface-raised)",
                   )}
                 />
               ))}
@@ -106,7 +106,7 @@ export function OnboardingFrame({
               type="button"
               onClick={onSkip}
               disabled={skipping}
-              className="rounded-md px-2 py-1 text-[13px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] disabled:opacity-50"
+              className="rounded-md px-2 py-1 text-[13px] text-(--text-muted) transition-colors hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong) disabled:opacity-50"
             >
               Skip setup
             </button>
@@ -162,12 +162,12 @@ export function StageHeading({
       <h1
         ref={headingRef}
         tabIndex={-1}
-        className="text-2xl font-medium tracking-[-0.02em] text-[var(--text-primary)] focus:outline-none"
+        className="text-2xl font-medium tracking-[-0.02em] text-(--text-primary) focus:outline-hidden"
       >
         {title}
       </h1>
       {description ? (
-        <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+        <p className="text-sm leading-relaxed text-(--text-muted)">
           {description}
         </p>
       ) : null}

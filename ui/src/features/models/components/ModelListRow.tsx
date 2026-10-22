@@ -106,12 +106,12 @@ export function ModelStatusCell({
     case "downloading":
       return (
         <div {...live} className="flex flex-col gap-1.5">
-          <span className="whitespace-nowrap text-[12.5px] text-[var(--text-primary)]">
+          <span className="whitespace-nowrap text-[12.5px] text-(--text-primary)">
             Downloading · {Math.round(progress)}%
           </span>
-          <div className="h-[3px] w-full max-w-28 overflow-hidden rounded-full bg-[var(--surface-raised)]">
+          <div className="h-[3px] w-full max-w-28 overflow-hidden rounded-full bg-(--surface-raised)">
             <div
-              className="h-full rounded-full bg-[var(--text-primary)] transition-[width]"
+              className="h-full rounded-full bg-(--text-primary) transition-[width]"
               style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
             />
           </div>
@@ -142,7 +142,7 @@ export function ModelStatusCell({
     default: {
       const needs = neededMemoryLabel(model);
       return (
-        <span {...live} className="whitespace-nowrap text-[12.5px] text-[var(--text-subtle)]">
+        <span {...live} className="whitespace-nowrap text-[12.5px] text-(--text-subtle)">
           {needs ?? "Not downloaded"}
         </span>
       );
@@ -319,21 +319,21 @@ export function ModelListRow({
     <li
       data-testid={`model-row-${model.variant}`}
       className={cn(
-        "grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-x-3 gap-y-2 border-b border-[var(--border-subtle)] px-4 py-3 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_8.5rem_4.5rem_6.5rem_1.75rem]",
-        highlighted && "bg-[var(--accent-soft)]",
+        "grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-x-3 gap-y-2 border-b border-(--border-subtle) px-4 py-3 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_8.5rem_4.5rem_6.5rem_1.75rem]",
+        highlighted && "bg-(--accent-soft)",
       )}
     >
       <div className="col-span-4 flex min-w-0 flex-col sm:col-span-1">
         <span
           className={cn(
             "truncate text-[13.5px] font-medium",
-            tooLarge ? "text-[var(--text-subtle)]" : "text-[var(--text-primary)]",
+            tooLarge ? "text-(--text-subtle)" : "text-(--text-primary)",
           )}
         >
           {label}
         </span>
         <span
-          className="truncate text-[12.5px] text-[var(--text-subtle)]"
+          className="truncate text-[12.5px] text-(--text-subtle)"
           title={model.status === "error" ? (model.error_message ?? undefined) : undefined}
         >
           {model.status === "error" && model.error_message
@@ -345,7 +345,7 @@ export function ModelListRow({
       <span
         className={cn(
           "whitespace-nowrap text-right text-[13px] tabular-nums",
-          tooLarge ? "text-[var(--text-subtle)]" : "text-[var(--text-muted)]",
+          tooLarge ? "text-(--text-subtle)" : "text-(--text-muted)",
         )}
       >
         {size !== null ? formatModelBytes(size) : "—"}

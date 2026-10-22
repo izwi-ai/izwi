@@ -22,19 +22,19 @@ export function FactsList({
     <dl
       aria-label={label}
       className={cn(
-        "rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4 py-1",
+        "rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-4 py-1",
         className,
       )}
     >
       {facts.map((fact) => (
         <div
           key={fact.label}
-          className="flex items-baseline justify-between gap-3 border-b border-[var(--border-subtle)] py-2.5 text-[13.5px] last:border-b-0"
+          className="flex items-baseline justify-between gap-3 border-b border-(--border-subtle) py-2.5 text-[13.5px] last:border-b-0"
         >
-          <dt className="shrink-0 whitespace-nowrap text-[var(--text-muted)]">
+          <dt className="shrink-0 whitespace-nowrap text-(--text-muted)">
             {fact.label}
           </dt>
-          <dd className="min-w-0 truncate text-right text-[var(--text-primary)]">
+          <dd className="min-w-0 truncate text-right text-(--text-primary)">
             {fact.value}
           </dd>
         </div>

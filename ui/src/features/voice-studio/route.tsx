@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Settings2 } from "lucide-react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -233,7 +233,7 @@ export function VoiceStudioPage({
         onDelete={onDelete}
         onUseModel={handleSavedVoiceModelSelect}
         emptyMessage={VIEW_CONFIGS["voice-clone"].emptyStateDescription}
-        zIndexClassName="z-[70]"
+        zIndexClassName="z-70"
       />
 
       <RouteModelModal
@@ -254,7 +254,7 @@ export function VoiceStudioPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage={designViewConfig.emptyStateDescription}
-        zIndexClassName="z-[70]"
+        zIndexClassName="z-70"
       />
     </PageShell>
   );

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppLayout } from "@/app/layouts/AppLayout";
@@ -125,7 +125,7 @@ describe("AppLayout compact navigation accessibility", () => {
     // The search button opens the drawer's Tab order; focus starts on the
     // first page link.
     const search = within(drawer).getByRole("button", {
-      name: "Search or jump to",
+      name: /^Search or jump to/,
     });
     search.focus();
     fireEvent.keyDown(search, { key: "Tab", shiftKey: true });

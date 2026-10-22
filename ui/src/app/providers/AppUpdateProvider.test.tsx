@@ -61,6 +61,7 @@ const availableUpdate = {
     appExitsDuringInstall: false,
     supportsRestartLater: true,
   },
+  requiredSystem: null,
 };
 
 function deferredPromise<T>() {
@@ -75,6 +76,7 @@ function UpdateProbe() {
   const {
     status,
     availableUpdate: offered,
+    unsupportedUpdate,
     downloadedVersion,
     capabilityStatus,
     updaterSupported,
@@ -87,6 +89,9 @@ function UpdateProbe() {
       <span data-testid="capability-status">{capabilityStatus}</span>
       <span data-testid="update-status">{status}</span>
       <span data-testid="offered-version">{offered?.version ?? "none"}</span>
+      <span data-testid="unsupported-version">
+        {unsupportedUpdate?.version ?? "none"}
+      </span>
       <span data-testid="downloaded-version">{downloadedVersion ?? "none"}</span>
       <button type="button" onClick={() => void checkForUpdates(true)}>
         Check
@@ -269,5 +274,69 @@ describe("AppUpdateProvider re-checks after a download", () => {
     expect(screen.getByTestId("downloaded-version")).toHaveTextContent(
       availableUpdate.version,
     );
+  });
+});
+
+describe("AppUpdateProvider with a release this system is too old for", () => {
+  const tooNew = {
+    ...availableUpdate,
+    version: "0.2.0",
+    releaseTag: "v0.2.0",
+    requiredSystem: "macOS 13.3",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    coreMocks.isTauri.mockReturnValue(true);
+    updateMocks.getUpdaterHealthSnapshot.mockResolvedValue(health);
+    updateMocks.checkForBetaUpdate.mockResolvedValue(tooNew);
+  });
+
+  async function renderChecked() {
+    renderProvider();
+    await waitFor(() =>
+      expect(screen.getByTestId("unsupported-version")).toHaveTextContent("0.2.0"),
+    );
+  }
+
+  it("reports the release without offering it", async () => {
+    await renderChecked();
+
+    expect(screen.getByTestId("update-status")).toHaveTextContent("idle");
+    expect(screen.getByTestId("offered-version")).toHaveTextContent("none");
+    // A background check stays quiet, and there is nothing to install.
+    expect(updateMocks.notify).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    expect(updateMocks.installBetaUpdate).not.toHaveBeenCalled();
+  });
+
+  it("says what the release needs on a manual check", async () => {
+    await renderChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check" }));
+
+    await waitFor(() =>
+      expect(updateMocks.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Izwi 0.2.0 needs macOS 13.3 or later",
+          tone: "info",
+        }),
+      ),
+    );
+    expect(screen.getByTestId("offered-version")).toHaveTextContent("none");
+  });
+
+  it("offers the next release this system can install", async () => {
+    await renderChecked();
+
+    updateMocks.checkForBetaUpdate.mockResolvedValueOnce(availableUpdate);
+    fireEvent.click(screen.getByRole("button", { name: "Check" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("offered-version")).toHaveTextContent(
+        availableUpdate.version,
+      ),
+    );
+    expect(screen.getByTestId("unsupported-version")).toHaveTextContent("none");
   });
 });

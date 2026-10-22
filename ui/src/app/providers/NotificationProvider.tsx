@@ -342,7 +342,7 @@ export function NotificationProvider({ children }: NotificationProviderProps) {
         {children}
         <section
           aria-label="Notifications"
-          className="pointer-events-none fixed bottom-4 right-4 z-[80] flex w-[min(23.25rem,calc(100vw-2rem))] flex-col gap-2 sm:bottom-6 sm:right-6"
+          className="pointer-events-none fixed bottom-4 right-4 z-80 flex w-[min(23.25rem,calc(100vw-2rem))] flex-col gap-2 sm:bottom-6 sm:right-6"
         >
           <AnimatePresence initial={false}>
             {views.map((view) => (

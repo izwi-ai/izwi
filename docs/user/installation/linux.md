@@ -92,7 +92,7 @@ espeak-ng --version
 
 ### Prerequisites
 
-`./scripts/install-cli.sh` also builds the web UI and the desktop app, so you need Node.js 18+ (with `npm`) and the Tauri system libraries.
+`./scripts/install-cli.sh` also builds the web UI and the desktop app, so you need Node.js 24.15+ or 22.22+ (with `npm`) and the Tauri system libraries.
 
 ```bash
 # Ubuntu/Debian

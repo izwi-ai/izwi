@@ -396,19 +396,19 @@ export function DiarizationRecordDetail({
       alerts={
         <>
           {error ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)">
               {error}
             </Card>
           ) : null}
 
           {summaryRefreshError ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)">
               {summaryRefreshError}
             </Card>
           ) : null}
 
           {cancelError ? (
-            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+            <Card className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)">
               {cancelError}
             </Card>
           ) : null}
@@ -417,8 +417,8 @@ export function DiarizationRecordDetail({
             <Card
               className={
                 processingStatus === "failed"
-                  ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
-                  : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+                  ? "border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
+                  : "border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
               }
             >
               <div className="flex items-start gap-3">
@@ -436,8 +436,8 @@ export function DiarizationRecordDetail({
             <Card
               className={
                 summaryStatus === "failed"
-                  ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
-                  : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+                  ? "border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
+                  : "border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
               }
             >
               <div className="flex items-start gap-3">
@@ -452,7 +452,7 @@ export function DiarizationRecordDetail({
           ) : null}
 
           {visibleSummaryGuidance ? (
-            <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
+            <Card className="border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)">
               {visibleSummaryGuidance}
             </Card>
           ) : null}
@@ -464,7 +464,7 @@ export function DiarizationRecordDetail({
         onValueChange={setWorkspaceTab}
         className="space-y-4"
       >
-        <TabsList className="inline-flex h-auto w-auto justify-start gap-0.5 rounded-[10px] border border-[var(--border-subtle)] bg-transparent p-[3px]">
+        <TabsList className="inline-flex h-auto w-auto justify-start gap-0.5 rounded-[10px] border border-(--border-subtle) bg-transparent p-[3px]">
           {[
             ["transcript", "Transcript"],
             ["speakers", "Speakers"],
@@ -473,7 +473,7 @@ export function DiarizationRecordDetail({
             <TabsTrigger
               key={value}
               value={value}
-              className="h-[26px] rounded-[7px] px-3 text-[12.5px] font-medium text-[var(--text-muted)] shadow-none data-[state=active]:bg-[var(--surface-raised)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+              className="h-[26px] rounded-[7px] px-3 text-[12.5px] font-medium text-(--text-muted) shadow-none data-[state=active]:bg-(--surface-raised) data-[state=active]:text-(--text-primary) data-[state=active]:shadow-none"
             >
               {label}
             </TabsTrigger>
@@ -524,28 +524,28 @@ export function DiarizationRecordDetail({
           }
         }}
       >
-        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+        <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
           <DialogTitle className="sr-only">Delete diarization record?</DialogTitle>
           <div className="flex items-start gap-3">
-            <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+            <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
               <AlertTriangle className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              <h3 className="text-sm font-semibold text-(--text-primary)">
                 Delete diarization record?
               </h3>
-              <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+              <DialogDescription className="mt-1 text-sm text-(--text-muted)">
                 This permanently removes the saved audio and transcript from
                 history.
               </DialogDescription>
-              <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+              <p className="mt-2 truncate text-xs text-(--text-subtle)">
                 {record?.audio_filename || record?.id}
               </p>
             </div>
           </div>
 
           {deleteError ? (
-            <div className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
+            <div className="mt-4 rounded-md border border-(--danger-border) bg-(--danger-bg) px-3 py-2 text-xs text-(--danger-text)">
               {deleteError}
             </div>
           ) : null}
@@ -556,7 +556,7 @@ export function DiarizationRecordDetail({
               variant="outline"
               onClick={() => setDeleteConfirmOpen(false)}
               size="sm"
-              className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
+              className="h-8 border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) hover:bg-(--bg-surface-3)"
               disabled={deletePending}
             >
               Cancel

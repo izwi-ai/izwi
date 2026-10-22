@@ -233,7 +233,7 @@ export function TextToSpeechRecordDetail({
     >
       {error || actionError ? (
         <Card
-          className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+          className="border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
           role="alert"
           aria-live="assertive"
         >
@@ -248,8 +248,8 @@ export function TextToSpeechRecordDetail({
           aria-atomic="true"
           className={
             statusIsError
-              ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
-              : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              ? "border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
+              : "border-(--status-warning-border) bg-(--status-warning-bg) p-4 text-sm text-(--status-warning-text)"
           }
         >
           <div className="flex items-start gap-3">
@@ -263,15 +263,15 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr),280px]">
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
         <div className="space-y-5">
-    <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+    <Card className="rounded-[14px] border-(--border-subtle) bg-(--surface-panel) p-4">
+            <h3 className="text-sm font-semibold text-(--text-primary)">
               Audio
             </h3>
             {loading ? (
               <p
-                className="mt-3 text-sm text-[var(--text-muted)]"
+                className="mt-3 text-sm text-(--text-muted)"
                 role="status"
                 aria-live="polite"
               >
@@ -284,17 +284,17 @@ export function TextToSpeechRecordDetail({
                 className="mt-3"
               />
             ) : (
-              <p className="mt-3 text-sm text-[var(--text-muted)]">
+              <p className="mt-3 text-sm text-(--text-muted)">
                 Audio is not available yet.
               </p>
             )}
           </Card>
 
-          <Card className="rounded-[14px] border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+          <Card className="rounded-[14px] border-(--border-subtle) bg-(--surface-panel) p-4">
+            <h3 className="text-sm font-semibold text-(--text-primary)">
               Input text
             </h3>
-            <p className="mt-3 whitespace-pre-wrap rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-sm leading-6 text-[var(--text-primary)]">
+            <p className="mt-3 whitespace-pre-wrap rounded-xl border border-(--border-muted) bg-(--bg-surface-1) p-4 text-sm leading-6 text-(--text-primary)">
               {record?.input_text || "No input text available."}
             </p>
           </Card>
@@ -334,21 +334,21 @@ export function TextToSpeechRecordDetail({
           }
         }}
       >
-        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
+        <DialogContent className="max-w-md border-(--border-strong) bg-(--bg-surface-1) p-5">
           <DialogTitle className="sr-only">Delete speech generation?</DialogTitle>
           <div className="flex items-start gap-3">
-            <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+            <div className="mt-0.5 rounded-full border border-(--danger-border) bg-(--danger-bg) p-2 text-(--danger-text)">
               <AlertTriangle className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              <h3 className="text-sm font-semibold text-(--text-primary)">
                 Delete generation?
               </h3>
-              <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
+              <DialogDescription className="mt-1 text-sm text-(--text-muted)">
                 This permanently removes the saved audio and metadata from
                 history.
               </DialogDescription>
-              <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+              <p className="mt-2 truncate text-xs text-(--text-subtle)">
                 {record?.model_id || record?.id || "Record"}
               </p>
             </div>
@@ -356,7 +356,7 @@ export function TextToSpeechRecordDetail({
 
           {deleteError ? (
             <div
-              className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]"
+              className="mt-4 rounded-md border border-(--danger-border) bg-(--danger-bg) px-3 py-2 text-xs text-(--danger-text)"
               role="alert"
               aria-live="assertive"
             >
@@ -370,7 +370,7 @@ export function TextToSpeechRecordDetail({
               variant="outline"
               onClick={() => setDeleteConfirmOpen(false)}
               size="sm"
-              className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-3)]"
+              className="h-8 border-(--border-muted) bg-(--bg-surface-2) text-(--text-secondary) hover:bg-(--bg-surface-3)"
               disabled={deletePending}
             >
               Cancel

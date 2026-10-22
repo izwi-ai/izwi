@@ -70,7 +70,7 @@ export function GenerationStats({
       className={clsx(
         "flex flex-wrap items-center gap-3 px-3 py-2",
         surface === "card"
-          ? "rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)]"
+          ? "rounded-lg border border-(--border-muted) bg-(--bg-surface-2)"
           : null,
         className,
       )}

@@ -378,7 +378,7 @@ export function NewTextToSpeechModal({
       onClose={onClose}
       modal={!isModelManagerOpen}
       blockDismiss={isModelManagerOpen}
-      className="max-w-[52rem]"
+      className="max-w-208"
       title="New text-to-speech job"
       description="Create a generation job and open it on its own record page immediately."
       onSubmit={() => void submitGeneration()}
@@ -398,10 +398,10 @@ export function NewTextToSpeechModal({
                 rows={12}
                 autoFocus
                 placeholder="Write or paste the text to speak…"
-                className="min-h-[17rem] w-full flex-1 resize-y rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-4 py-3 text-[14.5px] leading-6 text-[var(--text-primary)] outline-none transition-colors placeholder:text-[var(--text-subtle)] focus:border-[var(--border-strong)]"
+                className="min-h-68 w-full flex-1 resize-y rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
               />
               {isSubmitting ? (
-                <div className="inline-flex items-center gap-2 text-xs text-[var(--text-muted)]">
+                <div className="inline-flex items-center gap-2 text-xs text-(--text-muted)">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   Creating job
                 </div>
@@ -436,7 +436,7 @@ export function NewTextToSpeechModal({
                   >
                     <SelectTrigger
                       aria-label="Built-in voice"
-                      className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+                      className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
                     >
                       <SelectValue placeholder="Select built-in voice" />
                     </SelectTrigger>
@@ -458,7 +458,7 @@ export function NewTextToSpeechModal({
                     savedVoicesLoading ? (
                       "Loading saved voices…"
                     ) : savedVoicesError ? (
-                      <span className="text-[var(--danger-text)]">
+                      <span className="text-(--danger-text)">
                         {savedVoicesError}
                       </span>
                     ) : undefined
@@ -471,7 +471,7 @@ export function NewTextToSpeechModal({
                   >
                     <SelectTrigger
                       aria-label="Saved voice"
-                      className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+                      className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
                     >
                       <SelectValue placeholder="Select saved voice" />
                     </SelectTrigger>
@@ -571,7 +571,7 @@ export function NewTextToSpeechModal({
               {error ? (
                 <div
                   role="alert"
-                  className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+                  className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
                 >
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>{error}</span>

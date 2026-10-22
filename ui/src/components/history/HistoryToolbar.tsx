@@ -44,7 +44,7 @@ export function SearchField({
   return (
     <label
       className={cn(
-        "flex h-[34px] w-full items-center gap-2 rounded-[10px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-2.5 text-[13px] text-[var(--text-subtle)] focus-within:border-[var(--border-strong)] sm:w-[300px]",
+        "flex h-[34px] w-full items-center gap-2 rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-2.5 text-[13px] text-(--text-subtle) focus-within:border-(--border-strong) sm:w-[300px]",
         className,
       )}
     >
@@ -62,7 +62,7 @@ export function SearchField({
         }}
         placeholder={placeholder}
         aria-label={placeholder.replace(/…$/, "")}
-        className="min-w-0 flex-1 bg-transparent text-[var(--text-primary)] outline-none placeholder:text-[var(--text-subtle)] [&::-webkit-search-cancel-button]:hidden"
+        className="min-w-0 flex-1 bg-transparent text-(--text-primary) outline-hidden placeholder:text-(--text-subtle) [&::-webkit-search-cancel-button]:hidden"
       />
       {draft ? (
         <button
@@ -72,7 +72,7 @@ export function SearchField({
             onChange("");
           }}
           aria-label="Clear search"
-          className="rounded p-0.5 hover:text-[var(--text-primary)]"
+          className="rounded p-0.5 hover:text-(--text-primary)"
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -110,7 +110,7 @@ export function SegmentedFilter<T extends string>({
     <div
       role="radiogroup"
       aria-label={label}
-      className="inline-flex gap-0.5 overflow-x-auto rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-[3px]"
+      className="inline-flex gap-0.5 overflow-x-auto rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) p-[3px]"
     >
       {options.map((option) => {
         const selected = option.id === value;
@@ -127,14 +127,14 @@ export function SegmentedFilter<T extends string>({
             className={cn(
               "inline-flex h-[26px] items-center gap-1.5 whitespace-nowrap rounded-[7px] px-2.5 text-[12.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60",
               selected
-                ? "bg-[var(--surface-raised)] text-[var(--text-primary)]"
-                : "text-[var(--text-muted)] hover:text-[var(--text-primary)]",
+                ? "bg-(--surface-raised) text-(--text-primary)"
+                : "text-(--text-muted) hover:text-(--text-primary)",
             )}
           >
             {option.label}
             {count != null ? " " : null}
             {count != null ? (
-              <span className="text-[11px] text-[var(--text-muted)]">
+              <span className="text-[11px] text-(--text-muted)">
                 {count}
               </span>
             ) : null}

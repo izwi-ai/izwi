@@ -153,7 +153,7 @@ export function VoicePage({
   if (loading) {
     return (
       <PageShell className="flex h-full items-center justify-center">
-        <p className="text-sm text-[var(--text-muted)]">Loading models…</p>
+        <p className="text-sm text-(--text-muted)">Loading models…</p>
       </PageShell>
     );
   }
@@ -182,13 +182,13 @@ export function VoicePage({
         <div className="flex min-h-24 max-w-[560px] flex-col items-center gap-2.5">
           <p
             role="status"
-            className="text-xl font-medium tracking-[-0.01em] text-[var(--text-primary)]"
+            className="text-xl font-medium tracking-[-0.01em] text-(--text-primary)"
           >
             {session.isMicMuted ? "Muted" : STATUS_LABELS[session.status]}
           </p>
           {isTranscriptOpen ? (
             session.status === "assistant_speaking" && (
-              <p className="text-sm text-[var(--text-subtle)]">
+              <p className="text-sm text-(--text-subtle)">
                 Start talking to interrupt
               </p>
             )
@@ -196,10 +196,10 @@ export function VoicePage({
             <p
               className={
                 session.notice
-                  ? "text-sm text-[var(--danger-text)]"
+                  ? "text-sm text-(--danger-text)"
                   : showsLastLine
-                    ? "line-clamp-2 text-lg leading-relaxed text-[var(--text-secondary)]"
-                    : "text-sm text-[var(--text-subtle)]"
+                    ? "line-clamp-2 text-lg leading-relaxed text-(--text-secondary)"
+                    : "text-sm text-(--text-subtle)"
               }
             >
               {caption}
@@ -263,16 +263,16 @@ export function VoicePage({
           <VoiceOrb status="idle" audioLevel={0} />
         </button>
         <div className="flex flex-col items-center gap-2">
-          <h1 className="text-2xl font-medium tracking-[-0.02em] text-[var(--text-primary)]">
+          <h1 className="text-2xl font-medium tracking-[-0.02em] text-(--text-primary)">
             Talk to Izwi
           </h1>
           {speaker && (
-            <p className="text-sm text-[var(--text-muted)]">
+            <p className="text-sm text-(--text-muted)">
               Replies in the voice of{" "}
               <button
                 type="button"
                 onClick={() => openSettings("main")}
-                className="text-[var(--text-primary)] underline decoration-[var(--border-strong)] underline-offset-[3px] hover:text-[var(--text-muted)]"
+                className="text-(--text-primary) underline decoration-(--border-strong) underline-offset-[3px] hover:text-(--text-muted)"
               >
                 {speaker.name}
               </button>
@@ -283,14 +283,14 @@ export function VoicePage({
           <button
             type="button"
             onClick={() => void start()}
-            className="flex h-12 items-center gap-2 rounded-full bg-[var(--accent-solid)] px-6 text-[15px] font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-surface-0)]"
+            className="flex h-12 items-center gap-2 rounded-full bg-(--accent-solid) px-6 text-[15px] font-medium text-(--text-on-accent) transition-opacity hover:opacity-90 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong) focus-visible:ring-offset-2 focus-visible:ring-offset-(--bg-surface-0)"
           >
             <Mic className="h-[18px] w-[18px]" />
             Start talking
           </button>
-          <p className="flex items-center gap-1.5 text-xs text-[var(--text-subtle)]">
+          <p className="flex items-center gap-1.5 text-xs text-(--text-subtle)">
             or press
-            <kbd className="rounded-md border border-[var(--border-default)] bg-[var(--bg-surface-2)] px-1.5 py-0.5 font-sans text-[11px] text-[var(--text-muted)]">
+            <kbd className="rounded-md border border-(--border-default) bg-(--bg-surface-2) px-1.5 py-0.5 font-sans text-[11px] text-(--text-muted)">
               Space
             </kbd>
           </p>
@@ -303,7 +303,7 @@ export function VoicePage({
     <PageShell className="flex h-full min-h-[560px] flex-col lg:flex-row">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <header className="flex h-16 shrink-0 items-center justify-between px-5">
-          <span className="text-[13px] tabular-nums text-[var(--text-subtle)]">
+          <span className="text-[13px] tabular-nums text-(--text-subtle)">
             {isActive ? elapsed : ""}
           </span>
           <button
@@ -311,7 +311,7 @@ export function VoicePage({
             onClick={() => openSettings("main")}
             aria-label="Voice settings"
             title="Voice settings"
-            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+            className="flex h-10 w-10 items-center justify-center rounded-[10px] text-(--text-muted) transition-colors hover:bg-(--bg-surface-2) hover:text-(--text-primary)"
           >
             <SlidersHorizontal className="h-[18px] w-[18px]" />
           </button>

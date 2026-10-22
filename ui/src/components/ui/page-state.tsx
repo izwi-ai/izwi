@@ -4,16 +4,16 @@ import { Loader2, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const focusRing =
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-surface-0)]";
+  "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong) focus-visible:ring-offset-2 focus-visible:ring-offset-(--bg-surface-0)";
 
 /** Pill buttons for a PageState's actions; also fit a react-router Link. */
 export const pageStateButtonClass = {
   primary: cn(
-    "inline-flex h-10 items-center justify-center rounded-full bg-[var(--accent-solid)] px-5 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 disabled:opacity-50",
+    "inline-flex h-10 items-center justify-center rounded-full bg-(--accent-solid) px-5 text-sm font-medium text-(--text-on-accent) transition-opacity hover:opacity-90 disabled:opacity-50",
     focusRing,
   ),
   secondary: cn(
-    "inline-flex h-10 items-center justify-center rounded-full border border-[var(--border-default)] px-4 text-sm text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)] disabled:opacity-50",
+    "inline-flex h-10 items-center justify-center rounded-full border border-(--border-default) px-4 text-sm text-(--text-primary) transition-colors hover:bg-(--bg-surface-2) disabled:opacity-50",
     focusRing,
   ),
 };
@@ -68,18 +68,18 @@ export function PageState({
               className={cn(
                 "mb-2 flex h-9 w-9 items-center justify-center rounded-full",
                 tone === "danger"
-                  ? "bg-[var(--danger-bg)] text-[var(--danger-text)]"
-                  : "bg-[var(--accent-soft)] text-[var(--text-primary)]",
+                  ? "bg-(--danger-bg) text-(--danger-text)"
+                  : "bg-(--accent-soft) text-(--text-primary)",
               )}
             >
               <Icon aria-hidden="true" className="h-[18px] w-[18px]" />
             </span>
           ) : null}
-          <h1 className="text-2xl font-medium tracking-[-0.02em] text-[var(--text-primary)]">
+          <h1 className="text-2xl font-medium tracking-[-0.02em] text-(--text-primary)">
             {title}
           </h1>
           {description ? (
-            <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+            <p className="text-sm leading-relaxed text-(--text-muted)">
               {description}
             </p>
           ) : null}
@@ -112,11 +112,11 @@ export function PageLoading({
     <div
       role="status"
       className={cn(
-        "flex h-[420px] max-h-[70dvh] min-h-[12rem] items-center justify-center rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]",
+        "flex h-[420px] max-h-[70dvh] min-h-48 items-center justify-center rounded-[14px] border border-(--border-subtle) bg-(--surface-panel)",
         className,
       )}
     >
-      <span className="flex items-center gap-2 text-[13px] text-[var(--text-muted)]">
+      <span className="flex items-center gap-2 text-[13px] text-(--text-muted)">
         <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
         {label}
       </span>

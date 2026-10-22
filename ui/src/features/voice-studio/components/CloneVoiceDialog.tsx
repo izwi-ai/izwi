@@ -375,7 +375,7 @@ export function CloneVoiceDialog({
       <CreationDialog
         open={open}
         onClose={onClose}
-        className="max-w-[32rem]"
+        className="max-w-lg"
         title="Voice saved"
         onSubmit={
           onUseInTextToSpeech
@@ -395,14 +395,14 @@ export function CloneVoiceDialog({
   let recordingArea: ReactNode;
   if (readingClip) {
     recordingArea = (
-      <div className="flex items-center gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-3.5 text-[13px] text-[var(--text-muted)]">
+      <div className="flex items-center gap-3 rounded-[12px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-3.5 text-[13px] text-(--text-muted)">
         <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
         Reading audio…
       </div>
     );
   } else if (clip) {
     recordingArea = (
-      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2.5">
+      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 rounded-[12px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-2.5">
         <PlayButton
           playing={preview.playingId === "clip"}
           label="recording"
@@ -415,10 +415,10 @@ export function CloneVoiceDialog({
         />
         <div className="flex min-w-0 flex-col gap-1">
           <div className="flex items-baseline justify-between gap-3">
-            <span className="truncate text-[13.5px] font-medium text-[var(--text-primary)]">
+            <span className="truncate text-[13.5px] font-medium text-(--text-primary)">
               {clip.name}
             </span>
-            <span className="whitespace-nowrap text-[12px] tabular-nums text-[var(--text-subtle)]">
+            <span className="whitespace-nowrap text-[12px] tabular-nums text-(--text-subtle)">
               {formatClipLength(clip.durationSecs)}
             </span>
           </div>
@@ -426,7 +426,7 @@ export function CloneVoiceDialog({
             {clip.peaks.map((peak, index) => (
               <span
                 key={index}
-                className="w-[3px] shrink-0 rounded-full bg-[var(--text-muted)]"
+                className="w-[3px] shrink-0 rounded-full bg-(--text-muted)"
                 style={{ height: `${Math.max(3, Math.round(peak * 20))}px` }}
               />
             ))}
@@ -437,7 +437,7 @@ export function CloneVoiceDialog({
           aria-label="Remove recording"
           onClick={() => setClips((current) => ({ ...current, [source]: null }))}
           disabled={saving}
-          className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--accent-soft)] hover:text-[var(--text-primary)] disabled:opacity-50"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-(--text-muted) transition-colors hover:bg-(--accent-soft) hover:text-(--text-primary) disabled:opacity-50"
         >
           <X aria-hidden="true" className="h-4 w-4" />
         </button>
@@ -459,15 +459,15 @@ export function CloneVoiceDialog({
           className={cn(
             "flex w-full flex-col items-center justify-center gap-1.5 rounded-[12px] border border-dashed px-4 py-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
             dragging
-              ? "border-[var(--text-primary)] bg-[var(--surface-raised)]"
-              : "border-[var(--border-strong)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+              ? "border-(--text-primary) bg-(--surface-raised)"
+              : "border-(--border-strong) bg-(--surface-panel) hover:bg-(--surface-raised)",
           )}
         >
-          <Upload aria-hidden="true" className="h-4 w-4 text-[var(--text-primary)]" />
-          <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
+          <Upload aria-hidden="true" className="h-4 w-4 text-(--text-primary)" />
+          <span className="text-[13.5px] font-medium text-(--text-primary)">
             Drop a recording here or browse
           </span>
-          <span className="text-xs text-[var(--text-subtle)]">
+          <span className="text-xs text-(--text-subtle)">
             {AUDIO_FILE_HINT} · {LENGTH_RANGE}
           </span>
         </button>
@@ -489,13 +489,13 @@ export function CloneVoiceDialog({
   } else {
     const isRecording = recording === "recording";
     recordingArea = (
-      <div className="flex items-center gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2.5">
+      <div className="flex items-center gap-3 rounded-[12px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-2.5">
         {isRecording ? (
           <button
             type="button"
             onClick={stopRecording}
             aria-label="Stop recording"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--danger-bg)] text-[var(--danger-text)]"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-(--danger-bg) text-(--danger-text)"
           >
             <Square aria-hidden="true" className="h-3 w-3 fill-current" />
           </button>
@@ -505,7 +505,7 @@ export function CloneVoiceDialog({
             onClick={() => void startRecording()}
             disabled={recording === "starting" || saving}
             aria-label="Start recording"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent-soft)] text-[var(--text-primary)] transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-(--accent-soft) text-(--text-primary) transition-colors hover:bg-(--surface-raised) disabled:opacity-60"
           >
             {recording === "starting" ? (
               <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
@@ -516,24 +516,24 @@ export function CloneVoiceDialog({
         )}
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <div className="flex items-baseline justify-between gap-3">
-            <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
+            <span className="text-[13.5px] font-medium text-(--text-primary)">
               {isRecording ? "Recording…" : "Record from your microphone"}
             </span>
             {isRecording ? (
-              <span className="whitespace-nowrap text-[12px] tabular-nums text-[var(--text-subtle)]">
+              <span className="whitespace-nowrap text-[12px] tabular-nums text-(--text-subtle)">
                 {formatClockDuration(elapsedSecs)} / {formatClockDuration(MAX_REFERENCE_SECS)}
               </span>
             ) : null}
           </div>
           {isRecording ? (
-            <div aria-hidden="true" className="h-1 overflow-hidden rounded-full bg-[var(--border-subtle)]">
+            <div aria-hidden="true" className="h-1 overflow-hidden rounded-full bg-(--border-subtle)">
               <div
-                className="h-full rounded-full bg-[var(--danger-text)] transition-[width]"
+                className="h-full rounded-full bg-(--danger-text) transition-[width]"
                 style={{ width: `${Math.min(100, (elapsedSecs / MAX_REFERENCE_SECS) * 100)}%` }}
               />
             </div>
           ) : (
-            <span className="text-xs text-[var(--text-subtle)]">
+            <span className="text-xs text-(--text-subtle)">
               Read a few natural sentences. Recording stops at{" "}
               {formatClockDuration(MAX_REFERENCE_SECS)}.
             </span>
@@ -549,7 +549,7 @@ export function CloneVoiceDialog({
       onClose={onClose}
       modal={!isModelManagerOpen}
       blockDismiss={isModelManagerOpen || saving}
-      className="max-w-[52rem]"
+      className="max-w-208"
       title="Clone a voice"
       onSubmit={() => void save()}
       submitLabel="Save voice"
@@ -608,7 +608,7 @@ export function CloneVoiceDialog({
 
             <label
               htmlFor="clone-voice-consent"
-              className="flex cursor-pointer items-start gap-3 border-t border-[var(--border-subtle)] pt-4"
+              className="flex cursor-pointer items-start gap-3 border-t border-(--border-subtle) pt-4"
             >
               <input
                 id="clone-voice-consent"
@@ -623,13 +623,13 @@ export function CloneVoiceDialog({
               <span className="flex flex-col">
                 <span
                   id="clone-voice-consent-title"
-                  className="text-[13.5px] font-medium text-[var(--text-primary)]"
+                  className="text-[13.5px] font-medium text-(--text-primary)"
                 >
                   I have permission to clone this voice
                 </span>
                 <span
                   id="clone-voice-consent-detail"
-                  className="text-xs leading-4 text-[var(--text-subtle)]"
+                  className="text-xs leading-4 text-(--text-subtle)"
                 >
                   It's my voice, or its owner agreed.
                 </span>
@@ -649,7 +649,7 @@ export function CloneVoiceDialog({
 
             <div className="flex flex-col gap-1.5">
               <span className={FIELD_LABEL_CLASS}>Sample</span>
-              <ul className="border-t border-[var(--border-subtle)]">
+              <ul className="border-t border-(--border-subtle)">
                 <SampleCheck
                   title="Length"
                   detail={lengthProblem ? `${lengthProblem}: ${LENGTH_RANGE}` : LENGTH_RANGE}
@@ -689,15 +689,15 @@ function SampleCheck({
   state: "empty" | "ok" | "problem";
 }) {
   return (
-    <li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-[var(--border-subtle)] py-2.5">
+    <li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-(--border-subtle) py-2.5">
       <span className="flex flex-col">
-        <span className="text-[13px] text-[var(--text-primary)]">{title}</span>
+        <span className="text-[13px] text-(--text-primary)">{title}</span>
         <span
           className={cn(
             "text-[11.5px]",
             state === "problem"
-              ? "text-[var(--danger-text)]"
-              : "text-[var(--text-subtle)]",
+              ? "text-(--danger-text)"
+              : "text-(--text-subtle)",
           )}
         >
           {detail}
@@ -707,10 +707,10 @@ function SampleCheck({
         className={cn(
           "flex items-center gap-1.5 whitespace-nowrap text-[13px] tabular-nums",
           state === "ok"
-            ? "text-[var(--status-positive-text)]"
+            ? "text-(--status-positive-text)"
             : state === "problem"
-              ? "text-[var(--danger-text)]"
-              : "text-[var(--text-subtle)]",
+              ? "text-(--danger-text)"
+              : "text-(--text-subtle)",
         )}
       >
         {state === "ok" ? (

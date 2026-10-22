@@ -24,7 +24,7 @@ interface UserMessageProps {
 }
 
 const actionButtonClass =
-  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-subtle)] transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "inline-flex h-7 w-7 items-center justify-center rounded-lg text-(--text-subtle) transition-colors hover:bg-(--surface-raised) hover:text-(--text-primary) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 
 /** Edit-in-place for a sent message. Enter sends, Escape cancels. */
 function EditMessageForm({
@@ -56,7 +56,7 @@ function EditMessageForm({
 
   return (
     <form
-      className="ml-[18%] flex flex-col gap-1.5 self-stretch rounded-2xl border border-[var(--border-strong)] bg-[var(--surface-panel)] px-3 py-2.5"
+      className="ml-[18%] flex flex-col gap-1.5 self-stretch rounded-2xl border border-(--border-strong) bg-(--surface-panel) px-3 py-2.5"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -77,9 +77,9 @@ function EditMessageForm({
             onCancel();
           }
         }}
-        className="w-full resize-none bg-transparent text-[0.9375rem] leading-relaxed text-[var(--text-primary)] focus:outline-none"
+        className="w-full resize-none bg-transparent text-[0.9375rem] leading-relaxed text-(--text-primary) focus:outline-hidden"
       />
-      <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-subtle)]">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-(--text-subtle)">
         <span className="min-w-0 flex-1">
           Sending replaces the replies below this message.
         </span>
@@ -126,7 +126,7 @@ export function UserMessage({
       aria-label="Your message"
       className="group flex max-w-[78%] flex-col items-end gap-1 self-end"
     >
-      <div className="break-words rounded-[18px] bg-[var(--surface-raised)] px-4 py-2.5 text-[0.9375rem] leading-relaxed text-[var(--text-primary)]">
+      <div className="wrap-break-word rounded-[18px] bg-(--surface-raised) px-4 py-2.5 text-[0.9375rem] leading-relaxed text-(--text-primary)">
         {(!parsed || parsed.text || parsed.attachments.length === 0) && (
           <MarkdownContent
             content={text}
@@ -147,7 +147,7 @@ export function UserMessage({
                       })
                     }
                     title={`Open ${attachment.label}`}
-                    className="block h-16 w-16 overflow-hidden rounded-md border border-primary-foreground/20 bg-primary-foreground/10 hover:bg-primary-foreground/15 transition-colors focus:outline-none focus:ring-2 focus:ring-primary-foreground/70"
+                    className="block h-16 w-16 overflow-hidden rounded-md border border-primary-foreground/20 bg-primary-foreground/10 hover:bg-primary-foreground/15 transition-colors focus:outline-hidden focus:ring-2 focus:ring-primary-foreground/70"
                   >
                     <img
                       src={attachment.source}
@@ -171,7 +171,7 @@ export function UserMessage({
           </div>
         )}
       </div>
-      <div className="flex h-7 items-center gap-0.5 text-[11.5px] text-[var(--text-subtle)] opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+      <div className="flex h-7 items-center gap-0.5 text-[11.5px] text-(--text-subtle) opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
         <MessageTime timestamp={message.created_at} />
         {text.trim() ? <CopyButton text={text} label="Copy message" /> : null}
         {editable ? (

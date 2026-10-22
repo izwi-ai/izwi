@@ -169,6 +169,9 @@ export function ModelCatalogProvider({
   // Retry from a failed download's notification; set once downloadModel
   // exists.
   const retryDownloadRef = useRef<(variant: string) => void>(() => {});
+  // The progress stream's watchdog and reconnect timers open it again; set
+  // once connectDownloadStream exists, which can't name itself.
+  const reconnectDownloadStreamRef = useRef<(variant: string) => void>(() => {});
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [residencySummary, setResidencySummary] =
     useState<ModelResidencySummary | null>(null);
@@ -442,7 +445,7 @@ export function ModelCatalogProvider({
         try {
           const model = await api.getModelInfo(variant);
           if (model.status === "downloading") {
-            connectDownloadStream(variant);
+            reconnectDownloadStreamRef.current(variant);
           }
         } catch (watchdogErr) {
           console.error(
@@ -594,7 +597,7 @@ export function ModelCatalogProvider({
                 `Download progress stream disconnected for ${variant}; reconnecting`,
                 err,
               );
-              connectDownloadStream(variant);
+              reconnectDownloadStreamRef.current(variant);
               return;
             }
           } catch (reconnectErr) {
@@ -621,6 +624,10 @@ export function ModelCatalogProvider({
       refreshModels,
     ],
   );
+
+  useEffect(() => {
+    reconnectDownloadStreamRef.current = connectDownloadStream;
+  }, [connectDownloadStream]);
 
   useEffect(() => {
     // No once-guard here: StrictMode's dev mount→cleanup→mount must be free to

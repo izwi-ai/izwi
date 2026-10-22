@@ -85,6 +85,13 @@ that carries the right manifest, and installs the entry for its platform:
 `macos`, `windows`, `linux` (the AppImage) or `linux-deb` for an app
 installed from the `.deb` (added when the build signed the `.deb`).
 
+The manifest also records the desktop bundle's macOS floor
+(`"minimum_system_version": {"macos": "…"}`, from `bundle.macOS.minimumSystemVersion`
+in `crates/izwi-desktop/tauri.conf.json`). An app on an older macOS reports
+the release (for example "needs macOS 13.3 or later") but doesn't install it, since macOS
+would refuse to open the result. Apps from before this field install every
+release, so ship a release that has it before one that raises the floor.
+
 To try an update before publishing, point a build at a staged manifest:
 `IZWI_UPDATER_FORCE_MANIFEST_URL=https://…/latest.json`.
 
@@ -120,7 +127,8 @@ For each OS runner, the workflow builds:
 GitHub Releases currently publish:
 
 1. macOS assets as the Metal-capable path on Apple Silicon with macOS 15+;
-   those same assets fall back to CPU on macOS 12-14.
+   those same assets fall back to CPU on older macOS. The desktop app needs
+   macOS 13.3+ (its bundle floor); the terminal binaries keep a 12.0 floor.
 2. Linux and Windows assets as CPU-only native artifacts with CPU-safe public entrypoints.
 
 Linux and Windows public binary names must remain unchanged:

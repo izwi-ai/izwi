@@ -7,7 +7,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppLayout } from "@/app/layouts/AppLayout";
@@ -904,7 +904,7 @@ describe("TextToSpeechPage", () => {
 
     expect(screen.getByTestId("route-model-modal")).toHaveAttribute(
       "data-z-index",
-      "z-[70]",
+      "z-70",
     );
 
     fireEvent.click(screen.getByRole("button", { name: /Close model modal/i }));

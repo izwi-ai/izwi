@@ -93,28 +93,28 @@ function getStatusPresentation(option: RouteModelSelectOption): {
     case "ready":
       return {
         icon: CheckCircle2,
-        className: "text-[var(--status-positive-text)]",
+        className: "text-(--status-positive-text)",
       };
     case "downloaded":
       return {
         icon: ArrowDownToLine,
-        className: "text-[var(--status-info-text)]",
+        className: "text-(--status-info-text)",
       };
     case "downloading":
     case "loading":
       return {
         icon: Loader2,
-        className: "text-[var(--status-warning-text)]",
+        className: "text-(--status-warning-text)",
       };
     case "error":
       return {
         icon: AlertTriangle,
-        className: "text-[var(--danger-text)]",
+        className: "text-(--danger-text)",
       };
     default:
       return {
         icon: CircleDashed,
-        className: "text-[var(--text-muted)]",
+        className: "text-(--text-muted)",
       };
   }
 }
@@ -158,7 +158,7 @@ export function RouteModelSelect({
           aria-label={ariaLabel ?? selectedOption?.label ?? placeholder}
           aria-describedby={descriptionId}
           className={cn(
-            "w-full rounded-[var(--radius-md)] border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 font-normal text-[var(--text-primary)] shadow-[var(--shadow-soft)] transition-[border-color,background-color,box-shadow] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)] data-[state=open]:border-ring/50 data-[state=open]:ring-2 data-[state=open]:ring-ring/35",
+            "w-full rounded-(--app-radius-md) border-(--border-muted) bg-(--bg-surface-0) px-3.5 font-normal text-(--text-primary) shadow-(--shadow-soft) transition-[border-color,background-color,box-shadow] hover:border-(--border-strong) hover:bg-(--bg-surface-1) data-[state=open]:border-ring/50 data-[state=open]:ring-2 data-[state=open]:ring-ring/35",
             triggerClassName ?? "h-10",
           )}
         >
@@ -175,7 +175,7 @@ export function RouteModelSelect({
               />
             ) : null}
             <span
-              className="min-w-0 flex-1 truncate text-left text-sm font-medium text-[var(--text-primary)]"
+              className="min-w-0 flex-1 truncate text-left text-sm font-medium text-(--text-primary)"
               title={selectedOption?.label || placeholder}
             >
               {selectedOption?.label || placeholder}
@@ -187,7 +187,7 @@ export function RouteModelSelect({
           position="popper"
           side={menuPlacement}
           sideOffset={8}
-          className="z-[90] max-h-72 min-w-[18rem] max-w-[min(36rem,calc(100vw-2rem))] p-1.5"
+          className="z-90 max-h-72 min-w-[18rem] max-w-[min(36rem,calc(100vw-2rem))] p-1.5"
         >
           {options.map((option) => (
             <SelectPrimitive.Item
@@ -196,9 +196,9 @@ export function RouteModelSelect({
               disabled={option.disabled}
               textValue={option.label}
               className={cn(
-                "relative flex min-w-[18rem] cursor-default select-none items-start rounded-[var(--radius-sm)] py-2.5 pl-3 pr-9 text-left outline-none transition-colors focus:bg-[var(--bg-surface-1)] focus:text-[var(--text-primary)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+                "relative flex min-w-[18rem] cursor-default select-none items-start rounded-(--app-radius-sm) py-2.5 pl-3 pr-9 text-left outline-hidden transition-colors focus:bg-(--bg-surface-1) focus:text-(--text-primary) data-disabled:pointer-events-none data-disabled:opacity-50",
                 selectedOption?.value === option.value &&
-                  "bg-[var(--bg-surface-1)]",
+                  "bg-(--bg-surface-1)",
               )}
               title={option.label}
             >
@@ -209,7 +209,7 @@ export function RouteModelSelect({
               </SelectPrimitive.ItemText>
               <div aria-hidden="true" className="flex w-full min-w-0 items-start gap-3">
                 <div className="flex min-w-0 flex-1 items-start gap-2.5">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-(--border-muted) bg-(--bg-surface-1)">
                     {(() => {
                       const status = getStatusPresentation(option);
                       const StatusIcon = status.icon;
@@ -227,10 +227,10 @@ export function RouteModelSelect({
                     })()}
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium leading-5 text-[var(--text-primary)] break-words">
+                    <div className="text-sm font-medium leading-5 text-(--text-primary) wrap-break-word">
                       {option.label}
                     </div>
-                    <div className="mt-1 text-xs text-[var(--text-muted)]">
+                    <div className="mt-1 text-xs text-(--text-muted)">
                       {option.statusLabel}
                     </div>
                   </div>

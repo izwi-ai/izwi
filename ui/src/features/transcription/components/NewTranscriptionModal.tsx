@@ -324,7 +324,6 @@ export function NewTranscriptionModal({
             ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
               let createdRecordId: string | null = null;
-              let streamController: AbortController | null = null;
               const handleCreated = (createdRecord: TranscriptionRecord) => {
                 if (settled) {
                   return;
@@ -348,7 +347,7 @@ export function NewTranscriptionModal({
                 reject(createUploadAbortError());
               };
 
-              streamController = api.createTranscriptionRecordStream(request, {
+              const streamController = api.createTranscriptionRecordStream(request, {
                 onUploadProgress: updateUploadProgress,
                 onStart: () => {
                   onStreamingStart?.();
@@ -586,21 +585,21 @@ export function NewTranscriptionModal({
             disabled={isSubmitting}
             aria-label="Upload audio file"
             className={cn(
-              "group flex min-h-[13rem] w-full flex-col items-center justify-center gap-3 rounded-[12px] border border-dashed p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+              "group flex min-h-52 w-full flex-col items-center justify-center gap-3 rounded-[12px] border border-dashed p-5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-60",
               isDraggingFile
-                ? "border-[var(--text-primary)] bg-[var(--surface-raised)]"
-                : "border-[var(--border-strong)] bg-[var(--surface-panel)] hover:bg-[var(--surface-raised)]",
+                ? "border-(--text-primary) bg-(--surface-raised)"
+                : "border-(--border-strong) bg-(--surface-panel) hover:bg-(--surface-raised)",
             )}
           >
-            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border-default)] bg-[var(--surface-panel-alt)]">
-              <Upload className="h-[18px] w-[18px] text-[var(--text-primary)]" />
+            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-(--border-default) bg-(--surface-panel-alt)">
+              <Upload className="h-[18px] w-[18px] text-(--text-primary)" />
             </span>
-            <span className="text-[14px] font-medium text-[var(--text-primary)]">
+            <span className="text-[14px] font-medium text-(--text-primary)">
               {isDraggingFile
                 ? "Drop to start the transcript"
                 : "Drop a recording here or browse"}
             </span>
-            <span className="text-xs text-[var(--text-subtle)]">
+            <span className="text-xs text-(--text-subtle)">
               {AUDIO_FILE_HINT}
             </span>
             <input
@@ -640,7 +639,7 @@ export function NewTranscriptionModal({
                 onValueChange={setSpeakerExpectation}
                 disabled={isSubmitting}
               >
-                <SelectTrigger aria-label="Expected speakers" className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]">
+                <SelectTrigger aria-label="Expected speakers" className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]">
                   <SelectValue placeholder="Expected speakers" />
                 </SelectTrigger>
                 <SelectContent>
@@ -752,7 +751,7 @@ export function NewTranscriptionModal({
           {error ? (
             <div
               role="alert"
-              className="flex items-start gap-2 rounded-[10px] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2.5 text-[13px] text-[var(--danger-text)]"
+              className="flex items-start gap-2 rounded-[10px] border border-(--danger-border) bg-(--danger-bg) p-2.5 text-[13px] text-(--danger-text)"
             >
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <p>{error}</p>
@@ -792,7 +791,7 @@ export function NewTranscriptionModal({
       {...frameProps}
       open={isOpen}
       blockDismiss={blockOutsideDismiss || isSubmitting}
-      className="max-w-[46rem]"
+      className="max-w-184"
     >
       {modalBody}
     </CreationDialog>

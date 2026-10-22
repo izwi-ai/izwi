@@ -17,13 +17,13 @@ const SheetClose = DialogPrimitive.Close
 const SheetPortal = DialogPrimitive.Portal
 
 const SheetOverlay = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Overlay>,
+  React.ComponentRef<typeof DialogPrimitive.Overlay>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-50 bg-background/70 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      "fixed inset-0 z-50 bg-background/70 backdrop-blur-xs data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       className
     )}
     {...props}
@@ -56,7 +56,7 @@ interface SheetContentProps
     VariantProps<typeof sheetVariants> {}
 
 const SheetContent = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Content>,
+  React.ComponentRef<typeof DialogPrimitive.Content>,
   SheetContentProps
 >(({ side = "right", className, children, onOpenAutoFocus, onCloseAutoFocus, ...props }, ref) => {
   const returnFocus = useReturnFocus(onOpenAutoFocus, onCloseAutoFocus)
@@ -71,7 +71,7 @@ const SheetContent = React.forwardRef<
       onCloseAutoFocus={returnFocus.onCloseAutoFocus}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-md border border-border/70 bg-muted/55 p-1 text-muted-foreground ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring/45 focus:ring-offset-2 disabled:pointer-events-none">
+      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-md border border-border/70 bg-muted/55 p-1 text-muted-foreground ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-hidden focus:ring-2 focus:ring-ring/45 focus:ring-offset-2 disabled:pointer-events-none">
         <X className="h-4 w-4" />
         <span className="sr-only">Close</span>
       </DialogPrimitive.Close>
@@ -101,7 +101,7 @@ const SheetFooter = ({
 SheetFooter.displayName = "SheetFooter"
 
 const SheetTitle = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Title>,
+  React.ComponentRef<typeof DialogPrimitive.Title>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Title
@@ -113,7 +113,7 @@ const SheetTitle = React.forwardRef<
 SheetTitle.displayName = DialogPrimitive.Title.displayName
 
 const SheetDescription = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Description>,
+  React.ComponentRef<typeof DialogPrimitive.Description>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description

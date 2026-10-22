@@ -151,7 +151,7 @@ export async function trackUpdateCheckStarted(
 }
 
 export async function trackUpdateCheckCompleted(
-  outcome: "update_available" | "no_update" | "failed",
+  outcome: "update_available" | "no_update" | "system_too_old" | "failed",
   version?: string,
   reason?: string,
 ) {

@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Check, ChevronRight, Cpu, Loader2 } from "lucide-react";
 
 import { api, type ModelInfo, type ModelStorage } from "@/api";
@@ -107,7 +107,7 @@ function ChoiceRow({
 }) {
   const id = useId();
   return (
-    <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3.5 border-b border-[var(--border-muted)] py-3 [@media(max-height:760px)]:py-2">
+    <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3.5 border-b border-(--border-muted) py-3 [@media(max-height:760px)]:py-2">
       <input
         id={id}
         type="checkbox"
@@ -133,7 +133,7 @@ function ChoiceRow({
           id={`${id}-title`}
           className={cn(
             "text-sm font-medium",
-            dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-primary)]",
+            dimmed ? "text-(--text-subtle)" : "text-(--text-primary)",
           )}
         >
           {title}
@@ -142,7 +142,7 @@ function ChoiceRow({
           id={`${id}-detail`}
           className={cn(
             "truncate text-[13px]",
-            dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-muted)]",
+            dimmed ? "text-(--text-subtle)" : "text-(--text-muted)",
           )}
         >
           {detail}
@@ -151,7 +151,7 @@ function ChoiceRow({
       <span
         className={cn(
           "whitespace-nowrap text-[13px] tabular-nums",
-          dimmed ? "text-[var(--text-subtle)]" : "text-[var(--text-muted)]",
+          dimmed ? "text-(--text-subtle)" : "text-(--text-muted)",
         )}
       >
         {trailing}
@@ -164,7 +164,7 @@ function LoadingModels() {
   return (
     <div
       role="status"
-      className="flex items-center gap-2 border-y border-[var(--border-muted)] py-6 text-[13px] text-[var(--text-muted)]"
+      className="flex items-center gap-2 border-y border-(--border-muted) py-6 text-[13px] text-(--text-muted)"
     >
       <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
       Loading models…
@@ -484,14 +484,14 @@ export function FirstRunOnboarding({
           title="Welcome to Izwi"
           description={`Talk, transcribe, read aloud and chat on this ${device}. What you say and type stays on it.`}
         />
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-y border-[var(--border-muted)] py-3.5">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-y border-(--border-muted) py-3.5">
           <div className="flex min-w-0 flex-col gap-0.5">
             <label htmlFor="first-run-usage-data" className="text-sm font-medium">
               Share anonymous usage data
             </label>
             <span
               id="first-run-usage-data-detail"
-              className="text-[13px] text-[var(--text-muted)]"
+              className="text-[13px] text-(--text-muted)"
             >
               Which features and models you use. Never your audio, text or files.
             </span>
@@ -523,7 +523,7 @@ export function FirstRunOnboarding({
           description="Pick what to use first. You can add more any time in Models."
           after={
             hardware ? (
-              <p className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-subtle)]">
+              <p className="flex items-center gap-1.5 text-[12.5px] text-(--text-subtle)">
                 <Cpu aria-hidden="true" className="h-3.5 w-3.5" />
                 {hardware}
               </p>
@@ -533,7 +533,7 @@ export function FirstRunOnboarding({
         {catalogUnavailable ? (
           <LoadingModels />
         ) : (
-          <ul aria-label="Tasks" className="border-t border-[var(--border-muted)]">
+          <ul aria-label="Tasks" className="border-t border-(--border-muted)">
             {taskRows.map((row) => (
               <ChoiceRow
                 key={row.id}
@@ -560,9 +560,9 @@ export function FirstRunOnboarding({
               ? `Download and set up · ${formatModelBytes(taskPlan.bytes)}`
               : "Set up"}
           </PrimaryButton>
-          <p className="text-[13px] text-[var(--text-muted)]">
+          <p className="text-[13px] text-(--text-muted)">
             {disk ? (
-              <span className={cn(disk.short && "text-[var(--danger-text)]")}>
+              <span className={cn(disk.short && "text-(--danger-text)")}>
                 {disk.text}{" "}
               </span>
             ) : null}
@@ -602,13 +602,13 @@ export function FirstRunOnboarding({
                 <h2
                   id={`first-run-group-${group.id}`}
                   className={cn(
-                    "pb-1.5 text-[13px] font-medium text-[var(--text-muted)]",
+                    "pb-1.5 text-[13px] font-medium text-(--text-muted)",
                     index > 0 && "pt-6",
                   )}
                 >
                   {group.title}
                 </h2>
-                <ul className="border-t border-[var(--border-muted)]">
+                <ul className="border-t border-(--border-muted)">
                   {group.models.map((model) => {
                     const onDisk = isOnDisk(model);
                     const settled = onDisk || model.status === "downloading";
@@ -640,7 +640,7 @@ export function FirstRunOnboarding({
             ))}
           </div>
         )}
-        <div className="flex shrink-0 flex-col gap-3 border-t border-[var(--border-muted)] pt-4">
+        <div className="flex shrink-0 flex-col gap-3 border-t border-(--border-muted) pt-4">
           <PrimaryButton
             disabled={chosenModels.length === 0}
             onClick={() => start("custom", chosenModels)}
@@ -653,7 +653,7 @@ export function FirstRunOnboarding({
             <p
               className={cn(
                 "text-center text-[13px]",
-                disk.short ? "text-[var(--danger-text)]" : "text-[var(--text-muted)]",
+                disk.short ? "text-(--danger-text)" : "text-(--text-muted)",
               )}
             >
               {disk.text}
@@ -670,7 +670,7 @@ export function FirstRunOnboarding({
           title="Setting up Izwi"
           description="You can start using Izwi now. Downloads keep going in the background."
         />
-        <ul aria-label="Downloads" className="border-t border-[var(--border-muted)]">
+        <ul aria-label="Downloads" className="border-t border-(--border-muted)">
           {startedModels.map((model) => {
             const status = progressStatus(
               model,
@@ -707,7 +707,7 @@ export function FirstRunOnboarding({
         </ul>
         <div className="flex flex-col gap-3.5">
           <PrimaryButton onClick={() => onExit()}>Start using Izwi</PrimaryButton>
-          <p className="text-[13px] text-[var(--text-muted)]">
+          <p className="text-[13px] text-(--text-muted)">
             Progress also shows in Models.
             {downloading.length > 0 ? (
               <>
@@ -735,7 +735,7 @@ export function FirstRunOnboarding({
         <StageHeading
           headingRef={headingRef}
           before={
-            <span className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]">
+            <span className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-(--status-positive-bg) text-(--status-positive-text)">
               <Check aria-hidden="true" className="h-[18px] w-[18px]" strokeWidth={2.5} />
             </span>
           }
@@ -747,7 +747,7 @@ export function FirstRunOnboarding({
           }
         />
         {destinations.length > 0 ? (
-          <nav aria-label="Start with" className="border-t border-[var(--border-muted)]">
+          <nav aria-label="Start with" className="border-t border-(--border-muted)">
             {destinations.map((row) => {
               const Icon = NAV_GROUPS.flatMap((group) => group.items).find(
                 (item) => item.path === row.path,
@@ -760,17 +760,17 @@ export function FirstRunOnboarding({
                     event.preventDefault();
                     onExit(row.path);
                   }}
-                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-[var(--border-muted)] py-3.5 text-[var(--text-primary)] transition-colors hover:bg-[var(--sidebar-link-hover-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]"
+                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-(--border-muted) py-3.5 text-(--text-primary) transition-colors hover:bg-(--sidebar-link-hover-bg) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)"
                 >
                   {Icon ? (
-                    <Icon aria-hidden="true" className="h-4 w-4 text-[var(--text-muted)]" />
+                    <Icon aria-hidden="true" className="h-4 w-4 text-(--text-muted)" />
                   ) : (
                     <span />
                   )}
                   <span className="text-sm font-medium">{row.doneTitle}</span>
                   <ChevronRight
                     aria-hidden="true"
-                    className="h-4 w-4 text-[var(--text-subtle)]"
+                    className="h-4 w-4 text-(--text-subtle)"
                   />
                 </Link>
               );

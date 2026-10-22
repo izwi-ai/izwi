@@ -31,7 +31,7 @@ export function SpeechTextLanguageField({
       <Select value={value} onValueChange={onValueChange} disabled={disabled}>
         <SelectTrigger
           aria-label="Language"
-          className="h-9 w-full rounded-[10px] border-[var(--border-default)] bg-[var(--surface-panel)] text-[13.5px]"
+          className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
         >
           <SelectValue placeholder="Language" />
         </SelectTrigger>

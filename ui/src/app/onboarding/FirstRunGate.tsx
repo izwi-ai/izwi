@@ -9,7 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import { api, type OnboardingStateResponse } from "@/api";
 import { setAnalyticsEnabled } from "@/app/analytics/client";
@@ -142,7 +142,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
   switch (state.status) {
     case "checking":
       content = (
-        <div className="h-dvh bg-[var(--surface-canvas)]">
+        <div className="h-dvh bg-(--surface-canvas)">
           <span role="status" className="sr-only">
             Starting Izwi…
           </span>

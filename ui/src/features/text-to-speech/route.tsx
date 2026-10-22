@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 import { Settings2 } from "lucide-react";
 
 import { api, type ModelInfo, type SpeechHistoryRecord } from "@/api";
@@ -599,7 +599,7 @@ export function TextToSpeechPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage="Load a compatible TTS model with built-in voices, saved voices, or voice-direction prompts to generate speech."
-        zIndexClassName={isNewTextToSpeechModalOpen ? "z-[70]" : "z-50"}
+        zIndexClassName={isNewTextToSpeechModalOpen ? "z-70" : "z-50"}
       />
     </PageShell>
   );

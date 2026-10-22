@@ -346,8 +346,8 @@ export function DiarizationReviewWorkspace({
 
   if (loading) {
     return (
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
-        <CardContent className="flex min-h-[320px] items-center justify-center gap-2 py-12 text-sm text-[var(--text-muted)]">
+      <Card className="border-(--border-muted) bg-(--bg-surface-1)">
+        <CardContent className="flex min-h-[320px] items-center justify-center gap-2 py-12 text-sm text-(--text-muted)">
           <Loader2 className="h-4 w-4 animate-spin" />
           Loading transcript...
         </CardContent>
@@ -359,13 +359,13 @@ export function DiarizationReviewWorkspace({
     return (
       <div className="flex min-h-[320px] items-center justify-center px-6 py-12 text-center">
         <div className="max-w-sm">
-          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] shadow-sm">
-            <Users className="h-8 w-8 text-[var(--text-subtle)]" />
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-(--border-muted) bg-(--bg-surface-1) shadow-xs">
+            <Users className="h-8 w-8 text-(--text-subtle)" />
           </div>
-          <p className="mb-2 text-base font-semibold text-[var(--text-secondary)]">
+          <p className="mb-2 text-base font-semibold text-(--text-secondary)">
             {emptyTitle}
           </p>
-          <p className="text-sm text-[var(--text-muted)] leading-relaxed">
+          <p className="text-sm text-(--text-muted) leading-relaxed">
             {emptyMessage}
           </p>
         </div>
@@ -376,17 +376,17 @@ export function DiarizationReviewWorkspace({
   const floatingPlaybackFooter = stickyPlaybackFooter || fixedPlaybackFooter;
   const rootClassName = floatingPlaybackFooter
     ? "relative flex min-h-0 flex-col"
-    : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
+    : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-(--border-muted) bg-(--bg-surface-1)";
   const contentClassName = fixedPlaybackFooter
-    ? "grid gap-6 pb-32 xl:grid-cols-[minmax(0,1fr),248px]"
+    ? "grid gap-6 pb-32 xl:grid-cols-[minmax(0,1fr)_248px]"
     : stickyPlaybackFooter
-      ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr),248px]"
-      : "grid gap-6 xl:grid-cols-[minmax(0,1fr),248px] pb-20";
+      ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr)_248px]"
+      : "grid gap-6 xl:grid-cols-[minmax(0,1fr)_248px] pb-20";
   const playbackClassName = fixedPlaybackFooter
-    ? "fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur lg:left-[var(--app-shell-left)]"
+    ? "fixed inset-x-0 bottom-0 z-40 border-t border-(--border-muted) bg-[color-mix(in_srgb,var(--bg-surface-0)_96%,transparent)] shadow-[0_-18px_48px_-30px_rgba(15,23,42,0.45)] backdrop-blur-sm lg:left-(--app-shell-left)"
     : stickyPlaybackFooter
-      ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
-      : "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3";
+      ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-(--border-muted) bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur-sm sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
+      : "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-(--border-muted) bg-[color-mix(in_srgb,var(--bg-surface-0)_95%,transparent)] p-3 backdrop-blur-sm sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3";
   const playbackInnerClassName = fixedPlaybackFooter
     ? "mx-auto flex w-full max-w-[calc(100vw-var(--app-shell-left))] flex-col gap-2.5 px-4 py-3 sm:px-6"
     : "flex flex-col gap-2.5";
@@ -397,58 +397,58 @@ export function DiarizationReviewWorkspace({
 
       <div className={contentClassName}>
         <div className="space-y-5">
-          <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3.5">
+          <div className="rounded-lg border border-(--border-muted) bg-(--bg-surface-0) px-3.5 py-3.5">
             <div className="flex items-center justify-between gap-3">
-              <h3 className="text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
+              <h3 className="text-[13px] font-semibold tracking-wide text-(--text-primary)">
                 Summary
               </h3>
               {summaryStatus !== "ready" ? (
-                <span className="text-xs text-[var(--text-muted)]">
+                <span className="text-xs text-(--text-muted)">
                   {diarizationSummaryStatusLabel(summaryStatus)}
                 </span>
               ) : null}
             </div>
             {summaryText ? (
-              <p className="mt-2 text-[15px] leading-7 text-[var(--text-secondary)]">
+              <p className="mt-2 text-[15px] leading-7 text-(--text-secondary)">
                 {summaryText}
               </p>
             ) : summaryStatus === "pending" ? (
-              <p className="mt-2 text-[12px] text-[var(--text-muted)]">
+              <p className="mt-2 text-[12px] text-(--text-muted)">
                 Generating summary...
               </p>
             ) : summaryStatus === "failed" ? (
-              <p className="mt-2 text-[12px] text-[var(--danger-text)]">
+              <p className="mt-2 text-[12px] text-(--danger-text)">
                 {summaryError || "Summary generation failed."}
               </p>
             ) : (
-              <p className="mt-2 text-[12px] text-[var(--text-muted)]">
+              <p className="mt-2 text-[12px] text-(--text-muted)">
                 No summary available yet.
               </p>
             )}
             {normalizedSummaryGuidance && summaryStatus !== "ready" ? (
-              <p className="mt-2 text-[11px] leading-4 text-[var(--status-warning-text)]">
+              <p className="mt-2 text-[11px] leading-4 text-(--status-warning-text)">
                 {normalizedSummaryGuidance}
               </p>
             ) : null}
-            <div className="mt-2 text-[11px] text-[var(--text-muted)]">
+            <div className="mt-2 text-[11px] text-(--text-muted)">
               {record.summary_model_id || "Qwen3.5-4B"}
               {summaryUpdatedLabel ? ` • Updated ${summaryUpdatedLabel}` : ""}
             </div>
           </div>
           <div>
-            <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
+            <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-(--text-primary)">
               Transcript
             </h3>
             {confidenceFlags.length > 0 ? (
               <div
                 data-testid="diarization-confidence-nav"
-                className="mb-3 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2.5"
+                className="mb-3 rounded-lg border border-(--status-warning-border) bg-(--status-warning-bg) px-3 py-2.5"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-[12px] font-semibold text-[var(--status-warning-text)]">
+                  <div className="flex items-center gap-2 text-[12px] font-semibold text-(--status-warning-text)">
                     <AlertTriangle className="h-4 w-4" />
                     Uncertain turns
-                    <span className="rounded-full bg-[var(--bg-surface-0)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-primary)]">
+                    <span className="rounded-full bg-(--bg-surface-0) px-2 py-0.5 text-[11px] font-medium text-(--text-primary)">
                       {confidenceFlags.length} flagged
                     </span>
                   </div>
@@ -457,7 +457,7 @@ export function DiarizationReviewWorkspace({
                       type="button"
                       variant="outline"
                       size="sm"
-                      className="h-7 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
+                      className="h-7 border-(--status-warning-border) text-(--status-warning-text) hover:bg-(--status-warning-bg)"
                       onClick={() => stepConfidenceFlag(-1)}
                       disabled={confidenceFlags.length === 0}
                       aria-label="Previous flagged turn"
@@ -468,7 +468,7 @@ export function DiarizationReviewWorkspace({
                       type="button"
                       variant="outline"
                       size="sm"
-                      className="h-7 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
+                      className="h-7 border-(--status-warning-border) text-(--status-warning-text) hover:bg-(--status-warning-bg)"
                       onClick={() => stepConfidenceFlag(1)}
                       disabled={confidenceFlags.length === 0}
                       aria-label="Next flagged turn"
@@ -542,10 +542,10 @@ export function DiarizationReviewWorkspace({
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0 flex items-center gap-2">
-                        <div className="truncate text-[13px] font-semibold text-[var(--text-primary)]">
+                        <div className="truncate text-[13px] font-semibold text-(--text-primary)">
                           {entry.speaker}
                         </div>
-                        <div className="text-[11px] font-medium text-[var(--text-muted)]">
+                        <div className="text-[11px] font-medium text-(--text-muted)">
                           {formatClockTime(entry.start)}
                         </div>
                       </div>
@@ -563,15 +563,15 @@ export function DiarizationReviewWorkspace({
                     </div>
                     {confidenceFlag ? (
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                        <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--status-warning-text)]">
+                        <span className="rounded-full border border-(--status-warning-border) bg-(--status-warning-bg) px-1.5 py-0.5 text-[11px] font-medium text-(--status-warning-text)">
                           Review
                         </span>
-                        <span className="text-[11px] text-[var(--status-warning-text)]">
+                        <span className="text-[11px] text-(--status-warning-text)">
                           {confidenceFlag.reason}
                         </span>
                       </div>
                     ) : null}
-                    <p className="mt-1.5 text-[15px] leading-7 text-[var(--text-secondary)]">
+                    <p className="mt-1.5 text-[15px] leading-7 text-(--text-secondary)">
                       {entry.text}
                     </p>
                   </button>
@@ -583,7 +583,7 @@ export function DiarizationReviewWorkspace({
 
         <div className="space-y-5">
           <div>
-            <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
+            <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-(--text-primary)">
               Talk Time
             </h3>
             <div className="space-y-2.5">
@@ -611,24 +611,24 @@ export function DiarizationReviewWorkspace({
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
+                        <div className="truncate text-sm font-semibold text-(--text-primary)">
                           {summary.displaySpeaker}
                         </div>
-                        <div className="mt-1 text-[11px] leading-5 text-[var(--text-muted)]">
+                        <div className="mt-1 text-[11px] leading-5 text-(--text-muted)">
                           {summary.utteranceCount} turns • {summary.wordCount}{" "}
                           words
                         </div>
                       </div>
                       <div className="text-right">
-                        <div className="text-base font-semibold text-[var(--text-primary)]">
+                        <div className="text-base font-semibold text-(--text-primary)">
                           {formatDurationLabel(summary.totalDuration)}
                         </div>
-                        <div className="text-[11px] text-[var(--text-muted)]">
+                        <div className="text-[11px] text-(--text-muted)">
                           {share.toFixed(0)}%
                         </div>
                       </div>
                     </div>
-                    <div className="mt-2.5 h-1.5 rounded-full bg-[var(--bg-surface-2)]">
+                    <div className="mt-2.5 h-1.5 rounded-full bg-(--bg-surface-2)">
                       <div
                         className="h-full rounded-full"
                         style={{

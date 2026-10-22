@@ -169,29 +169,35 @@ export function DiarizationSpeakersTable({
   const savedRef = useRef(namesToSave(record.speaker_name_overrides ?? {}));
   const savingRef = useRef(false);
   const latestRef = useRef(names);
-  latestRef.current = names;
   const flush = useCallback(async () => {
     if (savingRef.current) {
       return;
     }
-    const next = namesToSave(latestRef.current);
-    if (sameNames(next, savedRef.current)) {
-      return;
-    }
     savingRef.current = true;
     try {
-      await onSave(next);
-      savedRef.current = next;
-    } catch {
-      // The page shows the error; the next edit sends the names again.
-      return;
+      // Until the names stop changing under the save.
+      for (;;) {
+        const next = namesToSave(latestRef.current);
+        if (sameNames(next, savedRef.current)) {
+          return;
+        }
+        try {
+          await onSave(next);
+        } catch {
+          // The page shows the error; the next edit sends the names again.
+          return;
+        }
+        savedRef.current = next;
+      }
     } finally {
       savingRef.current = false;
     }
-    if (!sameNames(namesToSave(latestRef.current), savedRef.current)) {
-      void flush();
-    }
   }, [onSave]);
+
+  // Declared before the save timer so the flush it schedules sees these names.
+  useEffect(() => {
+    latestRef.current = names;
+  }, [names]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void flush(), SAVE_DELAY_MS);
@@ -204,7 +210,7 @@ export function DiarizationSpeakersTable({
 
   if (rows.length === 0) {
     return (
-      <p className="rounded-[14px] border border-dashed border-[var(--border-subtle)] px-4 py-6 text-sm text-[var(--text-muted)]">
+      <p className="rounded-[14px] border border-dashed border-(--border-subtle) px-4 py-6 text-sm text-(--text-muted)">
         No speakers were detected in this recording.
       </p>
     );
@@ -212,12 +218,12 @@ export function DiarizationSpeakersTable({
 
   return (
     <div>
-      <div className="overflow-x-auto rounded-[14px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
-        <div className="min-w-[34rem]">
+      <div className="overflow-x-auto rounded-[14px] border border-(--border-subtle) bg-(--surface-panel)">
+        <div className="min-w-136">
           <div
             className={cn(
               GRID,
-              "border-b border-[var(--border-subtle)] px-3.5 py-2.5 text-xs font-medium text-[var(--text-subtle)]",
+              "border-b border-(--border-subtle) px-3.5 py-2.5 text-xs font-medium text-(--text-subtle)",
             )}
           >
             <span>Speaker</span>
@@ -271,17 +277,17 @@ export function DiarizationSpeakersTable({
                 className={cn(
                   GRID,
                   "px-3.5 py-2.5",
-                  index < rows.length - 1 && "border-b border-[var(--border-subtle)]",
+                  index < rows.length - 1 && "border-b border-(--border-subtle)",
                 )}
               >
                 <div className="flex min-w-0 items-center gap-3">
                   <span
                     aria-hidden="true"
                     className={cn(
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--speaker-avatar-border)] bg-[var(--speaker-avatar-bg)] text-[12.5px] font-medium",
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-(--speaker-avatar-border) bg-(--speaker-avatar-bg) text-[12.5px] font-medium",
                       silent
-                        ? "text-[var(--text-subtle)]"
-                        : "text-[var(--speaker-avatar-text)]",
+                        ? "text-(--text-subtle)"
+                        : "text-(--speaker-avatar-text)",
                     )}
                   >
                     {String.fromCharCode(65 + (index % 26))}
@@ -299,13 +305,13 @@ export function DiarizationSpeakersTable({
                         }))
                       }
                       className={cn(
-                        "-ml-2 h-7 w-full max-w-[16rem] rounded-[8px] border px-2 text-[13.5px] font-medium text-[var(--text-primary)] outline-none placeholder:text-[var(--text-primary)] focus:border-[var(--border-default)] focus:bg-[var(--surface-canvas)]",
+                        "-ml-2 h-7 w-full max-w-[16rem] rounded-[8px] border px-2 text-[13.5px] font-medium text-(--text-primary) outline-hidden placeholder:text-(--text-primary) focus:border-(--border-default) focus:bg-(--surface-canvas)",
                         renamed
-                          ? "border-[var(--border-default)] bg-[var(--surface-canvas)]"
-                          : "border-transparent bg-transparent hover:border-[var(--border-default)]",
+                          ? "border-(--border-default) bg-(--surface-canvas)"
+                          : "border-transparent bg-transparent hover:border-(--border-default)",
                       )}
                     />
-                    <span className="text-[11.5px] text-[var(--text-subtle)]">
+                    <span className="text-[11.5px] text-(--text-subtle)">
                       {silent
                         ? "Detected, but no words"
                         : renamed
@@ -315,24 +321,24 @@ export function DiarizationSpeakersTable({
                   </div>
                 </div>
                 {silent ? (
-                  <span className="text-[13px] text-[var(--text-subtle)]">—</span>
+                  <span className="text-[13px] text-(--text-subtle)">—</span>
                 ) : (
                   <div className="flex items-center gap-3">
-                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
+                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-(--bg-surface-3)">
                       <div
-                        className="h-full rounded-full bg-[var(--accent-solid)]"
+                        className="h-full rounded-full bg-(--accent-solid)"
                         style={{ width: `${Math.round(share * 100)}%` }}
                       />
                     </div>
-                    <span className="w-[6.5rem] shrink-0 whitespace-nowrap text-right text-[13px] tabular-nums text-[var(--text-muted)]">
+                    <span className="w-26 shrink-0 whitespace-nowrap text-right text-[13px] tabular-nums text-(--text-muted)">
                       {formatTalkTime(row.talkSeconds)} · {Math.round(share * 100)}%
                     </span>
                   </div>
                 )}
-                <span className="text-right text-[13px] tabular-nums text-[var(--text-muted)]">
+                <span className="text-right text-[13px] tabular-nums text-(--text-muted)">
                   {row.turns.length}
                 </span>
-                <span className="text-right text-[13px] tabular-nums text-[var(--text-muted)]">
+                <span className="text-right text-[13px] tabular-nums text-(--text-muted)">
                   {row.wordCount}
                 </span>
                 <RowMenu
@@ -345,11 +351,11 @@ export function DiarizationSpeakersTable({
         </div>
       </div>
       {error ? (
-        <p role="alert" className="mt-3 text-xs text-[var(--danger-text)]">
+        <p role="alert" className="mt-3 text-xs text-(--danger-text)">
           {error}
         </p>
       ) : (
-        <p className="mt-3 text-xs text-[var(--text-subtle)]">
+        <p className="mt-3 text-xs text-(--text-subtle)">
           Names save as you type. Copy, export and summaries use them.
         </p>
       )}

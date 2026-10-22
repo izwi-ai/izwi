@@ -32,14 +32,14 @@ export interface NotificationView {
 }
 
 const TONE_ICON: Record<NotificationTone, { icon: LucideIcon; className: string }> = {
-  info: { icon: Info, className: "text-[var(--text-muted)]" },
-  success: { icon: Check, className: "text-[var(--status-positive-text)]" },
-  warning: { icon: TriangleAlert, className: "text-[var(--status-warning-text)]" },
-  danger: { icon: CircleAlert, className: "text-[var(--danger-text)]" },
+  info: { icon: Info, className: "text-(--text-muted)" },
+  success: { icon: Check, className: "text-(--status-positive-text)" },
+  warning: { icon: TriangleAlert, className: "text-(--status-warning-text)" },
+  danger: { icon: CircleAlert, className: "text-(--danger-text)" },
 };
 
 const textButtonClass =
-  "rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)]";
+  "rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong)";
 
 interface NotificationItemProps {
   view: NotificationView;
@@ -107,7 +107,7 @@ export function NotificationItem({
         }
       }}
       className={cn(
-        "flex flex-col gap-2 rounded-[12px] border border-[var(--border-default)] bg-[var(--surface-panel)] px-3.5 py-3 text-[var(--text-primary)] shadow-[var(--shadow-raised)]",
+        "flex flex-col gap-2 rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-3.5 py-3 text-(--text-primary) shadow-(--shadow-raised)",
         isPresent ? "pointer-events-auto" : "pointer-events-none",
       )}
     >
@@ -127,7 +127,7 @@ export function NotificationItem({
             title={fullText ? undefined : view.title}
             className={cn(
               "text-[13.5px] font-medium leading-5",
-              fullText ? "break-words" : "truncate",
+              fullText ? "wrap-break-word" : "truncate",
             )}
           >
             {view.title}
@@ -136,8 +136,8 @@ export function NotificationItem({
             <span
               title={fullText ? undefined : view.description}
               className={cn(
-                "text-[12.5px] leading-[1.45] text-[var(--text-muted)]",
-                fullText ? "whitespace-pre-line break-words" : "truncate",
+                "text-[12.5px] leading-[1.45] text-(--text-muted)",
+                fullText ? "whitespace-pre-line wrap-break-word" : "truncate",
               )}
             >
               {view.description}
@@ -149,7 +149,7 @@ export function NotificationItem({
             <span
               // The progress bar reports this to assistive tech without re-announcing each tick.
               aria-hidden={hasProgress || undefined}
-              className="whitespace-nowrap pl-1 text-[12.5px] tabular-nums text-[var(--text-muted)]"
+              className="whitespace-nowrap pl-1 text-[12.5px] tabular-nums text-(--text-muted)"
             >
               {detail}
             </span>
@@ -163,7 +163,7 @@ export function NotificationItem({
               }}
               className={cn(
                 textButtonClass,
-                "whitespace-nowrap px-1 text-[13px] font-medium underline decoration-[var(--border-strong)] underline-offset-[3px] transition-colors hover:decoration-[var(--text-primary)]",
+                "whitespace-nowrap px-1 text-[13px] font-medium underline decoration-(--border-strong) underline-offset-[3px] transition-colors hover:decoration-(--text-primary)",
               )}
             >
               {view.action.label}
@@ -175,7 +175,7 @@ export function NotificationItem({
             aria-label={`Dismiss ${view.title} notification`}
             className={cn(
               textButtonClass,
-              "flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-subtle)] transition-colors hover:bg-[var(--accent-soft)] hover:text-[var(--text-primary)]",
+              "flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-(--text-subtle) transition-colors hover:bg-(--accent-soft) hover:text-(--text-primary)",
             )}
           >
             <X aria-hidden="true" className="h-3.5 w-3.5" />
@@ -190,10 +190,10 @@ export function NotificationItem({
           aria-valuemax={100}
           aria-valuenow={percent}
           aria-valuetext={detail}
-          className="ml-7 h-[3px] overflow-hidden rounded-full bg-[var(--bg-surface-3)]"
+          className="ml-7 h-[3px] overflow-hidden rounded-full bg-(--bg-surface-3)"
         >
           <div
-            className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+            className="h-full rounded-full bg-(--accent-solid) transition-[width] duration-300"
             style={{ width: `${percent}%` }}
           />
         </div>

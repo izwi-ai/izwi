@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router-dom";
+import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
 
 const apiMocks = vi.hoisted(() => ({
@@ -577,7 +577,7 @@ describe("ChatPlayground", () => {
     const threadTitle = within(dialog).getByText(longTitle);
 
     expect(threadTitle).toHaveClass("whitespace-normal");
-    expect(threadTitle).toHaveClass("break-words");
+    expect(threadTitle).toHaveClass("wrap-break-word");
     expect(threadTitle).not.toHaveClass("truncate");
   });
 

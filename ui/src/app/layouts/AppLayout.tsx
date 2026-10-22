@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router";
 import { AnimatePresence, motion } from "framer-motion";
-import { CircleAlert, Github, Menu, PanelLeft, Search } from "lucide-react";
+import {
+  CircleAlert,
+  createLucideIcon,
+  Menu,
+  PanelLeft,
+  Search,
+} from "lucide-react";
 import { APP_ICON_URL } from "@/shared/config/runtime";
 import { useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { RouteErrorBoundary } from "@/app/router/RouteErrorBoundary";
@@ -23,6 +29,18 @@ const DESKTOP_NAVIGATION_QUERY = "(min-width: 1024px)";
 const SIDEBAR_WIDTH = "15rem";
 const SIDEBAR_COLLAPSED_WIDTH = "72px";
 const SIDEBAR_COLLAPSED_KEY = "izwi.sidebar.collapsed";
+
+// Lucide 1.0 dropped its brand icons; this is its former Github glyph (ISC).
+const GithubIcon = createLucideIcon("Github", [
+  [
+    "path",
+    {
+      d: "M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4",
+      key: "tonef",
+    },
+  ],
+  ["path", { d: "M9 18c-4.51 2-5-2-7-2", key: "9comsn" }],
+]);
 
 function readSidebarPreference(): boolean {
   try {
@@ -108,7 +126,7 @@ function SidebarLink({
               title={badge.label}
               aria-label={badge.label}
               className={cn(
-                "h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--status-warning-text)]",
+                "h-1.5 w-1.5 shrink-0 rounded-full bg-(--status-warning-text)",
                 collapsed && "absolute right-1.5 top-1.5",
               )}
             />
@@ -302,13 +320,13 @@ function AppShell({
         onOpenChange={setIsCommandPaletteOpen}
       />
       {/* Compact header: the sidebar's brand row, for narrow windows */}
-      <header className="fixed inset-x-0 top-0 z-40 flex h-14 items-center gap-2.5 border-b border-[var(--border-subtle)] bg-[var(--surface-canvas)] pl-5 pr-3 lg:hidden">
+      <header className="fixed inset-x-0 top-0 z-40 flex h-14 items-center gap-2.5 border-b border-(--border-subtle) bg-(--surface-canvas) pl-5 pr-3 lg:hidden">
         <img
           src={appIconUrl}
           alt=""
           className="h-[26px] w-[26px] shrink-0 rounded-[7px]"
         />
-        <span className="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+        <span className="text-[15px] font-semibold tracking-tight text-(--text-primary)">
           Izwi
         </span>
         <Button
@@ -322,7 +340,7 @@ function AppShell({
           aria-expanded={mobileMenuOpen}
           aria-controls="app-sidebar-navigation"
           data-testid="mobile-navigation-trigger"
-          className="ml-auto h-8 w-8 rounded-md text-[var(--text-subtle)] hover:text-foreground"
+          className="ml-auto h-8 w-8 rounded-md text-(--text-subtle) hover:text-foreground"
         >
           <Menu className="h-4 w-4" />
         </Button>
@@ -337,7 +355,7 @@ function AppShell({
             exit={{ opacity: 0 }}
             onClick={closeMobileMenu}
             aria-hidden="true"
-            className="lg:hidden fixed inset-0 bg-background/70 backdrop-blur-sm z-40"
+            className="lg:hidden fixed inset-0 bg-background/70 backdrop-blur-xs z-40"
           />
         )}
       </AnimatePresence>
@@ -352,9 +370,9 @@ function AppShell({
         onKeyDown={handleSidebarKeyDown}
         data-testid="app-sidebar"
         className={cn(
-          "w-[15rem] border-r border-[var(--border-subtle)] flex flex-col fixed h-full z-50 bg-[var(--surface-canvas)] transition-all duration-300",
+          "w-60 border-r border-(--border-subtle) flex flex-col fixed h-full z-50 bg-(--surface-canvas) transition-all duration-300",
           "lg:translate-x-0",
-          isSidebarCollapsed ? "lg:w-[72px]" : "lg:w-[15rem]",
+          isSidebarCollapsed ? "lg:w-[72px]" : "lg:w-60",
           mobileMenuOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full",
         )}
       >
@@ -390,7 +408,7 @@ function AppShell({
             data-testid="sidebar-collapse-toggle"
             tabIndex={isDesktopNavigation ? undefined : -1}
             className={cn(
-              "hidden h-8 w-8 rounded-md text-[var(--text-subtle)] hover:text-foreground lg:inline-flex",
+              "hidden h-8 w-8 rounded-md text-(--text-subtle) hover:text-foreground lg:inline-flex",
               !isSidebarCollapsed && "ml-auto",
             )}
             title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -404,11 +422,13 @@ function AppShell({
             type="button"
             onClick={() => setIsCommandPaletteOpen(true)}
             tabIndex={sidebarInteractive ? undefined : -1}
-            aria-label="Search or jump to"
+            // Expanded, the visible label (shortcut included) is the name, so
+            // the name contains what sighted users see (WCAG 2.5.3).
+            aria-label={isSidebarCollapsed ? "Search or jump to" : undefined}
             aria-keyshortcuts={isMacPlatform() ? "Meta+K" : "Control+K"}
             title={isSidebarCollapsed ? "Search or jump to" : undefined}
             className={cn(
-              "flex items-center gap-2 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] text-[13px] text-[var(--text-subtle)] transition-colors hover:text-[var(--text-primary)]",
+              "flex items-center gap-2 rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) text-[13px] text-(--text-subtle) transition-colors hover:text-(--text-primary)",
               isSidebarCollapsed ? "h-10 w-10 justify-center" : "h-[34px] w-full px-2.5",
             )}
           >
@@ -416,7 +436,7 @@ function AppShell({
             {!isSidebarCollapsed ? (
               <>
                 <span className="truncate">Search or jump to…</span>
-                <kbd className="ml-auto rounded-[5px] border border-[var(--border-default)] px-1.5 font-sans text-[11px] leading-[18px] text-[var(--text-subtle)]">
+                <kbd className="ml-auto rounded-[5px] border border-(--border-default) px-1.5 font-sans text-[11px] leading-[18px] text-(--text-subtle)">
                   {isMacPlatform() ? "⌘K" : "Ctrl K"}
                 </kbd>
               </>
@@ -438,12 +458,12 @@ function AppShell({
               className={cn(
                 isSidebarCollapsed &&
                   index > 0 &&
-                  "mx-2 mt-2 border-t border-[var(--border-subtle)] pt-2",
+                  "mx-2 mt-2 border-t border-(--border-subtle) pt-2",
               )}
             >
               <h4
                 className={cn(
-                  "px-2.5 pb-1 pt-3 text-[11px] font-medium tracking-[0.02em] text-[var(--text-subtle)]",
+                  "px-2.5 pb-1 pt-3 text-[11px] font-medium tracking-[0.02em] text-(--text-subtle)",
                   isSidebarCollapsed && "sr-only",
                 )}
               >
@@ -488,9 +508,9 @@ function AppShell({
               rel="noopener noreferrer"
               aria-label="Izwi on GitHub"
               tabIndex={sidebarInteractive ? undefined : -1}
-              className="mt-2 inline-flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[11px] text-[var(--text-subtle)] transition-colors hover:text-foreground"
+              className="mt-2 inline-flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[11px] text-(--text-subtle) transition-colors hover:text-foreground"
             >
-              <Github className="h-3.5 w-3.5" />
+              <GithubIcon className="h-3.5 w-3.5" />
               GitHub
             </a>
           ) : null}
@@ -501,7 +521,7 @@ function AppShell({
       <div
         className={cn(
           "flex-1 flex flex-col pt-14 lg:pt-0 transition-all duration-300 min-w-0 overflow-hidden",
-          isSidebarCollapsed ? "lg:ml-[72px]" : "lg:ml-[15rem]",
+          isSidebarCollapsed ? "lg:ml-[72px]" : "lg:ml-60",
         )}
         style={
           {
@@ -516,17 +536,17 @@ function AppShell({
           {catalogError ? (
             <div
               role="alert"
-              className="mb-5 flex shrink-0 items-start gap-3 rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-3"
+              className="mb-5 flex shrink-0 items-start gap-3 rounded-[12px] border border-(--border-subtle) bg-(--surface-panel) px-3.5 py-3"
             >
               <CircleAlert
                 aria-hidden="true"
-                className="mt-0.5 h-4 w-4 shrink-0 text-[var(--danger-text)]"
+                className="mt-0.5 h-4 w-4 shrink-0 text-(--danger-text)"
               />
               <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <p className="text-[13.5px] font-medium leading-5 text-[var(--text-primary)]">
+                <p className="text-[13.5px] font-medium leading-5 text-(--text-primary)">
                   Couldn’t load models
                 </p>
-                <p className="break-words text-[12.5px] leading-[1.45] text-[var(--text-muted)]">
+                <p className="wrap-break-word text-[12.5px] leading-[1.45] text-(--text-muted)">
                   {catalogError}
                 </p>
               </div>
@@ -534,7 +554,7 @@ function AppShell({
                 type="button"
                 disabled={isRetryingModelCatalog}
                 onClick={() => void handleRetryModelCatalog()}
-                className="inline-flex h-8 shrink-0 items-center rounded-full border border-[var(--border-default)] px-3.5 text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-surface-2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-strong)] disabled:opacity-50"
+                className="inline-flex h-8 shrink-0 items-center rounded-full border border-(--border-default) px-3.5 text-[13px] text-(--text-primary) transition-colors hover:bg-(--bg-surface-2) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--border-strong) disabled:opacity-50"
               >
                 {isRetryingModelCatalog ? "Retrying…" : "Retry"}
               </button>
