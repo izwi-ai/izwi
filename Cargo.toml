@@ -41,7 +41,7 @@ async-trait = "0.1"
 # Web framework
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
 tower = "0.5.3"
-tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 utoipa = { version = "6", features = ["preserve_path_order"] }
 scalar_api_reference = { version = "0.2.2", features = ["axum"] }
 
