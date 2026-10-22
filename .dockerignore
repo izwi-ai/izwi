@@ -61,8 +61,6 @@ tests/
 *_test.rs
 
 # Development files
-Dockerfile.dev
-docker-compose.dev.yml
 .editorconfig
 .pre-commit-config.yaml
 
