@@ -6,11 +6,13 @@
 //!   counted from the moment the connection opens, so neither a client that
 //!   trickles headers (slowloris) nor one that sends nothing holds a
 //!   connection.
-//! - Each connection serves one request (no keep-alive): hyper never times
-//!   out a keep-alive connection waiting for its next request, so idle ones
-//!   could otherwise fill the connection cap. A new connection per request
-//!   costs little on loopback or behind a proxy; streamed responses and
-//!   WebSockets are unaffected.
+//! - Each connection serves one request: every response carries
+//!   `Connection: close`, because hyper never times out a keep-alive
+//!   connection waiting for its next request, so idle ones could otherwise
+//!   fill the connection cap. A new connection per request costs little on
+//!   loopback or behind a proxy. A WebSocket's 101 keeps its own
+//!   `Connection: upgrade` (hyper's `keep_alive(false)` would overwrite it and
+//!   break the upgrade), and streamed responses are unaffected.
 //! - At most [`HttpLimits::max_connections`] HTTP connections are open at
 //!   once; past that, new ones wait in the kernel's accept backlog instead of
 //!   each getting a task. A WebSocket leaves the count once it upgrades.
@@ -28,6 +30,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{header, HeaderValue};
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
@@ -35,6 +38,8 @@ use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
+use tower::Layer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, warn};
 
 /// Connection limits for [`serve_router_with`].
@@ -73,8 +78,14 @@ pub async fn serve_router_with(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout)
-        .keep_alive(false);
+        .header_read_timeout(limits.header_read_timeout);
+    // hyper closes the connection after a response that says so; a
+    // WebSocket's 101 already carries `Connection: upgrade` and keeps it.
+    let service = SetResponseHeaderLayer::if_not_present(
+        header::CONNECTION,
+        HeaderValue::from_static("close"),
+    )
+    .layer(router);
     let graceful = GracefulShutdown::new();
     // Ends the first-byte waits below when shutdown begins; each holds a
     // graceful-shutdown watcher, which shutdown would otherwise wait out.
@@ -101,7 +112,7 @@ pub async fn serve_router_with(
         };
         let watcher = graceful.watcher();
         let builder = builder.clone();
-        let router = router.clone();
+        let service = service.clone();
         let mut stopping = stopping.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -120,7 +131,7 @@ pub async fn serve_router_with(
             let connection = builder
                 .serve_connection_with_upgrades(
                     TokioIo::new(stream),
-                    TowerToHyperService::new(router),
+                    TowerToHyperService::new(service),
                 )
                 .into_owned();
             if let Err(error) = watcher.watch(connection).await {
@@ -153,7 +164,9 @@ async fn accept_backoff(error: io::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ws::WebSocketUpgrade;
     use axum::routing::get;
+    use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::oneshot;
@@ -167,7 +180,18 @@ mod tests {
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = Router::new().route("/", get(|| async { "ok" }));
+        let router = Router::new().route("/", get(|| async { "ok" })).route(
+            "/ws",
+            get(|upgrade: WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if socket.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }),
+        );
         let (stop, stopped) = oneshot::channel::<()>();
         let server = tokio::spawn(serve_router_with(
             listener,
@@ -206,6 +230,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(TcpStream::connect(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn websockets_upgrade_and_outlive_the_one_request_rule() {
+        let (addr, stop, _server) = start(HttpLimits::default()).await;
+        let (mut socket, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the WebSocket upgrades");
+        assert_eq!(response.status(), 101);
+        for text in ["one", "two"] {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::text(text))
+                .await
+                .unwrap();
+            let echoed = socket.next().await.unwrap().unwrap();
+            assert_eq!(echoed.into_text().unwrap().as_str(), text);
+        }
+        drop(stop);
     }
 
     #[tokio::test]
