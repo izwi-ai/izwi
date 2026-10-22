@@ -3,13 +3,25 @@
 //! gives hyper no timer.
 //!
 //! - Request headers must arrive within [`HttpLimits::header_read_timeout`],
-//!   so a client that trickles them (slowloris) cannot hold a connection.
-//! - At most [`HttpLimits::max_connections`] connections are open at once;
-//!   past that, new ones wait in the kernel's accept backlog instead of each
-//!   getting a task.
+//!   counted from the moment the connection opens, so neither a client that
+//!   trickles headers (slowloris) nor one that sends nothing holds a
+//!   connection.
+//! - Each connection serves one request (no keep-alive): hyper never times
+//!   out a keep-alive connection waiting for its next request, so idle ones
+//!   could otherwise fill the connection cap. A new connection per request
+//!   costs little on loopback or behind a proxy; streamed responses and
+//!   WebSockets are unaffected.
+//! - At most [`HttpLimits::max_connections`] HTTP connections are open at
+//!   once; past that, new ones wait in the kernel's accept backlog instead of
+//!   each getting a task. A WebSocket leaves the count once it upgrades.
 //! - The shutdown signal stops accepting, asks open connections to close once
 //!   their in-flight requests finish, and resolves when they have, as
 //!   `axum::serve(..).with_graceful_shutdown(..)` did.
+//!
+//! The listener speaks HTTP/1.1 only. Browsers use HTTP/2 only over TLS, which
+//! terminates in front of this listener, and the HTTP/2 protocol sniff would
+//! wait for a client's first bytes with no timeout, before the header timer
+//! starts: idle connections could then fill the connection cap.
 
 use std::future::Future;
 use std::io;
@@ -22,7 +34,7 @@ use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tracing::{debug, warn};
 
 /// Connection limits for [`serve_router_with`].
@@ -57,17 +69,16 @@ pub async fn serve_router_with(
     signal: impl Future<Output = ()> + Send + 'static,
     limits: HttpLimits,
 ) -> io::Result<()> {
-    let mut builder = Builder::new(TokioExecutor::new());
+    let mut builder = Builder::new(TokioExecutor::new()).http1_only();
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout);
-    // CONNECT carries WebSockets over HTTP/2.
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .enable_connect_protocol();
+        .header_read_timeout(limits.header_read_timeout)
+        .keep_alive(false);
     let graceful = GracefulShutdown::new();
+    // Ends the first-byte waits below when shutdown begins; each holds a
+    // graceful-shutdown watcher, which shutdown would otherwise wait out.
+    let (stopping_tx, stopping) = watch::channel(false);
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     tokio::pin!(signal);
 
@@ -88,23 +99,38 @@ pub async fn serve_router_with(
             },
             () = &mut signal => break,
         };
-        let connection = graceful.watch(
-            builder
+        let watcher = graceful.watcher();
+        let builder = builder.clone();
+        let router = router.clone();
+        let mut stopping = stopping.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            // hyper starts its header timer at the first byte, so a client
+            // that sends nothing is cut off here instead.
+            let mut probe = [0u8; 1];
+            let first_byte = tokio::select! {
+                peeked = tokio::time::timeout(limits.header_read_timeout, stream.peek(&mut probe)) => {
+                    matches!(peeked, Ok(Ok(read)) if read > 0)
+                }
+                _ = stopping.wait_for(|stopping| *stopping) => false,
+            };
+            if !first_byte {
+                return;
+            }
+            let connection = builder
                 .serve_connection_with_upgrades(
                     TokioIo::new(stream),
-                    TowerToHyperService::new(router.clone()),
+                    TowerToHyperService::new(router),
                 )
-                .into_owned(),
-        );
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
+                .into_owned();
+            if let Err(error) = watcher.watch(connection).await {
                 debug!(%error, "HTTP connection ended with an error");
             }
-            drop(permit);
         });
     }
 
     drop(listener);
+    let _ = stopping_tx.send(true);
     graceful.shutdown().await;
     Ok(())
 }
@@ -169,6 +195,10 @@ mod tests {
     async fn serves_requests_and_drains_on_shutdown() {
         let (addr, stop, server) = start(HttpLimits::default()).await;
         assert!(get_root(addr).await.ends_with("ok"));
+        // A connection still waiting for its first byte must not hold up
+        // shutdown for the 30 s header window.
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         stop.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
@@ -195,6 +225,38 @@ mod tests {
         let _closed = tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut rest))
             .await
             .expect("the server closes a connection whose headers stall");
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn silent_and_finished_connections_are_closed() {
+        let limits = HttpLimits {
+            header_read_timeout: Duration::from_millis(200),
+            ..HttpLimits::default()
+        };
+        let (addr, stop, _server) = start(limits).await;
+
+        // A connection that never sends a byte.
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), silent.read_to_end(&mut rest))
+            .await
+            .expect("the server closes a connection that sends nothing")
+            .ok();
+
+        // A client that asks for keep-alive still gets one request.
+        let mut idle = TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), idle.read_to_end(&mut response))
+            .await
+            .expect("the server closes the connection after its response")
+            .ok();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("connection: close"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
         drop(stop);
     }
 
