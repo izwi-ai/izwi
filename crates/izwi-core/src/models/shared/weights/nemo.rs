@@ -38,7 +38,7 @@ pub(crate) fn check_free_disk(
 /// [`check_free_disk`] against the volume holding `location` (statvfs). A
 /// volume that cannot be queried is reported and not treated as full.
 pub(crate) fn ensure_free_disk(location: &Path, required_bytes: u64, purpose: &str) -> Result<()> {
-    match fs2::available_space(location) {
+    match fs4::available_space(location) {
         Ok(available) => check_free_disk(available, required_bytes, location, purpose),
         Err(error) => {
             tracing::warn!(

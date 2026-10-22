@@ -3,19 +3,21 @@ name = "izwi-serving-supervisor"
 description = "Accelerator-free local worker assignment and supervision primitives for Izwi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fs2 = "0.4.3"
 serde_json = { workspace = true }
 izwi-env = { path = "../izwi-env" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-fence = { path = "../izwi-serving-fence" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

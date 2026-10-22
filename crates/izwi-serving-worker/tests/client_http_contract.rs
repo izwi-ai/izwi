@@ -310,6 +310,7 @@ async fn descriptor_negotiates_the_minor_and_its_features() {
     assert_eq!(descriptor.negotiated_version(), Some(PROTOCOL_V1));
     assert!(descriptor.features.contains(&WorkerFeature::ChatSeed));
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let undeclared: serde_json::Value = reqwest::Client::new()
         .get(format!(
             "{}{}",
@@ -531,6 +532,7 @@ async fn incompatible_version_model_and_generation_are_rejected_before_execution
     // separately over the same real HTTP socket to prove independently versioned peers are safe.
     let mut raw_wrong_version = request(worker.config(), "raw-version");
     raw_wrong_version.schema_version = SchemaVersion::new(2, 0);
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let response = reqwest::Client::new()
         .post(format!(
             "{}{}",

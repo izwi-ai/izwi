@@ -389,6 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_diarization_job_reports_a_failed_record() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -408,6 +409,7 @@ mod tests {
     /// terminal; there is no client-side deadline.
     #[tokio::test]
     async fn wait_for_diarization_job_polls_until_the_job_is_terminal() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()

@@ -88,6 +88,8 @@ fn local_server_url(url: &str) -> Result<Url> {
 /// Stream `url` into `path` through a partial file, so a failed download
 /// neither leaves a truncated file nor replaces the one the user picked.
 async fn download_to(url: Url, path: &Path) -> Result<()> {
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut response = reqwest::get(url.clone())
         .await
         .with_context(|| format!("failed downloading {url}"))?;

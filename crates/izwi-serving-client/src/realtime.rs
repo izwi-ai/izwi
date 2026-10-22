@@ -40,7 +40,6 @@ use izwi_serving_protocol::{
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_rustls::rustls;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderValue, Error as WsError, Message,
 };
@@ -423,35 +422,8 @@ fn tls_connector(
     if !tls.is_configured() {
         return Ok(None);
     }
-    let invalid = |message| RealtimeClientError::InvalidConfiguration(message);
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    for pem in &tls.private_ca_roots_pem {
-        for der in
-            crate::pem_certificates(pem).map_err(|_| invalid("private CA root is not valid PEM"))?
-        {
-            roots
-                .add(rustls::pki_types::CertificateDer::from(der))
-                .map_err(|_| invalid("private CA root is not a valid certificate"))?;
-        }
-    }
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|_| invalid("TLS client configuration could not be constructed"))?
-    .with_root_certificates(roots);
-    let config = match &tls.client_identity_pem {
-        None => builder.with_no_client_auth(),
-        Some(identity) => {
-            let (certificates, key) = crate::pem_identity(identity)
-                .map_err(|_| invalid("mTLS identity is not valid PEM"))?;
-            builder
-                .with_client_auth_cert(certificates, key)
-                .map_err(|_| invalid("mTLS identity could not be used for TLS"))?
-        }
-    };
+    let config =
+        crate::worker_tls_client_config(tls).map_err(RealtimeClientError::InvalidConfiguration)?;
     Ok(Some(Connector::Rustls(Arc::new(config))))
 }
 
@@ -838,6 +810,7 @@ impl RealtimeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_rustls::rustls;
 
     fn credentials() -> ServiceCredentials {
         ServiceCredentials {

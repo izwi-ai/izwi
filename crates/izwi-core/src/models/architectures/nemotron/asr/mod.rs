@@ -3333,7 +3333,7 @@ mod tests {
     #[test]
     fn incremental_deltas_concatenate_to_the_full_vocab_decode() {
         use crate::models::shared::detokenize::stream_deltas;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
         let vocab: Vec<String> = [
@@ -3365,8 +3365,8 @@ mod tests {
         let decoder = NemotronDecoder::Vocab(vocab.clone());
         let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_5);
         for _ in 0..500 {
-            let ids = (0..rng.gen_range(0..60))
-                .map(|_| rng.gen_range(0..vocab.len() + 2))
+            let ids = (0..rng.random_range(0..60))
+                .map(|_| rng.random_range(0..vocab.len() + 2))
                 .collect::<Vec<_>>();
             let (deltas, detokenizer) =
                 stream_deltas(&ids, |ids: &[usize]| Ok(decoder.decode(ids)));

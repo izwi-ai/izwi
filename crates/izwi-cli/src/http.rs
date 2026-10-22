@@ -5,6 +5,8 @@ use std::time::Duration;
 pub const API_KEY_ENV: &str = "IZWI_API_KEY";
 
 pub fn client(timeout: Option<Duration>) -> Result<reqwest::Client> {
+    // reqwest's rustls has no built-in crypto provider in this workspace.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .user_agent(format!("izwi-cli/{}", env!("CARGO_PKG_VERSION")))

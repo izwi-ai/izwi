@@ -218,7 +218,7 @@ impl MetalMemoryPool {
             pool_key
         } else {
             self.checked_out
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_sub(1)
                 })
                 .ok();
@@ -230,12 +230,12 @@ impl MetalMemoryPool {
         if current > self.config.max_pool_size_bytes {
             debug!("Pool at capacity, dropping tensor");
             self.current_usage
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_sub(size_bytes)
                 })
                 .ok();
             self.checked_out
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_sub(1)
                 })
                 .ok();
@@ -252,7 +252,7 @@ impl MetalMemoryPool {
         let mut buckets = self.buckets.lock().unwrap();
         buckets.entry(pool_key).or_default().push(buffer);
         self.checked_out
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_sub(1)
             })
             .ok();

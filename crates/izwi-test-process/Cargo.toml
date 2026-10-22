@@ -3,6 +3,7 @@ name = "izwi-test-process"
 description = "Test harness for spawned Izwi processes: every process tree is reaped, even after a panic or a killed test binary"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false

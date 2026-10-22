@@ -1675,8 +1675,7 @@ fn try_cuda_paged_decode_graph(
     backing_generation: u64,
 ) -> candle_core::Result<(Option<Tensor>, CudaPagedDecodeGraphOutcome)> {
     use candle_core::cuda_backend::cudarc::driver::sys::{
-        CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-        CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        CUgraphInstantiate_flags, CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
     };
 
     let key = cuda_paged_decode_graph_key(
@@ -1813,8 +1812,9 @@ fn try_cuda_paged_decode_graph(
                     softmax_scale,
                     softcap,
                 );
-                let captured_graph =
-                    stream.end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+                let captured_graph = stream.end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                );
                 let Ok(()) = captured_launch else {
                     cache.push_back((
                         key,

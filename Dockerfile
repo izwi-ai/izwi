@@ -24,7 +24,7 @@ RUN npm run build
 # -----------------------------------------------------------------------------
 # Stage 2: Build the Rust backend (CPU)
 # -----------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS rust-builder-cpu
+FROM rust:1.99-bookworm AS rust-builder-cpu
 
 WORKDIR /app
 
@@ -46,7 +46,7 @@ RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervis
 # Stage 2b: Build the standalone gateway. It links no inference engine, so this
 # stage builds none of the model or accelerator code.
 # -----------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS rust-builder-gateway
+FROM rust:1.99-bookworm AS rust-builder-gateway
 
 WORKDIR /app
 
@@ -80,7 +80,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     --profile minimal \
-    --default-toolchain 1.88.0
+    --default-toolchain 1.99.0
 
 # Copy Cargo files first for dependency caching
 COPY Cargo.toml Cargo.lock ./

@@ -481,7 +481,7 @@ impl RolloutPlan {
         hasher.update([self.strategy as u8]);
         hasher.update([0]);
         hasher.update(target_config_bytes);
-        format!("sha256:{:x}", hasher.finalize())
+        format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
     /// Validates the plan against the running and target node configs and
@@ -938,11 +938,14 @@ mod tests {
         }
     }
 
+    /// Validation needs a regular executable, and nothing here runs it: the
+    /// test binary is one everywhere. `/usr/bin/true` is a symlink on
+    /// Ubuntu 26.04, which validation rejects.
     fn binaries() -> crate::config::BinaryCatalog {
         crate::config::BinaryCatalog::new(vec![(
             crate::config::WorkerBinaryFlavor::Cpu,
             crate::config::BinaryRecord {
-                path: "/usr/bin/true".into(),
+                path: std::env::current_exe().unwrap(),
                 supported_backends: vec![izwi_serving_protocol::BackendKind::Cpu],
             },
         )])

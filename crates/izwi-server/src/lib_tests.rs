@@ -112,6 +112,7 @@ async fn local_server_answers_liveness_while_models_preload() {
         },
         test_shutdown_plan(),
     ));
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -385,6 +386,7 @@ async fn local_shutdown_serves_through_prestop_then_drains() {
         },
         plan,
     ));
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

@@ -3,8 +3,10 @@
 //! the token that crosses top-p (except that rank zero always survives).
 
 use candle_core::{DType, IndexOp, Tensor};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+// ChaCha12 is what StdRng runs, but it stays Clone (samplers snapshot their
+// RNG) and its seeded stream is stable across releases.
+use rand_chacha::ChaCha12Rng;
+use rand::{RngExt, SeedableRng};
 
 use crate::error::{Error, Result};
 use crate::models::shared::sampling::{
@@ -17,7 +19,7 @@ pub struct FishS2Sampler {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
-    rng: StdRng,
+    rng: ChaCha12Rng,
 }
 
 impl FishS2Sampler {
@@ -30,7 +32,7 @@ impl FishS2Sampler {
             temperature,
             top_p,
             top_k,
-            rng: StdRng::seed_from_u64(seed),
+            rng: ChaCha12Rng::seed_from_u64(seed),
         }
     }
 
@@ -50,11 +52,11 @@ impl FishS2Sampler {
             // Greedy mode has no RNG side effects. Stochastic singleton draws
             // still consume a value, keeping replay stable across support sizes.
             if temperature > 0.0 {
-                let _ = self.rng.r#gen::<f32>();
+                let _ = self.rng.random::<f32>();
             }
             return Ok(probabilities[0].0);
         }
-        let mut draw = self.rng.r#gen::<f32>();
+        let mut draw = self.rng.random::<f32>();
         for (token, probability) in &probabilities {
             if draw < *probability {
                 return Ok(*token);
@@ -90,7 +92,7 @@ impl FishS2Sampler {
         }
         let noise = if self.temperature > 0.0 {
             let rng = &mut self.rng;
-            let mut draw = || rng.r#gen::<f32>();
+            let mut draw = || rng.random::<f32>();
             let values = gumbel_noise(tokens * self.top_k, &mut draw);
             Some(Tensor::from_vec(values, (tokens, self.top_k), device)?)
         } else {

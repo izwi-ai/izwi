@@ -436,6 +436,23 @@ fn download_disk_requirement(files: &[(&str, u64, bool)], extracts_nemo: bool) -
         .fold(0u64, u64::saturating_add)
 }
 
+/// `error` and its causes, without repeating a cause its parent already
+/// quotes. reqwest's `Display` leaves out the cause (refused connection, DNS or
+/// TLS failure), which is the useful part of a failed download.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 #[derive(Debug, Clone)]
 struct FileDownloadPlan {
     source_repo: String,
@@ -656,6 +673,8 @@ impl ModelDownloader {
     pub fn new(models_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&models_dir)?;
 
+        // reqwest's rustls has no built-in crypto provider in this workspace.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http_client = reqwest::Client::builder()
             // Large model files can take significant time on slower links.
             .timeout(std::time::Duration::from_secs(6 * 3600))
@@ -663,7 +682,7 @@ impl ModelDownloader {
             // restricted runtime environments (sandboxed agents/CI).
             .no_proxy()
             .build()
-            .map_err(|e| Error::HfHubError(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| Error::HfHubError(format!("Failed to create HTTP client: {}", error_chain(&e))))?;
 
         let multi_progress = MultiProgress::new();
         multi_progress.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(10));
@@ -722,7 +741,7 @@ impl ModelDownloader {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
-            .map_err(|e| Error::HfHubError(format!("Repo tree request failed: {}", e)))?;
+            .map_err(|e| Error::HfHubError(format!("Repo tree request failed: {}", error_chain(&e))))?;
 
         if !response.status().is_success() {
             return Err(Error::HfHubError(format!(
@@ -773,7 +792,7 @@ impl ModelDownloader {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
-            .map_err(|error| Error::HfHubError(format!("HTTP request failed: {error}")))?;
+            .map_err(|error| Error::HfHubError(format!("HTTP request failed: {}", error_chain(&error))))?;
         if !response.status().is_success() {
             return Err(Error::HfHubError(format!(
                 "HTTP {} for {}",
@@ -785,7 +804,7 @@ impl ModelDownloader {
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|error| Error::HfHubError(format!("Response body failed: {error}")))
+            .map_err(|error| Error::HfHubError(format!("Response body failed: {}", error_chain(&error))))
     }
 
     /// Download a file with streaming and progress bar
@@ -811,7 +830,7 @@ impl ModelDownloader {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
-            .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", error_chain(&e))))?;
 
         if !response.status().is_success() {
             return Err(Error::HfHubError(format!(
@@ -859,7 +878,7 @@ impl ModelDownloader {
 
         while let Some(chunk) = stream.next().await {
             let chunk =
-                chunk.map_err(|error| Error::HfHubError(format!("Stream error: {error}")))?;
+                chunk.map_err(|error| Error::HfHubError(format!("Stream error: {}", error_chain(&error))))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
             downloaded += chunk.len() as u64;
 
@@ -2117,7 +2136,7 @@ impl ModelDownloader {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
-            .map_err(|e| Error::HfHubError(format!("HEAD request failed: {}", e)))?;
+            .map_err(|e| Error::HfHubError(format!("HEAD request failed: {}", error_chain(&e))))?;
 
         if !response.status().is_success() {
             return Err(Error::HfHubError(format!(

@@ -86,6 +86,7 @@ async fn server_gateway_role_routes_inference_through_an_approved_worker() {
         }
     };
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
     loop {

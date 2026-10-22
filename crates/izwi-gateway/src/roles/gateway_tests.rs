@@ -495,6 +495,7 @@ async fn gateway_shutdown_serves_through_prestop_and_ends_streams_with_a_termina
         plan,
     ));
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
     let stream = || {
         client

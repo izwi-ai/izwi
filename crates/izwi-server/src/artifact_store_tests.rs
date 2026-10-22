@@ -3614,3 +3614,18 @@ impl MediaStorageProvider for MemoryMediaProvider {
         }
     }
 }
+
+/// Artifact digests are stored and compared as lowercase hex. Pin the
+/// encoding to the SHA-256 test vectors so a hashing or hex change cannot
+/// silently stop matching digests already on disk.
+#[test]
+fn artifact_digests_are_lowercase_sha256_hex() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}

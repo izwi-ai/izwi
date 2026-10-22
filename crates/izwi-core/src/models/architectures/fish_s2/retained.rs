@@ -1243,7 +1243,7 @@ fn validate_preparation_inputs(text: &str, reference: &FishS2Reference) -> Resul
 
 fn next_state_id() -> Result<u64> {
     NEXT_FISH_S2_STATE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| Error::InferenceError("Fish S2 state identity space exhausted".into()))

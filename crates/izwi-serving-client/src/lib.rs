@@ -16,7 +16,8 @@ use izwi_serving_protocol::{
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
-use std::{collections::VecDeque, fmt, io::Cursor, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, pin::Pin, sync::Arc, time::Duration};
+use tokio_rustls::rustls::pki_types::pem::{PemObject, SectionKind};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
 pub mod otlp;
@@ -83,7 +84,7 @@ impl WorkerClientTlsConfig {
             if items.is_empty()
                 || items
                     .iter()
-                    .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+                    .any(|item| !matches!(item, (SectionKind::Certificate, _)))
             {
                 return Err(WorkerClientError::InvalidConfiguration(
                     "private CA root must contain only certificate PEM blocks",
@@ -112,7 +113,7 @@ impl WorkerClientTlsConfig {
                 if certificate_items.is_empty()
                     || certificate_items
                         .iter()
-                        .any(|item| !matches!(item, rustls_pemfile::Item::X509Certificate(_)))
+                        .any(|item| !matches!(item, (SectionKind::Certificate, _)))
                 {
                     return Err(WorkerClientError::InvalidConfiguration(
                         "mTLS client certificate must contain only certificate PEM blocks",
@@ -124,9 +125,12 @@ impl WorkerClientTlsConfig {
                     || !private_key_items.iter().all(|item| {
                         matches!(
                             item,
-                            rustls_pemfile::Item::RSAKey(_)
-                                | rustls_pemfile::Item::PKCS8Key(_)
-                                | rustls_pemfile::Item::ECKey(_)
+                            (
+                                SectionKind::RsaPrivateKey
+                                    | SectionKind::PrivateKey
+                                    | SectionKind::EcPrivateKey,
+                                _
+                            )
                         )
                     })
                 {
@@ -165,11 +169,14 @@ impl WorkerClientTlsConfig {
     }
 }
 
+/// Every PEM section `pem` holds, labelled by kind. Sections with labels
+/// rustls does not know are skipped.
 fn parse_pem_items(
     pem: &[u8],
     error: &'static str,
-) -> Result<Vec<rustls_pemfile::Item>, WorkerClientError> {
-    rustls_pemfile::read_all(&mut Cursor::new(pem))
+) -> Result<Vec<(SectionKind, Vec<u8>)>, WorkerClientError> {
+    <(SectionKind, Vec<u8>)>::pem_slice_iter(pem)
+        .collect::<Result<_, _>>()
         .map_err(|_| WorkerClientError::InvalidConfiguration(error))
 }
 
@@ -178,7 +185,7 @@ fn pem_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, WorkerClientError> {
     Ok(parse_pem_items(pem, "certificate PEM is invalid")?
         .into_iter()
         .filter_map(|item| match item {
-            rustls_pemfile::Item::X509Certificate(der) => Some(der),
+            (SectionKind::Certificate, der) => Some(der),
             _ => None,
         })
         .collect())
@@ -201,16 +208,16 @@ fn pem_identity(
     let mut key = None;
     for item in parse_pem_items(pem, "mTLS identity is not valid PEM")? {
         match item {
-            rustls_pemfile::Item::X509Certificate(der) => {
+            (SectionKind::Certificate, der) => {
                 certificates.push(CertificateDer::from(der));
             }
-            rustls_pemfile::Item::PKCS8Key(der) => {
+            (SectionKind::PrivateKey, der) => {
                 key = Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)));
             }
-            rustls_pemfile::Item::RSAKey(der) => {
+            (SectionKind::RsaPrivateKey, der) => {
                 key = Some(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)));
             }
-            rustls_pemfile::Item::ECKey(der) => {
+            (SectionKind::EcPrivateKey, der) => {
                 key = Some(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)));
             }
             _ => {}
@@ -220,6 +227,41 @@ fn pem_identity(
         "mTLS identity has no private key",
     ))?;
     Ok((certificates, key))
+}
+
+/// The rustls client configuration for HTTPS and `wss` worker links: the
+/// public web roots plus any private CA roots, presenting the mTLS identity
+/// when one is configured.
+fn worker_tls_client_config(
+    tls: &WorkerClientTlsConfig,
+) -> Result<tokio_rustls::rustls::ClientConfig, &'static str> {
+    use tokio_rustls::rustls;
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for pem in &tls.private_ca_roots_pem {
+        for der in pem_certificates(pem).map_err(|_| "private CA root is not valid PEM")? {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .map_err(|_| "private CA root is not a valid certificate")?;
+        }
+    }
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| "TLS client configuration could not be constructed")?
+    .with_root_certificates(roots);
+    match &tls.client_identity_pem {
+        None => Ok(builder.with_no_client_auth()),
+        Some(identity) => {
+            let (certificates, key) =
+                pem_identity(identity).map_err(|_| "mTLS identity is not valid PEM")?;
+            builder
+                .with_client_auth_cert(certificates, key)
+                .map_err(|_| "mTLS identity could not be used for TLS")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -396,33 +438,19 @@ impl WorkerClient {
                 "custom TLS trust or mTLS identity requires an HTTPS worker endpoint",
             ));
         }
-        // Additional roots augment reqwest/rustls defaults. Certificate and
-        // hostname verification remain enabled; redirects remain forbidden.
-        let mut http_builder = reqwest::Client::builder()
+        // HTTPS trusts the same roots as the realtime dialer: the public web
+        // roots plus any private CA roots. Certificate and hostname
+        // verification remain enabled; redirects remain forbidden. reqwest
+        // leaves a ready rustls config's ALPN alone, so offer HTTP/2 here.
+        let mut tls = worker_tls_client_config(&config.tls)
+            .map_err(WorkerClientError::InvalidConfiguration)?;
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let http = reqwest::Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(config.connect_timeout);
-        for pem in &config.tls.private_ca_roots_pem {
-            let certificate = reqwest::Certificate::from_pem(pem).map_err(|_| {
-                WorkerClientError::InvalidConfiguration("private CA root is not valid PEM")
-            })?;
-            http_builder = http_builder.add_root_certificate(certificate);
-        }
-        if let Some(pem) = &config.tls.client_identity_pem {
-            let identity = reqwest::Identity::from_pem(pem).map_err(|_| {
-                WorkerClientError::InvalidConfiguration("mTLS identity is not valid PEM")
-            })?;
-            http_builder = http_builder.identity(identity);
-        }
-        let tls_configured = config.tls.is_configured();
-        let http = http_builder.build().map_err(|error| {
-            if tls_configured {
-                WorkerClientError::InvalidConfiguration(
-                    "TLS client configuration could not be constructed",
-                )
-            } else {
-                WorkerClientError::Build(error)
-            }
-        })?;
+            .connect_timeout(config.connect_timeout)
+            .tls_backend_preconfigured(tls)
+            .build()
+            .map_err(WorkerClientError::Build)?;
         Ok(Self {
             inner: Arc::new(WorkerClientInner {
                 http,

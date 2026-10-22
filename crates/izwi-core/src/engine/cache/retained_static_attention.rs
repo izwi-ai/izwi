@@ -503,7 +503,7 @@ impl RetainedStaticAttentionRuntimeV2 {
 
 fn next_identity(counter: &AtomicU64, label: &str) -> Result<u64> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
         .map_err(|_| {

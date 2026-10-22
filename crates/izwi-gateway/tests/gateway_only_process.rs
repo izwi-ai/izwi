@@ -101,6 +101,13 @@ impl GatewayProcess {
     }
 }
 
+/// A reqwest client. reqwest's rustls has no built-in crypto provider in this
+/// workspace, so ring is installed first.
+fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 /// The port in the gateway's "Gateway listening on http://HOST:PORT" log
 /// line, in text or JSON format.
 fn listening_port(line: &str) -> Option<u16> {
@@ -171,7 +178,7 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
 
@@ -340,7 +347,7 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     let readyz = loop {
@@ -523,7 +530,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut ready = false;
@@ -766,7 +773,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut ready = false;
@@ -1041,7 +1048,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut ready = false;
@@ -1245,7 +1252,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut ready = false;
@@ -1485,7 +1492,7 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
     );
     let port = gateway.port;
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
