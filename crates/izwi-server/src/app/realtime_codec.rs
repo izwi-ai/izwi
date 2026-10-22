@@ -3,7 +3,8 @@
 //! G.711 μ-law or A-law at 8 kHz (64 kb/s, telephony). Opus would need a C
 //! encoder; there is none in the dependency tree.
 
-use rubato::{FftFixedIn, Resampler};
+use rubato::audioadapter_buffers::direct::SequentialSlice;
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 
 /// G.711's sample rate.
 pub(crate) const G711_SAMPLE_RATE: u32 = 8_000;
@@ -101,7 +102,7 @@ impl AudioOutputEncoder {
 
 /// A band-limited resampler fed in arbitrary pieces.
 struct StreamResampler {
-    resampler: FftFixedIn<f32>,
+    resampler: Fft<f32>,
     from: u32,
     to: u32,
     pending: Vec<f32>,
@@ -113,9 +114,18 @@ struct StreamResampler {
 
 impl StreamResampler {
     fn new(from: u32, to: u32) -> Result<Self, String> {
-        let resampler =
-            FftFixedIn::<f32>::new(from as usize, to as usize, RESAMPLE_CHUNK_FRAMES, 1, 1)
-                .map_err(|err| format!("Failed to build the output resampler: {err}"))?;
+        // Fixed input chunks with one FFT block each and the BlackmanHarris2
+        // window: rubato 0.15's FftFixedIn with one sub-chunk.
+        let resampler = Fft::<f32>::new_custom(
+            from as usize,
+            to as usize,
+            RESAMPLE_CHUNK_FRAMES,
+            1,
+            1,
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Input,
+        )
+        .map_err(|err| format!("Failed to build the output resampler: {err}"))?;
         Ok(Self {
             delay: resampler.output_delay(),
             resampler,
@@ -137,11 +147,8 @@ impl StreamResampler {
                 break;
             }
             let chunk: Vec<f32> = self.pending.drain(..needed).collect();
-            let produced = self
-                .resampler
-                .process(&[chunk], None)
-                .map_err(|err| format!("Output resampling failed: {err}"))?;
-            out.extend_from_slice(&produced[0]);
+            let produced = self.process_chunk(&chunk)?;
+            out.extend_from_slice(&produced);
         }
         let out = self.skip_delay(out);
         self.output_total += out.len();
@@ -157,16 +164,23 @@ impl StreamResampler {
         let mut pending = std::mem::take(&mut self.pending);
         while self.output_total + out.len() < expected + self.delay {
             pending.resize(self.resampler.input_frames_next(), 0.0);
-            let produced = self
-                .resampler
-                .process(&[std::mem::take(&mut pending)], None)
-                .map_err(|err| format!("Output resampling failed: {err}"))?;
-            out.extend_from_slice(&produced[0]);
+            let produced = self.process_chunk(&std::mem::take(&mut pending))?;
+            out.extend_from_slice(&produced);
         }
         let mut out = self.skip_delay(out);
         out.truncate(expected.saturating_sub(self.output_total));
         self.output_total += out.len();
         Ok(out)
+    }
+
+    /// Resample one `input_frames_next()`-frame chunk.
+    fn process_chunk(&mut self, chunk: &[f32]) -> Result<Vec<f32>, String> {
+        let input = SequentialSlice::new(chunk, 1, chunk.len())
+            .map_err(|err| format!("Output resampling failed: {err}"))?;
+        self.resampler
+            .process(&input, None)
+            .map(|produced| produced.take_data())
+            .map_err(|err| format!("Output resampling failed: {err}"))
     }
 
     fn skip_delay(&mut self, mut out: Vec<f32>) -> Vec<f32> {

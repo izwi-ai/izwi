@@ -63,7 +63,7 @@ half = "2.7"
 # Audio processing
 hound = "3.5"
 symphonia = { version = "0.6", default-features = false }
-rubato = "0.15"
+rubato = "5"
 rustfft = "6.2"
 
 # MLX bindings (Apple Silicon ML framework)
