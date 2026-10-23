@@ -1,6 +1,6 @@
 use axum::{
     extract::Request,
-    http::{HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware,
     response::Response,
     routing::get,
@@ -8,9 +8,11 @@ use axum::{
 };
 use izwi_core::ServeRuntimeConfig;
 use std::time::Duration;
+use tower::ServiceBuilder;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
@@ -24,6 +26,16 @@ pub(crate) const DESKTOP_CORS_ORIGINS: &[&str] = &[
     "http://tauri.localhost",
     "https://tauri.localhost",
 ];
+
+/// The web UI's Content-Security-Policy: scripts only from this origin;
+/// styles also inline (Tailwind and component libraries inject them); audio,
+/// images and downloads also through blob: and data: URLs; no plugins, no
+/// framing. An injected script cannot load code or send data elsewhere.
+const UI_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
+     media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' blob:; \
+     worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; \
+     frame-ancestors 'none'";
 
 async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
@@ -123,8 +135,22 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
             attach_enterprise_request_context,
         ))
         .layer(middleware::from_fn_with_state(
-            LocalRequestGuard::new(serve_config),
+            LocalRequestGuard::new(serve_config, &crate::env_config::tuning().local_exposure),
             guard_local_request,
+        ))
+        // On every response, rejections included, unless a handler chose
+        // its own: no MIME sniffing, no Referer, no framing.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
         ));
     // CORS is the outermost layer so browser preflights are answered before
     // authentication, which would otherwise reject them for lacking a key.
@@ -137,7 +163,14 @@ fn apply_ui_fallback(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
     }
     let index_path = serve_config.ui_dir.join("index.html");
     app.fallback_service(
-        ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
+        ServiceBuilder::new()
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(UI_CONTENT_SECURITY_POLICY),
+            ))
+            .service(
+                ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
+            ),
     )
 }
 

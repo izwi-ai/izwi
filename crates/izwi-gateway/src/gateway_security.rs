@@ -1,11 +1,12 @@
 //! Fail-closed authentication and ingress policy for the public gateway.
 //!
 //! Local/desktop serving does not use this module. Gateway credentials are
-//! resolved from an environment reference so bearer secrets never become
+//! resolved from an `env:` or `file:` reference so bearer secrets never become
 //! command-line arguments or part of a derived `Debug` representation.
 
 use axum::http::{header, HeaderMap};
 use izwi_hooks::{HookMetadata, Principal};
+use izwi_serving_protocol::secret_file::{file_reference_path, read_secret_file, SecretFileError};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -71,22 +72,17 @@ impl fmt::Debug for GatewayPerimeterConfig {
 
 impl GatewayPerimeterConfig {
     /// Resolve the public bearer credential and ingress policy from bounded
-    /// environment configuration. The secret reference currently supports
-    /// only `env:VARIABLE`, keeping secret bytes out of argv and config files.
+    /// environment configuration. Secret references are `env:VARIABLE` or
+    /// `file:/absolute/path`, keeping secret bytes out of argv and config
+    /// files.
     pub fn from_env() -> Result<Self, GatewayPerimeterConfigError> {
         let secret_ref =
             std::env::var(API_KEY_REF_ENV).unwrap_or_else(|_| DEFAULT_API_KEY_REF.to_string());
-        if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
-            return Err(GatewayPerimeterConfigError::InvalidSecretReference);
-        }
-        let variable = secret_ref
-            .strip_prefix("env:")
-            .filter(|name| valid_env_name(name))
-            .ok_or(GatewayPerimeterConfigError::InvalidSecretReference)?;
-        let api_key = std::env::var_os(variable)
-            .ok_or(GatewayPerimeterConfigError::MissingSecret)?
-            .into_string()
-            .map_err(|_| GatewayPerimeterConfigError::InvalidSecret)?;
+        let api_key = resolve_secret_ref(&secret_ref).map_err(|error| match error {
+            SecretRefError::Reference => GatewayPerimeterConfigError::InvalidSecretReference,
+            SecretRefError::Missing => GatewayPerimeterConfigError::MissingSecret,
+            SecretRefError::Invalid => GatewayPerimeterConfigError::InvalidSecret,
+        })?;
         let metrics_credential = optional_metrics_credential_from_env()?;
         let admin_credential = optional_admin_credential_from_env(&api_key)?;
         let principal_id = bounded_identity_env(PRINCIPAL_ID_ENV, DEFAULT_PRINCIPAL_ID)?;
@@ -318,23 +314,25 @@ fn authenticate_bearer(headers: &HeaderMap, expected: &[u8]) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayPerimeterConfigError {
-    #[error("gateway API key reference must be a bounded env:VARIABLE reference")]
+    #[error(
+        "gateway API key reference must be a bounded env:VARIABLE or file:/absolute/path reference"
+    )]
     InvalidSecretReference,
-    #[error("gateway API key environment reference is not set")]
+    #[error("gateway API key reference names no set variable or readable file")]
     MissingSecret,
     #[error("gateway API key does not satisfy the bounded credential policy")]
     InvalidSecret,
-    #[error("gateway metrics API key reference must be a bounded env:VARIABLE reference")]
+    #[error("gateway metrics API key reference must be a bounded env:VARIABLE or file:/absolute/path reference")]
     InvalidMetricsSecretReference,
-    #[error("gateway metrics API key environment reference is not set")]
+    #[error("gateway metrics API key reference names no set variable or readable file")]
     MissingMetricsSecret,
     #[error("gateway metrics API key does not satisfy the bounded credential policy")]
     InvalidMetricsSecret,
     #[error("gateway metrics API key must differ from the public inference key")]
     ReusedMetricsSecret,
-    #[error("gateway admin API key reference must be a bounded env:VARIABLE reference")]
+    #[error("gateway admin API key reference must be a bounded env:VARIABLE or file:/absolute/path reference")]
     InvalidAdminSecretReference,
-    #[error("gateway admin API key environment reference is not set")]
+    #[error("gateway admin API key reference names no set variable or readable file")]
     MissingAdminSecret,
     #[error("gateway admin API key does not satisfy the bounded credential policy")]
     InvalidAdminSecret,
@@ -362,17 +360,11 @@ fn optional_metrics_credential_from_env(
     let secret_ref = secret_ref
         .into_string()
         .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecretReference)?;
-    if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
-        return Err(GatewayPerimeterConfigError::InvalidMetricsSecretReference);
-    }
-    let variable = secret_ref
-        .strip_prefix("env:")
-        .filter(|name| valid_env_name(name))
-        .ok_or(GatewayPerimeterConfigError::InvalidMetricsSecretReference)?;
-    let secret = std::env::var_os(variable)
-        .ok_or(GatewayPerimeterConfigError::MissingMetricsSecret)?
-        .into_string()
-        .map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
+    let secret = resolve_secret_ref(&secret_ref).map_err(|error| match error {
+        SecretRefError::Reference => GatewayPerimeterConfigError::InvalidMetricsSecretReference,
+        SecretRefError::Missing => GatewayPerimeterConfigError::MissingMetricsSecret,
+        SecretRefError::Invalid => GatewayPerimeterConfigError::InvalidMetricsSecret,
+    })?;
     validate_secret(&secret).map_err(|_| GatewayPerimeterConfigError::InvalidMetricsSecret)?;
     Ok(Some((secret, secret_ref)))
 }
@@ -386,22 +378,50 @@ fn optional_admin_credential_from_env(
     let secret_ref = secret_ref
         .into_string()
         .map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecretReference)?;
-    if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
-        return Err(GatewayPerimeterConfigError::InvalidAdminSecretReference);
-    }
-    let variable = secret_ref
-        .strip_prefix("env:")
-        .filter(|name| valid_env_name(name))
-        .ok_or(GatewayPerimeterConfigError::InvalidAdminSecretReference)?;
-    let secret = std::env::var_os(variable)
-        .ok_or(GatewayPerimeterConfigError::MissingAdminSecret)?
-        .into_string()
-        .map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecret)?;
+    let secret = resolve_secret_ref(&secret_ref).map_err(|error| match error {
+        SecretRefError::Reference => GatewayPerimeterConfigError::InvalidAdminSecretReference,
+        SecretRefError::Missing => GatewayPerimeterConfigError::MissingAdminSecret,
+        SecretRefError::Invalid => GatewayPerimeterConfigError::InvalidAdminSecret,
+    })?;
     validate_secret(&secret).map_err(|_| GatewayPerimeterConfigError::InvalidAdminSecret)?;
     if constant_time_eq(secret.as_bytes(), inference_key.as_bytes()) {
         return Err(GatewayPerimeterConfigError::ReusedAdminSecret);
     }
     Ok(Some((secret, secret_ref)))
+}
+
+/// Why a secret reference did not yield a secret; each caller maps it to
+/// its own credential's error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretRefError {
+    Reference,
+    Missing,
+    Invalid,
+}
+
+/// The secret a reference names: `env:VARIABLE`, or `file:/absolute/path`
+/// (a Docker or systemd secret; one trailing newline is ignored).
+fn resolve_secret_ref(secret_ref: &str) -> Result<String, SecretRefError> {
+    if secret_ref.is_empty() || secret_ref.len() > MAX_SECRET_REF_BYTES {
+        return Err(SecretRefError::Reference);
+    }
+    if let Some(variable) = secret_ref.strip_prefix("env:") {
+        if !valid_env_name(variable) {
+            return Err(SecretRefError::Reference);
+        }
+        return std::env::var_os(variable)
+            .ok_or(SecretRefError::Missing)?
+            .into_string()
+            .map_err(|_| SecretRefError::Invalid);
+    }
+    let path = file_reference_path(secret_ref).map_err(|_| SecretRefError::Reference)?;
+    let file =
+        read_secret_file(path, MAX_API_KEY_BYTES as u64 + 2).map_err(|error| match error {
+            SecretFileError::Unavailable => SecretRefError::Missing,
+            _ => SecretRefError::Invalid,
+        })?;
+    let secret = String::from_utf8(file.bytes).map_err(|_| SecretRefError::Invalid)?;
+    Ok(secret.trim_end_matches(['\r', '\n']).to_string())
 }
 
 pub fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
@@ -509,6 +529,38 @@ mod tests {
         ] {
             std::env::remove_var(name);
         }
+    }
+
+    #[test]
+    fn secret_references_can_name_a_secret_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "izwi-gateway-secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("izwi_gateway_api_key");
+        std::fs::write(&file, format!("{TEST_API_KEY}\n")).unwrap();
+
+        assert_eq!(
+            resolve_secret_ref(&format!("file:{}", file.display())).as_deref(),
+            Ok(TEST_API_KEY)
+        );
+        assert_eq!(
+            resolve_secret_ref(&format!("file:{}", dir.join("missing").display())),
+            Err(SecretRefError::Missing)
+        );
+        for reference in ["file:relative/key", "vault:gateway", "env:", ""] {
+            assert_eq!(
+                resolve_secret_ref(reference),
+                Err(SecretRefError::Reference),
+                "{reference:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

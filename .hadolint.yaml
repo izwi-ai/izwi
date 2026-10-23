@@ -1,0 +1,6 @@
+# hadolint configuration (CI: the Docker lane in backend-truth.yml).
+ignored:
+  # Pinning apt package versions breaks the build whenever Debian or Ubuntu
+  # ship a security update and drop the old version. The base images are
+  # pinned by digest instead, and Dependabot moves them.
+  - DL3008

@@ -40,8 +40,12 @@ async-trait = "0.1"
 
 # Web framework
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
+# The HTTP listener (izwi-gateway::http_serve): hyper with a timer, which
+# axum::serve does not configure.
+hyper = { version = "1.12", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["server-auto", "server-graceful", "service", "tokio"] }
 tower = "0.5.3"
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "set-header", "trace"] }
 utoipa = { version = "6", features = ["preserve_path_order"] }
 scalar_api_reference = { version = "0.2.2", features = ["axum"] }
 

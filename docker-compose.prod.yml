@@ -1,0 +1,101 @@
+# =============================================================================
+# Izwi Audio - Production overlay for docker-compose.yml
+# =============================================================================
+#
+# Enable it with two lines in .env (see .env.example):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#   COMPOSE_PATH_SEPARATOR=:
+# or pass both files to every command:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# On top of the development defaults it:
+#   - requires IZWI_API_KEY, or IZWI_API_KEY_FILE for a mounted secret (clients
+#     send "Authorization: Bearer <key>"),
+#   - publishes on IZWI_PUBLISH_ADDR (default 127.0.0.1, for a reverse proxy on
+#     this host); set 0.0.0.0 only behind TLS, since the server speaks plain HTTP,
+#   - runs on a read-only root filesystem with a pids limit and an optional
+#     memory limit (IZWI_MEM_LIMIT, e.g. 24g),
+#   - restarts the server and logs JSON.
+#
+# HTTPS: `docker compose --profile tls up -d` adds Caddy on ports 80 and 443,
+# with an automatic certificate for IZWI_DOMAIN. Set IZWI_ALLOWED_HOSTS to the
+# same name. For the CUDA service, set IZWI_TLS_UPSTREAM=izwi-cuda:8080.
+#
+# Needs a Docker Compose v2 release that supports the !override merge tag.
+#
+# =============================================================================
+
+# `docker compose` refuses to start without a key: IZWI_API_KEY, or
+# IZWI_API_KEY_FILE naming a mounted secret file (see the Docker docs).
+x-require-api-key: ${IZWI_API_KEY_FILE:-${IZWI_API_KEY:?set IZWI_API_KEY in .env (generate one with openssl rand -hex 32), or IZWI_API_KEY_FILE}}
+
+x-izwi-production: &izwi-production
+  ports: !override
+    - "${IZWI_PUBLISH_ADDR:-127.0.0.1}:${IZWI_PORT:-8080}:8080"
+  environment:
+    IZWI_LOOPBACK_PUBLISHED: "false"
+    IZWI_API_KEY: ${IZWI_API_KEY:-}
+    IZWI_API_KEY_FILE: ${IZWI_API_KEY_FILE:-}
+    IZWI_LOG_FORMAT: json
+    # The root filesystem is read-only: the speech spool lives on the data
+    # volume (the server clears stale entries at start) and /tmp is small.
+    IZWI_SPEECH_SPOOL_DIR: /app/data/spool
+  read_only: true
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+  # Threads count against the limit: the Tokio blocking pool alone may grow
+  # to 512.
+  pids_limit: 4096
+  mem_limit: ${IZWI_MEM_LIMIT:-0}
+  restart: unless-stopped
+
+services:
+  izwi:
+    <<: *izwi-production
+
+  izwi-cuda:
+    <<: *izwi-production
+
+  # ---------------------------------------------------------------------------
+  # TLS reverse proxy - activated with --profile tls
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine@sha256:24ec7b05bc532c7bb57f727030c5056e257ff7138b4b50460306819ff79362bd
+    container_name: izwi-caddy
+    profiles:
+      - tls
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${IZWI_DOMAIN:-localhost}
+      - --to
+      - ${IZWI_TLS_UPSTREAM:-izwi:8080}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - "no-new-privileges:true"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy-data:
+    name: izwi-caddy-data
+  caddy-config:
+    name: izwi-caddy-config

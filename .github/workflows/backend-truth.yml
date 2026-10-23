@@ -10,7 +10,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - ".dockerignore"
+      - ".hadolint.yaml"
       - "docker-compose.yml"
+      - "docker-compose.prod.yml"
+      - "config/serving/**"
       - "crates/**"
       - "scripts/**"
       - "ui/**"
@@ -26,7 +30,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - ".dockerignore"
+      - ".hadolint.yaml"
       - "docker-compose.yml"
+      - "docker-compose.prod.yml"
+      - "config/serving/**"
       - "crates/**"
       - "scripts/**"
       - "ui/**"
@@ -47,7 +55,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Linux dependencies for Tauri
         run: |
@@ -65,12 +75,12 @@ jobs:
         # `-D warnings` with no repo change. Bump deliberately, together
         # with the workspace rust-version, the Dockerfile builders and the
         # CUDA compile lanes, which all use this same version.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
         with:
           components: rustfmt, clippy
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run repository hygiene gates
         run: scripts/ci/check-backend-truth.sh hygiene
@@ -82,7 +92,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -93,10 +105,10 @@ jobs:
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -111,7 +123,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -122,10 +136,10 @@ jobs:
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -140,14 +154,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -195,7 +211,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -206,10 +224,10 @@ jobs:
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -240,7 +258,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # The workspace .cargo/config.toml sets a python3 rustc-wrapper; the
       # NVIDIA base image ships no python interpreter, so install one or
@@ -285,18 +305,20 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Run required native and FlashAttention device certification
         run: scripts/ci/check-backend-truth.sh cargo-cuda-device
 
       - name: Retain numerical certification records
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kv-cache-cuda-certification-${{ github.sha }}
           path: target/kv-cache-cuda-certification.jsonl
@@ -322,14 +344,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         # Pinned like the first Rust toolchain step in this file.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -340,11 +364,14 @@ jobs:
   docker-cpu:
     name: Docker Build (CPU)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Builds the CPU and gateway images, runs them, and scans them.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Run CPU Docker build checks
         env:
@@ -362,7 +389,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Run CUDA Docker build checks
         run: scripts/ci/check-backend-truth.sh docker-cuda

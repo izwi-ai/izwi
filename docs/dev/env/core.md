@@ -180,6 +180,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_NEMOTRON_REALTIME_MAX_SECONDS` | integer | `3600` | first use | Caps a Nemotron realtime ASR session length in seconds and sizes its reservation; a non-integer value is a config error. |
 | `IZWI_NO_UI` | flag | false (UI enabled) | startup | Disables serving the web UI when true (inverted into ui_enabled). |
 | `IZWI_NUM_THREADS` | integer | min(available cores, 8) (4 if unknown) | startup | Number of compute threads (0 or invalid ignored; floor 1). |
+| `IZWI_OFFLINE` | flag | `false` | startup | Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates. |
 | `IZWI_PARAKEET_ASR_DTYPE` | choice | F16 encoder projections on Metal, else F32 | model load | Parakeet dtype override: on Metal f32 keeps every weight F32 and f16 stores encoder projections in F16. |
 | `IZWI_PARAKEET_METAL_CONV1D_BN_SWISH` | flag | true (Metal only) | first use | Enables the fused Metal depthwise Conv1d + bias + Swish kernel for Parakeet ASR conformer convs. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Parakeet ASR. |

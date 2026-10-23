@@ -146,8 +146,22 @@ The `Backend Truth` and `Release` workflows are the pre-release guardrails for t
 1. CPU cargo checks run separately from CUDA cargo checks.
 2. CPU Docker builds run separately from CUDA Docker builds.
 3. Linux and Windows release jobs verify native artifacts are CPU-only, reject CUDA runtime payloads, and enforce a conservative per-file size cap.
-4. Docker build jobs smoke-run the final CPU image and audit the CUDA image's dynamic dependencies, allowing `libcuda.so.1` to come from the NVIDIA container runtime on GPU hosts.
-5. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, end-to-end CUDA execution remains a manual release check on an NVIDIA Linux host.
+4. The CPU Docker job lints the Dockerfile (`docker build --check`, hadolint), validates every compose file, builds the CPU and gateway images, and runs the CPU image: it must refuse a 0.0.0.0 bind without a key, serve the development mode with its Host check, require the key in production mode on a read-only root filesystem, run as uid 1000, and exit 0 on SIGTERM. The CUDA Docker job audits the CUDA image's dynamic dependencies, allowing `libcuda.so.1` to come from the NVIDIA container runtime on GPU hosts. Both scan their images with Grype and fail on fixable critical vulnerabilities.
+5. The self-hosted NVIDIA runner covers CUDA cargo and model evidence; the CUDA image itself is not yet run on a GPU in CI, so end-to-end CUDA execution of the image remains a manual release check on an NVIDIA Linux host.
+
+## Container images
+
+Each `v*` tag also publishes images to the GitHub Container Registry (`release.yml`, jobs `docker-build` and `docker-publish`):
+
+| Image | Platforms |
+|-------|-----------|
+| `ghcr.io/izwi-ai/izwi:<version>` (also `<major>.<minor>` and `latest` for stable tags) | linux/amd64, linux/arm64 |
+| `ghcr.io/izwi-ai/izwi:<version>-cuda` | linux/amd64 |
+| `ghcr.io/izwi-ai/izwi-gateway:<version>` | linux/amd64, linux/arm64 |
+
+Every platform builds on its own runner (arm64 natively) with SLSA provenance and an SBOM. The joined multi-platform image is signed with cosign (keyless, through the workflow's OIDC identity) and gets a GitHub build-provenance attestation. The release notes carry the `cosign verify` and `gh attestation verify` commands.
+
+The first publish creates the packages as private. Make `izwi` and `izwi-gateway` public once under the organization's **Packages** settings, and link them to this repository.
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.
 

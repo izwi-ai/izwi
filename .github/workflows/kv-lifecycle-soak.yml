@@ -30,17 +30,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         # Pinned: a new stable release can add clippy lints that fail
         # `-D warnings` with no repo change. Bump deliberately, together
         # with the workspace rust-version, the Dockerfile builders and the
         # CUDA compile lanes, which all use this same version.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run managed KV lifecycle soak
         run: scripts/ci/run-kv-lifecycle-soak.sh --profile "${{ inputs.profile || 'nightly' }}"

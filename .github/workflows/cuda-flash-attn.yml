@@ -26,7 +26,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # The workspace .cargo/config.toml sets a python3 rustc-wrapper; the
       # NVIDIA base image ships no python interpreter, so install one or
@@ -64,7 +66,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Run CUDA FlashAttention Docker build checks
         run: scripts/ci/check-backend-truth.sh docker-cuda

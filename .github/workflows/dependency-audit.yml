@@ -39,7 +39,7 @@ jobs:
     steps:
       - name: Setup Rust toolchain
         # Pinned like the Backend Truth lanes.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       # Before checkout, so the workspace .cargo/config.toml (a python
       # rustc-wrapper) does not apply to this build.
@@ -47,7 +47,9 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Audit Cargo.lock against the RustSec advisory database
         # Fails on vulnerabilities. Accepted advisories, each with its

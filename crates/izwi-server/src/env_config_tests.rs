@@ -142,6 +142,8 @@ fn tuning_with(pairs: &[(&str, &str)]) -> anyhow::Result<ServerTuning> {
 fn unset_variables_keep_the_previous_defaults() {
     let tuning = tuning_with(&[]).unwrap();
     assert!(!tuning.allow_unauthenticated_network);
+    assert_eq!(tuning.local_exposure, LocalExposure::default());
+    assert!(tuning.public_probe_details);
     assert_eq!(
         tuning.openai_compat_profile,
         OpenAiCompatibilityProfile::Strict
@@ -173,18 +175,48 @@ fn booleans_use_the_shared_vocabulary_and_fail_closed() {
         ("IZWI_FISH_LONG_FORM_ENABLED", "no"),
         ("IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED", "ON"),
         ("IZWI_ALLOW_UNAUTHENTICATED_NETWORK", "yes"),
+        ("IZWI_LOOPBACK_PUBLISHED", "1"),
     ])
     .unwrap();
     assert!(!tuning.fish_long_form_enabled);
     assert!(tuning.tts_opaque_final_wav_enabled);
     assert!(tuning.allow_unauthenticated_network);
+    assert!(tuning.local_exposure.loopback_published);
     for name in [
         "IZWI_ALLOW_UNAUTHENTICATED_NETWORK",
+        "IZWI_LOOPBACK_PUBLISHED",
         "IZWI_FISH_LONG_FORM_ENABLED",
         "IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED",
     ] {
         let error = tuning_with(&[(name, "fasle")]).unwrap_err().to_string();
         assert!(error.contains(name), "{error}");
+    }
+}
+
+#[test]
+fn a_keyed_server_keeps_probe_details_private() {
+    for name in ["IZWI_API_KEY", "IZWI_API_KEY_FILE"] {
+        assert!(!tuning_with(&[(name, "set")]).unwrap().public_probe_details);
+        assert!(tuning_with(&[(name, "")]).unwrap().public_probe_details);
+    }
+}
+
+#[test]
+fn allowed_hosts_are_lower_cased_names_without_ports() {
+    let tuning = tuning_with(&[(
+        "IZWI_ALLOWED_HOSTS",
+        " Izwi , izwi.example.com:443,,[::1]:8080 ",
+    )])
+    .unwrap();
+    assert_eq!(
+        tuning.local_exposure.allowed_hosts,
+        ["izwi", "izwi.example.com", "::1"]
+    );
+    for value in ["*", "*.example.com", "https://izwi.example.com", "a b"] {
+        let error = tuning_with(&[("IZWI_ALLOWED_HOSTS", value)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IZWI_ALLOWED_HOSTS"), "{value}: {error}");
     }
 }
 

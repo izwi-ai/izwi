@@ -33,7 +33,7 @@ If another page says something different, this page should win.
 | **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, and debugging outside Docker. Requires a compatible NVIDIA driver/toolkit environment. |
 | **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and custom validation. Native Windows release artifacts remain CPU-only. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
-| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Shipped CUDA binary path. The final image is based on `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
+| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Shipped CUDA binary path. The final image is based on `nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04` and needs NVIDIA driver 580 or newer. It targets compute capability 8.0 (Ampere) and newer; set `CUDA_COMPUTE_CAP` at build time for another architecture. |
 
 ---
 
@@ -46,7 +46,7 @@ If another page says something different, this page should win.
 | **Single-host Linux server on NVIDIA GPU** | Supported / Preview by artifact | Use the Docker CUDA image/profile, or build from source with `--features cuda`. Native Linux release artifacts are CPU-only. |
 | **Windows desktop evaluation** | Stable CPU | Native Windows release artifacts are CPU-only. CUDA on Windows is source-build preview only. |
 | **Docker Compose on CPU** | Stable | Use the default `izwi` service. |
-| **Docker Compose on NVIDIA GPU** | Preview | Use `IZWI_API_KEY=<key> docker compose --profile cuda up -d izwi-cuda`; name the `izwi-cuda` service, because the profile otherwise also starts the CPU `izwi` service on the same port. The `izwi-cuda` service binds `0.0.0.0` and therefore requires an API key, and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
+| **Docker Compose on NVIDIA GPU** | Preview | Use `docker compose --profile cuda up -d izwi-cuda`; name the `izwi-cuda` service, because the profile otherwise also starts the CPU `izwi` service on the same port. The default setup is for development (published on `127.0.0.1`, no API key); the production overlay requires a key. See [Docker](/installation/docker). The image targets compute capability 8.0 and newer; set `CUDA_COMPUTE_CAP` at build time for another architecture. |
 | **Kubernetes / Helm / multi-node production orchestration** | Not yet supported | Not published in OSS today. |
 
 ---
@@ -87,7 +87,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - Linux and Windows GitHub Release artifacts are CPU-only and must not contain CUDA runtime libraries or private CUDA binaries.
 - Release installers do not replace the host NVIDIA driver. CUDA acceleration requires a compatible NVIDIA driver and CUDA-capable GPU.
 - Source builds still require the CUDA toolkit and remain useful for development or fallback validation.
-- The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
+- The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts. It targets compute capability 8.0 (Ampere) and newer unless built with another `CUDA_COMPUTE_CAP`.
 - On macOS 15+, the recommended GPU path is Metal, not CUDA. macOS 12-14 are CPU-only.
 
 ### Qwen3.8 CUDA weight residency
@@ -340,7 +340,7 @@ Use the following expectations when validating a host:
 - **Apple Silicon, macOS 15+:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
 - **macOS 12-14:** run with `--backend cpu`; `auto` and explicit `metal` requests fall back to CPU.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Docker CUDA on NVIDIA Linux hosts:** run `IZWI_API_KEY=<key> docker compose --profile cuda up -d izwi-cuda`, then confirm the container selects CUDA through `/v1/health` (with `Authorization: Bearer <key>`) or `izwi status --detailed` from a client environment that exports the same `IZWI_API_KEY`. Eligible Candle FlashAttention and Qwen3/Qwen3.5 RoPE CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
+- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up -d izwi-cuda`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed`. With the production overlay, send `Authorization: Bearer <key>` (or export the same `IZWI_API_KEY` for the CLI). Eligible Candle FlashAttention and Qwen3/Qwen3.5 RoPE CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
 - **Linux/Windows source build for CUDA:** build with `cargo build --release -p izwi-cli -p izwi-server --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
 
 ---

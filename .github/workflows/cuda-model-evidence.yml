@@ -43,14 +43,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         # Pinned: a new stable release can add clippy lints that fail
         # `-D warnings` with no repo change. Bump deliberately, together
         # with the workspace rust-version, the Dockerfile builders and the
         # CUDA compile lanes, which all use this same version.
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
 
       - name: Require preprovisioned model storage
         run: |
@@ -134,7 +136,7 @@ jobs:
 
       - name: Retain CUDA model evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cuda-model-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: target/cuda-model-evidence

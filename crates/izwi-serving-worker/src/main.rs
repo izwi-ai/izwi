@@ -54,6 +54,9 @@ fn init_tracing(env: &EnvSnapshot) -> anyhow::Result<()> {
 /// before any other thread exists: the Tokio runtime and the OTLP exporter
 /// start after it.
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        return healthcheck(&env_config::capture());
+    }
     // A worker started without the serving allocator settings (macOS: not
     // by the supervisor) restarts itself with them; see izwi_env::allocator.
     if let Err(error) = izwi_env::reexec_with_serving_allocator_env() {
@@ -72,6 +75,44 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("start the Tokio runtime")?
         .block_on(run(env, process))
+}
+
+/// `izwi-serving-worker healthcheck`, the container HEALTHCHECK: GET the
+/// status route from this worker's own plaintext listener with the
+/// credentials the gateway presents. They come from the environment, so the
+/// bearer token never appears in argv.
+fn healthcheck(env: &EnvSnapshot) -> anyhow::Result<()> {
+    use izwi_serving_protocol::health_probe::{probe_address, probe_http, HEALTH_PROBE_TIMEOUT};
+    if env
+        .get(WORKER_TLS_CERT_REF_ENV)?
+        .is_some_and(|reference| !reference.trim().is_empty())
+    {
+        bail!("healthcheck probes plaintext workers only; this worker serves TLS");
+    }
+    let bind = env
+        .get_or("IZWI_WORKER_BIND", "127.0.0.1:9470")?
+        .parse::<SocketAddr>()
+        .context("parse IZWI_WORKER_BIND")?;
+    let addr = probe_address(&bind.ip().to_string(), bind.port())?;
+    let authorization = format!("Bearer {}", env.required("IZWI_WORKER_BEARER_TOKEN")?);
+    let status = probe_http(
+        addr,
+        WORKER_STATUS_PATH,
+        &[
+            ("authorization", &authorization),
+            (
+                SERVICE_CREDENTIAL_ID_HEADER,
+                env.required("IZWI_WORKER_CREDENTIAL_ID")?,
+            ),
+        ],
+        HEALTH_PROBE_TIMEOUT,
+    )
+    .with_context(|| format!("GET http://{addr}{WORKER_STATUS_PATH} failed"))?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "GET http://{addr}{WORKER_STATUS_PATH} returned {status}"
+    );
+    Ok(())
 }
 
 async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<()> {

@@ -1,7 +1,7 @@
 //! The `izwi-server` command line: arguments, roles and how they resolve to the runtime
 //! configuration.
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use izwi_core::backends::BackendPreference;
 use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 pub(crate) use izwi_gateway::cli::{BackendArg, GatewayArgs, GatewayTopology};
@@ -30,7 +30,8 @@ pub(crate) struct ServerArgs {
     pub(crate) performance: Vec<izwi_core::PerformanceConfigOverrides>,
 
     /// Host to bind to (default 127.0.0.1). A non-loopback bind on the local
-    /// role requires IZWI_API_KEY unless --allow-unauthenticated-network.
+    /// role requires IZWI_API_KEY unless IZWI_LOOPBACK_PUBLISHED or
+    /// --allow-unauthenticated-network.
     #[arg(short = 'H', long)]
     pub(crate) host: Option<String>,
 
@@ -77,6 +78,19 @@ pub(crate) struct ServerArgs {
     /// `izwi-gateway` binary takes the same ones.
     #[command(flatten)]
     pub(crate) gateway: GatewayArgs,
+
+    #[command(subcommand)]
+    pub(crate) command: Option<ServerCommand>,
+}
+
+/// One-shot commands run instead of serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub(crate) enum ServerCommand {
+    /// Exit 0 when this server's listener answers /readyz with 2xx (the
+    /// container HEALTHCHECK). It finds the listener through IZWI_HOST,
+    /// IZWI_PORT and the config file, as the server does; flags given to the
+    /// server's own command line are not visible to it.
+    Healthcheck,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

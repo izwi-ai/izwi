@@ -61,6 +61,13 @@ services:
     container_name: izwi-worker-cpu
     restart: unless-stopped
     command: ["izwi-serving-worker"]
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # Lets in-flight inference finish before SIGKILL (Compose's default is 10 s).
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -86,7 +93,8 @@ services:
       - IZWI_WORKER_STREAMING=true
       - IZWI_MODELS_DIR=/app/models
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$IZWI_WORKER_BEARER_TOKEN\" -H \"x-izwi-service-credential-id: $$IZWI_WORKER_CREDENTIAL_ID\" http://127.0.0.1:9470/internal/v1/status"]
+      # Reads the bearer token from the environment, never argv.
+      test: ["CMD", "izwi-serving-worker", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -105,6 +113,11 @@ services:
     container_name: izwi-gateway
     restart: unless-stopped
     network_mode: "service:worker"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     # Above IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS (Compose's default is 10 s).
     stop_grace_period: 30s
     environment:
@@ -114,14 +127,14 @@ services:
       - IZWI_GATEWAY_WORKER_CREDENTIAL_ID=gateway-worker-key-1
       - IZWI_GATEWAY_WORKER_BEARER_TOKEN=${WORKER_BEARER_TOKEN:?set WORKER_BEARER_TOKEN}
       - IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1
+      # Set here rather than as --host/--port, so the healthcheck finds the
+      # same listener.
+      - IZWI_HOST=0.0.0.0
+      - IZWI_PORT=8080
       - IZWI_GATEWAY_PRESTOP_SECS=0
       - IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
     command:
       - "izwi-gateway"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8080"
       - "--public-model"
       - "LFM2.5-1.2B-Instruct-GGUF"
       - "--gateway-worker-approval"
@@ -132,7 +145,7 @@ services:
       worker:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      test: ["CMD", "izwi-gateway", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 3

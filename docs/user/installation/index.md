@@ -8,7 +8,7 @@ Before choosing an install path, check the [Runtime Support Matrix](/support-mat
 - GitHub Release artifacts are not the same thing as CUDA source builds.
 - Linux and Windows GitHub Release artifacts are CPU-only and do not bundle CUDA runtime libraries.
 - CUDA acceleration requires a compatible NVIDIA driver and GPU; source builds still require the CUDA toolkit.
-- The Docker CUDA profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
+- The Docker CUDA profile is the CUDA distribution path for NVIDIA Linux hosts; see [Docker](/installation/docker).
 
 ---
 
@@ -19,6 +19,7 @@ Before choosing an install path, check the [Runtime Support Matrix](/support-mat
 | **macOS** | [macOS Installation](/installation/macos) |
 | **Linux** | [Linux Installation](/installation/linux) |
 | **Windows** | [Windows Installation](/installation/windows) |
+| **Docker** | [Docker](/installation/docker) |
 | **From Source** | [Build from Source](/installation/from-source) |
 
 ---

@@ -50,17 +50,17 @@ pub static GATEWAY_ENV: &[EnvVar] = &[
     var(
         "IZWI_GATEWAY_API_KEY_REF",
         "env:IZWI_GATEWAY_API_KEY",
-        "`env:VARIABLE` naming the public inference API key (16-4096 printable bytes).",
+        "`env:VARIABLE` or `file:/absolute/path` naming the public inference API key (16-4096 printable bytes).",
     ),
     var(
         "IZWI_GATEWAY_METRICS_API_KEY_REF",
         "",
-        "`env:VARIABLE` naming the /metrics key; unset turns /metrics off. Must differ from the inference key.",
+        "`env:VARIABLE` or `file:/absolute/path` naming the /metrics key; unset turns /metrics off. Must differ from the inference key.",
     ),
     var(
         "IZWI_GATEWAY_ADMIN_API_KEY_REF",
         "",
-        "`env:VARIABLE` naming the admin API key; unset turns the admin API off. Must differ from the inference key.",
+        "`env:VARIABLE` or `file:/absolute/path` naming the admin API key; unset turns the admin API off. Must differ from the inference key.",
     ),
     var(
         "IZWI_GATEWAY_API_PRINCIPAL_ID",
