@@ -118,6 +118,7 @@ impl RuntimeService {
         audio_input: AsrAudioInput<'_>,
         language: Option<&str>,
         prompt: Option<&str>,
+        task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
@@ -125,6 +126,7 @@ impl RuntimeService {
         native_word_timestamps: bool,
     ) -> Result<AdmittedEngineRequest> {
         validate_asr_language(variant, language)?;
+        validate_asr_task(variant, language, prompt, &task)?;
         let audio_bytes = match audio_input {
             AsrAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
@@ -144,6 +146,7 @@ impl RuntimeService {
             .checked_add(language.map(str::len).unwrap_or_default())
             .and_then(|bytes| bytes.checked_add(prompt.map(str::len).unwrap_or_default()))
             .and_then(|bytes| bytes.checked_add(correlation_id.map(str::len).unwrap_or_default()))
+            .and_then(|bytes| bytes.checked_add(task.retained_bytes()))
             .ok_or_else(|| Error::Overloaded("ASR preparation input overflowed".to_string()))?;
         self.prepare_engine_request_blocking_with_input(
             variant,
@@ -201,6 +204,7 @@ impl RuntimeService {
                     )?,
                 }
                 .with_prompt(prompt)
+                .with_task(task)
                 .with_native_word_timestamps(native_word_timestamps);
                 let mut request = runtime_request.into_engine_request();
                 apply_asr_max_tokens(&mut request, variant, max_tokens);
@@ -279,6 +283,7 @@ impl RuntimeService {
                 AsrAudioInput::Base64(audio_base64),
                 language,
                 prompt,
+                AsrTaskOptions::default(),
                 max_tokens,
                 correlation_id,
                 RuntimeRequestContext::default(),
@@ -292,7 +297,7 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            language: asr_response_language(language, None, output.asr_diagnostics.as_ref()),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -381,6 +386,7 @@ impl RuntimeService {
                 AsrAudioInput::Base64(audio_base64),
                 language,
                 prompt,
+                AsrTaskOptions::default(),
                 max_tokens,
                 correlation_id,
                 RuntimeRequestContext::default(),
@@ -388,7 +394,7 @@ impl RuntimeService {
                 false,
             )
             .await?;
-        self.stream_admitted_asr_request(admitted, variant, true, language, on_delta, |_| {})
+        self.stream_admitted_asr_request(admitted, variant, true, language, None, on_delta, |_| {})
             .await
     }
 
@@ -425,6 +431,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             prompt,
+            AsrTaskOptions::default(),
             max_tokens,
             correlation_id,
             RuntimeRequestContext::default(),
@@ -440,12 +447,14 @@ impl RuntimeService {
         audio_bytes: &[u8],
         language: Option<&str>,
         prompt: Option<&str>,
+        task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
+            validate_asr_task(variant, language, prompt, &task)?;
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
                 .asr_transcribe_audio_chat(
@@ -462,12 +471,14 @@ impl RuntimeService {
                 .await;
         }
 
+        let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
+                task,
                 max_tokens,
                 correlation_id,
                 runtime_context,
@@ -481,7 +492,11 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            language: asr_response_language(
+                language,
+                translate_to.as_deref(),
+                output.asr_diagnostics.as_ref(),
+            ),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -561,6 +576,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             prompt,
+            AsrTaskOptions::default(),
             max_tokens,
             correlation_id,
             on_delta,
@@ -578,6 +594,7 @@ impl RuntimeService {
         audio_bytes: &[u8],
         language: Option<&str>,
         prompt: Option<&str>,
+        task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         on_delta: F,
@@ -590,6 +607,7 @@ impl RuntimeService {
         P: FnMut(AsrProgress) + Send + 'static,
     {
         if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
+            validate_asr_task(variant, language, prompt, &task)?;
             self.observe_broker_capability_request(
                 CapabilityKind::Asr,
                 Some(variant),
@@ -610,12 +628,14 @@ impl RuntimeService {
                 .await;
         }
 
+        let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
+                task,
                 max_tokens,
                 correlation_id,
                 runtime_context,
@@ -628,6 +648,7 @@ impl RuntimeService {
             variant,
             broker_streaming_required,
             language,
+            translate_to.as_deref(),
             on_delta,
             on_progress,
         )
@@ -642,12 +663,14 @@ impl RuntimeService {
     /// transport still carries the deltas its decode emits (retained per-step
     /// text, chunk partials). Either way the deltas end with whatever part of
     /// the final transcript they did not cover, so they concatenate to it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn stream_admitted_asr_request<F, P>(
         &self,
         admitted: AdmittedEngineRequest,
         variant: ModelVariant,
         native_stream_requested: bool,
         language: Option<&str>,
+        translate_to: Option<&str>,
         mut on_delta: F,
         mut on_progress: P,
     ) -> Result<AsrTranscription>
@@ -684,7 +707,11 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            language: asr_response_language(
+                language,
+                translate_to,
+                output.asr_diagnostics.as_ref(),
+            ),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -861,6 +888,7 @@ impl RuntimeService {
             model_id,
             language,
             prompt,
+            AsrTaskOptions::default(),
             max_tokens,
             correlation_id,
             runtime_context,
@@ -869,10 +897,12 @@ impl RuntimeService {
         .await
     }
 
-    /// Like [`Self::asr_transcribe_bytes_with_runtime_context`], optionally
-    /// asking for model-native word timestamps: a model that emits them
-    /// (Granite Speech Plus) returns them as `timestamp_words` in its
-    /// diagnostics; any other model transcribes as usual.
+    /// Like [`Self::asr_transcribe_bytes_with_runtime_context`], with a
+    /// translation target or keywords (`task`; a model that cannot honour
+    /// them rejects the request) and optionally asking for model-native word
+    /// timestamps: a model that emits them (Granite Speech Plus) returns them
+    /// as `timestamp_words` in its diagnostics; any other model transcribes
+    /// as usual.
     #[allow(clippy::too_many_arguments)]
     pub async fn asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
         &self,
@@ -880,6 +910,7 @@ impl RuntimeService {
         model_id: Option<&str>,
         language: Option<&str>,
         prompt: Option<&str>,
+        task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
@@ -891,6 +922,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             prompt,
+            task,
             max_tokens,
             correlation_id,
             runtime_context,
@@ -1086,6 +1118,8 @@ impl RuntimeService {
         .await
     }
 
+    /// Streams a transcription (or, with `task.translate_to`, a translation)
+    /// as text deltas.
     #[allow(clippy::too_many_arguments)]
     pub async fn asr_transcribe_streaming_bytes_with_runtime_context<F>(
         &self,
@@ -1093,6 +1127,7 @@ impl RuntimeService {
         model_id: Option<&str>,
         language: Option<&str>,
         prompt: Option<&str>,
+        task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
@@ -1107,6 +1142,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             prompt,
+            task,
             max_tokens,
             correlation_id,
             on_delta,
@@ -1166,6 +1202,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             None,
+            AsrTaskOptions::default(),
             None,
             correlation_id,
             on_delta,
@@ -1195,6 +1232,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             None,
+            AsrTaskOptions::default(),
             None,
             correlation_id,
             on_delta,
@@ -1205,12 +1243,15 @@ impl RuntimeService {
         .await
     }
 
+    /// Transcribes (or, with `task.translate_to`, translates) with progress
+    /// reports; the transcription jobs' path.
     #[allow(clippy::too_many_arguments)]
     pub async fn asr_transcribe_bytes_with_progress_and_runtime_context<F, P>(
         &self,
         audio_bytes: &[u8],
         model_id: Option<&str>,
         language: Option<&str>,
+        task: AsrTaskOptions,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         on_delta: F,
@@ -1226,6 +1267,7 @@ impl RuntimeService {
             audio_bytes,
             language,
             None,
+            task,
             None,
             correlation_id,
             on_delta,

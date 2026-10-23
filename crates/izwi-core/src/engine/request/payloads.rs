@@ -213,6 +213,7 @@ impl EngineCoreRequest {
         self.asr_language_for_execution().hash(&mut hasher);
         self.asr_prompt_for_execution().hash(&mut hasher);
         self.asr_native_word_timestamps.hash(&mut hasher);
+        self.asr_task.hash(&mut hasher);
         hasher.finish()
     }
 

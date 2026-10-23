@@ -543,6 +543,20 @@ pub(super) fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -
     ] {
         add_optional_string_capacity(&mut total, value, label)?;
     }
+    add_optional_string_capacity(
+        &mut total,
+        request.asr_task.translate_to.as_ref(),
+        "request ASR translation target",
+    )?;
+    add_retained_allocation(
+        &mut total,
+        request.asr_task.keywords.capacity(),
+        std::mem::size_of::<String>(),
+        "request ASR keywords",
+    )?;
+    for keyword in &request.asr_task.keywords {
+        add_owned_string_capacity(&mut total, keyword, "request ASR keyword")?;
+    }
     add_generation_param_allocations(&mut total, &request.params)?;
     add_retained_allocation(
         &mut total,

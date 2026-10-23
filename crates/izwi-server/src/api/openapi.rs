@@ -2229,6 +2229,14 @@ pub struct TranscriptionMultipartRequest {
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
+    /// Izwi extension: translate the speech into this language instead of
+    /// transcribing it. Models without speech translation reject it (400);
+    /// word timestamps are not available for a translation.
+    pub target_language: Option<String>,
+    /// Izwi extension: terms to bias recognition toward. Repeat the field or
+    /// separate terms with commas or newlines. Models without keyword
+    /// biasing reject it (400).
+    pub keywords: Option<Vec<String>>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2245,6 +2253,14 @@ pub struct TranscriptionJsonRequest {
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
+    /// Izwi extension: translate the speech into this language instead of
+    /// transcribing it. Models without speech translation reject it (400);
+    /// word timestamps are not available for a translation.
+    pub target_language: Option<String>,
+    /// Izwi extension: terms to bias recognition toward, as an array (or
+    /// one comma- or newline-separated string). Models without keyword
+    /// biasing reject it (400).
+    pub keywords: Option<Vec<String>>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2618,7 +2634,13 @@ mod tests {
         let schemas = openapi["components"]["schemas"]
             .as_object()
             .expect("schemas should exist");
-        for field in ["prompt", "max_tokens", "temperature"] {
+        for field in [
+            "prompt",
+            "target_language",
+            "keywords",
+            "max_tokens",
+            "temperature",
+        ] {
             assert!(
                 schemas["TranscriptionJsonRequest"]["properties"]
                     .get(field)

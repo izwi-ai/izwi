@@ -2903,6 +2903,23 @@ fn fish_streaming_output_admission_is_bounded_independently_of_length() {
 }
 
 #[test]
+fn asr_task_options_count_toward_the_retained_request() {
+    let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+    let before = retained_engine_request_input_bytes(&request).unwrap();
+    let task = crate::engine::AsrTaskOptions::new(
+        Some("English".to_string()),
+        vec!["Izwi".to_string(), "Granite".to_string()],
+    );
+    let task_bytes = task.translate_to.as_ref().unwrap().capacity()
+        + task.keywords.capacity() * std::mem::size_of::<String>()
+        + task.keywords.iter().map(String::capacity).sum::<usize>();
+    let request = request.with_asr_task(task);
+    let after = retained_engine_request_input_bytes(&request).unwrap();
+    assert_eq!(after - before, task_bytes);
+    assert_eq!(request.asr_task.retained_bytes(), task_bytes);
+}
+
+#[test]
 fn direct_qwen_asr_job_accounts_the_prepared_audio_artifact_exactly() {
     let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
     let backend = runtime.backend_context().backend_kind;

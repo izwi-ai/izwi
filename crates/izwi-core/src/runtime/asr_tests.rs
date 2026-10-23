@@ -1158,16 +1158,65 @@ fn single_window_and_chunked_transcripts_get_the_same_cleanup() {
 fn asr_response_language_prefers_the_hint_then_the_detected_language() {
     let detected = serde_json::json!({ "language": "de" });
     assert_eq!(
-        asr_response_language(Some("en"), Some(&detected)).as_deref(),
+        asr_response_language(Some("en"), None, Some(&detected)).as_deref(),
         Some("en")
     );
     assert_eq!(
-        asr_response_language(None, Some(&detected)).as_deref(),
+        asr_response_language(None, None, Some(&detected)).as_deref(),
         Some("de")
     );
-    assert_eq!(asr_response_language(None, None), None);
+    assert_eq!(asr_response_language(None, None, None), None);
     let undetected = serde_json::json!({ "language": null });
-    assert_eq!(asr_response_language(None, Some(&undetected)), None);
+    assert_eq!(asr_response_language(None, None, Some(&undetected)), None);
+    // A translation is in its target language.
+    assert_eq!(
+        asr_response_language(Some("fr"), Some("English"), Some(&detected)).as_deref(),
+        Some("English")
+    );
+}
+
+#[test]
+fn only_granite_speech_5_takes_a_translation_target_or_keywords() {
+    let granite5 = ModelVariant::GraniteSpeech502B;
+    let translate = AsrTaskOptions::new(Some("English".to_string()), Vec::new());
+    let keywords = AsrTaskOptions::new(None, vec!["Izwi".to_string()]);
+
+    validate_asr_task(granite5, Some("fr"), None, &translate).unwrap();
+    validate_asr_task(granite5, None, None, &keywords).unwrap();
+    validate_asr_task(granite5, None, None, &AsrTaskOptions::default()).unwrap();
+    for variant in [
+        ModelVariant::WhisperLargeV3Turbo,
+        ModelVariant::GraniteSpeech412B,
+    ] {
+        validate_asr_task(variant, None, None, &AsrTaskOptions::default()).unwrap();
+        assert!(matches!(
+            validate_asr_task(variant, None, None, &translate),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_asr_task(variant, None, None, &keywords),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    // 5.0's own limits: an unsupported pair and an oversized keyword.
+    assert!(matches!(
+        validate_asr_task(
+            granite5,
+            Some("ja"),
+            None,
+            &AsrTaskOptions::new(Some("German".to_string()), Vec::new()),
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        validate_asr_task(
+            granite5,
+            None,
+            None,
+            &AsrTaskOptions::new(None, vec!["x".repeat(129)]),
+        ),
+        Err(Error::InvalidInput(_))
+    ));
 }
 
 #[test]

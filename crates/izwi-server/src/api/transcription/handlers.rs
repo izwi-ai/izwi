@@ -1490,6 +1490,7 @@ where
             audio_bytes,
             model_id,
             requested_language,
+            izwi_core::AsrTaskOptions::default(),
             correlation_id,
             runtime_context,
             on_delta,

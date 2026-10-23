@@ -312,6 +312,10 @@
           "forced_alignment": {
             "type": "boolean"
           },
+          "keyword_biasing": {
+            "description": "Transcription requests may bias recognition with `keywords`.",
+            "type": "boolean"
+          },
           "openai_audio_speech": {
             "type": "boolean"
           },
@@ -331,6 +335,10 @@
             "type": "boolean"
           },
           "speech_to_text_realtime": {
+            "type": "boolean"
+          },
+          "speech_translation": {
+            "description": "Transcription requests may ask for a translation (`target_language`).",
             "type": "boolean"
           },
           "studio_projects": {
@@ -368,6 +376,8 @@
           "openai_audio_transcriptions",
           "speech_to_text_jobs",
           "speech_to_text_realtime",
+          "speech_translation",
+          "keyword_biasing",
           "diarization_records",
           "text_to_speech_records",
           "voice_design_records",
@@ -2049,6 +2059,16 @@
           "audio_base64": {
             "type": "string"
           },
+          "keywords": {
+            "description": "Izwi extension: terms to bias recognition toward, as an array (or\none comma- or newline-separated string). Models without keyword\nbiasing reject it (400).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "language": {
             "type": [
               "string",
@@ -2084,6 +2104,13 @@
           "stream": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "target_language": {
+            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2127,6 +2154,16 @@
             "format": "binary",
             "type": "string"
           },
+          "keywords": {
+            "description": "Izwi extension: terms to bias recognition toward. Repeat the field or\nseparate terms with commas or newlines. Models without keyword\nbiasing reject it (400).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "language": {
             "type": [
               "string",
@@ -2162,6 +2199,13 @@
           "stream": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "target_language": {
+            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation.",
+            "type": [
+              "string",
               "null"
             ]
           },

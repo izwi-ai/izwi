@@ -44,7 +44,9 @@ pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
     granite_speech5_asr_planned_max_tokens, invocation_decode_room,
 };
-pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
+pub use asr::{
+    validate_asr_language, validate_asr_task, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream,
+};
 pub use chat::AdmittedChatStream;
 pub use chat_request::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,

@@ -157,6 +157,10 @@ pub struct AdminModelRouteCapabilities {
     pub openai_audio_transcriptions: bool,
     pub speech_to_text_jobs: bool,
     pub speech_to_text_realtime: bool,
+    /// Transcription requests may ask for a translation (`target_language`).
+    pub speech_translation: bool,
+    /// Transcription requests may bias recognition with `keywords`.
+    pub keyword_biasing: bool,
     pub diarization_records: bool,
     pub text_to_speech_records: bool,
     pub voice_design_records: bool,
@@ -356,6 +360,8 @@ impl AdminModelRouteCapabilities {
                 || variant.is_voxtral()
                 || variant.supports_diarization_records(),
             speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
+            speech_translation: variant.supports_asr_translation(),
+            keyword_biasing: variant.supports_asr_keyword_biasing(),
             diarization_records: variant.supports_diarization_records(),
             text_to_speech_records: supports_tts,
             voice_design_records: supports_voice_description,

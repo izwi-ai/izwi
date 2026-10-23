@@ -10,6 +10,8 @@ pub struct TranscribeArgs {
     pub model: String,
     pub language: Option<String>,
     pub prompt: Option<String>,
+    pub translate_to: Option<String>,
+    pub keywords: Vec<String>,
     pub max_tokens: Option<usize>,
     pub format: TranscriptFormat,
     pub output: Option<PathBuf>,
@@ -22,6 +24,8 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         model,
         language,
         prompt,
+        translate_to,
+        keywords,
         max_tokens,
         format,
         output,
@@ -39,9 +43,17 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
     // The audio goes as a multipart file, not base64 JSON, so the whole
     // upload limit is available for the audio itself.
     let mut form = Form::new().part("file", utils::audio_file_part(&file).await?);
-    for (name, value) in
-        transcription_form_fields(model, language, prompt, max_tokens, format, word_timestamps)
-    {
+    let fields = TranscriptionFormFields {
+        model,
+        language,
+        prompt,
+        translate_to,
+        keywords,
+        max_tokens,
+        format,
+        word_timestamps,
+    };
+    for (name, value) in fields.into_form_fields() {
         form = form.text(name, value);
     }
 
@@ -71,50 +83,72 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
     Ok(())
 }
 
-/// The text fields of the multipart transcription request.
-fn transcription_form_fields(
+/// What the multipart transcription request carries besides the audio.
+struct TranscriptionFormFields {
     model: String,
     language: Option<String>,
     prompt: Option<String>,
+    translate_to: Option<String>,
+    keywords: Vec<String>,
     max_tokens: Option<usize>,
     format: TranscriptFormat,
     word_timestamps: bool,
-) -> Vec<(&'static str, String)> {
-    let format_str = if word_timestamps {
-        "verbose_json"
-    } else {
-        match format {
-            TranscriptFormat::Text => "text",
-            TranscriptFormat::Json => "json",
-            TranscriptFormat::VerboseJson => "verbose_json",
+}
+
+impl TranscriptionFormFields {
+    /// The text fields of the multipart transcription request.
+    fn into_form_fields(self) -> Vec<(&'static str, String)> {
+        let format_str = if self.word_timestamps {
+            "verbose_json"
+        } else {
+            match self.format {
+                TranscriptFormat::Text => "text",
+                TranscriptFormat::Json => "json",
+                TranscriptFormat::VerboseJson => "verbose_json",
+            }
+        };
+
+        let mut fields = vec![
+            ("model", self.model),
+            ("response_format", format_str.to_string()),
+        ];
+
+        if let Some(language) = self.language {
+            fields.push(("language", language));
         }
-    };
 
-    let mut fields = vec![
-        ("model", model),
-        ("response_format", format_str.to_string()),
-    ];
+        if let Some(prompt) = non_empty(self.prompt) {
+            fields.push(("prompt", prompt));
+        }
 
-    if let Some(language) = language {
-        fields.push(("language", language));
+        if let Some(target) = non_empty(self.translate_to) {
+            fields.push(("target_language", target));
+        }
+
+        // One field per keyword. The server also splits each field on
+        // commas and newlines, so a keyword cannot hold a comma.
+        for keyword in self.keywords {
+            if let Some(keyword) = non_empty(Some(keyword)) {
+                fields.push(("keywords", keyword));
+            }
+        }
+
+        if let Some(max_tokens) = self.max_tokens {
+            fields.push(("max_tokens", max_tokens.to_string()));
+        }
+
+        if self.word_timestamps {
+            fields.push(("timestamp_granularities[]", "word".to_string()));
+        }
+
+        fields
     }
+}
 
-    if let Some(prompt) = prompt
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    {
-        fields.push(("prompt", prompt));
-    }
-
-    if let Some(max_tokens) = max_tokens {
-        fields.push(("max_tokens", max_tokens.to_string()));
-    }
-
-    if word_timestamps {
-        fields.push(("timestamp_granularities[]", "word".to_string()));
-    }
-
-    fields
 }
 
 #[cfg(test)]
@@ -123,14 +157,17 @@ mod tests {
 
     #[test]
     fn form_fields_include_prompt_max_tokens_and_word_timestamps() {
-        let fields = transcription_form_fields(
-            "Granite-Speech-4.1-2B-Plus".to_string(),
-            Some("en".to_string()),
-            Some("keywords: izwi, granite".to_string()),
-            Some(64),
-            TranscriptFormat::Text,
-            true,
-        );
+        let fields = TranscriptionFormFields {
+            model: "Granite-Speech-4.1-2B-Plus".to_string(),
+            language: Some("en".to_string()),
+            prompt: Some("keywords: izwi, granite".to_string()),
+            translate_to: None,
+            keywords: Vec::new(),
+            max_tokens: Some(64),
+            format: TranscriptFormat::Text,
+            word_timestamps: true,
+        }
+        .into_form_fields();
         let field = |name: &str| {
             fields
                 .iter()
@@ -145,5 +182,34 @@ mod tests {
         assert_eq!(field("max_tokens"), Some("64"));
         assert_eq!(field("timestamp_granularities[]"), Some("word"));
         assert_eq!(field("audio_base64"), None);
+        assert_eq!(field("target_language"), None);
+        assert_eq!(field("keywords"), None);
+    }
+
+    #[test]
+    fn form_fields_carry_a_translation_target_and_one_field_per_keyword() {
+        let fields = TranscriptionFormFields {
+            model: "Granite-Speech-5.0-2B".to_string(),
+            language: Some("de".to_string()),
+            prompt: None,
+            translate_to: Some(" en ".to_string()),
+            keywords: vec![
+                "Izwi".to_string(),
+                " ".to_string(),
+                "Granite Speech".to_string(),
+            ],
+            max_tokens: None,
+            format: TranscriptFormat::Text,
+            word_timestamps: false,
+        }
+        .into_form_fields();
+
+        assert!(fields.contains(&("target_language", "en".to_string())));
+        let keywords = fields
+            .iter()
+            .filter(|(name, _)| *name == "keywords")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keywords, vec!["Izwi", "Granite Speech"]);
     }
 }

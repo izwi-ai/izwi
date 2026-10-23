@@ -172,9 +172,9 @@ pub use metrics::{
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub(crate) use request::KokoroPreparedText;
 pub use request::{
-    AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
-    EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,
-    RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
+    AsrEngineInput, AsrTaskOptions, AudioChatEngineInput, ChatEngineInput, EngineAudioInput,
+    EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
+    RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,

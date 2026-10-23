@@ -541,7 +541,8 @@ impl NativeExecutor {
         let granite_speech5_request = GraniteSpeech5RequestOptions {
             language: language.map(str::to_string),
             prompt: asr_prompt.map(str::to_string),
-            ..GraniteSpeech5RequestOptions::default()
+            translate_to: request.asr_task.translate_to.clone(),
+            keywords: request.asr_task.keywords.clone(),
         };
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;

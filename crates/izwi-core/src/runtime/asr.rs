@@ -11,9 +11,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::config::RealtimeAsrSessionConfig;
 use crate::engine::{
-    AsrProgress, AsrProgressPhase, EngineCoreRequest, EngineOutput, RealtimeAsrSessionHandle,
-    ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType,
-    WorkCost, WorkUnit,
+    AsrProgress, AsrProgressPhase, AsrTaskOptions, EngineCoreRequest, EngineOutput,
+    RealtimeAsrSessionHandle, ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2,
+    StreamingOutput, TaskType, WorkCost, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
@@ -23,6 +23,7 @@ use crate::models::architectures::granite_speech::asr::{
 };
 use crate::models::architectures::granite_speech5::asr::{
     granite_speech5_auto_max_tokens_for_duration, resolve_granite_speech5_source_language,
+    validate_granite_speech5_request, GraniteSpeech5RequestOptions,
     GRANITE_SPEECH5_AUTO_MAX_TOKENS,
 };
 use crate::models::architectures::voxtral::realtime::{
@@ -441,6 +442,39 @@ pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> R
     }
 }
 
+/// Reject a translation target or keyword list `variant` cannot honour
+/// before the request is admitted. Only Granite Speech 5.0 translates and
+/// takes structured keywords; its own validation checks the language pair
+/// and the keyword limits against the rest of the request.
+pub fn validate_asr_task(
+    variant: ModelVariant,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    task: &AsrTaskOptions,
+) -> Result<()> {
+    if task.translate_to.is_some() && !variant.supports_asr_translation() {
+        return Err(Error::InvalidInput(format!(
+            "{variant} transcribes only; speech translation needs a model that supports it"
+        )));
+    }
+    if !task.keywords.is_empty() && !variant.supports_asr_keyword_biasing() {
+        return Err(Error::InvalidInput(format!(
+            "{variant} does not take keywords; pass them in the prompt instead"
+        )));
+    }
+    match variant.family() {
+        ModelFamily::GraniteSpeech5Asr => {
+            validate_granite_speech5_request(&GraniteSpeech5RequestOptions {
+                language: language.map(str::to_string),
+                prompt: prompt.map(str::to_string),
+                translate_to: task.translate_to.clone(),
+                keywords: task.keywords.clone(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// IBM's automatic Granite budget, `ceil(200 * max(1, secs / 30))` tokens.
 /// Callers bound it by the request ceiling and the invocation context.
 pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
@@ -551,13 +585,15 @@ fn unstreamed_transcript_tail<'a>(streamed: &str, text: &'a str) -> Option<&'a s
         .filter(|tail| !tail.is_empty())
 }
 
-/// Transcript language: the caller's hint when given, otherwise the language
-/// the model detected and reported as `language` in its ASR diagnostics.
+/// Transcript language: the translation target when the request translates,
+/// the caller's hint when given, otherwise the language the model detected
+/// and reported as `language` in its ASR diagnostics.
 fn asr_response_language(
     requested: Option<&str>,
+    translate_to: Option<&str>,
     diagnostics: Option<&serde_json::Value>,
 ) -> Option<String> {
-    requested.map(str::to_string).or_else(|| {
+    translate_to.or(requested).map(str::to_string).or_else(|| {
         diagnostics
             .and_then(|diagnostics| diagnostics.get("language"))
             .and_then(serde_json::Value::as_str)

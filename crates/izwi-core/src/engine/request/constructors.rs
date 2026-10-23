@@ -49,6 +49,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -116,6 +117,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -183,6 +185,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -247,6 +250,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -312,6 +316,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -377,6 +382,7 @@ impl EngineCoreRequest {
             asr_prompt: None,
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
+            asr_task: AsrTaskOptions::default(),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -475,6 +481,12 @@ impl EngineCoreRequest {
     /// Ask for model-native word timestamps where the model emits them.
     pub fn with_asr_native_word_timestamps(mut self, enabled: bool) -> Self {
         self.asr_native_word_timestamps = enabled;
+        self
+    }
+
+    /// Set the ASR translation target and keyword list.
+    pub fn with_asr_task(mut self, task: AsrTaskOptions) -> Self {
+        self.asr_task = task;
         self
     }
 

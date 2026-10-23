@@ -3534,6 +3534,17 @@ async fn admin_models_expose_voice_app_capabilities() {
         granite_model["route_capabilities"]["diarization_records"].as_bool(),
         Some(false)
     );
+    for capability in ["speech_translation", "keyword_biasing"] {
+        assert_eq!(
+            granite_model["route_capabilities"][capability].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            find_model("Granite-Speech-5.0-2B")["route_capabilities"][capability].as_bool(),
+            Some(true),
+            "Granite Speech 5.0 should report {capability}"
+        );
+    }
     assert_eq!(
         granite_model["route_capabilities"]["speech_to_text_jobs"].as_bool(),
         Some(true)
