@@ -36,6 +36,8 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 | `-m, --model <MODEL>` | ASR model to use | `parakeet-tdt-0.6b-v3` |
 | `-l, --language <LANG>` | Language hint (e.g., `en`, `es`) | Auto-detect |
 | `--prompt <TEXT>` | Initial ASR prompt or keyword guidance | — |
+| `--translate-to <LANGUAGE>` | Translate the speech into this language instead of transcribing it (models with speech translation, such as `Granite-Speech-5.0-2B`) | — |
+| `--keyword <TERM>` | A term to bias recognition toward; repeat for more (models with keyword biasing, such as `Granite-Speech-5.0-2B`) | — |
 | `--max-tokens <N>` | Maximum number of ASR decoder tokens to generate | Model default |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
@@ -74,6 +76,25 @@ izwi transcribe meeting.wav \
   --max-tokens 256 \
   --format verbose-json
 ```
+
+### Granite Speech 5.0 translation and keyword biasing
+
+```bash
+# Translate German speech into English text
+izwi transcribe interview.wav \
+  --model Granite-Speech-5.0-2B \
+  --language de \
+  --translate-to en
+
+# Bias recognition toward names and product terms
+izwi transcribe standup.wav \
+  --model Granite-Speech-5.0-2B \
+  --keyword Izwi --keyword "Granite Speech" --keyword Kubernetes
+```
+
+`--translate-to` and `--keyword` need a model with speech translation or
+keyword biasing (`Granite-Speech-5.0-2B`); the server rejects them for other
+models.
 
 ### Word timestamps
 
@@ -169,6 +190,7 @@ selected model or forced aligner can provide word timing metadata.
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | Medium | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control |
 | `Granite-Speech-4.1-2B` | 4.6 GB | Medium | IBM ASR with punctuated, capitalized transcripts |
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with speaker turns and native word timestamps; unpunctuated |
+| `Granite-Speech-5.0-2B` | 4.6 GB | Medium | IBM ASR with punctuated transcripts, speech translation (`--translate-to`) and keyword biasing (`--keyword`) |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
