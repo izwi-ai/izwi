@@ -307,6 +307,13 @@ impl ModelVariant {
         "cd03eee90fbec18297ac31b8c21546e596b7f71c";
     pub const NEMOTRON3_DIARIZATION_ARTIFACT_REVISION: &'static str =
         "f667ed73aee57d40cc39428eb768b4fd87a0a29e";
+    /// The Granite Speech 4.1 revisions the 4.1 loader was built against. On
+    /// 2026-10-21 IBM moved plus's `main` (e69efe37) to a `language_model.model.model.*`
+    /// layout with YaRN RoPE, which this loader does not read.
+    pub const GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION: &'static str =
+        "de575db64086f84fdc79da4932d1076e965bc546";
+    pub const GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION: &'static str =
+        "1454e6e1e33845ca9280ff65f52cf1141ba6e6e2";
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
@@ -339,6 +346,8 @@ impl ModelVariant {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
             Self::Nemotron3Diarization => Some(Self::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION),
+            Self::GraniteSpeech412B => Some(Self::GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION),
+            Self::GraniteSpeech412BPlus => Some(Self::GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION),
             _ => None,
         }
     }
@@ -1648,6 +1657,10 @@ mod tests {
         assert_eq!(variant.dir_name(), "Granite-Speech-4.1-2B");
         assert_eq!(variant.estimated_size(), 4_626_414_392);
         assert_eq!(
+            variant.artifact_revision(),
+            Some("de575db64086f84fdc79da4932d1076e965bc546")
+        );
+        assert_eq!(
             variant.memory_required_gb(),
             ModelVariant::GraniteSpeech412BPlus.memory_required_gb()
         );
@@ -1668,6 +1681,11 @@ mod tests {
         assert_eq!(variant.repo_id(), "ibm-granite/granite-speech-4.1-2b-plus");
         assert_eq!(variant.dir_name(), "Granite-Speech-4.1-2B-Plus");
         assert_eq!(variant.estimated_size(), 4_223_757_112);
+        // The last revision in the layout the 4.1 loader reads.
+        assert_eq!(
+            variant.artifact_revision(),
+            Some("1454e6e1e33845ca9280ff65f52cf1141ba6e6e2")
+        );
         assert_eq!(variant.license_label(), Some("Apache-2.0"));
         assert!(!variant.is_quantized());
         assert!(!variant.is_gguf());
