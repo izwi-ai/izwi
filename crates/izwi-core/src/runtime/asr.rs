@@ -21,6 +21,10 @@ use crate::models::architectures::granite_speech::asr::{
     granite_speech_request_plan, parse_granite_speech_output,
     validate_granite_speech_request_language, GraniteSpeechTask,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    granite_speech5_auto_max_tokens_for_duration, resolve_granite_speech5_source_language,
+    GRANITE_SPEECH5_AUTO_MAX_TOKENS,
+};
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
     VoxtralRealtimePreparationMode, VoxtralRealtimePreparationStageSeal,
@@ -430,6 +434,9 @@ pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> R
         ModelFamily::GraniteSpeechAsr => {
             validate_granite_speech_request_language(variant, language)
         }
+        ModelFamily::GraniteSpeech5Asr => {
+            resolve_granite_speech5_source_language(language).map(|_| ())
+        }
         _ => Ok(()),
     }
 }
@@ -486,7 +493,25 @@ fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     // admitted blocking audio decode. Reserving the production ceiling here
     // avoids decoding compressed public input synchronously on a Tokio worker
     // merely to construct the engine request.
-    (variant.family() == ModelFamily::GraniteSpeechAsr).then_some(GRANITE_ASR_AUTO_MAX_TOKENS)
+    match variant.family() {
+        ModelFamily::GraniteSpeechAsr => Some(GRANITE_ASR_AUTO_MAX_TOKENS),
+        ModelFamily::GraniteSpeech5Asr => Some(GRANITE_SPEECH5_AUTO_MAX_TOKENS),
+        _ => None,
+    }
+}
+
+/// Decode budget Granite Speech 5.0 plans and decodes an invocation of
+/// `audio_seconds` with: its automatic duration budget under the request
+/// ceiling, or the caller's own `max_tokens`.
+pub(crate) fn granite_speech5_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    let ceiling = request.params.max_tokens.max(1);
+    if !request.asr_auto_max_tokens {
+        return ceiling;
+    }
+    granite_speech5_auto_max_tokens_for_duration(audio_seconds).min(ceiling)
 }
 
 /// Transcribed audio duration. Preparation records it for every family that

@@ -3028,11 +3028,42 @@ mod tests {
     }
 
     #[test]
+    fn granite_speech_5_files_are_the_unsharded_bundle_without_unused_assets() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::GraniteSpeech502B);
+        assert_eq!(
+            files,
+            GRANITE_SPEECH_5_FILES
+                .iter()
+                .map(|file| file.to_string())
+                .collect::<Vec<_>>()
+        );
+        for unused in [
+            "model.safetensors.index.json",
+            "out_llm.safetensors",
+            "multilingual_sample.wav",
+            "vocab.json",
+            "merges.txt",
+        ] {
+            assert!(!files.iter().any(|file| file == unused), "{unused}");
+        }
+        assert_eq!(
+            downloader.get_single_file_size_estimate(
+                ModelVariant::GraniteSpeech502B,
+                "model.safetensors"
+            ),
+            GRANITE_SPEECH_5_MODEL_BYTES
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
     fn granite_speech_is_downloaded_only_when_all_required_assets_exist() {
         let (downloader, temp_dir) = test_downloader();
         for variant in [
             ModelVariant::GraniteSpeech412B,
             ModelVariant::GraniteSpeech412BPlus,
+            ModelVariant::GraniteSpeech502B,
         ] {
             let required = granite_speech_required_files(variant);
             let model_dir = downloader.model_path(variant);

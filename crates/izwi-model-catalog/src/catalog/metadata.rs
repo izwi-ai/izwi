@@ -144,6 +144,16 @@ pub enum ModelVariant {
         alias = "Granite Speech 4.1 2B Plus"
     )]
     GraniteSpeech412BPlus,
+    /// IBM Granite Speech 5.0 2B: punctuated multilingual ASR, speech
+    /// translation, keyword biasing and language hints. Its own family: the
+    /// language model uses YaRN RoPE over a 16k context.
+    #[serde(
+        rename = "Granite-Speech-5.0-2B",
+        alias = "ibm-granite/granite-speech-5.0-2b",
+        alias = "granite-speech-5.0-2b",
+        alias = "Granite Speech 5.0 2B"
+    )]
+    GraniteSpeech502B,
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
@@ -314,6 +324,11 @@ impl ModelVariant {
         "de575db64086f84fdc79da4932d1076e965bc546";
     pub const GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION: &'static str =
         "1454e6e1e33845ca9280ff65f52cf1141ba6e6e2";
+    /// Granite Speech 5.0 2B as published 2026-10-23. The weights are from
+    /// 818a37c6 (2026-10-07); later commits changed only the card and the
+    /// config's `_name_or_path`.
+    pub const GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION: &'static str =
+        "0555e70346a8992da6b5df98ae26ec50c43958b8";
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
@@ -348,6 +363,7 @@ impl ModelVariant {
             Self::Nemotron3Diarization => Some(Self::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION),
             Self::GraniteSpeech412B => Some(Self::GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION),
             Self::GraniteSpeech412BPlus => Some(Self::GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION),
+            Self::GraniteSpeech502B => Some(Self::GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION),
             _ => None,
         }
     }
@@ -386,6 +402,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "nvidia/nemotron-3.5-asr-streaming-0.6b",
             Self::GraniteSpeech412B => "ibm-granite/granite-speech-4.1-2b",
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
+            Self::GraniteSpeech502B => "ibm-granite/granite-speech-5.0-2b",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
@@ -436,6 +453,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron 3.5 ASR Streaming 0.6B",
             Self::GraniteSpeech412B => "Granite Speech 4.1 2B",
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
+            Self::GraniteSpeech502B => "Granite Speech 5.0 2B",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Nemotron3Diarization => "Nemotron 3 Diarization",
             Self::Qwen306B => "Qwen3 0.6B",
@@ -486,6 +504,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron-3.5-ASR-Streaming-0.6B",
             Self::GraniteSpeech412B => "Granite-Speech-4.1-2B",
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
+            Self::GraniteSpeech502B => "Granite-Speech-5.0-2B",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen3-0.6B",
@@ -536,6 +555,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 2_368_284_501, // .nemo bytes, HF tree, Oct 2026
             Self::GraniteSpeech412B => 4_626_414_392,   // safetensors index metadata total_size
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
+            Self::GraniteSpeech502B => 4_626_414_392,   // model.safetensors tensor bytes
             Self::DiarStreamingSortformer4SpkV21 => 471_367_680, // .nemo bytes, HF tree, Oct 2026
             Self::Nemotron3Diarization => 198_676_480,  // .nemo bytes, HF tree, Oct 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
@@ -585,6 +605,8 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 6.0,
             // Same architecture as plus; base's untied head adds 0.4 GB BF16.
             Self::GraniteSpeech412B | Self::GraniteSpeech412BPlus => 10.0,
+            // The same weights as 4.1 with a 16k-token decoder context.
+            Self::GraniteSpeech502B => 12.0,
             // The diarizers and the forced aligner are priced by their
             // residency plans (`asr_memory`); these figures cover the largest
             // plan resident on any backend. Sortformer loads F32 weights:
@@ -674,6 +696,18 @@ impl ModelVariant {
         matches!(self, Self::GraniteSpeech412BPlus)
     }
 
+    /// Whether a transcription request may ask this model to translate the
+    /// speech into another language instead of transcribing it.
+    pub fn supports_asr_translation(&self) -> bool {
+        matches!(self, Self::GraniteSpeech502B)
+    }
+
+    /// Whether a transcription request may bias this model toward a list of
+    /// keywords (names, product terms, acronyms).
+    pub fn supports_asr_keyword_biasing(&self) -> bool {
+        matches!(self, Self::GraniteSpeech502B)
+    }
+
     /// Whether this is a forced aligner model
     pub fn is_forced_aligner(&self) -> bool {
         matches!(
@@ -722,6 +756,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412B
             | Self::GraniteSpeech412BPlus
+            | Self::GraniteSpeech502B
             | Self::Qwen3827BFp8
             | Self::Qwen36Moe35BA3BFp8 => Some("Apache-2.0"),
             _ => None,
@@ -1117,6 +1152,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B,
             Self::GraniteSpeech412B,
             Self::GraniteSpeech412BPlus,
+            Self::GraniteSpeech502B,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Nemotron3Diarization,
             Self::Qwen306B,
@@ -1671,6 +1707,46 @@ mod tests {
         assert!(ModelVariant::GraniteSpeech412BPlus.supports_speaker_attributed_asr());
         assert!(!variant.is_quantized());
         assert!(!variant.is_gguf());
+    }
+
+    #[test]
+    fn granite_speech_5_is_an_enabled_asr_variant_of_its_own_family() {
+        let variant = ModelVariant::GraniteSpeech502B;
+        assert!(variant.is_asr());
+        assert!(variant.is_enabled());
+        assert_eq!(
+            variant.family(),
+            crate::catalog::ModelFamily::GraniteSpeech5Asr
+        );
+        assert_ne!(
+            variant.family(),
+            ModelVariant::GraniteSpeech412B.family(),
+            "5.0 is an architecture of its own, not a 4.1 checkpoint"
+        );
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert_eq!(variant.repo_id(), "ibm-granite/granite-speech-5.0-2b");
+        assert_eq!(variant.dir_name(), "Granite-Speech-5.0-2B");
+        assert_eq!(variant.display_name(), "Granite Speech 5.0 2B");
+        assert_eq!(variant.estimated_size(), 4_626_414_392);
+        assert_eq!(
+            variant.artifact_revision(),
+            Some("0555e70346a8992da6b5df98ae26ec50c43958b8")
+        );
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert!(variant.supports_asr_translation());
+        assert!(variant.supports_asr_keyword_biasing());
+        assert!(!variant.supports_speaker_attributed_asr());
+        assert!(!variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert!(ModelVariant::all().contains(&variant));
+        for other in [
+            ModelVariant::GraniteSpeech412B,
+            ModelVariant::GraniteSpeech412BPlus,
+            ModelVariant::WhisperLargeV3Turbo,
+        ] {
+            assert!(!other.supports_asr_translation(), "{other}");
+            assert!(!other.supports_asr_keyword_biasing(), "{other}");
+        }
     }
 
     #[test]

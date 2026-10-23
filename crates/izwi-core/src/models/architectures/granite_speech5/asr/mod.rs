@@ -50,7 +50,6 @@ pub use config::{
     GraniteSpeech5ProcessorConfig, GraniteSpeech5ProjectorConfig, GraniteSpeech5TextConfig,
     GraniteSpeech5TokenizerConfig,
 };
-#[allow(unused_imports)] // Load admission's pricing reads these (asr_memory).
 pub(crate) use precision::{
     granite_speech5_load_representation, granite_speech5_tensor_is_f16_encoder_projection,
     resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype,
@@ -538,14 +537,22 @@ fn granite_speech5_physical_state_spec(
                 .into(),
         ));
     }
-    let atomic = |stages: &[StageDescriptor]| {
+    // One unbatched stage per graph: the scalar ASR stage, which plans
+    // long audio's chunks inside its dispatch. Sequence stages would need
+    // retained decoder state this family does not author.
+    let invocation_only = |stages: &[StageDescriptor]| {
         stages.len() == 1
-            && stages[0].selector == crate::engine::StageWorkSelector::Atomic
             && stages[0].batch_mode == crate::engine::NativeBatchMode::None
+            && !matches!(
+                stages[0].selector,
+                crate::engine::StageWorkSelector::SequencePrefill
+                    | crate::engine::StageWorkSelector::SequenceDecode
+                    | crate::engine::StageWorkSelector::PreSequencePreparation
+            )
     };
-    if !stage_graphs.iter().all(|stages| atomic(stages)) {
+    if !stage_graphs.iter().all(|stages| invocation_only(stages)) {
         return Err(Error::ModelLoadError(
-            "Granite Speech 5.0 ASR runs only its atomic graph".into(),
+            "Granite Speech 5.0 ASR runs one unbatched invocation stage per graph".into(),
         ));
     }
     let max_tokens = u64::try_from(max_context_tokens)
@@ -756,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn only_atomic_graphs_are_accepted() {
+    fn only_single_invocation_graphs_are_accepted() {
         let config = published_config();
         let invocation =
             granite_speech5_invocation_contract(&config, DType::F32, default_kv_page_size())
@@ -769,7 +776,16 @@ mod tests {
             16_384
         )
         .is_err());
-        assert!(granite_speech5_physical_state_spec(&[], invocation, 16_384).is_err());
+        assert!(granite_speech5_physical_state_spec(&[], invocation.clone(), 16_384).is_err());
+        // The scalar adapter's stage selects any work.
+        let mut scalar = atomic_stage(0);
+        scalar.selector = StageWorkSelector::Any;
+        assert!(granite_speech5_physical_state_spec(
+            &[std::slice::from_ref(&scalar)],
+            invocation,
+            16_384
+        )
+        .is_ok());
     }
 
     #[test]

@@ -73,17 +73,13 @@ impl ModelFamily {
     /// of one file instead of holding it for the whole file. The chunks run
     /// on the chunk executor, whose state between chunks is host-only.
     /// VibeVoice's load-sealed state spec authenticates its long-form graph
-    /// as one atomic stage; offline Voxtral and Nemotron plan their chunks
-    /// inside the dispatch (no prepared long-form route); Parakeet never
-    /// chunks. Those keep one dispatch per file.
+    /// as one atomic stage; offline Voxtral, Nemotron and Granite Speech 5.0
+    /// plan their chunks inside the dispatch (no prepared long-form route);
+    /// Parakeet never chunks. Those keep one dispatch per file.
     pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
         matches!(
             self,
-            Self::WhisperAsr
-                | Self::Qwen3Asr
-                | Self::GraniteSpeechAsr
-                | Self::GraniteSpeech5Asr
-                | Self::Lfm25Audio
+            Self::WhisperAsr | Self::Qwen3Asr | Self::GraniteSpeechAsr | Self::Lfm25Audio
         )
     }
 
@@ -373,6 +369,7 @@ impl ModelVariant {
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
+            GraniteSpeech502B => ModelFamily::GraniteSpeech5Asr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -835,6 +832,19 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
+    // Granite Speech 5.0 is its own family, so a 5.0 id must never fall
+    // through to the 4.1 checkpoints below. 5.0's Turbo CTC sibling is a
+    // different model that the catalog does not carry.
+    if normalized.contains("speech5") {
+        if ["turbo", "ctc", "470m"]
+            .iter()
+            .any(|other| normalized.contains(other))
+        {
+            return None;
+        }
+        return Some(GraniteSpeech502B);
+    }
+
     // IBM's library resolves local checkpoints the same way: "plus" names the
     // rich-transcription model, anything else the punctuating base model,
     // which is IBM's default.
@@ -1257,6 +1267,48 @@ mod tests {
         ] {
             assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
         }
+    }
+
+    #[test]
+    fn granite_speech_5_names_never_resolve_to_a_4_1_checkpoint() {
+        for input in [
+            "ibm-granite/granite-speech-5.0-2b",
+            "granite-speech-5.0-2b",
+            "Granite-Speech-5.0-2B",
+            "Granite Speech 5.0 2B",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::GraniteSpeech502B,
+                "{input}"
+            );
+        }
+        for input in [
+            "granite speech 5",
+            "granite-speech-5.0",
+            "granite_speech_5_2b",
+            "granite-speech-5.0-2b-local",
+        ] {
+            assert_eq!(
+                resolve_asr_model_variant(Some(input)),
+                ModelVariant::GraniteSpeech502B,
+                "{input}"
+            );
+        }
+        // The Turbo CTC sibling is not this model.
+        assert!(parse_model_variant("granite-speech-5.0-470m-turboctc").is_err());
+        // 4.1 ids keep resolving to 4.1.
+        assert_eq!(
+            resolve_asr_model_variant(Some("granite-speech-4.1")),
+            ModelVariant::GraniteSpeech412B
+        );
+        assert_eq!(
+            ModelVariant::GraniteSpeech502B.family(),
+            ModelFamily::GraniteSpeech5Asr
+        );
+        assert!(ModelFamily::GraniteSpeech5Asr.hallucinates_on_non_speech());
+        assert!(!ModelFamily::GraniteSpeech5Asr.dispatches_long_form_asr_by_chunk());
+        assert!(!ModelFamily::GraniteSpeech5Asr.asr_streams_within_chunk());
     }
 
     #[test]

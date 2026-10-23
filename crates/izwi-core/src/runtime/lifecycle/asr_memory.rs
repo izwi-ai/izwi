@@ -78,6 +78,11 @@ use crate::models::architectures::granite_speech::asr::{
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    ensure_granite_speech5_artifacts, granite_speech5_load_representation,
+    granite_speech5_tensor_is_f16_encoder_projection, resolve_granite_speech5_encoder_precision,
+    select_granite_speech5_dtype, GraniteSpeech5Config, GraniteSpeech5LoadRepresentation,
+};
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
@@ -178,7 +183,10 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
             | ModelVariant::VibeVoiceAsr
             | ModelVariant::VoxtralMini4BRealtime2602
             | ModelVariant::Lfm25Audio15BGguf
-    ) || variant.family() == ModelFamily::GraniteSpeechAsr
+    ) || matches!(
+        variant.family(),
+        ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+    )
 }
 
 /// Whether this module prices `variant`: the ASR variants, and the forced
@@ -229,6 +237,9 @@ pub(super) fn residency_plan(
             granite.speech_dtype.as_deref(),
             Precision::Selected,
         ),
+        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
+            granite_speech5_plan(model_path, device, backend, Precision::Selected)
+        }
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
@@ -1695,6 +1706,14 @@ pub(super) fn precision_reload_plan(
             };
             plan
         }
+        ModelFamily::GraniteSpeech5Asr => {
+            let Some(plan) =
+                granite_speech5_plan(model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
         _ => return super::tts_memory::precision_reload_plan(variant, model_path, device),
     };
     tracing::info!(
@@ -2157,15 +2176,74 @@ fn nemo_payload_bytes(path: &Path) -> Result<u64> {
     Ok(payload)
 }
 
-/// The switches the Granite Speech loader resolves.
+/// Which loader a Granite plan prices. Granite Speech 4.1 and 5.0 share one
+/// tensor layout and load shape, but each family owns its switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraniteCheckpointFamily {
+    Speech41,
+    Speech5,
+}
+
+impl GraniteCheckpointFamily {
+    fn is_f16_encoder_projection(self, name: &str) -> bool {
+        match self {
+            Self::Speech41 => granite_tensor_is_f16_encoder_projection(name),
+            Self::Speech5 => granite_speech5_tensor_is_f16_encoder_projection(name),
+        }
+    }
+}
+
+/// A Granite language model's load-time representation switches, as each
+/// family's loader resolves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraniteLmRepresentation {
+    f16_lm_head: bool,
+    f16_qkv: bool,
+    f16_mlp: bool,
+    f16_attention_output: bool,
+    qkv_fusion: bool,
+    gate_up_fusion: bool,
+    residual_prescale: bool,
+}
+
+impl From<GraniteLoadRepresentation> for GraniteLmRepresentation {
+    fn from(value: GraniteLoadRepresentation) -> Self {
+        Self {
+            f16_lm_head: value.f16_lm_head,
+            f16_qkv: value.f16_qkv,
+            f16_mlp: value.f16_mlp,
+            f16_attention_output: value.f16_attention_output,
+            qkv_fusion: value.qkv_fusion,
+            gate_up_fusion: value.gate_up_fusion,
+            residual_prescale: value.residual_prescale,
+        }
+    }
+}
+
+impl From<GraniteSpeech5LoadRepresentation> for GraniteLmRepresentation {
+    fn from(value: GraniteSpeech5LoadRepresentation) -> Self {
+        Self {
+            f16_lm_head: value.f16_lm_head,
+            f16_qkv: value.f16_qkv,
+            f16_mlp: value.f16_mlp,
+            f16_attention_output: value.f16_attention_output,
+            qkv_fusion: value.qkv_fusion,
+            gate_up_fusion: value.gate_up_fusion,
+            residual_prescale: value.residual_prescale,
+        }
+    }
+}
+
+/// The switches a Granite Speech loader resolves.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraniteLoad {
+    family: GraniteCheckpointFamily,
     dtype: DType,
     /// The encoder and projector's dtype (F32 under weight-only F16).
     audio_dtype: DType,
     /// Encoder projections load as weight-only F16.
     f16_encoder_projections: bool,
-    representation: GraniteLoadRepresentation,
+    representation: GraniteLmRepresentation,
     residual_multiplier: f32,
     tied_lm_head: bool,
     /// (encoder layers, attention context) of the per-layer U32 distance table.
@@ -2197,6 +2275,7 @@ fn granite_plan(
     let f16_encoder_projections = precision == Precision::Selected
         && resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
     let load = GraniteLoad {
+        family: GraniteCheckpointFamily::Speech41,
         dtype,
         audio_dtype: if f16_encoder_projections {
             DType::F32
@@ -2204,7 +2283,7 @@ fn granite_plan(
             dtype
         },
         f16_encoder_projections,
-        representation: granite_load_representation(&device.device, dtype, speech_dtype),
+        representation: granite_load_representation(&device.device, dtype, speech_dtype).into(),
         residual_multiplier: config.text_config.residual_multiplier,
         tied_lm_head: config.tie_word_embeddings(),
         encoder_attention_dists: (
@@ -2215,7 +2294,50 @@ fn granite_plan(
     price_granite(&files, backend, &load).map(Some)
 }
 
-/// Granite Speech (`granite_speech/asr/runtime.rs`): every tensor through a
+/// Granite Speech 5.0 (`granite_speech5/asr/runtime.rs`): 4.1's load shape
+/// over one unsharded checkpoint, with 5.0's own switches.
+fn granite_speech5_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+    precision: Precision,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(weights) = ensure_granite_speech5_artifacts(model_path) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(&[weights])? else {
+        return Ok(None);
+    };
+    let config = GraniteSpeech5Config::load(model_path)?;
+    // The F32 reload bounds either fallback: the encoder's dense reload or
+    // the language model's F32 one.
+    let dtype = match precision {
+        Precision::Selected => select_granite_speech5_dtype(device, config.target_dtype_hint())?,
+        Precision::F32Reload => DType::F32,
+    };
+    let f16_encoder_projections = precision == Precision::Selected
+        && resolve_granite_speech5_encoder_precision(device).dtype == DType::F16;
+    let load = GraniteLoad {
+        family: GraniteCheckpointFamily::Speech5,
+        dtype,
+        audio_dtype: if f16_encoder_projections {
+            DType::F32
+        } else {
+            dtype
+        },
+        f16_encoder_projections,
+        representation: granite_speech5_load_representation(&device.device, dtype).into(),
+        residual_multiplier: config.text_config.residual_multiplier,
+        tied_lm_head: config.tie_word_embeddings(),
+        encoder_attention_dists: (
+            config.encoder_config.num_layers,
+            config.encoder_config.context_size,
+        ),
+    };
+    price_granite(&files, backend, &load).map(Some)
+}
+
+/// Granite Speech (`granite_speech/asr/runtime.rs`, and 5.0's fork of it): every tensor through a
 /// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
 /// and down_proj read at F16 (when selective) and then pre-scaled by the
@@ -2254,7 +2376,7 @@ fn price_granite(
         if !name.starts_with("encoder.") || name.ends_with(".num_batches_tracked") {
             continue;
         }
-        if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
+        if load.f16_encoder_projections && load.family.is_f16_encoder_projection(name) {
             ledger.host_converted(tensor, DType::F16)?;
         } else {
             ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
@@ -3213,9 +3335,9 @@ pub(super) mod tests {
     /// takes the F16 LM projections and head copy and the residual
     /// pre-scaling for F32 weights (`granite_speech/asr/runtime.rs` policies);
     /// every backend fuses Q/K/V and gate/up.
-    fn granite_representation(backend: BackendKind) -> GraniteLoadRepresentation {
+    fn granite_representation(backend: BackendKind) -> GraniteLmRepresentation {
         let metal = backend == BackendKind::Metal;
-        GraniteLoadRepresentation {
+        GraniteLmRepresentation {
             f16_lm_head: metal,
             f16_qkv: metal,
             f16_mlp: metal,
@@ -3240,6 +3362,7 @@ pub(super) mod tests {
         // Metal loads the encoder projections as weight-only F16.
         let f16_encoder_projections = backend == BackendKind::Metal;
         GraniteLoad {
+            family: GraniteCheckpointFamily::Speech41,
             dtype,
             audio_dtype: if f16_encoder_projections {
                 DType::F32
@@ -4040,6 +4163,7 @@ pub(super) mod tests {
                 tensors,
             }];
             let load = GraniteLoad {
+                family: GraniteCheckpointFamily::Speech41,
                 dtype: DType::F32,
                 audio_dtype: DType::F32,
                 f16_encoder_projections: true,
@@ -4068,7 +4192,18 @@ pub(super) mod tests {
     fn granite_cpu_representation_matches_the_loader() {
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&candle_core::Device::Cpu, DType::F32, None),
+            GraniteLmRepresentation::from(granite_load_representation(
+                &candle_core::Device::Cpu,
+                DType::F32,
+                None
+            )),
+            granite_representation(BackendKind::Cpu)
+        );
+        assert_eq!(
+            GraniteLmRepresentation::from(granite_speech5_load_representation(
+                &candle_core::Device::Cpu,
+                DType::F32
+            )),
             granite_representation(BackendKind::Cpu)
         );
     }
@@ -4083,8 +4218,47 @@ pub(super) mod tests {
         };
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&device, DType::F32, None),
+            GraniteLmRepresentation::from(granite_load_representation(&device, DType::F32, None)),
             granite_representation(BackendKind::Metal)
+        );
+        assert_eq!(
+            GraniteLmRepresentation::from(granite_speech5_load_representation(&device, DType::F32)),
+            granite_representation(BackendKind::Metal)
+        );
+    }
+
+    /// Granite Speech 5.0's published tensors priced as its loader holds
+    /// them: BF16 on CUDA, F32 on the CPU, and on Metal an F32 base with
+    /// weight-only F16 encoder projections and the untied head and LM
+    /// projections in F16.
+    #[test]
+    fn granite_speech_5_prices_its_published_census_per_backend() {
+        let files = census!("granite_speech_5_0_2b.json");
+        let price = |backend: BackendKind| {
+            let mut load = granite_load(backend);
+            load.family = GraniteCheckpointFamily::Speech5;
+            // The published granite-speech-5.0-2b config.json.
+            load.tied_lm_head = false;
+            price_granite(&files, backend, &load).unwrap()
+        };
+        let tensor_bytes = 4_626_414_392u64;
+        let step_counters = 16 * 8;
+        let distance_tables = 16 * 200 * 200 * 4;
+        let cuda = price(BackendKind::Cuda).logical_resident_bytes;
+        assert_eq!(cuda, tensor_bytes - step_counters + distance_tables);
+        let cpu = price(BackendKind::Cpu).logical_resident_bytes;
+        assert_eq!(cpu, 2 * (tensor_bytes - step_counters) + distance_tables);
+        let metal = price(BackendKind::Metal).logical_resident_bytes;
+        assert!(metal < cpu && metal > cuda, "{metal}");
+        // The same census through 4.1's switches prices identically: the two
+        // families share one load shape.
+        let mut speech41 = granite_load(BackendKind::Metal);
+        speech41.tied_lm_head = false;
+        assert_eq!(
+            price_granite(&files, BackendKind::Metal, &speech41)
+                .unwrap()
+                .logical_resident_bytes,
+            metal
         );
     }
 

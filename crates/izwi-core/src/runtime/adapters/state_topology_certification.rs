@@ -111,6 +111,8 @@ fn certified_topology(
         (ParakeetAsr, Asr) => RetainedTensorAndInvocationTensor,
         (GraniteSpeechAsr, Asr) => RetainedPagedAndInvocationPaged,
         (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
+        // Granite Speech 5.0 runs one atomic invocation on leased pages.
+        (GraniteSpeech5Asr, Asr) => InvocationPaged,
         (NemotronAsr, Asr) => InvocationTensorStatic,
         // Realtime Nemotron retains append/ring/tensor streaming state and
         // uses invocation-scoped workspace for the exact graph.

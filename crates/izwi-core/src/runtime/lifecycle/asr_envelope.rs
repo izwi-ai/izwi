@@ -226,19 +226,26 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             forced_alignment: None,
         },
         // Conformer over 50 positions per second in 4 s attention blocks;
-        // the projector emits 10 audio tokens per second.
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => AsrEnvelopeGeometry {
-            max_chunk_secs: CHUNK_SECS,
-            encoder_positions_per_sec: 50.0,
-            encoder_window_secs: Some(4.0),
-            encoder: stack(1024, 4096, 8),
-            audio_tokens_per_sec: 10.0,
-            prompt_tokens: PROMPT_TEXT_TOKENS,
-            decoder: stack(2048, 8192, 32),
-            vocab: 100_353,
-            conv_stem: None,
-            forced_alignment: None,
-        },
+        // the projector emits 10 audio tokens per second. Granite Speech 5.0
+        // keeps 4.1's shapes.
+        _ if matches!(
+            variant.family(),
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+        ) =>
+        {
+            AsrEnvelopeGeometry {
+                max_chunk_secs: CHUNK_SECS,
+                encoder_positions_per_sec: 50.0,
+                encoder_window_secs: Some(4.0),
+                encoder: stack(1024, 4096, 8),
+                audio_tokens_per_sec: 10.0,
+                prompt_tokens: PROMPT_TEXT_TOKENS,
+                decoder: stack(2048, 8192, 32),
+                vocab: 100_353,
+                conv_stem: None,
+                forced_alignment: None,
+            }
+        }
         // The retained route takes one 60 s tokenizer chunk (450 audio
         // tokens) and 512 prompt tokens; the σ-VAE tokenizers are
         // convolutional (priced as a 7.5 Hz stack of the decoder width).
@@ -352,6 +359,14 @@ pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
             rate,
             PLANNED_CHUNK_SECS,
             crate::runtime::granite_auto_asr_max_tokens_for_duration(30.0),
+        ),
+        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            PLANNED_CHUNK_SECS,
+            crate::models::architectures::granite_speech5::asr::granite_speech5_auto_max_tokens_for_duration(
+                30.0,
+            ),
         ),
         // The retained route's one 60 s tokenizer chunk.
         ModelVariant::VibeVoiceAsr => asr_sequence_ceiling(
@@ -620,7 +635,7 @@ pub(crate) fn deferred_request_envelope(
 mod tests {
     use super::*;
 
-    const ENVELOPE_VARIANTS: [ModelVariant; 10] = [
+    const ENVELOPE_VARIANTS: [ModelVariant; 11] = [
         ModelVariant::WhisperLargeV3Turbo,
         ModelVariant::Qwen3Asr06BGguf,
         ModelVariant::Qwen3Asr17BGguf,
@@ -628,6 +643,7 @@ mod tests {
         ModelVariant::Nemotron35AsrStreaming06B,
         ModelVariant::GraniteSpeech412BPlus,
         ModelVariant::GraniteSpeech412B,
+        ModelVariant::GraniteSpeech502B,
         ModelVariant::VibeVoiceAsr,
         ModelVariant::VoxtralMini4BRealtime2602,
         ModelVariant::Lfm25Audio15BGguf,
@@ -797,6 +813,11 @@ mod tests {
         // single-pass decode budget.
         assert_eq!(floor(ModelVariant::Lfm25Audio15BGguf), 128 + 375 + 1_024);
         assert!(floor(ModelVariant::GraniteSpeech412BPlus) > 128 + 316);
+        // 5.0's 30 s budget is 300 tokens, against 4.1's 200.
+        assert_eq!(
+            floor(ModelVariant::GraniteSpeech502B),
+            floor(ModelVariant::GraniteSpeech412B) + 100
+        );
         assert!(floor(ModelVariant::VoxtralMini4BRealtime2602) > 2 * 395);
         assert_eq!(
             minimum_sequence_tokens(ModelVariant::ParakeetTdt06BV3),
@@ -883,6 +904,14 @@ mod tests {
                 "language_model.model.embed_tokens.weight"
             ),
             [granite.vocab, granite.decoder.hidden]
+        );
+        let granite_5 = envelope_geometry(ModelVariant::GraniteSpeech502B).unwrap();
+        assert_eq!(
+            shape(
+                fixture!("granite_speech_5_0_2b.json"),
+                "language_model.model.embed_tokens.weight"
+            ),
+            [granite_5.vocab, granite_5.decoder.hidden]
         );
         let vibevoice = envelope_geometry(ModelVariant::VibeVoiceAsr).unwrap();
         assert_eq!(

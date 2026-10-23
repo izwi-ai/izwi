@@ -48,11 +48,17 @@ use super::state::{
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    granite_speech5_auto_max_tokens_for_duration, GraniteSpeech5RequestOptions,
+};
+use granite_speech5::{recover_granite_speech5_chunk, ChunkRecoveryLimits};
 
 #[path = "handler_asr/continuous.rs"]
 mod continuous;
 #[path = "handler_asr/granite.rs"]
 mod granite;
+#[path = "handler_asr/granite_speech5.rs"]
+mod granite_speech5;
 #[path = "handler_asr/lfm25_audio.rs"]
 mod lfm25_audio;
 #[path = "handler_asr/parakeet.rs"]
@@ -214,6 +220,7 @@ enum PhysicalAsrRoute {
     Qwen3,
     VibeVoice,
     GraniteSpeech,
+    GraniteSpeech5,
     Whisper,
     Parakeet,
     Nemotron,
@@ -226,6 +233,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::Qwen3Asr => Ok(PhysicalAsrRoute::Qwen3),
         ModelFamily::VibeVoiceAsr => Ok(PhysicalAsrRoute::VibeVoice),
         ModelFamily::GraniteSpeechAsr => Ok(PhysicalAsrRoute::GraniteSpeech),
+        ModelFamily::GraniteSpeech5Asr => Ok(PhysicalAsrRoute::GraniteSpeech5),
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
@@ -247,8 +255,6 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
         | ModelFamily::Gemma3Chat
-        // Granite Speech 5.0 is in the catalog before its runtime is wired.
-        | ModelFamily::GraniteSpeech5Asr
         | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
             "{family:?} has no physical ASR route on the generic executor path"
         ))),
@@ -532,6 +538,11 @@ impl NativeExecutor {
         let language = request.asr_language_for_execution();
         let asr_prompt = request.asr_prompt_for_execution();
         let generation_options = Self::asr_generation_options(request);
+        let granite_speech5_request = GraniteSpeech5RequestOptions {
+            language: language.map(str::to_string),
+            prompt: asr_prompt.map(str::to_string),
+            ..GraniteSpeech5RequestOptions::default()
+        };
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         // A long-form row of a family that dispatches its chunks one at a
@@ -783,6 +794,34 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
+                            // Its chunk text is final only once recovery has
+                            // looked at it, so it never streams within a chunk.
+                            PhysicalAsrRoute::GraniteSpeech5 => {
+                                let redecode = |options: NativeAsrGenerationOptions| {
+                                    with_single_invocation_cache(request, scheduled, |cache| {
+                                        model.transcribe_granite_speech5_physical(
+                                            chunk_audio,
+                                            sr,
+                                            &granite_speech5_request,
+                                            options,
+                                            cache,
+                                            None,
+                                        )
+                                    })
+                                };
+                                let details = redecode(chunk_generation_options.clone())?;
+                                recover_granite_speech5_chunk(
+                                    details,
+                                    chunk_audio.len() as f32 / sr.max(1) as f32,
+                                    &chunk_generation_options,
+                                    ChunkRecoveryLimits {
+                                        auto_max_tokens: request.asr_auto_max_tokens,
+                                        request_ceiling: request.params.max_tokens,
+                                        invocation_context,
+                                    },
+                                    redecode,
+                                )?
+                            }
                             PhysicalAsrRoute::Whisper => {
                                 if let Some(emit) = partial {
                                     return with_whisper_invocation_state(
@@ -986,6 +1025,20 @@ impl NativeExecutor {
                                     )
                             })?
                         }
+                        PhysicalAsrRoute::GraniteSpeech5 => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model
+                                    .transcribe_granite_speech5_physical(
+                                        samples,
+                                        sample_rate,
+                                        &granite_speech5_request,
+                                        segment_generation_options.clone(),
+                                        cache,
+                                        Some(&mut emit),
+                                    )
+                                    .map(|details| details.text)
+                            })?
+                        }
                         PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
                             scheduled,
@@ -1076,6 +1129,18 @@ impl NativeExecutor {
                                 segment_generation_options.clone(),
                                 cache,
                             )
+                    })?
+                }
+                PhysicalAsrRoute::GraniteSpeech5 => {
+                    with_single_invocation_cache(request, scheduled, |cache| {
+                        model.transcribe_granite_speech5_physical(
+                            samples,
+                            sample_rate,
+                            &granite_speech5_request,
+                            segment_generation_options.clone(),
+                            cache,
+                            None,
+                        )
                     })?
                 }
                 PhysicalAsrRoute::Whisper => {
@@ -1340,6 +1405,17 @@ impl NativeExecutor {
                 budget.min(invocation_decode_room(context, rate, chunk_seconds))
             });
         }
+        if request.asr_auto_max_tokens
+            && matches!(family, ModelFamily::GraniteSpeech5Asr)
+            && sample_rate > 0
+        {
+            let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
+            let budget = granite_speech5_auto_max_tokens_for_duration(chunk_seconds)
+                .min(base.max_new_tokens);
+            options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
+                budget.min(invocation_decode_room(context, rate, chunk_seconds))
+            });
+        }
         // VibeVoice's automatic budget is admitted at the reference ceiling;
         // each chunk decodes with its own duration budget.
         if request.asr_auto_max_tokens
@@ -1368,6 +1444,9 @@ pub(super) fn asr_planned_decode_tokens(
 ) -> usize {
     match family {
         ModelFamily::GraniteSpeechAsr => granite_asr_planned_max_tokens(request, audio_seconds),
+        ModelFamily::GraniteSpeech5Asr => {
+            crate::runtime::granite_speech5_asr_planned_max_tokens(request, audio_seconds)
+        }
         ModelFamily::VibeVoiceAsr => {
             crate::runtime::vibevoice_asr_planned_max_tokens(request, audio_seconds)
         }

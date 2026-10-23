@@ -42,7 +42,7 @@ pub(crate) use adapters::capability_rows;
 pub use adapters::CapabilityKind;
 pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
-    invocation_decode_room,
+    granite_speech5_asr_planned_max_tokens, invocation_decode_room,
 };
 pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use chat::AdmittedChatStream;
