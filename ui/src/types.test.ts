@@ -67,6 +67,12 @@ describe("speech route model filters", () => {
         "ibm-granite/granite-speech-4.1-2b-plus",
       ),
     ).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-5.0-2B"),
+    ).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("ibm-granite/granite-speech-5.0-2b"),
+    ).toBe(true);
   });
 
   it("includes lfm25 audio on transcription routes", () => {

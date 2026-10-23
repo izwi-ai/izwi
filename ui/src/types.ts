@@ -94,6 +94,14 @@ function isGraniteSpeechAsrVariant(variant: string): boolean {
   );
 }
 
+function isGraniteSpeech5AsrVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "granite-speech-5.0-2b" ||
+    normalized === "ibm-granite/granite-speech-5.0-2b"
+  );
+}
+
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -175,6 +183,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
       isGraniteSpeechAsrVariant(variant) ||
+      isGraniteSpeech5AsrVariant(variant) ||
       isNemotronAsrVariant(variant) ||
       isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||

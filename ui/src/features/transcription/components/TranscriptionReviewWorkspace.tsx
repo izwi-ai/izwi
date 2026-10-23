@@ -42,7 +42,12 @@ interface TranscriptionReviewWorkspaceProps {
     | "summary_error"
     | "summary_updated_at"
   > &
-    Partial<Pick<TranscriptionRecord, "processing_time_ms" | "rtf">> | null;
+    Partial<
+      Pick<
+        TranscriptionRecord,
+        "processing_time_ms" | "rtf" | "target_language"
+      >
+    > | null;
   audioUrl?: string | null;
   loading?: boolean;
   emptyTitle?: string;
@@ -375,6 +380,9 @@ export function TranscriptionReviewWorkspace({
             { label: "Duration", value: formatClockDuration(record.duration_secs) },
             { label: "Words", value: wordCount },
             { label: "Language", value: record.language || "Unknown" },
+            ...(record.target_language
+              ? [{ label: "Translated to", value: record.target_language }]
+              : []),
             {
               label: "Timestamps",
               value: timestamped

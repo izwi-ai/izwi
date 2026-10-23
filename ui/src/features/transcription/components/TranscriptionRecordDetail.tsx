@@ -254,6 +254,14 @@ export function TranscriptionRecordDetail({
           ? [{ icon: Clock, label: formatClockDuration(record.duration_secs) }]
           : []),
         ...(record.language ? [{ icon: Languages, label: record.language }] : []),
+        ...(record.target_language
+          ? [
+              {
+                icon: Languages,
+                label: `Translated to ${record.target_language}`,
+              },
+            ]
+          : []),
         ...(record.model_id
           ? [
               {

@@ -34,6 +34,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { parseKeywords } from "@/features/speech-text/keywords";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
@@ -60,6 +62,10 @@ interface NewTranscriptionModalProps {
   selectedModel: string | null;
   selectedModelReady: boolean;
   selectedModelStatus?: string | null;
+  /** The selected model translates speech on request. */
+  selectedModelSupportsTranslation?: boolean;
+  /** The selected model accepts a keyword list. */
+  selectedModelSupportsKeywords?: boolean;
   timestampAlignerModelId: string | null;
   timestampAlignerReady: boolean;
   timestampAlignerModelStatus?: string | null;
@@ -87,6 +93,20 @@ const SAA_MODEL_REQUIRED_ERROR =
   "Select and load Granite Speech before creating speaker-attributed ASR.";
 const ALIGNER_MODEL_REQUIRED_ERROR =
   "Load the timestamp aligner model to include timestamps.";
+/** Leave the speech in its own language. */
+const NO_TRANSLATION = "Off";
+/** Languages a translation can target (the server checks the pair). */
+const TRANSLATION_TARGETS = [
+  "English",
+  "French",
+  "German",
+  "Spanish",
+  "Portuguese",
+  "Japanese",
+  "Italian",
+  "Chinese",
+] as const;
+
 const SPEAKER_EXPECTATION_OPTIONS = [
   { value: "auto", label: "Auto" },
   { value: "2", label: "2+" },
@@ -104,6 +124,8 @@ export function NewTranscriptionModal({
   selectedModel,
   selectedModelReady,
   selectedModelStatus = null,
+  selectedModelSupportsTranslation = false,
+  selectedModelSupportsKeywords = false,
   timestampAlignerModelId,
   timestampAlignerReady,
   timestampAlignerModelStatus = null,
@@ -123,6 +145,8 @@ export function NewTranscriptionModal({
   const uploadAbortRef = useRef<AbortController | null>(null);
 
   const [selectedLanguage, setSelectedLanguage] = useState(AUTO_LANGUAGE);
+  const [translationTarget, setTranslationTarget] = useState(NO_TRANSLATION);
+  const [keywordsText, setKeywordsText] = useState("");
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [generateSummary, setGenerateSummary] = useState(false);
@@ -221,11 +245,20 @@ export function NewTranscriptionModal({
     setStreamingEnabled(nextValue);
   }, []);
 
+  const translating =
+    selectedModelSupportsTranslation && translationTarget !== NO_TRANSLATION;
   const streamingUnavailableReason = includeTimestamps
     ? "Streaming is unavailable while timestamps are enabled. Turn timestamps off to stream."
     : null;
-  const timestampsUnavailableReason = streamingEnabled
-    ? "Timestamps are unavailable while streaming is enabled. Turn streaming off to add timestamps."
+  // A translation's words are not the audio's, so the aligner cannot time
+  // them; the server refuses the combination.
+  const timestampsUnavailableReason = translating
+    ? "Timestamps are unavailable for a translation. Turn translation off to add timestamps."
+    : streamingEnabled
+      ? "Timestamps are unavailable while streaming is enabled. Turn streaming off to add timestamps."
+      : null;
+  const translationUnavailableReason = includeTimestamps
+    ? "Translation is unavailable while timestamps are enabled. Turn timestamps off to translate."
     : null;
 
   const requireTimestampAligner = useCallback(() => {
@@ -290,6 +323,9 @@ export function NewTranscriptionModal({
         setUploadState(
           createSpeechTextUploadState(uploadedBlob, uploadFilename, "uploading"),
         );
+        const keywords = selectedModelSupportsKeywords
+          ? parseKeywords(keywordsText)
+          : [];
         const request = {
           audio_file: uploadedBlob,
           audio_filename: uploadFilename,
@@ -298,6 +334,8 @@ export function NewTranscriptionModal({
             ? timestampAlignerModelId || undefined
             : undefined,
           language: languageHint(selectedLanguage),
+          target_language: translating ? translationTarget : undefined,
+          keywords: keywords.length > 0 ? keywords : undefined,
           include_timestamps: includeTimestamps,
           generate_summary: generateSummary,
         };
@@ -459,6 +497,10 @@ export function NewTranscriptionModal({
       includeTimestamps,
       isSpeakerAttributedAsrMode,
       generateSummary,
+      keywordsText,
+      selectedModelSupportsKeywords,
+      translating,
+      translationTarget,
       onClose,
       onCreated,
       onStreamingDelta,
@@ -688,6 +730,49 @@ export function NewTranscriptionModal({
             />
           </CreationField>
 
+          {!isSpeakerAttributedAsrMode && selectedModelSupportsTranslation ? (
+            <CreationField
+              label="Translate to"
+              hint={translationUnavailableReason}
+            >
+              <Select
+                value={translationTarget}
+                onValueChange={setTranslationTarget}
+                disabled={isSubmitting || includeTimestamps}
+              >
+                <SelectTrigger
+                  aria-label="Translate to"
+                  className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
+                >
+                  <SelectValue placeholder="Translate to" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_TRANSLATION}>
+                    Off (transcribe)
+                  </SelectItem>
+                  {TRANSLATION_TARGETS.map((language) => (
+                    <SelectItem key={language} value={language}>
+                      {language}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </CreationField>
+          ) : null}
+
+          {!isSpeakerAttributedAsrMode && selectedModelSupportsKeywords ? (
+            <CreationField label="Keywords">
+              <Textarea
+                aria-label="Keywords"
+                value={keywordsText}
+                onChange={(event) => setKeywordsText(event.target.value)}
+                disabled={isSubmitting}
+                placeholder="Names, products, acronyms — one per line or comma-separated"
+                className="min-h-[72px] text-[13.5px]"
+              />
+            </CreationField>
+          ) : null}
+
           {!isSpeakerAttributedAsrMode ? (
             <>
               <CreationOption
@@ -698,7 +783,7 @@ export function NewTranscriptionModal({
                 }
                 checked={includeTimestamps}
                 onCheckedChange={handleIncludeTimestampsChange}
-                disabled={isSubmitting || streamingEnabled}
+                disabled={isSubmitting || streamingEnabled || translating}
               />
               {includeTimestamps ? (
                 <CreationField label="Timestamp aligner">
