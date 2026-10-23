@@ -6463,6 +6463,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::VibeVoiceAsr => "vibevoice_asr",
         ModelFamily::NemotronAsr => "nemotron_asr",
         ModelFamily::GraniteSpeechAsr => "granite_speech_asr",
+        ModelFamily::GraniteSpeech5Asr => "granite_speech5_asr",
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",

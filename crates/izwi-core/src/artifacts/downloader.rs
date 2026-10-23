@@ -190,7 +190,29 @@ const GRANITE_SPEECH_BASE_FILES: &[&str] = &[
     "tokenizer_config.json",
 ];
 
+/// Granite Speech 5.0 ships one unsharded `model.safetensors` and its audio
+/// settings in `preprocessor_config.json`. `out_llm.safetensors` (a BPE CTC
+/// head for self-speculative decoding), the sample WAV and the card assets
+/// are not needed to serve it; `tokenizer.json` covers the BPE vocabulary.
+const GRANITE_SPEECH_5_FILES: &[&str] = &[
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+/// The exact size of Granite Speech 5.0's `model.safetensors` at the pinned
+/// revision (LFS sha256 `4151269881d2dd82…`).
+const GRANITE_SPEECH_5_MODEL_BYTES: u64 = 4_626_528_224;
+
 fn granite_speech_required_files(variant: ModelVariant) -> &'static [&'static str] {
+    if variant.family() == ModelFamily::GraniteSpeech5Asr {
+        return GRANITE_SPEECH_5_FILES;
+    }
     match variant {
         ModelVariant::GraniteSpeech412B => GRANITE_SPEECH_BASE_FILES,
         _ => GRANITE_SPEECH_PLUS_FILES,
@@ -1120,9 +1142,11 @@ impl ModelDownloader {
                 path.join("nemotron-3.5-asr-streaming-0.6b.nemo").exists()
                     || nemotron_native_artifacts_complete(&path, variant)
             }
-            ModelFamily::GraniteSpeechAsr => granite_speech_required_files(variant)
-                .iter()
-                .all(|file| path.join(file).exists()),
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
+                granite_speech_required_files(variant)
+                    .iter()
+                    .all(|file| path.join(file).exists())
+            }
             ModelFamily::SortformerDiarization => {
                 let nemo_file = match variant {
                     ModelVariant::DiarStreamingSortformer4SpkV21 => {
@@ -1802,7 +1826,9 @@ impl ModelDownloader {
             ModelFamily::NemotronAsr => {
                 vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
             }
-            ModelFamily::GraniteSpeechAsr => granite_speech_files(variant),
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
+                granite_speech_files(variant)
+            }
             ModelFamily::SortformerDiarization => match variant {
                 ModelVariant::Nemotron3Diarization => {
                     vec!["Nemotron-3-Diarization.nemo".to_string()]
@@ -2429,6 +2455,9 @@ impl ModelDownloader {
             }
         } else if let Some(size) = granite_speech_shard_size(variant, file) {
             size
+        } else if variant.family() == ModelFamily::GraniteSpeech5Asr && file == "model.safetensors"
+        {
+            GRANITE_SPEECH_5_MODEL_BYTES
         } else if file.contains("model.safetensors") && !file.contains("index") {
             if matches!(
                 variant,

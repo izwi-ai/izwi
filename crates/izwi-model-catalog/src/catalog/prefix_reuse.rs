@@ -221,6 +221,7 @@ impl ModelFamily {
             | Self::VibeVoiceAsr
             | Self::NemotronAsr
             | Self::GraniteSpeechAsr
+            | Self::GraniteSpeech5Asr
             | Self::SortformerDiarization
             | Self::Qwen3ForcedAligner => excluded(
                 "managed prefix reuse is gated to chat task requests",

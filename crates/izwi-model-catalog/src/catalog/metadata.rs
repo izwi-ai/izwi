@@ -642,6 +642,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::VibeVoiceAsr
                 | crate::catalog::ModelFamily::NemotronAsr
                 | crate::catalog::ModelFamily::GraniteSpeechAsr
+                | crate::catalog::ModelFamily::GraniteSpeech5Asr
         )
     }
 

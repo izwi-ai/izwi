@@ -247,6 +247,8 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
         | ModelFamily::Gemma3Chat
+        // Granite Speech 5.0 is in the catalog before its runtime is wired.
+        | ModelFamily::GraniteSpeech5Asr
         | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
             "{family:?} has no physical ASR route on the generic executor path"
         ))),

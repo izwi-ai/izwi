@@ -32,6 +32,7 @@ impl ModelLifecycleController {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts

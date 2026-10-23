@@ -17,6 +17,9 @@ pub enum ModelFamily {
     VibeVoiceAsr,
     NemotronAsr,
     GraniteSpeechAsr,
+    /// Granite Speech 5.0: the 4.1 encoder, projector and Granite LM shapes
+    /// with a YaRN language model and its own prompt contract.
+    GraniteSpeech5Asr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen3MoeChat,
@@ -43,6 +46,7 @@ impl ModelFamily {
             | Self::Qwen3Asr
             | Self::VibeVoiceAsr
             | Self::GraniteSpeechAsr
+            | Self::GraniteSpeech5Asr
             | Self::Lfm25Audio
             | Self::Voxtral => true,
             Self::ParakeetAsr | Self::NemotronAsr => false,
@@ -75,7 +79,11 @@ impl ModelFamily {
     pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
         matches!(
             self,
-            Self::WhisperAsr | Self::Qwen3Asr | Self::GraniteSpeechAsr | Self::Lfm25Audio
+            Self::WhisperAsr
+                | Self::Qwen3Asr
+                | Self::GraniteSpeechAsr
+                | Self::GraniteSpeech5Asr
+                | Self::Lfm25Audio
         )
     }
 
@@ -97,7 +105,8 @@ impl ModelFamily {
     /// Whether the chunked ASR route can stream this family's text token by
     /// token while a chunk decodes. Granite's chunk decode replays earlier
     /// text as a prefix and may re-decode a looping chunk, so its chunk text is
-    /// known only when the chunk finishes.
+    /// known only when the chunk finishes; Granite Speech 5.0 re-decodes a
+    /// looping or truncated chunk the same way.
     pub fn asr_streams_within_chunk(self) -> bool {
         matches!(
             self,
@@ -394,7 +403,8 @@ impl ModelVariant {
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
-            | ModelFamily::GraniteSpeechAsr => ModelTask::Asr,
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat

@@ -1,0 +1,14 @@
+{
+  "feature_extractor_type": "GraniteSpeechFeatureExtractor",
+  "melspec_kwargs": {
+    "hop_length": 160,
+    "n_fft": 512,
+    "n_mels": 80,
+    "sample_rate": 16000,
+    "win_length": 400
+  },
+  "processor_class": "GraniteSpeechProcessor",
+  "projector_downsample_rate": 5,
+  "projector_window_size": 15,
+  "sampling_rate": 16000
+}

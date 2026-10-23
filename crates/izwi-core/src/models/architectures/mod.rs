@@ -8,6 +8,7 @@
 pub mod fish_s2;
 pub mod gemma3;
 pub mod granite_speech;
+pub mod granite_speech5;
 pub mod kokoro;
 pub mod lfm2;
 pub mod lfm25_audio;
