@@ -4192,6 +4192,8 @@ mod tests {
             residual_multiplier: 0.22,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_parameters: None,
             tie_word_embeddings: Some(true),
             use_cache: true,
             vocab_size: 16,
