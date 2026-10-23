@@ -773,6 +773,72 @@ async fn transcription_jobs_can_be_cancelled_and_retried() {
     assert_eq!(read_json(source).await["processing_status"], "failed");
 }
 
+/// A translation job records its spoken language, target and keywords, and
+/// a retry asks the model for the same translation.
+#[tokio::test]
+async fn a_retried_translation_job_translates_again() {
+    let (state, _temp_dir) = test_state("a_retried_translation_job_translates_again", false);
+    state.lifecycle.mark_ready();
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+    let audio_body = tiny_audio_json_body_with_fields(
+        r#""model":"Granite-Speech-5.0-2B","language":"fr","target_language":"English","keywords":["Izwi","Granite"]"#,
+    );
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(audio_body.as_str()),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created = read_json(created).await;
+    let record_id = created["id"].as_str().expect("record id").to_string();
+    let member = |suffix: &str| format!("/v1/speech-to-text/jobs/{record_id}{suffix}");
+    let cancelled = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/cancel"), None),
+    )
+    .await;
+    assert_eq!(cancelled.status(), StatusCode::OK);
+
+    let retried = send_request(
+        app.clone(),
+        build_request(Method::POST, &member("/reruns"), Some("{}")),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::ACCEPTED);
+    let retried = read_json(retried).await;
+    for record in [&created, &retried] {
+        assert_eq!(record["language"], "fr");
+        assert_eq!(record["target_language"], "English");
+        assert_eq!(record["keywords"], serde_json::json!(["Izwi", "Granite"]));
+    }
+
+    // A model that cannot translate is refused when the job is made.
+    let refused = send_request(
+        app,
+        build_request(
+            Method::POST,
+            "/v1/speech-to-text/jobs?job_kind=transcription",
+            Some(
+                tiny_audio_json_body_with_fields(
+                    r#""model":"Granite-Speech-4.1-2B","target_language":"English""#,
+                )
+                .as_str(),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Deleting a diarization that is still running stops its pipeline.
 #[tokio::test]
 async fn deleting_a_running_diarization_cancels_it() {

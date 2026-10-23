@@ -46,6 +46,7 @@ impl Schema {
                     "repair reasoning stored as summaries, titles and memories",
                 ),
                 (11, "voice session chat threads"),
+                (12, "transcription translation target and keywords"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -208,6 +209,11 @@ async fn apply_migration<C: ConnectionTrait>(
         (Schema::App, 11) => {
             ensure_column(db, &CHAT_THREAD_VOICE_SESSION_COLUMN).await?;
             db.execute_unprepared(HIDE_LEGACY_VOICE_THREADS).await?;
+        }
+        (Schema::App, 12) => {
+            for column in TRANSCRIPTION_TASK_COLUMNS {
+                ensure_column(db, column).await?;
+            }
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1154,6 +1160,22 @@ const CHAT_THREAD_VOICE_SESSION_COLUMN: CompatibilityColumn = CompatibilityColum
 const HIDE_LEGACY_VOICE_THREADS: &str = "UPDATE chat_threads SET voice_session_id = 'legacy' \
      WHERE voice_session_id IS NULL AND title = 'Voice Session'";
 
+/// Migration 12: what a transcription job asked of the model besides its
+/// language, so a retry asks the same: the language it translates into
+/// and the keywords it biases recognition toward.
+const TRANSCRIPTION_TASK_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "target_language",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "keywords_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1689,6 +1711,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     // Migration 10 repairs stored data: an empty schema has none.
     // Migration 11.
     push(&add_column(&CHAT_THREAD_VOICE_SESSION_COLUMN));
+    // Migration 12.
+    for column in TRANSCRIPTION_TASK_COLUMNS {
+        push(&add_column(column));
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1924,6 +1950,33 @@ mod tests {
 
         Migrator::up(db).await.expect("the database upgrades");
         for column in STUDIO_SEGMENT_RENDER_COLUMNS {
+            assert!(table_has_column(db, column.table, column.column)
+                .await
+                .unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_11_gains_the_transcription_task_columns() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        for column in TRANSCRIPTION_TASK_COLUMNS {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                column.table, column.column
+            ))
+            .await
+            .expect("column drops");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 12",
+        )
+        .await
+        .expect("version row deletes");
+
+        Migrator::up(db).await.expect("the database upgrades");
+        for column in TRANSCRIPTION_TASK_COLUMNS {
             assert!(table_has_column(db, column.table, column.column)
                 .await
                 .unwrap());

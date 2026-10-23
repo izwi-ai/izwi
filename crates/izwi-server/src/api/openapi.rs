@@ -1307,6 +1307,21 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         }),
     );
     properties.insert(
+        "target_language".to_string(),
+        json!({
+            "type": "string",
+            "description": "For transcription jobs, translate the speech into this language instead of transcribing it. Only models whose route_capabilities report speech_translation accept it; it cannot be combined with include_timestamps."
+        }),
+    );
+    properties.insert(
+        "keywords".to_string(),
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "For transcription jobs, terms to bias recognition toward. Multipart repeats the field or separates terms with commas or newlines. Only models whose route_capabilities report keyword_biasing accept it."
+        }),
+    );
+    properties.insert(
         "include_timestamps".to_string(),
         json!({
             "type": "boolean",
@@ -2653,6 +2668,22 @@ mod tests {
                     .is_some(),
                 "TranscriptionMultipartRequest should document {field}"
             );
+        }
+    }
+
+    #[test]
+    fn openapi_documents_speech_text_job_translation_and_keywords() {
+        let openapi = document();
+        let content = openapi["paths"]["/v1/speech-to-text/jobs"]["post"]["requestBody"]["content"]
+            .as_object()
+            .expect("job request body content should exist");
+        for content_type in ["application/json", "multipart/form-data"] {
+            let properties = &content[content_type]["schema"]["properties"];
+            assert_eq!(
+                properties["target_language"]["type"].as_str(),
+                Some("string")
+            );
+            assert_eq!(properties["keywords"]["type"].as_str(), Some("array"));
         }
     }
 
