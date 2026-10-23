@@ -269,7 +269,7 @@ impl GraniteSpeech5Runtime {
 
     /// The prompt's token ids with the audio placeholder expanded to one id
     /// per projected audio frame.
-    fn expanded_input_ids(
+    pub(super) fn expanded_input_ids(
         prompt: &GraniteSpeech5Prompt,
         audio_tokens: usize,
         audio_token_id: u32,
@@ -422,6 +422,11 @@ impl GraniteSpeech5Runtime {
             },
             token_ids: generated,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn language_model(&self) -> &GraniteLanguageModel {
+        &self.language_model
     }
 
     /// Prefill logits at transformers' scale, for the parity fixture.

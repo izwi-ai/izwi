@@ -41,6 +41,8 @@ mod precision;
 mod preprocessor;
 mod projector;
 mod prompt;
+#[cfg(test)]
+mod reference_tests;
 mod runtime;
 mod transcript;
 
