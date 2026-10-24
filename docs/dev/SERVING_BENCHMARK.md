@@ -228,6 +228,23 @@ M1 Pro, chat beside a 6-minute Whisper transcription finished in 39 s with lane
 drivers and 57 s without (the transcription took 32 s and 37 s); its p95
 inter-delta gap stayed about 1.8 s either way.
 
+A mixed soak decides the lane-driver default. One server ran, all at once,
+a chat sweep (LFM2.5, 64 prompts of 256 words, 128 output tokens, 0.5 req/s),
+an ASR load (Qwen3-ASR, 24 mixed clips, 0.3 req/s), a TTS load (Kokoro, 24
+inputs, 0.3 req/s) and four real-time Nemotron sessions. M1 Pro, one run each:
+
+| Metric | Lane drivers | One step driver |
+|---|---|---|
+| ASR latency p50 / p95 | 0.92 / 2.13 s | 0.99 / 2.32 s |
+| TTS latency p50 / p95 | 1.48 / 3.40 s | 2.77 / 4.17 s |
+| Realtime: last frame to final transcript | 1.4-3.7 s | 0.8-1.2 s |
+| Chat TTFT p50 | 21.0 s | 11.6 s |
+| Chat ITL p50 / p95 / max | 42 / 475 / 6,877 ms | 32 / 333 / 15,059 ms |
+
+Every ASR and TTS response matched its solo output in both, and nothing
+failed. Lane drivers help TTS and the worst chat gap, and cost chat TTFT,
+typical inter-token latency and realtime lag, so they stay off by default.
+
 Measured on an M-series Mac (Metal, LFM2.5-1.2B-Instruct Q4_K_M chat at
 `--request-rate 2 --num-prompts 16`, 128 tokens in and out, beside a
 26-minute Whisper-Large-v3-Turbo transcription started 4 s before the chat
@@ -293,13 +310,13 @@ Measured on an M1 Pro (Metal, one run each, at `--request-rate inf`):
 | Qwen3-ASR-0.6B (GGUF) | 16 clips, 2-20 s | 18.2 | 21.3 | 16/16 exact |
 | Granite Speech 5.0 2B (GGUF) | 12 clips, 2-20 s | 7.1 | 7.3 | 12/12 exact |
 | Kokoro-82M | 16 inputs, 4-40 words | 6.5 | 6.5 | 16/16 exact |
-| Qwen3-TTS 0.6B CustomVoice, greedy | 12 inputs, 4-30 words | 0.62 | 0.82 | 8/12 |
+| Qwen3-TTS 0.6B CustomVoice, greedy | 12 inputs, 4-30 words | 0.60 | 0.87 | 12/12 exact |
 
 Kokoro and Granite 5 gain nothing under load. Granite 5 runs one request at
 a time, and Kokoro's decoder batches only rows of equal duration, which
-mixed inputs rarely are. Qwen3-TTS gains about a third, but four of twelve
-greedy outputs differ from their solo audio: its batched path does not yet
-reproduce single-request output.
+mixed inputs rarely are. Qwen3-TTS gains about 45%. Before the Metal GQA
+decode kernel split each row by its own context, four of its twelve greedy
+outputs differed from their solo audio.
 
 ## Regression check per backend
 

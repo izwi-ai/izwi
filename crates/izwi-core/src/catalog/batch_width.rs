@@ -21,8 +21,8 @@ use crate::backends::BackendKind;
 /// The width every family has been served at on CPU and Metal.
 pub(crate) const PORTABLE_BASELINE_WIDTH: usize = 2;
 
-/// The CUDA ceiling: the kernel and metadata width limit, not a measured
-/// width.
+/// The CUDA ceiling: a policy constant, not a kernel or metadata limit and
+/// not a measured width.
 pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 
 /// The widest decode batch `family` is certified for on `backend`. The
