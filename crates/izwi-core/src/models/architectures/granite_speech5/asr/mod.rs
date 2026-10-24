@@ -329,8 +329,8 @@ impl GraniteSpeech5AsrModel {
     }
 
     /// The invocation state for the loaded ASR capability's stage graphs:
-    /// each must be the single atomic stage, which leases one paged decoder
-    /// cache of the model's full context.
+    /// each must be the single invocation stage, which leases one paged
+    /// decoder cache of the model's full context per chunk.
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -581,8 +581,8 @@ fn granite_speech5_physical_state_spec(
                 .into(),
         ));
     }
-    // One unbatched stage per graph: the scalar ASR stage, which plans
-    // long audio's chunks inside its dispatch. Sequence stages would need
+    // One unbatched stage per graph: the chunked atomic ASR stage, one
+    // invocation per chunk of long audio. Sequence stages would need
     // retained decoder state this family does not author.
     let invocation_only = |stages: &[StageDescriptor]| {
         stages.len() == 1

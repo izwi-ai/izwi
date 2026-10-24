@@ -613,6 +613,19 @@ fn scalar_contract(
     {
         stage.selector = StageWorkSelector::Pipeline { ordinal: None };
     }
+    // A scalar ASR family that dispatches long audio by chunk has one graph,
+    // the chunked atomic stage, for every request: each invocation leases
+    // its own decoder state, and a long file yields the device between its
+    // chunks. A short file finishes in its first dispatch.
+    if metadata.capability == CapabilityKind::Asr
+        && metadata
+            .model_variant
+            .family()
+            .dispatches_long_form_asr_by_chunk()
+    {
+        stage.selector = StageWorkSelector::Atomic;
+        dispatch_long_form_asr_by_chunk(&mut stage, &metadata, "asr.long_form.chunked");
+    }
     stage.output_visibility = output_visibility_for(
         streaming.transport_output,
         execution_profile.mode,

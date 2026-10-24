@@ -954,6 +954,7 @@ fn bind_request_to_residency(
                 | ModelFamily::WhisperAsr
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()

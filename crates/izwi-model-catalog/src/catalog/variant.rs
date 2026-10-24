@@ -73,13 +73,17 @@ impl ModelFamily {
     /// of one file instead of holding it for the whole file. The chunks run
     /// on the chunk executor, whose state between chunks is host-only.
     /// VibeVoice's load-sealed state spec authenticates its long-form graph
-    /// as one atomic stage; offline Voxtral, Nemotron and Granite Speech 5.0
-    /// plan their chunks inside the dispatch (no prepared long-form route);
-    /// Parakeet never chunks. Those keep one dispatch per file.
+    /// as one atomic stage; offline Voxtral and Nemotron plan their chunks
+    /// inside the dispatch (no prepared long-form route); Parakeet never
+    /// chunks. Those keep one dispatch per file.
     pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
         matches!(
             self,
-            Self::WhisperAsr | Self::Qwen3Asr | Self::GraniteSpeechAsr | Self::Lfm25Audio
+            Self::WhisperAsr
+                | Self::Qwen3Asr
+                | Self::GraniteSpeechAsr
+                | Self::GraniteSpeech5Asr
+                | Self::Lfm25Audio
         )
     }
 
@@ -1335,7 +1339,7 @@ mod tests {
             ModelFamily::GraniteSpeech5Asr
         );
         assert!(ModelFamily::GraniteSpeech5Asr.hallucinates_on_non_speech());
-        assert!(!ModelFamily::GraniteSpeech5Asr.dispatches_long_form_asr_by_chunk());
+        assert!(ModelFamily::GraniteSpeech5Asr.dispatches_long_form_asr_by_chunk());
         assert!(!ModelFamily::GraniteSpeech5Asr.asr_streams_within_chunk());
     }
 

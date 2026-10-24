@@ -2485,6 +2485,63 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
     }
 }
 
+/// Granite Speech 5.0 runs on the scalar adapter, whose ASR graph is the
+/// chunked atomic stage for every request: a long file dispatches one chunk
+/// at a time (it used to hold the device for the whole file), and the normal
+/// and long-form requirements seal the same graph, so the load keeps one
+/// invocation pool. Nemotron's scalar ASR keeps its single-dispatch stage.
+#[test]
+fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::GraniteSpeech502B,
+            backend,
+        )
+        .unwrap();
+        let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        for contract in [&normal, &long] {
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+            assert_eq!(contract.stages.len(), 1);
+            let stage = &contract.stages[0];
+            assert_eq!(stage.name, "asr.long_form.chunked", "{backend:?}");
+            assert_eq!(stage.selector, StageWorkSelector::Atomic);
+            assert_eq!(stage.progress, StageProgressKind::Iterative);
+            assert_eq!(
+                stage.membership_safe_point,
+                MembershipSafePoint::QuantumBoundary
+            );
+        }
+        assert_eq!(
+            crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+        );
+    }
+    let nemotron = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(7),
+        ModelInstanceId::new(2),
+        ModelVariant::Nemotron35AsrStreaming06B,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let scalar = nemotron
+        .capabilities
+        .get(&CapabilityKind::Asr)
+        .unwrap()
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(scalar.stages[0].name, "asr.scalar");
+    assert_eq!(scalar.stages[0].progress, StageProgressKind::Atomic);
+}
+
 #[test]
 fn whisper_normal_and_long_form_graphs_are_distinct_and_scalar() {
     let registry = RuntimeAdapterRegistry::built_in();
