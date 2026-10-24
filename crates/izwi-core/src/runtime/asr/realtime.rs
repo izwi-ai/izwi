@@ -543,43 +543,29 @@ impl RuntimeService {
             session_lease,
             _guard: operation_guard,
         } = handles;
-        let observation_job = job.clone();
-        let result = run_realtime_blocking_operation(
-            &self.coordinator,
-            &job,
-            execution_contract,
-            operation_gate,
-            "asr.realtime.push",
-            || {
-                // The ordering guard is held before this allocation, bounding
-                // each stream to one owned packet even after caller timeout.
-                let samples = samples.to_vec();
-                Ok(move || {
-                    let _operation_lease = operation_lease;
-                    let _session_lease = session_lease;
-                    let _operation_guard = operation_guard;
-                    let mut state = state.lock().map_err(|_| {
-                        Error::InferenceError("realtime ASR state mutex poisoned".to_string())
-                    })?;
-                    // Streaming internals replace and release model-owned
-                    // tensors while decoding. Restore the full pending claim
-                    // before entering that transition so any physical frees
-                    // cannot be observed as unclaimed headroom.
-                    observation_job
-                        .prepare_materialized_release(JobResourceObservation::default())?;
-                    let events = state.transact(model.as_ref(), |native| {
-                        model.push_realtime_stream_samples(native, &samples, sample_rate)
-                    });
-                    observation_job.record_materialized_usage(
-                        realtime_state_with_input_observation(&state.native, samples.capacity())?,
-                    )?;
-                    let steady_usage = realtime_state_observation(&state.native)?;
-                    observation_job.prepare_materialized_release(steady_usage)?;
-                    drop(samples);
-                    events
-                })
-            },
-        )
+        let result = async {
+            // The ordering guard is held before this allocation, bounding
+            // each stream to one owned packet even after caller timeout.
+            let ordering = self
+                .coordinator
+                .acquire_job_ordering(&job, operation_gate)
+                .await?;
+            self.push_realtime_batched(RealtimePush {
+                model,
+                contract: execution_contract,
+                job,
+                state,
+                samples: samples.to_vec(),
+                sample_rate,
+                _holds: RealtimePushHolds {
+                    _ordering: ordering,
+                    _residency: operation_lease,
+                    _session: session_lease,
+                    _operation: operation_guard,
+                },
+            })
+            .await
+        }
         .await;
         if let Err(err) = &result {
             if matches!(err, Error::Timeout(_)) {

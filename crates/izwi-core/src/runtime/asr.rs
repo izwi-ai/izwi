@@ -70,9 +70,11 @@ use crate::serve_runtime::{
 use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 mod realtime;
+mod realtime_push;
 mod realtime_session;
 mod speaker_attribution;
 mod transcribe;
+use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
 use realtime_session::{
     add_realtime_stream_reservation, map_native_realtime_events, realtime_asr_execution_path,
     realtime_segment_rollover_due, realtime_state_observation,
@@ -80,9 +82,9 @@ use realtime_session::{
     realtime_trailing_quiet_samples, release_realtime_asr_cleanup, run_realtime_blocking_operation,
     spawn_realtime_asr_watchdog, validate_realtime_input_copy,
     voxtral_realtime_committed_observation, voxtral_realtime_preparation_cost,
-    RealtimeAsrEngineOperationHandles, RealtimeAsrOperationHandles, RealtimeAsrSessionLease,
-    RealtimeEngineSegment, RuntimeAsrRealtimeResources, RuntimeAsrRealtimeState,
-    RuntimeEngineRealtimeSession,
+    RealtimeAsrEngineOperationHandles, RealtimeAsrOperationGuard, RealtimeAsrOperationHandles,
+    RealtimeAsrSessionLease, RealtimeEngineSegment, RuntimeAsrRealtimeResources,
+    RuntimeAsrRealtimeState, RuntimeEngineRealtimeSession,
 };
 #[cfg(test)]
 use realtime_session::{
@@ -656,6 +658,8 @@ pub(super) struct RealtimeAsrSessionLimits {
 pub(super) struct RealtimeAsrSessionPolicy {
     limits: RealtimeAsrSessionLimits,
     permits: Arc<Semaphore>,
+    /// Direct-path pushes waiting to run with other streams' pushes.
+    pushes: Arc<RealtimePushBatcher<RealtimePushRow>>,
 }
 
 pub struct RuntimeAsrRealtimeStream {

@@ -89,6 +89,7 @@ impl RealtimeAsrSessionPolicy {
         Ok(Self {
             permits: Arc::new(Semaphore::new(limits.max_sessions)),
             limits,
+            pushes: Arc::default(),
         })
     }
 
@@ -278,6 +279,84 @@ impl RuntimeAsrRealtimeState {
                 );
             }
             self.physical.abort();
+        }
+        result
+    }
+
+    /// [`Self::transact`] over several streams of one model: every row
+    /// hydrates, one operation runs over all of them, then every row stages
+    /// and commits. A failure rolls back every row that has not committed;
+    /// the rows are untouched unless the commit itself failed part way.
+    pub(super) fn transact_batch<T>(
+        rows: &mut [&mut Self],
+        model: &NativeAsrModel,
+        operation: impl FnOnce(&mut [&mut NativeAsrRealtimeState]) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let checkpoints = rows
+            .iter()
+            .map(|row| match &row.native {
+                NativeAsrRealtimeState::Nemotron(state) => {
+                    NativeAsrRealtimeState::Nemotron(state.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = (|| {
+            let mut transactions = Vec::with_capacity(rows.len());
+            for row in rows.iter_mut() {
+                transactions.push(row.physical.begin()?);
+            }
+            for (row, &transaction) in rows.iter_mut().zip(&transactions) {
+                model.hydrate_realtime_physical_state(
+                    &mut row.native,
+                    &row.physical.runtime,
+                    transaction,
+                )?;
+            }
+            let outputs = {
+                let mut natives = rows
+                    .iter_mut()
+                    .map(|row| &mut row.native)
+                    .collect::<Vec<_>>();
+                operation(&mut natives)?
+            };
+            if outputs.len() != rows.len() {
+                return Err(Error::InferenceError(
+                    "realtime ASR batch returned the wrong number of rows".into(),
+                ));
+            }
+            let mut revisions = Vec::with_capacity(rows.len());
+            for (row, &transaction) in rows.iter_mut().zip(&transactions) {
+                let revision = row.physical.revision.checked_add(1).ok_or_else(|| {
+                    Error::InferenceError("realtime ASR physical revision overflowed".into())
+                })?;
+                model.stage_realtime_physical_state(
+                    &mut row.native,
+                    &row.physical.runtime,
+                    transaction,
+                    revision,
+                )?;
+                revisions.push(revision);
+            }
+            for ((row, &transaction), revision) in rows.iter_mut().zip(&transactions).zip(revisions)
+            {
+                row.physical.commit(transaction, revision)?;
+            }
+            Ok(outputs)
+        })();
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                if row.physical.active_transaction.is_none() {
+                    continue;
+                }
+                row.native = checkpoint;
+                if let Err(error) = model.clear_realtime_tensor_handles(&mut row.native) {
+                    tracing::error!(
+                        error = %error,
+                        "failed to drain Nemotron tensor handles after aborted operation"
+                    );
+                }
+                row.physical.abort();
+            }
         }
         result
     }

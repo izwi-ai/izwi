@@ -4226,4 +4226,114 @@ mod tests {
             .as_u64()
             .is_some_and(|frames| frames > 0));
     }
+
+    /// Two streams pushed together through the realtime cohort give the
+    /// same events as each stream pushed alone.
+    #[test]
+    #[ignore = "requires local Nemotron-3.5-ASR-Streaming-0.6B assets and loads a 2.4 GB checkpoint"]
+    fn nemotron_local_cohort_push_matches_solo_streams_if_available() {
+        let models_root = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("izwi")
+                    .join("models")
+            });
+        let model_dir = models_root.join(ModelVariant::Nemotron35AsrStreaming06B.dir_name());
+        if !model_dir
+            .join("nemotron-native")
+            .join("model_weights.ckpt")
+            .exists()
+        {
+            eprintln!("Skipping Nemotron cohort test, checkpoint not found");
+            return;
+        }
+        let device = DeviceSelector::detect_with_preference(Some("cpu")).expect("cpu device");
+        let model =
+            NemotronAsrModel::load(&model_dir, ModelVariant::Nemotron35AsrStreaming06B, device)
+                .expect("Nemotron ASR model should load");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let read = |name: &str| {
+            let mut reader = hound::WavReader::open(fixtures.join(name)).expect("fixture wav");
+            let rate = reader.spec().sample_rate;
+            let samples = reader
+                .samples::<i16>()
+                .map(|sample| f32::from(sample.expect("pcm16 sample")) / 32768.0)
+                .take(rate as usize * 6)
+                .collect::<Vec<_>>();
+            (samples, rate)
+        };
+        let clips = [read("test.wav"), read("fox.wav")];
+        let chunks = |(samples, rate): &(Vec<f32>, u32)| {
+            samples
+                .chunks(*rate as usize * 2 / 5)
+                .map(<[f32]>::to_vec)
+                .collect::<Vec<_>>()
+        };
+        let pushes = clips.iter().map(chunks).collect::<Vec<_>>();
+        let new_state = || {
+            model
+                .start_stream_state(Some("English"), None, None)
+                .expect("stream")
+        };
+        let flatten = |events: Vec<Vec<NemotronRealtimeStreamEvent>>| {
+            events.into_iter().flatten().collect::<Vec<_>>()
+        };
+
+        let solo = clips
+            .iter()
+            .zip(&pushes)
+            .map(|((_, rate), chunks)| {
+                let mut state = new_state();
+                let mut events = chunks
+                    .iter()
+                    .map(|chunk| {
+                        model
+                            .push_stream_samples(&mut state, chunk, *rate)
+                            .expect("push")
+                    })
+                    .collect::<Vec<_>>();
+                events.push(model.finish_stream(&mut state).expect("finish"));
+                flatten(events)
+            })
+            .collect::<Vec<_>>();
+
+        let mut states = [new_state(), new_state()];
+        let mut together = [Vec::new(), Vec::new()];
+        let rounds = pushes.iter().map(Vec::len).max().unwrap_or(0);
+        for round in 0..=rounds {
+            let mut rows = states
+                .iter_mut()
+                .zip(&pushes)
+                .zip(&clips)
+                .map(|((state, chunks), (_, rate))| NemotronRealtimeBatchRow {
+                    state,
+                    input: match chunks.get(round) {
+                        Some(chunk) => NemotronRealtimeBatchInput::Push {
+                            samples: chunk,
+                            sample_rate: *rate,
+                        },
+                        None if round == rounds => NemotronRealtimeBatchInput::Finish,
+                        None => NemotronRealtimeBatchInput::Push {
+                            samples: &[],
+                            sample_rate: *rate,
+                        },
+                    },
+                })
+                .collect::<Vec<_>>();
+            let events = model.run_realtime_batch(&mut rows).expect("cohort push");
+            for (row, events) in together.iter_mut().zip(events) {
+                row.extend(events);
+            }
+        }
+
+        assert!(solo
+            .iter()
+            .all(|events| events.iter().any(|event| !event.text.is_empty())));
+        assert_eq!(together[0], solo[0], "test.wav pushed with fox.wav");
+        assert_eq!(together[1], solo[1], "fox.wav pushed with test.wav");
+    }
 }

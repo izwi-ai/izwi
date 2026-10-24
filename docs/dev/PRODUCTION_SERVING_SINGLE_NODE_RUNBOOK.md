@@ -925,6 +925,20 @@ that a Nemotron or Parakeet load allocates up front. Nemotron's arena is
 about 74 MB per session in F32, all of it held while the model is resident.
 Size the count from the concurrency you need, not as high as possible.
 
+Nemotron decodes concurrent sessions together. Audio that arrives while the
+model is busy waits, and the next device job carries every waiting session
+through one model call; an idle model runs a lone session's audio at once.
+On an M1 Pro (Metal) with 20 ms frames at real time:
+
+| Sessions | Pushed one at a time | Batched |
+|---|---|---|
+| 8 | final transcript 1.22 s after the last frame (max 1.60 s) | 0.87 s (max 1.24 s) |
+| 12 | 14.3 s behind | 7.1 s behind |
+| 16 | falls behind until input queues overflow (32 times) | still falls behind (4 overflows) |
+
+Transcripts were identical in every run. On that machine, size
+`IZWI_ASR_REALTIME_MAX_SESSIONS` at 8 or fewer for real-time results.
+
 Voxtral rolls its stream over at a pause before the model's ceiling, and
 Nemotron's streaming state is bounded. The lifetime therefore only reaps a
 session that is never closed; it does not limit transcript length.
