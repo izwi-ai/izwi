@@ -18,7 +18,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build the React UI
 # -----------------------------------------------------------------------------
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS ui-builder
+FROM node:26.11.1-trixie-slim@sha256:193fe51b64e77981119c98c2002c9e32a70e2f006fb4d25068ce0558998917f0 AS ui-builder
 
 WORKDIR /app/ui
 
@@ -84,7 +84,7 @@ RUN --mount=type=cache,id=izwi-cargo-registry,target=/usr/local/cargo/registry,s
 # digest-pinned rust image above rather than fetched with curl | sh; rustup's
 # release binaries run on any glibc distribution.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04@sha256:0230b7f243483cb15969fa3cc724a9459599604427052fc2a0d4291c7c0647dd AS rust-builder-cuda
+FROM nvidia/cuda:13.4.2-cudnn-devel-ubuntu24.04@sha256:30d7f07218b81ab2df50a2bec77ddc096ed12023f6d478331ba9875409c4f1aa AS rust-builder-cuda
 ARG TARGETARCH
 ARG CUDA_COMPUTE_CAP=80
 ARG IZWI_CUDA_FEATURES=cuda,cudnn
@@ -182,7 +182,7 @@ CMD ["izwi-server"]
 # -----------------------------------------------------------------------------
 # Stage 5: Production runtime with CUDA support (Docker-only CUDA artifact)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04@sha256:14f6d08d1cd4a96effbfe3101d0b56326f552c199d05e4979ee0bd616df5811b AS production-cuda
+FROM nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04@sha256:2aa09bb7626c4bff7d0a08b0028edb8dc254d0252a8b67cd386966a864fafac2 AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)" \
       org.opencontainers.image.description="Rust-native audio inference engine with CUDA support" \
