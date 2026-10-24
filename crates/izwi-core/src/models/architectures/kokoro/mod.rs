@@ -313,12 +313,27 @@ fn normalize_kokoro_speed(speed: f32) -> Result<f32> {
     Ok(speed.clamp(KOKORO_MIN_SPEED, KOKORO_MAX_SPEED))
 }
 
-fn kokoro_static_token_buckets(prepared: &[KokoroPreparedRequest]) -> Vec<Vec<usize>> {
+/// Rows grouped by exact token width, each group cut into native launches of
+/// at most `max_rows`: the engine may co-batch more rows than one backend
+/// launch takes (the CPU's native width is one), and those rows still run, one
+/// launch after another, inside the same dispatch.
+fn kokoro_static_token_buckets(
+    prepared: &[KokoroPreparedRequest],
+    max_rows: usize,
+) -> Vec<Vec<usize>> {
     let mut buckets = BTreeMap::<usize, Vec<usize>>::new();
     for (index, row) in prepared.iter().enumerate() {
         buckets.entry(row.token_ids.len()).or_default().push(index);
     }
-    buckets.into_values().collect()
+    buckets
+        .into_values()
+        .flat_map(|bucket| {
+            bucket
+                .chunks(max_rows.max(1))
+                .map(<[usize]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn kokoro_duration_buckets(expanded_frames: &[usize]) -> Vec<Vec<usize>> {
@@ -869,15 +884,8 @@ impl KokoroTtsModel {
         if prepared.is_empty() {
             return Ok(Vec::new());
         }
-        let max_batch_size = self.max_native_batch_size();
-        if prepared.len() > max_batch_size {
-            return Err(Error::Overloaded(format!(
-                "Kokoro native batch width {} exceeds this backend's static limit {max_batch_size}",
-                prepared.len()
-            )));
-        }
         let mut results = vec![None; prepared.len()];
-        let token_buckets = kokoro_static_token_buckets(prepared);
+        let token_buckets = kokoro_static_token_buckets(prepared, self.max_native_batch_size());
         for bucket in token_buckets {
             self.generate_token_bucket(prepared, &bucket, &mut results)?;
         }
@@ -1510,8 +1518,32 @@ mod tests {
             prepared_with_width(3),
         ];
         assert_eq!(
-            kokoro_static_token_buckets(&prepared),
+            kokoro_static_token_buckets(&prepared, 8),
             vec![vec![1, 4], vec![3], vec![0, 2]]
+        );
+    }
+
+    #[test]
+    fn token_buckets_wider_than_the_native_width_split_into_launches() {
+        // The engine co-batches two rows on the CPU, whose native Kokoro width
+        // is one: both rows must still run, as two launches, not fail the batch.
+        let prepared = vec![
+            prepared_with_width(7),
+            prepared_with_width(7),
+            prepared_with_width(3),
+            prepared_with_width(7),
+        ];
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 1),
+            vec![vec![2], vec![0], vec![1], vec![3]]
+        );
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 2),
+            vec![vec![2], vec![0, 1], vec![3]]
+        );
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 0),
+            kokoro_static_token_buckets(&prepared, 1)
         );
     }
 
