@@ -73,6 +73,7 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
         | ModelFamily::VibeVoiceAsr
         | ModelFamily::NemotronAsr
         | ModelFamily::GraniteSpeechAsr
+        | ModelFamily::GraniteSpeech5Asr
         | ModelFamily::Qwen3ForcedAligner => {
             registry.load_asr(variant, model_path, reload_gate).await?;
             InstantiatedPayload::None

@@ -37,6 +37,10 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    GraniteSpeech5AsrModel, GraniteSpeech5GenerationOptions, GraniteSpeech5PhysicalStateSpec,
+    GraniteSpeech5RequestOptions, GraniteSpeech5Transcription, GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
+};
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::{
     ChatDecodeState as Lfm2ChatDecodeState, ChatDecodeStep as Lfm2ChatDecodeStep,
@@ -304,6 +308,17 @@ fn load_granite_speech_asr_model(
     )?))
 }
 
+fn load_granite_speech5_asr_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
+) -> Result<NativeAsrModel> {
+    Ok(NativeAsrModel::GraniteSpeech5(
+        GraniteSpeech5AsrModel::load(model_dir, variant, device)?,
+    ))
+}
+
 fn load_qwen_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -524,6 +539,11 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         family: ModelFamily::GraniteSpeechAsr,
         loader: load_granite_speech_asr_model,
     },
+    AsrLoaderRegistration {
+        name: "granite_speech5_asr",
+        family: ModelFamily::GraniteSpeech5Asr,
+        loader: load_granite_speech5_asr_model,
+    },
 ];
 
 const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[AudioChatLoaderRegistration {
@@ -627,6 +647,7 @@ fn resolve_asr_loader_registration(
         ModelFamily::WhisperAsr => ModelFamily::WhisperAsr,
         ModelFamily::VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
         ModelFamily::GraniteSpeechAsr => ModelFamily::GraniteSpeechAsr,
+        ModelFamily::GraniteSpeech5Asr => ModelFamily::GraniteSpeech5Asr,
         _ => return None,
     };
 
@@ -723,6 +744,7 @@ pub enum NativeAsrModel {
     WhisperTurbo(WhisperTurboAsrModel),
     VibeVoice(VibeVoiceAsrModel),
     GraniteSpeech(GraniteSpeechAsrModel),
+    GraniteSpeech5(GraniteSpeech5AsrModel),
 }
 
 pub(crate) fn reject_foreign_whisper_prefill(
@@ -743,7 +765,8 @@ impl InferenceStateContractProvider for NativeAsrModel {
             | Self::Nemotron(_)
             | Self::WhisperTurbo(_)
             | Self::VibeVoice(_)
-            | Self::GraniteSpeech(_) => Ok(InferenceStateCapability::Stateless),
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_) => Ok(InferenceStateCapability::Stateless),
         }
     }
 }
@@ -1361,6 +1384,23 @@ impl NativeAsrModel {
                     cache,
                 )
             }
+            Self::GraniteSpeech5(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_granite_speech5_physical(
+                    audio,
+                    sample_rate,
+                    &GraniteSpeech5RequestOptions {
+                        language: language.map(str::to_string),
+                        prompt: prompt.map(str::to_string),
+                        ..GraniteSpeech5RequestOptions::default()
+                    },
+                    options,
+                    cache,
+                    None,
+                )
+            }
             Self::Parakeet(_) => {
                 let state = leases
                     .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)?
@@ -1382,6 +1422,58 @@ impl NativeAsrModel {
                 )
             }
         }
+    }
+
+    pub(crate) fn granite_speech5_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<GraniteSpeech5PhysicalStateSpec> {
+        match self {
+            Self::GraniteSpeech5(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Granite-Speech-5.0 ASR model cannot author its physical state".to_string(),
+            )),
+        }
+    }
+
+    /// One Granite Speech 5.0 invocation on its lifecycle-owned paged cache;
+    /// with `on_delta`, text streams as it decodes.
+    pub(crate) fn transcribe_granite_speech5_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &GraniteSpeech5RequestOptions,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech5(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech 5.0 physical ASR pages were routed to a different model"
+                    .to_string(),
+            ));
+        };
+        let GraniteSpeech5Transcription {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_physical(
+            audio,
+            sample_rate,
+            request,
+            GraniteSpeech5GenerationOptions {
+                max_new_tokens: options.max_new_tokens,
+                stop_token_ids: options.stop_token_ids,
+                stop_sequences: options.stop_sequences,
+            },
+            cache,
+            on_delta,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
     }
 
     pub(crate) fn nemotron_offline_physical_state_spec(
@@ -2054,6 +2146,10 @@ impl NativeAsrModel {
                 prompt,
                 on_delta,
             ),
+            Self::GraniteSpeech5(_) => Err(Error::InferenceError(
+                "Granite Speech 5.0 ASR requires a lifecycle-owned physical invocation cache"
+                    .into(),
+            )),
             Self::GraniteSpeech(model) => model.transcribe_with_callback_and_prompt(
                 audio,
                 sample_rate,
@@ -2119,6 +2215,10 @@ impl NativeAsrModel {
         prompt: Option<&str>,
     ) -> Result<NativeAsrTranscription> {
         match self {
+            Self::GraniteSpeech5(_) => Err(Error::InferenceError(
+                "Granite Speech 5.0 ASR requires a lifecycle-owned physical invocation cache"
+                    .into(),
+            )),
             Self::Qwen3(model) => {
                 let Qwen3AsrTranscriptionOutput {
                     text,
@@ -2624,6 +2724,7 @@ impl NativeAsrModel {
             Self::WhisperTurbo(model) => model.max_audio_seconds_hint(),
             Self::VibeVoice(model) => model.max_audio_seconds_hint(),
             Self::GraniteSpeech(model) => model.max_audio_seconds_hint(),
+            Self::GraniteSpeech5(model) => model.max_audio_seconds_hint(),
         }
     }
 
@@ -2643,6 +2744,12 @@ impl NativeAsrModel {
                     max_chunk_seconds: plan.max_chunk_seconds,
                 }
             }
+            // IBM decodes segments of up to about two minutes; longer audio
+            // is cut by the generic chunk planner.
+            Self::GraniteSpeech5(_) => AsrInvocationWindow {
+                max_audio_seconds: Some(GRANITE_SPEECH5_MAX_AUDIO_SECONDS),
+                max_chunk_seconds: None,
+            },
             Self::Qwen3(_)
             | Self::Parakeet(_)
             | Self::Nemotron(_)
@@ -2667,6 +2774,7 @@ impl NativeAsrModel {
             Self::WhisperTurbo(_) => None,
             Self::VibeVoice(model) => Some(model.audio_token_rate()),
             Self::GraniteSpeech(model) => Some(model.audio_token_rate()),
+            Self::GraniteSpeech5(model) => Some(model.audio_token_rate()),
         }
     }
 
@@ -2728,7 +2836,7 @@ impl NativeAsrModel {
             Self::VibeVoice(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
-            Self::GraniteSpeech(_) => Err(Error::InvalidInput(
+            Self::GraniteSpeech(_) | Self::GraniteSpeech5(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
         }
@@ -6463,6 +6571,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::VibeVoiceAsr => "vibevoice_asr",
         ModelFamily::NemotronAsr => "nemotron_asr",
         ModelFamily::GraniteSpeechAsr => "granite_speech_asr",
+        ModelFamily::GraniteSpeech5Asr => "granite_speech5_asr",
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",
@@ -6486,6 +6595,7 @@ fn native_asr_model_kind(model: &NativeAsrModel) -> &'static str {
         NativeAsrModel::WhisperTurbo(_) => "whisper_turbo_asr",
         NativeAsrModel::VibeVoice(_) => "vibevoice_asr",
         NativeAsrModel::GraniteSpeech(_) => "granite_speech_asr",
+        NativeAsrModel::GraniteSpeech5(_) => "granite_speech5_asr",
     }
 }
 
@@ -6503,6 +6613,12 @@ fn native_asr_runtime_diagnostics(
             (actual_runtime, Some(diagnostics))
         }
         NativeAsrModel::GraniteSpeech(model) => {
+            let diagnostics = model.diagnostics_summary();
+            let actual_runtime =
+                LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");
+            (actual_runtime, Some(diagnostics))
+        }
+        NativeAsrModel::GraniteSpeech5(model) => {
             let diagnostics = model.diagnostics_summary();
             let actual_runtime =
                 LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");

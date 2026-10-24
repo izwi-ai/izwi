@@ -2252,6 +2252,7 @@ fn spawn_turn_task(
                                 Some(&asr_model_id),
                                 asr_language.as_deref(),
                                 None,
+                                izwi_core::AsrTaskOptions::default(),
                                 None,
                                 Some(&correlation_id),
                                 runtime_context,

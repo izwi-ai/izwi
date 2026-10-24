@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 44;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 46;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 63;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 65;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -449,7 +449,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            11
+            13
         );
 
         assert_eq!(
@@ -571,5 +571,23 @@ mod tests {
             .iter()
             .any(|case| case.variant == ModelVariant::GraniteSpeech412B
                 && case.capability == CapabilityKind::SpeakerAttributedAsr));
+        // Granite Speech 5.0 runs one atomic invocation on leased pages and
+        // retains nothing between requests; it serves plain ASR only.
+        // Its GGUF release is the same model with the same state.
+        for variant in [
+            ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
+        ] {
+            let granite_5 = manifest_case(&manifest, variant, CapabilityKind::Asr);
+            assert_eq!(granite_5.retained_state, Stateless);
+            assert_eq!(granite_5.workspace, InvocationStateRequired);
+            assert_eq!(
+                manifest
+                    .iter()
+                    .filter(|case| case.variant == variant)
+                    .count(),
+                1
+            );
+        }
     }
 }

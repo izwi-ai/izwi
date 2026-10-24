@@ -126,6 +126,46 @@ describe("viewport-safe creation dialogs", () => {
     expect(streamToggle).not.toBeChecked();
   });
 
+  it("offers translation and keywords only to a model that takes them", () => {
+    const props = {
+      isOpen: true,
+      onClose: vi.fn(),
+      selectedModelReady: true,
+      timestampAlignerModelId: "Qwen3-ForcedAligner-0.6B",
+      timestampAlignerReady: true,
+      onOpenModelManager: vi.fn(),
+      onModelRequired: vi.fn(),
+      onTimestampAlignerRequired: vi.fn(),
+      onCreated: vi.fn(),
+    };
+    const { rerender } = render(
+      <NewTranscriptionModal {...props} selectedModel="Parakeet-TDT-0.6B-v3" />,
+    );
+    expect(screen.queryByLabelText("Translate to")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Keywords")).not.toBeInTheDocument();
+
+    rerender(
+      <NewTranscriptionModal
+        {...props}
+        selectedModel="Granite-Speech-5.0-2B"
+        selectedModelSupportsTranslation
+        selectedModelSupportsKeywords
+      />,
+    );
+    const translate = screen.getByRole("combobox", { name: "Translate to" });
+    expect(translate).toBeEnabled();
+    expect(screen.getByRole("textbox", { name: "Keywords" })).toBeEnabled();
+
+    // Timestamps time the audio's own words, so turning them on (streaming
+    // off first) disables translation with an explanation.
+    fireEvent.click(screen.getByRole("switch", { name: /Stream results/i }));
+    fireEvent.click(screen.getByRole("switch", { name: /Include timestamps/i }));
+    expect(translate).toBeDisabled();
+    expect(
+      screen.getByText(/Translation is unavailable while timestamps are enabled/i),
+    ).toBeInTheDocument();
+  });
+
   it("keeps the diarization title, capture actions, and final setting reachable", () => {
     render(
       <NewDiarizationModal

@@ -69,6 +69,7 @@ impl ModelLifecycleController {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Qwen3ForcedAligner => {
                 self.model_registry.unload_asr(variant).await;
             }

@@ -430,6 +430,16 @@ pub enum Commands {
         #[arg(long)]
         prompt: Option<String>,
 
+        /// Translate the speech into this language instead of transcribing
+        /// it (models with speech translation, such as Granite-Speech-5.0-2B)
+        #[arg(long, value_name = "LANGUAGE")]
+        translate_to: Option<String>,
+
+        /// A term to bias recognition toward; repeat for more (models with
+        /// keyword biasing, such as Granite-Speech-5.0-2B)
+        #[arg(long = "keyword", value_name = "TERM")]
+        keywords: Vec<String>,
+
         /// Maximum number of ASR decoder tokens to generate
         #[arg(long)]
         max_tokens: Option<usize>,

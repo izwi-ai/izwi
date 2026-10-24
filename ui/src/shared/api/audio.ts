@@ -773,7 +773,12 @@ export interface TranscriptionRecord {
   transcription_mode?: "transcription" | "speaker_attributed_asr";
   model_id: string | null;
   aligner_model_id: string | null;
+  /** The spoken language the job named, or the one the model reported. */
   language: string | null;
+  /** The language the speech was translated into, for a translation. */
+  target_language?: string | null;
+  /** Terms the job biased recognition toward. */
+  keywords?: string[];
   processing_status: TranscriptionProcessingStatus;
   processing_error?: string | null;
   processing_progress?: TranscriptionProcessingProgress | null;
@@ -806,6 +811,10 @@ export interface TranscriptionRecordCreateRequest {
   model_id?: string;
   aligner_model_id?: string;
   language?: string;
+  /** Translate the speech into this language (models with speech translation). */
+  target_language?: string;
+  /** Terms to bias recognition toward (models with keyword biasing). */
+  keywords?: string[];
   include_timestamps?: boolean;
   generate_summary?: boolean;
 }
@@ -3168,6 +3177,12 @@ export class AudioApiClient {
       if (request.language) {
         form.append("language", request.language);
       }
+      if (request.target_language) {
+        form.append("target_language", request.target_language);
+      }
+      for (const keyword of request.keywords ?? []) {
+        form.append("keywords", keyword);
+      }
       if (request.include_timestamps) {
         form.append("include_timestamps", "true");
       }
@@ -3197,6 +3212,8 @@ export class AudioApiClient {
         model: request.model_id,
         aligner_model: request.aligner_model_id,
         language: request.language,
+        target_language: request.target_language,
+        keywords: request.keywords,
         include_timestamps: Boolean(request.include_timestamps),
         generate_summary: Boolean(request.generate_summary),
         stream,

@@ -199,6 +199,44 @@ pub struct AsrEngineInput {
     pub prompt: Option<String>,
 }
 
+/// What an ASR request asks for beyond transcription in the spoken language.
+/// Only families that report the capability accept a non-empty value
+/// (`ModelVariant::supports_asr_translation`, `supports_asr_keyword_biasing`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AsrTaskOptions {
+    /// Translate the speech into this language instead of transcribing it.
+    pub translate_to: Option<String>,
+    /// Terms to bias recognition toward.
+    pub keywords: Vec<String>,
+}
+
+impl AsrTaskOptions {
+    /// Options with a blank target and blank keywords dropped.
+    pub fn new(translate_to: Option<String>, keywords: Vec<String>) -> Self {
+        Self {
+            translate_to: translate_to
+                .map(|target| target.trim().to_string())
+                .filter(|target| !target.is_empty()),
+            keywords: keywords
+                .into_iter()
+                .map(|keyword| keyword.trim().to_string())
+                .filter(|keyword| !keyword.is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.translate_to.is_none() && self.keywords.is_empty()
+    }
+
+    /// Host bytes the options keep alive while the request is retained.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.translate_to.as_ref().map_or(0, String::capacity)
+            + self.keywords.capacity() * std::mem::size_of::<String>()
+            + self.keywords.iter().map(String::capacity).sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum RealtimeAsrOperationPayload {
     Push {
@@ -975,6 +1013,8 @@ pub struct EngineCoreRequest {
     /// them (Granite Speech Plus) runs its timestamp task instead of plain
     /// ASR; the others ignore it and leave timing to the forced aligner.
     pub asr_native_word_timestamps: bool,
+    /// Translation target and keyword list, for families that support them.
+    pub asr_task: AsrTaskOptions,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
     pub reference_audio: Option<String>,

@@ -315,6 +315,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::SortformerDiarization
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm25Audio
@@ -373,6 +374,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
             // The forced aligner runs one cacheless forward per request.
@@ -457,6 +459,13 @@ impl ModelVariant {
             );
         }
 
+        if self.is_granite_speech5_gguf() {
+            return CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Granite Speech 5.0 GGUF runs its Q8_0 YaRN Granite decoder on Candle quantized CUDA kernels and the F16 audio encoder and Q-Former projector on dense Candle CUDA kernels; its RoPE tables are built on the host",
+            );
+        }
+
         if self.is_qwen38_fp8() {
             return CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -488,6 +497,10 @@ impl ModelVariant {
             ModelFamily::GraniteSpeechAsr => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Granite Speech ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and Granite decoder once the native loader is selected",
+            ),
+            ModelFamily::GraniteSpeech5Asr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Granite Speech 5.0 ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and YaRN Granite decoder once the native loader is selected; its RoPE tables are built on the host",
             ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
@@ -524,6 +537,13 @@ impl ModelVariant {
             );
         }
 
+        if self.is_granite_speech5_gguf() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Granite Speech 5.0 GGUF keeps its Q8_0 decoder projections, head and token table quantized (QMatMul); the F16 audio encoder and projector load dense",
+            );
+        }
+
         if self.is_qwen38_fp8() {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
@@ -555,7 +575,7 @@ impl ModelVariant {
                 CudaQuantizationSupportLevel::Dense,
                 "Nemotron ASR ships a dense .nemo checkpoint; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
-            ModelFamily::GraniteSpeechAsr => CudaQuantizationInfo::new(
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Granite Speech ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),

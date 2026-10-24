@@ -5,8 +5,8 @@
 //! capability that needs them while preserving the existing engine contract.
 
 use crate::engine::{
-    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams, Priority,
-    WorkloadClass,
+    AsrTaskOptions, EngineCoreRequest, EngineStreamPolicy,
+    GenerationParams as CoreGenerationParams, Priority, WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -186,6 +186,7 @@ pub(crate) struct AsrRuntimeRequest {
     audio: RuntimeAudioInput,
     language: Option<String>,
     prompt: Option<String>,
+    task: AsrTaskOptions,
     native_word_timestamps: bool,
 }
 
@@ -206,6 +207,7 @@ impl AsrRuntimeRequest {
             audio,
             language,
             prompt: None,
+            task: AsrTaskOptions::default(),
             native_word_timestamps: false,
         })
     }
@@ -226,6 +228,7 @@ impl AsrRuntimeRequest {
             audio,
             language,
             prompt: None,
+            task: AsrTaskOptions::default(),
             native_word_timestamps: false,
         })
     }
@@ -239,6 +242,11 @@ impl AsrRuntimeRequest {
                 Some(trimmed.to_string())
             }
         });
+        self
+    }
+
+    pub(crate) fn with_task(mut self, task: AsrTaskOptions) -> Self {
+        self.task = task;
         self
     }
 
@@ -259,7 +267,9 @@ impl AsrRuntimeRequest {
         if let Some(prompt) = self.prompt {
             request = request.with_asr_prompt(prompt);
         }
-        request.with_asr_native_word_timestamps(self.native_word_timestamps)
+        request
+            .with_asr_task(self.task)
+            .with_asr_native_word_timestamps(self.native_word_timestamps)
     }
 }
 
@@ -498,6 +508,30 @@ mod tests {
         // Large direct fields remain in their compatibility owner until the
         // Engine/RequestProcessor preflight establishes the typed task view.
         assert!(matches!(core_request.task, EngineTask::Asr(_)));
+        assert!(core_request.asr_task.is_empty());
+    }
+
+    #[test]
+    fn asr_runtime_request_carries_translation_and_keywords() {
+        let core_request = AsrRuntimeRequest::from_bytes(
+            vec![1, 2, 3],
+            ModelVariant::GraniteSpeech502B,
+            None,
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .expect("valid ASR request")
+        .with_task(AsrTaskOptions::new(
+            Some(" German ".to_string()),
+            vec![" Izwi ".to_string(), " ".to_string(), "Granite".to_string()],
+        ))
+        .into_engine_request();
+
+        assert_eq!(
+            core_request.asr_task.translate_to.as_deref(),
+            Some("German")
+        );
+        assert_eq!(core_request.asr_task.keywords, vec!["Izwi", "Granite"]);
     }
 
     #[test]

@@ -67,22 +67,22 @@ pub mod tokenizer;
 // Re-export main types from the new engine module
 pub use engine::{
     AdapterAbiRevision, AdapterInstanceId, AsrEngineInput, AsrProgress, AsrProgressPhase,
-    AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey, CacheReleaseOutcome,
-    ChatEngineInput, Engine, EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest,
-    EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities, ExecutionDisposition,
-    ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind,
-    FailureScope, FinishReason, GenerationParams, HealthImpact, ManagedKvArenaRuntimeSnapshot,
-    ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot, ManagedKvOperationSnapshot,
-    ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot, ManagedKvTelemetrySnapshot,
-    MembershipSafePoint, ModelExecutor, ModelInstanceId, ModelSessionResult, OutputProcessor,
-    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, Priority,
-    ReadyQuantum, RequestProcessor, RequestStatus, ResourceAmount, ResourceEstimate,
-    ResourceLedger, ResourceReservation, ResourceVector, RetryDisposition, Scheduler,
-    SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, SpeechSamplingOptions,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
-    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
-    YieldReason,
+    AsrTaskOptions, AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey,
+    CacheReleaseOutcome, ChatEngineInput, Engine, EngineAudioInput, EngineCore, EngineCoreConfig,
+    EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities,
+    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
+    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult,
+    FailureKind, FailureScope, FinishReason, GenerationParams, HealthImpact,
+    ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
+    ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
+    ManagedKvTelemetrySnapshot, MembershipSafePoint, ModelExecutor, ModelInstanceId,
+    ModelSessionResult, OutputProcessor, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
+    PhysicalBatchRowReport, PlanId, Priority, ReadyQuantum, RequestProcessor, RequestStatus,
+    ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
+    RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey,
+    SpeechSamplingOptions, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
+    StateDisposition, StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost,
+    WorkUnit, WorkloadClass, YieldReason,
 };
 
 // Legacy re-exports for backward compatibility
@@ -116,12 +116,12 @@ pub use runtime::{
 };
 pub use runtime::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
-    validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
-    ChatFinishReason, ChatGeneration, ChatGenerationControls, ChatSamplingRequest, ChunkStats,
-    DiarizationConfig, DiarizationPipelineOptions, DiarizationResult, DiarizationSegment,
-    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
-    GenerationResult, JobCancellation, ResolvedChatSampling, TtsStopReason, TtsStreamingMode,
-    WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
+    validate_asr_language, validate_asr_task, AlignedWindow, AlignmentSource, AlignmentWindow,
+    AsrTranscription, ChatFinishReason, ChatGeneration, ChatGenerationControls,
+    ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationPipelineOptions,
+    DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
+    DiarizationWord, GenerationRequest, GenerationResult, JobCancellation, ResolvedChatSampling,
+    TtsStopReason, TtsStreamingMode, WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,

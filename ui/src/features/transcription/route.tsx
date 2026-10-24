@@ -808,6 +808,9 @@ export function TranscriptionPage({
   const newTranscriptionSelectedModelStatus = isNewSpeakerAttributedAsrMode
     ? selectedSpeakerAttributedAsrModelStatus
     : selectedTranscriptionModelStatus;
+  const newTranscriptionRouteCapabilities = models.find(
+    (model) => model.variant === newTranscriptionSelectedModel,
+  )?.route_capabilities;
   const openNewTranscriptionModelManager = isNewSpeakerAttributedAsrMode
     ? openSpeakerAttributedAsrModelManager
     : openTranscriptionModelManager;
@@ -959,6 +962,13 @@ export function TranscriptionPage({
                       selectedModel={newTranscriptionSelectedModel}
                       selectedModelReady={newTranscriptionSelectedModelReady}
                       selectedModelStatus={newTranscriptionSelectedModelStatus}
+                      selectedModelSupportsTranslation={
+                        newTranscriptionRouteCapabilities?.speech_translation ===
+                        true
+                      }
+                      selectedModelSupportsKeywords={
+                        newTranscriptionRouteCapabilities?.keyword_biasing === true
+                      }
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
                       timestampAlignerModelStatus={selectedAlignerModelStatus}

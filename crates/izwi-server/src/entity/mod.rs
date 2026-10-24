@@ -208,6 +208,8 @@ pub mod transcription_records {
         pub summary_error: Option<String>,
         pub summary_updated_at: Option<i64>,
         pub owner_node_id: Option<String>,
+        pub target_language: Option<String>,
+        pub keywords_json: String,
     }
     empty_relation!();
 }

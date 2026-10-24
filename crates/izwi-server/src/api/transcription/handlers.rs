@@ -15,6 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::api::asr_task::{split_keywords, validate_asr_task_request, KeywordsField};
 use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
@@ -54,8 +55,8 @@ use crate::transcription_store::{
 use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ModelVariant,
-    RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
+    parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, AsrTaskOptions,
+    ModelVariant, RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -97,11 +98,21 @@ struct ParsedTranscriptionCreateRequest {
     model_id: Option<String>,
     aligner_model_id: Option<String>,
     language: Option<String>,
+    /// Translate into this language (models with speech translation).
+    target_language: Option<String>,
+    /// Terms to bias recognition toward (models with keyword biasing).
+    keywords: Vec<String>,
     include_timestamps: bool,
     stream: bool,
     generate_summary: bool,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
+}
+
+impl ParsedTranscriptionCreateRequest {
+    fn task(&self) -> AsrTaskOptions {
+        AsrTaskOptions::new(self.target_language.clone(), self.keywords.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +121,12 @@ struct BatchTranscriptionRequest {
     model_id: Option<String>,
     aligner_model_id: Option<String>,
     language: Option<String>,
+    // Omitted when unset, so the idempotency digest of a request without
+    // them is the one it had before they existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keywords: Vec<String>,
     include_timestamps: bool,
     generate_summary: bool,
     min_speakers: Option<usize>,
@@ -125,6 +142,8 @@ impl BatchTranscriptionRequest {
             model_id: parsed.model_id.clone(),
             aligner_model_id: parsed.aligner_model_id.clone(),
             language: parsed.language.clone(),
+            target_language: parsed.target_language.clone(),
+            keywords: parsed.keywords.clone(),
             include_timestamps: parsed.include_timestamps,
             generate_summary: parsed.generate_summary,
             min_speakers: parsed.min_speakers,
@@ -143,6 +162,8 @@ impl BatchTranscriptionRequest {
             model_id: self.model_id,
             aligner_model_id: self.aligner_model_id,
             language: self.language,
+            target_language: self.target_language,
+            keywords: self.keywords,
             include_timestamps: self.include_timestamps,
             stream: false,
             generate_summary: self.generate_summary,
@@ -163,6 +184,10 @@ struct JsonCreateRequest {
     aligner_model_id: Option<String>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    target_language: Option<String>,
+    #[serde(default)]
+    keywords: Option<KeywordsField>,
     #[serde(default)]
     include_timestamps: Option<bool>,
     #[serde(default)]
@@ -431,6 +456,8 @@ fn retry_create_request(
             .as_deref()
             .map(|id| izwi_core::normalize_stored_model_id(id).into_owned()),
         language: source.language.clone(),
+        target_language: source.target_language.clone(),
+        keywords: source.keywords.clone(),
         include_timestamps: source.aligner_model_id.is_some(),
         stream: false,
         generate_summary: source.summary_status != TranscriptionSummaryStatus::NotRequested,
@@ -634,6 +661,8 @@ async fn create_pending_record(
                 parsed.aligner_model_id.clone()
             },
             language: parsed.language.clone(),
+            target_language: parsed.target_language.clone(),
+            keywords: parsed.keywords.clone(),
             processing_status: TranscriptionProcessingStatus::Pending,
             processing_error: None,
             processing_progress: None,
@@ -1303,6 +1332,7 @@ async fn process_transcription_record_inner(
                 model_id.as_deref(),
                 aligner_model_id.as_deref(),
                 requested_language.as_deref(),
+                parsed.task(),
                 parsed.include_timestamps,
                 input_duration_secs,
                 correlation_id.as_deref(),
@@ -1472,6 +1502,7 @@ async fn generate_transcription_artifacts<F, P>(
     model_id: Option<&str>,
     aligner_model_id: Option<&str>,
     requested_language: Option<&str>,
+    task: AsrTaskOptions,
     include_timestamps: bool,
     input_duration_secs: f64,
     correlation_id: Option<&str>,
@@ -1485,11 +1516,13 @@ where
 {
     let progress_callback = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
     let runtime_progress_callback = progress_callback.clone();
+    let translates = task.translate_to.is_some();
     let output = runtime
         .asr_transcribe_bytes_with_progress_and_runtime_context(
             audio_bytes,
             model_id,
             requested_language,
+            task,
             correlation_id,
             runtime_context,
             on_delta,
@@ -1502,10 +1535,16 @@ where
         .await
         .map_err(core_api_error)?;
 
-    let resolved_language = output
-        .language
-        .clone()
-        .or_else(|| requested_language.map(|value| value.to_string()));
+    // A translation's record keeps the spoken language it named, so a retry
+    // translates the same speech again; the target is stored on its own.
+    let resolved_language = if translates {
+        requested_language.map(str::to_string)
+    } else {
+        output
+            .language
+            .clone()
+            .or_else(|| requested_language.map(|value| value.to_string()))
+    };
 
     let (aligner_model_id, words, segments, alignment_warnings) =
         if include_timestamps && !output.text.trim().is_empty() {
@@ -1717,6 +1756,11 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
             model_id,
             aligner_model_id: sanitize_optional(payload.aligner_model_id),
             language: sanitize_optional(payload.language),
+            target_language: sanitize_optional(payload.target_language),
+            keywords: payload
+                .keywords
+                .map(KeywordsField::into_keywords)
+                .unwrap_or_default(),
             include_timestamps: payload
                 .include_timestamps
                 .or(payload.word_timestamps)
@@ -1804,6 +1848,22 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     })?;
                     out.language = sanitize_optional(Some(text));
                 }
+                "target_language" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'target_language' field: {e}"
+                        ))
+                    })?;
+                    out.target_language = sanitize_optional(Some(text));
+                }
+                "keywords" | "keywords[]" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{name}' field: {e}"
+                        ))
+                    })?;
+                    out.keywords.extend(split_keywords(&text));
+                }
                 "include_timestamps" | "word_timestamps" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
@@ -1868,6 +1928,13 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
     if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
         validate_batch_transcription_model(parsed.model_id.as_deref())?;
         validate_transcription_language(parsed.model_id.as_deref(), parsed.language.as_deref())?;
+        validate_asr_task_request(
+            parsed.model_id.as_deref(),
+            parsed.language.as_deref(),
+            None,
+            &parsed.task(),
+            parsed.include_timestamps,
+        )?;
         crate::api::transcript_alignment::reject_removed_aligner(
             parsed.aligner_model_id.as_deref(),
         )?;
@@ -1885,6 +1952,13 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
         .model_id
         .get_or_insert_with(|| DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL.to_string());
     validate_transcription_language(Some(model_id), parsed.language.as_deref())?;
+    validate_asr_task_request(
+        Some(model_id),
+        parsed.language.as_deref(),
+        None,
+        &AsrTaskOptions::new(parsed.target_language.clone(), parsed.keywords.clone()),
+        false,
+    )?;
     parsed.aligner_model_id = None;
     parsed.include_timestamps = false;
     Ok(())
@@ -2206,7 +2280,8 @@ mod tests {
         TranscriptionSummaryStatus, TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
     use super::{
-        prepare_create_request, ParsedTranscriptionCreateRequest, TranscriptionRecordMode,
+        prepare_create_request, BatchTranscriptionRequest, ParsedTranscriptionCreateRequest,
+        TranscriptionRecordMode,
     };
     use izwi_core::RuntimeService;
     use tokio::sync::mpsc;
@@ -2323,6 +2398,70 @@ mod tests {
         prepare_create_request(&mut removed_aligner).unwrap();
     }
 
+    /// A translation or keyword list goes only to a model that takes it,
+    /// and a translation has no word timestamps.
+    #[test]
+    fn create_request_checks_the_translation_target_and_keywords() {
+        let request = |model_id: &str, target: Option<&str>, keywords: &[&str]| {
+            ParsedTranscriptionCreateRequest {
+                model_id: Some(model_id.to_string()),
+                language: Some("fr".to_string()),
+                target_language: target.map(str::to_string),
+                keywords: keywords.iter().map(|keyword| keyword.to_string()).collect(),
+                ..ParsedTranscriptionCreateRequest::default()
+            }
+        };
+
+        prepare_create_request(&mut request("Granite-Speech-5.0-2B", Some("en"), &["Izwi"]))
+            .unwrap();
+        for mut rejected in [
+            request("Granite-Speech-4.1-2B", Some("en"), &[]),
+            request("Granite-Speech-4.1-2B", None, &["Izwi"]),
+            // fr -> de is not one of 5.0's pairs.
+            request("Granite-Speech-5.0-2B", Some("de"), &[]),
+        ] {
+            assert_eq!(
+                prepare_create_request(&mut rejected).unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut timed = request("Granite-Speech-5.0-2B", Some("en"), &[]);
+        timed.include_timestamps = true;
+        assert_eq!(
+            prepare_create_request(&mut timed).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut saa = request("Granite-Speech-4.1-2B-Plus", Some("en"), &[]);
+        saa.record_mode = TranscriptionRecordMode::SpeakerAttributedAsr;
+        assert_eq!(
+            prepare_create_request(&mut saa).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The queued job carries the task, and a request without one keeps the
+    /// snapshot (and so the idempotency digest) it had before.
+    #[test]
+    fn batch_request_snapshot_carries_the_task_only_when_set() {
+        let plain = ParsedTranscriptionCreateRequest::default();
+        let snapshot =
+            serde_json::to_value(BatchTranscriptionRequest::from_parsed(&plain)).unwrap();
+        assert!(snapshot.get("target_language").is_none());
+        assert!(snapshot.get("keywords").is_none());
+
+        let translated = ParsedTranscriptionCreateRequest {
+            target_language: Some("English".to_string()),
+            keywords: vec!["Izwi".to_string()],
+            ..ParsedTranscriptionCreateRequest::default()
+        };
+        let snapshot =
+            serde_json::to_value(BatchTranscriptionRequest::from_parsed(&translated)).unwrap();
+        let restored: BatchTranscriptionRequest = serde_json::from_value(snapshot).unwrap();
+        let restored = restored.into_parsed();
+        assert_eq!(restored.target_language.as_deref(), Some("English"));
+        assert_eq!(restored.keywords, vec!["Izwi"]);
+    }
+
     #[test]
     fn durable_asr_uses_a_separate_queue_for_long_form_audio() {
         assert_eq!(asr_queue_class(299.999), QueueClass::BatchAsr);
@@ -2411,6 +2550,62 @@ mod tests {
             .expect("request should parse");
 
         assert!(parsed.generate_summary);
+    }
+
+    #[tokio::test]
+    async fn create_requests_read_the_translation_target_and_keywords() {
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "model": "Granite-Speech-5.0-2B",
+                    "target_language": "English",
+                    "keywords": ["Izwi", "Granite"]
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        let parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+        assert_eq!(parsed.target_language.as_deref(), Some("English"));
+        assert_eq!(parsed.keywords, vec!["Izwi", "Granite"]);
+
+        let boundary = "izwi-transcription-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes());
+        for (name, value) in [
+            ("target_language", "de"),
+            ("keywords", "Izwi, Granite"),
+            ("keywords", "Agentic AI"),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("request should build");
+        let parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+        assert_eq!(parsed.target_language.as_deref(), Some("de"));
+        assert_eq!(parsed.keywords, vec!["Izwi", "Granite", "Agentic AI"]);
     }
 
     #[tokio::test]

@@ -651,7 +651,9 @@ impl DeviceProfile {
                     })
                 }
             }
-            ModelFamily::NemotronAsr | ModelFamily::GraniteSpeechAsr => {
+            ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr => {
                 if self.capabilities.supports_bf16 {
                     Some(DTypeSelection {
                         dtype: DType::BF16,
@@ -1159,8 +1161,12 @@ pub fn parse_dtype_name(raw: &str) -> Option<DType> {
 /// Families whose loader passes the checkpoint's config dtype (not a user
 /// override) through the requested-dtype path. On Metal that hint keeps the
 /// family default. Granite Speech resolves its own `IZWI_GRANITE_SPEECH_DTYPE`
-/// before it reaches the resolver, so only its config hint arrives here.
-const METAL_REQUEST_IS_CONFIG_HINT: &[ModelFamily] = &[ModelFamily::GraniteSpeechAsr];
+/// before it reaches the resolver, so only its config hint arrives here;
+/// Granite Speech 5.0 passes only its config hint.
+const METAL_REQUEST_IS_CONFIG_HINT: &[ModelFamily] = &[
+    ModelFamily::GraniteSpeechAsr,
+    ModelFamily::GraniteSpeech5Asr,
+];
 
 /// The global Metal dtype override variable.
 pub const METAL_DTYPE_ENV: &str = "IZWI_METAL_DTYPE";

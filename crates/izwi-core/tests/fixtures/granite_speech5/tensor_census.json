@@ -1,0 +1,90 @@
+{
+  "source": "HTTP-range header of model.safetensors (generated 2026-10-23)",
+  "repo_id": "ibm-granite/granite-speech-5.0-2b",
+  "revision": "0555e70346a8992da6b5df98ae26ec50c43958b8",
+  "file": "model.safetensors",
+  "file_bytes": 4626528224,
+  "tensor_bytes": 4626414392,
+  "tensor_count": 954,
+  "has_lm_head": true,
+  "tensors": {
+    "language_model.lm_head.weight": {
+      "dtype": "BF16",
+      "shape": [
+        100353,
+        2048
+      ]
+    },
+    "language_model.model.embed_tokens.weight": {
+      "dtype": "BF16",
+      "shape": [
+        100353,
+        2048
+      ]
+    },
+    "language_model.model.layers.0.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        2048
+      ]
+    },
+    "language_model.model.layers.0.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    "encoder.layers.0.attn.rel_pos_emb.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1025,
+        128
+      ]
+    },
+    "encoder.input_linear.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        160
+      ]
+    },
+    "encoder.out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        348,
+        1024
+      ]
+    },
+    "encoder.out_mid.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        348
+      ]
+    },
+    "projector.query": {
+      "dtype": "BF16",
+      "shape": [
+        1,
+        3,
+        1024
+      ]
+    },
+    "projector.linear.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024
+      ]
+    },
+    "projector.qformer.encoder.layer.0.crossattention.attention.key.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ]
+    }
+  }
+}

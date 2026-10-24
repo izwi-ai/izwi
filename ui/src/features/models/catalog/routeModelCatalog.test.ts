@@ -145,6 +145,8 @@ describe("route model catalog", () => {
     expect(TRANSCRIPTION_PREFERRED_MODELS).not.toContain(
       "Granite-Speech-4.1-2B-Plus",
     );
+    // The recommended Granite: translation and keyword biasing.
+    expect(TRANSCRIPTION_PREFERRED_MODELS).toContain("Granite-Speech-5.0-2B");
     expect(TRANSCRIPTION_PREFERRED_MODELS[0]).toBe("Qwen3-ASR-0.6B-GGUF");
   });
 

@@ -29,6 +29,10 @@ export interface ModelRouteCapabilities {
   openai_audio_transcriptions: boolean;
   speech_to_text_jobs: boolean;
   speech_to_text_realtime: boolean;
+  /** The model translates speech into another language on request. */
+  speech_translation?: boolean;
+  /** The model accepts a keyword list to bias recognition toward. */
+  keyword_biasing?: boolean;
   diarization_records: boolean;
   text_to_speech_records: boolean;
   voice_design_records: boolean;

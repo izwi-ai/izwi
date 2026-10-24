@@ -17,6 +17,9 @@ pub enum ModelFamily {
     VibeVoiceAsr,
     NemotronAsr,
     GraniteSpeechAsr,
+    /// Granite Speech 5.0: the 4.1 encoder, projector and Granite LM shapes
+    /// with a YaRN language model and its own prompt contract.
+    GraniteSpeech5Asr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen3MoeChat,
@@ -43,6 +46,7 @@ impl ModelFamily {
             | Self::Qwen3Asr
             | Self::VibeVoiceAsr
             | Self::GraniteSpeechAsr
+            | Self::GraniteSpeech5Asr
             | Self::Lfm25Audio
             | Self::Voxtral => true,
             Self::ParakeetAsr | Self::NemotronAsr => false,
@@ -69,9 +73,9 @@ impl ModelFamily {
     /// of one file instead of holding it for the whole file. The chunks run
     /// on the chunk executor, whose state between chunks is host-only.
     /// VibeVoice's load-sealed state spec authenticates its long-form graph
-    /// as one atomic stage; offline Voxtral and Nemotron plan their chunks
-    /// inside the dispatch (no prepared long-form route); Parakeet never
-    /// chunks. Those keep one dispatch per file.
+    /// as one atomic stage; offline Voxtral, Nemotron and Granite Speech 5.0
+    /// plan their chunks inside the dispatch (no prepared long-form route);
+    /// Parakeet never chunks. Those keep one dispatch per file.
     pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
         matches!(
             self,
@@ -97,7 +101,8 @@ impl ModelFamily {
     /// Whether the chunked ASR route can stream this family's text token by
     /// token while a chunk decodes. Granite's chunk decode replays earlier
     /// text as a prefix and may re-decode a looping chunk, so its chunk text is
-    /// known only when the chunk finishes.
+    /// known only when the chunk finishes; Granite Speech 5.0 re-decodes a
+    /// looping or truncated chunk the same way.
     pub fn asr_streams_within_chunk(self) -> bool {
         matches!(
             self,
@@ -364,6 +369,7 @@ impl ModelVariant {
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
+            GraniteSpeech502B | GraniteSpeech502BGguf => ModelFamily::GraniteSpeech5Asr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -394,7 +400,8 @@ impl ModelVariant {
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
-            | ModelFamily::GraniteSpeechAsr => ModelTask::Asr,
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
@@ -825,6 +832,29 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
+    // Granite Speech 5.0 is its own family, so a 5.0 id must never fall
+    // through to the 4.1 checkpoints below. 5.0's Turbo CTC sibling is a
+    // different model that the catalog does not carry.
+    if normalized.contains("speech5") {
+        if ["turbo", "ctc", "470m"]
+            .iter()
+            .any(|other| normalized.contains(other))
+        {
+            return None;
+        }
+        // Of IBM's GGUF quantizations the catalog carries Q8_0 only.
+        if normalized.contains("gguf") || normalized.contains("q80") {
+            return Some(GraniteSpeech502BGguf);
+        }
+        if ["q2k", "q3k", "q4", "q5", "q6k", "bf16"]
+            .iter()
+            .any(|quant| normalized.contains(quant))
+        {
+            return None;
+        }
+        return Some(GraniteSpeech502B);
+    }
+
     // IBM's library resolves local checkpoints the same way: "plus" names the
     // rich-transcription model, anything else the punctuating base model,
     // which is IBM's default.
@@ -1247,6 +1277,66 @@ mod tests {
         ] {
             assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
         }
+    }
+
+    #[test]
+    fn granite_speech_5_names_never_resolve_to_a_4_1_checkpoint() {
+        for input in [
+            "ibm-granite/granite-speech-5.0-2b",
+            "granite-speech-5.0-2b",
+            "Granite-Speech-5.0-2B",
+            "Granite Speech 5.0 2B",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::GraniteSpeech502B,
+                "{input}"
+            );
+        }
+        for input in [
+            "granite speech 5",
+            "granite-speech-5.0",
+            "granite_speech_5_2b",
+            "granite-speech-5.0-2b-local",
+        ] {
+            assert_eq!(
+                resolve_asr_model_variant(Some(input)),
+                ModelVariant::GraniteSpeech502B,
+                "{input}"
+            );
+        }
+        // The Turbo CTC sibling is not this model.
+        assert!(parse_model_variant("granite-speech-5.0-470m-turboctc").is_err());
+        // The GGUF release is its own variant of the same family; only its
+        // Q8_0 quantization is carried.
+        for input in [
+            "Granite-Speech-5.0-2B-GGUF",
+            "ibm-granite/granite-speech-5.0-2b-GGUF",
+            "granite-speech-5.0-2b-Q8_0.gguf",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::GraniteSpeech502BGguf,
+                "{input}"
+            );
+        }
+        assert!(parse_model_variant("granite-speech-5.0-2b-Q4_K_M").is_err());
+        assert_eq!(
+            ModelVariant::GraniteSpeech502BGguf.family(),
+            ModelFamily::GraniteSpeech5Asr
+        );
+        // 4.1 ids keep resolving to 4.1.
+        assert_eq!(
+            resolve_asr_model_variant(Some("granite-speech-4.1")),
+            ModelVariant::GraniteSpeech412B
+        );
+        assert_eq!(
+            ModelVariant::GraniteSpeech502B.family(),
+            ModelFamily::GraniteSpeech5Asr
+        );
+        assert!(ModelFamily::GraniteSpeech5Asr.hallucinates_on_non_speech());
+        assert!(!ModelFamily::GraniteSpeech5Asr.dispatches_long_form_asr_by_chunk());
+        assert!(!ModelFamily::GraniteSpeech5Asr.asr_streams_within_chunk());
     }
 
     #[test]

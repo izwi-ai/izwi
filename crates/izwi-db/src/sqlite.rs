@@ -658,6 +658,8 @@ mod tests {
         ("transcription_records", "summary_error"),
         ("transcription_records", "summary_updated_at"),
         ("transcription_records", "owner_node_id"),
+        ("transcription_records", "target_language"),
+        ("transcription_records", "keywords_json"),
         ("speech_history_records", "saved_voice_id"),
         ("speech_history_records", "speed"),
         ("speech_history_records", "processing_status"),

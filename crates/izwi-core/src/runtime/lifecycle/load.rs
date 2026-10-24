@@ -133,6 +133,7 @@ enum LoadedAsrStatePublicationRoute {
     Whisper,
     Parakeet,
     NemotronOffline,
+    GraniteSpeech5,
     LegacyCache,
 }
 
@@ -143,6 +144,9 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::WhisperAsr => LoadedAsrStatePublicationRoute::Whisper,
         crate::catalog::ModelFamily::ParakeetAsr => LoadedAsrStatePublicationRoute::Parakeet,
         crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
+        crate::catalog::ModelFamily::GraniteSpeech5Asr => {
+            LoadedAsrStatePublicationRoute::GraniteSpeech5
+        }
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
 }
@@ -178,6 +182,7 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
             | crate::catalog::ModelFamily::VibeVoiceAsr
             | crate::catalog::ModelFamily::NemotronAsr
             | crate::catalog::ModelFamily::GraniteSpeechAsr
+            | crate::catalog::ModelFamily::GraniteSpeech5Asr
             | crate::catalog::ModelFamily::Qwen3ForcedAligner
     )
 }

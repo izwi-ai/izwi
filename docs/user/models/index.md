@@ -49,6 +49,8 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
 | `Granite-Speech-4.1-2B` | IBM Granite Speech ASR with punctuated, capitalized transcripts (en, fr, de, es, pt, ja); the default Granite Speech model |
 | `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with speaker-attributed output and native word timestamps; unpunctuated by design (en, fr, de, es, pt) |
+| `Granite-Speech-5.0-2B` | IBM Granite Speech 5.0: punctuated transcripts (en, fr, de, es, pt, ja), speech translation to and from English (plus English to Italian and Mandarin), and keyword lists of up to 2,000 terms; the recommended Granite Speech model |
+| `Granite-Speech-5.0-2B-GGUF` | IBM's GGUF release of Granite Speech 5.0: the same transcription, translation and keywords with a Q8_0 language model, in less memory and faster (several times faster on CPU) |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
 | `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
@@ -128,6 +130,10 @@ izwi pull Nemotron-3.5-ASR-Streaming-0.6B
 # Download IBM Granite Speech (punctuated ASR, and rich ASR with speaker turns)
 izwi pull Granite-Speech-4.1-2B
 izwi pull Granite-Speech-4.1-2B-Plus
+# Granite Speech 5.0 (transcription, translation and keyword biasing)
+izwi pull Granite-Speech-5.0-2B
+# or its GGUF release, with a Q8_0 language model
+izwi pull Granite-Speech-5.0-2B-GGUF
 
 # Download Microsoft VibeVoice models
 izwi pull VibeVoice-1.5B

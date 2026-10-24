@@ -181,7 +181,13 @@ pub struct TranscriptionRecord {
     pub transcription_mode: TranscriptionRecordMode,
     pub model_id: Option<String>,
     pub aligner_model_id: Option<String>,
+    /// The spoken language the job named, or the transcript's language
+    /// when the model reported it.
     pub language: Option<String>,
+    /// The language the job translated the speech into, if it did.
+    pub target_language: Option<String>,
+    /// The keywords the job biased recognition toward.
+    pub keywords: Vec<String>,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
     pub processing_progress: Option<AsrProgress>,
@@ -221,6 +227,8 @@ pub struct NewTranscriptionRecord {
     pub model_id: Option<String>,
     pub aligner_model_id: Option<String>,
     pub language: Option<String>,
+    pub target_language: Option<String>,
+    pub keywords: Vec<String>,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
     pub processing_progress: Option<AsrProgress>,
@@ -461,6 +469,8 @@ impl TranscriptionStore {
         let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
         let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
         let language = sanitize_optional_text(record.language.as_deref(), 80);
+        let target_language = sanitize_optional_text(record.target_language.as_deref(), 80);
+        let keywords = sanitize_keywords(record.keywords);
         let processing_error = sanitize_optional_text(record.processing_error.as_deref(), 1_000);
         let processing_status =
             normalize_processing_status(record.processing_status, processing_error.as_deref());
@@ -526,6 +536,8 @@ impl TranscriptionStore {
             serde_json::to_string(&speaker_turns).context("Failed serializing SAA turns")?;
         let saa_warnings_json =
             serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
+        let keywords_json =
+            serde_json::to_string(&keywords).context("Failed serializing keywords")?;
 
         if let Err(err) =
             transcription_records::Entity::insert(transcription_records::ActiveModel {
@@ -560,6 +572,8 @@ impl TranscriptionStore {
                 summary_error: Set(summary_error),
                 summary_updated_at: Set(summary_updated_at),
                 owner_node_id: Set(Some(self.node.id().to_string())),
+                target_language: Set(target_language),
+                keywords_json: Set(keywords_json),
             })
             .exec(db)
             .await
@@ -1215,7 +1229,9 @@ const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     summary_text,
     summary_error,
     summary_updated_at,
-    alignment_warnings_json
+    alignment_warnings_json,
+    target_language,
+    keywords_json
 "#;
 
 async fn fetch_record_without_audio(
@@ -1293,6 +1309,8 @@ fn map_transcription_record(row: &QueryResult) -> anyhow::Result<TranscriptionRe
         model_id: row.try_get_by_index(3)?,
         aligner_model_id: row.try_get_by_index(4)?,
         language: row.try_get_by_index(5)?,
+        target_language: row.try_get_by_index(27)?,
+        keywords: parse_json_vec(row.try_get_by_index(28)?),
         processing_status: parse_processing_status(row.try_get_by_index(6)?),
         processing_error: row.try_get_by_index(7)?,
         processing_progress: parse_processing_progress(row.try_get_by_index(8)?),
@@ -1597,6 +1615,13 @@ fn sanitize_speaker_turns(
         .collect()
 }
 
+fn sanitize_keywords(keywords: Vec<String>) -> Vec<String> {
+    keywords
+        .into_iter()
+        .filter_map(|keyword| sanitize_optional_text(Some(keyword.as_str()), 128))
+        .collect()
+}
+
 fn sanitize_saa_warnings(warnings: Vec<String>) -> Vec<String> {
     warnings
         .into_iter()
@@ -1721,6 +1746,8 @@ mod tests {
             model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
             aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
             language: Some("English".to_string()),
+            target_language: None,
+            keywords: Vec::new(),
             processing_status: TranscriptionProcessingStatus::Ready,
             processing_error: None,
             processing_progress: None,
@@ -1898,6 +1925,36 @@ mod tests {
 
         assert_eq!(fetched.words.len(), 4);
         assert_eq!(fetched.segments[0].text, "Hello there.");
+        assert!(fetched.target_language.is_none());
+        assert!(fetched.keywords.is_empty());
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn persists_the_translation_target_and_keywords() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.model_id = Some("Granite-Speech-5.0-2B".to_string());
+        record.language = Some("fr".to_string());
+        record.target_language = Some(" English ".to_string());
+        record.keywords = vec!["Izwi".to_string(), " ".to_string(), "Granite".to_string()];
+
+        let created = store
+            .create_record(record)
+            .await
+            .expect("record should be created");
+        let fetched = store
+            .get_record(created.id.clone())
+            .await
+            .expect("fetch should succeed")
+            .expect("record should exist");
+
+        for record in [&created, &fetched] {
+            assert_eq!(record.language.as_deref(), Some("fr"));
+            assert_eq!(record.target_language.as_deref(), Some("English"));
+            assert_eq!(record.keywords, vec!["Izwi", "Granite"]);
+        }
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

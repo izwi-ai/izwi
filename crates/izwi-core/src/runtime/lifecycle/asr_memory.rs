@@ -78,6 +78,12 @@ use crate::models::architectures::granite_speech::asr::{
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    ensure_granite_speech5_artifacts, granite_speech5_load_representation,
+    granite_speech5_mmproj_safetensors_name, granite_speech5_tensor_is_f16_encoder_projection,
+    resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype, GraniteSpeech5Config,
+    GraniteSpeech5LoadRepresentation, GraniteSpeech5Weights,
+};
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
@@ -178,7 +184,10 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
             | ModelVariant::VibeVoiceAsr
             | ModelVariant::VoxtralMini4BRealtime2602
             | ModelVariant::Lfm25Audio15BGguf
-    ) || variant.family() == ModelFamily::GraniteSpeechAsr
+    ) || matches!(
+        variant.family(),
+        ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+    )
 }
 
 /// Whether this module prices `variant`: the ASR variants, and the forced
@@ -229,6 +238,9 @@ pub(super) fn residency_plan(
             granite.speech_dtype.as_deref(),
             Precision::Selected,
         ),
+        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
+            granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+        }
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
@@ -981,6 +993,42 @@ impl Ledger {
         self.apply(step)
     }
 
+    /// Quantized GGUF tensors read on the host, joined row by row and
+    /// uploaded once as one `QTensor` (`granite_speech5/asr/gguf.rs`). Each
+    /// part is read whole (the GGUF bytes and Candle's copy of them) while
+    /// the join grows; the join is alive with the upload.
+    fn gguf_host_joined(&mut self, parts: &[&CensusTensor]) -> Result<()> {
+        let first = parts.first().ok_or_else(overflow)?;
+        let stored = sum(&parts
+            .iter()
+            .map(|part| part.stored_bytes)
+            .collect::<Vec<_>>())?;
+        let largest = parts
+            .iter()
+            .map(|part| part.stored_bytes)
+            .max()
+            .unwrap_or(0);
+        let reading = sum(&[stored, largest, largest])?;
+        let uploading = sum(&[stored, stored])?;
+        self.apply(if self.backend == BackendKind::Cuda {
+            let resident = sum(&[stored, cuda_qtensor_padding(first)?])?;
+            Step {
+                logical: stored,
+                resident,
+                high: resident,
+                host: reading.max(stored),
+                ..Step::default()
+            }
+        } else {
+            Step {
+                logical: stored,
+                resident: stored,
+                high: reading.max(uploading),
+                ..Step::default()
+            }
+        })
+    }
+
     /// Metal: quantized projections packed into one `QTensor`. Each part is
     /// uploaded and read back through a pooled blit copy (each read-back
     /// synchronizes), concatenated on the host, and uploaded again.
@@ -1695,6 +1743,14 @@ pub(super) fn precision_reload_plan(
             };
             plan
         }
+        ModelFamily::GraniteSpeech5Asr => {
+            let Some(plan) =
+                granite_speech5_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
+        }
         _ => return super::tts_memory::precision_reload_plan(variant, model_path, device),
     };
     tracing::info!(
@@ -2157,15 +2213,74 @@ fn nemo_payload_bytes(path: &Path) -> Result<u64> {
     Ok(payload)
 }
 
-/// The switches the Granite Speech loader resolves.
+/// Which loader a Granite plan prices. Granite Speech 4.1 and 5.0 share one
+/// tensor layout and load shape, but each family owns its switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraniteCheckpointFamily {
+    Speech41,
+    Speech5,
+}
+
+impl GraniteCheckpointFamily {
+    fn is_f16_encoder_projection(self, name: &str) -> bool {
+        match self {
+            Self::Speech41 => granite_tensor_is_f16_encoder_projection(name),
+            Self::Speech5 => granite_speech5_tensor_is_f16_encoder_projection(name),
+        }
+    }
+}
+
+/// A Granite language model's load-time representation switches, as each
+/// family's loader resolves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraniteLmRepresentation {
+    f16_lm_head: bool,
+    f16_qkv: bool,
+    f16_mlp: bool,
+    f16_attention_output: bool,
+    qkv_fusion: bool,
+    gate_up_fusion: bool,
+    residual_prescale: bool,
+}
+
+impl From<GraniteLoadRepresentation> for GraniteLmRepresentation {
+    fn from(value: GraniteLoadRepresentation) -> Self {
+        Self {
+            f16_lm_head: value.f16_lm_head,
+            f16_qkv: value.f16_qkv,
+            f16_mlp: value.f16_mlp,
+            f16_attention_output: value.f16_attention_output,
+            qkv_fusion: value.qkv_fusion,
+            gate_up_fusion: value.gate_up_fusion,
+            residual_prescale: value.residual_prescale,
+        }
+    }
+}
+
+impl From<GraniteSpeech5LoadRepresentation> for GraniteLmRepresentation {
+    fn from(value: GraniteSpeech5LoadRepresentation) -> Self {
+        Self {
+            f16_lm_head: value.f16_lm_head,
+            f16_qkv: value.f16_qkv,
+            f16_mlp: value.f16_mlp,
+            f16_attention_output: value.f16_attention_output,
+            qkv_fusion: value.qkv_fusion,
+            gate_up_fusion: value.gate_up_fusion,
+            residual_prescale: value.residual_prescale,
+        }
+    }
+}
+
+/// The switches a Granite Speech loader resolves.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraniteLoad {
+    family: GraniteCheckpointFamily,
     dtype: DType,
     /// The encoder and projector's dtype (F32 under weight-only F16).
     audio_dtype: DType,
     /// Encoder projections load as weight-only F16.
     f16_encoder_projections: bool,
-    representation: GraniteLoadRepresentation,
+    representation: GraniteLmRepresentation,
     residual_multiplier: f32,
     tied_lm_head: bool,
     /// (encoder layers, attention context) of the per-layer U32 distance table.
@@ -2197,6 +2312,7 @@ fn granite_plan(
     let f16_encoder_projections = precision == Precision::Selected
         && resolve_granite_encoder_projection_precision(device, speech_dtype).dtype == DType::F16;
     let load = GraniteLoad {
+        family: GraniteCheckpointFamily::Speech41,
         dtype,
         audio_dtype: if f16_encoder_projections {
             DType::F32
@@ -2204,7 +2320,7 @@ fn granite_plan(
             dtype
         },
         f16_encoder_projections,
-        representation: granite_load_representation(&device.device, dtype, speech_dtype),
+        representation: granite_load_representation(&device.device, dtype, speech_dtype).into(),
         residual_multiplier: config.text_config.residual_multiplier,
         tied_lm_head: config.tie_word_embeddings(),
         encoder_attention_dists: (
@@ -2215,7 +2331,66 @@ fn granite_plan(
     price_granite(&files, backend, &load).map(Some)
 }
 
-/// Granite Speech (`granite_speech/asr/runtime.rs`): every tensor through a
+/// Granite Speech 5.0 (`granite_speech5/asr/runtime.rs`): 4.1's load shape
+/// over one unsharded checkpoint, with 5.0's own switches.
+fn granite_speech5_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+    precision: Precision,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(weights) = ensure_granite_speech5_artifacts(model_path, variant) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(&weights.files())? else {
+        return Ok(None);
+    };
+    let config = GraniteSpeech5Config::load(model_path)?;
+    // The F32 reload bounds either fallback: the encoder's dense reload or
+    // the language model's F32 one.
+    let dtype = match precision {
+        Precision::Selected => select_granite_speech5_dtype(device, config.target_dtype_hint())?,
+        Precision::F32Reload => DType::F32,
+    };
+    let f16_encoder_projections = precision == Precision::Selected
+        && resolve_granite_speech5_encoder_precision(device).dtype == DType::F16;
+    let audio_dtype = if f16_encoder_projections {
+        DType::F32
+    } else {
+        dtype
+    };
+    if let GraniteSpeech5Weights::Gguf { .. } = weights {
+        let [language_model, mmproj]: [CensusFile; 2] = files.try_into().map_err(|_| overflow())?;
+        let load = GraniteSpeech5GgufLoad {
+            dtype,
+            audio_dtype,
+            f16_encoder_projections,
+            encoder_attention_dists: (
+                config.encoder_config.num_layers,
+                config.encoder_config.context_size,
+            ),
+            layers: config.text_config.num_hidden_layers,
+        };
+        return price_granite_speech5_gguf(&language_model, &mmproj, backend, &load).map(Some);
+    }
+    let load = GraniteLoad {
+        family: GraniteCheckpointFamily::Speech5,
+        dtype,
+        audio_dtype,
+        f16_encoder_projections,
+        representation: granite_speech5_load_representation(&device.device, dtype).into(),
+        residual_multiplier: config.text_config.residual_multiplier,
+        tied_lm_head: config.tie_word_embeddings(),
+        encoder_attention_dists: (
+            config.encoder_config.num_layers,
+            config.encoder_config.context_size,
+        ),
+    };
+    price_granite(&files, backend, &load).map(Some)
+}
+
+/// Granite Speech (`granite_speech/asr/runtime.rs`, and 5.0's fork of it): every tensor through a
 /// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
 /// and down_proj read at F16 (when selective) and then pre-scaled by the
@@ -2254,7 +2429,7 @@ fn price_granite(
         if !name.starts_with("encoder.") || name.ends_with(".num_batches_tracked") {
             continue;
         }
-        if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
+        if load.f16_encoder_projections && load.family.is_f16_encoder_projection(name) {
             ledger.host_converted(tensor, DType::F16)?;
         } else {
             ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
@@ -2354,6 +2529,90 @@ fn price_granite(
         } else {
             ledger.var(tensor, Source::Mapped, &[dtype])?;
         }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// How the GGUF release of Granite Speech 5.0 loads
+/// (`granite_speech5/asr/gguf.rs`, `language_model.rs`).
+#[derive(Debug, Clone, Copy)]
+struct GraniteSpeech5GgufLoad {
+    /// The LM's activation and norm dtype.
+    dtype: DType,
+    /// The encoder's and projector's dtype.
+    audio_dtype: DType,
+    /// The encoder's projections load as weight-only F16.
+    f16_encoder_projections: bool,
+    /// Conformer layers and attention block size.
+    encoder_attention_dists: (usize, usize),
+    layers: usize,
+}
+
+/// Granite Speech 5.0's GGUF release: every mmproj tensor is read on the
+/// host under its safetensors name, converted there and uploaded (the
+/// encoder's projections as weight-only F16 when selected); the LM's
+/// quantized projections are read on the host, joined (Q/K/V and gate/up)
+/// and uploaded once, its token table loads quantized, and its norms are
+/// converted on the host to the activation dtype and uploaded.
+fn price_granite_speech5_gguf(
+    language_model: &CensusFile,
+    mmproj: &CensusFile,
+    backend: BackendKind,
+    load: &GraniteSpeech5GgufLoad,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::staged(backend);
+    for tensor in &mmproj.tensors {
+        let name = granite_speech5_mmproj_safetensors_name(&tensor.name).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Granite Speech 5.0 mmproj tensor {} has no counterpart in the model",
+                tensor.name
+            ))
+        })?;
+        if load.f16_encoder_projections && granite_speech5_tensor_is_f16_encoder_projection(&name) {
+            // Read in the stored dtype, converted to F32, then to F16.
+            ledger.host_converted_through(tensor, Some(DType::F32), DType::F16)?;
+        } else {
+            ledger.var(tensor, Source::Copied, &[load.audio_dtype])?;
+        }
+    }
+    let (layers, context) = load.encoder_attention_dists;
+    let dists = (layers as u64)
+        .checked_mul(context as u64)
+        .and_then(|n| n.checked_mul(context as u64))
+        .ok_or_else(overflow)?;
+    ledger.uploaded(dists, DType::U32)?;
+    if load.f16_encoder_projections {
+        ledger.barrier()?;
+    }
+    let tensors = by_name(std::slice::from_ref(language_model));
+    let mut joined = BTreeSet::new();
+    let mut join = |ledger: &mut Ledger, names: &[String]| -> Result<()> {
+        let parts = names
+            .iter()
+            .map(|name| tensor(&tensors, name))
+            .collect::<Result<Vec<_>>>()?;
+        ledger.gguf_host_joined(&parts)?;
+        joined.extend(names.iter().cloned());
+        Ok(())
+    };
+    for layer in 0..load.layers {
+        let name = |part: &str| format!("blk.{layer}.{part}.weight");
+        join(
+            &mut ledger,
+            &[name("attn_q"), name("attn_k"), name("attn_v")],
+        )?;
+        join(&mut ledger, &[name("attn_output")])?;
+        join(&mut ledger, &[name("ffn_gate"), name("ffn_up")])?;
+        join(&mut ledger, &[name("ffn_down")])?;
+    }
+    join(&mut ledger, &["output.weight".to_string()])?;
+    ledger.gguf_stored(tensor(&tensors, "token_embd.weight")?)?;
+    for (name, tensor) in &tensors {
+        if joined.contains(*name) || *name == "token_embd.weight" {
+            continue;
+        }
+        // The norms.
+        ledger.var(tensor, Source::Copied, &[load.dtype])?;
     }
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
@@ -3213,9 +3472,9 @@ pub(super) mod tests {
     /// takes the F16 LM projections and head copy and the residual
     /// pre-scaling for F32 weights (`granite_speech/asr/runtime.rs` policies);
     /// every backend fuses Q/K/V and gate/up.
-    fn granite_representation(backend: BackendKind) -> GraniteLoadRepresentation {
+    fn granite_representation(backend: BackendKind) -> GraniteLmRepresentation {
         let metal = backend == BackendKind::Metal;
-        GraniteLoadRepresentation {
+        GraniteLmRepresentation {
             f16_lm_head: metal,
             f16_qkv: metal,
             f16_mlp: metal,
@@ -3240,6 +3499,7 @@ pub(super) mod tests {
         // Metal loads the encoder projections as weight-only F16.
         let f16_encoder_projections = backend == BackendKind::Metal;
         GraniteLoad {
+            family: GraniteCheckpointFamily::Speech41,
             dtype,
             audio_dtype: if f16_encoder_projections {
                 DType::F32
@@ -4040,6 +4300,7 @@ pub(super) mod tests {
                 tensors,
             }];
             let load = GraniteLoad {
+                family: GraniteCheckpointFamily::Speech41,
                 dtype: DType::F32,
                 audio_dtype: DType::F32,
                 f16_encoder_projections: true,
@@ -4068,7 +4329,18 @@ pub(super) mod tests {
     fn granite_cpu_representation_matches_the_loader() {
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&candle_core::Device::Cpu, DType::F32, None),
+            GraniteLmRepresentation::from(granite_load_representation(
+                &candle_core::Device::Cpu,
+                DType::F32,
+                None
+            )),
+            granite_representation(BackendKind::Cpu)
+        );
+        assert_eq!(
+            GraniteLmRepresentation::from(granite_speech5_load_representation(
+                &candle_core::Device::Cpu,
+                DType::F32
+            )),
             granite_representation(BackendKind::Cpu)
         );
     }
@@ -4083,9 +4355,150 @@ pub(super) mod tests {
         };
         let _env = env_lock();
         assert_eq!(
-            granite_load_representation(&device, DType::F32, None),
+            GraniteLmRepresentation::from(granite_load_representation(&device, DType::F32, None)),
             granite_representation(BackendKind::Metal)
         );
+        assert_eq!(
+            GraniteLmRepresentation::from(granite_speech5_load_representation(&device, DType::F32)),
+            granite_representation(BackendKind::Metal)
+        );
+    }
+
+    /// Granite Speech 5.0's published tensors priced as its loader holds
+    /// them: BF16 on CUDA, F32 on the CPU, and on Metal an F32 base with
+    /// weight-only F16 encoder projections and the untied head and LM
+    /// projections in F16.
+    #[test]
+    fn granite_speech_5_prices_its_published_census_per_backend() {
+        let files = census!("granite_speech_5_0_2b.json");
+        let price = |backend: BackendKind| {
+            let mut load = granite_load(backend);
+            load.family = GraniteCheckpointFamily::Speech5;
+            // The published granite-speech-5.0-2b config.json.
+            load.tied_lm_head = false;
+            price_granite(&files, backend, &load).unwrap()
+        };
+        let tensor_bytes = 4_626_414_392u64;
+        let step_counters = 16 * 8;
+        let distance_tables = 16 * 200 * 200 * 4;
+        let cuda = price(BackendKind::Cuda).logical_resident_bytes;
+        assert_eq!(cuda, tensor_bytes - step_counters + distance_tables);
+        let cpu = price(BackendKind::Cpu).logical_resident_bytes;
+        assert_eq!(cpu, 2 * (tensor_bytes - step_counters) + distance_tables);
+        let metal = price(BackendKind::Metal).logical_resident_bytes;
+        assert!(metal < cpu && metal > cuda, "{metal}");
+        // The same census through 4.1's switches prices identically: the two
+        // families share one load shape.
+        let mut speech41 = granite_load(BackendKind::Metal);
+        speech41.tied_lm_head = false;
+        assert_eq!(
+            price_granite(&files, BackendKind::Metal, &speech41)
+                .unwrap()
+                .logical_resident_bytes,
+            metal
+        );
+    }
+
+    /// Granite Speech 5.0's GGUF release priced as its loader holds it: the
+    /// Q8_0 projections, head and token table at their stored bytes on every
+    /// backend, the norms in the LM's dtype, and the mmproj in the encoder's
+    /// (BF16 on CUDA, F32 on the CPU, and on Metal F32 with weight-only F16
+    /// encoder projections).
+    #[test]
+    fn granite_speech_5_gguf_keeps_the_language_model_quantized() {
+        let files = census!("granite_speech_5_0_2b_gguf_q8_0.json");
+        let (language_model, mmproj) = (&files[0], &files[1]);
+        let quantized = language_model
+            .tensors
+            .iter()
+            .filter(|tensor| gguf_quantized(tensor))
+            .map(|tensor| tensor.stored_bytes)
+            .sum::<u64>();
+        let norms = language_model
+            .tensors
+            .iter()
+            .filter(|tensor| !gguf_quantized(tensor))
+            .map(CensusTensor::elements)
+            .sum::<u64>();
+        let f16_projection = |tensor: &&CensusTensor| {
+            granite_speech5_tensor_is_f16_encoder_projection(
+                &granite_speech5_mmproj_safetensors_name(&tensor.name).unwrap(),
+            )
+        };
+        let audio = mmproj
+            .tensors
+            .iter()
+            .map(CensusTensor::elements)
+            .sum::<u64>();
+        let audio_f16 = mmproj
+            .tensors
+            .iter()
+            .filter(f16_projection)
+            .map(CensusTensor::elements)
+            .sum::<u64>();
+        assert_eq!(quantized, 1_952_592_128 - 81 * 2_048 * 4);
+        let distance_tables = 16 * 200 * 200 * 4;
+        let price = |backend: BackendKind, dtype: DType, f16_encoder_projections: bool| {
+            let load = GraniteSpeech5GgufLoad {
+                dtype,
+                audio_dtype: if f16_encoder_projections {
+                    DType::F32
+                } else {
+                    dtype
+                },
+                f16_encoder_projections,
+                encoder_attention_dists: (16, 200),
+                layers: 40,
+            };
+            price_granite_speech5_gguf(language_model, mmproj, backend, &load).unwrap()
+        };
+        let cuda = price(BackendKind::Cuda, DType::BF16, false);
+        assert_eq!(
+            cuda.logical_resident_bytes,
+            quantized + 2 * norms + 2 * audio + distance_tables
+        );
+        let cpu = price(BackendKind::Cpu, DType::F32, false);
+        assert_eq!(
+            cpu.logical_resident_bytes,
+            quantized + 4 * norms + 4 * audio + distance_tables
+        );
+        let metal = price(BackendKind::Metal, DType::F32, true);
+        assert_eq!(
+            metal.logical_resident_bytes,
+            quantized + 4 * norms + 2 * audio_f16 + 4 * (audio - audio_f16) + distance_tables
+        );
+        for plan in [cuda, cpu, metal] {
+            assert!(
+                plan.load_peak_bytes > plan.logical_resident_bytes,
+                "{plan:?}"
+            );
+        }
+    }
+
+    /// The published mmproj names exactly the safetensors release's encoder
+    /// and projector, with each BatchNorm folded into a scale and shift and
+    /// K and V joined back into `to_kv`.
+    #[test]
+    fn granite_speech_5_gguf_mmproj_names_the_safetensors_encoder_and_projector() {
+        let gguf = census!("granite_speech_5_0_2b_gguf_q8_0.json");
+        let safetensors = census!("granite_speech_5_0_2b.json");
+        let mapped = gguf[1]
+            .tensors
+            .iter()
+            .map(|tensor| granite_speech5_mmproj_safetensors_name(&tensor.name).unwrap())
+            .collect::<BTreeSet<_>>();
+        let (folded, mapped): (BTreeSet<_>, BTreeSet<_>) = mapped
+            .into_iter()
+            .partition(|name| name.contains(".batch_norm.folded_"));
+        assert_eq!(folded.len(), 2 * 16);
+        let expected = safetensors[0]
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .filter(|name| name.starts_with("encoder.") || name.starts_with("projector."))
+            .filter(|name| !name.contains(".batch_norm."))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mapped, expected);
     }
 
     pub(in super::super) fn temp_dir(label: &str) -> PathBuf {

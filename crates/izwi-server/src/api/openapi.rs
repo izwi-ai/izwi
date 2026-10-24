@@ -1307,6 +1307,21 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         }),
     );
     properties.insert(
+        "target_language".to_string(),
+        json!({
+            "type": "string",
+            "description": "For transcription jobs, translate the speech into this language instead of transcribing it. Only models whose route_capabilities report speech_translation accept it; it cannot be combined with include_timestamps."
+        }),
+    );
+    properties.insert(
+        "keywords".to_string(),
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "For transcription jobs, terms to bias recognition toward. Multipart repeats the field or separates terms with commas or newlines. Only models whose route_capabilities report keyword_biasing accept it."
+        }),
+    );
+    properties.insert(
         "include_timestamps".to_string(),
         json!({
             "type": "boolean",
@@ -2229,6 +2244,14 @@ pub struct TranscriptionMultipartRequest {
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
+    /// Izwi extension: translate the speech into this language instead of
+    /// transcribing it. Models without speech translation reject it (400);
+    /// word timestamps are not available for a translation.
+    pub target_language: Option<String>,
+    /// Izwi extension: terms to bias recognition toward. Repeat the field or
+    /// separate terms with commas or newlines. Models without keyword
+    /// biasing reject it (400).
+    pub keywords: Option<Vec<String>>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2245,6 +2268,14 @@ pub struct TranscriptionJsonRequest {
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
+    /// Izwi extension: translate the speech into this language instead of
+    /// transcribing it. Models without speech translation reject it (400);
+    /// word timestamps are not available for a translation.
+    pub target_language: Option<String>,
+    /// Izwi extension: terms to bias recognition toward, as an array (or
+    /// one comma- or newline-separated string). Models without keyword
+    /// biasing reject it (400).
+    pub keywords: Option<Vec<String>>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2618,7 +2649,13 @@ mod tests {
         let schemas = openapi["components"]["schemas"]
             .as_object()
             .expect("schemas should exist");
-        for field in ["prompt", "max_tokens", "temperature"] {
+        for field in [
+            "prompt",
+            "target_language",
+            "keywords",
+            "max_tokens",
+            "temperature",
+        ] {
             assert!(
                 schemas["TranscriptionJsonRequest"]["properties"]
                     .get(field)
@@ -2631,6 +2668,22 @@ mod tests {
                     .is_some(),
                 "TranscriptionMultipartRequest should document {field}"
             );
+        }
+    }
+
+    #[test]
+    fn openapi_documents_speech_text_job_translation_and_keywords() {
+        let openapi = document();
+        let content = openapi["paths"]["/v1/speech-to-text/jobs"]["post"]["requestBody"]["content"]
+            .as_object()
+            .expect("job request body content should exist");
+        for content_type in ["application/json", "multipart/form-data"] {
+            let properties = &content[content_type]["schema"]["properties"];
+            assert_eq!(
+                properties["target_language"]["type"].as_str(),
+                Some("string")
+            );
+            assert_eq!(properties["keywords"]["type"].as_str(), Some("array"));
         }
     }
 

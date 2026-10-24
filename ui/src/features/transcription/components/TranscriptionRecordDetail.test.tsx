@@ -71,4 +71,15 @@ describe("TranscriptionRecordDetail", () => {
     expect(onRetry).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
   });
+
+  it("names the language a translation is in", () => {
+    renderDetail({
+      model_id: "Granite-Speech-5.0-2B",
+      language: "fr",
+      target_language: "English",
+    });
+
+    expect(screen.getByText("fr")).toBeInTheDocument();
+    expect(screen.getByText("Translated to English")).toBeInTheDocument();
+  });
 });

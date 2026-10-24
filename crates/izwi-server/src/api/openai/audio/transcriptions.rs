@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use super::resolve_audio_upload_limit_bytes;
+use crate::api::asr_task::{split_keywords, validate_asr_task_request, KeywordsField};
 use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
@@ -30,7 +31,7 @@ use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_asr_model_variant, validate_asr_language, AlignmentSource,
-    AsrTranscription, WindowedAlignment, WorkloadClass,
+    AsrTaskOptions, AsrTranscription, WindowedAlignment, WorkloadClass,
 };
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
@@ -158,9 +159,19 @@ struct TranscriptionRequest {
     response_format: Option<String>,
     stream: bool,
     prompt: Option<String>,
+    /// Translate into this language (models that translate speech).
+    target_language: Option<String>,
+    /// Terms to bias recognition toward (models that take keywords).
+    keywords: Vec<String>,
     max_tokens: Option<usize>,
     _temperature: Option<f32>,
     timestamp_granularities: Option<Vec<String>>,
+}
+
+impl TranscriptionRequest {
+    fn task(&self) -> AsrTaskOptions {
+        AsrTaskOptions::new(self.target_language.clone(), self.keywords.clone())
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -243,6 +254,16 @@ pub async fn transcriptions(
     validate_transcription_model(req.model.as_deref())?;
     validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
     crate::api::transcript_alignment::reject_removed_aligner(req.aligner_model.as_deref())?;
+    let timestamp_request =
+        TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
+    let task = req.task();
+    validate_asr_task_request(
+        req.model.as_deref(),
+        req.language.as_deref(),
+        req.prompt.as_deref(),
+        &task,
+        timestamp_request.any(),
+    )?;
     let audio = req
         .audio
         .take()
@@ -261,12 +282,10 @@ pub async fn transcriptions(
     validate_transcription_response_format(&response_format)?;
 
     if req.stream {
-        return transcriptions_stream(state, req, audio, ctx.correlation_id).await;
+        return transcriptions_stream(state, req, task, audio, ctx.correlation_id).await;
     }
     let audio_bytes = audio.bytes;
 
-    let timestamp_request =
-        TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
     if timestamp_request.any() && response_format != "verbose_json" {
         return Err(ApiError::bad_request(
             "`timestamp_granularities` requires `response_format: \"verbose_json\"`",
@@ -287,6 +306,7 @@ pub async fn transcriptions(
             req.model.as_deref(),
             req.language.as_deref(),
             req.prompt.as_deref(),
+            task,
             req.max_tokens,
             Some(&ctx.correlation_id),
             permit.runtime_context(),
@@ -520,6 +540,7 @@ impl From<&WindowedAlignment> for AlignmentReport {
 async fn transcriptions_stream(
     state: AppState,
     req: TranscriptionRequest,
+    task: AsrTaskOptions,
     audio: AudioPayload,
     correlation_id: String,
 ) -> Result<Response<Body>, ApiError> {
@@ -557,6 +578,7 @@ async fn transcriptions_stream(
             model.as_deref(),
             language.as_deref(),
             prompt.as_deref(),
+            task,
             max_tokens,
             Some(correlation_id.as_str()),
             permit.runtime_context(),
@@ -609,6 +631,10 @@ struct JsonRequestBody {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
+    target_language: Option<String>,
+    #[serde(default)]
+    keywords: Option<KeywordsField>,
+    #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -640,6 +666,11 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             response_format: payload.response_format,
             stream: payload.stream.unwrap_or(false),
             prompt: payload.prompt,
+            target_language: payload.target_language,
+            keywords: payload
+                .keywords
+                .map(KeywordsField::into_keywords)
+                .unwrap_or_default(),
             max_tokens: payload.max_tokens,
             _temperature: payload.temperature,
             timestamp_granularities: payload.timestamp_granularities,
@@ -743,6 +774,24 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     if !text.trim().is_empty() {
                         out.prompt = Some(text.trim().to_string());
                     }
+                }
+                "target_language" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'target_language' field: {e}"
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        out.target_language = Some(text.trim().to_string());
+                    }
+                }
+                "keywords" | "keywords[]" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{name}' field: {e}"
+                        ))
+                    })?;
+                    out.keywords.extend(split_keywords(&text));
                 }
                 "max_tokens" => {
                     let text = field.text().await.map_err(|e| {
@@ -1404,6 +1453,66 @@ mod tests {
         assert!(audio.bytes.starts_with(b"RIFF"));
         assert_eq!(audio.data_url_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.model.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+    }
+
+    #[tokio::test]
+    async fn parse_json_request_reads_a_translation_target_and_keywords() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url(),
+                    "model": "Granite-Speech-5.0-2B",
+                    "target_language": "English",
+                    "keywords": ["Izwi", " Granite Speech "]
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let task = parse_transcription_request(request)
+            .await
+            .expect("request should parse")
+            .task();
+
+        assert_eq!(task.translate_to.as_deref(), Some("English"));
+        assert_eq!(task.keywords, vec!["Izwi", "Granite Speech"]);
+    }
+
+    #[tokio::test]
+    async fn parse_multipart_request_splits_repeated_keyword_fields() {
+        let boundary = "izwi-boundary";
+        let field = |name: &str, value: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+        };
+        let body = [
+            field("model", "Granite-Speech-5.0-2B"),
+            field("target_language", " de "),
+            field("keywords", "Izwi, Granite"),
+            field("keywords[]", "Agentic AI\nsovereign data"),
+            format!("--{boundary}--\r\n"),
+        ]
+        .concat();
+        let request = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("request should build");
+
+        let task = parse_transcription_request(request)
+            .await
+            .expect("request should parse")
+            .task();
+
+        assert_eq!(task.translate_to.as_deref(), Some("de"));
+        assert_eq!(
+            task.keywords,
+            vec!["Izwi", "Granite", "Agentic AI", "sovereign data"]
+        );
     }
 
     #[tokio::test]

@@ -166,6 +166,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "summary_error",
             "summary_updated_at",
             "owner_node_id",
+            "target_language",
+            "keywords_json",
         ],
     },
     RequiredSchemaTable {

@@ -155,6 +155,13 @@ pub struct GraniteTextConfig {
     pub rms_norm_eps: f64,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    /// transformers v4 RoPE scaling and its v5 replacement. The 4.1 runtime
+    /// implements default RoPE only, so [`GraniteSpeechConfig::validate`]
+    /// rejects any other `rope_type` instead of silently dropping it.
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rope_parameters: Option<serde_json::Value>,
     /// Language-model tie flag; resolve through
     /// [`GraniteSpeechConfig::tie_word_embeddings`], which also consults the
     /// composite config.
@@ -303,6 +310,8 @@ impl GraniteSpeechConfig {
             )));
         }
 
+        self.text_config.validate_default_rope()?;
+
         let encoder = &self.encoder_config;
         // transformers' base encoder has no concatenation; only plus exports
         // intermediate layers into the projector input.
@@ -367,6 +376,41 @@ impl GraniteSpeechConfig {
 
     pub fn decoder_kv_groups(&self) -> usize {
         self.text_config.num_attention_heads / self.text_config.num_key_value_heads.max(1)
+    }
+}
+
+impl GraniteTextConfig {
+    /// A checkpoint whose language model uses RoPE scaling (Granite Speech
+    /// 5.0, or plus re-published with YaRN) must not load here: without the
+    /// scaling it would run and quietly transcribe worse.
+    fn validate_default_rope(&self) -> Result<()> {
+        for (field, value) in [
+            ("rope_scaling", &self.rope_scaling),
+            ("rope_parameters", &self.rope_parameters),
+        ] {
+            let Some(params) = value.as_ref().filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let rope_type = params
+                .get("rope_type")
+                .or_else(|| params.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("default");
+            if rope_type != "default" {
+                return Err(Error::ModelLoadError(format!(
+                    "Granite Speech 4.1 implements default RoPE only, but text_config.{field} declares rope_type {rope_type:?}"
+                )));
+            }
+            if let Some(theta) = params.get("rope_theta").and_then(serde_json::Value::as_f64) {
+                if theta != self.rope_theta {
+                    return Err(Error::ModelLoadError(format!(
+                        "Granite Speech text_config.{field}.rope_theta {theta} disagrees with rope_theta {}",
+                        self.rope_theta
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -579,6 +623,8 @@ mod tests {
                 residual_multiplier: 0.22,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10_000.0,
+                rope_scaling: None,
+                rope_parameters: None,
                 tie_word_embeddings: Some(true),
                 use_cache: true,
                 vocab_size: 100_353,
@@ -758,6 +804,67 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("context_size 513"));
+    }
+
+    /// The published 4.1 configs declare default RoPE in the v5 form; YaRN in
+    /// either form (Granite Speech 5.0's v4 `rope_scaling`, the re-published
+    /// plus's v5 `rope_parameters`) is a checkpoint this runtime cannot run.
+    #[test]
+    fn validate_rejects_rope_scaling_the_runtime_does_not_implement() {
+        let base = || -> serde_json::Value {
+            serde_json::from_str(
+                &fs::read_to_string(fixture_dir("base").join("config.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        let parse = |raw: serde_json::Value| -> GraniteSpeechConfig {
+            serde_json::from_value(raw).unwrap()
+        };
+        let published = parse(base());
+        assert_eq!(
+            published.text_config.rope_parameters,
+            Some(serde_json::json!({"rope_theta": 10000, "rope_type": "default"}))
+        );
+        assert_eq!(
+            published.validate().unwrap(),
+            GraniteSpeechCheckpointKind::Base
+        );
+
+        let yarn = serde_json::json!({
+            "factor": 4.0,
+            "original_max_position_embeddings": 4096,
+            "rope_type": "yarn"
+        });
+        let mut granite_5 = base();
+        granite_5["text_config"]["rope_scaling"] = yarn.clone();
+        granite_5["text_config"]["max_position_embeddings"] = serde_json::json!(16384);
+        granite_5["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_parameters");
+        let err = parse(granite_5).validate().unwrap_err().to_string();
+        assert!(
+            err.contains("rope_scaling declares rope_type \"yarn\""),
+            "{err}"
+        );
+
+        let mut plus_v2610 = base();
+        plus_v2610["text_config"]["rope_parameters"] = yarn;
+        let err = parse(plus_v2610).validate().unwrap_err().to_string();
+        assert!(
+            err.contains("rope_parameters declares rope_type \"yarn\""),
+            "{err}"
+        );
+
+        let mut legacy_key = base();
+        legacy_key["text_config"]["rope_scaling"] =
+            serde_json::json!({"type": "linear", "factor": 2.0});
+        assert!(parse(legacy_key).validate().is_err());
+
+        let mut theta = base();
+        theta["text_config"]["rope_parameters"]["rope_theta"] = serde_json::json!(500000);
+        let err = parse(theta).validate().unwrap_err().to_string();
+        assert!(err.contains("disagrees with rope_theta"), "{err}");
     }
 
     #[test]

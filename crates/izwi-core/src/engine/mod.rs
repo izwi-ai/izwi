@@ -172,9 +172,9 @@ pub use metrics::{
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub(crate) use request::KokoroPreparedText;
 pub use request::{
-    AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
-    EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,
-    RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
+    AsrEngineInput, AsrTaskOptions, AudioChatEngineInput, ChatEngineInput, EngineAudioInput,
+    EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
+    RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
@@ -5860,10 +5860,21 @@ mod tests {
             .expect_err("generate task should be cancelled")
             .is_cancelled());
 
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+        // The ID stays fenced until the exact session's release finishes:
+        // cleanup confirmed and its terminal acknowledged. The session key
+        // disappears earlier when an in-flight step sees the cancellation,
+        // since that step acknowledges the terminal under a later core lock.
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
-                if engine.request_session_key(&request_id).await.is_none() {
-                    break;
+                {
+                    let core = engine.core.read().await;
+                    if core.get_session_key(&request_id).is_none()
+                        && core
+                            .abandoned_session_cleanup_delay(&abandoned_session)
+                            .is_none()
+                    {
+                        break;
+                    }
                 }
                 tokio::task::yield_now().await;
             }
