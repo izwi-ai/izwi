@@ -235,6 +235,60 @@ across runs. Several requests failed with 503 in these runs because the
 shared machine left little live memory (`insufficient live memory`), in
 both builds.
 
+## Audio load (ASR and TTS)
+
+`scripts/bench/run-audio-load.py` is the open-loop load generator for
+`/v1/audio/transcriptions` (`--task asr`) and `/v1/audio/speech`
+(`--task tts`). It uses the same arrival process and metadata as the chat
+benchmark and the same standard-library-only rule.
+
+Every request has its own input, so batching sees mixed lengths. ASR clips
+are cut from the `--audio` WAV files at seeded random offsets, with lengths
+uniform in `--min-secs`..`--max-secs`. TTS inputs are seeded random sentences
+of `--min-words`..`--max-words` words, each request with its own seed.
+
+Before the load, every input runs alone once, and the first input runs a
+second time to check that the model repeats itself. Under load each response
+is compared with its solo output: ASR text must match exactly (a match that
+ignores case and punctuation is reported too), and TTS audio must have the
+same length and stay within `--tts-tolerance` of full scale. A batching bug
+that changes one request's output therefore shows up as a parity failure,
+not only as latency. A model that does not repeat its own solo output is
+reported (`solo.repeatable: false`) and not held to parity. The samplers
+treat seed 0 as "seed from the clock", so request seeds start at 1.
+
+```bash
+python3 scripts/bench/run-audio-load.py --task asr \
+  --base-url http://127.0.0.1:8080 --model Qwen3-ASR-0.6B-GGUF \
+  --audio data/test.wav --audio data/diarization.wav \
+  --num-requests 16 --min-secs 2 --max-secs 20 --request-rate 1,inf \
+  --output asr-load.json
+
+python3 scripts/bench/run-audio-load.py --task tts \
+  --base-url http://127.0.0.1:8080 --model Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --num-requests 12 --request-rate inf --temperature 0 \
+  --tts-extra '{"subtalker_do_sample": false}' --require-parity
+```
+
+`--tts-extra` merges a JSON object into every speech request.
+`--require-parity` exits 3 on any parity failure, or when the model does not
+repeat itself. Without it, the run only reports.
+
+Measured on an M1 Pro (Metal, one run each, at `--request-rate inf`):
+
+| Model | Inputs | Audio s/s alone | Audio s/s under load | Parity |
+|---|---|---|---|---|
+| Qwen3-ASR-0.6B (GGUF) | 16 clips, 2-20 s | 18.2 | 21.3 | 16/16 exact |
+| Granite Speech 5.0 2B (GGUF) | 12 clips, 2-20 s | 7.1 | 7.3 | 12/12 exact |
+| Kokoro-82M | 16 inputs, 4-40 words | 6.5 | 6.5 | 16/16 exact |
+| Qwen3-TTS 0.6B CustomVoice, greedy | 12 inputs, 4-30 words | 0.62 | 0.82 | 8/12 |
+
+Kokoro and Granite 5 gain nothing under load. Granite 5 runs one request at
+a time, and Kokoro's decoder batches only rows of equal duration, which
+mixed inputs rarely are. Qwen3-TTS gains about a third, but four of twelve
+greedy outputs differ from their solo audio: its batched path does not yet
+reproduce single-request output.
+
 ## Regression check per backend
 
 `--profile regression` is a small deterministic profile. It uses 24 seeded
@@ -280,3 +334,8 @@ mean and spread), percentile math, the SSE parser (every split point, CR/LF
 variants), goodput, Prometheus deltas and histogram quantiles, the result
 schema, the comparison, and an end-to-end run against a local fake SSE
 server. It runs in the `hygiene` lane of `scripts/ci/check-backend-truth.sh`.
+
+`scripts/bench/test-audio-load.py` covers clip cutting, TTS input lengths,
+WAV handling, the parity checks, the repeatability guard, and end-to-end runs
+against a fake server that corrupts a response whenever requests overlap. It
+runs in the same lane.
