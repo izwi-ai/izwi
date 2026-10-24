@@ -1219,11 +1219,13 @@ Server events:
 | `transcript_partial` | Includes `sequence`, `text`, optional `language`, and audio duration. |
 | `session_done` | Session stopped. |
 | `pong` | Ping response. |
-| `error` | Error message. |
+| `error` | Error message. `fatal: true` ends the session. |
 
 Constraints:
 
 - Binary frames larger than 512 KiB are rejected.
+- Natively streaming models serve at most `IZWI_ASR_REALTIME_MAX_SESSIONS` streams at once. A session over that cap gets one non-fatal `error` with code `realtime_stream_capacity` (typed protocol: `recoverable_error` with code `backpressure`) and keeps going by re-transcribing a rolling window, which adds latency.
+- Frames that arrive while the model is busy are handed to it together, up to one second of audio at a time.
 - Sample rate must remain stable during a session.
 - Sample rates outside the accepted runtime range return an error.
 

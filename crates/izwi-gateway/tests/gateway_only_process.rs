@@ -492,6 +492,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
             final_text: "gateway relayed transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
+            report_pushed_samples: false,
         }),
         ..TestWorkerConfig::default()
     })
@@ -964,6 +965,24 @@ type PublicWsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Next text frame from the public socket, or None on close.
+/// Each worker push adds one "partial " delta and the gateway republishes the
+/// whole hypothesis, so the partials grow by one delta each. The worker may
+/// merge frames that queued behind a push, so `frames` frames give between
+/// one and `frames` partials.
+fn assert_accumulating_partials(partials: &[String], frames: usize) {
+    assert!(
+        (1..=frames).contains(&partials.len()),
+        "one partial per push, at most one per frame: {partials:?}"
+    );
+    for (index, partial) in partials.iter().enumerate() {
+        assert_eq!(
+            partial,
+            &"partial ".repeat(index + 1),
+            "deltas accumulate into the replaceable partial hypothesis"
+        );
+    }
+}
+
 async fn next_public_text(ws: &mut PublicWsStream) -> Option<String> {
     use futures::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
@@ -1012,6 +1031,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
             final_text: "gateway translated transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
+            report_pushed_samples: false,
         }),
         ..TestWorkerConfig::default()
     })
@@ -1157,11 +1177,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
             other => panic!("unexpected public event: {other:?}: {value}"),
         }
     }
-    assert_eq!(
-        partials,
-        vec!["partial ", "partial partial "],
-        "deltas accumulate into the replaceable partial hypothesis"
-    );
+    assert_accumulating_partials(&partials, 2);
     assert_eq!(
         final_text.as_deref(),
         Some("gateway translated transcript"),
@@ -1216,6 +1232,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
             final_text: "gateway translated transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
+            report_pushed_samples: false,
         }),
         ..TestWorkerConfig::default()
     })
@@ -1423,11 +1440,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
         vec![(3, 4, 1)],
         "the skipped frame 3 is reported as one missing frame"
     );
-    assert_eq!(
-        partials,
-        vec!["partial ", "partial partial ", "partial partial partial "],
-        "deltas accumulate into replaceable partial hypotheses"
-    );
+    assert_accumulating_partials(&partials, 3);
     assert_eq!(
         final_text.as_deref(),
         Some("gateway translated transcript"),

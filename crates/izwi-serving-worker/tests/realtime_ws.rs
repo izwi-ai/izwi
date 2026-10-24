@@ -40,6 +40,8 @@ struct RunnerCounters {
     start_calls: AtomicUsize,
     active_streams: AtomicUsize,
     pushes: AtomicUsize,
+    /// Samples in each push, in order.
+    pushed_samples: Mutex<Vec<usize>>,
 }
 
 /// Scripted ASR stage runner: one delta per push, one final transcript on
@@ -51,6 +53,8 @@ struct FakeAsrRunner {
     deltas: Arc<Mutex<VecDeque<String>>>,
     final_text: Arc<String>,
     fail_start: Arc<AsyncMutex<bool>>,
+    /// Every push waits on this, so a test holding it keeps a push running.
+    push_gate: Arc<AsyncMutex<()>>,
 }
 
 impl FakeAsrRunner {
@@ -63,6 +67,7 @@ impl FakeAsrRunner {
             ]))),
             final_text: Arc::new(final_text.into()),
             fail_start: Arc::new(AsyncMutex::new(false)),
+            push_gate: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -71,6 +76,7 @@ struct FakeAsrStream {
     final_text: Arc<String>,
     counters: Arc<RunnerCounters>,
     deltas: Arc<Mutex<VecDeque<String>>>,
+    push_gate: Arc<AsyncMutex<()>>,
     chunk_index: usize,
 }
 
@@ -84,10 +90,16 @@ impl Drop for FakeAsrStream {
 impl RealtimeAsrStageStream for FakeAsrStream {
     async fn push_samples(
         &mut self,
-        _samples: &[f32],
+        samples: &[f32],
         _sample_rate: u32,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>, izwi_core::Error> {
         self.counters.pushes.fetch_add(1, Ordering::AcqRel);
+        self.counters
+            .pushed_samples
+            .lock()
+            .unwrap()
+            .push(samples.len());
+        let _open = self.push_gate.lock().await;
         let delta = self
             .deltas
             .lock()
@@ -134,6 +146,7 @@ impl RealtimeStageRunner for FakeAsrRunner {
             final_text: Arc::clone(&self.final_text),
             counters: Arc::clone(&self.counters),
             deltas: Arc::clone(&self.deltas),
+            push_gate: Arc::clone(&self.push_gate),
             chunk_index: 0,
         }))
     }
@@ -681,6 +694,66 @@ async fn realtime_audio_sequence_regression_fails_the_session() {
         other => panic!("expected error event, got {other:?}"),
     }
     expect_close(&mut ws, 1000).await;
+}
+
+/// Frames that queue while a push runs reach the model as one push, in
+/// order, with every sample.
+#[tokio::test]
+async fn audio_queued_behind_a_running_push_joins_one_push() {
+    let runner = FakeAsrRunner::new("done");
+    let service = WorkerService::new(
+        realtime_config(REALTIME_SESSION_DEFAULT_LIMITS),
+        FakeRealtimeExecutor {
+            runner: runner.clone(),
+        },
+    )
+    .unwrap();
+    let addr = spawn_worker(&service).await;
+
+    let (mut ws, _) = connect(addr, true, true).await.unwrap();
+    send_text(&mut ws, admit_frame("attempt-1", |_| {})).await;
+    assert!(matches!(next_frame(&mut ws).await, NextFrame::Admitted));
+    assert!(matches!(next_frame(&mut ws).await, NextFrame::Event(_)));
+
+    let gate = runner.push_gate.lock().await;
+    ws.send(audio_frame(1, &[0, 0, 0, 0])).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runner.counters.pushes.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first push starts");
+    for sequence in 2..=5u32 {
+        ws.send(audio_frame(sequence, &[0, 0, 0, 0])).await.unwrap();
+    }
+    // Let the reader queue the frames behind the held push.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(gate);
+
+    for _ in 0..2 {
+        match next_frame(&mut ws).await {
+            NextFrame::Event(event) => {
+                assert!(matches!(event.event, InvocationEventKind::TextDelta { .. }));
+            }
+            other => panic!("expected a delta, got {other:?}"),
+        }
+    }
+    send_json(&mut ws, &RealtimeClientFrame::Finish).await;
+    assert!(matches!(next_frame(&mut ws).await, NextFrame::Event(_)));
+    match next_frame(&mut ws).await {
+        NextFrame::Event(event) => {
+            assert!(matches!(event.event, InvocationEventKind::Completed { .. }));
+        }
+        other => panic!("expected completed, got {other:?}"),
+    }
+    expect_close(&mut ws, 1000).await;
+
+    assert_eq!(
+        *runner.counters.pushed_samples.lock().unwrap(),
+        [2, 8],
+        "frames 2-5 join one push"
+    );
 }
 
 #[tokio::test]

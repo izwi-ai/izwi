@@ -916,7 +916,7 @@ variable, else from the default:
 
 | Limit | Environment | Default |
 |---|---|---|
-| Concurrent sessions | `IZWI_ASR_REALTIME_MAX_SESSIONS` | 16 on CUDA, 4 on CPU and Metal |
+| Concurrent sessions | `IZWI_ASR_REALTIME_MAX_SESSIONS` | `IZWI_MAX_NUM_SEQS`, else 16 on CUDA and 4 on CPU and Metal |
 | Absolute lifetime (s) | `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | 28,800 (8 hours) |
 | Idle timeout (s) | `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | 90 |
 

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::StreamExt;
-use izwi_core::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass};
+use izwi_core::{
+    ErrorKind, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass,
+};
 use izwi_vad::{SpeechEvidence, SpeechEvidenceConfig, VadScorer};
 use serde::Serialize;
 use serde_json::json;
@@ -36,6 +38,12 @@ const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
+/// Audio frames queued behind the one being handled join its push, up to
+/// this much audio, so a backlog costs one model push instead of one a frame.
+const MAX_COALESCED_AUDIO_SECS: usize = 1;
+/// Legacy error code for a session that found every native realtime stream
+/// taken and re-transcribes a rolling window instead.
+const NATIVE_STREAM_CAPACITY_CODE: &str = "realtime_stream_capacity";
 // LocalAgreement-2 style stabilization (as used in whisper_streaming):
 // commit only the common prefix between the previous and current hypothesis.
 // Text-only approximation of whisper_streaming's timestamp boundary filtering:
@@ -121,17 +129,20 @@ impl OutboundTx {
 }
 
 #[derive(Debug)]
+struct AudioFrame {
+    frame_seq: u32,
+    sample_rate: u32,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
 enum WorkerCommand {
     SessionStart {
         model_id: Option<String>,
         language: Option<String>,
         wire_protocol: TranscriptionWireProtocol,
     },
-    AudioFrame {
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: Vec<u8>,
-    },
+    AudioFrame(AudioFrame),
     Ping {
         timestamp_ms: Option<u64>,
     },
@@ -438,11 +449,11 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
                 }) => {
                     if !send_worker_command(
                         &worker_tx,
-                        WorkerCommand::AudioFrame {
+                        WorkerCommand::AudioFrame(AudioFrame {
                             frame_seq,
                             sample_rate,
                             payload,
-                        },
+                        }),
                     ) {
                         send_json(
                             &out_tx,
@@ -566,6 +577,8 @@ async fn run_worker(
     let mut session = RealtimeSessionState::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A command taken off the queue while coalescing audio, handled next.
+    let mut deferred: Option<WorkerCommand> = None;
 
     loop {
         enum LoopEvent {
@@ -574,7 +587,9 @@ async fn run_worker(
             InferenceDone(Result<Result<InferenceResult, String>, oneshot::error::RecvError>),
         }
 
-        let event = if let Some(in_flight) = session.in_flight.as_mut() {
+        let event = if let Some(command) = deferred.take() {
+            LoopEvent::Command(Some(command))
+        } else if let Some(in_flight) = session.in_flight.as_mut() {
             tokio::select! {
                 command = worker_rx.recv() => LoopEvent::Command(command),
                 _ = ticker.tick() => LoopEvent::Tick,
@@ -588,6 +603,23 @@ async fn run_worker(
         };
 
         match event {
+            LoopEvent::Command(Some(WorkerCommand::AudioFrame(frame))) => {
+                let ingress_queue_depth = worker_rx.len();
+                let (frames, next) = take_queued_audio_frames(frame, &mut worker_rx);
+                deferred = next;
+                if handle_audio_frames(
+                    &state,
+                    &correlation_id,
+                    &out_tx,
+                    &mut session,
+                    frames,
+                    ingress_queue_depth,
+                )
+                .await
+                {
+                    break;
+                }
+            }
             LoopEvent::Command(Some(command)) => {
                 let ingress_queue_depth = worker_rx.len();
                 if handle_worker_command(
@@ -685,66 +717,16 @@ async fn handle_worker_command(
             send_session_started(out_tx, session);
             false
         }
-        WorkerCommand::AudioFrame {
-            frame_seq,
-            sample_rate,
-            payload,
-        } => {
-            let previous_frame_seq = session.last_frame_seq;
-            let frame_samples = match ingest_audio_frame(session, frame_seq, sample_rate, &payload)
-            {
-                Ok(samples) => samples,
-                Err(err) => {
-                    send_session_error(out_tx, session, err);
-                    return false;
-                }
-            };
-
-            if !frame_samples.is_empty() {
-                send_audio_ingress_events(
-                    out_tx,
-                    session,
-                    previous_frame_seq,
-                    frame_seq,
-                    ingress_queue_depth,
-                );
-            }
-
-            match maybe_process_native_stream_frame(
+        WorkerCommand::AudioFrame(frame) => {
+            handle_audio_frames(
                 state,
+                correlation_id,
                 out_tx,
                 session,
-                &frame_samples,
-                sample_rate,
+                vec![frame],
+                ingress_queue_depth,
             )
             .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    if let Err(err) =
-                        maybe_schedule_inference(state, correlation_id, session, false)
-                    {
-                        send_session_error_with_code(
-                            out_tx,
-                            session,
-                            RealtimeErrorCode::InferenceFailed,
-                            err,
-                        );
-                    }
-                }
-                Err(failure) if failure.terminal => {
-                    session.native_asr_stream = None;
-                    send_session_fatal_error(out_tx, session, failure.message);
-                    return true;
-                }
-                Err(failure) => send_session_error_with_code(
-                    out_tx,
-                    session,
-                    RealtimeErrorCode::InferenceFailed,
-                    failure.message,
-                ),
-            }
-            false
         }
         WorkerCommand::Ping { timestamp_ms } => {
             send_session_pong(out_tx, session, timestamp_ms);
@@ -774,6 +756,94 @@ async fn handle_worker_command(
         }
         WorkerCommand::Shutdown => true,
     }
+}
+
+/// Takes the audio frames queued directly behind `first`, up to
+/// `MAX_COALESCED_AUDIO_SECS` of audio. A queued command that is not audio
+/// ends the batch and comes back to be handled next, so order holds.
+fn take_queued_audio_frames(
+    first: AudioFrame,
+    worker_rx: &mut mpsc::Receiver<WorkerCommand>,
+) -> (Vec<AudioFrame>, Option<WorkerCommand>) {
+    let byte_limit = first.sample_rate as usize * 2 * MAX_COALESCED_AUDIO_SECS;
+    let mut bytes = first.payload.len();
+    let mut frames = vec![first];
+    while bytes < byte_limit {
+        match worker_rx.try_recv() {
+            Ok(WorkerCommand::AudioFrame(frame)) => {
+                bytes += frame.payload.len();
+                frames.push(frame);
+            }
+            Ok(command) => return (frames, Some(command)),
+            Err(_) => break,
+        }
+    }
+    (frames, None)
+}
+
+/// Ingests each frame in order, then hands their fresh audio to the native
+/// stream in one push, or schedules one windowed re-transcription. Returns
+/// whether the session ended.
+async fn handle_audio_frames(
+    state: &AppState,
+    correlation_id: &str,
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    frames: Vec<AudioFrame>,
+    ingress_queue_depth: usize,
+) -> bool {
+    let mut fresh_samples = Vec::new();
+    let mut sample_rate = None;
+    for (index, frame) in frames.into_iter().enumerate() {
+        let previous_frame_seq = session.last_frame_seq;
+        match ingest_audio_frame(session, frame.frame_seq, frame.sample_rate, &frame.payload) {
+            Ok(samples) => {
+                sample_rate = Some(frame.sample_rate);
+                if !samples.is_empty() {
+                    send_audio_ingress_events(
+                        out_tx,
+                        session,
+                        previous_frame_seq,
+                        frame.frame_seq,
+                        ingress_queue_depth.saturating_sub(index),
+                    );
+                    fresh_samples.extend_from_slice(&samples);
+                }
+            }
+            Err(err) => send_session_error(out_tx, session, err),
+        }
+    }
+    let Some(sample_rate) = sample_rate else {
+        return false;
+    };
+
+    match maybe_process_native_stream_frame(state, out_tx, session, &fresh_samples, sample_rate)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(err) = maybe_schedule_inference(state, correlation_id, session, false) {
+                send_session_error_with_code(
+                    out_tx,
+                    session,
+                    RealtimeErrorCode::InferenceFailed,
+                    err,
+                );
+            }
+        }
+        Err(failure) if failure.terminal => {
+            session.native_asr_stream = None;
+            send_session_fatal_error(out_tx, session, failure.message);
+            return true;
+        }
+        Err(failure) => send_session_error_with_code(
+            out_tx,
+            session,
+            RealtimeErrorCode::InferenceFailed,
+            failure.message,
+        ),
+    }
+    false
 }
 
 fn send_session_started(out_tx: &OutboundTx, session: &mut RealtimeSessionState) {
@@ -1221,7 +1291,7 @@ async fn maybe_process_native_stream_frame(
     if !session.native_stream_checked {
         session.native_stream_checked = true;
         let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
-        session.native_asr_stream = state
+        match state
             .runtime
             .try_start_asr_realtime_stream(
                 session.model_id.as_deref(),
@@ -1229,7 +1299,14 @@ async fn maybe_process_native_stream_frame(
                 None,
             )
             .await
-            .map_err(NativeStreamFailure::recoverable)?;
+        {
+            Ok(stream) => session.native_asr_stream = stream,
+            Err(error) if error.kind() == ErrorKind::CapacityExhausted => {
+                send_native_capacity_notice(out_tx, session, &error);
+                return Ok(false);
+            }
+            Err(error) => return Err(NativeStreamFailure::recoverable(error)),
+        }
     }
 
     let Some(stream) = session.native_asr_stream.as_mut() else {
@@ -1251,6 +1328,43 @@ async fn maybe_process_native_stream_frame(
     emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
     session.pending_recompute = false;
     Ok(true)
+}
+
+/// Tells the client, once, that every native realtime stream is taken, so
+/// this session re-transcribes a rolling window instead: it keeps working,
+/// with more latency and more compute per word.
+fn send_native_capacity_notice(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    error: &izwi_core::Error,
+) {
+    warn!("transcription realtime falls back to windowed re-transcription: {error}");
+    let message = format!(
+        "Native realtime streaming is at capacity ({error}); this session re-transcribes a rolling window instead"
+    );
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => send_json(
+            out_tx,
+            json!({
+                "type": "error",
+                "code": NATIVE_STREAM_CAPACITY_CODE,
+                "message": message,
+                "fatal": false,
+            }),
+        ),
+        TranscriptionWireProtocol::TypedV3 => {
+            if let Some(typed) = session.typed_session.as_mut() {
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::RecoverableError {
+                        code: RealtimeErrorCode::Backpressure,
+                        message,
+                        retry_after_ms: None,
+                    },
+                );
+            }
+        }
+    }
 }
 
 async fn finish_native_stream_if_needed(
@@ -1960,17 +2074,119 @@ mod tests {
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
         negotiate_transcription_protocol, new_audio_needs_decode, pcm16_i16_to_f32,
-        send_session_fatal_error,
-        send_session_finished, strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput,
-        OutboundTx, RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
-        TypedTranscriptionSession,
+        send_native_capacity_notice, send_session_fatal_error, send_session_finished,
+        strip_suffix_prefix_overlap_with_lookahead_by_words, take_queued_audio_frames, AudioFrame,
+        MailboxOutput, OutboundTx, RealtimeInferenceDiagnostics, RealtimeSessionState,
+        TranscriptionWireProtocol, TypedTranscriptionSession, WorkerCommand,
+        NATIVE_STREAM_CAPACITY_CODE,
     };
     use crate::app::realtime_protocol::{
-        RealtimeEventFinality, RealtimeServerEnvelope, RealtimeServerEvent,
+        RealtimeErrorCode, RealtimeEventFinality, RealtimeServerEnvelope, RealtimeServerEvent,
         TRANSCRIPTION_REALTIME_VERSION,
     };
     use axum::extract::ws::Message;
     use izwi_core::{EngineConfig, RuntimeService};
+    use tokio::sync::mpsc;
+
+    fn audio_frame(frame_seq: u32, samples: usize) -> AudioFrame {
+        AudioFrame {
+            frame_seq,
+            sample_rate: 16_000,
+            payload: vec![0; samples * 2],
+        }
+    }
+
+    fn frame_seqs(frames: &[AudioFrame]) -> Vec<u32> {
+        frames.iter().map(|frame| frame.frame_seq).collect()
+    }
+
+    /// W3: frames that queued while a push ran go out as one push, and a
+    /// control command behind them is still handled next, in order.
+    #[test]
+    fn queued_audio_frames_join_one_push_up_to_a_control_command() {
+        let (tx, mut rx) = mpsc::channel(16);
+        for command in [
+            WorkerCommand::AudioFrame(audio_frame(2, 320)),
+            WorkerCommand::AudioFrame(audio_frame(3, 320)),
+            WorkerCommand::Ping { timestamp_ms: None },
+            WorkerCommand::AudioFrame(audio_frame(4, 320)),
+        ] {
+            assert!(tx.try_send(command).is_ok());
+        }
+
+        let (frames, next) = take_queued_audio_frames(audio_frame(1, 320), &mut rx);
+
+        assert_eq!(frame_seqs(&frames), [1, 2, 3]);
+        assert!(matches!(next, Some(WorkerCommand::Ping { .. })));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkerCommand::AudioFrame(AudioFrame { frame_seq: 4, .. }))
+        ));
+    }
+
+    #[test]
+    fn coalesced_audio_stops_at_one_second() {
+        let (tx, mut rx) = mpsc::channel(16);
+        for frame_seq in 2..=5 {
+            assert!(tx
+                .try_send(WorkerCommand::AudioFrame(audio_frame(frame_seq, 6_400)))
+                .is_ok());
+        }
+
+        let (frames, next) = take_queued_audio_frames(audio_frame(1, 6_400), &mut rx);
+
+        // 0.4 s frames: the third crosses one second and ends the batch.
+        assert_eq!(frame_seqs(&frames), [1, 2, 3]);
+        assert!(next.is_none());
+        assert_eq!(rx.len(), 2);
+    }
+
+    /// W4: a session that finds every native stream taken is told so with a
+    /// non-fatal, typed notice instead of an inference failure.
+    #[tokio::test]
+    async fn native_stream_capacity_notice_is_typed_and_not_fatal() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let full = izwi_core::Error::Overloaded("realtime ASR session quota is full".to_string());
+        for wire_protocol in [
+            TranscriptionWireProtocol::TypedV3,
+            TranscriptionWireProtocol::LegacyV2,
+        ] {
+            let outbound = OutboundTx::with_capacity(runtime.clone(), "transcription test", 8);
+            let mut session = RealtimeSessionState {
+                started: true,
+                wire_protocol,
+                typed_session: (wire_protocol == TranscriptionWireProtocol::TypedV3).then(|| {
+                    TypedTranscriptionSession::with_identity(
+                        "session-1".to_string(),
+                        "process-42".to_string(),
+                    )
+                }),
+                ..RealtimeSessionState::default()
+            };
+
+            send_native_capacity_notice(&outbound, &mut session, &full);
+
+            let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+                panic!("expected the capacity notice");
+            };
+            if wire_protocol == TranscriptionWireProtocol::TypedV3 {
+                let envelope = serde_json::from_str::<RealtimeServerEnvelope>(text.as_str())
+                    .expect("typed event envelope");
+                let RealtimeServerEvent::RecoverableError { code, message, .. } = &envelope.event
+                else {
+                    panic!("expected a recoverable error, got {:?}", envelope.event);
+                };
+                assert_eq!(*code, RealtimeErrorCode::Backpressure);
+                assert!(message.contains("rolling window"), "{message}");
+                assert!(!envelope.event.requires_connection_close());
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("legacy error");
+                assert_eq!(value["code"], NATIVE_STREAM_CAPACITY_CODE);
+                assert_eq!(value["fatal"], false);
+            }
+        }
+    }
 
     #[test]
     fn realtime_protocol_negotiation_defaults_to_legacy_and_requires_explicit_v3() {

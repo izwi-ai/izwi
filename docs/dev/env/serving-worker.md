@@ -71,6 +71,6 @@ The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `tr
 | `IZWI_KV_OFFLOAD_LOW_WATERMARK` | the engine default | Device KV occupancy that stops offload. |
 | `IZWI_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES` | the engine default | Offload pages in flight at once. |
 | `IZWI_KV_OFFLOAD_MAX_PROMOTION_PAGES` | the engine default | Pages promoted back per step. |
-| `IZWI_ASR_REALTIME_MAX_SESSIONS` | 16 on CUDA, 4 on CPU and Metal | Concurrent realtime ASR sessions (also the state arena rows a load reserves). |
+| `IZWI_ASR_REALTIME_MAX_SESSIONS` | IZWI_MAX_NUM_SEQS, else 16 on CUDA and 4 on CPU and Metal | Concurrent realtime ASR sessions (also the state arena rows a load reserves). |
 | `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | 28800 (8 hours) | Seconds one realtime ASR session may live. |
 | `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | `90` | Seconds without audio before a realtime ASR session is reaped. |
