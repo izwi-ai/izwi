@@ -415,8 +415,8 @@ Multipart fields:
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
 | `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. |
-| `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
-| `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (`Granite-Speech-5.0-2B`, up to 2,000 terms of at most 128 characters); others return `400`. A long list shortens the audio one invocation can hold. |
+| `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
+| `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters); others return `400`. A long list shortens the audio one invocation can hold. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
 | `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
@@ -675,7 +675,7 @@ Transcription jobs also accept `target_language` and `keywords`, with the
 same meaning and limits as on `/v1/audio/transcriptions`: multipart repeats
 `keywords` or separates terms with commas or newlines; JSON takes an array.
 Models whose `route_capabilities` report `speech_translation` or
-`keyword_biasing` accept them (`Granite-Speech-5.0-2B`); others return `400`,
+`keyword_biasing` accept them (both Granite Speech 5.0 releases); others return `400`,
 as does a translation with `include_timestamps` or in speaker-attributed mode.
 The record stores both as `target_language` and `keywords`, keeps the spoken
 `language` the job named, and a retry asks for the same translation.

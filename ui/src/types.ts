@@ -98,7 +98,9 @@ function isGraniteSpeech5AsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
     normalized === "granite-speech-5.0-2b" ||
-    normalized === "ibm-granite/granite-speech-5.0-2b"
+    normalized === "ibm-granite/granite-speech-5.0-2b" ||
+    normalized === "granite-speech-5.0-2b-gguf" ||
+    normalized === "ibm-granite/granite-speech-5.0-2b-gguf"
   );
 }
 

@@ -390,6 +390,22 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "4.63 GB",
   },
+  "Granite-Speech-5.0-2B-GGUF": {
+    shortName: "Granite Speech 5.0 GGUF",
+    fullName: "IBM Granite Speech 5.0 2B (GGUF Q8_0)",
+    description:
+      "IBM Granite Speech 5.0 with a Q8_0 language model: the same transcription, speech translation and keyword biasing in less memory",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "Translation",
+      "Punctuation",
+      "Keyword biasing",
+      "GGUF",
+      "Q8_0",
+    ],
+    size: "3.12 GB",
+  },
   "Granite-Speech-4.1-2B-Plus": {
     shortName: "Granite Speech 4.1 Plus",
     fullName: "IBM Granite Speech 4.1 2B Plus",

@@ -106,7 +106,7 @@ The Transcription workspace has three modes:
 
 | Mode | Best for | Notes |
 |------|----------|-------|
-| **Transcription** | Single-speaker or general ASR | Streaming is enabled by default. Word timestamps require a ready `Qwen3-ForcedAligner-0.6B` aligner and disable streaming. With `Granite-Speech-5.0-2B`, **Translate to** and **Keywords** appear; a translation has no timestamps. |
+| **Transcription** | Single-speaker or general ASR | Streaming is enabled by default. Word timestamps require a ready `Qwen3-ForcedAligner-0.6B` aligner and disable streaming. With `Granite-Speech-5.0-2B` or its GGUF release, **Translate to** and **Keywords** appear; a translation has no timestamps. |
 | **Speaker Attributed ASR** | Granite Speech speaker-turn transcripts | Requires `Granite-Speech-4.1-2B-Plus`, accepts speaker expectation hints, and disables streaming/timestamps. |
 | **Diarization** | Speaker-separated timelines with start/end times | Uses the diarization pipeline and optional ASR/aligner models. |
 
@@ -218,6 +218,7 @@ transcripts, and `job_kind=diarization` for speaker timelines.
 | `Granite-Speech-4.1-2B` | 4.6 GB | IBM ASR with punctuated, capitalized transcripts | Medium |
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | IBM rich transcription model with speaker-attributed output and native word timestamps; unpunctuated | Medium |
 | `Granite-Speech-5.0-2B` | 4.6 GB | IBM ASR with punctuated transcripts, speech translation and keyword biasing | Medium |
+| `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU | Fast |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |
 

@@ -93,8 +93,8 @@ izwi transcribe standup.wav \
 ```
 
 `--translate-to` and `--keyword` need a model with speech translation or
-keyword biasing (`Granite-Speech-5.0-2B`); the server rejects them for other
-models.
+keyword biasing (`Granite-Speech-5.0-2B` and its GGUF release); the server
+rejects them for other models.
 
 ### Word timestamps
 
@@ -191,6 +191,7 @@ selected model or forced aligner can provide word timing metadata.
 | `Granite-Speech-4.1-2B` | 4.6 GB | Medium | IBM ASR with punctuated, capitalized transcripts |
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with speaker turns and native word timestamps; unpunctuated |
 | `Granite-Speech-5.0-2B` | 4.6 GB | Medium | IBM ASR with punctuated transcripts, speech translation (`--translate-to`) and keyword biasing (`--keyword`) |
+| `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Fast | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
