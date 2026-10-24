@@ -507,6 +507,9 @@ pub struct KokoroPreparedRequest {
     pub token_ids: Vec<u32>,
     pub ref_style: Tensor,
     pub speed: f32,
+    /// Seeds the decoder's harmonic-source noise, so the same seed repeats
+    /// the same audio alone or in a batch; `None` draws fresh noise.
+    pub rng_seed: Option<u64>,
 }
 
 impl KokoroPreparedRequest {
@@ -799,6 +802,7 @@ impl KokoroTtsModel {
             token_ids,
             ref_style,
             speed,
+            rng_seed: None,
         })
     }
 
@@ -945,7 +949,10 @@ impl KokoroTtsModel {
                 .collect::<Result<Vec<_>>>()?;
             let style_refs = style_rows.iter().collect::<Vec<_>>();
             let style = Tensor::cat(&style_refs, 0).map_err(Error::from)?;
-            let seeds = vec![None; duration_bucket.len()];
+            let seeds = duration_bucket
+                .iter()
+                .map(|&row| rows[row].rng_seed)
+                .collect::<Vec<_>>();
             let t2 = Instant::now();
             let samples = self.decoder.forward_batch(&asr, &f0, &n, &style, &seeds)?;
             log_kokoro_profile("tts.decoder", t2.elapsed());
@@ -1498,6 +1505,7 @@ mod tests {
             ref_style: Tensor::zeros((1, 256), DType::F32, &candle_core::Device::Cpu)
                 .expect("style"),
             speed: 1.0,
+            rng_seed: None,
         }
     }
 
@@ -1830,6 +1838,54 @@ mod tests {
             .expect("run native Kokoro B=2 generation");
         assert_eq!(outputs.len(), 2);
         assert!(outputs.iter().all(|output| !output.samples.is_empty()));
+    }
+
+    /// A seeded row repeats its solo audio inside a batch: the same text with
+    /// two seeds shares one decoder bucket, and each row matches its solo run.
+    #[test]
+    fn kokoro_local_seeded_rows_batch_like_solo_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu"))
+            .expect("detect cpu device for Kokoro seeded batch");
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        let seeded = |seed| {
+            let mut prepared = model
+                .prepare_request("Hello world.", Some("af_heart"), Some("en-US"), 1.0)
+                .expect("prepare a seeded Kokoro row");
+            prepared.rng_seed = Some(seed);
+            prepared
+        };
+        let solo = |seed| {
+            model
+                .generate_prepared_batch(&[seeded(seed)])
+                .expect("solo Kokoro synthesis")
+                .pop()
+                .expect("one row")
+                .samples
+        };
+        let (first, second) = (solo(7), solo(8));
+        assert_eq!(first, solo(7), "a seed repeats its audio");
+        assert_ne!(first, second, "different seeds draw different noise");
+
+        let batch = model
+            .generate_prepared_batch(&[seeded(7), seeded(8)])
+            .expect("batched Kokoro synthesis");
+        for (row, expected) in batch.iter().zip([&first, &second]) {
+            assert_eq!(row.samples.len(), expected.len());
+            let max_diff = row
+                .samples
+                .iter()
+                .zip(expected.iter())
+                .map(|(batched, solo)| (batched - solo).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "batched row differs from solo by {max_diff}"
+            );
+        }
     }
 
     #[test]

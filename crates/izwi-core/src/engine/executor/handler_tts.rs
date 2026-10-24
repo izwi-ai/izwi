@@ -4395,6 +4395,7 @@ mod tests {
             )
             .unwrap(),
             speed: 1.0,
+            rng_seed: None,
         };
         let row = |chunks: Vec<KokoroPreparedRequest>| crate::engine::KokoroPreparedText {
             source_text: "x".into(),

@@ -139,7 +139,7 @@ pub struct SpeechSamplingRequest {
     /// Nucleus sampling threshold, in (0, 1].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise).
+    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise, Kokoro noise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Repetition penalty (Qwen3-TTS), >= 1.

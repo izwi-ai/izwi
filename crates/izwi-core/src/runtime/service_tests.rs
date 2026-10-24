@@ -3075,6 +3075,7 @@ fn kokoro_engine_reservation_follows_the_prepared_chunks() {
         )
         .unwrap(),
         speed: 1.0,
+        rng_seed: None,
     };
     let prepared = crate::engine::KokoroPreparedText {
         source_text: "ab".into(),
