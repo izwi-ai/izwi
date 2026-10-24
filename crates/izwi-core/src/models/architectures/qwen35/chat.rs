@@ -1304,6 +1304,23 @@ impl Qwen35ChatExec {
             state.telemetry.record_batched_decode_step(states.len());
         }
 
+        // Every row's greedy pick or device candidates come back in one
+        // readback; grammar, logprobs and host rows sample on their own.
+        let vocab_size = self.tokenizer.vocab_size;
+        let reads_before = thread_host_reads();
+        let plans = states
+            .iter()
+            .enumerate()
+            .map(|(row, state)| plan_row_readback(state, &logits.i((row, 0))?, vocab_size))
+            .collect::<Result<Vec<_>>>()?;
+        let mut planned = crate::models::shared::sampling::read_planned_rows(
+            &logits.reshape((states.len(), ()))?,
+            vocab_size,
+            plans,
+        )?
+        .into_iter();
+        let mut shared_reads = thread_host_reads().wrapping_sub(reads_before);
+
         let mut sampled = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
             let history = penalty_history(
@@ -1314,7 +1331,19 @@ impl Qwen35ChatExec {
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
             let reads_before = thread_host_reads();
-            let (token, raw_logprobs, path) = if let Some(grammar) = state.grammar.as_mut() {
+            let values = planned
+                .next()
+                .ok_or_else(|| Error::InferenceError("batched readback lost a row".into()))?;
+            let (token, raw_logprobs, path) = if let Some(sampled) = sample_planned_row(
+                values,
+                &row_logits,
+                vocab_size,
+                &state.config,
+                history,
+                &mut state.rng,
+            )? {
+                (sampled.0, None, sampled.1)
+            } else if let Some(grammar) = state.grammar.as_mut() {
                 let (token, raw_logprobs) = grammar.sample_token_with_history(
                     &row_logits,
                     self.tokenizer.vocab_size,
@@ -1332,9 +1361,11 @@ impl Qwen35ChatExec {
                     &mut state.rng,
                 )?
             };
-            state
-                .telemetry
-                .record_sample(path, thread_host_reads().wrapping_sub(reads_before));
+            // The step's shared readback counts once, on its first row.
+            let reads = thread_host_reads()
+                .wrapping_sub(reads_before)
+                .wrapping_add(std::mem::take(&mut shared_reads));
+            state.telemetry.record_sample(path, reads);
             let entry = raw_logprobs
                 .map(|raw| {
                     crate::models::shared::sampling::resolve_token_logprob(
@@ -2249,6 +2280,133 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
     }
 }
 
+/// What a decode row's sampler needs from the step's shared readback,
+/// planned exactly as [`sample_next_token_traced`] would sample the row:
+/// deterministic greedy reads its argmax, a device row its bounded
+/// candidates; grammar, logprobs and host rows read nothing here.
+fn plan_row_readback(
+    state: &ChatDecodeState,
+    row_logits: &Tensor,
+    vocab_size: usize,
+) -> Result<crate::models::shared::sampling::PlannedReadback> {
+    use crate::models::shared::sampling::PlannedReadback;
+    let config = &state.config;
+    if state.grammar.is_some() || config.logprobs || vocab_size == 0 {
+        return Ok(PlannedReadback::None);
+    }
+    if deterministic_greedy(config) {
+        return Ok(PlannedReadback::Greedy);
+    }
+    let history = penalty_history(
+        state.track_history,
+        &state.history_ids,
+        state.penalty_prompt_len,
+    );
+    // Greedy over penalized logits (temperature 0 with a penalty, as the
+    // Qwen3.5 profiles' presence penalty makes it): the device applies the
+    // penalties and keeps the top candidate, so the row reads one candidate
+    // instead of copying its whole row to the host.
+    let (top_k, temperature) = if config.temperature <= 1e-5 {
+        (1, 1.0)
+    } else {
+        (config.top_k, config.temperature)
+    };
+    Ok(
+        crate::models::shared::sampling::plan_device_sampling_candidates_with_history(
+            row_logits,
+            vocab_size,
+            top_k,
+            temperature,
+            history,
+            config.repetition_penalty,
+            config.presence_penalty,
+        )?
+        .map_or(PlannedReadback::None, PlannedReadback::Candidates),
+    )
+}
+
+/// Draw a row from its share of the batched readback with the same steps,
+/// RNG draws and fallbacks as [`sample_next_token_traced`]. `None` when the
+/// row read nothing and samples on its own.
+fn sample_planned_row(
+    values: crate::models::shared::sampling::PlannedValues,
+    row_logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: PenaltyHistory<'_>,
+    rng: &mut SimpleRng,
+) -> Result<Option<(u32, SamplerPath)>> {
+    use crate::models::shared::sampling::PlannedValues;
+    match values {
+        PlannedValues::None => Ok(None),
+        PlannedValues::Greedy { index, logit } => {
+            let token = if logit.is_finite() {
+                index
+            } else {
+                // A non-finite pick: the exact slow path of `argmax_clamped`.
+                argmax_clamped(row_logits, vocab_size)?
+            };
+            Ok(Some((token, SamplerPath::Greedy)))
+        }
+        PlannedValues::Candidates(candidates) => {
+            if config.temperature <= 1e-5 {
+                // The penalized argmax, as `sample_on_host` takes it at
+                // temperature 0 (no draw); a non-finite candidate keeps its
+                // host fallback.
+                return match candidates.as_ref().and_then(argmax_candidate) {
+                    Some(token) => Ok(Some((token, SamplerPath::Device))),
+                    None => sample_on_host(row_logits, vocab_size, config, history, rng)
+                        .map(|token| Some((token, SamplerPath::Host))),
+                };
+            }
+            if let Some(candidates) = candidates {
+                if device_candidates_cover_top_p(&candidates, config.top_p) {
+                    if let Some(sampled) =
+                        sample_device_candidates(&candidates, config.top_p, rng.next_f32())
+                    {
+                        return Ok(Some((sampled, SamplerPath::Device)));
+                    }
+                }
+            }
+            sample_on_host(row_logits, vocab_size, config, history, rng)
+                .map(|token| Some((token, SamplerPath::Host)))
+        }
+    }
+}
+
+/// The highest-valued candidate's token (lowest index on a tie, as
+/// `argmax_values` breaks it).
+fn argmax_candidate(
+    candidates: &crate::models::shared::sampling::DeviceSamplingCandidates,
+) -> Option<u32> {
+    candidates
+        .values
+        .iter()
+        .zip(&candidates.indices)
+        .filter(|(value, _)| value.is_finite())
+        .fold(
+            None,
+            |best: Option<(f32, u32)>, (&value, &index)| match best {
+                Some((best_value, best_index))
+                    if best_value > value || (best_value == value && best_index < index) =>
+                {
+                    Some((best_value, best_index))
+                }
+                _ => Some((value, index)),
+            },
+        )
+        .map(|(_, index)| index)
+}
+
+/// Temperature 0 with no penalties, top-k or nucleus: the argmax.
+fn deterministic_greedy(config: &ChatGenerationConfig) -> bool {
+    config.temperature <= 1e-5
+        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+        && config.presence_penalty.abs() <= f32::EPSILON
+        && config.top_k == 0
+        && config.top_p >= 1.0
+}
+
 fn take_quantum_sample(
     output: &mut Option<Tensor>,
     vocab_size: usize,
@@ -2337,12 +2495,7 @@ fn sample_next_token_traced(
 
     // Fast path for deterministic greedy decode (bench/default path):
     // avoid copying full logits tensors to CPU each token.
-    let deterministic_greedy = config.temperature <= 1e-5
-        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        && config.presence_penalty.abs() <= f32::EPSILON
-        && config.top_k == 0
-        && config.top_p >= 1.0;
-    if deterministic_greedy {
+    if deterministic_greedy(config) {
         return argmax_clamped(logits, vocab_size).map(|token| (token, SamplerPath::Greedy));
     }
 
@@ -3763,6 +3916,128 @@ mod tests {
                 assert_eq!(replayed.generated_ids, baseline.generated_ids);
             }
         }
+    }
+
+    /// Rows decoding together sample from one shared readback but draw
+    /// exactly what each draws alone: greedy, seeded nucleus and top-k with a
+    /// repetition penalty, seeded top-k with a presence penalty, greedy over
+    /// a presence penalty, and an unbounded (top-k 0) row that still reads
+    /// its whole row on the host.
+    fn assert_batched_sampling_matches_solo(device: &candle_core::Device) {
+        const STEPS: usize = 12;
+        let exec = tiny_exec(device);
+        let prompt_ids = vec![104u32, 101, 108, 108, 111, 33];
+        let prepared = Qwen35PreparedPrompt {
+            prompt_positions: (0..prompt_ids.len()).map(|index| [index; 3]).collect(),
+            next_text_position: prompt_ids.len(),
+            prompt_ids: prompt_ids.clone(),
+            vision_inputs: None,
+        };
+        let profile = DeviceProfile {
+            device: device.clone(),
+            kind: if device.is_metal() {
+                crate::backends::DeviceKind::Metal
+            } else {
+                crate::backends::DeviceKind::Cpu
+            },
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        let configs = [
+            ChatGenerationConfig::default(),
+            ChatGenerationConfig {
+                temperature: 1.3,
+                top_k: 12,
+                top_p: 0.9,
+                repetition_penalty: 1.2,
+                seed: 7,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig {
+                temperature: 0.9,
+                top_k: 20,
+                presence_penalty: 0.8,
+                seed: 19,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig {
+                temperature: 0.7,
+                seed: 23,
+                ..ChatGenerationConfig::default()
+            },
+            // Greedy over a presence penalty (the Qwen3.5 profiles' default
+            // at temperature 0).
+            ChatGenerationConfig {
+                temperature: 0.0,
+                top_k: 20,
+                presence_penalty: 2.0,
+                seed: 29,
+                ..ChatGenerationConfig::default()
+            },
+        ];
+        let start = |config: &ChatGenerationConfig, cache| {
+            let mut state = exec
+                .begin_resumable_prefill_state_physical(&prepared, STEPS + 2, config, cache)
+                .unwrap();
+            exec.continue_resumable_prefill_physical(&mut state, &prepared, 0, prompt_ids.len())
+                .unwrap();
+            // The prefill's own token, as decoding sessions see it.
+            exec.decode_step(&mut state).unwrap();
+            state
+        };
+        let mut caches =
+            super::trace_tests::trace_caches(&exec.text_config, &profile, 2 * configs.len() as u32);
+        let mut solo = configs
+            .iter()
+            .map(|config| start(config, caches.pop().unwrap()))
+            .collect::<Vec<_>>();
+        let mut batched = configs
+            .iter()
+            .map(|config| start(config, caches.pop().unwrap()))
+            .collect::<Vec<_>>();
+        for step in 0..STEPS {
+            if batched.iter().any(|state| state.finished) {
+                break;
+            }
+            // The reference is the per-row sampler `decode_step` keeps.
+            let expected = solo
+                .iter_mut()
+                .map(|state| exec.decode_step(state).unwrap())
+                .collect::<Vec<_>>();
+            let reads_before = crate::models::shared::telemetry::thread_host_reads();
+            let actual = exec
+                .decode_step_batch(&mut batched.iter_mut().collect::<Vec<_>>())
+                .unwrap();
+            if device.is_metal() {
+                // One readback for the four device-sampled rows, plus the
+                // unbounded row's own host read.
+                assert_eq!(
+                    crate::models::shared::telemetry::thread_host_reads()
+                        .wrapping_sub(reads_before),
+                    2,
+                    "step {step}"
+                );
+            }
+            for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(actual.delta, expected.delta, "row {row} step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn batched_sampling_matches_solo_on_cpu() {
+        assert_batched_sampling_matches_solo(&candle_core::Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn batched_sampling_matches_solo_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen35 batched_sampling_matches_solo_on_metal",
+        ) else {
+            return;
+        };
+        assert_batched_sampling_matches_solo(&device);
     }
 
     #[test]
