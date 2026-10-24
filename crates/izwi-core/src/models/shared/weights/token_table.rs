@@ -56,6 +56,42 @@ impl QuantizedTokenTable {
         QMatMul::from_arc(self.tensor.clone()).map_err(Error::from)
     }
 
+    /// Whether `head` is this table's tied head (it shares the tensor).
+    pub(crate) fn ties(&self, head: &QMatMul) -> bool {
+        matches!(head, QMatMul::QTensor(tensor) if Arc::ptr_eq(tensor, &self.tensor))
+    }
+
+    /// On Metal, move the table into a buffer the small-batch head kernel
+    /// can share, and return the tied head and that kernel over it: still
+    /// one copy of the table (the old one is freed once its head is
+    /// replaced). `None` for a type or device the kernel does not serve.
+    #[cfg(feature = "metal")]
+    pub(crate) fn rehome_tied_head(
+        &mut self,
+    ) -> Result<Option<(QMatMul, crate::kernels::metal_kquant_mv::MetalKQuantMatVec)>> {
+        use candle_core::quantized::QStorage;
+        let device = self.tensor.device();
+        let dtype = self.tensor.dtype();
+        if !device.is_metal() || !crate::kernels::metal_kquant_mv::serves(dtype, self.hidden_size) {
+            return Ok(None);
+        }
+        let storage = QStorage::from_data(self.tensor.data()?, &device, dtype)?;
+        let QStorage::Metal(metal) = &storage else {
+            return Ok(None);
+        };
+        let Some(kernel) = crate::kernels::metal_kquant_mv::MetalKQuantMatVec::new(
+            metal.buffer().clone(),
+            dtype,
+            self.vocab_size,
+            self.hidden_size,
+        ) else {
+            return Ok(None);
+        };
+        let tensor = Arc::new(QTensor::new(storage, (self.vocab_size, self.hidden_size))?);
+        self.tensor = tensor.clone();
+        Ok(Some((QMatMul::from_arc(tensor)?, kernel)))
+    }
+
     /// Stored bytes of the table (what it keeps resident).
     pub(crate) fn storage_bytes(&self) -> usize {
         self.tensor.storage_size_in_bytes()
@@ -100,6 +136,60 @@ mod tests {
                 .unwrap();
             assert_eq!(difference, 0.0, "{dtype:?}");
             assert_eq!((table.vocab_size(), table.hidden_size()), (8, 256));
+        }
+    }
+
+    /// On Metal the re-homed table still gathers the same rows, its head
+    /// gives the same logits, the small-batch kernel matches the head, and
+    /// the table and head share one tensor.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_rehomed_table_shares_one_tensor_with_its_head_and_kernel() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "a_rehomed_table_shares_one_tensor_with_its_head_and_kernel",
+        ) else {
+            return;
+        };
+        let values: Vec<f32> = (0..40 * 256)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect();
+        let dense = Tensor::from_vec(values, (40, 256), &Device::Cpu).unwrap();
+        let mut table = QuantizedTokenTable::new(
+            QTensor::quantize_onto(&dense, GgmlDType::Q6K, &device).unwrap(),
+        )
+        .unwrap();
+        let ids = Tensor::new(&[3u32, 39, 0], &device).unwrap();
+        let rows_before = table.embed(&ids).unwrap().to_vec2::<f32>().unwrap();
+        let hidden = Tensor::from_vec(
+            (0..3 * 256)
+                .map(|index| (index % 7) as f32 - 3.0)
+                .collect::<Vec<_>>(),
+            (3, 1, 256),
+            &device,
+        )
+        .unwrap();
+        let logits_before = table.tied_head().unwrap().forward(&hidden).unwrap();
+        let logits_before = logits_before
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let (head, kernel) = table.rehome_tied_head().unwrap().expect("Q6_K on Metal");
+        assert!(table.ties(&head));
+        assert_eq!(
+            table.embed(&ids).unwrap().to_vec2::<f32>().unwrap(),
+            rows_before
+        );
+        let scale = logits_before.iter().fold(0f32, |max, e| max.max(e.abs()));
+        for logits in [
+            head.forward(&hidden).unwrap(),
+            kernel.forward(&hidden).unwrap(),
+        ] {
+            let logits = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (a, e) in logits.iter().zip(&logits_before) {
+                assert!((a - e).abs() <= 2e-6 * scale, "{a} vs {e}");
+            }
         }
     }
 

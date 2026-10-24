@@ -549,6 +549,25 @@ impl Qwen35TextModel {
         for linear in self.linears_mut() {
             linear.resolve_kquant(switches.kquant_off);
         }
+        #[cfg(feature = "metal")]
+        if self.device.is_metal() && crate::kernels::use_fused_kernels_for_device(&self.device) {
+            for linear in self.linears_mut() {
+                linear.resolve_metal_small_batch();
+            }
+            // A tied head shares the token table, which the per-weight pass
+            // will not duplicate: re-home the one table for both instead.
+            if !super::fast_path::legacy_requested(super::linear::KQUANT_ENV)
+                && self.token_table.ties(self.output.matmul())
+            {
+                match self.token_table.rehome_tied_head() {
+                    Ok(Some((head, kernel))) => self.output.adopt_metal_small_batch(head, kernel),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Qwen3.5 tied head re-home failed; keeping QMatMul")
+                    }
+                }
+            }
+        }
         let hidden = self.hidden_size();
         for layer in &mut self.layers {
             if let Qwen35Mixer::Linear(mixer) = &mut layer.mixer {

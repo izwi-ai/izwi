@@ -22,6 +22,10 @@ pub(crate) struct Qwen35Linear {
     matmul: QMatMul,
     kquant: Option<KQuantWeight>,
     kquant_path: Qwen35FastPath,
+    /// On Metal, a Q4_K / Q6_K mat-vec that reads the weight once for 2..=8
+    /// decode rows; Candle's `QMatMul` streams it once per row.
+    #[cfg(feature = "metal")]
+    small_batch: Option<crate::kernels::metal_kquant_mv::MetalKQuantMatVec>,
 }
 
 impl Qwen35Linear {
@@ -30,10 +34,18 @@ impl Qwen35Linear {
             matmul,
             kquant: None,
             kquant_path: Qwen35FastPath::legacy("unresolved"),
+            #[cfg(feature = "metal")]
+            small_batch: None,
         }
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Some(small_batch) = &self.small_batch {
+            if small_batch.accepts(x) {
+                return Ok(small_batch.forward(x)?);
+            }
+        }
         match &self.kquant {
             Some(weight) if kquant::accepts(x) => {
                 Ok(kquant::mat_vec(weight, &kquant::quantize(x)?)?)
@@ -44,6 +56,100 @@ impl Qwen35Linear {
 
     pub(crate) fn kquant_path(&self) -> &Qwen35FastPath {
         &self.kquant_path
+    }
+
+    pub(crate) fn matmul(&self) -> &QMatMul {
+        &self.matmul
+    }
+
+    /// Take `matmul` (the same weight in a buffer `kernel` shares) and the
+    /// kernel, once it passes the self-check; a failed check keeps `matmul`
+    /// on Candle.
+    #[cfg(feature = "metal")]
+    pub(crate) fn adopt_metal_small_batch(
+        &mut self,
+        matmul: QMatMul,
+        kernel: crate::kernels::metal_kquant_mv::MetalKQuantMatVec,
+    ) {
+        self.matmul = matmul;
+        self.small_batch = None;
+        match self.small_batch_self_check(&kernel) {
+            Ok(()) => {
+                self.small_batch = Some(kernel);
+                self.kquant_path = Qwen35FastPath::Fused;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Qwen3.5 Metal small-batch self-check failed; keeping QMatMul");
+                self.kquant_path = Qwen35FastPath::legacy(format!("self-check failed: {error}"));
+            }
+        }
+    }
+
+    /// Resolve the Metal small-batch mat-vec for this weight: a Q4_K, Q5_K,
+    /// Q6_K or Q8_0 Metal weight whose output for several decode rows
+    /// matches `QMatMul` to float rounding (the sums only regroup). One row
+    /// stays on Candle.
+    #[cfg(feature = "metal")]
+    pub(crate) fn resolve_metal_small_batch(&mut self) {
+        self.small_batch = None;
+        if legacy_requested(KQUANT_ENV) {
+            return;
+        }
+        let kernel = match crate::kernels::metal_kquant_mv::share_qmatmul_weight(&mut self.matmul) {
+            Ok(Some(kernel)) => kernel,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "Qwen3.5 Metal small-batch weight upload failed");
+                return;
+            }
+        };
+        match self.small_batch_self_check(&kernel) {
+            Ok(()) => {
+                self.small_batch = Some(kernel);
+                self.kquant_path = Qwen35FastPath::Fused;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Qwen3.5 Metal small-batch self-check failed; keeping QMatMul");
+                self.kquant_path = Qwen35FastPath::legacy(format!("self-check failed: {error}"));
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn small_batch_self_check(
+        &self,
+        kernel: &crate::kernels::metal_kquant_mv::MetalKQuantMatVec,
+    ) -> Result<()> {
+        let device = match &self.matmul {
+            QMatMul::QTensor(qtensor) => qtensor.device(),
+            _ => return Err(Error::InferenceError("not a quantized weight".into())),
+        };
+        let cols = match &self.matmul {
+            QMatMul::QTensor(qtensor) => qtensor.shape().dims2()?.1,
+            _ => unreachable!("checked above"),
+        };
+        for (rows, seed) in [(2usize, 41u64), (5, 42)] {
+            let x = Tensor::from_vec(
+                xorshift_values(rows * cols, seed, 1.0),
+                (rows, 1, cols),
+                &device,
+            )?;
+            let expected = self.matmul.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+            let actual = kernel.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+            let scale = expected.iter().fold(0f32, |max, e| max.max(e.abs()));
+            if actual.len() != expected.len()
+                || !scale.is_finite()
+                || actual
+                    .iter()
+                    .zip(&expected)
+                    .any(|(a, e)| !a.is_finite() || (a - e).abs() > 1e-5 * scale.max(1e-6))
+            {
+                return Err(Error::InferenceError(format!(
+                    "small-batch mat-vec at {rows} rows differs from QMatMul"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the K-quant MMVQ path for this weight. It needs a CUDA Q4_K,
