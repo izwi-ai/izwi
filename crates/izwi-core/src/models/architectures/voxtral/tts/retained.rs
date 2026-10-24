@@ -67,10 +67,13 @@ pub(crate) struct VoxtralTtsDecodeStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoxtralTtsDecodeBatch {
     pub(crate) steps: Vec<VoxtralTtsDecodeStep>,
-    /// Physical width of the acoustic-transformer launch. A value greater
-    /// than one is only reported after a real batched tensor invocation.
-    pub(crate) acoustic_launch_width: usize,
-    pub(crate) lm_launch_width: usize,
+    /// Physical width of each acoustic-transformer launch, one per compatible
+    /// cohort. A value greater than one is only reported after a real batched
+    /// tensor invocation.
+    pub(crate) acoustic_launch_widths: Vec<usize>,
+    /// Physical width of each LM feedback launch (cohorts whose rows all
+    /// finished launch none).
+    pub(crate) lm_launch_widths: Vec<usize>,
     pub(crate) scalar_lm_launches: usize,
 }
 
@@ -280,6 +283,39 @@ pub(crate) fn voxtral_tts_stage_resource_envelope(
     })
 }
 
+/// Rows that may share one acoustic launch, in order of first appearance:
+/// the same CFG strength and flow steps, and all on their first frame or all
+/// past it (the first frame may not end the audio). Every row must be in its
+/// decode phase with a hidden state.
+pub(crate) fn acoustic_cohorts(states: &[&mut VoxtralTtsRetainedState]) -> Result<Vec<Vec<usize>>> {
+    let mut cohorts: Vec<((u32, usize, bool), Vec<usize>)> = Vec::new();
+    for (row, state) in states.iter().enumerate() {
+        if state.phase != VoxtralTtsRetainedPhase::Decode || state.last_hidden.is_none() {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral TTS acoustic row {row} is not ready to decode"
+            )));
+        }
+        let key = (
+            state.params.cfg_alpha.to_bits(),
+            state.params.n_decoding_steps,
+            state.frames.is_empty(),
+        );
+        match cohorts
+            .iter_mut()
+            .find(|(cohort_key, _)| *cohort_key == key)
+        {
+            Some((_, rows)) => rows.push(row),
+            None => cohorts.push((key, vec![row])),
+        }
+    }
+    if cohorts.is_empty() {
+        return Err(Error::InvalidInput(
+            "Voxtral TTS acoustic cohort cannot be empty".into(),
+        ));
+    }
+    Ok(cohorts.into_iter().map(|(_, rows)| rows).collect())
+}
+
 pub(crate) fn validate_acoustic_cohort(states: &[&mut VoxtralTtsRetainedState]) -> Result<()> {
     let Some(first) = states.first() else {
         return Err(Error::InvalidInput(
@@ -379,6 +415,30 @@ mod tests {
         right.params.cfg_alpha = 1.2;
         right.frames.push(vec![1, 2]);
         assert!(validate_acoustic_cohort(&[&mut left, &mut right]).is_err());
+    }
+
+    #[test]
+    fn acoustic_cohorts_keep_first_frames_and_generation_configs_apart() {
+        // A request on its first frame arrives while two others stream, and a
+        // fourth streams with its own CFG strength: three launches, in order of
+        // first appearance, instead of one rejected batch.
+        let mut streaming = decode_state(1.2, 3);
+        let mut arriving = decode_state(1.2, 0);
+        let mut other_cfg = decode_state(1.1, 2);
+        let mut streaming_too = decode_state(1.2, 1);
+        assert_eq!(
+            acoustic_cohorts(&[
+                &mut streaming,
+                &mut arriving,
+                &mut other_cfg,
+                &mut streaming_too
+            ])
+            .unwrap(),
+            vec![vec![0, 3], vec![1], vec![2]]
+        );
+        arriving.last_hidden = None;
+        assert!(acoustic_cohorts(&[&mut streaming, &mut arriving]).is_err());
+        assert!(acoustic_cohorts(&[]).is_err());
     }
 
     #[test]
