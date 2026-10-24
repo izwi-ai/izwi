@@ -8,7 +8,7 @@ use super::{
     qwen38_representation_memory_estimate, reconcile_observed_growth,
     residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
     validate_scratch_only_invocation_publication, DeviceUsageSample,
-    LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
+    LoadedAsrStatePublicationRoute, MeasuredLoads, ModelMemoryEstimate, PortableInvocationContextIntent,
     PrecisionReloadRequest, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
     QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
 };
@@ -1737,6 +1737,32 @@ fn portable_context_reserve_is_the_configured_reserve_when_residency_is_the_cata
         portable_context_reserve_bytes(ModelVariant::Kokoro82M, GIB),
         GIB
     );
+}
+
+/// Device usage is sampled for the whole device, so a load window that
+/// another load's window overlapped is not reconciled: a concurrent load's
+/// weights would otherwise read as this load's under-pricing.
+#[test]
+fn a_load_window_knows_when_another_load_overlapped_it() {
+    let loads = MeasuredLoads::default();
+    let _first = loads.open();
+    let alone = loads.mark();
+    assert!(!loads.overlapped_since(alone), "no other load");
+
+    let second = loads.open();
+    assert!(loads.overlapped_since(alone), "another load is open");
+    drop(second);
+    assert!(
+        loads.overlapped_since(alone),
+        "another load opened and closed inside the window"
+    );
+
+    let after = loads.mark();
+    assert!(!loads.overlapped_since(after), "the other load ended before");
+
+    let _third = loads.open();
+    let crowded = loads.mark();
+    assert!(loads.overlapped_since(crowded), "another load was open at the start");
 }
 
 /// Truth reconciliation (ADM-8): growth beyond the authorization plus the

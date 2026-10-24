@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -513,6 +514,54 @@ fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool 
         && asr_memory::weights_on_backend_device(variant, backend)
 }
 
+/// Loads whose device-usage windows are open. Usage is sampled for the whole
+/// device, so a window that another load's window overlaps also sees that
+/// load's allocations: it cannot be reconciled against this load's plan, and
+/// the load proceeds as one without an observation.
+#[derive(Debug, Default)]
+pub(super) struct MeasuredLoads {
+    open: AtomicUsize,
+    opened: AtomicU64,
+}
+
+/// One load's open window; closes when dropped.
+pub(super) struct MeasuredLoad<'a>(&'a MeasuredLoads);
+
+/// The state of [`MeasuredLoads`] when a window started.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LoadWindowMark {
+    open: usize,
+    opened: u64,
+}
+
+impl MeasuredLoads {
+    pub(super) fn open(&self) -> MeasuredLoad<'_> {
+        self.opened.fetch_add(1, Ordering::AcqRel);
+        self.open.fetch_add(1, Ordering::AcqRel);
+        MeasuredLoad(self)
+    }
+
+    pub(super) fn mark(&self) -> LoadWindowMark {
+        LoadWindowMark {
+            open: self.open.load(Ordering::Acquire),
+            opened: self.opened.load(Ordering::Acquire),
+        }
+    }
+
+    /// Whether another load had a window open at any time since `mark`.
+    pub(super) fn overlapped_since(&self, mark: LoadWindowMark) -> bool {
+        mark.open > 1
+            || self.open.load(Ordering::Acquire) > 1
+            || self.opened.load(Ordering::Acquire) != mark.opened
+    }
+}
+
+impl Drop for MeasuredLoad<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +862,8 @@ impl ModelLifecycleController {
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
             let weights_started = Instant::now();
+            let _measured_load = self.measured_loads.open();
+            let weights_mark = self.measured_loads.mark();
             let usage_before_weights = self.sample_device_usage(variant);
             // Admission priced the selected precision. A component whose
             // load-time probe fails reloads at F32 only once this task has
@@ -947,6 +998,16 @@ impl ModelLifecycleController {
             // growth is what the weights occupy. A load that outgrew its
             // authorized peak fails here, before any state is fitted beside
             // a model the ledger under-counts.
+            let usage_before_weights = usage_before_weights.filter(|_| {
+                let overlapped = self.measured_loads.overlapped_since(weights_mark);
+                if overlapped {
+                    info!(
+                        model = %variant,
+                        "Another load overlapped the weight load; device growth is not reconciled"
+                    );
+                }
+                !overlapped
+            });
             let observed_weights = match usage_before_weights {
                 Some(before) => match self.sample_device_usage(variant) {
                     Some(after) => {
@@ -1005,6 +1066,7 @@ impl ModelLifecycleController {
                     .refresh_physical_capacity_after_release();
             }
             let request_envelope_hold = self.hold_request_envelope(variant, backend).await?;
+            let state_mark = self.measured_loads.mark();
             let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
@@ -1102,7 +1164,17 @@ impl ModelLifecycleController {
                 // State arenas are zero-filled by queued blits; synchronize so
                 // the observation covers what they really occupy.
                 self.core_engine.synchronize_worker_device().await?;
-                if let Some(after) = self.sample_device_usage(variant) {
+                let after = self.sample_device_usage(variant).filter(|_| {
+                    let overlapped = self.measured_loads.overlapped_since(state_mark);
+                    if overlapped {
+                        info!(
+                            model = %variant,
+                            "Another load overlapped the state allocation; device growth is not reconciled"
+                        );
+                    }
+                    !overlapped
+                });
+                if let Some(after) = after {
                     let observed =
                         reconcile_observed_growth(variant, "state allocation", before, after, 0)?;
                     info!(
