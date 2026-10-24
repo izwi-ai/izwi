@@ -1012,6 +1012,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Maximum models resident at once (residency guardrail; 0 or invalid ignored, floor 1).",
     ),
     CoreEnvVar::new(
+        "IZWI_MAX_NUM_SEQS",
+        Int,
+        "0 (automatic: single user on CPU and Metal, VRAM-fitted on CUDA)",
+        Startup,
+        "Sequences served concurrently per model; sizes the scheduler, retained and staged rows, tensor width and realtime ASR quota left automatic, and above 1 turns chunked prefill on unless set.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAX_PHYSICAL_IN_FLIGHT",
         Int,
         "1",

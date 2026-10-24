@@ -87,9 +87,9 @@ pub use engine::{
 
 // Legacy re-exports for backward compatibility
 pub use config::{
-    BatchSizePreference, ContextLengthPreference, EngineConfig, GraniteSpeechOptions,
-    PhysicalExecutionCapacity, PhysicalExecutionMode, PhysicalInFlightLimit,
-    RealtimeAsrSessionConfig,
+    BatchSizePreference, ConcurrencyProfile, ContextLengthPreference, EngineConfig,
+    GraniteSpeechOptions, PhysicalExecutionCapacity, PhysicalExecutionMode, PhysicalInFlightLimit,
+    RealtimeAsrSessionConfig, ResolvedConcurrency,
 };
 pub use error::{Error, ErrorKind, Result};
 /// The separator between two transcript pieces: none where a script is

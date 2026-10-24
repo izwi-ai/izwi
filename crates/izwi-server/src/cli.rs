@@ -62,6 +62,12 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "AUTO_OR_TOKENS")]
     pub(crate) max_sequence_length: Option<izwi_core::ContextLengthPreference>,
 
+    /// Sequences served concurrently per model (also IZWI_MAX_NUM_SEQS).
+    /// Unset keeps the backend's automatic sizing: one user on CPU and
+    /// Metal, VRAM-fitted rows on CUDA.
+    #[arg(long, value_name = "COUNT")]
+    pub(crate) max_num_seqs: Option<usize>,
+
     /// Log output format (`text`, `json`)
     #[arg(long, value_enum, env = "IZWI_LOG_FORMAT", default_value = "text")]
     pub(crate) log_format: LogFormat,
@@ -148,6 +154,7 @@ pub(crate) fn resolve_serve_runtime_config_with_env(
         physical_execution_mode: args.physical_execution_mode,
         max_physical_in_flight: args.max_physical_in_flight,
         max_sequence_length: args.max_sequence_length,
+        max_num_seqs: args.max_num_seqs,
         ..ServeRuntimeConfigOverrides::default()
     };
     let file = ServeRuntimeConfigOverrides::from_user_config(args.config.as_deref())?;

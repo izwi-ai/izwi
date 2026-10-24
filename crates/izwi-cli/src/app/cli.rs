@@ -230,6 +230,11 @@ pub enum Commands {
         #[arg(long, value_name = "COUNT")]
         max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
 
+        /// Sequences served concurrently per model; unset keeps the
+        /// backend's automatic sizing (one user on CPU and Metal)
+        #[arg(long, value_name = "COUNT")]
+        max_num_seqs: Option<usize>,
+
         /// Maximum logical rows selected by one scheduler step
         #[arg(long)]
         max_scheduler_batch_size: Option<usize>,

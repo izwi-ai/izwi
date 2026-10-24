@@ -17,7 +17,10 @@ use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, RuntimeDeviceAssignment,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
-use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
+use crate::config::{
+    BatchSizePreference, ConcurrencyProfile, EngineConfig, PrefixCachePolicy, ResolvedConcurrency,
+    ResolvedKvCachePolicy,
+};
 use crate::engine::metrics::{
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
     ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES, ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
@@ -907,6 +910,7 @@ pub struct RuntimeService {
     pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
+    concurrency: ResolvedConcurrency,
 }
 
 pub(crate) struct AdmittedEngineRequest {

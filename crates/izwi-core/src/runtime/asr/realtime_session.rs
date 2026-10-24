@@ -6,7 +6,18 @@ use super::*;
 impl RealtimeAsrSessionLimits {
     /// The engine config's limits, else the environment's, else the
     /// defaults for `backend`.
+    #[cfg(test)]
     pub(super) fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
+        Self::resolve_for_sequences(config, backend, None)
+    }
+
+    /// [`Self::resolve`], with `max_num_seqs` (when set) replacing the
+    /// backend's default session quota: the config and environment still win.
+    pub(super) fn resolve_for_sequences(
+        config: RealtimeAsrSessionConfig,
+        backend: BackendKind,
+        max_num_seqs: Option<usize>,
+    ) -> Result<Self> {
         fn configured<T: Default + PartialEq>(value: Option<T>, field: &str) -> Result<Option<T>> {
             match value {
                 Some(value) if value == T::default() => Err(Error::ConfigError(format!(
@@ -15,9 +26,10 @@ impl RealtimeAsrSessionLimits {
                 value => Ok(value),
             }
         }
-        let default_sessions = match backend {
-            BackendKind::Cuda => DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS,
-            BackendKind::Cpu | BackendKind::Metal => DEFAULT_ASR_REALTIME_MAX_SESSIONS,
+        let default_sessions = match (max_num_seqs, backend) {
+            (Some(seqs), _) if seqs > 0 => seqs,
+            (_, BackendKind::Cuda) => DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS,
+            (_, BackendKind::Cpu | BackendKind::Metal) => DEFAULT_ASR_REALTIME_MAX_SESSIONS,
         };
         let max_sessions = match configured(config.max_sessions, "max_sessions")? {
             Some(sessions) => sessions,
@@ -46,8 +58,20 @@ impl RealtimeAsrSessionLimits {
 }
 
 impl RealtimeAsrSessionPolicy {
-    pub(in crate::runtime) fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
-        Self::new(RealtimeAsrSessionLimits::resolve(config, backend)?)
+    pub(in crate::runtime) fn resolve_for_sequences(
+        config: RealtimeAsrSessionConfig,
+        backend: BackendKind,
+        max_num_seqs: Option<usize>,
+    ) -> Result<Self> {
+        Self::new(RealtimeAsrSessionLimits::resolve_for_sequences(
+            config,
+            backend,
+            max_num_seqs,
+        )?)
+    }
+
+    pub(in crate::runtime) fn max_sessions(&self) -> usize {
+        self.limits.max_sessions
     }
 
     pub(super) fn new(limits: RealtimeAsrSessionLimits) -> Result<Self> {

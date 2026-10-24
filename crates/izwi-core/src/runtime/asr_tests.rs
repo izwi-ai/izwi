@@ -108,6 +108,29 @@ fn realtime_session_limits_default_for_production_and_follow_the_config() {
         }
     }
 
+    if !env_set {
+        // `max_num_seqs` replaces the backend default; configuration wins.
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let limits = RealtimeAsrSessionLimits::resolve_for_sequences(
+                RealtimeAsrSessionConfig::default(),
+                backend,
+                Some(6),
+            )
+            .unwrap();
+            assert_eq!(limits.max_sessions, 6, "{backend:?}");
+        }
+        let configured = RealtimeAsrSessionLimits::resolve_for_sequences(
+            RealtimeAsrSessionConfig {
+                max_sessions: Some(2),
+                ..Default::default()
+            },
+            BackendKind::Cuda,
+            Some(6),
+        )
+        .unwrap();
+        assert_eq!(configured.max_sessions, 2);
+    }
+
     let configured = RealtimeAsrSessionLimits::resolve(
         RealtimeAsrSessionConfig {
             max_sessions: Some(9),

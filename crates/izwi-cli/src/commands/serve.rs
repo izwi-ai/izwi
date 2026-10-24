@@ -48,6 +48,10 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
         args.runtime.max_physical_in_flight,
         physical_capacity.physical_launch_limit
     );
+    match args.runtime.max_num_seqs {
+        Some(seqs) => println!("  Concurrent seqs: {seqs}"),
+        None => println!("  Concurrent seqs: auto"),
+    }
     println!(
         "  Scheduler rows: {}",
         args.runtime.max_scheduler_batch_size
@@ -225,6 +229,9 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
         "IZWI_MAX_PHYSICAL_IN_FLIGHT",
         args.runtime.max_physical_in_flight.to_string(),
     );
+    if let Some(seqs) = args.runtime.max_num_seqs {
+        cmd.env("IZWI_MAX_NUM_SEQS", seqs.to_string());
+    }
     cmd.env(
         "IZWI_MAX_SCHEDULER_BATCH_SIZE",
         args.runtime.max_scheduler_batch_size.to_string(),
@@ -707,6 +714,7 @@ mod tests {
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
                 max_loaded_models: 1,
+                max_num_seqs: None,
                 model_keep_alive_secs: 600,
                 max_batch_size: izwi_core::BatchSizePreference::Auto,
                 physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,

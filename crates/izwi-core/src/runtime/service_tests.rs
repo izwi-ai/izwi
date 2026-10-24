@@ -2762,6 +2762,61 @@ fn core_audio_requests_include_decoder_workspace_in_job_authorization() {
 }
 
 #[test]
+fn max_num_seqs_sizes_every_automatic_limit() {
+    let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+    if std::env::var_os("IZWI_ASR_REALTIME_MAX_SESSIONS").is_some() {
+        return;
+    }
+    let single = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = single.resolved_concurrency();
+    assert_eq!(
+        concurrency.profile,
+        crate::config::ConcurrencyProfile::SingleUser
+    );
+    assert_eq!(concurrency.max_num_seqs, None);
+    assert_eq!(concurrency.scheduler_rows, 8);
+    assert_eq!(concurrency.realtime_asr_sessions, 4);
+
+    let multi = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_num_seqs: Some(5),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = multi.resolved_concurrency();
+    assert_eq!(
+        concurrency.profile,
+        crate::config::ConcurrencyProfile::MultiUser
+    );
+    assert_eq!(concurrency.max_num_seqs, Some(5));
+    assert_eq!(concurrency.scheduler_rows, 5);
+    assert_eq!(concurrency.retained_sequences, 5);
+    assert_eq!(concurrency.tensor_width, 5);
+    assert_eq!(concurrency.realtime_asr_sessions, 5);
+    assert_eq!(multi.config().max_retained_sequences, 5);
+    // The engine width is the knob's; each chat family still caps it.
+    assert_eq!(multi.adapter_registry.max_chat_tensor_batch_size(), 5);
+
+    // Explicit limits keep their values.
+    let explicit = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_num_seqs: Some(5),
+        max_scheduler_batch_size: 3,
+        max_batch_size: crate::config::BatchSizePreference::fixed(2).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = explicit.resolved_concurrency();
+    assert_eq!(concurrency.scheduler_rows, 3);
+    assert_eq!(concurrency.retained_sequences, 5);
+    assert_eq!(concurrency.tensor_width, 2);
+}
+
+#[test]
 fn automatic_staged_rows_resolve_to_the_step_launch_width() {
     // CUDA: width 8, one candidate, 316 memory-derived rows on an H100.
     assert_eq!(automatic_staged_transaction_rows(8, 1, 316), 8);
