@@ -331,8 +331,11 @@ pub struct WorkerConfig {
     #[serde(deserialize_with = "deserialize_assignment_strict")]
     pub assignment: DeviceAssignment,
     pub deployment: DeploymentConfig,
-    #[serde(default = "default_max_active_invocations")]
-    pub max_active_invocations: u32,
+    /// Invocations the worker admits at once. Unset, the worker derives it
+    /// from the model it loads (`IZWI_MAX_NUM_SEQS`, else the rows its
+    /// engine batches), and the supervisor accepts what it advertises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_invocations: Option<u32>,
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
     #[serde(default = "default_max_retained_attempts")]
@@ -364,13 +367,16 @@ impl WorkerConfig {
             &self.environment,
         )?;
         validate_path_length("models_directory", &self.deployment.models_directory)?;
-        if self.max_active_invocations == 0 {
+        if self.max_active_invocations == Some(0) {
             return Err(ConfigError::ZeroWorkerBudget {
                 worker: self.worker_id.clone(),
                 field: "max_active_invocations",
             });
         }
-        if self.max_active_invocations > MAX_ACTIVE_INVOCATIONS_PER_WORKER {
+        if self
+            .max_active_invocations
+            .is_some_and(|active| active > MAX_ACTIVE_INVOCATIONS_PER_WORKER)
+        {
             return Err(ConfigError::WorkerLimitTooLarge {
                 worker: self.worker_id.clone(),
                 field: "max_active_invocations",
@@ -397,7 +403,10 @@ impl WorkerConfig {
                 maximum: MAX_RETAINED_ATTEMPTS_PER_WORKER as u64,
             });
         }
-        if self.max_retained_attempts < self.max_active_invocations as usize {
+        if self
+            .max_active_invocations
+            .is_some_and(|active| self.max_retained_attempts < active as usize)
+        {
             return Err(ConfigError::AttemptRetentionBelowCapacity {
                 worker: self.worker_id.clone(),
             });
@@ -918,7 +927,8 @@ impl DeploymentAutoscalingPolicy {
         }
         if workers
             .iter()
-            .any(|worker| self.scale_up_queue_depth > u64::from(worker.max_active_invocations))
+            .filter_map(|worker| worker.max_active_invocations)
+            .any(|active| self.scale_up_queue_depth > u64::from(active))
         {
             return Err(ConfigError::InvalidAutoscalingPolicy {
                 deployment: deployment.to_string(),
@@ -1180,10 +1190,6 @@ pub enum ConfigError {
     },
     #[error("integer overflow while calculating {0}")]
     BudgetOverflow(&'static str),
-}
-
-fn default_max_active_invocations() -> u32 {
-    1
 }
 
 fn default_max_request_bytes() -> usize {
@@ -1474,7 +1480,7 @@ mod tests {
                     },
                     models_directory: directory.to_path_buf(),
                 },
-                max_active_invocations: 1,
+                max_active_invocations: Some(1),
                 max_request_bytes: 4096,
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,

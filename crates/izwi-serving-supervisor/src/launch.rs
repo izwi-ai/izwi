@@ -255,10 +255,9 @@ pub fn build_child_launch_spec(
         "IZWI_WORKER_BEARER_TOKEN",
         secret.bearer_token.expose_secret().into(),
     );
-    set(
-        "IZWI_WORKER_MAX_ACTIVE",
-        worker.max_active_invocations.to_string().into(),
-    );
+    if let Some(active) = worker.max_active_invocations {
+        set("IZWI_WORKER_MAX_ACTIVE", active.to_string().into());
+    }
     set(
         "IZWI_WORKER_MAX_REQUEST_BYTES",
         worker.max_request_bytes.to_string().into(),
@@ -512,7 +511,7 @@ mod tests {
                     },
                     models_directory: directory.into(),
                 },
-                max_active_invocations: 1,
+                max_active_invocations: Some(1),
                 max_request_bytes: 4096,
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,
@@ -661,6 +660,28 @@ mod tests {
             env_value(&with, "IZWI_KV_HOST_POOL_BUDGET_BYTES"),
             OsStr::new("512")
         );
+    }
+
+    #[test]
+    fn worker_capacity_env_is_set_only_when_declared() {
+        let directory = tempfile::tempdir().unwrap();
+        let assignment = DeviceAssignment::Cpu {
+            thread_budget: 2,
+            affinity: vec![0, 1],
+            host_memory_limit_bytes: 1024,
+        };
+        let declared = build(directory.path(), assignment.clone());
+        assert_eq!(
+            env_value(&declared, "IZWI_WORKER_MAX_ACTIVE"),
+            OsStr::new("1")
+        );
+        // Undeclared, the worker sizes itself from the model it loads.
+        let automatic = build_with(directory.path(), assignment, |config| {
+            config.workers[0].max_active_invocations = None;
+        });
+        assert!(!automatic
+            .environment
+            .contains_key(OsStr::new("IZWI_WORKER_MAX_ACTIVE")));
     }
 
     #[test]

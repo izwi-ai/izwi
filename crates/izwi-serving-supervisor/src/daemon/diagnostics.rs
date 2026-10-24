@@ -32,7 +32,9 @@ pub(crate) fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
             worker.deployment.precision,
             worker.deployment.execution_representation,
             worker.deployment.capability.streaming,
-            worker.max_active_invocations,
+            worker
+                .max_active_invocations
+                .map_or_else(|| "auto".to_string(), |active| active.to_string()),
         ));
     }
     if let Some(autoscaling) = node.config().autoscaling.as_ref() {

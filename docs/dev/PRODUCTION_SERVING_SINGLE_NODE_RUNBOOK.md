@@ -628,7 +628,7 @@ The important current bounds are:
 | Gateway tenant work | process-local per-tenant and total ownership, fail-fast; hard cap 100,000 and configured total no greater than `--gateway-max-in-flight` |
 | Configured registry | 256 workers; bounded deployment/local-dispatch tables |
 | Worker request body | node `max_request_bytes`, at most 64 MiB by schema |
-| Worker execution | `max_active_invocations`, atomic and fail-fast; no transport queue |
+| Worker execution | `max_active_invocations` (unset: the loaded model's engine rows, or `IZWI_MAX_NUM_SEQS`, capped at `max_retained_attempts`), atomic and fail-fast; no transport queue |
 | Worker event channel | 4 events; 1 MiB encoded event limit in the real worker |
 | Worker attempt records | configured `max_retained_attempts`, at least active capacity, max 65,536; time-bounded by `attempt_retention_secs` (1-86,400) |
 | Private client JSON | 1 MiB request, 512 KiB control body, 16 KiB error body defaults |
@@ -1229,7 +1229,8 @@ Scale semantics:
   available, the scale-up window clear, and a running worker holding at
   least `scale_up_queue_depth` invocations (active plus queued; workers do
   not queue today, so this is the active count and validation rejects a
-  depth above the workers' `max_active_invocations`) for
+  depth above a worker's declared `max_active_invocations`; an undeclared
+  capacity is the worker's own and is not checked) for
   `scale_up_sustained_polls` consecutive evaluations. The standby starts
   through the standard launch path; the supervisor does not wait for it and
   publishes its approvals line once it is ready. A worker that crashed is

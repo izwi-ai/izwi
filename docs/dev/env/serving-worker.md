@@ -29,9 +29,9 @@ The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `tr
 | `IZWI_WORKER_EXECUTION_REPRESENTATION` | derived from the model | Execution representation the supervisor approved. |
 | `IZWI_WORKER_MAX_CONTEXT_TOKENS` | derived from the model | Context limit the supervisor approved; must not exceed the fitted context. |
 | `IZWI_WORKER_MAX_OUTPUT_TOKENS` | derived from the model | Output-token limit the supervisor approved. |
-| `IZWI_WORKER_MAX_ACTIVE` | `1` | Concurrent invocations (non-zero). |
+| `IZWI_WORKER_MAX_ACTIVE` | IZWI_MAX_NUM_SEQS, else the loaded model's rows | Concurrent invocations (non-zero). |
 | `IZWI_WORKER_MAX_REQUEST_BYTES` | `1048576` | Largest invocation body in bytes. |
-| `IZWI_WORKER_MAX_RETAINED_ATTEMPTS` | `1024` | Finished attempts kept for status queries. |
+| `IZWI_WORKER_MAX_RETAINED_ATTEMPTS` | 1024, raised to the active invocations | Finished attempts kept for status queries. |
 | `IZWI_WORKER_ATTEMPT_RETENTION_SECS` | `300` | How long a finished attempt stays queryable. |
 | `IZWI_WORKER_STREAMING` | `true` | Advertise and serve streaming invocations. |
 | `IZWI_WORKER_DRAIN_GRACE_MS` | `30000` | Shutdown drain grace (non-zero, at most one day). |
@@ -60,7 +60,8 @@ The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `tr
 | `IZWI_PREFIX_REUSE_AUTO` | `true` | With IZWI_ENABLE_PREFIX_CACHING unset, reuse prefixes where the catalog has evidence. |
 | `IZWI_MANAGED_PREFIX_CACHE_SALT` | unset | Prefix-cache namespace; required when IZWI_ENABLE_PREFIX_CACHING is true. |
 | `IZWI_MAX_PREFIX_CACHE_PAGES` | sized per model at load | Prefix cache page budget. |
-| `IZWI_ENABLE_CHUNKED_PREFILL` | `false` | Split long prompts into prefill chunks. |
+| `IZWI_MAX_NUM_SEQS` | automatic per backend | Sequences the engine serves concurrently; also the default IZWI_WORKER_MAX_ACTIVE. |
+| `IZWI_ENABLE_CHUNKED_PREFILL` | true when more than one sequence is requested | Split long prompts into prefill chunks. |
 | `IZWI_CHUNKED_PREFILL_THRESHOLD` | the engine default | Prompt length that turns chunked prefill on. |
 | `IZWI_MAX_TOKENS_PER_STEP` | the engine default | Token budget of one scheduler step. |
 | `IZWI_MAX_SEQUENCE_LENGTH` | the model's context | Explicit context-length cap. |

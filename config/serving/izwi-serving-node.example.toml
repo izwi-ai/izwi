@@ -49,7 +49,9 @@ bind = "127.0.0.1:9470"
 binary = "cpu"
 credential_id = "chat-cpu-credential-1"
 bearer_token_env = "IZWI_WORKER_CHAT_CPU_1_TOKEN"
-max_active_invocations = 1
+# max_active_invocations: unset, the worker admits as many invocations as
+# its loaded model batches (IZWI_MAX_NUM_SEQS, else the engine rows); set it
+# to pin the worker's capacity.
 max_request_bytes = 1048576
 max_retained_attempts = 128
 attempt_retention_secs = 300

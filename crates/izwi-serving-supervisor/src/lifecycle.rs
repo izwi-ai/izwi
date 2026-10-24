@@ -34,7 +34,8 @@ pub struct ExpectedWorkerIdentity {
     execution_representation: String,
     tokenizer_revision: Option<ArtifactRevision>,
     capability: Capability,
-    max_active_invocations: u32,
+    /// `None` accepts the capacity the worker derived from its model.
+    max_active_invocations: Option<u32>,
     endpoint: String,
 }
 
@@ -169,7 +170,11 @@ impl ReadinessTracker {
             return Err(IdentityMismatch::NonIncreasingStatusSequence);
         }
         self.last_status_sequence = Some(status.status_sequence);
-        if status.capacity.max_active_invocations != self.expected.max_active_invocations
+        if status.capacity.max_active_invocations == 0
+            || self
+                .expected
+                .max_active_invocations
+                .is_some_and(|expected| status.capacity.max_active_invocations != expected)
             || status.capacity.active_invocations > status.capacity.max_active_invocations
             || status.capacity.available_admission_credits > status.capacity.max_active_invocations
             || status
@@ -705,7 +710,7 @@ mod tests {
                 max_context_tokens: Some(512),
                 max_output_tokens: Some(128),
             },
-            max_active_invocations: 2,
+            max_active_invocations: Some(2),
             endpoint: "http://127.0.0.1:9470".into(),
         }
     }
@@ -755,13 +760,13 @@ mod tests {
                 kv_promotion_latency_avg_seconds: None,
             }],
             capacity: CapacitySnapshot {
-                max_active_invocations: expected.max_active_invocations,
+                max_active_invocations: expected.max_active_invocations.unwrap_or(1),
                 active_invocations: 0,
                 max_queued_invocations: 0,
                 queued_invocations: 0,
                 max_sessions: 0,
                 reserved_sessions: 0,
-                available_admission_credits: expected.max_active_invocations,
+                available_admission_credits: expected.max_active_invocations.unwrap_or(1),
                 outstanding_cost_units: 0,
             },
         }
@@ -838,6 +843,39 @@ mod tests {
         wrong_capacity.capacity.available_admission_credits = 1;
         assert_eq!(
             tracker.observe_status(&wrong_capacity).unwrap_err(),
+            IdentityMismatch::Capacity
+        );
+    }
+
+    #[test]
+    fn readiness_accepts_a_derived_capacity_only_when_none_is_declared() {
+        // Declared: the worker must advertise exactly that capacity.
+        let declared = expected();
+        let mut tracker = ReadinessTracker::new(declared.clone());
+        tracker.verify_descriptor(&descriptor(&declared)).unwrap();
+        let mut derived = status(&declared, 1);
+        derived.capacity.max_active_invocations = 8;
+        derived.capacity.available_admission_credits = 8;
+        assert_eq!(
+            tracker.observe_status(&derived).unwrap_err(),
+            IdentityMismatch::Capacity
+        );
+
+        // Undeclared: the worker sized itself from its model; any positive,
+        // self-consistent capacity is accepted, and zero never is.
+        let mut automatic = expected();
+        automatic.max_active_invocations = None;
+        let mut tracker = ReadinessTracker::new(automatic.clone());
+        tracker.verify_descriptor(&descriptor(&automatic)).unwrap();
+        let mut derived = status(&automatic, 1);
+        derived.capacity.max_active_invocations = 8;
+        derived.capacity.available_admission_credits = 8;
+        assert!(tracker.observe_status(&derived).unwrap());
+        let mut zero = status(&automatic, 2);
+        zero.capacity.max_active_invocations = 0;
+        zero.capacity.available_admission_credits = 0;
+        assert_eq!(
+            tracker.observe_status(&zero).unwrap_err(),
             IdentityMismatch::Capacity
         );
     }
