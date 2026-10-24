@@ -623,6 +623,19 @@ impl std::fmt::Debug for StageDeviceFence {
     }
 }
 
+/// Request preparations (chat templates, tokenization, context compaction,
+/// audio decoding) that may run at once: half the host's cores, between two
+/// and eight, and never fewer than the device's own capacity. They used to
+/// share the device capacity of one, so one request's audio decode queued
+/// every other request's tokenization. Each preparation still reserves its
+/// own memory.
+fn host_preparation_capacity(device_capacity: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    (cores / 2).clamp(2, 8).max(device_capacity)
+}
+
 #[derive(Debug)]
 pub struct InferenceCoordinator {
     execution_group_id: ExecutionGroupId,
@@ -715,7 +728,7 @@ impl InferenceCoordinator {
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
-            host_work: Arc::new(Semaphore::new(capacity)),
+            host_work: Arc::new(Semaphore::new(host_preparation_capacity(capacity))),
             host_models: Arc::new(Semaphore::new(1)),
             host_model_stages_total: AtomicU64::new(0),
             execution: PhysicalExecutionAdmission::with_idle(
@@ -6240,6 +6253,45 @@ mod tests {
         host.await.unwrap().unwrap();
         drop((host_job, device_job));
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    /// Two requests prepare at once beside a device capacity of one (every
+    /// Metal and CUDA coordinator, and a serial CPU one): preparation is host
+    /// work with its own lane.
+    #[tokio::test]
+    async fn requests_prepare_concurrently_beside_one_device_slot() {
+        assert!(host_preparation_capacity(1) >= 2);
+        assert!(host_preparation_capacity(1) <= 8);
+        assert_eq!(host_preparation_capacity(16), 16);
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let first = coordinator.admit(job("prepare-1")).await.unwrap();
+        let second = coordinator.admit(job("prepare-2")).await.unwrap();
+        // Each stage waits (bounded) until both are inside at once.
+        let inside = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let run = |job: JobLease| {
+            let coordinator = coordinator.clone();
+            let inside = inside.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run_host_blocking_stage(&job, move || {
+                        let (count, changed) = &*inside;
+                        let mut count = count.lock().unwrap_or_else(|poison| poison.into_inner());
+                        *count += 1;
+                        changed.notify_all();
+                        let (count, _) = changed
+                            .wait_timeout_while(count, Duration::from_secs(2), |count| *count < 2)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        Ok(*count >= 2)
+                    })
+                    .await
+            })
+        };
+        let (first, second) = (run(first), run(second));
+        assert!(first.await.unwrap().unwrap(), "first preparation ran alone");
+        assert!(
+            second.await.unwrap().unwrap(),
+            "second preparation ran alone"
+        );
     }
 
     /// P1V-2: a stage reservation refused memory another job holds waits and
