@@ -459,6 +459,13 @@ impl ModelVariant {
             );
         }
 
+        if self.is_granite_speech5_gguf() {
+            return CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Granite Speech 5.0 GGUF runs its Q8_0 YaRN Granite decoder on Candle quantized CUDA kernels and the F16 audio encoder and Q-Former projector on dense Candle CUDA kernels; its RoPE tables are built on the host",
+            );
+        }
+
         if self.is_qwen38_fp8() {
             return CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -527,6 +534,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Disabled,
                 "variant is disabled in the application catalog",
+            );
+        }
+
+        if self.is_granite_speech5_gguf() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Granite Speech 5.0 GGUF keeps its Q8_0 decoder projections, head and token table quantized (QMatMul); the F16 audio encoder and projector load dense",
             );
         }
 

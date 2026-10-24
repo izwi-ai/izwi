@@ -459,15 +459,25 @@ impl ConformerConv {
             },
             vb.pp("depth_conv.conv"),
         )?;
-        let batch_norm = batch_norm(inner, 1e-5, vb.pp("batch_norm"))?;
+        // The GGUF release stores the inference BatchNorm already folded to
+        // a per-channel scale and shift (llama.cpp's conversion), which its
+        // loader names `folded_scale` and `folded_shift`.
+        let (scale, shift) = if vb.contains_tensor("batch_norm.folded_scale") {
+            (
+                vb.get(inner, "batch_norm.folded_scale")?,
+                vb.get(inner, "batch_norm.folded_shift")?,
+            )
+        } else {
+            let batch_norm = batch_norm(inner, 1e-5, vb.pp("batch_norm"))?;
+            batch_norm_affine(
+                batch_norm.running_mean(),
+                batch_norm.running_var(),
+                batch_norm.eps(),
+                batch_norm.weight_and_bias(),
+            )?
+        };
         // Candle's grouped conv runs one convolution per channel; the shared
         // shift-and-accumulate op runs 2K + 2 element-wise ops.
-        let (scale, shift) = batch_norm_affine(
-            batch_norm.running_mean(),
-            batch_norm.running_var(),
-            batch_norm.eps(),
-            batch_norm.weight_and_bias(),
-        )?;
         let (depth_weight, depth_bias) =
             fold_channel_affine(depth_conv.weight(), None, &scale, &shift)?;
         // Same-length output: K / 2 on the left, one fewer on the right for

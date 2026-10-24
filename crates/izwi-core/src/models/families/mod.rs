@@ -70,7 +70,10 @@ const GRANITE_SPEECH_ASR_VARIANTS: &[ModelVariant] = &[
     ModelVariant::GraniteSpeech412B,
     ModelVariant::GraniteSpeech412BPlus,
 ];
-const GRANITE_SPEECH5_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::GraniteSpeech502B];
+const GRANITE_SPEECH5_ASR_VARIANTS: &[ModelVariant] = &[
+    ModelVariant::GraniteSpeech502B,
+    ModelVariant::GraniteSpeech502BGguf,
+];
 const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
     &[ModelVariant::DiarStreamingSortformer4SpkV21, ModelVariant::Nemotron3Diarization];
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[

@@ -281,7 +281,8 @@ fn run_leg(profile: DeviceProfile, tolerance: Tolerance) {
         return;
     }
     let fixture = fixture();
-    let model = GraniteSpeech5AsrModel::load(&dir, profile).unwrap();
+    let model =
+        GraniteSpeech5AsrModel::load(&dir, ModelVariant::GraniteSpeech502B, profile).unwrap();
     for (name, case) in &fixture.cases {
         let Some((samples, _)) = audio(&fixture, &case.audio) else {
             eprintln!("skipping: IZWI_GRANITE_SPEECH5_AUDIO_DIR is not set");

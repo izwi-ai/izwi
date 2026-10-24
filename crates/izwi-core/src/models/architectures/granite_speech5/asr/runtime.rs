@@ -18,11 +18,13 @@ use crate::models::shared::weights::staged;
 
 use super::config::GraniteSpeech5Config;
 use super::encoder::ConformerEncoder;
+use super::gguf::{check_gguf_metadata, mmproj_var_builder, open_gguf};
 use super::language_model::{argmax_last_token, text_attention_geometry, GraniteLanguageModel};
 use super::precision::{self, LmExecutionPlan};
 use super::preprocessor::GraniteSpeech5AudioFeatures;
 use super::projector::QFormerProjector;
 use super::prompt::{GraniteSpeech5Prompt, GraniteSpeech5SpecialTokens};
+use super::GraniteSpeech5Weights;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraniteSpeech5AudioStats {
@@ -70,18 +72,45 @@ pub struct GraniteSpeech5Runtime {
     encoder: ConformerEncoder,
     projector: QFormerProjector,
     language_model: GraniteLanguageModel,
+    /// Which release the weights came from, for diagnostics.
+    weights_format: &'static str,
 }
 
 impl GraniteSpeech5Runtime {
     pub fn load(
+        weights: &GraniteSpeech5Weights,
+        config: &GraniteSpeech5Config,
+        device: &DeviceProfile,
+        dtype: DType,
+        encoder_precision: &DTypeSelection,
+    ) -> Result<Self> {
+        // Reject malformed geometry before reading any weights.
+        text_attention_geometry(&config.text_config)?;
+        match weights {
+            GraniteSpeech5Weights::Safetensors(path) => {
+                Self::load_safetensors(path, config, device, dtype, encoder_precision)
+            }
+            GraniteSpeech5Weights::Gguf {
+                language_model,
+                mmproj,
+            } => Self::load_gguf(
+                language_model,
+                mmproj,
+                config,
+                device,
+                dtype,
+                encoder_precision,
+            ),
+        }
+    }
+
+    fn load_safetensors(
         weights: &Path,
         config: &GraniteSpeech5Config,
         device: &DeviceProfile,
         dtype: DType,
         encoder_precision: &DTypeSelection,
     ) -> Result<Self> {
-        // Reject malformed geometry before mapping the 4.6 GB checkpoint.
-        text_attention_geometry(&config.text_config)?;
         let rope = config.text_config.rope()?;
         let weights = [weights.to_path_buf()];
         let map = |dtype: DType| {
@@ -186,6 +215,103 @@ impl GraniteSpeech5Runtime {
             encoder,
             projector,
             language_model,
+            weights_format: "safetensors",
+        })
+    }
+
+    /// The GGUF release: the encoder and projector from the mmproj (each
+    /// tensor read on the host under its safetensors name as it loads), the
+    /// language model from the quantized GGUF. The encoder's weight-only F16
+    /// check and the LM's range probe run as for the safetensors release; the
+    /// LM's only selective-F16 part is its attention core.
+    fn load_gguf(
+        language_model_path: &Path,
+        mmproj_path: &Path,
+        config: &GraniteSpeech5Config,
+        device: &DeviceProfile,
+        dtype: DType,
+        encoder_precision: &DTypeSelection,
+    ) -> Result<Self> {
+        let rope = config.text_config.rope()?;
+        let load_started = Instant::now();
+        let lm_gguf = open_gguf(language_model_path)?;
+        let mmproj = open_gguf(mmproj_path)?;
+        check_gguf_metadata(config, &lm_gguf, &mmproj)?;
+
+        let audio_dtype = if encoder_precision.dtype == DType::F16 {
+            DType::F32
+        } else {
+            dtype
+        };
+        let audio_vb = mmproj_var_builder(mmproj, audio_dtype, &device.device)?;
+        let encoder_vb = audio_vb.pp("encoder");
+        let (encoder, encoder_weight_precision) = load_weight_only_f16(
+            "Granite Speech 5.0 encoder",
+            encoder_precision,
+            &device.device,
+            |f16| ConformerEncoder::load(&config.encoder_config, encoder_vb.clone(), f16),
+            |encoder| encoder.weight_only_f16_self_check(&config.encoder_config, &encoder_vb),
+        )?;
+        let projector = QFormerProjector::load(config, audio_vb.pp("projector"))?;
+        drop(encoder_vb);
+        drop(audio_vb);
+
+        let plan = LmExecutionPlan {
+            f16_attention_core: LmExecutionPlan::for_device(&device.device, dtype)
+                .f16_attention_core,
+            ..LmExecutionPlan::BASE_DTYPE
+        };
+        let lm_selection = precision::quantized_lm_precision(dtype, plan);
+        let load_lm = |loaded: DType| {
+            let (dtype, plan) = if loaded == lm_selection.dtype {
+                (dtype, plan)
+            } else {
+                // The range probe's fallback: F32 activations and attention.
+                (DType::F32, LmExecutionPlan::BASE_DTYPE)
+            };
+            GraniteLanguageModel::load_gguf(
+                &config.text_config,
+                &rope,
+                &lm_gguf,
+                &device.device,
+                dtype,
+                plan,
+            )
+        };
+        let (language_model, lm_precision) = load_with_precision_fallback(
+            "Granite Speech 5.0 LM",
+            &lm_selection,
+            device.kind.is_metal(),
+            DType::F32,
+            load_lm,
+            |lm| {
+                run_numeric_self_check(
+                    format!("Granite Speech 5.0 LM {:?}", lm_selection.dtype),
+                    F16_SAFE_MAX_ABS,
+                    || lm.numeric_probe(precision::LM_PROBE_TOKENS),
+                )
+            },
+        )?;
+        device.device.synchronize().map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to synchronize Granite Speech 5.0 GGUF materialization: {err}"
+            ))
+        })?;
+        tracing::info!(
+            dtype = ?dtype,
+            total_ms = load_started.elapsed().as_secs_f64() * 1_000.0,
+            "Granite Speech 5.0 GGUF materialization completed"
+        );
+        Ok(Self {
+            device: device.device.clone(),
+            dtype,
+            audio_dtype,
+            encoder_precision: encoder_weight_precision,
+            lm_precision,
+            encoder,
+            projector,
+            language_model,
+            weights_format: "gguf",
         })
     }
 
@@ -217,6 +343,7 @@ impl GraniteSpeech5Runtime {
             "qkv_projection_fused": precision::PROJECTION_FUSION,
             "gate_up_projection_fused": precision::PROJECTION_FUSION,
             "residual_branches_prescaled": self.language_model.residual_branches_prescaled(),
+            "weights_format": self.weights_format,
             "rope_type": "yarn",
             "rope_attention_scale": self.language_model.rope_attention_scale(),
             "audio_dtype": format!("{:?}", self.audio_dtype),

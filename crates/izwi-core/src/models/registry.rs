@@ -310,12 +310,12 @@ fn load_granite_speech_asr_model(
 
 fn load_granite_speech5_asr_model(
     model_dir: &Path,
-    _variant: ModelVariant,
+    variant: ModelVariant,
     device: DeviceProfile,
     _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::GraniteSpeech5(
-        GraniteSpeech5AsrModel::load(model_dir, device)?,
+        GraniteSpeech5AsrModel::load(model_dir, variant, device)?,
     ))
 }
 

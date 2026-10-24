@@ -86,6 +86,25 @@ pub(super) fn lm_precision(
     }
 }
 
+/// What the GGUF release's LM runs below its activation dtype: F16 when its
+/// attention core does (its projections stay quantized either way).
+pub(super) fn quantized_lm_precision(dtype: DType, plan: LmExecutionPlan) -> DTypeSelection {
+    if dtype == DType::F32 && plan.f16_attention_core {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "quantized GGUF LM projections, head and token table with F32 activations and an F16 attention core".into(),
+        }
+    } else {
+        DTypeSelection {
+            dtype,
+            reason: format!(
+                "quantized GGUF LM projections, head and token table with {dtype:?} activations"
+            )
+            .into(),
+        }
+    }
+}
+
 /// Q/K/V and gate/up are each joined into one projection on every backend.
 pub(super) const PROJECTION_FUSION: bool = true;
 

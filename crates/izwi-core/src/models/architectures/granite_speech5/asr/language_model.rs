@@ -2,8 +2,10 @@
 //! YaRN to 16k positions. Granite's four multipliers apply as in 4.1
 //! (embedding, residual, attention scale, logits), attention runs on the
 //! paged invocation cache, and RoPE reads a host-built F64 cos/sin table
-//! carrying the YaRN frequencies and attention scale.
+//! carrying the YaRN frequencies and attention scale. The GGUF release's
+//! projections, head and token table stay quantized (`QMatMul`).
 
+use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{
     embedding, linear_no_bias, rotary_emb, Embedding, Linear, Module, RmsNorm, VarBuilder,
@@ -21,8 +23,11 @@ use crate::models::shared::rope::{rope_frequencies, RopeFrequencies, RopeScaling
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
+use crate::models::shared::weights::gguf::GgufLoader;
+use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::config::GraniteSpeech5TextConfig;
+use super::gguf::{joined_qmatmul, QuantizedPart};
 use super::precision::{self, LmExecutionPlan};
 
 /// Attention geometry, checked before any head-dimension division.
@@ -53,11 +58,17 @@ pub(super) fn text_attention_geometry(
     Ok(geometry)
 }
 
+/// A bias-free projection: dense, or quantized as the GGUF release stores it.
 #[derive(Clone, Debug)]
-struct LinearNoBias {
-    linear: Linear,
-    /// Cached transposed weight (Metal), so each step skips the transpose.
-    weight_t: Option<Tensor>,
+enum LinearNoBias {
+    Dense {
+        linear: Linear,
+        /// Cached transposed weight (Metal), so each step skips the transpose.
+        weight_t: Option<Tensor>,
+    },
+    /// Candle's quantized kernels take F32 input on Metal and CUDA (and
+    /// quantize it on the CPU), so a quantized projection computes in F32.
+    Quantized(QMatMul),
 }
 
 impl LinearNoBias {
@@ -65,7 +76,7 @@ impl LinearNoBias {
         let weight_t = precision::cached_linear_t(linear.weight().device())
             .then(|| linear.weight().t())
             .transpose()?;
-        Ok(Self { linear, weight_t })
+        Ok(Self::Dense { linear, weight_t })
     }
 
     fn from_weight(weight: Tensor) -> Result<Self> {
@@ -73,24 +84,33 @@ impl LinearNoBias {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(weight_t) = &self.weight_t {
-            return cached_linear_forward(x, weight_t)
-                .or_else(|_| self.linear.forward(x).map_err(Error::from));
+        match self {
+            Self::Dense {
+                linear,
+                weight_t: Some(weight_t),
+            } => cached_linear_forward(x, weight_t)
+                .or_else(|_| linear.forward(x).map_err(Error::from)),
+            Self::Dense { linear, .. } => linear.forward(x).map_err(Error::from),
+            Self::Quantized(matmul) => matmul.forward(x).map_err(Error::from),
         }
-        self.linear.forward(x).map_err(Error::from)
     }
 
-    fn weight(&self) -> &Tensor {
-        self.linear.weight()
+    /// The dtype the projection reads its input in: the dense weight's, or
+    /// F32 for a quantized one.
+    fn compute_dtype(&self) -> DType {
+        match self {
+            Self::Dense { linear, .. } => linear.weight().dtype(),
+            Self::Quantized(_) => DType::F32,
+        }
     }
 
-    /// Run in the weight's dtype, returning `output_dtype`.
+    /// Run in the compute dtype, returning `output_dtype`.
     fn forward_cast(&self, x: &Tensor, output_dtype: DType) -> Result<Tensor> {
-        let weight_dtype = self.weight().dtype();
-        let out = if x.dtype() == weight_dtype {
+        let compute_dtype = self.compute_dtype();
+        let out = if x.dtype() == compute_dtype {
             self.forward(x)?
         } else {
-            self.forward(&x.to_dtype(weight_dtype)?)?
+            self.forward(&x.to_dtype(compute_dtype)?)?
         };
         if out.dtype() == output_dtype {
             Ok(out)
@@ -162,15 +182,24 @@ impl RopeCache {
     }
 }
 
+/// The token table: dense, or the GGUF release's quantized table.
+enum TokenTable {
+    Dense(Embedding),
+    Quantized(QuantizedTokenTable),
+}
+
 /// The token embedding in the model's base dtype.
 struct TokenEmbedding {
-    table: Embedding,
+    table: TokenTable,
     dtype: DType,
 }
 
 impl TokenEmbedding {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
-        let rows = self.table.forward(ids)?;
+        let rows = match &self.table {
+            TokenTable::Dense(table) => table.forward(ids)?,
+            TokenTable::Quantized(table) => table.embed(ids)?,
+        };
         if rows.dtype() == self.dtype {
             Ok(rows)
         } else {
@@ -211,10 +240,7 @@ impl GraniteLanguageModel {
         } else {
             vb.pp("model.embed_tokens")
         };
-        let embed_tokens = TokenEmbedding {
-            table: embedding(config.vocab_size, config.hidden_size, table_vb)?,
-            dtype: vb.dtype(),
-        };
+        let table = embedding(config.vocab_size, config.hidden_size, table_vb)?;
         let residual_branches_prescaled = precision::residual_prescale(vb.device());
         let layers = (0..config.num_hidden_layers)
             .map(|idx| {
@@ -230,7 +256,7 @@ impl GraniteLanguageModel {
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if tie_word_embeddings {
-            Linear::new(embed_tokens.table.embeddings().clone(), None)
+            Linear::new(table.embeddings().clone(), None)
         } else {
             let head_vb = if plan.f16_lm_head {
                 vb.to_dtype(DType::F16)
@@ -240,7 +266,10 @@ impl GraniteLanguageModel {
             linear_no_bias(config.hidden_size, config.vocab_size, head_vb.pp("lm_head"))?
         };
         Ok(Self {
-            embed_tokens,
+            embed_tokens: TokenEmbedding {
+                table: TokenTable::Dense(table),
+                dtype: vb.dtype(),
+            },
             layers,
             norm,
             lm_head: LinearNoBias::new(lm_head)?,
@@ -249,6 +278,110 @@ impl GraniteLanguageModel {
             head_dim,
             device: vb.device().clone(),
             residual_branches_prescaled,
+            plan,
+        })
+    }
+
+    /// The language model from the GGUF release: its quantized projections,
+    /// head and token table stay quantized (Q/K rows put back in half-split
+    /// RoPE order), norms load in `dtype`, and activations run in `dtype`.
+    /// Quantized weights cannot carry the residual multiplier, so it scales
+    /// each branch instead; `plan` may only change the attention core's dtype.
+    pub(super) fn load_gguf(
+        config: &GraniteSpeech5TextConfig,
+        rope: &RopeScaling,
+        gguf: &GgufLoader,
+        device: &Device,
+        dtype: DType,
+        plan: LmExecutionPlan,
+    ) -> Result<Self> {
+        if plan.f16_lm_head || plan.f16_qkv || plan.f16_mlp || plan.f16_attention_output {
+            return Err(Error::ModelLoadError(
+                "Granite Speech 5.0 GGUF projections stay quantized; only the attention core may run in F16"
+                    .to_string(),
+            ));
+        }
+        let geometry = text_attention_geometry(config)?;
+        let head_dim = geometry.key_head_dim();
+        let rope = rope_frequencies(head_dim, config.rope_theta, rope)?;
+        // Norms are read and converted on the host, then uploaded.
+        let norm = |name: &str| -> Result<RmsNorm> {
+            let weight = gguf.load_tensor(name, dtype, &Device::Cpu)?;
+            Ok(RmsNorm::new(weight.to_device(device)?, config.rms_norm_eps))
+        };
+        let quantized = |names: &[(&str, Option<usize>)]| -> Result<LinearNoBias> {
+            let parts = names
+                .iter()
+                .map(|(name, rope_heads)| QuantizedPart {
+                    name,
+                    rope_heads: *rope_heads,
+                })
+                .collect::<Vec<_>>();
+            Ok(LinearNoBias::Quantized(joined_qmatmul(
+                gguf, &parts, device,
+            )?))
+        };
+        let layers = (0..config.num_hidden_layers)
+            .map(|idx| {
+                let name = |part: &str| format!("blk.{idx}.{part}.weight");
+                let (q, k, v) = (name("attn_q"), name("attn_k"), name("attn_v"));
+                let (gate, up) = (name("ffn_gate"), name("ffn_up"));
+                Ok(DecoderLayer {
+                    input_layernorm: norm(&name("attn_norm"))?,
+                    self_attn: TextAttention {
+                        qkv_proj: QkvProjection::Fused {
+                            fused: quantized(&[
+                                (&q, Some(config.num_attention_heads)),
+                                (&k, Some(config.num_key_value_heads)),
+                                (&v, None),
+                            ])?,
+                            q_out: config.num_attention_heads * head_dim,
+                            k_out: config.num_key_value_heads * head_dim,
+                        },
+                        o_proj: quantized(&[(&name("attn_output"), None)])?,
+                        f16_attention_core: plan.f16_attention_core,
+                        num_heads: config.num_attention_heads,
+                        num_kv_heads: config.num_key_value_heads,
+                        head_dim,
+                        attention_multiplier: config.attention_multiplier,
+                    },
+                    post_attention_layernorm: norm(&name("ffn_norm"))?,
+                    mlp: TextMlp {
+                        gate_up_proj: GateUpProjection::Fused {
+                            fused: quantized(&[(&gate, None), (&up, None)])?,
+                            intermediate_size: config.intermediate_size,
+                        },
+                        down_proj: quantized(&[(&name("ffn_down"), None)])?,
+                        f16: false,
+                    },
+                    residual_multiplier: config.residual_multiplier,
+                    residual_branches_prescaled: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let table = QuantizedTokenTable::new(gguf.load_qtensor("token_embd.weight", device)?)?;
+        if table.vocab_size() != config.vocab_size || table.hidden_size() != config.hidden_size {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech 5.0 GGUF token table is {} x {}, but config.json gives {} x {}",
+                table.vocab_size(),
+                table.hidden_size(),
+                config.vocab_size,
+                config.hidden_size
+            )));
+        }
+        Ok(Self {
+            embed_tokens: TokenEmbedding {
+                table: TokenTable::Quantized(table),
+                dtype,
+            },
+            layers,
+            norm: norm("output_norm.weight")?,
+            lm_head: quantized(&[("output.weight", None)])?,
+            cfg: config.clone(),
+            rope,
+            head_dim,
+            device: device.clone(),
+            residual_branches_prescaled: false,
             plan,
         })
     }
@@ -395,7 +528,7 @@ impl GraniteLanguageModel {
         let hidden = hidden.narrow(1, sequence_len - 1, 1)?;
         let logits = self
             .lm_head
-            .forward_cast(&hidden, self.lm_head.weight().dtype())?;
+            .forward_cast(&hidden, self.lm_head.compute_dtype())?;
         cache.commit_prepared(prepared)?;
         Ok(logits)
     }
@@ -556,7 +689,7 @@ impl QkvProjection {
 
     fn weight_dtype(&self) -> DType {
         match self {
-            Self::Fused { fused, .. } => fused.weight().dtype(),
+            Self::Fused { fused, .. } => fused.compute_dtype(),
             Self::Separate { q_proj, .. } => q_proj.weight().dtype(),
         }
     }
@@ -1187,8 +1320,11 @@ pub(super) mod tests {
             LmExecutionPlan::BASE_DTYPE,
         )
         .unwrap();
+        let LinearNoBias::Dense { linear: head, .. } = &model.lm_head else {
+            panic!("a safetensors head loads dense");
+        };
         assert_eq!(
-            model.lm_head.weight().to_vec2::<f32>().unwrap(),
+            head.weight().to_vec2::<f32>().unwrap(),
             tensors["lm_head.weight"].to_vec2::<f32>().unwrap()
         );
         let linear = Linear::new(

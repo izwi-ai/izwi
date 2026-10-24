@@ -22,6 +22,9 @@ use tracing::{debug, info, warn};
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
+use crate::models::architectures::granite_speech5::asr::{
+    GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
+};
 use crate::models::architectures::nemotron::asr::nemotron_native_artifacts_complete;
 use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_complete;
 use crate::models::shared::weights::nemo::ensure_free_disk;
@@ -209,7 +212,29 @@ const GRANITE_SPEECH_5_FILES: &[&str] = &[
 /// revision (LFS sha256 `4151269881d2dd82…`).
 const GRANITE_SPEECH_5_MODEL_BYTES: u64 = 4_626_528_224;
 
+/// Granite Speech 5.0's GGUF release: the two GGUFs from the GGUF repo, and
+/// the configs and tokenizer the loader reads from the safetensors release
+/// (the GGUF repo ships neither the processor configs nor `tokenizer.json`).
+const GRANITE_SPEECH_5_GGUF_FILES: &[&str] = &[
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    GRANITE_SPEECH5_GGUF_LM_FILE,
+    GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
+];
+
+/// Exact sizes of the GGUF release's files at the pinned revision.
+const GRANITE_SPEECH_5_GGUF_LM_BYTES: u64 = 1_956_155_104;
+const GRANITE_SPEECH_5_GGUF_MMPROJ_BYTES: u64 = 1_159_354_752;
+
 fn granite_speech_required_files(variant: ModelVariant) -> &'static [&'static str] {
+    if variant.is_granite_speech5_gguf() {
+        return GRANITE_SPEECH_5_GGUF_FILES;
+    }
     if variant.family() == ModelFamily::GraniteSpeech5Asr {
         return GRANITE_SPEECH_5_FILES;
     }
@@ -2061,6 +2086,33 @@ impl ModelDownloader {
                 .collect();
         }
 
+        if variant.is_granite_speech5_gguf() {
+            // The configs and tokenizer come from the safetensors release at
+            // its pinned revision: the same model, so the same files.
+            let companion = ModelVariant::GraniteSpeech502B;
+            let companion_revision = companion.artifact_revision().unwrap_or("main");
+            return self
+                .get_model_files(variant)
+                .into_iter()
+                .map(|file| {
+                    let (source_repo, source_revision) = if file.ends_with(".gguf") {
+                        (default_repo.clone(), default_revision.clone())
+                    } else {
+                        (
+                            companion.repo_id().to_string(),
+                            companion_revision.to_string(),
+                        )
+                    };
+                    ModelFileSpec {
+                        source_repo,
+                        source_revision,
+                        source_file: file.clone(),
+                        local_file: file,
+                    }
+                })
+                .collect();
+        }
+
         if variant.is_lfm2_chat_gguf() {
             // The GGUF repos ship no tokenizer, so the companion files come
             // from the safetensors repos at a pinned revision: upstream
@@ -2416,6 +2468,10 @@ impl ModelDownloader {
                 ModelVariant::Qwen359BGguf => 918_166_080,
                 _ => 670_000_000,
             }
+        } else if variant.is_granite_speech5_gguf() && file == GRANITE_SPEECH5_GGUF_LM_FILE {
+            GRANITE_SPEECH_5_GGUF_LM_BYTES
+        } else if variant.is_granite_speech5_gguf() && file == GRANITE_SPEECH5_GGUF_MMPROJ_FILE {
+            GRANITE_SPEECH_5_GGUF_MMPROJ_BYTES
         } else if file == "mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf" {
             219_511_136
         } else if file == "tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf" {
@@ -3057,6 +3113,43 @@ mod tests {
         std::fs::remove_dir_all(temp_dir).ok();
     }
 
+    /// The GGUF release takes its two GGUFs from the GGUF repo and the
+    /// configs and tokenizer from the safetensors release, each pinned.
+    #[test]
+    fn granite_speech_5_gguf_specs_pin_both_repos() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::GraniteSpeech502BGguf;
+        let specs = downloader.get_model_file_specs(variant);
+        assert_eq!(specs.len(), GRANITE_SPEECH_5_GGUF_FILES.len());
+        for spec in &specs {
+            let (repo, revision) = if spec.local_file.ends_with(".gguf") {
+                (
+                    "ibm-granite/granite-speech-5.0-2b-GGUF",
+                    ModelVariant::GRANITE_SPEECH_5_0_2B_GGUF_ARTIFACT_REVISION,
+                )
+            } else {
+                (
+                    "ibm-granite/granite-speech-5.0-2b",
+                    ModelVariant::GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION,
+                )
+            };
+            assert_eq!(spec.source_repo, repo, "{}", spec.local_file);
+            assert_eq!(spec.source_revision, revision, "{}", spec.local_file);
+            assert_eq!(spec.source_file, spec.local_file);
+        }
+        assert!(specs
+            .iter()
+            .any(|spec| spec.local_file == "granite-speech-5.0-2b-Q8_0.gguf"));
+        assert!(!specs
+            .iter()
+            .any(|spec| spec.local_file == "model.safetensors"));
+        assert_eq!(
+            downloader.get_single_file_size_estimate(variant, "mmproj-model-f16.gguf"),
+            GRANITE_SPEECH_5_GGUF_MMPROJ_BYTES
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
     #[test]
     fn granite_speech_is_downloaded_only_when_all_required_assets_exist() {
         let (downloader, temp_dir) = test_downloader();
@@ -3064,6 +3157,7 @@ mod tests {
             ModelVariant::GraniteSpeech412B,
             ModelVariant::GraniteSpeech412BPlus,
             ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
         ] {
             let required = granite_speech_required_files(variant);
             let model_dir = downloader.model_path(variant);

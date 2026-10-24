@@ -369,7 +369,7 @@ impl ModelVariant {
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
-            GraniteSpeech502B => ModelFamily::GraniteSpeech5Asr,
+            GraniteSpeech502B | GraniteSpeech502BGguf => ModelFamily::GraniteSpeech5Asr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -842,6 +842,16 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
         {
             return None;
         }
+        // Of IBM's GGUF quantizations the catalog carries Q8_0 only.
+        if normalized.contains("gguf") || normalized.contains("q80") {
+            return Some(GraniteSpeech502BGguf);
+        }
+        if ["q2k", "q3k", "q4", "q5", "q6k", "bf16"]
+            .iter()
+            .any(|quant| normalized.contains(quant))
+        {
+            return None;
+        }
         return Some(GraniteSpeech502B);
     }
 
@@ -1297,6 +1307,24 @@ mod tests {
         }
         // The Turbo CTC sibling is not this model.
         assert!(parse_model_variant("granite-speech-5.0-470m-turboctc").is_err());
+        // The GGUF release is its own variant of the same family; only its
+        // Q8_0 quantization is carried.
+        for input in [
+            "Granite-Speech-5.0-2B-GGUF",
+            "ibm-granite/granite-speech-5.0-2b-GGUF",
+            "granite-speech-5.0-2b-Q8_0.gguf",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::GraniteSpeech502BGguf,
+                "{input}"
+            );
+        }
+        assert!(parse_model_variant("granite-speech-5.0-2b-Q4_K_M").is_err());
+        assert_eq!(
+            ModelVariant::GraniteSpeech502BGguf.family(),
+            ModelFamily::GraniteSpeech5Asr
+        );
         // 4.1 ids keep resolving to 4.1.
         assert_eq!(
             resolve_asr_model_variant(Some("granite-speech-4.1")),

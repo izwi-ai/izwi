@@ -19,6 +19,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::backends::{DeviceKind, DeviceProfile};
+use crate::catalog::ModelVariant;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -36,6 +37,7 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 mod config;
 mod encoder;
+mod gguf;
 mod language_model;
 mod precision;
 mod preprocessor;
@@ -52,6 +54,7 @@ pub use config::{
     GraniteSpeech5ProcessorConfig, GraniteSpeech5ProjectorConfig, GraniteSpeech5TextConfig,
     GraniteSpeech5TokenizerConfig,
 };
+pub(crate) use gguf::granite_speech5_mmproj_safetensors_name;
 pub(crate) use precision::{
     granite_speech5_load_representation, granite_speech5_tensor_is_f16_encoder_projection,
     resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype,
@@ -75,17 +78,45 @@ pub use runtime::{
 };
 pub use transcript::clean_granite_speech5_output;
 
-/// Files the loader reads. `generation_config.json` is optional.
-const REQUIRED_ARTIFACTS: &[&str] = &[
+/// Files both releases' loaders read besides the weights.
+/// `generation_config.json` is optional.
+const CONFIG_ARTIFACTS: &[&str] = &[
     "chat_template.jinja",
     "config.json",
-    "model.safetensors",
     "preprocessor_config.json",
     "processor_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
 ];
 const WEIGHTS_FILE: &str = "model.safetensors";
+/// IBM's GGUF release: the Q8_0 language model, and the F16 audio encoder
+/// and projector.
+pub const GRANITE_SPEECH5_GGUF_LM_FILE: &str = "granite-speech-5.0-2b-Q8_0.gguf";
+pub const GRANITE_SPEECH5_GGUF_MMPROJ_FILE: &str = "mmproj-model-f16.gguf";
+
+/// Where a Granite Speech 5.0 checkpoint keeps its weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraniteSpeech5Weights {
+    /// The safetensors release: one file.
+    Safetensors(PathBuf),
+    /// The GGUF release: the language model, and the encoder and projector.
+    Gguf {
+        language_model: PathBuf,
+        mmproj: PathBuf,
+    },
+}
+
+impl GraniteSpeech5Weights {
+    pub fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Safetensors(path) => vec![path.clone()],
+            Self::Gguf {
+                language_model,
+                mmproj,
+            } => vec![language_model.clone(), mmproj.clone()],
+        }
+    }
+}
 
 /// Most audio one invocation covers: IBM recommends segments of about two
 /// minutes or less. Longer audio is chunked by the generic ASR route.
@@ -212,8 +243,8 @@ pub struct GraniteSpeech5AsrModel {
 }
 
 impl GraniteSpeech5AsrModel {
-    pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
-        let weights = ensure_granite_speech5_artifacts(model_dir)?;
+    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        let weights = ensure_granite_speech5_artifacts(model_dir, variant)?;
         let config = GraniteSpeech5Config::load(model_dir)?;
         config.validate()?;
         if config.tie_word_embeddings() {
@@ -479,9 +510,20 @@ fn duration_ms(duration: Duration) -> f64 {
 }
 
 /// The checkpoint's weights file, once every file the loader reads exists.
-pub fn ensure_granite_speech5_artifacts(model_dir: &Path) -> Result<PathBuf> {
-    for file in REQUIRED_ARTIFACTS {
-        let path = model_dir.join(file);
+pub fn ensure_granite_speech5_artifacts(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<GraniteSpeech5Weights> {
+    let weights = if variant.is_granite_speech5_gguf() {
+        GraniteSpeech5Weights::Gguf {
+            language_model: model_dir.join(GRANITE_SPEECH5_GGUF_LM_FILE),
+            mmproj: model_dir.join(GRANITE_SPEECH5_GGUF_MMPROJ_FILE),
+        }
+    } else {
+        GraniteSpeech5Weights::Safetensors(model_dir.join(WEIGHTS_FILE))
+    };
+    let configs = CONFIG_ARTIFACTS.iter().map(|file| model_dir.join(file));
+    for path in configs.chain(weights.files()) {
         if !path.is_file() {
             return Err(Error::ModelNotFound(format!(
                 "Missing Granite Speech 5.0 artifact {}",
@@ -489,7 +531,7 @@ pub fn ensure_granite_speech5_artifacts(model_dir: &Path) -> Result<PathBuf> {
             )));
         }
     }
-    Ok(model_dir.join(WEIGHTS_FILE))
+    Ok(weights)
 }
 
 fn granite_speech5_invocation_contract(
@@ -791,23 +833,43 @@ mod tests {
     }
 
     #[test]
-    fn artifacts_require_the_single_weights_file_and_loader_configs() {
+    fn artifacts_require_each_releases_weights_and_the_loader_configs() {
         let dir = std::env::temp_dir().join(format!("granite-speech5-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        for file in REQUIRED_ARTIFACTS
-            .iter()
-            .filter(|file| **file != WEIGHTS_FILE)
-        {
+        for file in CONFIG_ARTIFACTS {
             std::fs::write(dir.join(file), b"{}").unwrap();
         }
-        let missing = ensure_granite_speech5_artifacts(&dir)
-            .unwrap_err()
-            .to_string();
-        assert!(missing.contains("model.safetensors"), "{missing}");
+        let safetensors = ModelVariant::GraniteSpeech502B;
+        let gguf = ModelVariant::GraniteSpeech502BGguf;
+        for (variant, expected) in [(safetensors, "model.safetensors"), (gguf, "Q8_0.gguf")] {
+            let missing = ensure_granite_speech5_artifacts(&dir, variant)
+                .unwrap_err()
+                .to_string();
+            assert!(missing.contains(expected), "{missing}");
+        }
         std::fs::write(dir.join(WEIGHTS_FILE), b"").unwrap();
         assert_eq!(
-            ensure_granite_speech5_artifacts(&dir).unwrap(),
-            dir.join(WEIGHTS_FILE)
+            ensure_granite_speech5_artifacts(&dir, safetensors).unwrap(),
+            GraniteSpeech5Weights::Safetensors(dir.join(WEIGHTS_FILE))
+        );
+        // The GGUF release needs both of its files.
+        std::fs::write(dir.join(GRANITE_SPEECH5_GGUF_LM_FILE), b"").unwrap();
+        let missing = ensure_granite_speech5_artifacts(&dir, gguf)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains(GRANITE_SPEECH5_GGUF_MMPROJ_FILE),
+            "{missing}"
+        );
+        std::fs::write(dir.join(GRANITE_SPEECH5_GGUF_MMPROJ_FILE), b"").unwrap();
+        assert_eq!(
+            ensure_granite_speech5_artifacts(&dir, gguf)
+                .unwrap()
+                .files(),
+            vec![
+                dir.join(GRANITE_SPEECH5_GGUF_LM_FILE),
+                dir.join(GRANITE_SPEECH5_GGUF_MMPROJ_FILE)
+            ]
         );
         std::fs::remove_dir_all(dir).ok();
     }
