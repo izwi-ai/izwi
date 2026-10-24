@@ -2518,6 +2518,48 @@ async fn batch_pipeline_observation_records_pipeline_telemetry() {
     assert_eq!(snapshot.pipelines.stages_recorded, 8);
 }
 
+/// Admitted CUDA requests hold no device headroom while they wait:
+/// sixteen fit beside 256 MiB of free device memory (each used to claim
+/// 64 MiB of it for its whole life, so the fifth was refused).
+#[test]
+fn concurrent_cuda_requests_do_not_claim_device_headroom() {
+    use crate::engine::{
+        CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
+        ReservationOwner, ResourceAuthority,
+    };
+    #[derive(Debug)]
+    struct FixedProvider(PhysicalCapacitySnapshot);
+    impl PhysicalCapacityProvider for FixedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            self.0
+        }
+    }
+    let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedProvider(
+        PhysicalCapacitySnapshot {
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64 << 30),
+                device_bytes: ResourceAmount::Known(24 << 30),
+                ..ResourceVector::zero()
+            },
+            available: ResourceVector {
+                host_bytes: ResourceAmount::Known(32 << 30),
+                device_bytes: ResourceAmount::Known(256 << 20),
+                ..ResourceVector::zero()
+            },
+            source: CapacitySource::Test,
+        },
+    ))));
+    let requests = (0..16)
+        .map(|index| {
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, format!("request-{index}")),
+                transient_resources(BackendKind::Cuda, 4096),
+            )
+        })
+        .collect::<Result<Vec<_>>>();
+    assert!(requests.is_ok(), "{:?}", requests.err());
+}
+
 #[test]
 fn transient_estimates_are_fully_known_for_every_backend() {
     const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2542,10 +2584,8 @@ fn transient_estimates_are_fully_known_for_every_backend() {
         cuda.host_bytes,
         ResourceAmount::Known(host_preparation_bytes)
     );
-    assert_eq!(
-        cuda.device_bytes,
-        ResourceAmount::Known(BASE_WORKSPACE_BYTES)
-    );
+    // Device scratch is charged per dispatched row, not per request.
+    assert_eq!(cuda.device_bytes, ResourceAmount::Known(0));
 }
 
 #[test]

@@ -231,11 +231,13 @@ pub(crate) fn transient_resources(backend: BackendKind, input_bytes: usize) -> R
         }
         BackendKind::Cuda => {
             // Decode, resample, tokenization, media parsing, and request
-            // construction all occur in host memory before CUDA upload. Keep
-            // the input expansion in the host domain and reserve only the
-            // backend-neutral execution workspace in VRAM.
+            // construction all occur in host memory before CUDA upload. The
+            // device scratch an execution needs is charged per row of each
+            // dispatch (`engine::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW`), not
+            // for the request's life: a queued request held 64 MiB of live
+            // headroom it never allocated, so a burst past headroom / 64 MiB
+            // failed admission with nothing on the device.
             resources.host_bytes = ResourceAmount::Known(host_preparation_bytes);
-            resources.device_bytes = ResourceAmount::Known(BASE_WORKSPACE_BYTES);
         }
     }
     resources
@@ -256,7 +258,6 @@ fn asr_transient_resources(
     audio_secs: Option<f32>,
 ) -> Result<Option<ResourceVector>> {
     use super::lifecycle::asr_envelope;
-    const CUDA_DEVICE_BASE_BYTES: u64 = 64 * 1024 * 1024;
     let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
         return Ok(None);
     };
@@ -293,12 +294,10 @@ fn asr_transient_resources(
             )
         }
         BackendKind::Cuda => {
+            // Dispatch scratch is charged per row of each dispatch; only an
+            // encoder no preparation stage prices stays on the request.
             resources.host_bytes = ResourceAmount::Known(host_bytes);
-            resources.device_bytes = ResourceAmount::Known(
-                CUDA_DEVICE_BASE_BYTES
-                    .checked_add(accelerator_bytes)
-                    .ok_or_else(overflow)?,
-            );
+            resources.device_bytes = ResourceAmount::Known(accelerator_bytes);
         }
     }
     Ok(Some(resources))

@@ -1532,6 +1532,29 @@ impl ExecutorStepResult {
     }
 }
 
+/// Backend-neutral device scratch for each row of a CUDA dispatch: allocator
+/// slack, sampling buffers and the temporaries a model's workspace formula
+/// leaves out. It is charged while the row is on the device, not for a
+/// request's whole life, so queued requests leave device headroom alone.
+pub(crate) const CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW: u64 = 64 * 1024 * 1024;
+
+/// The workspace one dispatch of `batch` reserves: the rows' declared
+/// workspace, plus per-row device scratch on CUDA.
+fn dispatch_workspace(batch: &PhysicalBatch) -> Result<ResourceVector> {
+    if batch.lane.backend != BackendKind::Cuda {
+        return Ok(batch.workspace);
+    }
+    let rows = u64::try_from(batch.rows.len().max(1))
+        .map_err(|_| Error::Overloaded("dispatch row count exceeds u64".to_string()))?;
+    let scratch = CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW
+        .checked_mul(rows)
+        .ok_or_else(|| Error::Overloaded("dispatch scratch overflowed".to_string()))?;
+    batch.workspace.checked_add(ResourceVector {
+        device_bytes: super::ResourceAmount::Known(scratch),
+        ..ResourceVector::zero()
+    })
+}
+
 /// Model executor trait - abstracts the model inference backend.
 pub struct PhysicalBatchExecution<'a> {
     pub batch: &'a PhysicalBatch,
@@ -4109,7 +4132,14 @@ impl UnifiedExecutor {
         &self,
         batch: &PhysicalBatch,
     ) -> Result<Option<BatchWorkspaceLease>> {
-        let workspace_bytes = match batch.workspace.workspace_bytes() {
+        let workspace = match dispatch_workspace(batch) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
+                return Err(error);
+            }
+        };
+        let workspace_bytes = match workspace.workspace_bytes() {
             Ok(workspace_bytes) => workspace_bytes,
             Err(error) => {
                 record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
@@ -4134,7 +4164,7 @@ impl UnifiedExecutor {
         }
         let reservation = context
             .authority
-            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, batch.workspace)
+            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, workspace)
             .map(Some);
         if let Err(error) = &reservation {
             match error {
@@ -6000,7 +6030,9 @@ mod tests {
                 BackendKind::Metal => capacity.unified_bytes = ResourceAmount::Known(64),
                 BackendKind::Cuda => {
                     capacity.host_bytes = ResourceAmount::Known(64);
-                    capacity.device_bytes = ResourceAmount::Known(64);
+                    // Room for the row's per-dispatch device scratch.
+                    capacity.device_bytes =
+                        ResourceAmount::Known(64 + CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW);
                 }
             }
             let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
@@ -6069,7 +6101,14 @@ mod tests {
                 .reserve_batch_workspace(&batch)
                 .unwrap()
                 .expect("workspace lease");
-            assert_eq!(workspace.resources(), expected_workspace);
+            assert_eq!(
+                workspace.resources(),
+                dispatch_workspace(&batch).unwrap(),
+                "{backend:?}"
+            );
+            if backend != BackendKind::Cuda {
+                assert_eq!(workspace.resources(), expected_workspace);
+            }
             assert_eq!(authority.snapshot().reservations, 1);
             drop(workspace);
             assert_eq!(authority.snapshot().reservations, 0);
@@ -6125,6 +6164,35 @@ mod tests {
         assert!(
             after.fallbacks.uncertified_profile
                 >= before.fallbacks.uncertified_profile.saturating_add(1)
+        );
+    }
+
+    /// CUDA charges device scratch for each row while it is dispatched, on
+    /// top of the rows' declared workspace; other backends reserve exactly
+    /// the declared workspace.
+    #[test]
+    fn cuda_dispatches_reserve_device_scratch_per_row() {
+        let request = EngineCoreRequest::tts("dispatch scratch");
+        let (mut batch, _, _) = single_row_physical_batch(&request);
+        batch.workspace = ResourceVector::temporary_workspace(1024);
+        assert_eq!(dispatch_workspace(&batch).unwrap(), batch.workspace);
+
+        batch.lane.backend = BackendKind::Cuda;
+        batch.workspace = ResourceVector {
+            device_bytes: ResourceAmount::Known(1024),
+            ..ResourceVector::zero()
+        };
+        let second = super::super::ReadyQuantum {
+            plan_id: 2,
+            ..batch.rows[0].clone()
+        };
+        batch.rows.push(second);
+        assert_eq!(
+            dispatch_workspace(&batch).unwrap(),
+            ResourceVector {
+                device_bytes: ResourceAmount::Known(1024 + 2 * CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW),
+                ..ResourceVector::zero()
+            }
         );
     }
 
