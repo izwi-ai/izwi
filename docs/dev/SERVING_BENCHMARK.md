@@ -216,6 +216,18 @@ Metal and CUDA the physical admission still launches one dispatch at a
 time, so the device time a long dispatch holds is bounded by the chunking
 above, not by the lane drivers.
 
+Physical admission hands the device to the loaded models in weighted-fair
+order, the policy the device thread uses: each model is charged for the time
+it holds the device divided by its workload class's weight, and the waiting
+model with the least charge goes next. Direct runtime stages (encoders,
+realtime pushes, diarization) are weighed the same way instead of jumping the
+queue as control jobs. This matters when one model has several dispatches
+waiting. Beside a long transcription, each lane keeps one dispatch in flight,
+so the device still alternates, and the gap tail is one encoder window. On an
+M1 Pro, chat beside a 6-minute Whisper transcription finished in 39 s with lane
+drivers and 57 s without (the transcription took 32 s and 37 s); its p95
+inter-delta gap stayed about 1.8 s either way.
+
 Measured on an M-series Mac (Metal, LFM2.5-1.2B-Instruct Q4_K_M chat at
 `--request-rate 2 --num-prompts 16`, 128 tokens in and out, beside a
 26-minute Whisper-Large-v3-Turbo transcription started 4 s before the chat

@@ -4236,13 +4236,12 @@ impl UnifiedExecutor {
         scheduled: &[ScheduledRequest],
     ) -> std::result::Result<PhysicalExecutionAdmissionOutcome, PhysicalDispatchError> {
         let width = batch.rows.len().max(1);
-        PhysicalBatchExecution {
+        let execution = PhysicalBatchExecution {
             batch,
             requests,
             scheduled,
-        }
-        .validate()
-        .map_err(|error| {
+        };
+        execution.validate().map_err(|error| {
             record_engine_physical_fallback(EnginePhysicalFallbackReason::BatchIncompatible);
             PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
         })?;
@@ -4252,13 +4251,15 @@ impl UnifiedExecutor {
         let lease = if let Some(admission) = &self.physical_execution_admission {
             let launch_policy = Self::explicit_physical_launch_policy(batch, requests);
             let deadline = requests.iter().filter_map(|request| request.deadline).min();
-            let acquire = admission.acquire_dispatch(
+            let (tag, _) = device_job_tag(&execution);
+            let acquire = admission.acquire_weighted_dispatch(
                 batch.lane.execution_group,
                 batch.lane.model_instance,
                 launch_policy,
                 batch.mode,
                 width,
                 deadline,
+                tag.weight,
             );
             tokio::pin!(acquire);
             let acquired = loop {
