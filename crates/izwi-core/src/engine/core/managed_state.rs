@@ -3,6 +3,24 @@
 
 use super::*;
 
+/// The context a multi-user model plans per sequence when it sizes its
+/// shared KV pool: a long conversation, not a whole model context each.
+pub(crate) const MULTI_USER_CONTEXT_TOKENS_PER_SEQUENCE: usize = 8_192;
+
+/// Tokens a portable chat pool is sized for. One context serves one user (or
+/// the single-user profile's own parallel calls); with a multi-user
+/// `max_num_seqs` every sequence plans `min(context, 8,192)` tokens, and the
+/// pool never shrinks below one context. Every sequence shares the pool, so
+/// one request may still use a whole context.
+pub(super) fn portable_pool_tokens(context: usize, max_num_seqs: Option<usize>) -> usize {
+    match max_num_seqs {
+        Some(seqs) if seqs > 1 => {
+            context.max(seqs.saturating_mul(context.min(MULTI_USER_CONTEXT_TOKENS_PER_SEQUENCE)))
+        }
+        _ => context,
+    }
+}
+
 pub(super) fn resolve_managed_token_reach(
     backend: BackendKind,
     configured_context: usize,
@@ -190,12 +208,21 @@ impl EngineCore {
                     } else {
                         logical_context_tokens
                     };
+                // A multi-user fit plans a context per sequence; the portable
+                // fit still caps the pool at what memory holds.
+                let pool_tokens =
+                    if self.config.portable_context_auto && backend != BackendKind::Cuda {
+                        logical_context_tokens
+                            .map(|tokens| portable_pool_tokens(tokens, self.config.max_num_seqs))
+                    } else {
+                        logical_context_tokens
+                    };
                 (
                     self.resolve_managed_token_reach_for_contract(
                         backend,
                         model_instance,
                         contract,
-                        logical_context_tokens,
+                        pool_tokens,
                         1,
                         PortableFitHeadroom::Planning {
                             minimum_tokens: CHAT_MINIMUM_CONTEXT_TOKENS,

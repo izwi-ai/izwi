@@ -3426,6 +3426,52 @@ fn portable_auto_chat_context_is_capped() -> crate::error::Result<()> {
     Ok(())
 }
 
+/// A multi-user `max_num_seqs` plans the capped context once per sequence
+/// (at most 8,192 tokens each), within what memory holds; one sequence keeps
+/// the single-user pool. Each request may still use the model's context.
+#[test]
+fn portable_multi_user_chat_pool_plans_a_context_per_sequence() -> crate::error::Result<()> {
+    for (max_num_seqs, cap, expected) in [
+        (None, 4_096_usize, 4_096_u64),
+        (Some(1), 4_096, 4_096),
+        (Some(4), 4_096, 16_384),
+        (Some(4), 32_768, 32_768),
+        (Some(8), 32_768, 65_536),
+    ] {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedUnifiedProvider {
+                capacity: 64 * GIB,
+                available: 64 * GIB,
+                observed: 0,
+            }),
+        ));
+        let mut config = crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_retained_sequences: max_num_seqs.unwrap_or(1),
+            max_staged_transactions: 1,
+            portable_auto_context_cap_tokens: cap,
+            max_num_seqs,
+            ..Default::default()
+        };
+        config.portable_context_auto = true;
+        let mut core =
+            crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+        let runtime = core
+            .load_managed_model_cache(
+                ModelInstanceId::new(4_103),
+                &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
+                Some(131_072),
+            )?
+            .expect("managed runtime");
+        assert_eq!(
+            runtime.logical_token_reach(),
+            expected,
+            "{max_num_seqs:?} cap {cap}"
+        );
+    }
+    Ok(())
+}
+
 /// R-1: Qwen3-TTS retained state collapsed to one 64-token page on
 /// Metal, cutting every CustomVoice request at 54 frames and refusing
 /// every clone. The fit must reach every request's prompt plus its

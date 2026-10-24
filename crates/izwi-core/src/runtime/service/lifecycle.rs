@@ -139,6 +139,7 @@ impl RuntimeService {
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
+        core_config.max_num_seqs = config.max_num_seqs.filter(|seqs| *seqs > 0);
         core_config.portable_context_reserve_bytes = config.portable_context_reserve_bytes;
         core_config.models_dir = config.models_dir.clone();
         core_config.performance = config.performance.clone();
