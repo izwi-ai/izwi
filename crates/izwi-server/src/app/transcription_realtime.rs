@@ -40,7 +40,10 @@ const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
 /// Audio frames queued behind the one being handled join its push, up to
 /// this much audio, so a backlog costs one model push instead of one a frame.
-const MAX_COALESCED_AUDIO_SECS: usize = 1;
+/// It is well above one push cycle: a session whose pushes wait behind other
+/// work catches up in its next push instead of falling further behind by the
+/// difference every cycle.
+const MAX_COALESCED_AUDIO_SECS: usize = 5;
 /// Legacy error code for a session that found every native realtime stream
 /// taken and re-transcribes a rolling window instead.
 const NATIVE_STREAM_CAPACITY_CODE: &str = "realtime_stream_capacity";
@@ -2125,17 +2128,17 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_audio_stops_at_one_second() {
+    fn coalesced_audio_stops_at_five_seconds() {
         let (tx, mut rx) = mpsc::channel(16);
         for frame_seq in 2..=5 {
             assert!(tx
-                .try_send(WorkerCommand::AudioFrame(audio_frame(frame_seq, 6_400)))
+                .try_send(WorkerCommand::AudioFrame(audio_frame(frame_seq, 32_000)))
                 .is_ok());
         }
 
-        let (frames, next) = take_queued_audio_frames(audio_frame(1, 6_400), &mut rx);
+        let (frames, next) = take_queued_audio_frames(audio_frame(1, 32_000), &mut rx);
 
-        // 0.4 s frames: the third crosses one second and ends the batch.
+        // 2 s frames: the third crosses five seconds and ends the batch.
         assert_eq!(frame_seqs(&frames), [1, 2, 3]);
         assert!(next.is_none());
         assert_eq!(rx.len(), 2);

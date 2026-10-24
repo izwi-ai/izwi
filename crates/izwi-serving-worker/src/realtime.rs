@@ -93,7 +93,9 @@ const TERMINATION_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Audio frames queued behind the one being pushed join its push, up to
 /// this much audio, so a backlog costs one model push instead of one a frame.
-const MAX_COALESCED_AUDIO_SECS: usize = 1;
+/// It is well above one push cycle, so a stream that waited behind other work
+/// catches up in its next push.
+const MAX_COALESCED_AUDIO_SECS: usize = 5;
 
 /// One inbound audio frame, decoded and bounds-checked at the reader.
 struct AudioFrame {
