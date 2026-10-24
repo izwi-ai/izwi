@@ -105,6 +105,9 @@ impl RuntimeService {
         // automatic tensor width (each chat family still caps it at its
         // certified width).
         let max_num_seqs = config.max_num_seqs.filter(|seqs| *seqs > 0);
+        // Only an operator's own width may run above the certified widths;
+        // one derived from `max_num_seqs` keeps them.
+        let explicit_tensor_width = matches!(config.max_batch_size, BatchSizePreference::Fixed(_));
         let automatic_rows = match max_num_seqs {
             Some(seqs) => seqs,
             None if selected_backend_kind == BackendKind::Cuda => backend_context
@@ -145,6 +148,7 @@ impl RuntimeService {
         core_config.performance = config.performance.clone();
         core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
         core_config.max_tensor_batch_size = config.max_batch_size;
+        core_config.explicit_tensor_width = explicit_tensor_width;
         core_config.physical_execution_mode = config.physical_execution_mode;
         core_config.max_physical_in_flight = config.max_physical_in_flight;
         core_config.max_retained_sequences = config.max_retained_sequences.max(1);
@@ -186,14 +190,28 @@ impl RuntimeService {
         core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
+        let non_chat_row_width = crate::catalog::non_chat_row_width(
+            selected_backend_kind,
+            worker_config.max_tensor_batch_size,
+            explicit_tensor_width,
+        );
+        if non_chat_row_width
+            > crate::catalog::engine_row_width(
+                selected_backend_kind,
+                worker_config.max_tensor_batch_size,
+            )
+        {
+            tracing::warn!(
+                width = non_chat_row_width,
+                backend = selected_backend_kind.as_str(),
+                "explicit batch width exceeds the certified speech-model width on this backend; ASR, TTS and realtime rows run uncertified"
+            );
+        }
         if automatic_staged_transactions {
             // Engine rows back every model without its own row fit; a chat
             // model sizes its staged rows from its decode width at load.
             let staged = automatic_staged_transaction_rows(
-                crate::catalog::engine_row_width(
-                    selected_backend_kind,
-                    worker_config.max_tensor_batch_size,
-                ),
+                non_chat_row_width,
                 core_config
                     .resolved_physical_execution_capacity()
                     .candidate_dispatch_limit
@@ -211,16 +229,15 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         // Chat models clamp the engine width to their family's certified
-        // width; every other capability runs at the engine rows' width.
+        // width; every other capability runs at the engine rows' width. An
+        // operator's explicit width applies as asked.
         let adapter_registry = Arc::new(
             RuntimeAdapterRegistry::built_in_with_execution_limits(
-                crate::catalog::engine_row_width(
-                    selected_backend_kind,
-                    worker_config.max_tensor_batch_size,
-                ),
+                non_chat_row_width,
                 worker_config.request_parallelism,
             )?
-            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size),
+            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size)
+            .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
@@ -259,10 +276,7 @@ impl RuntimeService {
             retained_sequences: core_config.max_retained_sequences,
             staged_transactions: core_config.max_staged_transactions,
             tensor_width: worker_config.max_tensor_batch_size,
-            non_chat_row_width: crate::catalog::engine_row_width(
-                selected_backend_kind,
-                worker_config.max_tensor_batch_size,
-            ),
+            non_chat_row_width,
             realtime_asr_sessions: asr_realtime_sessions.max_sessions(),
             chunked_prefill: core_config.effective_chunked_prefill(),
         };

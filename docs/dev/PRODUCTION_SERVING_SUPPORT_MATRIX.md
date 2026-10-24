@@ -73,8 +73,11 @@ wall-clock-proven.
 A chat family's continuous decode runs every row through one forward. The
 widest batch it may run at on each backend is recorded in one table in code,
 `crates/izwi-core/src/catalog/batch_width.rs`. Each loaded model clamps the
-engine width (automatic, or `IZWI_MAX_BATCH_SIZE`) to its family's width.
-Every other capability (TTS, ASR, realtime) stays at two on CPU and Metal.
+automatic engine width, and one derived from `IZWI_MAX_NUM_SEQS`, to its
+family's width. Every other capability (TTS, ASR, realtime) stays at two on
+CPU and Metal. An explicit `IZWI_MAX_BATCH_SIZE` applies as asked (up to 32
+on any backend) to chat and speech models alike, above the certified width,
+and the runtime logs a warning that the rows run uncertified.
 The automatic engine width on CPU and Metal is the widest certified family
 (eight). Staged transaction rows for TTS and ASR stay at two, and a chat
 model stages one step at its own width.

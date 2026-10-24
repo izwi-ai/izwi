@@ -11,7 +11,8 @@ mod batch_width;
 mod mixed_step;
 
 pub(crate) use batch_width::{
-    certified_decode_width, engine_row_width, max_certified_decode_width,
+    certified_decode_width, engine_row_width, max_certified_decode_width, non_chat_row_width,
+    EXPLICIT_WIDTH_CEILING,
 };
 pub use izwi_model_catalog::catalog::*;
 pub(crate) use mixed_step::mixed_step_enabled;

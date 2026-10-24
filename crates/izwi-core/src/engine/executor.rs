@@ -1040,10 +1040,15 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
         let backend_kind = backend_context.backend_kind;
         let num_threads = config.num_threads.max(1);
+        let width_cap = if config.explicit_tensor_width {
+            crate::catalog::EXPLICIT_WIDTH_CEILING
+        } else {
+            Self::tensor_batch_cap(backend_kind)
+        };
         let max_tensor_batch_size = config
             .max_tensor_batch_size
             .resolve(backend_kind)
-            .min(Self::tensor_batch_cap(backend_kind))
+            .min(width_cap)
             .max(1);
         let request_parallelism = Self::request_parallelism_for(backend_kind, num_threads);
         let physical_execution_capacity = Self::physical_execution_capacity(

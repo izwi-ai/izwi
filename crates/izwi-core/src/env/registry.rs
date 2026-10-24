@@ -995,7 +995,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Startup,
-        "Sets the maximum batch rows: auto or a positive integer; invalid ignored.",
+        "Sets the tensor batch width: auto, or a positive integer that applies as asked (up to 32) even above a family's certified width, with a warning; invalid ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_MAX_CONCURRENT",

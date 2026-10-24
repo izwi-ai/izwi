@@ -87,6 +87,12 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub max_tensor_batch_size: BatchSizePreference,
 
+    /// The operator fixed the tensor width (`IZWI_MAX_BATCH_SIZE`): it may
+    /// exceed the certified widths, up to `catalog::EXPLICIT_WIDTH_CEILING`.
+    /// A width derived from `max_num_seqs` keeps the certified caps.
+    #[serde(default)]
+    pub explicit_tensor_width: bool,
+
     /// Rollout mode for overlapping separate physical inference launches.
     #[serde(default)]
     pub physical_execution_mode: PhysicalExecutionMode,
@@ -643,6 +649,7 @@ impl Default for EngineCoreConfig {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_tensor_batch_size: BatchSizePreference::Auto,
+            explicit_tensor_width: false,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             lane_step_drivers: default_lane_step_drivers(),

@@ -831,6 +831,38 @@ fn loaded_launch_policy_matrix_is_group_exclusive_without_concurrency_evidence()
     }
 }
 
+/// An operator's explicit width reaches a chat model above its family's
+/// certified width (CPU Qwen3 is certified at 2); an automatic or
+/// `max_num_seqs`-derived width still clamps to it.
+#[test]
+fn an_explicit_width_runs_above_the_certified_chat_width() {
+    let decode_width = |explicit: bool| {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1)
+            .unwrap()
+            .with_chat_tensor_batch_size(6)
+            .with_explicit_tensor_width(explicit);
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(46),
+            ModelInstanceId::new(1),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cpu, 2);
+        draft
+            .execution_contracts(CapabilityKind::Chat)
+            .unwrap()
+            .iter()
+            .flat_map(|contract| contract.stages.to_vec())
+            .map(|stage| stage.max_batch_size)
+            .max()
+            .unwrap()
+    };
+    assert_eq!(decode_width(false), 2);
+    assert_eq!(decode_width(true), 6);
+}
+
 /// Built as the runtime builds it on each backend, a chat model's
 /// stages run at most its family's certified width and every other
 /// capability at the engine rows' width (EXE-F7).

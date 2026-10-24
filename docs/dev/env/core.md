@@ -150,7 +150,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_LOADING_WORKERS` | integer | 0 (automatic) | startup | Number of loader worker threads; 0 picks automatically (invalid = startup error). |
 | `IZWI_MANAGED_CHAT_CLAIM_QUANTUM_TOKENS` | integer | `1024` | startup | Sets the token quantum for managed chat KV claims; 0 restores full up-front claims; unparsable keeps 1024. |
 | `IZWI_MANAGED_PREFIX_CACHE_SALT` | text | `unset` | startup | Salt mixed into managed prefix-cache keys to isolate cache entries. |
-| `IZWI_MAX_BATCH_SIZE` | choice | `auto` | startup | Sets the maximum batch rows: auto or a positive integer; invalid ignored. |
+| `IZWI_MAX_BATCH_SIZE` | choice | `auto` | startup | Sets the tensor batch width: auto, or a positive integer that applies as asked (up to 32) even above a family's certified width, with a warning; invalid ignored. |
 | `IZWI_MAX_CONCURRENT` | integer | `100` | startup | Maximum concurrent HTTP requests (legacy alias MAX_CONCURRENT_REQUESTS; 0 or invalid ignored). |
 | `IZWI_MAX_LOADED_MODELS` | integer | `4` | startup | Maximum models resident at once (residency guardrail; 0 or invalid ignored, floor 1). |
 | `IZWI_MAX_NUM_SEQS` | integer | 0 (automatic: single user on CPU and Metal, VRAM-fitted on CUDA) | startup | Sequences served concurrently per model; sizes the scheduler, retained and staged rows, tensor width and realtime ASR quota left automatic, and above 1 turns chunked prefill on unless set. |

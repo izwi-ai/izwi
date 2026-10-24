@@ -163,6 +163,9 @@ pub(crate) struct RuntimeAdapterRegistry {
     /// certified width (`catalog::batch_width`); other capabilities run at
     /// `max_tensor_batch_size`.
     max_chat_tensor_batch_size: usize,
+    /// The operator fixed the width: chat runs it above a family's certified
+    /// width (with a warning) instead of clamping to it.
+    explicit_tensor_width: bool,
     request_parallelism: usize,
     loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
 }
@@ -182,6 +185,7 @@ impl RuntimeAdapterRegistry {
             adapters: HashMap::new(),
             max_tensor_batch_size: max_tensor_batch_size.max(1),
             max_chat_tensor_batch_size: max_tensor_batch_size.max(1),
+            explicit_tensor_width: false,
             request_parallelism: request_parallelism.max(1),
             loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
         };
@@ -224,6 +228,16 @@ impl RuntimeAdapterRegistry {
     pub(crate) fn with_chat_tensor_batch_size(mut self, rows: usize) -> Self {
         self.max_chat_tensor_batch_size = rows.max(1);
         self
+    }
+
+    /// Honor an operator's explicit width above the certified chat widths.
+    pub(crate) fn with_explicit_tensor_width(mut self, explicit: bool) -> Self {
+        self.explicit_tensor_width = explicit;
+        self
+    }
+
+    pub(crate) fn explicit_tensor_width(&self) -> bool {
+        self.explicit_tensor_width
     }
 
     pub(crate) fn max_tensor_batch_size(&self) -> usize {

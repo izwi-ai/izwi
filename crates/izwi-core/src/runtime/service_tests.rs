@@ -2854,6 +2854,20 @@ fn max_num_seqs_sizes_every_automatic_limit() {
     assert_eq!(concurrency.scheduler_rows, 3);
     assert_eq!(concurrency.retained_sequences, 5);
     assert_eq!(concurrency.tensor_width, 2);
+
+    // `max_num_seqs` keeps speech models at their certified CPU width; an
+    // explicit width runs them (and chat) as asked, above the CPU ceiling.
+    assert_eq!(multi.resolved_concurrency().non_chat_row_width, 2);
+    let wide = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_batch_size: crate::config::BatchSizePreference::fixed(12).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = wide.resolved_concurrency();
+    assert_eq!(concurrency.tensor_width, 12);
+    assert_eq!(concurrency.non_chat_row_width, 12);
+    assert_eq!(wide.tts_row_width(), 12);
 }
 
 #[test]
