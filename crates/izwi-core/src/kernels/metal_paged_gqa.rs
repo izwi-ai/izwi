@@ -88,27 +88,43 @@ impl GqaDecodeVariant {
     }
 }
 
-/// Context partitions for a decode batch: enough threadgroups to occupy the
-/// GPU, but never more partitions than the context has
-/// [`GQA_DECODE_MIN_PARTITION_TOKENS`]-token slices. Returns
-/// `(partitions, partition_tokens)` where every row's keys fall in the first
-/// `ceil(context / partition_tokens)` partitions.
+/// The most partitions one row's context is split into: enough for a lone
+/// row's KV heads to approach [`GQA_DECODE_TARGET_THREADGROUPS`].
+pub(crate) fn gqa_max_row_partitions(num_kv_heads: usize) -> usize {
+    GQA_DECODE_TARGET_THREADGROUPS
+        .div_ceil(num_kv_heads.max(1))
+        .max(1)
+}
+
+/// Tokens in each of one row's context partitions, from that row's own
+/// context length alone, never slicing below
+/// [`GQA_DECODE_MIN_PARTITION_TOKENS`]. A row therefore splits, and sums its
+/// keys, in the same order alone or in any batch: splitting by the batch's
+/// size or longest row made a row's attention, and so its greedy tokens,
+/// depend on which other requests shared its step. The kernel computes the
+/// same value (`izwi_gqa_row_partition_tokens`).
+pub(crate) fn gqa_row_partition_tokens(context_len: usize, max_row_partitions: usize) -> usize {
+    let by_length = context_len.div_ceil(GQA_DECODE_MIN_PARTITION_TOKENS).max(1);
+    let partitions = max_row_partitions.max(1).min(by_length);
+    context_len.div_ceil(partitions).max(1)
+}
+
+/// The launch's partition count (the most any row uses) and the per-row cap
+/// the kernel and reduce derive each row's split from.
 pub(crate) fn gqa_decode_partitions(
-    batch_size: usize,
     num_kv_heads: usize,
-    max_context_len: usize,
+    context_lens: impl IntoIterator<Item = usize>,
 ) -> (usize, usize) {
-    let base = batch_size.saturating_mul(num_kv_heads).max(1);
-    let wanted = GQA_DECODE_TARGET_THREADGROUPS.div_ceil(base).max(1);
-    let by_length = max_context_len
-        .div_ceil(GQA_DECODE_MIN_PARTITION_TOKENS)
+    let max_row_partitions = gqa_max_row_partitions(num_kv_heads);
+    let partitions = context_lens
+        .into_iter()
+        .map(|context_len| {
+            context_len.div_ceil(gqa_row_partition_tokens(context_len, max_row_partitions))
+        })
+        .max()
+        .unwrap_or(1)
         .max(1);
-    let partitions = wanted.min(by_length);
-    let partition_tokens = max_context_len.div_ceil(partitions).max(1);
-    (
-        max_context_len.div_ceil(partition_tokens).max(1),
-        partition_tokens,
-    )
+    (partitions, max_row_partitions)
 }
 
 /// Pipeline for one variant and dtype, compiled from this module's own
@@ -135,6 +151,44 @@ pub(crate) fn gqa_decode_pipeline(
         .map_err(candle_core::Error::wrap)?;
     let function = library
         .get_function(&variant.function_name(dtype)?, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+/// The reduce that merges each row's own partitions of a split GQA decode.
+pub(crate) fn gqa_decode_reduce_pipeline(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<ComputePipeline> {
+    type Key = (u64, DType);
+    static PIPELINES: OnceLock<Mutex<HashMap<Key, ComputePipeline>>> = OnceLock::new();
+    let key = (device.registry_id(), dtype);
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+    let name = match dtype {
+        DType::F32 => "izwi_paged_decode_gqa_reduce_f32",
+        DType::F16 => "izwi_paged_decode_gqa_reduce_f16",
+        _ => bail!("izwi-paged-decode-gqa only supports F32 and F16"),
+    };
+    let library = device
+        .new_library_with_source(GQA_DECODE_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(name, None)
         .map_err(candle_core::Error::wrap)?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&function)
@@ -346,6 +400,18 @@ const GQA_DECODE_SOURCE: &str = r#"
 using namespace metal;
 
 constant constexpr uint IZWI_GQA_SIMDGROUPS = 4;
+constant constexpr uint IZWI_GQA_MIN_PARTITION_TOKENS = 64;
+
+// Tokens in each of a row's context partitions, from that row's own context
+// alone, so a row splits the same way in any batch (host twin:
+// `gqa_row_partition_tokens`).
+inline uint izwi_gqa_row_partition_tokens(uint context_len, uint max_row_partitions) {
+    const uint by_length = max(
+        1u,
+        (context_len + IZWI_GQA_MIN_PARTITION_TOKENS - 1) / IZWI_GQA_MIN_PARTITION_TOKENS);
+    const uint partitions = min(max(max_row_partitions, 1u), by_length);
+    return max(1u, (context_len + partitions - 1) / partitions);
+}
 
 template <typename T, uint DPL, uint GMAX>
 kernel void izwi_paged_decode_gqa(
@@ -365,7 +431,7 @@ kernel void izwi_paged_decode_gqa(
     constant uint& head_dim [[buffer(13)]],
     constant float& scale [[buffer(14)]],
     constant float& softcap [[buffer(15)]],
-    constant uint& partition_tokens [[buffer(16)]],
+    constant uint& max_row_partitions [[buffer(16)]],
     constant uint& partitions [[buffer(17)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
@@ -385,6 +451,12 @@ kernel void izwi_paged_decode_gqa(
 
     const uint group_size = num_heads / num_kv_heads;
     const uint context_len = metadata[row];
+    const uint partition_tokens = izwi_gqa_row_partition_tokens(context_len, max_row_partitions);
+    // A row with fewer partitions than the launch has none here (uniform per
+    // threadgroup, before any barrier).
+    if (partition * partition_tokens >= context_len) {
+        return;
+    }
     const uint first_page_offset = metadata[batch_size + row];
     const uint table_base = 2 * batch_size + row * max_blocks;
     const uint start = partition * partition_tokens;
@@ -522,7 +594,7 @@ kernel void izwi_paged_decode_gqa<T, DPL, GMAX>(                                
     constant uint& head_dim [[buffer(13)]],                                            \
     constant float& scale [[buffer(14)]],                                              \
     constant float& softcap [[buffer(15)]],                                            \
-    constant uint& partition_tokens [[buffer(16)]],                                    \
+    constant uint& max_row_partitions [[buffer(16)]],                                  \
     constant uint& partitions [[buffer(17)]],                                          \
     uint3 group [[threadgroup_position_in_grid]],                                      \
     uint lane [[thread_index_in_simdgroup]],                                           \
@@ -543,6 +615,78 @@ kernel void izwi_paged_decode_gqa<T, DPL, GMAX>(                                
 
 IZWI_GQA_DECODE_DIMS(float, f32)
 IZWI_GQA_DECODE_DIMS(half, f16)
+
+// Merges each row's own partitions; the shared paged-attention reduce takes
+// one partition size for the whole batch.
+template <typename T>
+kernel void izwi_paged_decode_gqa_reduce(
+    device const float* partial_values [[buffer(0)]],
+    device const float* partial_maxes [[buffer(1)]],
+    device const float* partial_sums [[buffer(2)]],
+    device T* output [[buffer(3)]],
+    device const uint* context_lens [[buffer(4)]],
+    constant uint& num_heads [[buffer(5)]],
+    constant uint& value_head_dim [[buffer(6)]],
+    constant uint& max_row_partitions [[buffer(7)]],
+    constant uint& max_partitions [[buffer(8)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float merge_state[2];
+    const uint head = group.x;
+    const uint row = group.y;
+    const uint partial_base = (row * num_heads + head) * max_partitions;
+    const uint context_len = context_lens[row];
+    const uint partition_tokens = izwi_gqa_row_partition_tokens(context_len, max_row_partitions);
+    const uint partition_count = (context_len + partition_tokens - 1) / partition_tokens;
+
+    if (tid == 0) {
+        float global_max = -INFINITY;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_max = max(global_max, partial_maxes[partial_base + partition]);
+        }
+        float global_sum = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            global_sum += partial_sums[partial_base + partition]
+                * exp(partial_maxes[partial_base + partition] - global_max);
+        }
+        merge_state[0] = global_max;
+        merge_state[1] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint value_base = partial_base * value_head_dim;
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        float acc = 0.0f;
+        for (uint partition = 0; partition < partition_count; partition++) {
+            const float weight = exp(partial_maxes[partial_base + partition] - merge_state[0]);
+            acc += partial_values[value_base + partition * value_head_dim + dim] * weight;
+        }
+        output[out_base + dim] = T(acc / merge_state[1]);
+    }
+}
+
+#define IZWI_GQA_REDUCE(T, TNAME)                                                      \
+template [[host_name("izwi_paged_decode_gqa_reduce_" #TNAME)]]                        \
+kernel void izwi_paged_decode_gqa_reduce<T>(                                           \
+    device const float* partial_values [[buffer(0)]],                                  \
+    device const float* partial_maxes [[buffer(1)]],                                   \
+    device const float* partial_sums [[buffer(2)]],                                    \
+    device T* output [[buffer(3)]],                                                    \
+    device const uint* context_lens [[buffer(4)]],                                     \
+    constant uint& num_heads [[buffer(5)]],                                            \
+    constant uint& value_head_dim [[buffer(6)]],                                       \
+    constant uint& max_row_partitions [[buffer(7)]],                                   \
+    constant uint& max_partitions [[buffer(8)]],                                       \
+    uint tid [[thread_index_in_threadgroup]],                                          \
+    uint2 group [[threadgroup_position_in_grid]],                                      \
+    uint2 threads_per_group [[threads_per_threadgroup]]);
+
+IZWI_GQA_REDUCE(float, f32)
+IZWI_GQA_REDUCE(half, f16)
 "#;
 
 #[cfg(test)]
@@ -578,20 +722,35 @@ mod tests {
     }
 
     #[test]
-    fn partitions_fill_the_gpu_without_slicing_short_contexts() {
+    fn a_lone_row_fills_the_gpu_without_slicing_short_contexts() {
         // One row, two KV heads, long context: split to approach 128 groups.
-        let (partitions, tokens) = gqa_decode_partitions(1, 2, 4096);
-        assert_eq!(partitions, 64);
-        assert_eq!(tokens, 64);
+        assert_eq!(gqa_decode_partitions(2, [4096]), (64, 64));
+        assert_eq!(gqa_row_partition_tokens(4096, 64), 64);
         // Short contexts get at most one partition per 64 tokens.
-        assert_eq!(gqa_decode_partitions(1, 2, 100), (2, 50));
-        assert_eq!(gqa_decode_partitions(1, 2, 10), (1, 10));
-        // Enough rows already occupy the GPU.
-        assert_eq!(gqa_decode_partitions(64, 4, 8192).0, 1);
-        // Every row's partitions are within the dispatched count.
-        for (batch, heads, context) in [(1, 1, 1), (3, 2, 700), (2, 8, 40_000)] {
-            let (partitions, tokens) = gqa_decode_partitions(batch, heads, context);
-            assert!(context.div_ceil(tokens) <= partitions);
+        assert_eq!(gqa_row_partition_tokens(100, 64), 50);
+        assert_eq!(gqa_decode_partitions(2, [100]).0, 2);
+        assert_eq!(gqa_decode_partitions(2, [10]).0, 1);
+        assert_eq!(gqa_row_partition_tokens(10, 64), 10);
+    }
+
+    /// A row splits by its own context alone: the same partitions whatever
+    /// else shares the batch, so its attention sums run in the same order.
+    #[test]
+    fn a_rows_partitions_do_not_depend_on_the_batch() {
+        let heads = 8;
+        let cap = gqa_max_row_partitions(heads);
+        for context in [1, 63, 64, 65, 100, 135, 700, 4096, 40_000] {
+            let alone = gqa_decode_partitions(heads, [context]);
+            let tokens = gqa_row_partition_tokens(context, cap);
+            for others in [vec![10], vec![130, 5000], vec![70; 11]] {
+                let batch = gqa_decode_partitions(heads, others.iter().copied().chain([context]));
+                assert_eq!(batch.1, alone.1, "the cap depends on the model only");
+                assert!(
+                    context.div_ceil(tokens) <= batch.0,
+                    "the launch covers the row"
+                );
+            }
+            assert_eq!(context.div_ceil(tokens), alone.0);
         }
     }
 }
