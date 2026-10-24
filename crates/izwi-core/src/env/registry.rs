@@ -275,9 +275,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_CUDA_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
-        "Allows shared speculative MTP envelopes inside continuous batches, not just solo rows (auto/off mode).",
+        "Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass.",
     ),
     CoreEnvVar::new(
         "IZWI_CUDA_MTP_QUANTUM",
@@ -1301,7 +1301,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
         "Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset.",
     ),
@@ -1863,7 +1863,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_QWEN38_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
         "Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset.",
     ),

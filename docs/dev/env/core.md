@@ -48,7 +48,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_MTP` | auto/flag | `auto` | startup | Enables the multi-token-prediction (MTP) head; an explicit true value also asks Qwen3.8 for MTP over graph decode. |
 | `IZWI_CUDA_MTP_ADAPTIVE` | flag | `true` | startup | Enables adaptive MTP speculation (backs off drafting when acceptance is poor). |
 | `IZWI_CUDA_MTP_DRAFT_TOKENS` | integer | `1` | startup | Number of MTP draft tokens per step (1 to 3; other values are a startup error). |
-| `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Allows shared speculative MTP envelopes inside continuous batches, not just solo rows (auto/off mode). |
+| `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass. |
 | `IZWI_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Enables the quantum (multi-step) MTP decode path (auto/off mode). |
 | `IZWI_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Enables packed (fused) projection weights on CUDA (auto/off mode). |
 | `IZWI_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error. |
@@ -194,7 +194,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_PERFORMANCE_CUDA_MTP` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP (canonical unset only); a true value also requests the Qwen3.8 MTP head explicitly. |
 | `IZWI_PERFORMANCE_CUDA_MTP_ADAPTIVE` | flag | `true` | startup | Deprecated alias of IZWI_CUDA_MTP_ADAPTIVE; first non-empty alias is used when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_MTP_DRAFT_TOKENS` | integer | `1` | startup | Deprecated alias of IZWI_CUDA_MTP_DRAFT_TOKENS (1 to 3), used only when the canonical name is unset. |
-| `IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
+| `IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_QUANTUM, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_PACKED_PROJECTIONS, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Deprecated alias of IZWI_CUDA_PROJECTION_BACKEND (auto, q8, native_fp8), used only when the canonical name is unset. |
@@ -271,7 +271,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN38_MTP` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP (canonical unset only); a true value also requests the Qwen3.8 MTP head explicitly. |
 | `IZWI_QWEN38_MTP_ADAPTIVE` | flag | `true` | startup | Deprecated alias of IZWI_CUDA_MTP_ADAPTIVE; first non-empty alias is used when the canonical name is unset. |
 | `IZWI_QWEN38_MTP_DRAFT_TOKENS` | integer | `1` | startup | Deprecated alias of IZWI_CUDA_MTP_DRAFT_TOKENS (1 to 3), used only when the canonical name is unset. |
-| `IZWI_QWEN38_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
+| `IZWI_QWEN38_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
 | `IZWI_QWEN38_MTP_QUANTUM` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_QUANTUM, used only when the canonical name is unset. |
 | `IZWI_QWEN38_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_PACKED_PROJECTIONS, used only when the canonical name is unset. |
 | `IZWI_QWEN38_PREFILL_CHUNK_SIZE` | integer | 1024 on CUDA with the FP8 prefill GEMM, else 256 | model load | Sets the Qwen3.8 prefill forward chunk size in tokens (max 2048; 0 or invalid ignored). |

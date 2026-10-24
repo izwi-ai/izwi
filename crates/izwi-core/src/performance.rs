@@ -77,7 +77,10 @@ pub struct CudaPerformanceConfig {
     pub mtp_draft_tokens: usize,
     pub mtp_adaptive: bool,
     /// DS9.4: allow shared speculative MTP envelopes inside continuous
-    /// batches (not just isolated solo rows). `Off` is the kill switch.
+    /// batches (not just isolated solo rows). Off by default, `auto` opts
+    /// in: the envelope verifies each row with its own width-one trunk pass,
+    /// so N batched rows cost N passes where plain batched decode costs one.
+    /// Solo rows keep their MTP quanta either way.
     pub mtp_in_continuous: OptimizationMode,
 }
 impl Default for CudaPerformanceConfig {
@@ -93,7 +96,7 @@ impl Default for CudaPerformanceConfig {
             mtp_quantum: OptimizationMode::Auto,
             mtp_draft_tokens: 1,
             mtp_adaptive: true,
-            mtp_in_continuous: OptimizationMode::Auto,
+            mtp_in_continuous: OptimizationMode::Off,
         }
     }
 }
@@ -1043,7 +1046,13 @@ mod tests {
         assert_eq!(config, PerformanceConfig::default());
         for binding in ENVIRONMENT_BINDINGS.iter().filter(|binding| binding.mode) {
             let (group, field) = binding.key.split_once('.').unwrap();
-            assert_eq!(serde_json::to_value(&config).unwrap()[group][field], "auto");
+            // Batched MTP envelopes are opt-in (per-row verification).
+            let expected = if binding.key == "cuda.mtp_in_continuous" {
+                "off"
+            } else {
+                "auto"
+            };
+            assert_eq!(serde_json::to_value(&config).unwrap()[group][field], expected);
         }
         assert_eq!(config.cuda.mtp_draft_tokens, 1);
         assert!(config.cuda.mtp_adaptive);
