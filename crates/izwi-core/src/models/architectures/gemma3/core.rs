@@ -594,6 +594,10 @@ impl Gemma3PhysicalModel {
         self.config.hidden_size
     }
 
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
     pub(crate) fn managed_inference_state_contract(
         &self,
         domain: StateDomainId,
@@ -681,6 +685,10 @@ impl Gemma3PhysicalModel {
         Ok(contract)
     }
 
+    /// Commit a span's KV and return the last position's logits,
+    /// `[1, 1, vocab]`: only the next token is sampled, so the norm and the
+    /// 262K-row head run on that position alone (a whole prompt span used to
+    /// materialize `span x vocab` F32 logits, about 4 GB for 4K tokens).
     pub(crate) fn forward_physical(
         &self,
         input_ids: &Tensor,
@@ -689,12 +697,12 @@ impl Gemma3PhysicalModel {
     ) -> Result<Tensor> {
         let (hidden, prepared) = self.prepare_physical_hidden(input_ids, position, cache)?;
         let sequence = hidden.dim(1)?;
-        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
+        let last = hidden.narrow(1, sequence - 1, 1)?;
+        let logits = last.apply(&self.norm)?.apply(&self.lm_head)?;
         let logits = match self.config.final_logit_softcapping {
             Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
             None => logits,
         };
-        let logits = logits.narrow(1, sequence - 1, 1)?;
         cache.commit_prepared(prepared)?;
         Ok(logits)
     }
@@ -1262,6 +1270,43 @@ mod tests {
 
         assert_close(&actual, &expected);
         assert_eq!(cache.context_len(), 4);
+    }
+
+    /// The head runs on the span's last position alone and returns exactly
+    /// what projecting every position and keeping the last one returned.
+    #[test]
+    fn prefill_logits_project_only_the_last_position() {
+        let config = tiny_config();
+        let model = Gemma3PhysicalModel::load(
+            config.clone(),
+            VarBuilder::from_tensors(tiny_weights(&config), DType::F32, &Device::Cpu),
+        )
+        .unwrap();
+        let prompt = Tensor::from_vec(vec![1u32, 7, 3, 11, 5], (1, 5), &Device::Cpu).unwrap();
+        let mut cache = tiny_cache(&config);
+        let logits = model.forward_physical(&prompt, 0, &mut cache).unwrap();
+        assert_eq!(logits.dims(), &[1, 1, config.vocab_size]);
+
+        let mut reference_cache = tiny_cache(&config);
+        let (hidden, _) = model
+            .prepare_physical_hidden(&prompt, 0, &reference_cache)
+            .unwrap();
+        let every_position = hidden
+            .apply(&model.norm)
+            .unwrap()
+            .apply(&model.lm_head)
+            .unwrap();
+        let every_position = match config.final_logit_softcapping {
+            Some(softcap) => {
+                ((every_position / softcap).unwrap().tanh().unwrap() * softcap).unwrap()
+            }
+            None => every_position,
+        };
+        assert_close(&logits, &every_position.narrow(1, 4, 1).unwrap());
+        model
+            .prefill_physical(&prompt, 0, &mut reference_cache)
+            .unwrap();
+        assert_eq!(cache.context_len(), reference_cache.context_len());
     }
 
     #[test]

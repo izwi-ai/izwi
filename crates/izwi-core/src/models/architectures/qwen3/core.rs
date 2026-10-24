@@ -2625,6 +2625,11 @@ impl Qwen3Model {
         self.cfg.hidden_size
     }
 
+    /// Rows of the language-model head: the logits width.
+    pub fn lm_head_size(&self) -> usize {
+        self.cfg.lm_head_size.unwrap_or(self.cfg.vocab_size)
+    }
+
     pub fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         self.layers
             .iter()
