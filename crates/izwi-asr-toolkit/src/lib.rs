@@ -934,18 +934,23 @@ fn choose_longest_pause_split_point(
     let median = percentile(&mut energies, 0.5);
     let threshold = (floor * silence_scale.max(1.0) + 1e-5).min(median * 0.5 + 1e-5);
 
-    let mut quiet: Vec<bool> = frames.iter().map(|(_, e)| *e <= threshold).collect();
-    for index in 1..quiet.len().saturating_sub(1) {
-        if !quiet[index] && quiet[index - 1] && quiet[index + 1] {
-            quiet[index] = true;
-        }
-    }
+    let below: Vec<bool> = frames.iter().map(|(_, e)| *e <= threshold).collect();
+    let quiet: Vec<bool> = below
+        .iter()
+        .enumerate()
+        .map(|(index, &is_below)| {
+            is_below
+                || (index > 0
+                    && below[index - 1]
+                    && below.get(index + 1).copied().unwrap_or(false))
+        })
+        .collect();
 
     // (run length in frames, distance of its middle from `preferred`, middle)
     let mut best: Option<(usize, usize, usize)> = None;
     let mut run_start: Option<usize> = None;
-    for index in 0..=frames.len() {
-        let is_quiet = index < frames.len() && quiet[index];
+    // A loud sentinel after the last frame closes a run that reaches the end.
+    for (index, &is_quiet) in quiet.iter().chain(std::iter::once(&false)).enumerate() {
         match (is_quiet, run_start) {
             (true, None) => run_start = Some(index),
             (false, Some(first)) => {
