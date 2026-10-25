@@ -109,7 +109,11 @@ const baseModels: ModelInfo[] = [
 
 const graniteModel: ModelInfo = {
   variant: "Granite-Speech-4.1-2B-Plus",
-  route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+  route_capabilities: caps({
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+    speaker_attributed_asr: true,
+  }),
   status: "ready" as const,
   local_path: "/models/granite",
   size_bytes: null,

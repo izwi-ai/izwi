@@ -11,9 +11,9 @@ pub(super) fn resolve_speaker_attributed_asr_variant(model_id: Option<&str>) -> 
         None => ModelVariant::GraniteSpeech412BPlus,
     };
 
-    if variant != ModelVariant::GraniteSpeech412BPlus {
+    if !variant.supports_speaker_attributed_asr() {
         return Err(Error::InvalidInput(format!(
-            "Speaker attributed ASR currently requires Granite-Speech-4.1-2B-Plus, got {variant}"
+            "{variant} does not support speaker attributed ASR; use Granite-Speech-4.1-2B-Plus, or a diarization run with {variant} as its ASR model"
         )));
     }
 

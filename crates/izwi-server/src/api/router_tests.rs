@@ -3600,6 +3600,23 @@ async fn admin_models_expose_voice_app_capabilities() {
         granite_model["route_capabilities"]["diarization_records"].as_bool(),
         Some(false)
     );
+    // Speaker turns are a Plus capability: Granite Speech 5.0 has no
+    // speaker task (its card lists none and it emits no tags when asked).
+    assert_eq!(
+        granite_model["route_capabilities"]["speaker_attributed_asr"].as_bool(),
+        Some(true)
+    );
+    for variant in [
+        "Granite-Speech-5.0-2B",
+        "Granite-Speech-5.0-2B-GGUF",
+        "Whisper-Large-v3-Turbo",
+    ] {
+        assert_eq!(
+            find_model(variant)["route_capabilities"]["speaker_attributed_asr"].as_bool(),
+            Some(false),
+            "{variant} must not report speaker_attributed_asr"
+        );
+    }
     for capability in ["speech_translation", "keyword_biasing"] {
         assert_eq!(
             granite_model["route_capabilities"][capability].as_bool(),

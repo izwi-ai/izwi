@@ -216,6 +216,7 @@ const DIARIZATION_STACK_CAPABILITIES: Record<
   "Granite-Speech-4.1-2B-Plus": {
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    speaker_attributed_asr: true,
   },
   "Granite-Speech-5.0-2B-GGUF": {
     openai_audio_transcriptions: true,
@@ -1808,7 +1809,11 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Granite-Speech-4.1-2B-Plus",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          speaker_attributed_asr: true,
+        }),
         status: "ready",
         local_path: "/models/granite",
         size_bytes: null,
@@ -1864,6 +1869,39 @@ describe("TranscriptionPage detail route", () => {
     );
     expect(apiMocks.createDiarizationRecord).not.toHaveBeenCalled();
     expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
+  });
+
+  it("explains why Granite Speech 5.0 is not a speaker-attributed model", async () => {
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("Granite-Speech-4.1-2B-Plus", "downloaded"),
+      stackModel("Granite-Speech-5.0-2B-GGUF", "ready"),
+    ];
+
+    renderRoute("/transcription");
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Speaker Attributed ASR" }),
+    );
+    await screen.findByRole("heading", { name: "New speaker-attributed ASR" });
+
+    expect(
+      screen.getByText(/has no speaker attribution\. For speakers with it, use Diarization/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Change SAA model" }));
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Granite-Speech-4.1-2B-Plus",
+    );
+    expect(modelModal.getAttribute("data-models")).not.toContain(
+      "Granite-Speech-5.0-2B-GGUF",
+    );
   });
 
   it("shows streamed transcript deltas on the detail page while processing", async () => {

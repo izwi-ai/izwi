@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import type { ModelInfo } from "@/api";
 import {
+  installedGraniteSpeech5Model,
   isDiarizationPipelineAsrModel,
+  isSpeakerAttributedAsrModel,
   resolveDiarizationStackRole,
 } from "@/features/speech-text/modelFilters";
 
@@ -169,4 +171,30 @@ describe("isDiarizationPipelineAsrModel", () => {
       ).toBe(true);
     }
   });
+
+  it("keeps speaker-attributed ASR models out of the pipeline ASR", () => {
+    const plus = withCapabilities("Granite-Speech-4.1-2B-Plus", {
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      speaker_attributed_asr: true,
+    });
+    expect(isSpeakerAttributedAsrModel(plus)).toBe(true);
+    expect(isDiarizationPipelineAsrModel(plus)).toBe(false);
+  });
+
+  it("finds an installed Granite Speech 5.0 for the speaker-attribution hint", () => {
+    const asr = { openai_audio_transcriptions: true, speech_to_text_jobs: true };
+    expect(
+      installedGraniteSpeech5Model([
+        { ...withCapabilities("Granite-Speech-5.0-2B", asr), status: "not_downloaded" },
+        withCapabilities("Granite-Speech-5.0-2B-GGUF", asr),
+      ])?.variant,
+    ).toBe("Granite-Speech-5.0-2B-GGUF");
+    expect(
+      installedGraniteSpeech5Model([
+        { ...withCapabilities("Granite-Speech-5.0-2B", asr), status: "not_downloaded" },
+      ]),
+    ).toBeNull();
+  });
 });
+

@@ -66,6 +66,8 @@ interface NewTranscriptionModalProps {
   selectedModelSupportsTranslation?: boolean;
   /** The selected model accepts a keyword list. */
   selectedModelSupportsKeywords?: boolean;
+  /** Shown under the SAA model: why an installed model is not offered. */
+  speakerAttributionHint?: string | null;
   timestampAlignerModelId: string | null;
   timestampAlignerReady: boolean;
   timestampAlignerModelStatus?: string | null;
@@ -126,6 +128,7 @@ export function NewTranscriptionModal({
   selectedModelStatus = null,
   selectedModelSupportsTranslation = false,
   selectedModelSupportsKeywords = false,
+  speakerAttributionHint = null,
   timestampAlignerModelId,
   timestampAlignerReady,
   timestampAlignerModelStatus = null,
@@ -697,6 +700,7 @@ export function NewTranscriptionModal({
 
           <CreationField
             label={isSpeakerAttributedAsrMode ? "SAA model" : "Transcription model"}
+            hint={isSpeakerAttributedAsrMode ? speakerAttributionHint : null}
           >
             <ModelRow
               name={

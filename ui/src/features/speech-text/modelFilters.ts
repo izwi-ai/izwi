@@ -4,8 +4,6 @@ import {
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
 
-export const GRANITE_SPEECH_PLUS_VARIANT = "Granite-Speech-4.1-2B-Plus";
-
 export function filterAndSortModels(
   models: ModelInfo[],
   matches: (model: ModelInfo) => boolean,
@@ -34,10 +32,11 @@ export function isDiarizationModel(model: ModelInfo): boolean {
 }
 
 export function isDiarizationPipelineAsrModel(model: ModelInfo): boolean {
-  // Granite-Speech serves the dedicated speaker-attributed pipeline (its
-  // transcripts are speaker turns, not plain text); the server's job kinds
-  // keep the two apart and the pipeline groups mirror that split.
-  if (model.variant === GRANITE_SPEECH_PLUS_VARIANT) {
+  // A speaker-attributed ASR model serves the dedicated speaker-attributed
+  // pipeline (its transcripts are speaker turns, not plain text); the
+  // server's job kinds keep the two apart and the pipeline groups mirror
+  // that split.
+  if (isSpeakerAttributedAsrModel(model)) {
     return false;
   }
   // The pipeline transcribes as a speech-to-text job: audio-chat models
@@ -65,10 +64,27 @@ export function isTranscriptionSummaryModel(model: ModelInfo): boolean {
   return hasCapability(model, "openai_chat_completions");
 }
 
-export function isSpeakerAttributedAsrVariant(variant: string): boolean {
-  // Speaker-attributed ASR is a Granite-only pipeline today; the server
-  // rejects other models for that job kind.
-  return variant === GRANITE_SPEECH_PLUS_VARIANT;
+export function isSpeakerAttributedAsrModel(model: RouteCapabilityModel): boolean {
+  return hasCapability(model, "speaker_attributed_asr");
+}
+
+/**
+ * Display-only: the installed Granite Speech 5.0 model, if any, so the
+ * speaker-attributed ASR picker can say why it is not offered there. 5.0 has
+ * no speaker task; its speakers come from a diarization run with it as the
+ * ASR model.
+ */
+export function installedGraniteSpeech5Model(models: ModelInfo[]): ModelInfo | null {
+  return (
+    models.find(
+      (model) =>
+        model.variant.startsWith("Granite-Speech-5.") &&
+        !isSpeakerAttributedAsrModel(model) &&
+        (model.status === "downloaded" ||
+          model.status === "loading" ||
+          model.status === "ready"),
+    ) ?? null
+  );
 }
 
 /**

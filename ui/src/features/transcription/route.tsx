@@ -24,6 +24,7 @@ import {
   TRANSCRIPTION_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
@@ -35,7 +36,8 @@ import {
   isDiarizationPipelineAsrModel,
   isDiarizationPipelineLlmModel,
   isDiarizationModel,
-  isSpeakerAttributedAsrVariant,
+  installedGraniteSpeech5Model,
+  isSpeakerAttributedAsrModel,
   isTranscriptionAlignerModel,
   isTranscriptionSummaryModel,
   resolveDiarizationStackRole,
@@ -142,7 +144,7 @@ export function TranscriptionPage({
     [models],
   );
   const speakerAttributedAsrModels = useMemo(
-    () => filterAndSortModels(models, (model) => isSpeakerAttributedAsrVariant(model.variant)),
+    () => filterAndSortModels(models, isSpeakerAttributedAsrModel),
     [models],
   );
   const diarizationAsrPipelineModels = useMemo(
@@ -791,6 +793,15 @@ export function TranscriptionPage({
   }, [record, recordId, streamingRecord]);
   const isNewSpeakerAttributedAsrMode =
     newSpeechTextMode === "speaker_attributed_asr";
+  const installedGraniteSpeech5 = useMemo(
+    () => installedGraniteSpeech5Model(models),
+    [models],
+  );
+  // Granite Speech 5.0 is not a speaker-attributed model; say where its
+  // speakers come from instead of leaving users to wonder why it is missing.
+  const speakerAttributionHint = installedGraniteSpeech5
+    ? `${getModelDisplayName(installedGraniteSpeech5.variant, installedGraniteSpeech5.display_name)} has no speaker attribution. For speakers with it, use Diarization and pick it as the ASR model.`
+    : null;
   const reconcileStreamedTranscription = useCallback(
     async (createdRecordId: string | null) => {
       if (!createdRecordId) {
@@ -981,6 +992,7 @@ export function TranscriptionPage({
                       selectedModelSupportsKeywords={
                         newTranscriptionRouteCapabilities?.keyword_biasing === true
                       }
+                      speakerAttributionHint={speakerAttributionHint}
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
                       timestampAlignerModelStatus={selectedAlignerModelStatus}

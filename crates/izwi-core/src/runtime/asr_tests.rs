@@ -1594,6 +1594,17 @@ fn speaker_attributed_asr_rejects_non_granite_models() {
     let err = resolve_speaker_attributed_asr_variant(Some("Whisper-Large-v3-Turbo"))
         .expect_err("SAA should be Granite-only");
     assert!(err.to_string().contains("Granite-Speech-4.1-2B-Plus"));
+    // Granite Speech 5.0 has no speaker task; the error says where its
+    // speakers come from instead.
+    for variant in ["Granite-Speech-5.0-2B", "Granite-Speech-5.0-2B-GGUF"] {
+        let err = resolve_speaker_attributed_asr_variant(Some(variant))
+            .expect_err("Granite Speech 5.0 has no speaker attribution");
+        assert!(err.to_string().contains("diarization run"), "{err}");
+    }
+    assert_eq!(
+        resolve_speaker_attributed_asr_variant(None).unwrap(),
+        ModelVariant::GraniteSpeech412BPlus
+    );
 }
 
 #[test]
