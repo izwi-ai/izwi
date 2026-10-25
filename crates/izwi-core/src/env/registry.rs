@@ -660,7 +660,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_GRANITE_SAA_MAX_NEW_TOKENS",
         Int,
-        "256 + 8 per audio second, clamped 800..2500",
+        "256 + 8 per audio second, clamped 800..4608",
         Once,
         "Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer).",
     ),

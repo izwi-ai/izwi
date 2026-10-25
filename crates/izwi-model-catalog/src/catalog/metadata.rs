@@ -328,13 +328,15 @@ impl ModelVariant {
         "cd03eee90fbec18297ac31b8c21546e596b7f71c";
     pub const NEMOTRON3_DIARIZATION_ARTIFACT_REVISION: &'static str =
         "f667ed73aee57d40cc39428eb768b4fd87a0a29e";
-    /// The Granite Speech 4.1 revisions the 4.1 loader was built against. On
-    /// 2026-10-21 IBM moved plus's `main` (e69efe37) to a `language_model.model.model.*`
-    /// layout with YaRN RoPE, which this loader does not read.
+    /// The Granite Speech 4.1 revisions new downloads fetch. Plus is IBM's
+    /// v2610 weights (2026-10-21: better speaker attribution, timestamps and
+    /// long-form), with the language model under `language_model.model.model.*`
+    /// and YaRN RoPE; the loader also reads installs of the earlier revision
+    /// (1454e6e1), so they keep working without a re-download.
     pub const GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION: &'static str =
         "de575db64086f84fdc79da4932d1076e965bc546";
     pub const GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION: &'static str =
-        "1454e6e1e33845ca9280ff65f52cf1141ba6e6e2";
+        "e69efe37f97b6283c61f5a8dadda2b3eb67765d6";
     /// Granite Speech 5.0 2B as published 2026-10-23. The weights are from
     /// 818a37c6 (2026-10-07); later commits changed only the card and the
     /// config's `_name_or_path`.
@@ -1789,10 +1791,10 @@ mod tests {
         assert_eq!(variant.repo_id(), "ibm-granite/granite-speech-4.1-2b-plus");
         assert_eq!(variant.dir_name(), "Granite-Speech-4.1-2B-Plus");
         assert_eq!(variant.estimated_size(), 4_223_757_112);
-        // The last revision in the layout the 4.1 loader reads.
+        // IBM's v2610 weights; the loader reads the earlier layout too.
         assert_eq!(
             variant.artifact_revision(),
-            Some("1454e6e1e33845ca9280ff65f52cf1141ba6e6e2")
+            Some("e69efe37f97b6283c61f5a8dadda2b3eb67765d6")
         );
         assert_eq!(variant.license_label(), Some("Apache-2.0"));
         assert!(!variant.is_quantized());

@@ -199,7 +199,10 @@ const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
 const GRANITE_TIMESTAMP_TOKENS_PER_SECOND: f64 = 26.0;
 const GRANITE_TIMESTAMP_TOKEN_RESERVE: usize = 64;
 const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
-const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
+/// 8 tokens a second for the longest chunk (510 s) plus the reserve:
+/// speaker-attributed text runs ~3.3 tokens a second, so a dense nine-minute
+/// chunk (plus v2610's context allows them) still has room.
+const GRANITE_SAA_MAX_NEW_TOKENS: usize = 4_608;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
 const GRANITE_SAA_NEW_TOKEN_RESERVE: usize = 256;
 const GRANITE_SAA_TARGET_CHUNK_SECS: f32 = 240.0;

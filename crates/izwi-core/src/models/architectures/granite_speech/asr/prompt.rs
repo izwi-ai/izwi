@@ -675,7 +675,8 @@ mod tests {
     }
 
     /// Goldens rendered from the published `chat_template.jinja` files with
-    /// jinja2 (base de575db6, plus 1454e6e1) and IBM's `prompts.py`.
+    /// jinja2 (base de575db6, plus 1454e6e1 and e69efe37, whose templates are
+    /// byte-identical) and IBM's `prompts.py`.
     #[test]
     fn base_prompts_match_the_published_template_and_ibm_instructions() {
         assert_eq!(

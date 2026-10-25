@@ -1379,11 +1379,12 @@ fn granite_saa_decode_budget_uses_saa_sized_limit() {
         GRANITE_SAA_MIN_NEW_TOKENS
     );
     assert_eq!(granite_saa_max_new_tokens_for_duration(240.0), 2176);
+    assert_eq!(granite_saa_max_new_tokens_for_duration(510.0), 4336);
     assert_eq!(
-        granite_saa_max_new_tokens_for_duration(510.0),
+        granite_saa_max_new_tokens_for_duration(600.0),
         GRANITE_SAA_MAX_NEW_TOKENS
     );
-    assert!(granite_saa_max_new_tokens_for_duration(510.0) < 10_000);
+    assert!(granite_saa_max_new_tokens_for_duration(600.0) < 10_000);
 
     if let Some(previous) = previous {
         std::env::set_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS", previous);
