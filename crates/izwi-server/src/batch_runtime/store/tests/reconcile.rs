@@ -2,7 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
-    let (store, _root) = build_store().await;
+    let (mut store, _root) = build_store().await;
+    // The store reads time from the database clock (a sample advanced by this
+    // process's monotonic clock), which can trail the wall clock by a few
+    // milliseconds; pinned, the window boundary below is exact.
+    let now = current_timestamp_millis();
+    store.set_test_clock(Arc::new(AtomicI64::new(now)));
     let record_id = "cancelled-transcription";
     let db = store.connection().await.expect("database");
     db.execute_raw(
@@ -51,7 +56,7 @@ async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
             WHERE id = ?2
             "#,
             vec![
-                (current_timestamp_millis() - CANCELLED_PROJECTION_REPAIR_WINDOW_MS - 1).into(),
+                (now - CANCELLED_PROJECTION_REPAIR_WINDOW_MS - 1).into(),
                 job.id.clone().into(),
             ],
         )
@@ -72,7 +77,7 @@ async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
         raw::statement(
             db,
             "UPDATE runtime_jobs SET updated_at = ?1 WHERE id = ?2",
-            vec![current_timestamp_millis().into(), job.id.into()],
+            vec![now.into(), job.id.into()],
         )
         .expect("recent cancellation statement"),
     )
