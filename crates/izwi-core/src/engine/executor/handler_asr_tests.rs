@@ -790,6 +790,7 @@ fn granite_auto_chunk_generation_options_use_chunk_duration() {
         max_new_tokens: 2048,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        repetition_penalty: None,
     };
 
     let options = NativeExecutor::asr_chunk_generation_options(
@@ -813,6 +814,7 @@ fn granite_auto_single_segment_options_use_decoded_audio_duration() {
         max_new_tokens: 2048,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        repetition_penalty: None,
     };
 
     let options = NativeExecutor::asr_chunk_generation_options(
@@ -837,6 +839,7 @@ fn granite_explicit_chunk_generation_options_preserve_user_budget() {
         max_new_tokens: 2048,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        repetition_penalty: None,
     };
 
     let options = NativeExecutor::asr_chunk_generation_options(
@@ -860,6 +863,7 @@ fn granite_auto_chunk_budget_is_clamped_to_the_context_room() {
         max_new_tokens: 2048,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        repetition_penalty: None,
     };
     let options = |context: Option<(usize, f32)>| {
         NativeExecutor::asr_chunk_generation_options(
@@ -889,6 +893,7 @@ fn granite_timestamp_requests_budget_tagged_output_on_plus_only() {
         max_new_tokens: 2048,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        repetition_penalty: None,
     };
     let budget = |variant| {
         let mut request = EngineCoreRequest::asr("UklGRg==")
