@@ -2809,6 +2809,17 @@ impl NativeAsrModel {
         }
     }
 
+    /// The decoder context the checkpoint was built for, before memory
+    /// narrows what a load can hold; `None` for families without a
+    /// decoder prompt bound.
+    pub(crate) fn nominal_decoder_context(&self) -> Option<usize> {
+        match self {
+            Self::GraniteSpeech(model) => Some(model.nominal_decoder_context()),
+            Self::GraniteSpeech5(model) => Some(model.nominal_decoder_context()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn incremental_prompt_token_count(
         &self,
         audio: &[f32],

@@ -1414,12 +1414,14 @@ fn granite_saa_assembler_dedupes_overlap_and_preserves_turns() {
         .push_chunk_text(
             "[Speaker 1]: hello there [Speaker 2]: hi back from me now",
             0,
+            0.0,
         )
         .is_empty());
     assert!(assembler
         .push_chunk_text(
             "[Speaker 2]: hi back from me now and more [Speaker 1]: ok",
             1,
+            170.0,
         )
         .is_empty());
 
@@ -1432,81 +1434,69 @@ fn granite_saa_assembler_dedupes_overlap_and_preserves_turns() {
 }
 
 #[test]
-fn granite_saa_assembler_maps_reset_label_when_overlap_proves_continuity() {
+fn granite_saa_assembler_relinks_labels_a_chunk_numbered_afresh() {
+    // The second chunk opens on the guest, so Granite calls the guest
+    // "Speaker 1" there; the shared words link it back to "Speaker 2".
     let mut assembler = GraniteSaaTranscriptAssembler::default();
     assembler.push_chunk_text(
-        "[Speaker 1]: first person [Speaker 2]: boundary overlap words now",
+        "[Speaker 1]: how did it all start [Speaker 2]: well I started as a trading company in nineteen seventy eight",
         0,
+        0.0,
     );
-    let warnings =
-        assembler.push_chunk_text("[Speaker 1]: boundary overlap words now continuing", 1);
+    let warnings = assembler.push_chunk_text(
+        "[Speaker 1]: as a trading company in nineteen seventy eight [Speaker 2]: what kind of things did you trade [Speaker 1]: cement",
+        1,
+        170.0,
+    );
 
-    assert!(warnings.iter().any(|warning| warning.contains("mapped it")));
+    assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
         assembler.text(),
-        "[Speaker 1]: first person [Speaker 2]: boundary overlap words now continuing"
+        "[Speaker 1]: how did it all start [Speaker 2]: well I started as a trading company in nineteen seventy eight [Speaker 1]: what kind of things did you trade [Speaker 2]: cement"
     );
 }
 
 #[test]
-fn granite_saa_prefix_text_is_bounded_on_turn_boundaries() {
+fn granite_saa_assembler_flags_a_seam_it_could_only_guess() {
     let mut assembler = GraniteSaaTranscriptAssembler::default();
-    for idx in 0..32 {
-        let speaker = if idx % 2 == 0 { 1 } else { 2 };
-        assembler.push_chunk_text(format!("[Speaker {speaker}]: turn {idx}").as_str(), idx);
-    }
+    assembler.push_chunk_text("[Speaker 1]: question [Speaker 2]: a long answer", 0, 0.0);
+    let warnings = assembler.push_chunk_text(
+        "[Speaker 1]: unrelated words [Speaker 2]: another question",
+        2,
+        367.6,
+    );
 
-    let prefix = assembler.prefix_text();
-    assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
-    assert!(prefix.contains("[Speaker 1]:"));
-    assert!(!prefix.contains("turn 0"));
-}
-
-#[test]
-fn granite_saa_chunk_prefix_defaults_to_none() {
-    let _guard = env_lock().lock().expect("env lock poisoned");
-    let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
-    std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
-    let mut assembler = GraniteSaaTranscriptAssembler::default();
-    assembler.push_chunk_text("[Speaker 1]: prior audio text", 0);
-
-    assert_eq!(GraniteSaaPrefixMode::from_env(), GraniteSaaPrefixMode::None);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("from 6:08 on are a best guess"), "{}", warnings[0]);
+    assert!(warnings[0].contains("chunk 3"), "{}", warnings[0]);
+    // The chunk's first speaker continues the transcript's last one.
     assert_eq!(
-        granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env()),
-        None
+        assembler.text(),
+        "[Speaker 1]: question [Speaker 2]: a long answer unrelated words [Speaker 1]: another question"
     );
-
-    if let Some(previous) = previous {
-        std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
-    } else {
-        std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
-    }
 }
 
 #[test]
-fn granite_saa_chunk_prefix_full_mode_is_explicit_and_bounded() {
-    let _guard = env_lock().lock().expect("env lock poisoned");
-    let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
-    std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", "full");
-    let mut assembler = GraniteSaaTranscriptAssembler::default();
-    for idx in 0..32 {
-        assembler.push_chunk_text(format!("[Speaker 1]: turn {idx}").as_str(), idx);
-    }
+fn granite_saa_warns_only_when_memory_shortened_the_chunks() {
+    let warning = granite_saa_memory_limit_warning(2_940.0, Some(142.0), Some(206.0))
+        .expect("a 142 s limit against a 206 s checkpoint limit is memory-bound");
+    assert!(warning.contains("at most 142 s instead of 206 s"), "{warning}");
+    // Audio that fits one decode, a limit at the checkpoint's, or no limit
+    // at all says nothing.
+    assert_eq!(granite_saa_memory_limit_warning(120.0, Some(142.0), Some(206.0)), None);
+    assert_eq!(granite_saa_memory_limit_warning(2_940.0, Some(206.0), Some(206.0)), None);
+    assert_eq!(granite_saa_memory_limit_warning(2_940.0, None, Some(206.0)), None);
+}
 
-    let prefix = granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env())
-        .expect("full prefix");
-    assert_eq!(
-        GraniteSaaPrefixMode::from_env(),
-        GraniteSaaPrefixMode::FullTranscript
-    );
-    assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
-    assert!(prefix.contains("[Speaker 1]:"));
-
-    if let Some(previous) = previous {
-        std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
-    } else {
-        std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
-    }
+#[test]
+fn granite_saa_long_form_cuts_at_the_longest_pause_before_the_cap() {
+    let cfg = granite_saa_long_form_config(Some(206.0));
+    assert!(cfg.prefer_longest_pause);
+    assert!((cfg.hard_max_chunk_secs - 195.7).abs() < 0.01);
+    // The pause search spans the last 2 x 20 s up to the cap.
+    assert!((cfg.target_chunk_secs - (cfg.hard_max_chunk_secs - 20.0)).abs() < 0.01);
+    assert!((cfg.silence_search_secs - 20.0).abs() < f32::EPSILON);
+    assert!((cfg.overlap_secs - 30.0).abs() < f32::EPSILON);
 }
 
 #[test]

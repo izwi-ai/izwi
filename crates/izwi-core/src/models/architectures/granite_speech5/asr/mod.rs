@@ -308,6 +308,11 @@ impl GraniteSpeech5AsrModel {
         Some(GRANITE_SPEECH5_MAX_AUDIO_SECONDS)
     }
 
+    /// The decoder context the checkpoint was built for.
+    pub(crate) fn nominal_decoder_context(&self) -> usize {
+        self.config.text_config.max_position_embeddings
+    }
+
     /// Decoder-prompt tokens added per second of audio.
     pub(crate) fn audio_token_rate(&self) -> f32 {
         let frames_per_second = self.processor.sample_rate() as f32

@@ -1,6 +1,6 @@
 //! ASR runtime methods routed through the unified core engine.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,7 @@ use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConf
 mod realtime;
 mod realtime_push;
 mod realtime_session;
+mod saa_seam;
 mod speaker_attribution;
 mod transcribe;
 use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
@@ -94,7 +95,8 @@ use realtime_session::{
 };
 #[cfg(test)]
 use speaker_attribution::{
-    granite_saa_chunk_plan, granite_saa_chunk_prefix_text, granite_saa_chunk_progress,
+    granite_saa_chunk_plan, granite_saa_chunk_progress, granite_saa_long_form_config,
+    granite_saa_memory_limit_warning,
     granite_saa_decode_diagnostics, granite_saa_max_new_tokens_for_duration,
     granite_saa_max_token_warning, granite_saa_processing_progress,
     resolve_speaker_attributed_asr_variant, speaker_attributed_asr_result_from_text,
@@ -202,13 +204,11 @@ const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
 const GRANITE_SAA_NEW_TOKEN_RESERVE: usize = 256;
 const GRANITE_SAA_TARGET_CHUNK_SECS: f32 = 240.0;
 const GRANITE_SAA_HARD_MAX_CHUNK_SECS: f32 = 510.0;
-const GRANITE_SAA_OVERLAP_SECS: f32 = 12.0;
+/// Audio two consecutive chunks share: enough words for [`saa_seam`] to
+/// align, and usually both speakers of a conversation.
+const GRANITE_SAA_OVERLAP_SECS: f32 = 30.0;
 const GRANITE_SAA_MIN_CHUNK_SECS: f32 = 30.0;
-const GRANITE_SAA_SILENCE_SEARCH_SECS: f32 = 12.0;
-const GRANITE_SAA_PREFIX_MAX_TURNS: usize = 12;
-const GRANITE_SAA_PREFIX_MAX_CHARS: usize = 6_000;
-const GRANITE_SAA_MIN_OVERLAP_WORDS: usize = 4;
-const GRANITE_SAA_MAX_OVERLAP_WORDS: usize = 80;
+const GRANITE_SAA_SILENCE_SEARCH_SECS: f32 = 20.0;
 const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 /// Concurrent realtime sessions on CPU and Metal, which is also the row count
 /// of the realtime state arena a load allocates up front: Nemotron's is about
@@ -368,39 +368,6 @@ pub(crate) fn compose_invocation_audio_limit(
             Some(hint) => Some(hint.min(secs)),
             None => Some(secs),
         }),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraniteSaaPrefixMode {
-    None,
-    FullTranscript,
-}
-
-impl GraniteSaaPrefixMode {
-    /// `IZWI_GRANITE_SAA_PREFIX_MODE`, read once per process.
-    fn from_env() -> Self {
-        static MODE: crate::env::ReadOnce<GraniteSaaPrefixMode> =
-            crate::env::ReadOnce::new(GraniteSaaPrefixMode::read_env);
-        MODE.get()
-    }
-
-    fn read_env() -> Self {
-        match std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE")
-            .ok()
-            .map(|raw| raw.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("full") | Some("full_transcript") | Some("legacy") => Self::FullTranscript,
-            _ => Self::None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::FullTranscript => "full_transcript",
-        }
     }
 }
 

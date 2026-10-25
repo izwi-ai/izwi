@@ -42,7 +42,15 @@ pub(super) struct GraniteSaaTranscriptAssembler {
 }
 
 impl GraniteSaaTranscriptAssembler {
-    pub(super) fn push_chunk_text(&mut self, chunk_text: &str, chunk_index: usize) -> Vec<String> {
+    /// Add one chunk's decode, linking its speaker labels and its overlap
+    /// with the transcript so far (see [`saa_seam`]). `chunk_start_secs`
+    /// dates the seam in a warning when the link is a guess.
+    pub(super) fn push_chunk_text(
+        &mut self,
+        chunk_text: &str,
+        chunk_index: usize,
+        chunk_start_secs: f64,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         let incoming = speaker_attributed_asr_turns_from_text(chunk_text);
         if incoming.is_empty() {
@@ -55,79 +63,37 @@ impl GraniteSaaTranscriptAssembler {
             return warnings;
         }
 
-        let mut speaker_aliases = HashMap::<String, String>::new();
-        if let (Some(last), Some(first)) = (self.turns.last(), incoming.first()) {
-            let overlap = overlap_prefix_word_count(
-                last.text.as_str(),
-                first.text.as_str(),
-                GRANITE_SAA_MIN_OVERLAP_WORDS,
-                GRANITE_SAA_MAX_OVERLAP_WORDS,
-            );
-            if overlap > 0
-                && first.speaker != UNKNOWN_SAA_SPEAKER
-                && last.speaker != UNKNOWN_SAA_SPEAKER
-                && first.speaker != last.speaker
-            {
-                speaker_aliases.insert(first.speaker.clone(), last.speaker.clone());
-                warnings.push(format!(
-                    "Granite SAA chunk {} reused speaker label {} across an overlap; mapped it to {}.",
-                    chunk_index + 1,
-                    first.speaker,
-                    last.speaker
-                ));
-            }
+        let has_transcript = !self.turns.is_empty();
+        let link = saa_seam::link_seam(&self.turns, &incoming);
+        let incoming = match link.chunk_known_through {
+            Some(through) => saa_seam::drop_turn_words_through(incoming, through),
+            None => incoming,
+        };
+        if let Some(keep_through) = link.transcript_keep_through {
+            saa_seam::truncate_turns_after(&mut self.turns, keep_through);
         }
-        if !speaker_aliases.is_empty() {
-            let mut known_global_speakers = Vec::<String>::new();
-            for turn in &self.turns {
-                if turn.speaker != UNKNOWN_SAA_SPEAKER
-                    && !known_global_speakers.contains(&turn.speaker)
-                {
-                    known_global_speakers.push(turn.speaker.clone());
-                }
-            }
-
-            let mut used_global_speakers = speaker_aliases
-                .values()
-                .cloned()
-                .collect::<HashSet<String>>();
-            let mut local_speakers = Vec::<String>::new();
-            for turn in &incoming {
-                if turn.speaker != UNKNOWN_SAA_SPEAKER && !local_speakers.contains(&turn.speaker) {
-                    local_speakers.push(turn.speaker.clone());
-                }
-            }
-
-            for local_speaker in local_speakers {
-                if speaker_aliases.contains_key(local_speaker.as_str())
-                    || !used_global_speakers.contains(local_speaker.as_str())
-                {
-                    continue;
-                }
-                if let Some(global_speaker) = known_global_speakers
-                    .iter()
-                    .find(|speaker| !used_global_speakers.contains(speaker.as_str()))
-                    .cloned()
-                {
-                    speaker_aliases.insert(local_speaker.clone(), global_speaker.clone());
-                    used_global_speakers.insert(global_speaker.clone());
-                    warnings.push(format!(
-                        "Granite SAA chunk {} remapped local speaker label {} to {} after detecting a label reset.",
-                        chunk_index + 1,
-                        local_speaker,
-                        global_speaker
-                    ));
-                }
+        if has_transcript {
+            tracing::info!(
+                chunk_index = chunk_index + 1,
+                aligned_words = link.aligned_words,
+                labels = ?link.labels,
+                "linked Granite SAA chunk seam"
+            );
+            if !link.is_aligned() {
+                warnings.push(format!(
+                    "Speaker labels from {} on are a best guess: chunk {} shares too little text with the chunk before it to link its speakers.",
+                    format_seam_clock(chunk_start_secs),
+                    chunk_index + 1
+                ));
             }
         }
 
         for mut turn in incoming {
-            if let Some(mapped) = speaker_aliases.get(turn.speaker.as_str()) {
-                turn.speaker = mapped.clone();
+            if let Some(global) = link.labels.get(&turn.speaker) {
+                turn.speaker = global.clone();
             }
             self.push_turn(turn);
         }
-
         warnings
     }
 
@@ -136,63 +102,31 @@ impl GraniteSaaTranscriptAssembler {
         if turn.text.is_empty() {
             return;
         }
-
-        let Some(last) = self.turns.last_mut() else {
-            self.turns.push(turn);
-            return;
-        };
-
-        let overlap = overlap_prefix_word_count(
-            last.text.as_str(),
-            turn.text.as_str(),
-            GRANITE_SAA_MIN_OVERLAP_WORDS,
-            GRANITE_SAA_MAX_OVERLAP_WORDS,
-        );
-        if overlap > 0 {
-            turn.text = drop_prefix_words(turn.text.as_str(), overlap);
-            if turn.text.trim().is_empty() {
-                return;
+        match self.turns.last_mut() {
+            Some(last) if last.speaker == turn.speaker => {
+                append_with_spacing(&mut last.text, turn.text.as_str());
             }
-        }
-
-        if last.speaker == turn.speaker {
-            append_with_spacing(&mut last.text, turn.text.trim());
-        } else {
-            self.turns.push(turn);
+            _ => self.turns.push(turn),
         }
     }
 
     pub(super) fn text(&self) -> String {
         format_saa_turns(&self.turns)
     }
+}
 
-    pub(super) fn prefix_text(&self) -> String {
-        let mut selected = Vec::<String>::new();
-        let mut selected_chars = 0usize;
-
-        for turn in self.turns.iter().rev().take(GRANITE_SAA_PREFIX_MAX_TURNS) {
-            let formatted = format_saa_turn(turn);
-            let separator_chars = usize::from(!selected.is_empty());
-            let formatted_chars = formatted.chars().count();
-            if selected_chars + separator_chars + formatted_chars <= GRANITE_SAA_PREFIX_MAX_CHARS {
-                selected.push(formatted);
-                selected_chars += separator_chars + formatted_chars;
-                continue;
-            }
-
-            if selected.is_empty() {
-                let label_overhead = turn.speaker.chars().count() + "[]: ".chars().count();
-                let text_budget = GRANITE_SAA_PREFIX_MAX_CHARS.saturating_sub(label_overhead);
-                let suffix = recent_word_suffix(turn.text.as_str(), text_budget);
-                if !suffix.is_empty() {
-                    selected.push(format!("[{}]: {}", turn.speaker, suffix));
-                }
-            }
-            break;
-        }
-
-        selected.reverse();
-        selected.join(" ")
+/// `m:ss`, or `h:mm:ss` past an hour.
+fn format_seam_clock(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs.round() as u64
+    } else {
+        0
+    };
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -246,17 +180,34 @@ pub(super) fn granite_saa_should_use_single_pass(duration_secs: f32, model_limit
     duration_secs.is_finite() && duration_secs <= limit
 }
 
+/// A warning when the memory free at load time held a shorter context than
+/// the checkpoint's, so `duration_secs` of audio is cut into shorter chunks
+/// (each a seam where speaker labels must be linked again).
+pub(super) fn granite_saa_memory_limit_warning(
+    duration_secs: f32,
+    limit_secs: Option<f32>,
+    nominal_limit_secs: Option<f32>,
+) -> Option<String> {
+    let (limit, nominal) = (limit_secs?, nominal_limit_secs?);
+    if duration_secs <= limit || limit >= nominal * 0.98 {
+        return None;
+    }
+    Some(format!(
+        "Speaker attribution ran in chunks of at most {limit:.0} s instead of {nominal:.0} s because less memory was free when Granite loaded; reloading it with fewer models loaded gives longer chunks and fewer places where speaker labels can drift."
+    ))
+}
+
 pub(super) fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormConfig {
+    // Cut in the longest pause of the window that ends at the cap, so a
+    // chunk ends between phrases (often between speakers) instead of on
+    // whatever quiet frame lies nearest the cap.
     let mut cfg = AsrLongFormConfig {
         target_chunk_secs: GRANITE_SAA_TARGET_CHUNK_SECS,
         hard_max_chunk_secs: GRANITE_SAA_HARD_MAX_CHUNK_SECS,
         overlap_secs: GRANITE_SAA_OVERLAP_SECS,
         min_chunk_secs: GRANITE_SAA_MIN_CHUNK_SECS,
         silence_search_secs: GRANITE_SAA_SILENCE_SEARCH_SECS,
-        min_word_overlap: GRANITE_SAA_MIN_OVERLAP_WORDS,
-        max_word_overlap: GRANITE_SAA_MAX_OVERLAP_WORDS,
-        min_context_replay_words: GRANITE_SAA_MIN_OVERLAP_WORDS,
-        max_context_replay_words: GRANITE_SAA_MAX_OVERLAP_WORDS,
+        prefer_longest_pause: true,
         ..Default::default()
     };
 
@@ -302,8 +253,11 @@ pub(super) fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> Asr
         .hard_max_chunk_secs
         .max(cfg.min_chunk_secs.max(1.0))
         .min(GRANITE_SAA_HARD_MAX_CHUNK_SECS);
+    // The search window is centred on the target, so a target one window
+    // below the cap searches the last stretch before it.
     cfg.target_chunk_secs = cfg
         .target_chunk_secs
+        .min(cfg.hard_max_chunk_secs - cfg.silence_search_secs)
         .max(cfg.min_chunk_secs.max(1.0))
         .min(cfg.hard_max_chunk_secs);
     cfg.overlap_secs = cfg.overlap_secs.clamp(0.0, cfg.target_chunk_secs * 0.45);
@@ -367,19 +321,6 @@ pub(super) fn granite_saa_max_new_tokens(audio: &[f32], sample_rate: u32) -> usi
         0.0
     };
     granite_saa_max_new_tokens_for_duration(duration_secs)
-}
-
-pub(super) fn granite_saa_chunk_prefix_text(
-    assembler: &GraniteSaaTranscriptAssembler,
-    mode: GraniteSaaPrefixMode,
-) -> Option<String> {
-    match mode {
-        GraniteSaaPrefixMode::None => None,
-        GraniteSaaPrefixMode::FullTranscript => {
-            let prefix_text = assembler.prefix_text();
-            (!prefix_text.trim().is_empty()).then_some(prefix_text)
-        }
-    }
 }
 
 pub(super) fn granite_saa_decode_diagnostics(
@@ -511,12 +452,6 @@ where
         let observation_job = job.clone();
         let task_state_binding = state_binding.clone();
         let language_owned = language.map(ToOwned::to_owned);
-        let prefix_mode = GraniteSaaPrefixMode::from_env();
-        let prefix_text = granite_saa_chunk_prefix_text(&assembler, prefix_mode);
-        let prefix_chars = prefix_text
-            .as_deref()
-            .map(|text| text.chars().count())
-            .unwrap_or(0);
         let chunk_sample_count = chunk_end - chunk_start;
         let max_new_tokens =
             granite_saa_max_new_tokens(&samples[chunk_start..chunk_end], sample_rate);
@@ -528,8 +463,6 @@ where
             chunk_end_secs = samples_to_seconds_f64(chunk.end_sample, sample_rate),
             chunk_duration_secs,
             max_new_tokens,
-            prefix_mode = prefix_mode.as_str(),
-            prefix_chars,
             "starting Granite SAA chunk decode"
         );
         let chunk_started = Instant::now();
@@ -556,7 +489,7 @@ where
                         &chunk_audio,
                         sample_rate,
                         language_owned.as_deref(),
-                        prefix_text.as_deref(),
+                        None,
                         max_new_tokens,
                         granite_saa_single_invocation_cache(leases)?,
                     );
@@ -602,7 +535,11 @@ where
             );
             warnings.push(warning);
         }
-        warnings.extend(assembler.push_chunk_text(transcription.text.as_str(), idx));
+        warnings.extend(assembler.push_chunk_text(
+            transcription.text.as_str(),
+            idx,
+            samples_to_seconds_f64(chunk.start_sample, sample_rate),
+        ));
 
         on_progress(granite_saa_chunk_progress(
             AsrProgressPhase::ChunkFinished,
@@ -864,71 +801,6 @@ pub(super) fn append_with_spacing(target: &mut String, text: &str) {
     target.push_str(text);
 }
 
-pub(super) fn overlap_prefix_word_count(
-    existing: &str,
-    incoming: &str,
-    min_words: usize,
-    max_words: usize,
-) -> usize {
-    let existing_words = normalized_overlap_words(existing);
-    let incoming_words = normalized_overlap_words(incoming);
-    let max_words = max_words
-        .min(existing_words.len())
-        .min(incoming_words.len());
-    if max_words < min_words {
-        return 0;
-    }
-
-    for count in (min_words..=max_words).rev() {
-        if existing_words[existing_words.len() - count..] == incoming_words[..count] {
-            return count;
-        }
-    }
-    0
-}
-
-pub(super) fn normalized_overlap_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(normalize_overlap_word)
-        .collect()
-}
-
-pub(super) fn normalize_overlap_word(word: &str) -> Option<String> {
-    let normalized = word
-        .chars()
-        .filter(|ch| ch.is_alphanumeric() || *ch == '\'')
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    (!normalized.is_empty()).then_some(normalized)
-}
-
-pub(super) fn drop_prefix_words(text: &str, words_to_drop: usize) -> String {
-    text.split_whitespace()
-        .skip(words_to_drop)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(super) fn recent_word_suffix(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-
-    let mut selected = Vec::<&str>::new();
-    let mut selected_chars = 0usize;
-    for word in text.split_whitespace().rev() {
-        let separator_chars = usize::from(!selected.is_empty());
-        let word_chars = word.chars().count();
-        if selected_chars + separator_chars + word_chars > max_chars {
-            break;
-        }
-        selected.push(word);
-        selected_chars += separator_chars + word_chars;
-    }
-    selected.reverse();
-    selected.join(" ")
-}
-
 impl RuntimeService {
     pub async fn speaker_attributed_asr(
         &self,
@@ -1091,25 +963,32 @@ impl RuntimeService {
         let retained_input_bytes = input_bytes.checked_add(language_bytes).ok_or_else(|| {
             Error::Overloaded("speaker-attributed ASR retained input overflowed".to_string())
         })?;
-        // FullTranscript prefix mode grows every chunk's prompt with the
-        // prior transcript; reserve headroom for the capped prefix so chunk
-        // sizing leaves room for it instead of failing mid-job.
-        let prefix_token_allowance = match GraniteSaaPrefixMode::from_env() {
-            GraniteSaaPrefixMode::None => 0usize,
-            GraniteSaaPrefixMode::FullTranscript => GRANITE_SAA_PREFIX_MAX_CHARS / 4,
-        };
         let model_limit_secs = compose_invocation_audio_limit(
             model.max_audio_seconds_hint(),
             model.audio_token_rate(),
             self.model_registry.effective_context(variant),
-            move |secs| {
-                granite_saa_max_new_tokens_for_duration(secs)
-                    .saturating_add(prefix_token_allowance)
-            },
+            granite_saa_max_new_tokens_for_duration,
         )?;
+        // The context a load holds depends on the memory free when it loaded,
+        // so the same file can be cut into shorter chunks (more seams) on a
+        // busier machine; say so instead of leaving it silent.
+        let nominal_limit_secs = compose_invocation_audio_limit(
+            model.max_audio_seconds_hint(),
+            model.audio_token_rate(),
+            model.nominal_decoder_context(),
+            granite_saa_max_new_tokens_for_duration,
+        )
+        .ok()
+        .flatten();
+        let memory_limit_warning = granite_saa_memory_limit_warning(
+            duration_secs,
+            model_limit_secs,
+            nominal_limit_secs,
+        );
         tracing::info!(
             variant = %variant,
             model_limit_secs = ?model_limit_secs,
+            nominal_limit_secs = ?nominal_limit_secs,
             "resolved speaker-attributed ASR invocation audio limit"
         );
         if granite_saa_should_use_single_pass(duration_secs, model_limit_secs) {
@@ -1171,13 +1050,15 @@ impl RuntimeService {
         )
         .await?;
 
+        let mut warnings = long_form.warnings;
+        warnings.extend(memory_limit_warning);
         Ok(speaker_attributed_asr_result_from_text_with_warnings(
             long_form.text.as_str(),
             long_form.language.or(language_owned),
             duration_secs,
             min_speakers,
             max_speakers,
-            long_form.warnings,
+            warnings,
         ))
     }
 }

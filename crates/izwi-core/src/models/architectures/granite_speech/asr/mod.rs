@@ -1406,6 +1406,11 @@ impl GraniteSpeechAsrModel {
         Some(DEFAULT_MAX_AUDIO_SECONDS)
     }
 
+    /// The decoder context the checkpoint was built for.
+    pub(crate) fn nominal_decoder_context(&self) -> usize {
+        self.config.text_config.max_position_embeddings
+    }
+
     /// Decoder-prompt tokens added per second of audio: 16 kHz mel at hop 160
     /// yields 100 frames/s, paired stacking halves that to 50 encoder frames/s,
     /// and each projector window emits `window/downsample` queries — i.e.
