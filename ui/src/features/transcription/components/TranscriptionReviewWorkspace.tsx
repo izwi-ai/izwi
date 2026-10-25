@@ -14,11 +14,14 @@ import {
   normalizeSummaryStatus,
   summaryStatusLabel,
 } from "@/features/transcription/playground/support";
+import { SpeakerTranscriptFlow } from "@/features/transcription/components/SpeakerTranscriptFlow";
 import {
+  speakerTurnBlocksFromRecord,
   transcriptionEntriesFromRecord,
   transcriptionHasTimestamps,
   transcriptionWordCount,
 } from "@/features/transcription/transcript";
+import { speakerAccent } from "@/utils/speakerAccent";
 
 const ACCENT_SOLID = "hsl(189 76% 42%)";
 const ACCENT_SOFT = "hsla(189 76% 42% / 0.16)";
@@ -90,13 +93,24 @@ export function TranscriptionReviewWorkspace({
   const transcriptEntryRefs = useRef(new Map<number, HTMLElement>());
   const lastAutoScrolledEntryRef = useRef<number | null>(null);
 
-  const transcriptEntries = useMemo(
-    () => transcriptionEntriesFromRecord(record),
+  // A record with speaker turns (speaker-attributed ASR) reads as one
+  // flowing document; every other record keeps the per-entry list.
+  const speakerBlocks = useMemo(
+    () => speakerTurnBlocksFromRecord(record),
     [record],
   );
+  const speakerMode = speakerBlocks.length > 0;
+  const transcriptEntries = useMemo(
+    () => (speakerMode ? [] : transcriptionEntriesFromRecord(record)),
+    [record, speakerMode],
+  );
+  const timeline = speakerMode ? speakerBlocks : transcriptEntries;
   const timestamped = useMemo(
-    () => transcriptionHasTimestamps(record),
-    [record],
+    () =>
+      speakerMode
+        ? speakerBlocks.some((block) => block.timed)
+        : transcriptionHasTimestamps(record),
+    [record, speakerBlocks, speakerMode],
   );
   const wordCount = useMemo(() => transcriptionWordCount(record), [record]);
   const summaryStatus = useMemo(
@@ -130,14 +144,14 @@ export function TranscriptionReviewWorkspace({
     : null;
 
   const knownDuration = useMemo(() => {
-    const transcriptDuration = transcriptEntries.reduce(
+    const transcriptDuration = timeline.reduce(
       (max, entry) => Math.max(max, entry.end),
       0,
     );
     const recordDuration =
       record?.duration_secs && record.duration_secs > 0 ? record.duration_secs : 0;
     return Math.max(recordDuration, transcriptDuration);
-  }, [record, transcriptEntries]);
+  }, [record, timeline]);
   const playback = useAudioPlayback(audioUrl, {
     resetKey: record?.id,
     durationHint: knownDuration,
@@ -146,11 +160,43 @@ export function TranscriptionReviewWorkspace({
   });
   const { currentTime, isPlaying, seek } = playback;
 
-  const activeEntryIndex = transcriptEntries.findIndex(
+  const activeEntryIndex = timeline.findIndex(
     (entry) => entry.timed && isEntryActive(currentTime, entry.start, entry.end),
   );
   const activeEntry =
-    activeEntryIndex >= 0 ? transcriptEntries[activeEntryIndex] ?? null : null;
+    activeEntryIndex >= 0 ? timeline[activeEntryIndex] ?? null : null;
+  // Untimed speaker turns have no place on the timeline; the player then
+  // shows plain progress instead of one full-width bar per turn.
+  const playerSegments = speakerMode
+    ? speakerBlocks.some((block) => block.timed)
+      ? speakerBlocks.flatMap((block, index) => {
+          if (!block.timed) {
+            return [];
+          }
+          const accent = speakerAccent(block.speakerIndex);
+          return [
+            {
+              start: block.start,
+              end: block.end,
+              active: index === activeEntryIndex,
+              solid: accent.solid,
+              soft: accent.soft,
+            },
+          ];
+        })
+      : undefined
+    : transcriptEntries.map((entry, index) => ({
+        start: entry.start,
+        end: entry.end,
+        active: index === activeEntryIndex,
+      }));
+  const registerTranscriptEntry = (index: number, element: HTMLElement | null) => {
+    if (element) {
+      transcriptEntryRefs.current.set(index, element);
+    } else {
+      transcriptEntryRefs.current.delete(index);
+    }
+  };
 
   useEffect(() => {
     lastAutoScrolledEntryRef.current = null;
@@ -190,7 +236,7 @@ export function TranscriptionReviewWorkspace({
     );
   }
 
-  if (!record || transcriptEntries.length === 0) {
+  if (!record || timeline.length === 0) {
     return (
       <div className="flex min-h-[320px] items-center justify-center px-6 py-12 text-center">
         <div className="max-w-sm">
@@ -286,91 +332,88 @@ export function TranscriptionReviewWorkspace({
             </div>
           </div>
 
-          <div>
-            <div className="space-y-2.5">
-              {transcriptEntries.map((entry, index) => {
-                const active = index === activeEntryIndex;
-                const sharedClassName =
-                  "w-full rounded-lg border px-3.5 py-3 text-left transition-colors";
-                const style = {
-                  backgroundColor: active ? ACCENT_SOFT : "var(--bg-surface-0)",
-                  borderColor: active
-                    ? ACCENT_SOLID
-                    : "var(--border-muted)",
-                  boxShadow: active
-                    ? `0 0 0 1px ${ACCENT_SOLID} inset`
-                    : undefined,
-                };
-                const content = (
-                  <>
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0 flex items-center gap-2">
-                        <div className="truncate text-[13px] font-semibold text-(--text-primary)">
-                          {entry.timed
-                            ? `${formatClockTime(entry.start)} - ${formatClockTime(entry.end)}`
-                            : "Transcript"}
+          {speakerMode ? (
+            <SpeakerTranscriptFlow
+              blocks={speakerBlocks}
+              activeIndex={activeEntryIndex}
+              onSeek={seek}
+              registerBlock={registerTranscriptEntry}
+            />
+          ) : (
+            <div>
+              <div className="space-y-2.5">
+                {transcriptEntries.map((entry, index) => {
+                  const active = index === activeEntryIndex;
+                  const sharedClassName =
+                    "w-full rounded-lg border px-3.5 py-3 text-left transition-colors";
+                  const style = {
+                    backgroundColor: active ? ACCENT_SOFT : "var(--bg-surface-0)",
+                    borderColor: active
+                      ? ACCENT_SOLID
+                      : "var(--border-muted)",
+                    boxShadow: active
+                      ? `0 0 0 1px ${ACCENT_SOLID} inset`
+                      : undefined,
+                  };
+                  const content = (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0 flex items-center gap-2">
+                          <div className="truncate text-[13px] font-semibold text-(--text-primary)">
+                            {entry.timed
+                              ? `${formatClockTime(entry.start)} - ${formatClockTime(entry.end)}`
+                              : "Transcript"}
+                          </div>
                         </div>
+                        {active ? (
+                          <span
+                            className="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                            style={{
+                              color: ACCENT_SOLID,
+                              backgroundColor: ACCENT_SOFT,
+                            }}
+                          >
+                            Live
+                          </span>
+                        ) : null}
                       </div>
-                      {active ? (
-                        <span
-                          className="rounded-full px-2 py-0.5 text-[11px] font-medium"
-                          style={{
-                            color: ACCENT_SOLID,
-                            backgroundColor: ACCENT_SOFT,
-                          }}
-                        >
-                          Live
-                        </span>
-                      ) : null}
-                    </div>
-                    <p className="mt-1.5 text-[15px] leading-7 text-(--text-secondary)">
-                      {entry.text}
-                    </p>
-                  </>
-                );
+                      <p className="mt-1.5 text-[15px] leading-7 text-(--text-secondary)">
+                        {entry.text}
+                      </p>
+                    </>
+                  );
 
-                if (!entry.timed) {
+                  if (!entry.timed) {
+                    return (
+                      <div
+                        key={`entry-${index}`}
+                        ref={(element) => registerTranscriptEntry(index, element)}
+                        className={sharedClassName}
+                        style={style}
+                        data-active={active ? "true" : "false"}
+                      >
+                        {content}
+                      </div>
+                    );
+                  }
+
                   return (
-                    <div
-                      key={`entry-${index}`}
-                      ref={(element) => {
-                        if (element) {
-                          transcriptEntryRefs.current.set(index, element);
-                        } else {
-                          transcriptEntryRefs.current.delete(index);
-                        }
-                      }}
+                    <button
+                      key={`entry-${entry.start}-${entry.end}-${index}`}
+                      type="button"
+                      onClick={() => seek(entry.start)}
+                      ref={(element) => registerTranscriptEntry(index, element)}
                       className={sharedClassName}
                       style={style}
                       data-active={active ? "true" : "false"}
                     >
                       {content}
-                    </div>
+                    </button>
                   );
-                }
-
-                return (
-                  <button
-                    key={`entry-${entry.start}-${entry.end}-${index}`}
-                    type="button"
-                    onClick={() => seek(entry.start)}
-                    ref={(element) => {
-                      if (element) {
-                        transcriptEntryRefs.current.set(index, element);
-                      } else {
-                        transcriptEntryRefs.current.delete(index);
-                      }
-                    }}
-                    className={sharedClassName}
-                    style={style}
-                    data-active={active ? "true" : "false"}
-                  >
-                    {content}
-                  </button>
-                );
-              })}
+                })}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         <FactsList
@@ -386,17 +429,18 @@ export function TranscriptionReviewWorkspace({
             {
               label: "Timestamps",
               value: timestamped
-                ? record.words && record.words.length > 0
-                  ? "Word-level"
-                  : "Segment-level"
+                ? speakerMode
+                  ? "Turn-level"
+                  : record.words && record.words.length > 0
+                    ? "Word-level"
+                    : "Segment-level"
                 : "Off",
             },
             {
               label: "Speakers",
-              value:
-                record.speaker_turns && record.speaker_turns.length > 0
-                  ? `${new Set(record.speaker_turns.map((turn) => turn.speaker)).size} identified`
-                  : "Not requested",
+              value: speakerMode
+                ? `${new Set(speakerBlocks.map((block) => block.speaker)).size} identified`
+                : "Not requested",
             },
             ...(formatProcessingFact(record.processing_time_ms, record.rtf)
               ? [
@@ -421,11 +465,7 @@ export function TranscriptionReviewWorkspace({
           <AudioPlayer
             playback={playback}
             className={playbackInnerClassName}
-            segments={transcriptEntries.map((entry, index) => ({
-              start: entry.start,
-              end: entry.end,
-              active: index === activeEntryIndex,
-            }))}
+            segments={playerSegments}
             trailing={activeEntry?.timed ? formatClockTime(activeEntry.start) : ""}
           />
         </div>
