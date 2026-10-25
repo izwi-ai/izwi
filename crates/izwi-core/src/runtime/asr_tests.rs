@@ -1477,6 +1477,34 @@ fn granite_saa_assembler_flags_a_seam_it_could_only_guess() {
     );
 }
 
+/// Replays the chunk texts of a real long-form run through the assembler,
+/// to tune seam linking against a reference without decoding again. Input
+/// (`IZWI_SAA_REPLAY_CHUNKS`): a JSON array of `{chunk_start_secs, text}`
+/// taken from the `Granite SAA chunk text` debug lines; output
+/// (`IZWI_SAA_REPLAY_OUT`): the speaker turns as JSON.
+#[test]
+#[ignore = "needs IZWI_SAA_REPLAY_CHUNKS from a real run"]
+fn granite_saa_replay_recorded_chunks() {
+    #[derive(serde::Deserialize)]
+    struct RecordedChunk {
+        chunk_start_secs: f64,
+        text: String,
+    }
+    let input = std::env::var("IZWI_SAA_REPLAY_CHUNKS").expect("IZWI_SAA_REPLAY_CHUNKS");
+    let output = std::env::var("IZWI_SAA_REPLAY_OUT").expect("IZWI_SAA_REPLAY_OUT");
+    let chunks: Vec<RecordedChunk> =
+        serde_json::from_slice(&std::fs::read(input).expect("read chunks")).expect("chunks json");
+    let mut assembler = GraniteSaaTranscriptAssembler::default();
+    for (index, chunk) in chunks.iter().enumerate() {
+        for warning in assembler.push_chunk_text(&chunk.text, index, chunk.chunk_start_secs) {
+            eprintln!("{warning}");
+        }
+    }
+    let turns = speaker_attributed_asr_result_from_text(&assembler.text(), None, 0.0, None, None)
+        .speaker_turns;
+    std::fs::write(output, serde_json::to_vec_pretty(&turns).unwrap()).expect("write turns");
+}
+
 #[test]
 fn granite_saa_warns_only_when_memory_shortened_the_chunks() {
     let warning = granite_saa_memory_limit_warning(2_940.0, Some(142.0), Some(206.0))

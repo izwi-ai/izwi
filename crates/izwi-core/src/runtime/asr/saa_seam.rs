@@ -87,7 +87,7 @@ pub(super) fn link_seam(
             }
         }
     }
-    let labels = assign_labels(transcript, chunk, &votes, aligned);
+    let labels = complete_labels(transcript, chunk, vote_links(chunk, &votes), !aligned);
 
     if !aligned {
         return SeamLink {
@@ -104,22 +104,13 @@ pub(super) fn link_seam(
     }
 }
 
-/// Map every chunk label to a transcript label. Labels the alignment backs
-/// (most votes first, one chunk label per transcript speaker) come first.
-/// Without an alignment, the chunk's first speaker continues the transcript's
-/// last one: the chunk opens on audio the transcript just ended with. Other
-/// labels take the transcript speaker heard most recently that no label has
-/// claimed yet, and a new number once every known speaker is taken.
-fn assign_labels(
-    transcript: &[SpeakerAttributedAsrTurn],
+/// Chunk labels the alignment backs: most votes first, one chunk label per
+/// transcript speaker, each with a clear majority of its label's votes.
+fn vote_links(
     chunk: &[SpeakerAttributedAsrTurn],
     votes: &HashMap<(&str, &str), usize>,
-    aligned: bool,
-) -> HashMap<String, String> {
+) -> Vec<(String, String)> {
     let local_order = local_speakers(chunk);
-    let mut labels = HashMap::<String, String>::new();
-    let mut claimed = HashSet::<String>::new();
-
     let mut totals = HashMap::<&str, usize>::new();
     for (&(local, _), &count) in votes {
         *totals.entry(local).or_default() += count;
@@ -132,18 +123,41 @@ fn assign_labels(
             .then_with(|| order_of(left_local).cmp(&order_of(right_local)))
             .then_with(|| left_global.cmp(right_global))
     });
+    let mut links = Vec::<(String, String)>::new();
     for (&(local, global), &count) in ranked {
-        if labels.contains_key(local) || claimed.contains(global) {
+        if links
+            .iter()
+            .any(|(linked_local, linked_global)| linked_local == local || linked_global == global)
+        {
             continue;
         }
         if count >= MIN_LABEL_VOTES && count * 2 > totals[local] {
-            labels.insert(local.to_string(), global.to_string());
-            claimed.insert(global.to_string());
+            links.push((local.to_string(), global.to_string()));
         }
     }
+    links
+}
+
+/// Map every chunk label to a transcript label, starting from `links`. With
+/// `continuity`, the chunk's first speaker, when unlinked, continues the
+/// transcript's last one: the chunk opens on audio the transcript just ended
+/// with. Other labels take the transcript speaker heard most recently that no
+/// label has claimed yet, and a new number once every known speaker is taken.
+fn complete_labels(
+    transcript: &[SpeakerAttributedAsrTurn],
+    chunk: &[SpeakerAttributedAsrTurn],
+    links: Vec<(String, String)>,
+    continuity: bool,
+) -> HashMap<String, String> {
+    let local_order = local_speakers(chunk);
+    let mut claimed = links
+        .iter()
+        .map(|(_, global)| global.clone())
+        .collect::<HashSet<String>>();
+    let mut labels = links.into_iter().collect::<HashMap<String, String>>();
 
     let recent = recent_speakers(transcript);
-    if !aligned {
+    if continuity {
         if let (Some(first), Some(last)) = (local_order.first(), recent.first()) {
             if !labels.contains_key(*first) && !claimed.contains(*last) {
                 labels.insert(first.to_string(), last.to_string());
@@ -152,6 +166,14 @@ fn assign_labels(
         }
     }
 
+    // Most words first, then most recent: a voice heard for a sentence must
+    // not take the label of a main speaker who was quiet for a while.
+    let mut words = HashMap::<&str, usize>::new();
+    for turn in transcript {
+        *words.entry(turn.speaker.as_str()).or_default() += turn.text.split_whitespace().count();
+    }
+    let mut by_volume = recent.clone();
+    by_volume.sort_by_key(|speaker| std::cmp::Reverse(words.get(speaker).copied().unwrap_or(0)));
     let mut next_number = transcript
         .iter()
         .filter_map(|turn| speaker_number(&turn.speaker))
@@ -162,7 +184,7 @@ fn assign_labels(
         if labels.contains_key(local) {
             continue;
         }
-        let global = match recent.iter().find(|speaker| !claimed.contains(**speaker)) {
+        let global = match by_volume.iter().find(|speaker| !claimed.contains(**speaker)) {
             Some(speaker) => speaker.to_string(),
             None => {
                 let label = format!("Speaker {next_number}");

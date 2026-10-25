@@ -518,6 +518,14 @@ where
             "finished Granite SAA chunk decode"
         );
 
+        // Transcript text stays out of info logs; at debug it lets a seam
+        // linking change be replayed on a real recording.
+        tracing::debug!(
+            chunk_index = idx + 1,
+            chunk_start_secs = samples_to_seconds_f64(chunk.start_sample, sample_rate),
+            text = transcription.text.as_str(),
+            "Granite SAA chunk text"
+        );
         if language_out.is_none() {
             language_out = transcription.language.clone();
         }
