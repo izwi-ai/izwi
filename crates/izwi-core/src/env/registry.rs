@@ -665,13 +665,6 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer).",
     ),
     CoreEnvVar::new(
-        "IZWI_GRANITE_SAA_REPETITION_PENALTY",
-        Float,
-        "2.0 (the model card's; 1 turns it off)",
-        Once,
-        "Sets the repetition penalty Granite speaker-attributed ASR decodes with (transformers semantics, over prompt and generated tokens).",
-    ),
-    CoreEnvVar::new(
         "IZWI_GRANITE_SPEECH_DTYPE",
         Choice,
         "auto (family/backend default)",

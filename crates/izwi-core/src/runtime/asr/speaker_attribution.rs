@@ -314,15 +314,6 @@ pub(super) fn granite_saa_max_new_tokens_for_duration(duration_secs: f32) -> usi
         .clamp(GRANITE_SAA_MIN_NEW_TOKENS, GRANITE_SAA_MAX_NEW_TOKENS)
 }
 
-/// `IZWI_GRANITE_SAA_REPETITION_PENALTY`, else the card's 2.0.
-pub(super) fn granite_saa_repetition_penalty() -> f32 {
-    static PENALTY: crate::env::ReadOnce<f32> = crate::env::ReadOnce::new(|| {
-        env_positive_f32("IZWI_GRANITE_SAA_REPETITION_PENALTY")
-            .unwrap_or(GRANITE_SAA_REPETITION_PENALTY)
-    });
-    PENALTY.get()
-}
-
 pub(super) fn granite_saa_max_new_tokens(audio: &[f32], sample_rate: u32) -> usize {
     let duration_secs = if sample_rate > 0 {
         audio.len() as f32 / sample_rate as f32
@@ -607,7 +598,6 @@ pub(super) fn granite_saa_transcribe_chunk(
         prefix_text,
         NativeAsrGenerationOptions {
             max_new_tokens,
-            repetition_penalty: Some(granite_saa_repetition_penalty()),
             ..NativeAsrGenerationOptions::default()
         },
         cache,

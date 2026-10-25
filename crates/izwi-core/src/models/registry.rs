@@ -1095,14 +1095,11 @@ pub(crate) struct AsrInvocationWindow {
     pub(crate) max_chunk_seconds: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeAsrGenerationOptions {
     pub max_new_tokens: usize,
     pub stop_token_ids: Vec<u32>,
     pub stop_sequences: Vec<String>,
-    /// transformers-style repetition penalty over prompt and generated
-    /// tokens; only Granite Speech 4.1 honours it.
-    pub repetition_penalty: Option<f32>,
 }
 
 impl Default for NativeAsrGenerationOptions {
@@ -1111,7 +1108,6 @@ impl Default for NativeAsrGenerationOptions {
             max_new_tokens: 768,
             stop_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
-            repetition_penalty: None,
         }
     }
 }
@@ -1138,7 +1134,6 @@ fn granite_speech_asr_options(
         max_new_tokens: options.max_new_tokens,
         stop_token_ids: options.stop_token_ids,
         stop_sequences: options.stop_sequences,
-        repetition_penalty: options.repetition_penalty,
     }
 }
 

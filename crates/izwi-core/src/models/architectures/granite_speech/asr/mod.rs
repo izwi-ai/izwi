@@ -151,13 +151,11 @@ pub struct GraniteSpeechAsrTranscriptionOutput {
     pub diagnostics: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechAsrGenerationOptions {
     pub max_new_tokens: usize,
     pub stop_token_ids: Vec<u32>,
     pub stop_sequences: Vec<String>,
-    /// transformers-style repetition penalty over prompt and generated tokens.
-    pub repetition_penalty: Option<f32>,
 }
 
 impl Default for GraniteSpeechAsrGenerationOptions {
@@ -166,7 +164,6 @@ impl Default for GraniteSpeechAsrGenerationOptions {
             max_new_tokens: 768,
             stop_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
-            repetition_penalty: None,
         }
     }
 }
@@ -1679,7 +1676,6 @@ impl GraniteSpeechAsrModel {
             options.max_new_tokens,
             &options.stop_token_ids,
             &options.stop_sequences,
-            options.repetition_penalty,
             &mut decode,
             cache,
             on_delta,

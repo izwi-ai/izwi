@@ -202,9 +202,6 @@ const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
 const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
 const GRANITE_SAA_NEW_TOKEN_RESERVE: usize = 256;
-/// The model card's repetition penalty for speaker-attributed decoding,
-/// where repetition loops mostly happen.
-const GRANITE_SAA_REPETITION_PENALTY: f32 = 2.0;
 const GRANITE_SAA_TARGET_CHUNK_SECS: f32 = 240.0;
 const GRANITE_SAA_HARD_MAX_CHUNK_SECS: f32 = 510.0;
 /// Audio two consecutive chunks share: enough words for [`saa_seam`] to

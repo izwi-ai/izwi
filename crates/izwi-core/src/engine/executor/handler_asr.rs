@@ -1371,7 +1371,6 @@ impl NativeExecutor {
             max_new_tokens: request.params.max_tokens.max(1),
             stop_token_ids: request.params.stop_token_ids.clone(),
             stop_sequences: request.params.stop_sequences.clone(),
-            repetition_penalty: None,
         }
     }
 

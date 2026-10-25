@@ -1069,7 +1069,6 @@ impl GraniteSpeechRuntime {
         max_new_tokens: usize,
         extra_stop_token_ids: &[u32],
         stop_sequences: &[String],
-        repetition_penalty: Option<f32>,
         decode: &mut dyn FnMut(&[u32]) -> Result<String>,
         cache: &mut PhysicalPagedKvCache,
         on_delta: &mut dyn FnMut(&str),
@@ -1145,20 +1144,13 @@ impl GraniteSpeechRuntime {
         } else {
             0
         });
-        let mut repetition_penalty = repetition_penalty
-            .filter(|penalty| penalty.is_finite() && *penalty > 0.0 && *penalty != 1.0)
-            .map(|penalty| RepetitionPenalty::new(penalty, &input_ids, &logits))
-            .transpose()?;
         let decode_start = Instant::now();
 
         for step in 0..max_steps {
             let step_start = profile_start(profiling);
             let mut step_profile = GraniteSpeechDecodeLoopProfile::default();
             let argmax_start = profile_start(profiling);
-            let token_tensor = match repetition_penalty.as_mut() {
-                Some(penalty) => penalty.next_token(&logits)?,
-                None => argmax_last_token_tensor(&logits)?,
-            };
+            let token_tensor = argmax_last_token_tensor(&logits)?;
             step_profile.argmax = profile_elapsed(argmax_start);
             if deferred_stop_check {
                 deferred_token_tensors.push(token_tensor.clone());
@@ -1448,71 +1440,7 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
 }
 
 fn argmax_last_token_tensor(logits: &Tensor) -> Result<Tensor> {
-    let last = last_token_logits(logits)?;
-    let idx = last.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .reshape((1, 1))
-        .map_err(Error::from)
-}
-
-/// transformers' `RepetitionPenaltyLogitsProcessor`, kept on the device:
-/// every token of the prompt or generated so far has its logit divided by
-/// the penalty when positive and multiplied when negative. The tokens seen
-/// are a device mask, so the deferred and chunked stop checks never read a
-/// token back per step.
-struct RepetitionPenalty {
-    penalty: f64,
-    /// 1.0 where the token was seen, per vocabulary id.
-    seen: Tensor,
-    /// The vocabulary ids, to mark a picked token in `seen`.
-    vocab_ids: Tensor,
-}
-
-impl RepetitionPenalty {
-    fn new(penalty: f32, prompt_ids: &[u32], first_logits: &Tensor) -> Result<Self> {
-        let vocab = last_token_logits(first_logits)?.dim(0)?;
-        let device = first_logits.device();
-        let mut seen = vec![0f32; vocab];
-        for &id in prompt_ids {
-            if let Some(slot) = seen.get_mut(id as usize) {
-                *slot = 1.0;
-            }
-        }
-        let vocab_ids = u32::try_from(vocab)
-            .map_err(|_| Error::InferenceError("Granite Speech vocabulary too large".into()))?;
-        Ok(Self {
-            penalty: f64::from(penalty),
-            seen: Tensor::from_vec(seen, vocab, device)?,
-            vocab_ids: Tensor::arange(0u32, vocab_ids, device)?,
-        })
-    }
-
-    /// The penalized argmax of the last position's logits, as a `[1, 1]`
-    /// u32 tensor like [`argmax_last_token_tensor`]; the token is marked seen.
-    fn next_token(&mut self, logits: &Tensor) -> Result<Tensor> {
-        let last = last_token_logits(logits)?.to_dtype(DType::F32)?;
-        let penalized = last
-            .gt(0.0)?
-            .where_cond(&(&last / self.penalty)?, &(&last * self.penalty)?)?;
-        let adjusted = self.seen.gt(0.0)?.where_cond(&penalized, &last)?;
-        let token = argmax_last_token_tensor(&adjusted.unsqueeze(0)?)?;
-        let picked = self
-            .vocab_ids
-            .eq(&token.reshape((1,))?.broadcast_as(self.vocab_ids.shape())?)?
-            .to_dtype(DType::F32)?;
-        self.seen = self.seen.maximum(&picked)?;
-        Ok(token)
-    }
-}
-
-/// The last position's logits as a `[vocab]` tensor.
-fn last_token_logits(logits: &Tensor) -> Result<Tensor> {
-    Ok(match logits.dims() {
+    let last = match logits.dims() {
         [1, vocab] => logits.reshape((*vocab,))?,
         [1, 1, vocab] => logits.reshape((*vocab,))?,
         [1, seq, vocab] if *seq > 0 => logits.narrow(1, seq - 1, 1)?.reshape((*vocab,))?,
@@ -1526,7 +1454,16 @@ fn last_token_logits(logits: &Tensor) -> Result<Tensor> {
                 "Granite Speech logits expected [1,vocab] or [1,seq,vocab], got {dims:?}"
             )));
         }
-    })
+    };
+    let idx = last.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .reshape((1, 1))
+        .map_err(Error::from)
 }
 
 struct GraniteSpeechEncoder {
@@ -5468,24 +5405,6 @@ mod tests {
 
         assert_eq!(token.dims(), &[1, 1]);
         assert_eq!(token.reshape(()).unwrap().to_scalar::<u32>().unwrap(), 3);
-    }
-
-    #[test]
-    fn repetition_penalty_follows_transformers_semantics() {
-        let logits = |values: Vec<f32>| Tensor::from_vec(values, (1, 1, 5), &Device::Cpu).unwrap();
-        let token = |tensor: Tensor| tensor.reshape(()).unwrap().to_scalar::<u32>().unwrap();
-        // Token 3 was in the prompt: its 5.0 is halved below token 1's 3.0.
-        let first = logits(vec![-1.0, 3.0, 0.0, 5.0, 2.0]);
-        let mut penalty = RepetitionPenalty::new(2.0, &[3, 9_999], &first).unwrap();
-        assert_eq!(token(penalty.next_token(&first).unwrap()), 1);
-        // Token 1 is now seen as well (3.0 -> 1.5), so the seen token 3's
-        // 2.5 beats the unseen token 4's 2.0.
-        assert_eq!(token(penalty.next_token(&first).unwrap()), 3);
-        // A seen negative logit is multiplied, not divided: -1.0 -> -2.0
-        // stays below an unseen -1.5 once token 0 is seen.
-        let negative = logits(vec![-1.0, -9.0, -9.0, -9.0, -1.5]);
-        let mut penalty = RepetitionPenalty::new(2.0, &[0], &negative).unwrap();
-        assert_eq!(token(penalty.next_token(&negative).unwrap()), 4);
     }
 
     #[test]
