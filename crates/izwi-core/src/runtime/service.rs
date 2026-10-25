@@ -17,7 +17,10 @@ use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, RuntimeDeviceAssignment,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
-use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
+use crate::config::{
+    BatchSizePreference, ConcurrencyProfile, EngineConfig, PrefixCachePolicy, ResolvedConcurrency,
+    ResolvedKvCachePolicy,
+};
 use crate::engine::metrics::{
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
     ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES, ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
@@ -228,11 +231,13 @@ pub(crate) fn transient_resources(backend: BackendKind, input_bytes: usize) -> R
         }
         BackendKind::Cuda => {
             // Decode, resample, tokenization, media parsing, and request
-            // construction all occur in host memory before CUDA upload. Keep
-            // the input expansion in the host domain and reserve only the
-            // backend-neutral execution workspace in VRAM.
+            // construction all occur in host memory before CUDA upload. The
+            // device scratch an execution needs is charged per row of each
+            // dispatch (`engine::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW`), not
+            // for the request's life: a queued request held 64 MiB of live
+            // headroom it never allocated, so a burst past headroom / 64 MiB
+            // failed admission with nothing on the device.
             resources.host_bytes = ResourceAmount::Known(host_preparation_bytes);
-            resources.device_bytes = ResourceAmount::Known(BASE_WORKSPACE_BYTES);
         }
     }
     resources
@@ -253,7 +258,6 @@ fn asr_transient_resources(
     audio_secs: Option<f32>,
 ) -> Result<Option<ResourceVector>> {
     use super::lifecycle::asr_envelope;
-    const CUDA_DEVICE_BASE_BYTES: u64 = 64 * 1024 * 1024;
     let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
         return Ok(None);
     };
@@ -290,12 +294,10 @@ fn asr_transient_resources(
             )
         }
         BackendKind::Cuda => {
+            // Dispatch scratch is charged per row of each dispatch; only an
+            // encoder no preparation stage prices stays on the request.
             resources.host_bytes = ResourceAmount::Known(host_bytes);
-            resources.device_bytes = ResourceAmount::Known(
-                CUDA_DEVICE_BASE_BYTES
-                    .checked_add(accelerator_bytes)
-                    .ok_or_else(overflow)?,
-            );
+            resources.device_bytes = ResourceAmount::Known(accelerator_bytes);
         }
     }
     Ok(Some(resources))
@@ -907,6 +909,7 @@ pub struct RuntimeService {
     pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
+    concurrency: ResolvedConcurrency,
 }
 
 pub(crate) struct AdmittedEngineRequest {
@@ -950,6 +953,7 @@ fn bind_request_to_residency(
                 | ModelFamily::WhisperAsr
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()

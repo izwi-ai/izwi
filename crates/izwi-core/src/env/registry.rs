@@ -46,21 +46,21 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Duration,
         "engine per-backend default",
         Startup,
-        "Seconds a realtime ASR session may sit idle before it is closed (u64; invalid ignored).",
+        "Seconds a realtime ASR session may sit idle before it is closed (positive integer; zero or invalid fails startup).",
     ),
     CoreEnvVar::new(
         "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS",
         Duration,
         "engine per-backend default",
         Startup,
-        "Maximum lifetime in seconds of one realtime ASR session (u64; invalid ignored).",
+        "Maximum lifetime in seconds of one realtime ASR session (positive integer; zero or invalid fails startup).",
     ),
     CoreEnvVar::new(
         "IZWI_ASR_REALTIME_MAX_SESSIONS",
         Int,
-        "engine per-backend default",
+        "IZWI_MAX_NUM_SEQS, else 16 on CUDA and 4 on CPU and Metal",
         Startup,
-        "Maximum concurrent realtime ASR sessions (positive integer; 0 or invalid ignored).",
+        "Maximum concurrent native realtime ASR streams (Nemotron, Voxtral Realtime). A WebSocket session over the cap re-transcribes a rolling window and is told so (positive integer; zero or invalid fails startup).",
     ),
     CoreEnvVar::new(
         "IZWI_ASR_REALTIME_NOISE_GATE",
@@ -275,9 +275,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_CUDA_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
-        "Allows shared speculative MTP envelopes inside continuous batches, not just solo rows (auto/off mode).",
+        "Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass.",
     ),
     CoreEnvVar::new(
         "IZWI_CUDA_MTP_QUANTUM",
@@ -995,7 +995,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Startup,
-        "Sets the maximum batch rows: auto or a positive integer; invalid ignored.",
+        "Sets the tensor batch width: auto, or a positive integer that applies as asked (up to 32) even above a family's certified width, with a warning; invalid ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_MAX_CONCURRENT",
@@ -1010,6 +1010,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "4",
         Startup,
         "Maximum models resident at once (residency guardrail; 0 or invalid ignored, floor 1).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_MAX_NUM_SEQS",
+        Int,
+        "0 (automatic: single user on CPU and Metal, VRAM-fitted on CUDA)",
+        Startup,
+        "Sequences served concurrently per model; sizes the scheduler, retained and staged rows, tensor width and realtime ASR quota left automatic, and above 1 turns chunked prefill on unless set.",
     ),
     CoreEnvVar::new(
         "IZWI_MAX_PHYSICAL_IN_FLIGHT",
@@ -1294,7 +1301,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
         "Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset.",
     ),
@@ -1856,7 +1863,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_QWEN38_MTP_IN_CONTINUOUS",
         Mode,
-        "auto",
+        "off",
         Startup,
         "Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset.",
     ),

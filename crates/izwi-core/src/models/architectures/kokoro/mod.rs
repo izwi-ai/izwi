@@ -313,12 +313,27 @@ fn normalize_kokoro_speed(speed: f32) -> Result<f32> {
     Ok(speed.clamp(KOKORO_MIN_SPEED, KOKORO_MAX_SPEED))
 }
 
-fn kokoro_static_token_buckets(prepared: &[KokoroPreparedRequest]) -> Vec<Vec<usize>> {
+/// Rows grouped by exact token width, each group cut into native launches of
+/// at most `max_rows`: the engine may co-batch more rows than one backend
+/// launch takes (the CPU's native width is one), and those rows still run, one
+/// launch after another, inside the same dispatch.
+fn kokoro_static_token_buckets(
+    prepared: &[KokoroPreparedRequest],
+    max_rows: usize,
+) -> Vec<Vec<usize>> {
     let mut buckets = BTreeMap::<usize, Vec<usize>>::new();
     for (index, row) in prepared.iter().enumerate() {
         buckets.entry(row.token_ids.len()).or_default().push(index);
     }
-    buckets.into_values().collect()
+    buckets
+        .into_values()
+        .flat_map(|bucket| {
+            bucket
+                .chunks(max_rows.max(1))
+                .map(<[usize]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn kokoro_duration_buckets(expanded_frames: &[usize]) -> Vec<Vec<usize>> {
@@ -492,6 +507,9 @@ pub struct KokoroPreparedRequest {
     pub token_ids: Vec<u32>,
     pub ref_style: Tensor,
     pub speed: f32,
+    /// Seeds the decoder's harmonic-source noise, so the same seed repeats
+    /// the same audio alone or in a batch; `None` draws fresh noise.
+    pub rng_seed: Option<u64>,
 }
 
 impl KokoroPreparedRequest {
@@ -784,6 +802,7 @@ impl KokoroTtsModel {
             token_ids,
             ref_style,
             speed,
+            rng_seed: None,
         })
     }
 
@@ -869,15 +888,8 @@ impl KokoroTtsModel {
         if prepared.is_empty() {
             return Ok(Vec::new());
         }
-        let max_batch_size = self.max_native_batch_size();
-        if prepared.len() > max_batch_size {
-            return Err(Error::Overloaded(format!(
-                "Kokoro native batch width {} exceeds this backend's static limit {max_batch_size}",
-                prepared.len()
-            )));
-        }
         let mut results = vec![None; prepared.len()];
-        let token_buckets = kokoro_static_token_buckets(prepared);
+        let token_buckets = kokoro_static_token_buckets(prepared, self.max_native_batch_size());
         for bucket in token_buckets {
             self.generate_token_bucket(prepared, &bucket, &mut results)?;
         }
@@ -937,7 +949,10 @@ impl KokoroTtsModel {
                 .collect::<Result<Vec<_>>>()?;
             let style_refs = style_rows.iter().collect::<Vec<_>>();
             let style = Tensor::cat(&style_refs, 0).map_err(Error::from)?;
-            let seeds = vec![None; duration_bucket.len()];
+            let seeds = duration_bucket
+                .iter()
+                .map(|&row| rows[row].rng_seed)
+                .collect::<Vec<_>>();
             let t2 = Instant::now();
             let samples = self.decoder.forward_batch(&asr, &f0, &n, &style, &seeds)?;
             log_kokoro_profile("tts.decoder", t2.elapsed());
@@ -1490,6 +1505,7 @@ mod tests {
             ref_style: Tensor::zeros((1, 256), DType::F32, &candle_core::Device::Cpu)
                 .expect("style"),
             speed: 1.0,
+            rng_seed: None,
         }
     }
 
@@ -1510,8 +1526,32 @@ mod tests {
             prepared_with_width(3),
         ];
         assert_eq!(
-            kokoro_static_token_buckets(&prepared),
+            kokoro_static_token_buckets(&prepared, 8),
             vec![vec![1, 4], vec![3], vec![0, 2]]
+        );
+    }
+
+    #[test]
+    fn token_buckets_wider_than_the_native_width_split_into_launches() {
+        // The engine co-batches two rows on the CPU, whose native Kokoro width
+        // is one: both rows must still run, as two launches, not fail the batch.
+        let prepared = vec![
+            prepared_with_width(7),
+            prepared_with_width(7),
+            prepared_with_width(3),
+            prepared_with_width(7),
+        ];
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 1),
+            vec![vec![2], vec![0], vec![1], vec![3]]
+        );
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 2),
+            vec![vec![2], vec![0, 1], vec![3]]
+        );
+        assert_eq!(
+            kokoro_static_token_buckets(&prepared, 0),
+            kokoro_static_token_buckets(&prepared, 1)
         );
     }
 
@@ -1798,6 +1838,54 @@ mod tests {
             .expect("run native Kokoro B=2 generation");
         assert_eq!(outputs.len(), 2);
         assert!(outputs.iter().all(|output| !output.samples.is_empty()));
+    }
+
+    /// A seeded row repeats its solo audio inside a batch: the same text with
+    /// two seeds shares one decoder bucket, and each row matches its solo run.
+    #[test]
+    fn kokoro_local_seeded_rows_batch_like_solo_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu"))
+            .expect("detect cpu device for Kokoro seeded batch");
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        let seeded = |seed| {
+            let mut prepared = model
+                .prepare_request("Hello world.", Some("af_heart"), Some("en-US"), 1.0)
+                .expect("prepare a seeded Kokoro row");
+            prepared.rng_seed = Some(seed);
+            prepared
+        };
+        let solo = |seed| {
+            model
+                .generate_prepared_batch(&[seeded(seed)])
+                .expect("solo Kokoro synthesis")
+                .pop()
+                .expect("one row")
+                .samples
+        };
+        let (first, second) = (solo(7), solo(8));
+        assert_eq!(first, solo(7), "a seed repeats its audio");
+        assert_ne!(first, second, "different seeds draw different noise");
+
+        let batch = model
+            .generate_prepared_batch(&[seeded(7), seeded(8)])
+            .expect("batched Kokoro synthesis");
+        for (row, expected) in batch.iter().zip([&first, &second]) {
+            assert_eq!(row.samples.len(), expected.len());
+            let max_diff = row
+                .samples
+                .iter()
+                .zip(expected.iter())
+                .map(|(batched, solo)| (batched - solo).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "batched row differs from solo by {max_diff}"
+            );
+        }
     }
 
     #[test]

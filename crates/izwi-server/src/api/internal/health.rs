@@ -23,6 +23,9 @@ pub struct HealthResponse {
 pub struct RuntimeBackendResponse {
     pub build_git_sha: Option<&'static str>,
     pub memory: RuntimeMemoryResponse,
+    /// The concurrency the runtime resolved: `max_num_seqs` and every limit
+    /// it sized.
+    pub concurrency: izwi_core::ResolvedConcurrency,
     pub chat_concurrency_policy: EngineChatConcurrencyPolicySnapshot,
     pub requested_backend: String,
     pub requested_backend_available: bool,
@@ -122,6 +125,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
         runtime: RuntimeBackendResponse {
             build_git_sha: option_env!("IZWI_BUILD_GIT_SHA"),
             memory,
+            concurrency: state.runtime.resolved_concurrency().clone(),
             chat_concurrency_policy: state.runtime.chat_concurrency_policy(),
             requested_backend: context.preference.as_str().to_string(),
             requested_backend_available,
@@ -237,6 +241,17 @@ mod tests {
                 system_available_bytes: Some(16 * 1024 * 1024 * 1024),
                 reserved_bytes: 2 * 1024 * 1024 * 1024,
             },
+            concurrency: izwi_core::ResolvedConcurrency {
+                profile: izwi_core::ConcurrencyProfile::MultiUser,
+                max_num_seqs: Some(16),
+                scheduler_rows: 16,
+                retained_sequences: 16,
+                staged_transactions: 8,
+                tensor_width: 16,
+                non_chat_row_width: 16,
+                realtime_asr_sessions: 16,
+                chunked_prefill: true,
+            },
             chat_concurrency_policy: EngineChatConcurrencyPolicySnapshot {
                 cuda_incremental_chat_requested: true,
                 cuda_incremental_chat_effective: true,
@@ -335,6 +350,8 @@ mod tests {
             value["loaded_tts_model"]["model_family"],
             serde_json::json!("vibevoice_tts")
         );
+        assert_eq!(value["concurrency"]["profile"], "multi_user");
+        assert_eq!(value["concurrency"]["max_num_seqs"], 16);
         assert_eq!(
             value["chat_concurrency_policy"]["cuda_incremental_chat_effective"],
             true

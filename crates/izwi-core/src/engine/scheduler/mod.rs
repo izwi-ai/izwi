@@ -2036,6 +2036,9 @@ impl Scheduler {
                     .min(metadata.workspace_prefill_token_cap.unwrap_or(usize::MAX));
             }
             if target_tokens == 0 {
+                // This request was taken off the waiting queue: put it back
+                // for a later step instead of dropping it.
+                deferred_waiting.push(request_id);
                 break;
             }
 
@@ -5867,6 +5870,39 @@ mod tests {
         let first = scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(first.num_computed_tokens, 0);
         assert_eq!(first.num_tokens, 4);
+    }
+
+    /// A waiting request whose step budget leaves it no prefill tokens stays
+    /// queued for a later step (it was dequeued, then dropped).
+    #[test]
+    fn a_waiting_request_with_no_prefill_tokens_stays_queued() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: true,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::Chat, "zero-budget", Priority::Normal);
+        request.prompt_tokens = vec![7; 16];
+        assert!(scheduler.add_request(&request));
+        allow_incremental_prefill(&mut scheduler, &request.id);
+        scheduler
+            .requests
+            .get_mut(&request.id)
+            .unwrap()
+            .workspace_prefill_token_cap = Some(0);
+        assert!(scheduler.schedule().prefill_requests.is_empty());
+
+        scheduler
+            .requests
+            .get_mut(&request.id)
+            .unwrap()
+            .workspace_prefill_token_cap = None;
+        let scheduled = scheduler.schedule().prefill_requests;
+        assert_eq!(scheduled.len(), 1, "the request is still waiting");
+        assert_eq!(scheduled[0].request_id, request.id);
     }
 
     /// A prefill chunk keeps its configured size while other rows decode

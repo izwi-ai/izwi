@@ -1460,6 +1460,84 @@ impl RuntimeService {
         }
     }
 
+    /// Granite Speech 5.0: decode the audio and plan its chunks on a host
+    /// worker, then dispatch the chunked atomic stage one chunk at a time, so
+    /// a long file no longer holds the device for its whole length and the
+    /// upload is never decoded on the device thread.
+    pub(super) async fn prepare_granite_speech5_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::GraniteSpeech5Asr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Granite Speech 5.0 variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Granite Speech 5.0 model {variant} has no effective context"
+                ))
+            })?;
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model,
+                    variant,
+                    &request,
+                    Some(context_limit),
+                )?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &capabilities,
+                    request.streaming,
+                );
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                request.install_prepared_asr_long_form_atomic(plan)?;
+                Ok(request)
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| {
+                Error::Overloaded("Granite Speech 5.0 retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, spec, observation)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     pub(super) async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1477,6 +1555,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_granite_speech5_asr_shape_for_binding(request, job)
             .await?;
         let (request, job) = self
             .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)

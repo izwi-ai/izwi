@@ -919,7 +919,7 @@ mod tests {
                 },
                 models_directory: directory.to_path_buf(),
             },
-            max_active_invocations: 4,
+            max_active_invocations: Some(4),
             max_request_bytes: 4096,
             max_retained_attempts: 4,
             attempt_retention_secs: 30,

@@ -831,6 +831,38 @@ fn loaded_launch_policy_matrix_is_group_exclusive_without_concurrency_evidence()
     }
 }
 
+/// An operator's explicit width reaches a chat model above its family's
+/// certified width (CPU Qwen3 is certified at 2); an automatic or
+/// `max_num_seqs`-derived width still clamps to it.
+#[test]
+fn an_explicit_width_runs_above_the_certified_chat_width() {
+    let decode_width = |explicit: bool| {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1)
+            .unwrap()
+            .with_chat_tensor_batch_size(6)
+            .with_explicit_tensor_width(explicit);
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(46),
+            ModelInstanceId::new(1),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cpu, 2);
+        draft
+            .execution_contracts(CapabilityKind::Chat)
+            .unwrap()
+            .iter()
+            .flat_map(|contract| contract.stages.to_vec())
+            .map(|stage| stage.max_batch_size)
+            .max()
+            .unwrap()
+    };
+    assert_eq!(decode_width(false), 2);
+    assert_eq!(decode_width(true), 6);
+}
+
 /// Built as the runtime builds it on each backend, a chat model's
 /// stages run at most its family's certified width and every other
 /// capability at the engine rows' width (EXE-F7).
@@ -2483,6 +2515,63 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
             .iter()
             .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit));
     }
+}
+
+/// Granite Speech 5.0 runs on the scalar adapter, whose ASR graph is the
+/// chunked atomic stage for every request: a long file dispatches one chunk
+/// at a time (it used to hold the device for the whole file), and the normal
+/// and long-form requirements seal the same graph, so the load keeps one
+/// invocation pool. Nemotron's scalar ASR keeps its single-dispatch stage.
+#[test]
+fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::GraniteSpeech502B,
+            backend,
+        )
+        .unwrap();
+        let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        for contract in [&normal, &long] {
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+            assert_eq!(contract.stages.len(), 1);
+            let stage = &contract.stages[0];
+            assert_eq!(stage.name, "asr.long_form.chunked", "{backend:?}");
+            assert_eq!(stage.selector, StageWorkSelector::Atomic);
+            assert_eq!(stage.progress, StageProgressKind::Iterative);
+            assert_eq!(
+                stage.membership_safe_point,
+                MembershipSafePoint::QuantumBoundary
+            );
+        }
+        assert_eq!(
+            crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+        );
+    }
+    let nemotron = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(7),
+        ModelInstanceId::new(2),
+        ModelVariant::Nemotron35AsrStreaming06B,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let scalar = nemotron
+        .capabilities
+        .get(&CapabilityKind::Asr)
+        .unwrap()
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(scalar.stages[0].name, "asr.scalar");
+    assert_eq!(scalar.stages[0].progress, StageProgressKind::Atomic);
 }
 
 #[test]

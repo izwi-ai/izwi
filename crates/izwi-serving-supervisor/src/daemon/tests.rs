@@ -65,7 +65,7 @@ fn config(assignment: DeviceAssignment, binary: WorkerBinaryFlavor) -> NodeConfi
                 },
                 models_directory: PathBuf::from("/models"),
             },
-            max_active_invocations: 1,
+            max_active_invocations: Some(1),
             max_request_bytes: 1024,
             max_retained_attempts: 1,
             attempt_retention_secs: 60,

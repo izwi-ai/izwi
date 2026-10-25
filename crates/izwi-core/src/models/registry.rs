@@ -72,8 +72,9 @@ use crate::models::architectures::lfm25_audio::{
 };
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
-    NemotronOfflinePhysicalStateSpec, NemotronRealtimePhysicalStateSpec,
-    NemotronRealtimeResourceReservation, NemotronStreamingState,
+    NemotronOfflinePhysicalStateSpec, NemotronRealtimeBatchInput, NemotronRealtimeBatchRow,
+    NemotronRealtimePhysicalStateSpec, NemotronRealtimeResourceReservation,
+    NemotronRealtimeStreamEvent, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
@@ -1015,6 +1016,18 @@ impl NativeAsrDecodeState {
 
 pub enum NativeAsrRealtimeState {
     Nemotron(NemotronStreamingState),
+}
+
+fn native_realtime_events(events: Vec<NemotronRealtimeStreamEvent>) -> Vec<NativeAsrRealtimeEvent> {
+    events
+        .into_iter()
+        .map(|event| NativeAsrRealtimeEvent {
+            delta: event.delta,
+            text: event.text,
+            is_final: event.is_final,
+            chunk_index: event.chunk_index,
+        })
+        .collect()
 }
 
 impl NativeAsrRealtimeState {
@@ -2676,20 +2689,45 @@ impl NativeAsrModel {
         sample_rate: u32,
     ) -> Result<Vec<NativeAsrRealtimeEvent>> {
         match (self, state) {
-            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => Ok(model
-                .push_stream_samples(state, samples, sample_rate)?
-                .into_iter()
-                .map(|event| NativeAsrRealtimeEvent {
-                    delta: event.delta,
-                    text: event.text,
-                    is_final: event.is_final,
-                    chunk_index: event.chunk_index,
-                })
-                .collect()),
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => Ok(
+                native_realtime_events(model.push_stream_samples(state, samples, sample_rate)?),
+            ),
             _ => Err(Error::InvalidInput(
                 "ASR realtime stream state does not match loaded ASR model".to_string(),
             )),
         }
+    }
+
+    /// Pushes audio into several realtime streams of this model in one model
+    /// call, one `(state, samples, sample_rate)` per row; the result holds
+    /// each row's events, in row order.
+    pub fn push_realtime_stream_samples_batch(
+        &self,
+        rows: &mut [(&mut NativeAsrRealtimeState, &[f32], u32)],
+    ) -> Result<Vec<Vec<NativeAsrRealtimeEvent>>> {
+        let Self::Nemotron(model) = self else {
+            return Err(Error::InvalidInput(
+                "ASR realtime stream state does not match loaded ASR model".to_string(),
+            ));
+        };
+        let mut batch = rows
+            .iter_mut()
+            .map(|(state, samples, sample_rate)| {
+                let NativeAsrRealtimeState::Nemotron(state) = &mut **state;
+                NemotronRealtimeBatchRow {
+                    state,
+                    input: NemotronRealtimeBatchInput::Push {
+                        samples,
+                        sample_rate: *sample_rate,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(model
+            .run_realtime_batch(&mut batch)?
+            .into_iter()
+            .map(native_realtime_events)
+            .collect())
     }
 
     pub fn finish_realtime_stream(
@@ -2697,16 +2735,9 @@ impl NativeAsrModel {
         state: &mut NativeAsrRealtimeState,
     ) -> Result<Vec<NativeAsrRealtimeEvent>> {
         match (self, state) {
-            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => Ok(model
-                .finish_stream(state)?
-                .into_iter()
-                .map(|event| NativeAsrRealtimeEvent {
-                    delta: event.delta,
-                    text: event.text,
-                    is_final: event.is_final,
-                    chunk_index: event.chunk_index,
-                })
-                .collect()),
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                Ok(native_realtime_events(model.finish_stream(state)?))
+            }
             _ => Err(Error::InvalidInput(
                 "ASR realtime stream state does not match loaded ASR model".to_string(),
             )),

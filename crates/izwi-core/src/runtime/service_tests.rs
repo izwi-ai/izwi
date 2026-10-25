@@ -2518,6 +2518,48 @@ async fn batch_pipeline_observation_records_pipeline_telemetry() {
     assert_eq!(snapshot.pipelines.stages_recorded, 8);
 }
 
+/// Admitted CUDA requests hold no device headroom while they wait:
+/// sixteen fit beside 256 MiB of free device memory (each used to claim
+/// 64 MiB of it for its whole life, so the fifth was refused).
+#[test]
+fn concurrent_cuda_requests_do_not_claim_device_headroom() {
+    use crate::engine::{
+        CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
+        ReservationOwner, ResourceAuthority,
+    };
+    #[derive(Debug)]
+    struct FixedProvider(PhysicalCapacitySnapshot);
+    impl PhysicalCapacityProvider for FixedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            self.0
+        }
+    }
+    let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedProvider(
+        PhysicalCapacitySnapshot {
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64 << 30),
+                device_bytes: ResourceAmount::Known(24 << 30),
+                ..ResourceVector::zero()
+            },
+            available: ResourceVector {
+                host_bytes: ResourceAmount::Known(32 << 30),
+                device_bytes: ResourceAmount::Known(256 << 20),
+                ..ResourceVector::zero()
+            },
+            source: CapacitySource::Test,
+        },
+    ))));
+    let requests = (0..16)
+        .map(|index| {
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, format!("request-{index}")),
+                transient_resources(BackendKind::Cuda, 4096),
+            )
+        })
+        .collect::<Result<Vec<_>>>();
+    assert!(requests.is_ok(), "{:?}", requests.err());
+}
+
 #[test]
 fn transient_estimates_are_fully_known_for_every_backend() {
     const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2542,10 +2584,8 @@ fn transient_estimates_are_fully_known_for_every_backend() {
         cuda.host_bytes,
         ResourceAmount::Known(host_preparation_bytes)
     );
-    assert_eq!(
-        cuda.device_bytes,
-        ResourceAmount::Known(BASE_WORKSPACE_BYTES)
-    );
+    // Device scratch is charged per dispatched row, not per request.
+    assert_eq!(cuda.device_bytes, ResourceAmount::Known(0));
 }
 
 #[test]
@@ -2762,6 +2802,75 @@ fn core_audio_requests_include_decoder_workspace_in_job_authorization() {
 }
 
 #[test]
+fn max_num_seqs_sizes_every_automatic_limit() {
+    let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+    if std::env::var_os("IZWI_ASR_REALTIME_MAX_SESSIONS").is_some() {
+        return;
+    }
+    let single = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = single.resolved_concurrency();
+    assert_eq!(
+        concurrency.profile,
+        crate::config::ConcurrencyProfile::SingleUser
+    );
+    assert_eq!(concurrency.max_num_seqs, None);
+    assert_eq!(concurrency.scheduler_rows, 8);
+    assert_eq!(concurrency.realtime_asr_sessions, 4);
+
+    let multi = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_num_seqs: Some(5),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = multi.resolved_concurrency();
+    assert_eq!(
+        concurrency.profile,
+        crate::config::ConcurrencyProfile::MultiUser
+    );
+    assert_eq!(concurrency.max_num_seqs, Some(5));
+    assert_eq!(concurrency.scheduler_rows, 5);
+    assert_eq!(concurrency.retained_sequences, 5);
+    assert_eq!(concurrency.tensor_width, 5);
+    assert_eq!(concurrency.realtime_asr_sessions, 5);
+    assert_eq!(multi.config().max_retained_sequences, 5);
+    // The engine width is the knob's; each chat family still caps it.
+    assert_eq!(multi.adapter_registry.max_chat_tensor_batch_size(), 5);
+
+    // Explicit limits keep their values.
+    let explicit = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_num_seqs: Some(5),
+        max_scheduler_batch_size: 3,
+        max_batch_size: crate::config::BatchSizePreference::fixed(2).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = explicit.resolved_concurrency();
+    assert_eq!(concurrency.scheduler_rows, 3);
+    assert_eq!(concurrency.retained_sequences, 5);
+    assert_eq!(concurrency.tensor_width, 2);
+
+    // `max_num_seqs` keeps speech models at their certified CPU width; an
+    // explicit width runs them (and chat) as asked, above the CPU ceiling.
+    assert_eq!(multi.resolved_concurrency().non_chat_row_width, 2);
+    let wide = RuntimeService::new(EngineConfig {
+        backend: crate::backends::BackendPreference::Cpu,
+        max_batch_size: crate::config::BatchSizePreference::fixed(12).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let concurrency = wide.resolved_concurrency();
+    assert_eq!(concurrency.tensor_width, 12);
+    assert_eq!(concurrency.non_chat_row_width, 12);
+    assert_eq!(wide.tts_row_width(), 12);
+}
+
+#[test]
 fn automatic_staged_rows_resolve_to_the_step_launch_width() {
     // CUDA: width 8, one candidate, 316 memory-derived rows on an H100.
     assert_eq!(automatic_staged_transaction_rows(8, 1, 316), 8);
@@ -2966,6 +3075,7 @@ fn kokoro_engine_reservation_follows_the_prepared_chunks() {
         )
         .unwrap(),
         speed: 1.0,
+        rng_seed: None,
     };
     let prepared = crate::engine::KokoroPreparedText {
         source_text: "ab".into(),

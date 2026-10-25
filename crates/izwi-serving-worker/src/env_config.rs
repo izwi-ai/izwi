@@ -144,7 +144,7 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
     // Admission and lifecycle
     var(
         "IZWI_WORKER_MAX_ACTIVE",
-        "1",
+        "IZWI_MAX_NUM_SEQS, else the loaded model's rows",
         "Concurrent invocations (non-zero).",
     ),
     var(
@@ -154,7 +154,7 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
     ),
     var(
         "IZWI_WORKER_MAX_RETAINED_ATTEMPTS",
-        "1024",
+        "1024, raised to the active invocations",
         "Finished attempts kept for status queries.",
     ),
     var(
@@ -296,8 +296,13 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
         "Prefix cache page budget.",
     ),
     var(
+        "IZWI_MAX_NUM_SEQS",
+        "automatic per backend",
+        "Sequences the engine serves concurrently; also the default IZWI_WORKER_MAX_ACTIVE.",
+    ),
+    var(
         "IZWI_ENABLE_CHUNKED_PREFILL",
-        "false",
+        "true when more than one sequence is requested",
         "Split long prompts into prefill chunks.",
     ),
     var(
@@ -348,7 +353,7 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
     // Realtime ASR sessions
     var(
         ENV_ASR_REALTIME_MAX_SESSIONS,
-        "16 on CUDA, 4 on CPU and Metal",
+        "IZWI_MAX_NUM_SEQS, else 16 on CUDA and 4 on CPU and Metal",
         "Concurrent realtime ASR sessions (also the state arena rows a load reserves).",
     ),
     var(

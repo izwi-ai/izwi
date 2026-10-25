@@ -15,9 +15,9 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_ASR_CHUNK_MAX_SECS` | number | `30` | first use | Sets the hard max long-form ASR chunk length in seconds; also used by diarization and LFM2.5 chunking. Non-positive ignored. |
 | `IZWI_ASR_CHUNK_OVERLAP_SECS` | number | `3` | first use | Sets the overlap in seconds between consecutive long-form ASR chunks; also used by diarization and LFM2.5 chunking. |
 | `IZWI_ASR_CHUNK_TARGET_SECS` | number | `24` | first use | Sets the preferred long-form ASR chunk length in seconds before silence-split search; also used by diarization and LFM2.5. |
-| `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | duration | engine per-backend default | startup | Seconds a realtime ASR session may sit idle before it is closed (u64; invalid ignored). |
-| `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | duration | engine per-backend default | startup | Maximum lifetime in seconds of one realtime ASR session (u64; invalid ignored). |
-| `IZWI_ASR_REALTIME_MAX_SESSIONS` | integer | engine per-backend default | startup | Maximum concurrent realtime ASR sessions (positive integer; 0 or invalid ignored). |
+| `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | duration | engine per-backend default | startup | Seconds a realtime ASR session may sit idle before it is closed (positive integer; zero or invalid fails startup). |
+| `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | duration | engine per-backend default | startup | Maximum lifetime in seconds of one realtime ASR session (positive integer; zero or invalid fails startup). |
+| `IZWI_ASR_REALTIME_MAX_SESSIONS` | integer | IZWI_MAX_NUM_SEQS, else 16 on CUDA and 4 on CPU and Metal | startup | Maximum concurrent native realtime ASR streams (Nemotron, Voxtral Realtime). A WebSocket session over the cap re-transcribes a rolling window and is told so (positive integer; zero or invalid fails startup). |
 | `IZWI_ASR_REALTIME_NOISE_GATE` | flag | `true` | first use | Silences non-speech before it reaches a realtime ASR model that hallucinates on it (Voxtral), at a 500 ms transcript delay; false lets noise reach the model. |
 | `IZWI_ASR_STREAM_CHUNK_MAX_SECS` | number | 3.2 (audio <=12s) else min(long-form max, 8) | first use | Overrides the hard max of low-latency streaming ASR chunks; setting any STREAM_CHUNK var disables the single-chunk shortcut. |
 | `IZWI_ASR_STREAM_CHUNK_MIN_SECS` | number | 1.0 (audio <=12s) else 2.0 | first use | Overrides the minimum chunk length in seconds for low-latency streaming ASR chunk planning. |
@@ -48,7 +48,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_MTP` | auto/flag | `auto` | startup | Enables the multi-token-prediction (MTP) head; an explicit true value also asks Qwen3.8 for MTP over graph decode. |
 | `IZWI_CUDA_MTP_ADAPTIVE` | flag | `true` | startup | Enables adaptive MTP speculation (backs off drafting when acceptance is poor). |
 | `IZWI_CUDA_MTP_DRAFT_TOKENS` | integer | `1` | startup | Number of MTP draft tokens per step (1 to 3; other values are a startup error). |
-| `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Allows shared speculative MTP envelopes inside continuous batches, not just solo rows (auto/off mode). |
+| `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass. |
 | `IZWI_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Enables the quantum (multi-step) MTP decode path (auto/off mode). |
 | `IZWI_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Enables packed (fused) projection weights on CUDA (auto/off mode). |
 | `IZWI_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error. |
@@ -150,9 +150,10 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_LOADING_WORKERS` | integer | 0 (automatic) | startup | Number of loader worker threads; 0 picks automatically (invalid = startup error). |
 | `IZWI_MANAGED_CHAT_CLAIM_QUANTUM_TOKENS` | integer | `1024` | startup | Sets the token quantum for managed chat KV claims; 0 restores full up-front claims; unparsable keeps 1024. |
 | `IZWI_MANAGED_PREFIX_CACHE_SALT` | text | `unset` | startup | Salt mixed into managed prefix-cache keys to isolate cache entries. |
-| `IZWI_MAX_BATCH_SIZE` | choice | `auto` | startup | Sets the maximum batch rows: auto or a positive integer; invalid ignored. |
+| `IZWI_MAX_BATCH_SIZE` | choice | `auto` | startup | Sets the tensor batch width: auto, or a positive integer that applies as asked (up to 32) even above a family's certified width, with a warning; invalid ignored. |
 | `IZWI_MAX_CONCURRENT` | integer | `100` | startup | Maximum concurrent HTTP requests (legacy alias MAX_CONCURRENT_REQUESTS; 0 or invalid ignored). |
 | `IZWI_MAX_LOADED_MODELS` | integer | `4` | startup | Maximum models resident at once (residency guardrail; 0 or invalid ignored, floor 1). |
+| `IZWI_MAX_NUM_SEQS` | integer | 0 (automatic: single user on CPU and Metal, VRAM-fitted on CUDA) | startup | Sequences served concurrently per model; sizes the scheduler, retained and staged rows, tensor width and realtime ASR quota left automatic, and above 1 turns chunked prefill on unless set. |
 | `IZWI_MAX_PHYSICAL_IN_FLIGHT` | integer | `1` | startup | Engine-wide ceiling on overlapping physical model launches (1 to 1024; invalid ignored). |
 | `IZWI_MAX_PREFIX_CACHE_PAGES` | integer | unset (automatic) | startup | Prefix-cache page budget; 0 or invalid ignored, leaving the automatic budget. |
 | `IZWI_MAX_PREFIX_SNAPSHOTS` | integer | `8` | startup | Caps committed hybrid recurrent-state prefix snapshots per model (0..=1024; 0 keeps hybrid state private). |
@@ -193,7 +194,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_PERFORMANCE_CUDA_MTP` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP (canonical unset only); a true value also requests the Qwen3.8 MTP head explicitly. |
 | `IZWI_PERFORMANCE_CUDA_MTP_ADAPTIVE` | flag | `true` | startup | Deprecated alias of IZWI_CUDA_MTP_ADAPTIVE; first non-empty alias is used when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_MTP_DRAFT_TOKENS` | integer | `1` | startup | Deprecated alias of IZWI_CUDA_MTP_DRAFT_TOKENS (1 to 3), used only when the canonical name is unset. |
-| `IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
+| `IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_QUANTUM, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_PACKED_PROJECTIONS, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Deprecated alias of IZWI_CUDA_PROJECTION_BACKEND (auto, q8, native_fp8), used only when the canonical name is unset. |
@@ -270,7 +271,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN38_MTP` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP (canonical unset only); a true value also requests the Qwen3.8 MTP head explicitly. |
 | `IZWI_QWEN38_MTP_ADAPTIVE` | flag | `true` | startup | Deprecated alias of IZWI_CUDA_MTP_ADAPTIVE; first non-empty alias is used when the canonical name is unset. |
 | `IZWI_QWEN38_MTP_DRAFT_TOKENS` | integer | `1` | startup | Deprecated alias of IZWI_CUDA_MTP_DRAFT_TOKENS (1 to 3), used only when the canonical name is unset. |
-| `IZWI_QWEN38_MTP_IN_CONTINUOUS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
+| `IZWI_QWEN38_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Deprecated alias of IZWI_CUDA_MTP_IN_CONTINUOUS, used only when the canonical name is unset. |
 | `IZWI_QWEN38_MTP_QUANTUM` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_MTP_QUANTUM, used only when the canonical name is unset. |
 | `IZWI_QWEN38_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_PACKED_PROJECTIONS, used only when the canonical name is unset. |
 | `IZWI_QWEN38_PREFILL_CHUNK_SIZE` | integer | 1024 on CUDA with the FP8 prefill GEMM, else 256 | model load | Sets the Qwen3.8 prefill forward chunk size in tokens (max 2048; 0 or invalid ignored). |

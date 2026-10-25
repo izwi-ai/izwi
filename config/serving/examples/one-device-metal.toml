@@ -29,7 +29,9 @@ bind = "127.0.0.1:9471"
 binary = "metal"
 credential_id = "example-chat-metal-credential-1"
 bearer_token_env = "REPLACE_IZWI_WORKER_CHAT_METAL_1_TOKEN"
-max_active_invocations = 1
+# max_active_invocations: unset, the worker admits as many invocations as
+# its loaded model batches (IZWI_MAX_NUM_SEQS, else the engine rows); set it
+# to pin the worker's capacity.
 max_request_bytes = 1048576
 max_retained_attempts = 128
 attempt_retention_secs = 300

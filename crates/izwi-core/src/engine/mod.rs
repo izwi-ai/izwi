@@ -2288,6 +2288,64 @@ impl Engine {
                             "Granite Speech request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
+                } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeech5Asr
+                    && request.prepared_asr_execution_shape().is_none()
+                {
+                    // Decode and plan off the device, then dispatch the
+                    // chunked stage one chunk at a time.
+                    let model_for_shape = model.clone();
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct Granite Speech 5.0 preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let capabilities = executor::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let plan = executor::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &capabilities,
+                            request.streaming,
+                        );
+                        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                        request.install_prepared_asr_long_form_atomic(plan)?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Granite Speech 5.0 request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
                 }
                 request.install_asr_execution_model(variant, model)?;
             }

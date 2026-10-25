@@ -310,9 +310,10 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         )
         .only(GRANITE_SPEAKER_ATTRIBUTED)
         .target(Target::PipelineRunner),
-        // One atomic invocation on leased decoder pages; long audio is
-        // chunked inside the dispatch.
+        // One atomic invocation per chunk on leased decoder pages; long
+        // audio dispatches one chunk at a time.
         row(F::GraniteSpeech5Asr, C::Asr, Loaded::Scalar, Invocation).chunked(),
+        // Long audio is chunked inside the dispatch.
         row(F::Voxtral, C::Asr, Loaded::Scalar, Invocation).chunked(),
         row(
             F::Voxtral,

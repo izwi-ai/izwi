@@ -1439,7 +1439,11 @@ impl NativeExecutor {
                     .into_iter()
                     .map(|step| (step.finished, step.frames_generated))
                     .collect(),
-                vec![result.acoustic_launch_width, result.lm_launch_width],
+                result
+                    .acoustic_launch_widths
+                    .into_iter()
+                    .chain(result.lm_launch_widths)
+                    .collect(),
             )
         } else {
             unreachable!("Voxtral TTS cohort has one physical phase")
@@ -4391,6 +4395,7 @@ mod tests {
             )
             .unwrap(),
             speed: 1.0,
+            rng_seed: None,
         };
         let row = |chunks: Vec<KokoroPreparedRequest>| crate::engine::KokoroPreparedText {
             source_text: "x".into(),

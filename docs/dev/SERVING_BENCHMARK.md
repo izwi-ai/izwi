@@ -216,6 +216,35 @@ Metal and CUDA the physical admission still launches one dispatch at a
 time, so the device time a long dispatch holds is bounded by the chunking
 above, not by the lane drivers.
 
+Physical admission hands the device to the loaded models in weighted-fair
+order, the policy the device thread uses: each model is charged for the time
+it holds the device divided by its workload class's weight, and the waiting
+model with the least charge goes next. Direct runtime stages (encoders,
+realtime pushes, diarization) are weighed the same way instead of jumping the
+queue as control jobs. This matters when one model has several dispatches
+waiting. Beside a long transcription, each lane keeps one dispatch in flight,
+so the device still alternates, and the gap tail is one encoder window. On an
+M1 Pro, chat beside a 6-minute Whisper transcription finished in 39 s with lane
+drivers and 57 s without (the transcription took 32 s and 37 s); its p95
+inter-delta gap stayed about 1.8 s either way.
+
+A mixed soak decides the lane-driver default. One server ran, all at once,
+a chat sweep (LFM2.5, 64 prompts of 256 words, 128 output tokens, 0.5 req/s),
+an ASR load (Qwen3-ASR, 24 mixed clips, 0.3 req/s), a TTS load (Kokoro, 24
+inputs, 0.3 req/s) and four real-time Nemotron sessions. M1 Pro, one run each:
+
+| Metric | Lane drivers | One step driver |
+|---|---|---|
+| ASR latency p50 / p95 | 0.92 / 2.13 s | 0.99 / 2.32 s |
+| TTS latency p50 / p95 | 1.48 / 3.40 s | 2.77 / 4.17 s |
+| Realtime: last frame to final transcript | 1.4-3.7 s | 0.8-1.2 s |
+| Chat TTFT p50 | 21.0 s | 11.6 s |
+| Chat ITL p50 / p95 / max | 42 / 475 / 6,877 ms | 32 / 333 / 15,059 ms |
+
+Every ASR and TTS response matched its solo output in both, and nothing
+failed. Lane drivers help TTS and the worst chat gap, and cost chat TTFT,
+typical inter-token latency and realtime lag, so they stay off by default.
+
 Measured on an M-series Mac (Metal, LFM2.5-1.2B-Instruct Q4_K_M chat at
 `--request-rate 2 --num-prompts 16`, 128 tokens in and out, beside a
 26-minute Whisper-Large-v3-Turbo transcription started 4 s before the chat
@@ -234,6 +263,60 @@ tail. Without the transcription both builds measured ITL p95 39-63 ms
 across runs. Several requests failed with 503 in these runs because the
 shared machine left little live memory (`insufficient live memory`), in
 both builds.
+
+## Audio load (ASR and TTS)
+
+`scripts/bench/run-audio-load.py` is the open-loop load generator for
+`/v1/audio/transcriptions` (`--task asr`) and `/v1/audio/speech`
+(`--task tts`). It uses the same arrival process and metadata as the chat
+benchmark and the same standard-library-only rule.
+
+Every request has its own input, so batching sees mixed lengths. ASR clips
+are cut from the `--audio` WAV files at seeded random offsets, with lengths
+uniform in `--min-secs`..`--max-secs`. TTS inputs are seeded random sentences
+of `--min-words`..`--max-words` words, each request with its own seed.
+
+Before the load, every input runs alone once, and the first input runs a
+second time to check that the model repeats itself. Under load each response
+is compared with its solo output: ASR text must match exactly (a match that
+ignores case and punctuation is reported too), and TTS audio must have the
+same length and stay within `--tts-tolerance` of full scale. A batching bug
+that changes one request's output therefore shows up as a parity failure,
+not only as latency. A model that does not repeat its own solo output is
+reported (`solo.repeatable: false`) and not held to parity. The samplers
+treat seed 0 as "seed from the clock", so request seeds start at 1.
+
+```bash
+python3 scripts/bench/run-audio-load.py --task asr \
+  --base-url http://127.0.0.1:8080 --model Qwen3-ASR-0.6B-GGUF \
+  --audio data/test.wav --audio data/diarization.wav \
+  --num-requests 16 --min-secs 2 --max-secs 20 --request-rate 1,inf \
+  --output asr-load.json
+
+python3 scripts/bench/run-audio-load.py --task tts \
+  --base-url http://127.0.0.1:8080 --model Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --num-requests 12 --request-rate inf --temperature 0 \
+  --tts-extra '{"subtalker_do_sample": false}' --require-parity
+```
+
+`--tts-extra` merges a JSON object into every speech request.
+`--require-parity` exits 3 on any parity failure, or when the model does not
+repeat itself. Without it, the run only reports.
+
+Measured on an M1 Pro (Metal, one run each, at `--request-rate inf`):
+
+| Model | Inputs | Audio s/s alone | Audio s/s under load | Parity |
+|---|---|---|---|---|
+| Qwen3-ASR-0.6B (GGUF) | 16 clips, 2-20 s | 18.2 | 21.3 | 16/16 exact |
+| Granite Speech 5.0 2B (GGUF) | 12 clips, 2-20 s | 7.1 | 7.3 | 12/12 exact |
+| Kokoro-82M | 16 inputs, 4-40 words | 6.5 | 6.5 | 16/16 exact |
+| Qwen3-TTS 0.6B CustomVoice, greedy | 12 inputs, 4-30 words | 0.60 | 0.87 | 12/12 exact |
+
+Kokoro and Granite 5 gain nothing under load. Granite 5 runs one request at
+a time, and Kokoro's decoder batches only rows of equal duration, which
+mixed inputs rarely are. Qwen3-TTS gains about 45%. Before the Metal GQA
+decode kernel split each row by its own context, four of its twelve greedy
+outputs differed from their solo audio.
 
 ## Regression check per backend
 
@@ -280,3 +363,8 @@ mean and spread), percentile math, the SSE parser (every split point, CR/LF
 variants), goodput, Prometheus deltas and histogram quantiles, the result
 schema, the comparison, and an end-to-end run against a local fake SSE
 server. It runs in the `hygiene` lane of `scripts/ci/check-backend-truth.sh`.
+
+`scripts/bench/test-audio-load.py` covers clip cutting, TTS input lengths,
+WAV handling, the parity checks, the repeatability guard, and end-to-end runs
+against a fake server that corrupts a response whenever requests overlap. It
+runs in the same lane.

@@ -158,7 +158,13 @@ async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<(
     if enable_prefix_caching && managed_prefix_cache_salt.is_none() {
         bail!("IZWI_ENABLE_PREFIX_CACHING=1 requires IZWI_MANAGED_PREFIX_CACHE_SALT");
     }
-    let enable_chunked_prefill = env.flag_or("IZWI_ENABLE_CHUNKED_PREFILL", false)?;
+    // The worker's concurrency: `IZWI_MAX_NUM_SEQS`, else an explicit
+    // `IZWI_WORKER_MAX_ACTIVE` (the engine then serves that many sequences),
+    // else the runtime's automatic sizing for the loaded model and backend.
+    let requested_seqs = process.max_num_seqs.or(process.max_active_invocations);
+    let enable_chunked_prefill = env
+        .flag("IZWI_ENABLE_CHUNKED_PREFILL")?
+        .unwrap_or_else(|| izwi_core::config::default_chunked_prefill_for(requested_seqs));
     let engine_defaults = izwi_core::config::EngineConfig::default();
     let max_sequence_length =
         match env.get("IZWI_MAX_SEQUENCE_LENGTH")? {
@@ -172,10 +178,15 @@ async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<(
     let engine = EngineConfig {
         models_dir: process.models_dir.clone(),
         max_loaded_models: Some(1),
-        max_queued_requests: process.max_active_invocations,
-        max_scheduler_batch_size: process.max_active_invocations,
-        max_retained_sequences: process.max_active_invocations,
-        max_staged_transactions: process.max_active_invocations,
+        // Live runtime jobs must cover every admitted invocation.
+        max_queued_requests: engine_defaults
+            .max_queued_requests
+            .max(requested_seqs.unwrap_or(0)),
+        // Rows follow `max_num_seqs`, or the backend's automatic sizing.
+        max_num_seqs: requested_seqs,
+        max_scheduler_batch_size: 0,
+        max_retained_sequences: 0,
+        max_staged_transactions: 0,
         num_threads: process.thread_budget(),
         enable_prefix_caching,
         prefix_reuse_catalog_auto,
@@ -321,13 +332,25 @@ async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<(
         .find(|loaded| loaded.variant_id == process.variant.dir_name())
         .and_then(|loaded| loaded.effective_context_tokens);
     let deployment = loaded_deployment(&process, fitted_context_tokens)?;
+    let capacity = WorkerCapacity::resolve(
+        process.max_active_invocations,
+        requested_seqs,
+        runtime.resolved_concurrency().scheduler_rows,
+        process.max_retained_attempts,
+    )?;
+    tracing::info!(
+        max_active_invocations = capacity.max_active_invocations,
+        max_retained_attempts = capacity.max_retained_attempts,
+        profile = runtime.resolved_concurrency().profile.as_str(),
+        "worker capacity"
+    );
     let worker_config = WorkerConfig {
         descriptor,
         deployment,
         credentials,
-        max_active_invocations: process.max_active_invocations,
+        max_active_invocations: capacity.max_active_invocations,
         max_request_bytes: process.max_request_bytes,
-        max_retained_attempts: process.max_retained_attempts,
+        max_retained_attempts: capacity.max_retained_attempts,
         attempt_retention: process.attempt_retention,
         event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
         max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
@@ -728,9 +751,14 @@ struct WorkerProcessConfig {
     credential_id: CredentialId,
     bearer_token: ServiceBearerToken,
     assignment: DeviceAssignment,
-    max_active_invocations: usize,
+    /// `IZWI_WORKER_MAX_ACTIVE`; unset derives it from the loaded model.
+    max_active_invocations: Option<usize>,
+    /// `IZWI_MAX_NUM_SEQS`: sequences the engine serves concurrently.
+    max_num_seqs: Option<usize>,
     max_request_bytes: usize,
-    max_retained_attempts: usize,
+    /// `IZWI_WORKER_MAX_RETAINED_ATTEMPTS`; unset keeps the default, raised
+    /// to cover a derived capacity.
+    max_retained_attempts: Option<usize>,
     attempt_retention: Duration,
     streaming: bool,
     managed: bool,
@@ -744,6 +772,56 @@ struct WorkerProcessConfig {
     /// with its bounded backoff instead of leaving a Failed process up.
     exit_on_runtime_failure: bool,
     declared: DeclaredDeployment,
+}
+
+/// How many invocations the worker admits at once, and how many terminal
+/// attempts it keeps (never fewer than it admits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerCapacity {
+    max_active_invocations: usize,
+    max_retained_attempts: usize,
+}
+
+impl WorkerCapacity {
+    /// An explicit `IZWI_WORKER_MAX_ACTIVE` wins; else `IZWI_MAX_NUM_SEQS`;
+    /// else the rows the runtime serves the loaded model at, so a default
+    /// worker admits as many users as its engine batches instead of one. A
+    /// capacity that is not pinned stays within the attempts an operator
+    /// keeps; a pinned one below them is a configuration error.
+    fn resolve(
+        explicit_active: Option<usize>,
+        max_num_seqs: Option<usize>,
+        runtime_rows: usize,
+        explicit_retained: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let mut max_active_invocations = explicit_active
+            .or(max_num_seqs)
+            .unwrap_or(runtime_rows)
+            .max(1);
+        let max_retained_attempts = match explicit_retained {
+            Some(retained) if retained < max_active_invocations => {
+                if explicit_active.is_some() {
+                    bail!(
+                        "IZWI_WORKER_MAX_RETAINED_ATTEMPTS ({retained}) is below \
+                         IZWI_WORKER_MAX_ACTIVE ({max_active_invocations})"
+                    );
+                }
+                tracing::warn!(
+                    derived = max_active_invocations,
+                    retained,
+                    "worker admission capped at the retained attempt records"
+                );
+                max_active_invocations = retained.max(1);
+                retained.max(1)
+            }
+            Some(retained) => retained,
+            None => DEFAULT_MAX_RETAINED_ATTEMPTS.max(max_active_invocations),
+        };
+        Ok(Self {
+            max_active_invocations,
+            max_retained_attempts,
+        })
+    }
 }
 
 /// The execution profile and token limits a supervisor approved for this
@@ -839,10 +917,13 @@ impl WorkerProcessConfig {
             TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
         };
         let assignment = parse_assignment(env)?;
-        let max_active_invocations = env.parse_or("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
-        if max_active_invocations == 0 {
+        let max_active_invocations = env.parse::<usize>("IZWI_WORKER_MAX_ACTIVE")?;
+        if max_active_invocations == Some(0) {
             bail!("IZWI_WORKER_MAX_ACTIVE must be non-zero");
         }
+        let max_num_seqs = env
+            .parse::<usize>("IZWI_MAX_NUM_SEQS")?
+            .filter(|seqs| *seqs > 0);
         let bind: SocketAddr = env
             .get_or("IZWI_WORKER_BIND", "127.0.0.1:9470")?
             .parse()
@@ -888,12 +969,10 @@ impl WorkerProcessConfig {
             bearer_token: ServiceBearerToken::new(env.required("IZWI_WORKER_BEARER_TOKEN")?)?,
             assignment,
             max_active_invocations,
+            max_num_seqs,
             max_request_bytes: env
                 .parse_or("IZWI_WORKER_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?,
-            max_retained_attempts: env.parse_or(
-                "IZWI_WORKER_MAX_RETAINED_ATTEMPTS",
-                DEFAULT_MAX_RETAINED_ATTEMPTS,
-            )?,
+            max_retained_attempts: env.parse::<usize>("IZWI_WORKER_MAX_RETAINED_ATTEMPTS")?,
             attempt_retention: Duration::from_secs(env.parse_or(
                 "IZWI_WORKER_ATTEMPT_RETENTION_SECS",
                 DEFAULT_ATTEMPT_RETENTION.as_secs(),
@@ -1594,6 +1673,41 @@ mod tests {
         assert!(
             parse_bounded_duration_env(&env("0"), "IZWI_WORKER_TERMINATION_GRACE_MS", 5_000)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_capacity_defaults_to_the_engine_rows_not_one_request() {
+        // A default worker admits as many invocations as its engine batches.
+        let auto = WorkerCapacity::resolve(None, None, 8, None).unwrap();
+        assert_eq!(auto.max_active_invocations, 8);
+        assert_eq!(auto.max_retained_attempts, DEFAULT_MAX_RETAINED_ATTEMPTS);
+        // IZWI_MAX_NUM_SEQS sizes it; an explicit IZWI_WORKER_MAX_ACTIVE wins.
+        let seqs = WorkerCapacity::resolve(None, Some(3), 8, None).unwrap();
+        assert_eq!(seqs.max_active_invocations, 3);
+        let explicit = WorkerCapacity::resolve(Some(1), Some(3), 8, None).unwrap();
+        assert_eq!(explicit.max_active_invocations, 1);
+        // A large derived capacity raises the default retained attempts...
+        let wide = WorkerCapacity::resolve(None, None, 2_000, None).unwrap();
+        assert_eq!(wide.max_retained_attempts, 2_000);
+        // ...and an explicit value below a derived capacity caps it, so a
+        // worker on a large GPU still starts under a supervisor's 128.
+        let capped = WorkerCapacity::resolve(None, None, 320, Some(128)).unwrap();
+        assert_eq!(capped.max_active_invocations, 128);
+        assert_eq!(capped.max_retained_attempts, 128);
+        assert_eq!(
+            WorkerCapacity::resolve(None, Some(16), 8, Some(4))
+                .unwrap()
+                .max_active_invocations,
+            4
+        );
+        // A pinned capacity above the retained records is an error.
+        assert!(WorkerCapacity::resolve(Some(16), None, 8, Some(4)).is_err());
+        assert_eq!(
+            WorkerCapacity::resolve(None, Some(16), 8, Some(32))
+                .unwrap()
+                .max_retained_attempts,
+            32
         );
     }
 

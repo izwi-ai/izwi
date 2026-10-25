@@ -149,6 +149,9 @@ pub(crate) struct ModelLifecycleController {
     /// than the host memory macOS reports available), taken by the caller
     /// that asked for the load.
     pub(super) load_warnings: StdMutex<HashMap<ModelVariant, String>>,
+    /// Loads with a device-usage window open, so a window can tell whether
+    /// another load allocated during it.
+    pub(super) measured_loads: super::load::MeasuredLoads,
     state: StdMutex<LifecycleState>,
     #[cfg(test)]
     load_test_panics: AtomicUsize,
@@ -194,6 +197,7 @@ impl ModelLifecycleController {
             kept_variants: Mutex::new(HashSet::new()),
             mutation_gate: Mutex::new(()),
             load_warnings: StdMutex::new(HashMap::new()),
+            measured_loads: Default::default(),
             state: StdMutex::new(LifecycleState::default()),
             #[cfg(test)]
             load_test_panics: AtomicUsize::new(0),

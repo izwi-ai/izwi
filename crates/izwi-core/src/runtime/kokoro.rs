@@ -285,12 +285,15 @@ impl KokoroPreparer for KokoroTtsModel {
 /// Prepare a Kokoro request for engine synthesis: the whole text when it
 /// fits the voice pack's 510-phoneme limit, otherwise the chunks the
 /// planner splits it into (the streaming route's planner), each prepared.
+/// A `seed` seeds each chunk's decoder noise (offset by its position), so
+/// the request repeats exactly; without one every synthesis draws fresh noise.
 pub(crate) fn prepare_kokoro_text(
     model: &impl KokoroPreparer,
     text: &str,
     speaker: Option<&str>,
     language: Option<&str>,
     speed: f32,
+    seed: Option<u64>,
 ) -> Result<crate::engine::KokoroPreparedText> {
     // One G2P pass; one chunk when the text fits the voice pack (KOK-11).
     let planned = model.plan(text, speaker, language, KokoroChunkPolicy::WHOLE)?;
@@ -302,7 +305,12 @@ pub(crate) fn prepare_kokoro_text(
     }
     let chunks = planned
         .iter()
-        .map(|chunk| model.prepare_planned(chunk, speaker, language, speed))
+        .zip(0u64..)
+        .map(|(chunk, position)| {
+            let mut prepared = model.prepare_planned(chunk, speaker, language, speed)?;
+            prepared.rng_seed = seed.map(|seed| seed.wrapping_add(position));
+            Ok(prepared)
+        })
         .collect::<Result<Vec<_>>>()?;
     if chunks.is_empty() {
         return Err(Error::InvalidInput(
@@ -489,6 +497,7 @@ mod tests {
                 )
                 .unwrap(),
                 speed,
+                rng_seed: None,
             })
         }
     }
@@ -502,8 +511,15 @@ mod tests {
         let sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
         let long = sentence.repeat(25);
         assert!(long.split_whitespace().count() >= 250);
-        let prepared =
-            prepare_kokoro_text(&FakeKokoroPreparer, &long, Some("af_heart"), None, 1.0).unwrap();
+        let prepared = prepare_kokoro_text(
+            &FakeKokoroPreparer,
+            &long,
+            Some("af_heart"),
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert!(
             prepared.chunks.len() > 1,
             "{} chunks",
@@ -522,8 +538,30 @@ mod tests {
         assert_eq!(prepared.source_text, long);
         assert_eq!(prepared.requested_speaker.as_deref(), Some("af_heart"));
 
-        let short = prepare_kokoro_text(&FakeKokoroPreparer, sentence, None, None, 1.0).unwrap();
+        let short =
+            prepare_kokoro_text(&FakeKokoroPreparer, sentence, None, None, 1.0, None).unwrap();
         assert_eq!(short.chunks.len(), 1);
+        assert_eq!(short.chunks[0].rng_seed, None, "no seed draws fresh noise");
+    }
+
+    /// A request seed reaches every chunk, offset by its position, so a
+    /// seeded request repeats exactly however its chunks are batched.
+    #[test]
+    fn a_request_seed_seeds_every_chunk_in_order() {
+        let long = "The quick brown fox jumps over the lazy dog near the river bank. ".repeat(25);
+        let prepared =
+            prepare_kokoro_text(&FakeKokoroPreparer, &long, None, None, 1.0, Some(40)).unwrap();
+        let seeds = prepared
+            .chunks
+            .iter()
+            .map(|chunk| chunk.rng_seed)
+            .collect::<Vec<_>>();
+        let expected = (40..)
+            .take(prepared.chunks.len())
+            .map(Some)
+            .collect::<Vec<_>>();
+        assert!(seeds.len() > 1);
+        assert_eq!(seeds, expected);
     }
 
     /// KOK-12: the streaming policy starts with a short chunk for time

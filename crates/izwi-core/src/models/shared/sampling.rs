@@ -1385,10 +1385,134 @@ fn pending_sampling_candidates(
     }))
 }
 
+/// What one row of a step's batched readback carries, as planned by a
+/// family's own per-row sampler.
+pub(crate) enum PlannedReadback {
+    /// The row's argmax and the logit it selected.
+    Greedy,
+    /// The row's bounded device candidates.
+    Candidates(PendingCandidates),
+    /// Nothing: the row samples on its own (grammar, logprobs, host).
+    None,
+}
+
+/// A row's share of the batched readback.
+pub(crate) enum PlannedValues {
+    Greedy {
+        index: u32,
+        logit: f32,
+    },
+    /// `None` when a candidate came back non-finite (host fallback).
+    Candidates(Option<DeviceSamplingCandidates>),
+    None,
+}
+
+/// [`bounded_device_sampling_candidates_with_history`] without its readback:
+/// the candidates stay on the device for [`read_planned_rows`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_device_sampling_candidates_with_history(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    history: PenaltyHistory<'_>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+) -> Result<Option<PendingCandidates>> {
+    if !(logits.device().is_cuda() || logits.device().is_metal()) || temperature <= 1e-5 {
+        return Ok(None);
+    }
+    pending_sampling_candidates(
+        logits,
+        vocab_limit,
+        top_k,
+        temperature,
+        history,
+        repetition_penalty,
+        presence_penalty,
+        None,
+    )
+}
+
+/// Read every row's planned values of one step's `[rows, width]` logits in
+/// a single device-to-host transfer: the argmax and selected logit of each
+/// greedy row (over the first `vocab_size` columns), then each row's
+/// candidates. Families with their own per-row sampler draw from the result
+/// exactly as that sampler would.
+pub(crate) fn read_planned_rows(
+    logits: &Tensor,
+    vocab_size: usize,
+    plans: Vec<PlannedReadback>,
+) -> Result<Vec<PlannedValues>> {
+    let (rows, width) = logits.dims2()?;
+    if rows != plans.len() {
+        return Err(Error::InvalidInput(format!(
+            "batched readback planned {} rows for {rows} logits rows",
+            plans.len()
+        )));
+    }
+    let vocab = width.min(vocab_size);
+    if vocab == 0 || vocab > MAX_EXACT_F32_INTEGER {
+        return Err(Error::InvalidInput(format!(
+            "batched readback cannot carry a {vocab}-token vocabulary"
+        )));
+    }
+    let greedy_rows = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, plan)| matches!(plan, PlannedReadback::Greedy))
+        .map(|(row, _)| row as u32)
+        .collect::<Vec<_>>();
+    let mut parts = Vec::with_capacity(plans.len() + 2);
+    if !greedy_rows.is_empty() {
+        let selected = Tensor::from_vec(greedy_rows.clone(), greedy_rows.len(), logits.device())?;
+        let greedy = logits.narrow(1, 0, vocab)?.index_select(&selected, 0)?;
+        let greedy = greedy.to_dtype(DType::F32)?.contiguous()?;
+        let ids = greedy.argmax_keepdim(D::Minus1)?;
+        let picked = greedy.gather(&ids, D::Minus1)?;
+        parts.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+        parts.push(picked.flatten_all()?);
+    }
+    for plan in &plans {
+        if let PlannedReadback::Candidates(pending) = plan {
+            parts.push(pending.packed.clone());
+        }
+    }
+    let packed = if parts.is_empty() {
+        Vec::new()
+    } else {
+        read_f32_values_to_host(&Tensor::cat(&parts, 0)?)?
+    };
+    let greedy_count = greedy_rows.len();
+    let mut cursor = greedy_count * 2;
+    let mut greedy_seen = 0usize;
+    let mut values = Vec::with_capacity(plans.len());
+    for plan in plans {
+        values.push(match plan {
+            PlannedReadback::Greedy => {
+                let index = packed[greedy_seen] as u32;
+                let logit = packed[greedy_count + greedy_seen];
+                greedy_seen += 1;
+                PlannedValues::Greedy { index, logit }
+            }
+            PlannedReadback::Candidates(pending) => PlannedValues::Candidates(
+                pending.unpack(take(&packed, &mut cursor, pending.len())?)?,
+            ),
+            PlannedReadback::None => PlannedValues::None,
+        });
+    }
+    if cursor != packed.len() {
+        return Err(Error::InferenceError(
+            "batched planned readback has the wrong length".into(),
+        ));
+    }
+    Ok(values)
+}
+
 /// One row's bounded candidates, still on the device as one packed F32
 /// tensor (values, indices, then the normalizer when present), so a caller
 /// can read many rows back in a single transfer.
-struct PendingCandidates {
+pub(crate) struct PendingCandidates {
     packed: Tensor,
     count: usize,
     has_logsumexp: bool,

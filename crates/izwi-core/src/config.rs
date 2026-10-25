@@ -124,6 +124,68 @@ impl<'de> Deserialize<'de> for ContextLengthPreference {
     }
 }
 
+/// How the runtime sizes itself for concurrent users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyProfile {
+    /// One person's work: rows for the app's own parallel calls (a title
+    /// beside a chat, the stages of a voice turn), a KV pool for one long
+    /// context, and whole-prompt prefill. The CPU and Metal default.
+    SingleUser,
+    /// Several users at once: the automatic row limits, tensor width and
+    /// realtime quota follow `max_num_seqs`, and prompts prefill in chunks
+    /// between decode steps. The CUDA default, and any `max_num_seqs` above
+    /// one.
+    MultiUser,
+}
+
+impl ConcurrencyProfile {
+    /// The profile for `backend` when `max_num_seqs` (zero or `None` is
+    /// automatic) is requested.
+    pub const fn resolve(backend: BackendKind, max_num_seqs: Option<usize>) -> Self {
+        match max_num_seqs {
+            Some(1) => Self::SingleUser,
+            Some(0) | None => match backend {
+                BackendKind::Cuda => Self::MultiUser,
+                BackendKind::Cpu | BackendKind::Metal => Self::SingleUser,
+            },
+            Some(_) => Self::MultiUser,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleUser => "single_user",
+            Self::MultiUser => "multi_user",
+        }
+    }
+}
+
+/// The concurrency a runtime resolved at startup, for `/v1/health` and the
+/// startup log: what `max_num_seqs` asked for and every limit it sized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedConcurrency {
+    pub profile: ConcurrencyProfile,
+    /// `None` when every limit kept its automatic backend sizing.
+    pub max_num_seqs: Option<usize>,
+    pub scheduler_rows: usize,
+    pub retained_sequences: usize,
+    pub staged_transactions: usize,
+    /// Engine tensor width before each chat family's certified cap.
+    pub tensor_width: usize,
+    /// Rows of every non-chat capability (ASR, TTS, realtime).
+    pub non_chat_row_width: usize,
+    pub realtime_asr_sessions: usize,
+    pub chunked_prefill: bool,
+}
+
+/// Chunked prefill when the operator did not choose: on for a multi-user
+/// `max_num_seqs`, so one user's long prompt prefills between the others'
+/// decode steps instead of freezing them. CUDA chat chunks regardless.
+pub const fn default_chunked_prefill_for(max_num_seqs: Option<usize>) -> bool {
+    matches!(max_num_seqs, Some(seqs) if seqs > 1)
+}
+
 /// Operator intent for the maximum width of one physical tensor invocation.
 ///
 /// This is deliberately independent from scheduler, retained-session, staged
@@ -728,6 +790,15 @@ pub struct EngineConfig {
     #[serde(default)]
     pub max_physical_in_flight: PhysicalInFlightLimit,
 
+    /// Sequences served concurrently per model (`--max-num-seqs`,
+    /// `IZWI_MAX_NUM_SEQS`). `None` keeps each backend's automatic sizing
+    /// ([`ConcurrencyProfile::resolve`]). A value sizes every limit an
+    /// operator left automatic: scheduler, retained and staged rows, the
+    /// tensor width (still capped per family and backend) and the realtime
+    /// ASR session quota.
+    #[serde(default)]
+    pub max_num_seqs: Option<usize>,
+
     /// Maximum logical rows selected by one scheduler step.
     #[serde(default = "default_max_scheduler_batch_size")]
     pub max_scheduler_batch_size: usize,
@@ -858,6 +929,7 @@ impl Default for EngineConfig {
             max_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
+            max_num_seqs: None,
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
@@ -1192,10 +1264,29 @@ fn get_num_cpus() -> usize {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        resolve_prefix_engagement, BatchSizePreference, ContextLengthPreference, EngineConfig,
-        KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
+        default_chunked_prefill_for, resolve_prefix_engagement, BatchSizePreference,
+        ConcurrencyProfile, ContextLengthPreference, EngineConfig, KvCacheDtype,
+        PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::backends::BackendKind;
+
+    #[test]
+    fn concurrency_profile_follows_max_num_seqs_then_the_backend() {
+        use ConcurrencyProfile::{MultiUser, SingleUser};
+        for (backend, automatic) in [
+            (BackendKind::Cpu, SingleUser),
+            (BackendKind::Metal, SingleUser),
+            (BackendKind::Cuda, MultiUser),
+        ] {
+            assert_eq!(ConcurrencyProfile::resolve(backend, None), automatic);
+            assert_eq!(ConcurrencyProfile::resolve(backend, Some(0)), automatic);
+            assert_eq!(ConcurrencyProfile::resolve(backend, Some(1)), SingleUser);
+            assert_eq!(ConcurrencyProfile::resolve(backend, Some(4)), MultiUser);
+        }
+        assert!(!default_chunked_prefill_for(None));
+        assert!(!default_chunked_prefill_for(Some(1)));
+        assert!(default_chunked_prefill_for(Some(2)));
+    }
 
     #[test]
     fn physical_batch_defaults_are_backend_aware() {

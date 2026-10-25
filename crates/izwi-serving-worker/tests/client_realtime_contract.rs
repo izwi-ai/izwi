@@ -155,11 +155,13 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
 }
 
 /// Audio sent before finish is transcribed even when the finish reaches the
-/// worker while that audio still waits behind a slow runtime push.
+/// worker while that audio still waits behind a slow runtime push. Frames
+/// that queued behind a push may share the next one.
 #[tokio::test]
 async fn realtime_finish_transcribes_every_frame_sent_before_it() {
     let worker = TestWorker::spawn(realtime_config(TestAsrStage {
         push_cadence: Duration::from_millis(30),
+        report_pushed_samples: true,
         ..TestAsrStage::default()
     }))
     .await
@@ -183,15 +185,10 @@ async fn realtime_finish_transcribes_every_frame_sent_before_it() {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-    assert_eq!(
-        deltas,
-        [
-            "partial ",
-            "partial ",
-            "partial ",
-            "test realtime transcript"
-        ]
-    );
+    let (final_text, partials) = deltas.split_last().expect("a final transcript");
+    assert_eq!(final_text, "test realtime transcript after 48 samples");
+    assert!((1..=3).contains(&partials.len()), "{partials:?}");
+    assert!(partials.iter().all(|delta| delta == "partial "));
 }
 
 #[tokio::test]

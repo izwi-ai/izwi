@@ -13,7 +13,7 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use serde::Serialize;
 
-use crate::backends::{BackendKind, DeviceKind, DeviceProfile, DeviceThread};
+use crate::backends::{BackendKind, DeviceJobTag, DeviceKind, DeviceProfile, DeviceThread};
 use crate::engine::{
     AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
     ExecutionGroupId, MetalLoadAdmission, ModelInstanceId, NativeBatchMode,
@@ -24,6 +24,9 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
 use crate::runtime::health::{fatal_device_fault, RuntimeHealth};
+
+mod fair_permits;
+use fair_permits::{FairAcquireError, FairPermit, FairPermits};
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIRECT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
@@ -244,9 +247,11 @@ struct PhysicalExecutionAdmissionInner {
     poison_reason: Mutex<Option<String>>,
 }
 
+/// One execution group's units, granted to the loaded models that share it
+/// in weighted-fair order rather than arrival order.
 #[derive(Debug)]
 struct GroupPhysicalAdmission {
-    permits: Arc<Semaphore>,
+    permits: Arc<FairPermits>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +398,7 @@ impl PhysicalExecutionAdmission {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn acquire_dispatch(
         &self,
         execution_group: ExecutionGroupId,
@@ -401,6 +407,33 @@ impl PhysicalExecutionAdmission {
         batch_mode: NativeBatchMode,
         row_width: usize,
         deadline: Option<Instant>,
+    ) -> Result<PhysicalExecutionLease> {
+        self.acquire_weighted_dispatch(
+            execution_group,
+            model_instance,
+            launch_policy,
+            batch_mode,
+            row_width,
+            deadline,
+            1,
+        )
+        .await
+    }
+
+    /// Admits one dispatch of `model_instance`. Models that share the
+    /// execution group take turns in weighted-fair order: each model is a
+    /// flow charged for its hold time divided by `weight`, the service
+    /// weight of the dispatch's most latency-sensitive workload class.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_weighted_dispatch(
+        &self,
+        execution_group: ExecutionGroupId,
+        model_instance: ModelInstanceId,
+        launch_policy: PhysicalLaunchPolicy,
+        batch_mode: NativeBatchMode,
+        row_width: usize,
+        deadline: Option<Instant>,
+        weight: u64,
     ) -> Result<PhysicalExecutionLease> {
         self.ensure_healthy()?;
         if self
@@ -436,9 +469,11 @@ impl PhysicalExecutionAdmission {
         } else {
             units
         };
-        let group_permit = Self::acquire_from(
-            group.permits.clone(),
+        let group_permit = Self::acquire_fair(
+            &group.permits,
             group_units,
+            model_instance.get(),
+            weight,
             deadline,
             "execution-group",
         )
@@ -459,7 +494,7 @@ impl PhysicalExecutionAdmission {
         units: usize,
         deadline: Option<Instant>,
         group: Option<Arc<GroupPhysicalAdmission>>,
-        group_permit: Option<OwnedSemaphorePermit>,
+        group_permit: Option<FairPermit>,
         model: Option<Arc<ModelPhysicalAdmission>>,
         model_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<PhysicalExecutionLease> {
@@ -500,7 +535,7 @@ impl PhysicalExecutionAdmission {
         }
         groups.retain(|_, admission| admission.strong_count() > 0);
         let admission = Arc::new(GroupPhysicalAdmission {
-            permits: Arc::new(Semaphore::new(self.inner.capacity)),
+            permits: FairPermits::new(self.inner.capacity),
         });
         groups.insert(execution_group, Arc::downgrade(&admission));
         admission
@@ -552,6 +587,41 @@ impl PhysicalExecutionAdmission {
         Ok(permit)
     }
 
+    /// [`Self::acquire_from`] for a group's weighted-fair units.
+    async fn acquire_fair(
+        permits: &Arc<FairPermits>,
+        units: usize,
+        flow: u64,
+        weight: u64,
+        deadline: Option<Instant>,
+        scope: &'static str,
+    ) -> Result<FairPermit> {
+        let expired = || {
+            crate::engine::metrics::record_engine_physical_defer(
+                crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+            );
+            Error::Timeout(format!("{scope} execution capacity"))
+        };
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(expired());
+        }
+        let permit = match permits.acquire(units, flow, weight, deadline).await {
+            Ok(permit) => permit,
+            Err(FairAcquireError::Timeout) => return Err(expired()),
+            Err(FairAcquireError::Closed) => {
+                crate::engine::metrics::record_engine_physical_defer(
+                    crate::engine::metrics::EnginePhysicalDeferReason::ExecutionCapacity,
+                );
+                return Err(Error::Overloaded("coordinator closed".to_string()));
+            }
+        };
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            drop(permit);
+            return Err(expired());
+        }
+        Ok(permit)
+    }
+
     fn model_admission(
         &self,
         execution_group: ExecutionGroupId,
@@ -598,7 +668,7 @@ impl PhysicalExecutionAdmission {
 #[derive(Debug)]
 pub(crate) struct PhysicalExecutionLease {
     admission: PhysicalExecutionAdmission,
-    _group_permit: Option<OwnedSemaphorePermit>,
+    _group_permit: Option<FairPermit>,
     _group: Option<Arc<GroupPhysicalAdmission>>,
     _model_permit: Option<OwnedSemaphorePermit>,
     _model: Option<Arc<ModelPhysicalAdmission>>,
@@ -621,6 +691,19 @@ impl std::fmt::Debug for StageDeviceFence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StageDeviceFence")
     }
+}
+
+/// Request preparations (chat templates, tokenization, context compaction,
+/// audio decoding) that may run at once: half the host's cores, between two
+/// and eight, and never fewer than the device's own capacity. They used to
+/// share the device capacity of one, so one request's audio decode queued
+/// every other request's tokenization. Each preparation still reserves its
+/// own memory.
+fn host_preparation_capacity(device_capacity: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    (cores / 2).clamp(2, 8).max(device_capacity)
 }
 
 #[derive(Debug)]
@@ -715,7 +798,7 @@ impl InferenceCoordinator {
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
-            host_work: Arc::new(Semaphore::new(capacity)),
+            host_work: Arc::new(Semaphore::new(host_preparation_capacity(capacity))),
             host_models: Arc::new(Semaphore::new(1)),
             host_model_stages_total: AtomicU64::new(0),
             execution: PhysicalExecutionAdmission::with_idle(
@@ -1184,6 +1267,7 @@ impl InferenceCoordinator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_physical_dispatch(
         self: &Arc<Self>,
         execution_group: ExecutionGroupId,
@@ -1192,16 +1276,18 @@ impl InferenceCoordinator {
         batch_mode: NativeBatchMode,
         row_width: usize,
         deadline: Option<Instant>,
+        weight: u64,
     ) -> Result<PhysicalExecutionLease> {
         self.count_execution_timeout(
             self.execution
-                .acquire_dispatch(
+                .acquire_weighted_dispatch(
                     execution_group,
                     model_instance,
                     launch_policy,
                     batch_mode,
                     row_width,
                     deadline,
+                    weight,
                 )
                 .await,
         )
@@ -1290,6 +1376,7 @@ impl InferenceCoordinator {
                 NativeBatchMode::None,
                 1,
                 deadline,
+                job.spec.workload_class.service_weight(),
             )
             .await?;
         let result = future.await;
@@ -1361,7 +1448,7 @@ impl InferenceCoordinator {
                 .await
                 .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
         };
-        self.run_blocking_task(job, permit, "host preparation", operation)
+        self.run_blocking_task(job, permit, "host preparation", None, operation)
             .await
     }
 
@@ -1412,7 +1499,7 @@ impl InferenceCoordinator {
                 .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
         };
         self.host_model_stages_total.fetch_add(1, Ordering::Relaxed);
-        self.run_blocking_task(job, permit, "host model", move || {
+        self.run_blocking_task(job, permit, "host model", None, move || {
             let _contract = contract;
             let _work = work;
             operation()
@@ -1715,6 +1802,14 @@ impl InferenceCoordinator {
                     .max()
                     .expect("nonempty live rows have finite deadlines")
             });
+        let tag = DeviceJobTag {
+            flow: binding.model_instance_id.get(),
+            weight: live
+                .iter()
+                .map(|index| rows[*index].job.spec.workload_class.service_weight())
+                .max()
+                .unwrap_or(1),
+        };
         let execution = self
             .acquire_physical_dispatch(
                 binding.execution_group_id,
@@ -1723,6 +1818,7 @@ impl InferenceCoordinator {
                 stage.batch_mode,
                 live.len(),
                 deadline,
+                tag.weight,
             )
             .await?;
         let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
@@ -1735,6 +1831,7 @@ impl InferenceCoordinator {
                 deadline,
                 (execution, workspace),
                 "inference",
+                Some(tag),
                 move || {
                     let _contract = contract;
                     let _work = work;
@@ -2000,6 +2097,12 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         let deadline = job.spec.deadline;
+        // A direct stage is weighed against engine dispatches as its model's
+        // flow, both for admission and on the device thread.
+        let tag = DeviceJobTag {
+            flow: model_instance.get(),
+            weight: job.spec.workload_class.service_weight(),
+        };
         let execution = self
             .acquire_physical_dispatch(
                 execution_group,
@@ -2008,10 +2111,11 @@ impl InferenceCoordinator {
                 NativeBatchMode::None,
                 1,
                 deadline,
+                tag.weight,
             )
             .await?;
         self.execution.ensure_healthy()?;
-        self.run_blocking_task(job, execution, "inference", operation)
+        self.run_blocking_task(job, execution, "inference", Some(tag), operation)
             .await
     }
 
@@ -2020,6 +2124,7 @@ impl InferenceCoordinator {
         job: &JobLease,
         guard: G,
         task_kind: &'static str,
+        tag: Option<DeviceJobTag>,
         operation: F,
     ) -> Result<T>
     where
@@ -2036,16 +2141,27 @@ impl InferenceCoordinator {
             drop(stage_job);
             operation()
         };
-        self.run_blocking_task_with_deadline(job, job.spec.deadline, guard, task_kind, operation)
-            .await
+        self.run_blocking_task_with_deadline(
+            job,
+            job.spec.deadline,
+            guard,
+            task_kind,
+            tag,
+            operation,
+        )
+        .await
     }
 
+    /// Runs `operation` off the async workers. Inference runs on the device
+    /// thread, as the flow `tag` names when given, else as a control job.
+    #[allow(clippy::too_many_arguments)]
     async fn run_blocking_task_with_deadline<T, F, G>(
         self: &Arc<Self>,
         job: &JobLease,
         deadline: Option<Instant>,
         guard: G,
         task_kind: &'static str,
+        tag: Option<DeviceJobTag>,
         operation: F,
     ) -> Result<T>
     where
@@ -2090,7 +2206,10 @@ impl InferenceCoordinator {
         // deadline detaches the job instead of cancelling it.
         let handle: Pin<Box<dyn Future<Output = Result<Result<T>>> + Send>> =
             match (&self.device_thread, task_kind) {
-                (Some(device), "inference") => Box::pin(device.submit(job)),
+                (Some(device), "inference") => match tag {
+                    Some(tag) => Box::pin(device.submit_tagged(tag, job)),
+                    None => Box::pin(device.submit(job)),
+                },
                 _ => {
                     let handle = tokio::task::spawn_blocking(job);
                     Box::pin(async move {
@@ -5924,6 +6043,7 @@ mod tests {
                 NativeBatchMode::Static,
                 2,
                 Some(Instant::now() + Duration::from_millis(5)),
+                1,
             )
             .await;
         assert!(matches!(engine_concurrent, Err(Error::Timeout(_))));
@@ -6240,6 +6360,45 @@ mod tests {
         host.await.unwrap().unwrap();
         drop((host_job, device_job));
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    /// Two requests prepare at once beside a device capacity of one (every
+    /// Metal and CUDA coordinator, and a serial CPU one): preparation is host
+    /// work with its own lane.
+    #[tokio::test]
+    async fn requests_prepare_concurrently_beside_one_device_slot() {
+        assert!(host_preparation_capacity(1) >= 2);
+        assert!(host_preparation_capacity(1) <= 8);
+        assert_eq!(host_preparation_capacity(16), 16);
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let first = coordinator.admit(job("prepare-1")).await.unwrap();
+        let second = coordinator.admit(job("prepare-2")).await.unwrap();
+        // Each stage waits (bounded) until both are inside at once.
+        let inside = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let run = |job: JobLease| {
+            let coordinator = coordinator.clone();
+            let inside = inside.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run_host_blocking_stage(&job, move || {
+                        let (count, changed) = &*inside;
+                        let mut count = count.lock().unwrap_or_else(|poison| poison.into_inner());
+                        *count += 1;
+                        changed.notify_all();
+                        let (count, _) = changed
+                            .wait_timeout_while(count, Duration::from_secs(2), |count| *count < 2)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        Ok(*count >= 2)
+                    })
+                    .await
+            })
+        };
+        let (first, second) = (run(first), run(second));
+        assert!(first.await.unwrap().unwrap(), "first preparation ran alone");
+        assert!(
+            second.await.unwrap().unwrap(),
+            "second preparation ran alone"
+        );
     }
 
     /// P1V-2: a stage reservation refused memory another job holds waits and

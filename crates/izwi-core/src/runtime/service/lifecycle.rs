@@ -101,16 +101,26 @@ impl RuntimeService {
         // Automatic staged rows are resolved below from the launch width.
         let automatic_retained_sequences = config.max_retained_sequences == 0;
         let automatic_staged_transactions = config.max_staged_transactions == 0;
-        let automatic_rows = if selected_backend_kind == BackendKind::Cuda {
-            backend_context
+        // `max_num_seqs` sizes every row limit left automatic, and an
+        // automatic tensor width (each chat family still caps it at its
+        // certified width).
+        let max_num_seqs = config.max_num_seqs.filter(|seqs| *seqs > 0);
+        // Only an operator's own width may run above the certified widths;
+        // one derived from `max_num_seqs` keeps them.
+        let explicit_tensor_width = matches!(config.max_batch_size, BatchSizePreference::Fixed(_));
+        let automatic_rows = match max_num_seqs {
+            Some(seqs) => seqs,
+            None if selected_backend_kind == BackendKind::Cuda => backend_context
                 .device
                 .capabilities
                 .cuda_total_memory_bytes
                 .map(|bytes| (bytes / (256 * 1024 * 1024)).max(1))
-                .unwrap_or(1)
-        } else {
-            8
+                .unwrap_or(1),
+            None => 8,
         };
+        if let (Some(seqs), BatchSizePreference::Auto) = (max_num_seqs, config.max_batch_size) {
+            config.max_batch_size = BatchSizePreference::fixed(seqs)?;
+        }
         for rows in [
             &mut config.max_scheduler_batch_size,
             &mut config.max_retained_sequences,
@@ -132,11 +142,13 @@ impl RuntimeService {
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
+        core_config.max_num_seqs = config.max_num_seqs.filter(|seqs| *seqs > 0);
         core_config.portable_context_reserve_bytes = config.portable_context_reserve_bytes;
         core_config.models_dir = config.models_dir.clone();
         core_config.performance = config.performance.clone();
         core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
         core_config.max_tensor_batch_size = config.max_batch_size;
+        core_config.explicit_tensor_width = explicit_tensor_width;
         core_config.physical_execution_mode = config.physical_execution_mode;
         core_config.max_physical_in_flight = config.max_physical_in_flight;
         core_config.max_retained_sequences = config.max_retained_sequences.max(1);
@@ -178,14 +190,28 @@ impl RuntimeService {
         core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
+        let non_chat_row_width = crate::catalog::non_chat_row_width(
+            selected_backend_kind,
+            worker_config.max_tensor_batch_size,
+            explicit_tensor_width,
+        );
+        if non_chat_row_width
+            > crate::catalog::engine_row_width(
+                selected_backend_kind,
+                worker_config.max_tensor_batch_size,
+            )
+        {
+            tracing::warn!(
+                width = non_chat_row_width,
+                backend = selected_backend_kind.as_str(),
+                "explicit batch width exceeds the certified speech-model width on this backend; ASR, TTS and realtime rows run uncertified"
+            );
+        }
         if automatic_staged_transactions {
             // Engine rows back every model without its own row fit; a chat
             // model sizes its staged rows from its decode width at load.
             let staged = automatic_staged_transaction_rows(
-                crate::catalog::engine_row_width(
-                    selected_backend_kind,
-                    worker_config.max_tensor_batch_size,
-                ),
+                non_chat_row_width,
                 core_config
                     .resolved_physical_execution_capacity()
                     .candidate_dispatch_limit
@@ -203,16 +229,15 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         // Chat models clamp the engine width to their family's certified
-        // width; every other capability runs at the engine rows' width.
+        // width; every other capability runs at the engine rows' width. An
+        // operator's explicit width applies as asked.
         let adapter_registry = Arc::new(
             RuntimeAdapterRegistry::built_in_with_execution_limits(
-                crate::catalog::engine_row_width(
-                    selected_backend_kind,
-                    worker_config.max_tensor_batch_size,
-                ),
+                non_chat_row_width,
                 worker_config.request_parallelism,
             )?
-            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size),
+            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size)
+            .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
@@ -235,12 +260,38 @@ impl RuntimeService {
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
         let granite_speech_encoder_batcher =
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
-        let asr_realtime_sessions =
-            RealtimeAsrSessionPolicy::resolve(config.asr_realtime, selected_backend_kind)?;
+        let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
+            config.asr_realtime,
+            selected_backend_kind,
+            max_num_seqs,
+        )?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         worker_config.physical_execution_admission =
             Some(coordinator.physical_execution_admission());
+        let concurrency = ResolvedConcurrency {
+            profile: ConcurrencyProfile::resolve(selected_backend_kind, max_num_seqs),
+            max_num_seqs,
+            scheduler_rows: core_config.max_batch_size,
+            retained_sequences: core_config.max_retained_sequences,
+            staged_transactions: core_config.max_staged_transactions,
+            tensor_width: worker_config.max_tensor_batch_size,
+            non_chat_row_width,
+            realtime_asr_sessions: asr_realtime_sessions.max_sessions(),
+            chunked_prefill: core_config.effective_chunked_prefill(),
+        };
+        tracing::info!(
+            profile = concurrency.profile.as_str(),
+            max_num_seqs = ?concurrency.max_num_seqs,
+            scheduler_rows = concurrency.scheduler_rows,
+            retained_sequences = concurrency.retained_sequences,
+            staged_transactions = concurrency.staged_transactions,
+            tensor_width = concurrency.tensor_width,
+            non_chat_row_width = concurrency.non_chat_row_width,
+            realtime_asr_sessions = concurrency.realtime_asr_sessions,
+            chunked_prefill = concurrency.chunked_prefill,
+            "resolved runtime concurrency"
+        );
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let backend_router = BackendRouter::from_context(backend_context);
         let tokenizer = Arc::new(RwLock::new(None));
@@ -290,6 +341,7 @@ impl RuntimeService {
             loaded_tts_variant,
             max_loaded_models,
             model_lifecycle,
+            concurrency,
         })
     }
 
@@ -346,6 +398,12 @@ impl RuntimeService {
     /// out TTS work size their concurrency from it; more would only queue.
     pub fn tts_row_width(&self) -> usize {
         self.adapter_registry.max_tensor_batch_size().max(1)
+    }
+
+    /// The concurrency this runtime resolved at startup (`max_num_seqs` and
+    /// every limit it sized).
+    pub fn resolved_concurrency(&self) -> &ResolvedConcurrency {
+        &self.concurrency
     }
 
     /// Effective startup concurrency policy; never re-reads rollout environment variables.

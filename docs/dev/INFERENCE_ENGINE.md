@@ -254,7 +254,9 @@ while `Stateless` declares that no mutable state survives the invocation.
 Managed negotiation is mandatory; there is no managed-to-model-owned fallback.
 See [ADR 0001](./adr/0001-inference-state-abi-v2.md) for the ownership contract.
 
-**Metal execution note:** On MPS devices the step loop runs decode and prefill **sequentially** (not in parallel) to avoid Metal command-buffer contention.
+**Device execution note:** every device operation runs on that device's own
+thread, one job at a time (§5.9), so a step's prefill and decode never race on
+a Metal command buffer or a CUDA stream.
 
 ### 5.3 Request Processor
 
@@ -325,7 +327,65 @@ granted` include the requested/granted width and reason for scalar grants.
 | `ActiveLfm2TtsDecode` | LFM-2 TTS |
 | `ActiveSpeechToSpeechDecode` | Speech-to-speech |
 
-**Parallel execution (CPU):** `NativeExecutor::execute_requests_parallel` uses `thread::scope` to fan out requests across CPU threads. This path is disabled on MPS (`can_parallelize_requests` returns `false`), keeping Metal execution serial.
+**Parallel execution (CPU):** `NativeExecutor::execute_requests_parallel` uses `thread::scope` to fan out a scalar envelope's rows across CPU threads. Only CPU rows do (`backends::policy::can_parallelize_requests`): Metal shares one command queue and CUDA one device stream.
+
+### 5.9 Device Execution and Multi-User Serving
+
+**One knob.** `max_num_seqs` (`IZWI_MAX_NUM_SEQS`, `--max-num-seqs`) is the
+number of users served at once. Unset is the single-user profile on CPU and
+Metal: the app's own parallel calls (title generation, voice stages) still
+batch, and the portable KV pool holds one context. Set above 1 it is the
+multi-user profile: scheduler rows, the decode width (clamped to the family's
+certified width, `catalog/batch_width.rs`), retained sessions, the realtime
+ASR session cap and the worker's in-flight invocations follow it, chunked
+prefill turns on unless set explicitly, and the portable chat KV pool plans a
+context per sequence (`max(context, seqs × min(context, 8,192))` tokens).
+`runtime.concurrency` in `/v1/health` reports the resolved values.
+
+**Device thread.** One OS thread per device runs every device operation
+(`backends/device_thread.rs`). Control jobs (KV page operations, loads, frees)
+run first, in order. Model work carries a flow (its loaded model) and a weight
+(its workload class): the backlogged flow with the least weighted device time
+runs next. A running job is never preempted.
+
+**Physical admission.** Metal and CUDA admit one dispatch per device at a
+time (`PhysicalExecutionAdmission`, `runtime/coordinator.rs`). Loaded models
+sharing a device take turns in weighted-fair order, the device thread's
+policy: each is charged its hold time divided by its class weight
+(`runtime/coordinator/fair_permits.rs`). Direct runtime stages (encoders,
+realtime pushes, diarization) are weighed the same way rather than queueing
+as control jobs. Long work is chunked so it gives the device back:
+long-form ASR runs one audio window per dispatch.
+
+**Execution lanes.** Each loaded model is one lane, and a step fences only its
+own lane. `IZWI_LANE_STEP_DRIVERS=1` runs one step driver per lane instead of
+one for the engine. It is off by default: a mixed chat, ASR, TTS and realtime
+soak on an M1 Pro gave better TTS latency and a smaller worst chat gap with it
+on, but worse chat TTFT, typical inter-token latency and realtime lag
+(`SERVING_BENCHMARK.md`).
+
+**Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
+prefill spans beside decode rows in one model call. None is certified yet; the
+measurements are in the support matrix (`IZWI_MIXED_STEP=0|1` overrides).
+
+**Capacity replay.** When managed KV cannot hold every running request, the
+scheduler suspends the lowest-priority, youngest claim holder and replays it
+later from its prompt and the tokens it already produced. A request is
+replayed at most three times (`MAX_CAPACITY_REPLAYS`); after that the
+claim-deadlock breaker decides.
+
+**Batch invariance.** A request's output should not depend on which other
+requests share its step. The Metal GQA decode kernel splits each row's context
+from that row's length alone, so a row sums its attention in the same order
+in any batch. Seeded requests (`seed` ≥ 1; seed 0 means a clock seed) then
+repeat their solo output under load, which
+`scripts/bench/run-audio-load.py` checks per request.
+
+**Realtime ASR.** Nemotron sessions push their audio through one batcher per
+runtime: pushes that arrive while a batch runs go out together in the next
+one, through one device job and one cohort model call
+(`runtime/asr/realtime_push.rs`). A session over the native stream cap falls
+back to re-transcribing a rolling window and is told so.
 
 ### 5.6 Physical KV Cache and Paged Attention
 
@@ -412,7 +472,7 @@ explicit span-resumable contract (Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma3)
 are split into chunks of at most `chunked_prefill_threshold` tokens (512 on
 CUDA, 192 on CPU/Metal; the chunk does not shrink while other rows decode).
 CUDA always chunks; CPU and Metal run whole prompts unless chunking is
-enabled. This
+enabled or the multi-user profile (`max_num_seqs` above 1) turns it on. This
 allows the scheduler to interleave prefill chunks with decode steps, reducing
 time-to-first-token for concurrent requests. The flag is exposed to operators
 via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`,
@@ -454,9 +514,11 @@ Page size, storage dtype, head geometry, and layout are negotiated from the
 loaded model contract and Metal kernel capabilities rather than selected from
 an engine-wide hard-coded geometry.
 
-### Serial Execution on MPS
+### One Thread per Metal Device
 
-Because Metal command buffers are not thread-safe, `NativeExecutor::can_parallelize_requests` returns `false` for MPS devices. The `EngineCore::step()` loop runs decode and prefill sequentially on Metal, avoiding command-buffer races at the cost of reduced CPU parallelism.
+Candle's Metal device shares command-buffer state between the threads that use
+it, so every Metal operation runs on the device's own thread (§5.9). Model
+rows never fan out over request threads on Metal.
 
 ### Backend Selection
 
@@ -484,6 +546,7 @@ All engine parameters are centralised in `EngineCoreConfig` (`engine/config.rs`)
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `models_dir` | `PathBuf` | platform data directory | Model weights directory |
+| `max_num_seqs` | `Option<usize>` | `None` | Users served at once; sets rows, widths, KV sizing and chunked prefill (§5.9) |
 | `max_batch_size` | `usize` | 8 | Maximum inference batch size |
 | `max_seq_len` | `usize` | 4096 | Maximum sequence length |
 | `max_tokens_per_step` | `usize` | 384 | Scheduler token budget per step |

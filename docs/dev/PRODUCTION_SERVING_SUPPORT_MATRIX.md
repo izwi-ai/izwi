@@ -73,8 +73,11 @@ wall-clock-proven.
 A chat family's continuous decode runs every row through one forward. The
 widest batch it may run at on each backend is recorded in one table in code,
 `crates/izwi-core/src/catalog/batch_width.rs`. Each loaded model clamps the
-engine width (automatic, or `IZWI_MAX_BATCH_SIZE`) to its family's width.
-Every other capability (TTS, ASR, realtime) stays at two on CPU and Metal.
+automatic engine width, and one derived from `IZWI_MAX_NUM_SEQS`, to its
+family's width. Every other capability (TTS, ASR, realtime) stays at two on
+CPU and Metal. An explicit `IZWI_MAX_BATCH_SIZE` applies as asked (up to 32
+on any backend) to chat and speech models alike, above the certified width,
+and the runtime logs a warning that the rows run uncertified.
 The automatic engine width on CPU and Metal is the widest certified family
 (eight). Staged transaction rows for TTS and ASR stay at two, and a chat
 model stages one step at its own width.
@@ -92,11 +95,14 @@ The tests below are ignored and need the checkpoint.
 | Family | CPU | Metal | CUDA | Evidence (M1 Pro, 2026-10-16) |
 |---|---|---|---|---|
 | LFM2 / LFM2.5 | 8 | 8 | 32 (unmeasured) | Parity `lfm25_decode_matches_across_batch_widths_on_{cpu,metal}`: widths 2, 4 and 8 match width 1 on every decisive step (339–340). Worst top-8 logit delta is 0 on the CPU and 0.0096 on Metal. Throughput `lfm25_batch_width_scaling_{cpu,metal}` at widths 1/2/4/8: Metal 133/153/226/258 and 91/136/210/258 tok/s; CPU 89/113/134/155 and 90/107/136/165 tok/s. Metal's small-batch mat-vec serves 2..=8 rows, which bounds the family at 8 |
-| Qwen3.5 | 2 | 8 | 32 (unmeasured) | `qwen35_decode_width_parity_and_throughput_{cpu,metal}` (0.8B; 2B on Metal): every width is bit-identical to width 1. Metal 0.8B gives 109/125/136/144 and 112/130/141/148 tok/s; 2B gives 40/57/72/77. On the CPU, 0.8B gives 21/22/25/26, then 11/16/15/15 on a repeat under load. That is no repeatable gain past two, so the CPU stays at 2 |
+| Qwen3.5 | 2 | 8 | 32 (unmeasured) | `qwen35_decode_width_parity_and_throughput_{cpu,metal}` (0.8B; 2B on Metal): every decisive step agrees with width 1 and the top-16 logits move by under 1e-4. Metal (2026-10-24, with the shared small-batch k-quant mat-vec on every Q4_K/Q5_K/Q6_K/Q8_0 projection and the tied head) 0.8B gives 105/180/251/285 tok/s at widths 1/2/4/8 (Candle per-row: 105/122/133/140); 2B gives 68/99/137/147 (60/69/73/77). On the CPU, 0.8B gives 21/22/25/26, then 11/16/15/15 on a repeat under load. That is no repeatable gain past two, so the CPU stays at 2 |
 | Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | 32 (unmeasured) | No checkpoint on the measuring machine; the historical portable width |
 
-CUDA keeps its automatic width of eight (VRAM-tiered admission) and the
-kernel/metadata ceiling of 32. No CUDA width has been measured.
+CUDA keeps its automatic width of eight (VRAM-tiered admission) and a
+ceiling of 32. The 32 is a policy constant (`catalog/batch_width.rs`), not a
+kernel or metadata limit, and no CUDA width has been measured. An explicit
+`IZWI_MAX_BATCH_SIZE` above a certified width is honoured up to 32 with a
+startup warning.
 
 Live check (Metal, LFM2.5-1.2B, release build). The sweep used 32 prompts of
 256 words and 128 output tokens at rates 1, 2, 4 and inf, alternating runs on
@@ -120,7 +126,7 @@ The other rounds had no failures.
 | Backend | Token budget per step | Prefill chunk | Chunked prefill |
 |---|---|---|---|
 | CUDA | 2,048 | 512, kept while other rows decode | Always on (incremental chat) |
-| CPU, Metal | 384 | 192 | Off: prompts prefill whole, so neither size bounds a step |
+| CPU, Metal | 384 | 192 | Off by default: prompts prefill whole, so neither size bounds a step. On when `IZWI_MAX_NUM_SEQS` is above 1 (the multi-user profile), unless set explicitly |
 
 `IZWI_MAX_TOKENS_PER_STEP` and `IZWI_CHUNKED_PREFILL_THRESHOLD` override both
 sizes; `0` or unset takes the backend's. The CUDA sizes are unmeasured: no
@@ -128,12 +134,11 @@ NVIDIA device was available. The chunk no longer halves under decode load on
 any backend. CPU and Metal keep the historical sizes, for two reasons.
 Measured on Metal with LFM2.5 (1,000-word prompts at 2 req/s), the budget
 does not bound a whole-prompt prefill, and decode needs at most 64 tokens a
-step. Enabling chunked prefill (`IZWI_ENABLE_CHUNKED_PREFILL=1`) also fails
-requests under concurrent long prompts on CPU and Metal. The managed KV
-coordinator rejects decode rows with "transaction N is active or has already
-reached a terminal state" after a prefill row is withheld for tensor-state
-capacity. This happens with the old sizes and width too: it is a known open
-defect.
+step. Chunked prefill under concurrent long prompts used to fail decode rows
+with "transaction N is active or has already reached a terminal state". That
+was fixed in `9d9bae87`: the KV coordinator's terminal mark now covers only
+transactions evicted from its exact window (Metal 9/24 → 24/24 requests,
+CPU 9/16 → 16/16).
 
 ## Mixed prefill+decode steps by family and backend (Phase 3a)
 
@@ -293,7 +298,7 @@ semantics, and older workers tolerate the new fields.
 | `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming and streaming `choices[].logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
 | `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`) |
 | `response_format: json_object` on own-sampler families; `json_schema` everywhere | Documented 400, never silently ignored | Rejection is the recorded spike decision pending the schema→FSM follow-up (`c1f4b1af`) |
-| Shared speculative MTP envelopes in continuous batches (DS9.4) | Supported on the CUDA+MTP lane; perf claim hardware-gated | CPU fixture tests prove the two-row envelope commits exactly the solo sequence per row (greedy and sampled) with ragged exits and the opt-in gate both ways (`b6211f24`); the tokens/s-improvement / no-ITL-regression acceptance runs on CUDA via the qwen38 continuous-batching manifest's `IZWI_CUDA_MTP_IN_CONTINUOUS=off` vs default comparison using `summary.itl_ms` — recorded `not run` until hardware evidence exists |
+| Shared speculative MTP envelopes in continuous batches (DS9.4) | Opt-in (`IZWI_CUDA_MTP_IN_CONTINUOUS=auto`) on the CUDA+MTP lane: each row verifies with its own trunk pass, so it is off by default; perf claim hardware-gated | CPU fixture tests prove the two-row envelope commits exactly the solo sequence per row (greedy and sampled) with ragged exits and the opt-in gate both ways (`b6211f24`); the tokens/s-improvement / no-ITL-regression acceptance runs on CUDA via the qwen38 continuous-batching manifest's default (off) vs `IZWI_CUDA_MTP_IN_CONTINUOUS=auto` comparison using `summary.itl_ms` — recorded `not run` until hardware evidence exists |
 
 The constrained-decoding spike deliberately ships the grammar machine per
 state/key masking rather than a compressed-FSM grammar compiler; the

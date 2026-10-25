@@ -87,6 +87,12 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub max_tensor_batch_size: BatchSizePreference,
 
+    /// The operator fixed the tensor width (`IZWI_MAX_BATCH_SIZE`): it may
+    /// exceed the certified widths, up to `catalog::EXPLICIT_WIDTH_CEILING`.
+    /// A width derived from `max_num_seqs` keeps the certified caps.
+    #[serde(default)]
+    pub explicit_tensor_width: bool,
+
     /// Rollout mode for overlapping separate physical inference launches.
     #[serde(default)]
     pub physical_execution_mode: PhysicalExecutionMode,
@@ -279,6 +285,12 @@ pub struct EngineCoreConfig {
     /// memory budget can hold; zero disables the cap.
     #[serde(default = "default_portable_auto_context_cap_tokens")]
     pub portable_auto_context_cap_tokens: usize,
+
+    /// Sequences served concurrently per model (`max_num_seqs`), `None` when
+    /// automatic. Above one, the automatically fitted CPU/Metal chat pool
+    /// plans a context per sequence instead of one context for all of them.
+    #[serde(default)]
+    pub max_num_seqs: Option<usize>,
 
     /// Enable adaptive scheduling heuristics driven by runtime latency feedback.
     #[serde(default = "default_enable_adaptive_batching")]
@@ -637,6 +649,7 @@ impl Default for EngineCoreConfig {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_tensor_batch_size: BatchSizePreference::Auto,
+            explicit_tensor_width: false,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             lane_step_drivers: default_lane_step_drivers(),
@@ -675,6 +688,7 @@ impl Default for EngineCoreConfig {
             enable_capacity_replay: default_capacity_replay(),
             managed_chat_claim_quantum_tokens: default_managed_chat_claim_quantum_tokens(),
             portable_auto_context_cap_tokens: default_portable_auto_context_cap_tokens(),
+            max_num_seqs: None,
             enable_adaptive_batching: default_enable_adaptive_batching(),
             min_tokens_per_step: default_min_tokens_per_step(),
             target_ttft_ms: default_target_ttft_ms(),

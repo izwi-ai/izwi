@@ -21,12 +21,13 @@ use crate::backends::BackendKind;
 /// The width every family has been served at on CPU and Metal.
 pub(crate) const PORTABLE_BASELINE_WIDTH: usize = 2;
 
-/// The CUDA ceiling: the kernel and metadata width limit, not a measured
-/// width.
+/// The CUDA ceiling: a policy constant, not a kernel or metadata limit and
+/// not a measured width.
 pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 
 /// The widest decode batch `family` is certified for on `backend`. The
-/// engine clamps an operator's or the automatic width to it.
+/// engine clamps the automatic and `max_num_seqs` widths to it; an
+/// operator's explicit `IZWI_MAX_BATCH_SIZE` may exceed it, with a warning.
 ///
 /// | Family | CPU | Metal | Evidence (ignored real-checkpoint tests) |
 /// |---|---|---|---|
@@ -53,6 +54,26 @@ pub(crate) const fn max_certified_decode_width(backend: BackendKind) -> usize {
     match backend {
         BackendKind::Cuda => CUDA_MAX_WIDTH,
         BackendKind::Metal | BackendKind::Cpu => 8,
+    }
+}
+
+/// The widest tensor batch an operator may ask for explicitly
+/// (`IZWI_MAX_BATCH_SIZE`) on any backend. An explicit width above a family's
+/// certified width runs uncertified, with a startup warning, instead of being
+/// clamped silently.
+pub(crate) const EXPLICIT_WIDTH_CEILING: usize = CUDA_MAX_WIDTH;
+
+/// The rows every capability but chat runs at: the certified engine rows,
+/// or an operator's explicit width as asked.
+pub(crate) const fn non_chat_row_width(
+    backend: BackendKind,
+    tensor_width: usize,
+    explicit: bool,
+) -> usize {
+    if explicit {
+        tensor_width
+    } else {
+        engine_row_width(backend, tensor_width)
     }
 }
 

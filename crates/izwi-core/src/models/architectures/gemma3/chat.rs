@@ -924,9 +924,19 @@ impl Gemma3ChatModel {
             (1, span_end - physical_start),
             &self.device.device,
         )?;
-        let logits = self
-            .text_model
-            .forward_physical(&input, physical_start, &mut state.cache)?;
+        // Only the final span samples a token; earlier spans commit their KV
+        // without projecting logits.
+        let complete = span_end == prompt_ids.len();
+        let logits = if complete {
+            Some(
+                self.text_model
+                    .forward_physical(&input, physical_start, &mut state.cache)?,
+            )
+        } else {
+            self.text_model
+                .prefill_physical(&input, physical_start, &mut state.cache)?;
+            None
+        };
         if state.cache.context_len() != span_end {
             return Err(Error::InferenceError(format!(
                 "Gemma resumable prefill committed physical cursor {} instead of {span_end}",
@@ -935,9 +945,8 @@ impl Gemma3ChatModel {
         }
         state.position = span_end;
         state.prefill_progress = span_end;
-        let complete = span_end == prompt_ids.len();
         if complete {
-            state.unconsumed_logits = Some(logits);
+            state.unconsumed_logits = logits;
         }
         Ok(complete)
     }
@@ -1120,12 +1129,20 @@ impl Gemma3ChatModel {
         true
     }
 
+    /// Per decode row: the collated hidden state and the row's F32 logits
+    /// (262K entries, about 1 MiB, the larger of the two).
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.text_model.hidden_size())
+        let hidden = u64::try_from(self.text_model.hidden_size())
             .ok()
             .and_then(|hidden| {
                 hidden.checked_mul(u64::try_from(self.compute_dtype.size_in_bytes()).ok()?)
-            })
+            });
+        let logits = u64::try_from(self.text_model.vocab_size())
+            .ok()
+            .and_then(|vocab| vocab.checked_mul(4));
+        hidden
+            .zip(logits)
+            .and_then(|(hidden, logits)| hidden.checked_add(logits))
             .ok_or_else(|| Error::Overloaded("Gemma decode workspace estimate overflow".into()))
     }
 

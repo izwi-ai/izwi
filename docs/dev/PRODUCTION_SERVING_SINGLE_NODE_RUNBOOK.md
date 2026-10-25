@@ -628,7 +628,7 @@ The important current bounds are:
 | Gateway tenant work | process-local per-tenant and total ownership, fail-fast; hard cap 100,000 and configured total no greater than `--gateway-max-in-flight` |
 | Configured registry | 256 workers; bounded deployment/local-dispatch tables |
 | Worker request body | node `max_request_bytes`, at most 64 MiB by schema |
-| Worker execution | `max_active_invocations`, atomic and fail-fast; no transport queue |
+| Worker execution | `max_active_invocations` (unset: the loaded model's engine rows, or `IZWI_MAX_NUM_SEQS`, capped at `max_retained_attempts`), atomic and fail-fast; no transport queue |
 | Worker event channel | 4 events; 1 MiB encoded event limit in the real worker |
 | Worker attempt records | configured `max_retained_attempts`, at least active capacity, max 65,536; time-bounded by `attempt_retention_secs` (1-86,400) |
 | Private client JSON | 1 MiB request, 512 KiB control body, 16 KiB error body defaults |
@@ -916,7 +916,7 @@ variable, else from the default:
 
 | Limit | Environment | Default |
 |---|---|---|
-| Concurrent sessions | `IZWI_ASR_REALTIME_MAX_SESSIONS` | 16 on CUDA, 4 on CPU and Metal |
+| Concurrent sessions | `IZWI_ASR_REALTIME_MAX_SESSIONS` | `IZWI_MAX_NUM_SEQS`, else 16 on CUDA and 4 on CPU and Metal |
 | Absolute lifetime (s) | `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | 28,800 (8 hours) |
 | Idle timeout (s) | `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | 90 |
 
@@ -924,6 +924,20 @@ The session count is also the number of rows in the retained state arena
 that a Nemotron or Parakeet load allocates up front. Nemotron's arena is
 about 74 MB per session in F32, all of it held while the model is resident.
 Size the count from the concurrency you need, not as high as possible.
+
+Nemotron decodes concurrent sessions together. Audio that arrives while the
+model is busy waits, and the next device job carries every waiting session
+through one model call; an idle model runs a lone session's audio at once.
+On an M1 Pro (Metal) with 20 ms frames at real time:
+
+| Sessions | Pushed one at a time | Batched |
+|---|---|---|
+| 8 | final transcript 1.22 s after the last frame (max 1.60 s) | 0.87 s (max 1.24 s) |
+| 12 | 14.3 s behind | 7.1 s behind |
+| 16 | falls behind until input queues overflow (32 times) | still falls behind (4 overflows) |
+
+Transcripts were identical in every run. On that machine, size
+`IZWI_ASR_REALTIME_MAX_SESSIONS` at 8 or fewer for real-time results.
 
 Voxtral rolls its stream over at a pause before the model's ceiling, and
 Nemotron's streaming state is bounded. The lifetime therefore only reaps a
@@ -1229,7 +1243,8 @@ Scale semantics:
   available, the scale-up window clear, and a running worker holding at
   least `scale_up_queue_depth` invocations (active plus queued; workers do
   not queue today, so this is the active count and validation rejects a
-  depth above the workers' `max_active_invocations`) for
+  depth above a worker's declared `max_active_invocations`; an undeclared
+  capacity is the worker's own and is not checked) for
   `scale_up_sustained_polls` consecutive evaluations. The standby starts
   through the standard launch path; the supervisor does not wait for it and
   publishes its approvals line once it is ready. A worker that crashed is

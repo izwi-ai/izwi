@@ -26,6 +26,15 @@ use tower::ServiceExt;
 async fn spawn_tiny_worker(
     models: &std::path::Path,
 ) -> (ProcessGuard, WorkerClient, WorkerDescriptor) {
+    spawn_tiny_worker_admitting(models, Some("1")).await
+}
+
+/// [`spawn_tiny_worker`] with `IZWI_WORKER_MAX_ACTIVE` set to `max_active`,
+/// or left unset so the worker sizes itself from the loaded model.
+async fn spawn_tiny_worker_admitting(
+    models: &std::path::Path,
+    max_active: Option<&str>,
+) -> (ProcessGuard, WorkerClient, WorkerDescriptor) {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -37,11 +46,15 @@ async fn spawn_tiny_worker(
         .env("IZWI_WORKER_BEARER_TOKEN", "real-cpu-secret")
         .env("IZWI_WORKER_ARTIFACT_REVISION", "tiny-lfm-fixture-v1")
         .env("IZWI_WORKER_CPU_THREADS", "1")
-        .env("IZWI_WORKER_MAX_ACTIVE", "1")
+        .env_remove("IZWI_WORKER_MAX_ACTIVE")
+        .env_remove("IZWI_MAX_NUM_SEQS")
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    if let Some(max_active) = max_active {
+        command.env("IZWI_WORKER_MAX_ACTIVE", max_active);
+    }
     let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
@@ -151,6 +164,43 @@ async fn worker_capability_follows_the_loaded_model() {
         events.last().map(|event| &event.event),
         Some(InvocationEventKind::Completed { .. })
     ));
+
+    child.kill().unwrap();
+}
+
+/// A worker started without `IZWI_WORKER_MAX_ACTIVE` admits as many
+/// invocations as its engine batches, so two concurrent chats both complete.
+/// A default worker used to admit one and refuse the second with 429.
+#[tokio::test]
+async fn a_default_worker_serves_concurrent_chats() {
+    let models = tempfile::tempdir().unwrap();
+    write_tiny_lfm_fixture_with_context(models.path(), 256);
+    let (mut child, client, descriptor) = spawn_tiny_worker_admitting(models.path(), None).await;
+
+    let status = client.status().await.unwrap();
+    assert!(
+        status.capacity.max_active_invocations >= 2,
+        "a default worker admits {} invocations",
+        status.capacity.max_active_invocations
+    );
+    let mut first = chat_request(&descriptor, "concurrent-attempt-1", 32);
+    first.request_id = id("concurrent-request-1");
+    let mut second = chat_request(&descriptor, "concurrent-attempt-2", 32);
+    second.request_id = id("concurrent-request-2");
+    let (first, second) = tokio::join!(
+        client.invoke_collect(first),
+        client.invoke_collect(second)
+    );
+    for events in [first.unwrap(), second.unwrap()] {
+        assert!(
+            matches!(
+                events.last().map(|event| &event.event),
+                Some(InvocationEventKind::Completed { .. })
+            ),
+            "{:?}",
+            events.last()
+        );
+    }
 
     child.kill().unwrap();
 }

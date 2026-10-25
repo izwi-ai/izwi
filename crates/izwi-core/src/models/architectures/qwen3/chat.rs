@@ -614,10 +614,14 @@ impl Qwen3ChatModel {
         )?;
         let complete = span_end == prompt_ids.len();
         let output = if complete {
-            Some(
-                self.text_model
-                    .forward_managed(&input_ids, physical_start, &mut state.cache)?,
-            )
+            // Only the next token is sampled: project the span's last row.
+            let embeds = self.text_model.embeddings(&input_ids)?;
+            Some(self.text_model.forward_managed_last_logits_with_embeds(
+                &embeds,
+                physical_start,
+                &mut state.cache,
+                None,
+            )?)
         } else {
             let embeds = self.text_model.embeddings(&input_ids)?;
             self.text_model.forward_managed_hidden_with_embeds(
@@ -989,13 +993,23 @@ impl Qwen3ChatModel {
         true
     }
 
-    /// Additional per-row tensor materialization used only by the continuous
-    /// path when ragged attention rows are concatenated back into one batch.
+    /// Per-row tensors the continuous path materializes: the collated
+    /// attention row and the row's F32 logits.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        let logits = u64::try_from(self.text_model.lm_head_size())
+            .ok()
+            .and_then(|vocab| vocab.checked_mul(4))
+            .ok_or_else(|| {
+                Error::Overloaded("continuous decode workspace estimate overflow".to_string())
+            })?;
         continuous_decode_collation_workspace_bytes(
             self.text_model.hidden_size(),
             self.compute_dtype.size_in_bytes(),
-        )
+        )?
+        .checked_add(logits)
+        .ok_or_else(|| {
+            Error::Overloaded("continuous decode workspace estimate overflow".to_string())
+        })
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -1311,7 +1325,7 @@ mod tests {
     use super::{
         argmax_last_sequence_output, continuous_decode_collation_workspace_bytes,
         qwen3_chat_mlx_bits, qwen3_chat_safetensors_shards, select_qwen3_dense_dtype,
-        strip_think_blocks, take_quantum_argmax,
+        strip_think_blocks, take_quantum_argmax, tiny_chat_model_for_test,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, IndexOp, Tensor};
@@ -1367,6 +1381,22 @@ mod tests {
     fn strip_think_blocks_handles_implicit_open_pattern() {
         let stripped = strip_think_blocks("reasoning only</think>\nFinal answer");
         assert_eq!(stripped, "Final answer");
+    }
+
+    /// A decode row's workspace counts its F32 logits, not only the
+    /// collated hidden row: the logits are by far the larger tensor.
+    #[test]
+    fn decode_row_workspace_counts_the_logits_row() {
+        let model = tiny_chat_model_for_test(&Device::Cpu);
+        let hidden_only = continuous_decode_collation_workspace_bytes(
+            model.text_model.hidden_size(),
+            model.compute_dtype.size_in_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            model.continuous_decode_batch_workspace_per_row_bytes().unwrap(),
+            hidden_only + 4 * model.text_model.lm_head_size() as u64
+        );
     }
 
     #[test]

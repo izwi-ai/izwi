@@ -18,6 +18,7 @@ pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
 pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
 pub const ENV_MAX_PHYSICAL_IN_FLIGHT: &str = "IZWI_MAX_PHYSICAL_IN_FLIGHT";
 pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
+pub const ENV_MAX_NUM_SEQS: &str = "IZWI_MAX_NUM_SEQS";
 pub const ENV_ENABLE_PREFIX_CACHING: &str = "IZWI_ENABLE_PREFIX_CACHING";
 pub const ENV_PREFIX_REUSE_AUTO: &str = "IZWI_PREFIX_REUSE_AUTO";
 /// Shipped serving default (DS1.6): when the operator made no explicit
@@ -74,6 +75,10 @@ pub struct ServeRuntimeConfig {
     pub max_batch_size: BatchSizePreference,
     pub physical_execution_mode: PhysicalExecutionMode,
     pub max_physical_in_flight: PhysicalInFlightLimit,
+    /// Sequences served concurrently per model; `None` keeps each backend's
+    /// automatic sizing (see [`EngineConfig::max_num_seqs`]).
+    #[serde(default)]
+    pub max_num_seqs: Option<usize>,
     pub max_scheduler_batch_size: usize,
     pub enable_prefix_caching: bool,
     pub prefix_reuse_catalog_auto: bool,
@@ -123,6 +128,7 @@ impl Default for ServeRuntimeConfig {
             max_batch_size: default_max_batch_size(),
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
+            max_num_seqs: None,
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             enable_prefix_caching: default_enable_prefix_caching(),
             prefix_reuse_catalog_auto: PREFIX_REUSE_CATALOG_AUTO_DEFAULT,
@@ -157,6 +163,15 @@ impl ServeRuntimeConfig {
             .apply_overrides(config_file)
             .apply_overrides(env)
             .apply_overrides(cli);
+        // A multi-user `max_num_seqs` turns chunked prefill on unless some
+        // source chose it explicitly.
+        if [config_file, env, cli]
+            .iter()
+            .all(|source| source.enable_chunked_prefill.is_none())
+        {
+            config.enable_chunked_prefill =
+                crate::config::default_chunked_prefill_for(config.max_num_seqs);
+        }
         config.performance.mark_environment_resolved();
         config
     }
@@ -189,6 +204,9 @@ impl ServeRuntimeConfig {
         }
         if let Some(max_physical_in_flight) = overrides.max_physical_in_flight {
             self.max_physical_in_flight = max_physical_in_flight;
+        }
+        if let Some(max_num_seqs) = overrides.max_num_seqs {
+            self.max_num_seqs = (max_num_seqs > 0).then_some(max_num_seqs);
         }
         if let Some(max_scheduler_batch_size) = overrides.max_scheduler_batch_size {
             self.max_scheduler_batch_size = max_scheduler_batch_size;
@@ -273,6 +291,7 @@ impl ServeRuntimeConfig {
             max_batch_size: self.max_batch_size,
             physical_execution_mode: self.physical_execution_mode,
             max_physical_in_flight: self.max_physical_in_flight,
+            max_num_seqs: self.max_num_seqs,
             max_scheduler_batch_size: self.max_scheduler_batch_size,
             enable_prefix_caching: self.enable_prefix_caching,
             prefix_reuse_catalog_auto: self.prefix_reuse_catalog_auto,
@@ -309,6 +328,9 @@ pub struct ServeRuntimeConfigOverrides {
     pub max_batch_size: Option<BatchSizePreference>,
     pub physical_execution_mode: Option<PhysicalExecutionMode>,
     pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
+    /// Sequences served concurrently per model; zero is automatic.
+    #[serde(default)]
+    pub max_num_seqs: Option<usize>,
     pub max_scheduler_batch_size: Option<usize>,
     pub enable_prefix_caching: Option<bool>,
     pub prefix_reuse_catalog_auto: Option<bool>,
@@ -364,6 +386,7 @@ impl ServeRuntimeConfigOverrides {
             )?,
             max_loaded_models: read_user_usize(&document, &path, "max_loaded_models")?,
             model_keep_alive_secs: read_user_u64(&document, &path, "model_keep_alive_secs")?,
+            max_num_seqs: read_user_usize(&document, &path, "max_num_seqs")?,
             ..Self::default()
         })
     }
@@ -386,6 +409,7 @@ impl ServeRuntimeConfigOverrides {
                 ENV_MAX_PHYSICAL_IN_FLIGHT,
                 &[],
             ),
+            max_num_seqs: read_env_usize(ENV_MAX_NUM_SEQS, &[]),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
             enable_prefix_caching: crate::env::flag(ENV_ENABLE_PREFIX_CACHING),
             prefix_reuse_catalog_auto: crate::env::flag(ENV_PREFIX_REUSE_AUTO),
@@ -626,6 +650,7 @@ mod tests {
         ENV_PHYSICAL_EXECUTION_MODE,
         ENV_MAX_PHYSICAL_IN_FLIGHT,
         ENV_MAX_SCHEDULER_BATCH_SIZE,
+        ENV_MAX_NUM_SEQS,
         ENV_ENABLE_PREFIX_CACHING,
         ENV_MANAGED_PREFIX_CACHE_SALT,
         ENV_MAX_PREFIX_CACHE_PAGES,
@@ -884,6 +909,55 @@ workers = 5
             ServeRuntimeConfig::default().engine_config().asr_realtime,
             RealtimeAsrSessionConfig::default()
         );
+    }
+
+    #[test]
+    fn max_num_seqs_reaches_the_engine_and_chunks_prefill_unless_chosen() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        let defaults = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert_eq!(defaults.max_num_seqs, None);
+        assert!(!defaults.enable_chunked_prefill);
+        assert_eq!(defaults.engine_config().max_num_seqs, None);
+
+        std::env::set_var(ENV_MAX_NUM_SEQS, "6");
+        let multi = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert_eq!(multi.max_num_seqs, Some(6));
+        assert!(multi.enable_chunked_prefill);
+        let engine = multi.engine_config();
+        assert_eq!(engine.max_num_seqs, Some(6));
+        assert!(engine.enable_chunked_prefill);
+
+        // An explicit choice in any source wins over the multi-user default.
+        std::env::set_var(ENV_ENABLE_CHUNKED_PREFILL, "0");
+        let chosen = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!chosen.enable_chunked_prefill);
+        std::env::remove_var(ENV_ENABLE_CHUNKED_PREFILL);
+
+        // One sequence is the single-user profile; the CLI outranks the env.
+        let single = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides {
+                max_num_seqs: Some(1),
+                ..ServeRuntimeConfigOverrides::default()
+            },
+        );
+        assert_eq!(single.max_num_seqs, Some(1));
+        assert!(!single.enable_chunked_prefill);
+        clear_env();
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Q4_K / Q6_K mat-vec for Metal decode batches (2..=8 activation rows).
+//! Q4_K / Q5_K / Q6_K / Q8_0 mat-vec for Metal decode batches (2..=8
+//! activation rows).
 //!
 //! Candle's Metal mat-vec issues one dispatch per activation row, and each
 //! one streams the whole quantized weight again. This kernel follows
@@ -53,6 +54,20 @@ fn vectors_per_group(batch: usize) -> usize {
 
 const QK_K: usize = 256;
 
+/// Whether the kernels serve a `[_, cols]` weight of `dtype`.
+pub(crate) fn serves(dtype: GgmlDType, cols: usize) -> bool {
+    block_weights(dtype).is_some_and(|block| cols > 0 && cols.is_multiple_of(block))
+}
+
+/// Weights per quantization block of the types the kernels serve.
+fn block_weights(dtype: GgmlDType) -> Option<usize> {
+    match dtype {
+        GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => Some(QK_K),
+        GgmlDType::Q8_0 => Some(32),
+        _ => None,
+    }
+}
+
 /// A Q4_K or Q6_K weight `[rows, cols]` resident in a Metal buffer, in GGUF
 /// block layout. The buffer is the one the weight's `QTensor` owns, shared.
 #[derive(Clone)]
@@ -76,16 +91,13 @@ impl std::fmt::Debug for MetalKQuantMatVec {
 impl MetalKQuantMatVec {
     /// `None` for a type or geometry the kernels do not cover.
     pub(crate) fn new(buffer: Buffer, dtype: GgmlDType, rows: usize, cols: usize) -> Option<Self> {
-        (matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
-            && cols > 0
-            && cols.is_multiple_of(QK_K)
-            && rows > 0)
-            .then_some(Self {
-                buffer,
-                dtype,
-                rows,
-                cols,
-            })
+        let block = block_weights(dtype)?;
+        (cols > 0 && cols.is_multiple_of(block) && rows > 0).then_some(Self {
+            buffer,
+            dtype,
+            rows,
+            cols,
+        })
     }
 
     /// Whether `x` (`[..., cols]`, F32, on Metal) has 2..=[`MAX_ROWS`] rows.
@@ -118,6 +130,42 @@ impl MetalKQuantMatVec {
     }
 }
 
+/// Give a Metal Q4_K / Q5_K / Q6_K / Q8_0 `QMatMul` a small-batch mat-vec over the same
+/// weight. Candle's `QTensor` does not expose its buffer, so the weight is
+/// read back once and uploaded into a buffer both share; `matmul` is
+/// rebuilt over it (the old buffer is freed). `None`, leaving `matmul`
+/// untouched, for another type, device or geometry, or a weight another
+/// holder shares (a tied head would be duplicated).
+pub(crate) fn share_qmatmul_weight(
+    matmul: &mut candle_core::quantized::QMatMul,
+) -> candle_core::Result<Option<MetalKQuantMatVec>> {
+    use candle_core::quantized::{QMatMul, QStorage, QTensor};
+    let QMatMul::QTensor(qtensor) = matmul else {
+        return Ok(None);
+    };
+    let device = qtensor.device();
+    let dtype = qtensor.dtype();
+    let Some(block) = block_weights(dtype) else {
+        return Ok(None);
+    };
+    if !device.is_metal() || std::sync::Arc::strong_count(qtensor) != 1 {
+        return Ok(None);
+    }
+    let Ok((rows, cols)) = qtensor.shape().dims2() else {
+        return Ok(None);
+    };
+    if cols == 0 || !cols.is_multiple_of(block) {
+        return Ok(None);
+    }
+    let storage = QStorage::from_data(qtensor.data()?, &device, dtype)?;
+    let QStorage::Metal(metal) = &storage else {
+        return Ok(None);
+    };
+    let kernel = MetalKQuantMatVec::new(metal.buffer().clone(), dtype, rows, cols);
+    *matmul = QMatMul::from_qtensor(QTensor::new(storage, (rows, cols))?)?;
+    Ok(kernel)
+}
+
 impl CustomOp1 for MetalKQuantMatVec {
     fn name(&self) -> &'static str {
         "izwi-kquant-mat-vec"
@@ -144,7 +192,9 @@ impl CustomOp1 for MetalKQuantMatVec {
         }
         let kind = match self.dtype {
             GgmlDType::Q4K => "q4_K",
+            GgmlDType::Q5K => "q5_K",
             GgmlDType::Q6K => "q6_K",
+            GgmlDType::Q8_0 => "q8_0",
             dtype => bail!("izwi-kquant-mat-vec does not serve {dtype:?}"),
         };
         let vectors = vectors_per_group(batch);
@@ -242,6 +292,25 @@ typedef struct {
     half d;
 } block_q6_K;
 
+typedef struct {
+    union {
+        struct {
+            half d;
+            half dmin;
+        };
+        half2 dm;
+    };
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+
+#define QK8_0 32
+typedef struct {
+    half d;
+    int8_t qs[QK8_0];
+} block_q8_0;
+
 // llama.cpp's `mul_mv_ext` structure (ggml, MIT): NXPSG lanes share one
 // weight row, each lane dequantizes one 16-weight chunk per step into a
 // float4x4 and dots it with R activation vectors read straight from device
@@ -276,6 +345,37 @@ void izwi_dequantize_q4_K(device const block_q4_K * xb, short il, thread float4x
     }
 }
 
+// ggml's Q5_K dequantizer (chunk `il` of 16), with the scale divide in F32
+// as for Q4_K above.
+void izwi_dequantize_q5_K(device const block_q5_K * xb, short il, thread float4x4 & reg) {
+    device const uint8_t * q  = xb->qs;
+    device const uint8_t * qh = xb->qh;
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    const uint8_t ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = izwi_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.0f;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.0f : 256.0f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0.0f)) - ml;
+    }
+}
+
+// ggml's Q8_0 dequantizer: chunk `il` (0 or 1) of a 32-weight block.
+void izwi_dequantize_q8_0(device const block_q8_0 * xb, short il, thread float4x4 & reg) {
+    device const int8_t * qs = xb->qs;
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = qs[i + 16*il] * d;
+    }
+}
+
 void izwi_dequantize_q6_K(device const block_q6_K * xb, short il, thread float4x4 & reg) {
     const half d_all = xb->d;
     device const uint8_t * ql = (device const uint8_t *)xb->ql;
@@ -297,7 +397,7 @@ void izwi_dequantize_q6_K(device const block_q6_K * xb, short il, thread float4x
     }
 }
 
-template <typename block_q, short R, short NXPSG,
+template <typename block_q, short R, short NXPSG, short NL,
           void (*deq)(device const block_q *, short, thread float4x4 &)>
 void izwi_kq_ext_impl(
         device const char  * src0,
@@ -310,7 +410,7 @@ void izwi_kq_ext_impl(
     const short ty = tiisg / NXPSG;
     const uint i01 = tgpig.x * (NYPSG * IZWI_KQ_NSG) + NYPSG * sgitg + ty;
     const uint i11 = tgpig.y * R;
-    const uint nb = ne00 / QK_K;
+    const uint nb = ne00 / (16 * NL);
 
     device const block_q * xq = (device const block_q *)src0 + (i01 < ne01 ? i01 : 0) * nb;
     device const float4x4 * y4x4[R];
@@ -322,15 +422,15 @@ void izwi_kq_ext_impl(
     for (short ir = 0; ir < R; ++ir) {
         sumf[ir] = 0.0f;
     }
-    short cch = tx % 16;
-    xq += tx / 16;
+    short cch = tx % NL;
+    xq += tx / NL;
     for (uint ich = tx; 16 * ich < ne00; ich += NXPSG) {
         float4x4 lx;
         deq(xq, cch, lx);
         cch += NXPSG;
-        if (cch >= 16) {
-            xq += cch / 16;
-            cch %= 16;
+        if (cch >= NL) {
+            xq += cch / NL;
+            cch %= NL;
         }
         for (short ir = 0; ir < R; ++ir) {
             const float4x4 y = *y4x4[ir];
@@ -356,7 +456,7 @@ void izwi_kq_ext_impl(
     }
 }
 
-template <typename block_q, short R, short NXPSG,
+template <typename block_q, short R, short NXPSG, short NL,
           void (*deq)(device const block_q *, short, thread float4x4 &)>
 kernel void izwi_kq_ext(
         device const char  * src0 [[buffer(0)]],
@@ -368,16 +468,19 @@ kernel void izwi_kq_ext(
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    izwi_kq_ext_impl<block_q, R, NXPSG, deq>(src0, src1, dst, ne00, ne01, ne11, tgpig, tiisg, sgitg);
+    izwi_kq_ext_impl<block_q, R, NXPSG, NL, deq>(src0, src1, dst, ne00, ne01, ne11, tgpig, tiisg, sgitg);
 }
 
-typedef decltype(izwi_kq_ext<block_q4_K, 2, 8, izwi_dequantize_q4_K>) izwi_kq_ext_t;
+typedef decltype(izwi_kq_ext<block_q4_K, 2, 8, 16, izwi_dequantize_q4_K>) izwi_kq_ext_t;
 
 constant constexpr short IZWI_KQ_NXPSG = 8;
 
+// NL: 16-weight chunks per block (16 for the K-quants, 2 for Q8_0).
 #define IZWI_KQ_EXT(R) \
-template [[host_name("izwi_kq_ext_q4_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_K, R, IZWI_KQ_NXPSG, izwi_dequantize_q4_K>; \
-template [[host_name("izwi_kq_ext_q6_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q6_K, R, IZWI_KQ_NXPSG, izwi_dequantize_q6_K>;
+template [[host_name("izwi_kq_ext_q4_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q4_K>; \
+template [[host_name("izwi_kq_ext_q5_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q5_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q5_K>; \
+template [[host_name("izwi_kq_ext_q6_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q6_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q6_K>; \
+template [[host_name("izwi_kq_ext_q8_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q8_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q8_0>;
 
 IZWI_KQ_EXT(2)
 IZWI_KQ_EXT(3)
@@ -440,8 +543,12 @@ mod tests {
         for (dtype, rows, cols) in [
             (GgmlDType::Q4K, 64, 512),
             (GgmlDType::Q4K, 12, 768),
+            (GgmlDType::Q5K, 64, 512),
+            (GgmlDType::Q5K, 10, 1024),
             (GgmlDType::Q6K, 64, 512),
             (GgmlDType::Q6K, 6, 1024),
+            (GgmlDType::Q8_0, 64, 512),
+            (GgmlDType::Q8_0, 9, 96),
         ] {
             let (ext, matmul) = weight(&device, dtype, rows, cols);
             for batch in 2..=MAX_ROWS {
@@ -468,6 +575,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A `QMatMul` loaded the ordinary way gets a kernel over its own
+    /// (re-uploaded) weight that matches it; a shared or unsupported weight
+    /// is left alone.
+    #[test]
+    fn a_loaded_qmatmul_shares_its_weight_with_the_small_batch_kernel() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "a_loaded_qmatmul_shares_its_weight_with_the_small_batch_kernel",
+        ) else {
+            return;
+        };
+        let (rows, cols) = (48, 512);
+        let values = Tensor::from_vec(
+            xorshift(0x51A2, rows * cols, 2.0),
+            (rows, cols),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let loaded = || QTensor::quantize_onto(&values, GgmlDType::Q4K, &device).unwrap();
+        let reference = candle_core::quantized::QMatMul::from_qtensor(loaded()).unwrap();
+        let mut matmul = candle_core::quantized::QMatMul::from_qtensor(loaded()).unwrap();
+        let kernel = share_qmatmul_weight(&mut matmul)
+            .unwrap()
+            .expect("a Q4_K Metal weight takes the kernel");
+        for batch in [2usize, 5, MAX_ROWS] {
+            let x = Tensor::from_vec(
+                xorshift(batch as u32, batch * cols, 3.0),
+                (batch, 1, cols),
+                &device,
+            )
+            .unwrap();
+            let expected = reference.forward(&x).unwrap().flatten_all().unwrap();
+            let expected = expected.to_vec1::<f32>().unwrap();
+            for actual in [kernel.forward(&x).unwrap(), matmul.forward(&x).unwrap()] {
+                let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let scale = expected.iter().fold(0f32, |max, e| max.max(e.abs()));
+                for (a, e) in actual.iter().zip(&expected) {
+                    assert!((a - e).abs() <= 2e-6 * scale, "batch {batch}: {a} vs {e}");
+                }
+            }
+        }
+        // A weight with another holder is not duplicated.
+        let shared = std::sync::Arc::new(loaded());
+        let mut tied = candle_core::quantized::QMatMul::from_arc(shared.clone()).unwrap();
+        assert!(share_qmatmul_weight(&mut tied).unwrap().is_none());
+        // Unsupported types keep Candle.
+        let mut q4_0 = candle_core::quantized::QMatMul::from_qtensor(
+            QTensor::quantize_onto(&values, GgmlDType::Q4_0, &device).unwrap(),
+        )
+        .unwrap();
+        assert!(share_qmatmul_weight(&mut q4_0).unwrap().is_none());
     }
 
     /// Timing against Candle's per-row mat-vec on LFM2.5-sized weights.
@@ -527,7 +686,8 @@ mod tests {
             assert!(ext.forward(x).is_err());
         }
         let buffer = ext.buffer.clone();
-        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q8_0, 8, 256).is_none());
+        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q4_0, 8, 256).is_none());
+        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q8_0, 8, 48).is_none());
         assert!(MetalKQuantMatVec::new(buffer, GgmlDType::Q6K, 8, 300).is_none());
     }
 }

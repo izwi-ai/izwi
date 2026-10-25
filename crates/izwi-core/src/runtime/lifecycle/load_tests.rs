@@ -8,7 +8,7 @@ use super::{
     qwen38_representation_memory_estimate, reconcile_observed_growth,
     residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
     validate_scratch_only_invocation_publication, DeviceUsageSample,
-    LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
+    LoadedAsrStatePublicationRoute, MeasuredLoads, ModelMemoryEstimate, PortableInvocationContextIntent,
     PrecisionReloadRequest, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
     QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
 };
@@ -1739,6 +1739,32 @@ fn portable_context_reserve_is_the_configured_reserve_when_residency_is_the_cata
     );
 }
 
+/// Device usage is sampled for the whole device, so a load window that
+/// another load's window overlapped is not reconciled: a concurrent load's
+/// weights would otherwise read as this load's under-pricing.
+#[test]
+fn a_load_window_knows_when_another_load_overlapped_it() {
+    let loads = MeasuredLoads::default();
+    let _first = loads.open();
+    let alone = loads.mark();
+    assert!(!loads.overlapped_since(alone), "no other load");
+
+    let second = loads.open();
+    assert!(loads.overlapped_since(alone), "another load is open");
+    drop(second);
+    assert!(
+        loads.overlapped_since(alone),
+        "another load opened and closed inside the window"
+    );
+
+    let after = loads.mark();
+    assert!(!loads.overlapped_since(after), "the other load ended before");
+
+    let _third = loads.open();
+    let crowded = loads.mark();
+    assert!(loads.overlapped_since(crowded), "another load was open at the start");
+}
+
 /// Truth reconciliation (ADM-8): growth beyond the authorization plus the
 /// tolerance fails the load; growth inside it, or matched by leases
 /// reserved over the same interval (the load's own state, a concurrent
@@ -3422,6 +3448,52 @@ fn portable_auto_chat_context_is_capped() -> crate::error::Result<()> {
             )?
             .expect("managed runtime");
         assert_eq!(runtime.logical_token_reach(), expected, "cap {cap}");
+    }
+    Ok(())
+}
+
+/// A multi-user `max_num_seqs` plans the capped context once per sequence
+/// (at most 8,192 tokens each), within what memory holds; one sequence keeps
+/// the single-user pool. Each request may still use the model's context.
+#[test]
+fn portable_multi_user_chat_pool_plans_a_context_per_sequence() -> crate::error::Result<()> {
+    for (max_num_seqs, cap, expected) in [
+        (None, 4_096_usize, 4_096_u64),
+        (Some(1), 4_096, 4_096),
+        (Some(4), 4_096, 16_384),
+        (Some(4), 32_768, 32_768),
+        (Some(8), 32_768, 65_536),
+    ] {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedUnifiedProvider {
+                capacity: 64 * GIB,
+                available: 64 * GIB,
+                observed: 0,
+            }),
+        ));
+        let mut config = crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_retained_sequences: max_num_seqs.unwrap_or(1),
+            max_staged_transactions: 1,
+            portable_auto_context_cap_tokens: cap,
+            max_num_seqs,
+            ..Default::default()
+        };
+        config.portable_context_auto = true;
+        let mut core =
+            crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+        let runtime = core
+            .load_managed_model_cache(
+                ModelInstanceId::new(4_103),
+                &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
+                Some(131_072),
+            )?
+            .expect("managed runtime");
+        assert_eq!(
+            runtime.logical_token_reach(),
+            expected,
+            "{max_num_seqs:?} cap {cap}"
+        );
     }
     Ok(())
 }

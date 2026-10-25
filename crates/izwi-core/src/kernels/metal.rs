@@ -2406,11 +2406,13 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             if pipeline.max_total_threads_per_threadgroup()
                 >= super::metal_paged_gqa::GQA_DECODE_THREADS
             {
-                let (partitions, partition_tokens) = super::metal_paged_gqa::gqa_decode_partitions(
-                    self.batch_size,
-                    self.num_kv_heads,
-                    max_context_len,
-                );
+                let (partitions, max_row_partitions) =
+                    super::metal_paged_gqa::gqa_decode_partitions(
+                        self.num_kv_heads,
+                        self.metadata[..self.batch_size]
+                            .iter()
+                            .map(|&context_len| context_len as usize),
+                    );
                 let partial_count = if partitions > 1 {
                     self.batch_size
                         .checked_mul(self.num_heads)
@@ -2463,7 +2465,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                 encoder.set_bytes(13, &(self.key_head_dim as u32));
                 encoder.set_bytes(14, &self.scale);
                 encoder.set_bytes(15, &self.softcap.unwrap_or(0.0));
-                encoder.set_bytes(16, &(partition_tokens as u32));
+                encoder.set_bytes(16, &(max_row_partitions as u32));
                 encoder.set_bytes(17, &(partitions as u32));
                 encoder.dispatch_thread_groups(
                     objc2_metal::MTLSize {
@@ -2478,8 +2480,10 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     },
                 );
                 if partitions > 1 {
-                    let (_, reduce_pipeline) =
-                        paged_decode_attention_split_pipelines(device.metal_device(), dtype)?;
+                    let reduce_pipeline = super::metal_paged_gqa::gqa_decode_reduce_pipeline(
+                        device.metal_device(),
+                        dtype,
+                    )?;
                     encoder.insert_memory_barrier();
                     encoder.set_label("izwi-paged-decode-gqa-reduce");
                     encoder.set_compute_pipeline_state(&reduce_pipeline);
@@ -2490,7 +2494,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
                     encoder.set_bytes(5, &(self.num_heads as u32));
                     encoder.set_bytes(6, &(self.value_head_dim as u32));
-                    encoder.set_bytes(7, &(partition_tokens as u32));
+                    encoder.set_bytes(7, &(max_row_partitions as u32));
                     encoder.set_bytes(8, &(partitions as u32));
                     encoder.dispatch_thread_groups(
                         objc2_metal::MTLSize {
@@ -5385,6 +5389,118 @@ mod tests {
                 let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
                 assert_f32_close(&actual, &expected, tolerance, "one-pass paged attention");
             }
+        }
+    }
+
+    /// A row's GQA decode output does not depend on the other rows in its
+    /// batch: decoded alone and beside a longer and a shorter row, it is
+    /// bit-identical. Partitions sized by the batch made greedy Qwen3-TTS
+    /// output differ from its solo run.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_gqa_decode_row_is_batch_invariant_if_available() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_gqa_decode_row_is_batch_invariant_if_available",
+        ) else {
+            return;
+        };
+        let (num_heads, num_kv_heads, head_dim, page_tokens) = (16usize, 8usize, 128usize, 16usize);
+        let contexts = [130usize, 100, 10];
+        let pages_per_row = contexts
+            .iter()
+            .map(|context| context.div_ceil(page_tokens))
+            .collect::<Vec<_>>();
+        let total_pages: usize = pages_per_row.iter().sum();
+        let max_blocks = *pages_per_row.iter().max().unwrap();
+        let value =
+            |seed: usize| ((seed.wrapping_mul(2654435761) % 1000) as f32 / 500.0 - 1.0) * 1.7;
+        let kv_elements = total_pages * page_tokens * num_kv_heads * head_dim;
+        let keys_data = (0..kv_elements).map(value).collect::<Vec<_>>();
+        let values_data = (0..kv_elements)
+            .map(|index| value(index + 7))
+            .collect::<Vec<_>>();
+        let first_pages = pages_per_row
+            .iter()
+            .scan(0usize, |next, pages| {
+                let first = *next;
+                *next += pages;
+                Some(first)
+            })
+            .collect::<Vec<_>>();
+        let query_row = |row: usize| {
+            (0..num_heads * head_dim)
+                .map(|index| value(index * 31 + row * 977))
+                .collect::<Vec<_>>()
+        };
+
+        for dtype in [DType::F32, DType::F16] {
+            let keys = Tensor::from_vec(
+                keys_data.clone(),
+                (total_pages, page_tokens, num_kv_heads, head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let values = Tensor::from_vec(
+                values_data.clone(),
+                (total_pages, page_tokens, num_kv_heads, head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let decode = |rows: &[usize]| {
+                let batch = rows.len();
+                let mut metadata = rows
+                    .iter()
+                    .map(|&row| contexts[row] as u32)
+                    .collect::<Vec<_>>();
+                metadata.extend(std::iter::repeat_n(0u32, batch));
+                for &row in rows {
+                    let mut table = (0..pages_per_row[row])
+                        .map(|page| (first_pages[row] + page) as u32)
+                        .collect::<Vec<_>>();
+                    table.resize(max_blocks, 0);
+                    metadata.extend(table);
+                }
+                let device_metadata =
+                    Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
+                let queries = rows
+                    .iter()
+                    .flat_map(|&row| query_row(row))
+                    .collect::<Vec<_>>();
+                let query = Tensor::from_vec(queries, (batch, num_heads, head_dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                paged_decode_attention(
+                    &query,
+                    &keys,
+                    &values,
+                    metadata,
+                    &device_metadata,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    page_tokens,
+                    max_blocks,
+                    head_dim,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                    None,
+                )
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap()
+            };
+            let alone = decode(&[1]).remove(0);
+            let batched = decode(&[0, 1, 2]).remove(1);
+            assert_eq!(alone, batched, "{dtype:?}: the 100-token row in a batch");
         }
     }
 

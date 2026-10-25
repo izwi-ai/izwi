@@ -148,6 +148,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::WhisperAsr
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {

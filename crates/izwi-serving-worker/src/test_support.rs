@@ -57,17 +57,21 @@ pub enum WorkerScript {
     LoseAfterPartial,
 }
 
-/// Scripted realtime ASR stage: one transcript delta per pushed audio frame
+/// Scripted realtime ASR stage: one transcript delta per audio push
 /// and one final transcript on finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestAsrStage {
     pub delta_per_frame: String,
     pub final_text: String,
-    /// Delay before each frame's delta.
+    /// Delay before each push's delta.
     pub push_cadence: Duration,
     /// When set, the worker's open connections are cut once this many audio
-    /// frames arrived: owner loss with no terminal event.
+    /// pushes arrived: owner loss with no terminal event.
     pub disconnect_after_frames: Option<usize>,
+    /// When set, the final transcript ends with the number of samples
+    /// pushed, so a test can check every frame reached the runtime however
+    /// the worker grouped frames into pushes.
+    pub report_pushed_samples: bool,
 }
 
 impl Default for TestAsrStage {
@@ -77,6 +81,7 @@ impl Default for TestAsrStage {
             final_text: "test realtime transcript".into(),
             push_cadence: Duration::from_millis(5),
             disconnect_after_frames: None,
+            report_pushed_samples: false,
         }
     }
 }
@@ -774,6 +779,7 @@ impl RealtimeStageRunner for ScriptedAsrRunner {
             stage: self.stage.clone(),
             cuts: Arc::clone(&self.cuts),
             frames: 0,
+            samples: 0,
         }))
     }
 }
@@ -782,16 +788,18 @@ struct ScriptedAsrStream {
     stage: TestAsrStage,
     cuts: Arc<watch::Sender<u64>>,
     frames: usize,
+    samples: usize,
 }
 
 #[async_trait]
 impl RealtimeAsrStageStream for ScriptedAsrStream {
     async fn push_samples(
         &mut self,
-        _samples: &[f32],
+        samples: &[f32],
         _sample_rate: u32,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>, izwi_core::Error> {
         self.frames += 1;
+        self.samples += samples.len();
         if self
             .stage
             .disconnect_after_frames
@@ -810,9 +818,14 @@ impl RealtimeAsrStageStream for ScriptedAsrStream {
     }
 
     async fn finish(&mut self) -> Result<Vec<RuntimeAsrRealtimeEvent>, izwi_core::Error> {
+        let text = if self.stage.report_pushed_samples {
+            format!("{} after {} samples", self.stage.final_text, self.samples)
+        } else {
+            self.stage.final_text.clone()
+        };
         Ok(vec![RuntimeAsrRealtimeEvent {
             delta: String::new(),
-            text: self.stage.final_text.clone(),
+            text,
             is_final: true,
             chunk_index: self.frames,
         }])

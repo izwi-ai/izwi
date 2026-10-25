@@ -36,8 +36,8 @@ use super::codec::{
 };
 use super::config::VoxtralTtsConfig;
 use super::retained::{
-    validate_acoustic_cohort, voxtral_tts_stage_resource_envelope, VoxtralTtsDecodeBatch,
-    VoxtralTtsDecodeStep, VoxtralTtsPrefillBatch, VoxtralTtsPrefillStep,
+    acoustic_cohorts, validate_acoustic_cohort, voxtral_tts_stage_resource_envelope,
+    VoxtralTtsDecodeBatch, VoxtralTtsDecodeStep, VoxtralTtsPrefillBatch, VoxtralTtsPrefillStep,
     VoxtralTtsPreparedArtifact, VoxtralTtsQuantumCheckpoint, VoxtralTtsRetainedPhase,
     VoxtralTtsRetainedState, VoxtralTtsStageCeiling, VoxtralTtsStageResourceEnvelope,
 };
@@ -500,83 +500,17 @@ impl VoxtralTtsModel {
         cache: &mut PhysicalPagedKvCache,
         _checkpoint: &VoxtralTtsQuantumCheckpoint,
     ) -> Result<VoxtralTtsDecodeStep> {
-        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
-            Error::InferenceError("Voxtral TTS retained decode requires loaded weights".into())
-        })?;
-        if state.phase != VoxtralTtsRetainedPhase::Decode {
-            return Err(Error::InvalidInput(
-                "Voxtral TTS retained decode is not active".into(),
-            ));
-        }
-        let hidden = state.last_hidden.as_ref().ok_or_else(|| {
-            Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
-        })?;
-        let noise = seeded_flow_noise(
-            &[(state.params.seed, state.frames.len())],
-            self.config.multimodal.audio_model_args.n_acoustic_codebook,
-            hidden.device(),
-        )?;
-        let generated = pipeline
-            .acoustic_transformer
-            .forward_audio_codes_with_feedback_tensor(
-                hidden,
-                state.params.cfg_alpha,
-                state.params.n_decoding_steps,
-                !state.frames.is_empty(),
-                noise.as_ref(),
-            )?;
-        let feedback_tensor = generated.shifted_code_tensor;
-        let frame = generated.frames.into_iter().next().ok_or_else(|| {
-            Error::InferenceError("Voxtral TTS acoustic decode returned no frame".into())
-        })?;
-        if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
-            state.phase = VoxtralTtsRetainedPhase::Codec;
-            return Ok(VoxtralTtsDecodeStep {
-                frame: None,
-                frames_generated: state.frames.len(),
-                finished: true,
-            });
-        }
-        state.frames.push(frame.clone());
-        if state.frames.len() >= state.params.max_frames {
-            state.phase = VoxtralTtsRetainedPhase::Codec;
-            return Ok(VoxtralTtsDecodeStep {
-                frame: Some(frame),
-                frames_generated: state.frames.len(),
-                finished: true,
-            });
-        }
-        let next_embed = match feedback_tensor.as_ref() {
-            Some(codes) => pipeline
-                .audio_embeddings
-                .embedding_for_shifted_code_tensor(codes)?,
-            None => pipeline
-                .audio_embeddings
-                .embedding_for_shifted_codes(&frame)?,
-        };
-        let hidden = pipeline.language_model.forward_managed_hidden_with_embeds(
-            &next_embed,
-            state.lm_position,
-            cache,
-            None,
-            None,
-        )?;
-        state.lm_position += 1;
-        state.last_hidden = Some(last_sequence_hidden(
-            &hidden,
-            "Voxtral TTS retained decode",
-        )?);
-        Ok(VoxtralTtsDecodeStep {
-            frame: Some(frame),
-            frames_generated: state.frames.len(),
-            finished: false,
-        })
+        decode_scalar_row(self.decode_parts()?, state, cache)
     }
 
-    /// Decode one acoustic frame for a compatible retained cohort.
+    /// Decode one acoustic frame for every row of a retained batch.
     ///
-    /// Both the acoustic transformer and non-terminal LM feedback cohort are
-    /// genuinely invoked at `B > 1`; width-one cohorts retain the scalar path.
+    /// Rows run in compatible cohorts (`acoustic_cohorts`): a request on its
+    /// first frame, or with its own CFG strength or flow steps, cannot share
+    /// an acoustic launch with the rest, so a request that arrives while
+    /// others stream decodes beside them instead of failing the batch. Each
+    /// cohort wider than one row invokes the acoustic transformer and its LM
+    /// feedback at `B > 1`; width-one cohorts keep the scalar path.
     pub(crate) fn retained_decode_batch(
         &self,
         states: &mut [&mut VoxtralTtsRetainedState],
@@ -588,130 +522,18 @@ impl VoxtralTtsModel {
                 "Voxtral TTS retained decode batch widths do not match".into(),
             ));
         }
-        validate_acoustic_cohort(states)?;
-        if states.len() == 1 {
-            let step = self.retained_decode_step(states[0], caches[0], _checkpoints[0])?;
-            let scalar_lm_rows = usize::from(!step.finished);
-            return Ok(VoxtralTtsDecodeBatch {
-                steps: vec![step],
-                acoustic_launch_width: 1,
-                lm_launch_width: scalar_lm_rows,
-                scalar_lm_launches: scalar_lm_rows,
-            });
-        }
+        decode_acoustic_cohorts(self.decode_parts()?, states, caches)
+    }
+
+    fn decode_parts(&self) -> Result<VoxtralTtsDecodeParts<'_>> {
         let pipeline = self.pipeline.as_ref().ok_or_else(|| {
             Error::InferenceError("Voxtral TTS retained decode requires loaded weights".into())
         })?;
-        let hidden_rows = states
-            .iter()
-            .map(|state| {
-                state.last_hidden.as_ref().ok_or_else(|| {
-                    Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let hidden = Tensor::cat(&hidden_rows, 0)?;
-        let first = &states[0];
-        let noise = seeded_flow_noise(
-            &states
-                .iter()
-                .map(|state| (state.params.seed, state.frames.len()))
-                .collect::<Vec<_>>(),
-            self.config.multimodal.audio_model_args.n_acoustic_codebook,
-            hidden.device(),
-        )?;
-        let generated = pipeline
-            .acoustic_transformer
-            .forward_audio_codes_with_feedback_tensor(
-                &hidden,
-                first.params.cfg_alpha,
-                first.params.n_decoding_steps,
-                !first.frames.is_empty(),
-                noise.as_ref(),
-            )?;
-        if generated.frames.len() != states.len() {
-            return Err(Error::InferenceError(format!(
-                "Voxtral TTS acoustic batch returned {} rows for width {}",
-                generated.frames.len(),
-                states.len()
-            )));
-        }
-
-        let mut steps = Vec::with_capacity(states.len());
-        let mut feedback_rows = Vec::new();
-        let mut feedback_embeddings = Vec::new();
-        for (row, state) in states.iter_mut().enumerate() {
-            let frame = generated.frames[row].clone();
-            if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
-                state.phase = VoxtralTtsRetainedPhase::Codec;
-                steps.push(VoxtralTtsDecodeStep {
-                    frame: None,
-                    frames_generated: state.frames.len(),
-                    finished: true,
-                });
-                continue;
-            }
-            state.frames.push(frame.clone());
-            if state.frames.len() >= state.params.max_frames {
-                state.phase = VoxtralTtsRetainedPhase::Codec;
-                steps.push(VoxtralTtsDecodeStep {
-                    frame: Some(frame),
-                    frames_generated: state.frames.len(),
-                    finished: true,
-                });
-                continue;
-            }
-            let next_embed = match generated.shifted_code_tensor.as_ref() {
-                Some(codes) => pipeline
-                    .audio_embeddings
-                    .embedding_for_shifted_code_tensor(&codes.narrow(0, row, 1)?)?,
-                None => pipeline
-                    .audio_embeddings
-                    .embedding_for_shifted_codes(&frame)?,
-            };
-            feedback_rows.push(row);
-            feedback_embeddings.push(next_embed);
-            steps.push(VoxtralTtsDecodeStep {
-                frame: Some(frame),
-                frames_generated: state.frames.len(),
-                finished: false,
-            });
-        }
-        let lm_launch_width = feedback_rows.len();
-        let scalar_lm_launches = usize::from(lm_launch_width == 1);
-        if !feedback_rows.is_empty() {
-            let embeds = Tensor::cat(&feedback_embeddings.iter().collect::<Vec<_>>(), 0)?;
-            let positions = feedback_rows
-                .iter()
-                .map(|&row| states[row].lm_position)
-                .collect::<Vec<_>>();
-            let mut cache_refs = caches
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(row, cache)| feedback_rows.contains(&row).then_some(&mut **cache))
-                .collect::<Vec<_>>();
-            let hidden = pipeline
-                .language_model
-                .forward_managed_decode_batch_hidden_with_embeds(
-                    &embeds,
-                    &positions,
-                    &mut cache_refs,
-                    None,
-                )?;
-            for (batch_row, &state_row) in feedback_rows.iter().enumerate() {
-                let state = &mut states[state_row];
-                state.lm_position += 1;
-                state.last_hidden = Some(last_sequence_hidden(
-                    &hidden.narrow(0, batch_row, 1)?,
-                    "Voxtral TTS retained batched decode",
-                )?);
-            }
-        }
-        Ok(VoxtralTtsDecodeBatch {
-            steps,
-            acoustic_launch_width: states.len(),
-            lm_launch_width,
-            scalar_lm_launches,
+        Ok(VoxtralTtsDecodeParts {
+            language_model: &pipeline.language_model,
+            acoustic_transformer: &pipeline.acoustic_transformer,
+            audio_embeddings: &pipeline.audio_embeddings,
+            n_acoustic_codebook: self.config.multimodal.audio_model_args.n_acoustic_codebook,
         })
     }
 
@@ -1013,6 +835,274 @@ fn prefill_row_span(
         prompt_tokens: state.artifact.prompt_tokens,
         complete: state.phase == VoxtralTtsRetainedPhase::Decode,
     })
+}
+
+/// The pipeline parts one retained acoustic decode step reads.
+#[derive(Clone, Copy)]
+struct VoxtralTtsDecodeParts<'a> {
+    language_model: &'a VoxtralLM,
+    acoustic_transformer: &'a FlowMatchingAudioTransformer,
+    audio_embeddings: &'a VoxtralAudioTokenEmbeddings,
+    n_acoustic_codebook: usize,
+}
+
+/// Decode one frame for every row, one acoustic launch per compatible cohort.
+fn decode_acoustic_cohorts(
+    parts: VoxtralTtsDecodeParts<'_>,
+    states: &mut [&mut VoxtralTtsRetainedState],
+    caches: &mut [&mut PhysicalPagedKvCache],
+) -> Result<VoxtralTtsDecodeBatch> {
+    if states.len() != caches.len() {
+        return Err(Error::InvalidInput(
+            "Voxtral TTS retained decode batch widths do not match".into(),
+        ));
+    }
+    let cohorts = acoustic_cohorts(states)?;
+    let mut steps = vec![None; states.len()];
+    let mut acoustic_launch_widths = Vec::with_capacity(cohorts.len());
+    let mut lm_launch_widths = Vec::new();
+    let mut scalar_lm_launches = 0;
+    for cohort in &cohorts {
+        let mut cohort_states = states
+            .iter_mut()
+            .enumerate()
+            .filter(|(row, _)| cohort.contains(row))
+            .map(|(_, state)| &mut **state)
+            .collect::<Vec<_>>();
+        let mut cohort_caches = caches
+            .iter_mut()
+            .enumerate()
+            .filter(|(row, _)| cohort.contains(row))
+            .map(|(_, cache)| &mut **cache)
+            .collect::<Vec<_>>();
+        let (cohort_steps, lm_width) = if let [state] = cohort_states.as_mut_slice() {
+            let step = decode_scalar_row(parts, state, cohort_caches[0])?;
+            let lm_width = usize::from(!step.finished);
+            scalar_lm_launches += lm_width;
+            (vec![step], lm_width)
+        } else {
+            let (cohort_steps, lm_width) =
+                decode_cohort_batch(parts, &mut cohort_states, &mut cohort_caches)?;
+            scalar_lm_launches += usize::from(lm_width == 1);
+            (cohort_steps, lm_width)
+        };
+        acoustic_launch_widths.push(cohort.len());
+        if lm_width > 0 {
+            lm_launch_widths.push(lm_width);
+        }
+        for (&row, step) in cohort.iter().zip(cohort_steps) {
+            steps[row] = Some(step);
+        }
+    }
+    let steps = steps
+        .into_iter()
+        .map(|step| {
+            step.ok_or_else(|| {
+                Error::InferenceError("Voxtral TTS decode left a row without a step".into())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(VoxtralTtsDecodeBatch {
+        steps,
+        acoustic_launch_widths,
+        lm_launch_widths,
+        scalar_lm_launches,
+    })
+}
+
+/// One retained row's acoustic frame and LM feedback, at `B = 1`.
+fn decode_scalar_row(
+    parts: VoxtralTtsDecodeParts<'_>,
+    state: &mut VoxtralTtsRetainedState,
+    cache: &mut PhysicalPagedKvCache,
+) -> Result<VoxtralTtsDecodeStep> {
+    if state.phase != VoxtralTtsRetainedPhase::Decode {
+        return Err(Error::InvalidInput(
+            "Voxtral TTS retained decode is not active".into(),
+        ));
+    }
+    let hidden = state.last_hidden.as_ref().ok_or_else(|| {
+        Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
+    })?;
+    let noise = seeded_flow_noise(
+        &[(state.params.seed, state.frames.len())],
+        parts.n_acoustic_codebook,
+        hidden.device(),
+    )?;
+    let generated = parts
+        .acoustic_transformer
+        .forward_audio_codes_with_feedback_tensor(
+            hidden,
+            state.params.cfg_alpha,
+            state.params.n_decoding_steps,
+            !state.frames.is_empty(),
+            noise.as_ref(),
+        )?;
+    let feedback_tensor = generated.shifted_code_tensor;
+    let frame = generated.frames.into_iter().next().ok_or_else(|| {
+        Error::InferenceError("Voxtral TTS acoustic decode returned no frame".into())
+    })?;
+    if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
+        state.phase = VoxtralTtsRetainedPhase::Codec;
+        return Ok(VoxtralTtsDecodeStep {
+            frame: None,
+            frames_generated: state.frames.len(),
+            finished: true,
+        });
+    }
+    state.frames.push(frame.clone());
+    if state.frames.len() >= state.params.max_frames {
+        state.phase = VoxtralTtsRetainedPhase::Codec;
+        return Ok(VoxtralTtsDecodeStep {
+            frame: Some(frame),
+            frames_generated: state.frames.len(),
+            finished: true,
+        });
+    }
+    let next_embed = match feedback_tensor.as_ref() {
+        Some(codes) => parts
+            .audio_embeddings
+            .embedding_for_shifted_code_tensor(codes)?,
+        None => parts.audio_embeddings.embedding_for_shifted_codes(&frame)?,
+    };
+    let hidden = parts.language_model.forward_managed_hidden_with_embeds(
+        &next_embed,
+        state.lm_position,
+        cache,
+        None,
+        None,
+    )?;
+    state.lm_position += 1;
+    state.last_hidden = Some(last_sequence_hidden(
+        &hidden,
+        "Voxtral TTS retained decode",
+    )?);
+    Ok(VoxtralTtsDecodeStep {
+        frame: Some(frame),
+        frames_generated: state.frames.len(),
+        finished: false,
+    })
+}
+
+/// One compatible cohort's acoustic frames in one `B > 1` launch, and the
+/// unfinished rows' LM feedback in one more. Returns the steps and the LM
+/// launch width (0 when every row finished).
+fn decode_cohort_batch(
+    parts: VoxtralTtsDecodeParts<'_>,
+    states: &mut [&mut VoxtralTtsRetainedState],
+    caches: &mut [&mut PhysicalPagedKvCache],
+) -> Result<(Vec<VoxtralTtsDecodeStep>, usize)> {
+    validate_acoustic_cohort(states)?;
+    // Each row keeps its last hidden state as a `[hidden]` vector: stack the
+    // rows into `[rows, hidden]` (concatenating the vectors would hand the
+    // acoustic transformer one `[rows * hidden]` row).
+    let hidden_rows = states
+        .iter()
+        .map(|state| {
+            state
+                .last_hidden
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
+                })
+                .and_then(|hidden| Ok(hidden.flatten_all()?.unsqueeze(0)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let hidden = Tensor::cat(&hidden_rows, 0)?;
+    let first = &states[0];
+    let noise = seeded_flow_noise(
+        &states
+            .iter()
+            .map(|state| (state.params.seed, state.frames.len()))
+            .collect::<Vec<_>>(),
+        parts.n_acoustic_codebook,
+        hidden.device(),
+    )?;
+    let generated = parts
+        .acoustic_transformer
+        .forward_audio_codes_with_feedback_tensor(
+            &hidden,
+            first.params.cfg_alpha,
+            first.params.n_decoding_steps,
+            !first.frames.is_empty(),
+            noise.as_ref(),
+        )?;
+    if generated.frames.len() != states.len() {
+        return Err(Error::InferenceError(format!(
+            "Voxtral TTS acoustic batch returned {} rows for width {}",
+            generated.frames.len(),
+            states.len()
+        )));
+    }
+
+    let mut steps = Vec::with_capacity(states.len());
+    let mut feedback_rows = Vec::new();
+    let mut feedback_embeddings = Vec::new();
+    for (row, state) in states.iter_mut().enumerate() {
+        let frame = generated.frames[row].clone();
+        if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
+            state.phase = VoxtralTtsRetainedPhase::Codec;
+            steps.push(VoxtralTtsDecodeStep {
+                frame: None,
+                frames_generated: state.frames.len(),
+                finished: true,
+            });
+            continue;
+        }
+        state.frames.push(frame.clone());
+        if state.frames.len() >= state.params.max_frames {
+            state.phase = VoxtralTtsRetainedPhase::Codec;
+            steps.push(VoxtralTtsDecodeStep {
+                frame: Some(frame),
+                frames_generated: state.frames.len(),
+                finished: true,
+            });
+            continue;
+        }
+        let next_embed = match generated.shifted_code_tensor.as_ref() {
+            Some(codes) => parts
+                .audio_embeddings
+                .embedding_for_shifted_code_tensor(&codes.narrow(0, row, 1)?)?,
+            None => parts.audio_embeddings.embedding_for_shifted_codes(&frame)?,
+        };
+        feedback_rows.push(row);
+        feedback_embeddings.push(next_embed);
+        steps.push(VoxtralTtsDecodeStep {
+            frame: Some(frame),
+            frames_generated: state.frames.len(),
+            finished: false,
+        });
+    }
+    let lm_launch_width = feedback_rows.len();
+    if !feedback_rows.is_empty() {
+        let embeds = Tensor::cat(&feedback_embeddings.iter().collect::<Vec<_>>(), 0)?;
+        let positions = feedback_rows
+            .iter()
+            .map(|&row| states[row].lm_position)
+            .collect::<Vec<_>>();
+        let mut cache_refs = caches
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(row, cache)| feedback_rows.contains(&row).then_some(&mut **cache))
+            .collect::<Vec<_>>();
+        let hidden = parts
+            .language_model
+            .forward_managed_decode_batch_hidden_with_embeds(
+                &embeds,
+                &positions,
+                &mut cache_refs,
+                None,
+            )?;
+        for (batch_row, &state_row) in feedback_rows.iter().enumerate() {
+            let state = &mut states[state_row];
+            state.lm_position += 1;
+            state.last_hidden = Some(last_sequence_hidden(
+                &hidden.narrow(0, batch_row, 1)?,
+                "Voxtral TTS retained batched decode",
+            )?);
+        }
+    }
+    Ok((steps, lm_launch_width))
 }
 
 /// Prefill a ragged retained cohort, each row's span in one launch. This
@@ -1823,6 +1913,171 @@ mod tests {
                 .unwrap();
             let diff = crate::kernels::numeric_check::max_abs_diff(&actual, &expected);
             assert!(diff <= 1e-5, "max |diff| {diff}");
+        }
+    }
+
+    /// The parts a retained decode reads, tiny: the one-layer LM the shared
+    /// test caches fit, and an acoustic transformer and audio embeddings with
+    /// xorshift weights (zero weights would decode every row alike).
+    fn tiny_decode_parts(
+        device: &Device,
+    ) -> (
+        VoxtralLM,
+        FlowMatchingAudioTransformer,
+        VoxtralAudioTokenEmbeddings,
+        usize,
+    ) {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::architectures::voxtral::lm::tests::tiny_decode_model;
+
+        let config = super::super::acoustic::tests::tiny_acoustic_config();
+        let mut seed = 0x0C04_0A57u64;
+        let mut random = |shape: &[usize]| {
+            seed += 1;
+            xorshift_tensor(shape, seed, 0.5, device).unwrap()
+        };
+        let acoustic_tensors = super::super::acoustic::tests::tiny_acoustic_tensors(device)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let value = if name.contains("norm") {
+                    tensor
+                } else {
+                    random(tensor.dims())
+                };
+                (name, value)
+            })
+            .collect::<HashMap<_, _>>();
+        let acoustic = FlowMatchingAudioTransformer::load(
+            &config,
+            VarBuilder::from_tensors(acoustic_tensors, DType::F32, device),
+        )
+        .unwrap();
+        let table_rows = voxtral_audio_embedding_codebook_sizes(&config)
+            .unwrap()
+            .iter()
+            .map(|size| *size as usize)
+            .sum::<usize>()
+            .div_ceil(128)
+            * 128;
+        let embeddings = VoxtralAudioTokenEmbeddings::load(
+            &config,
+            4,
+            VarBuilder::from_tensors(
+                HashMap::from([(
+                    "mm_audio_embeddings.audio_codebook_embeddings.embeddings.weight".to_string(),
+                    random(&[table_rows, 4]),
+                )]),
+                DType::F32,
+                device,
+            ),
+        )
+        .unwrap();
+        (
+            tiny_decode_model(device, None),
+            acoustic,
+            embeddings,
+            config.multimodal.audio_model_args.n_acoustic_codebook,
+        )
+    }
+
+    /// A request that arrives while another streams is on its first frame,
+    /// which may not end the audio; the streaming row may. The two used to be
+    /// rejected as one incompatible cohort, failing both requests. Each row
+    /// must now decode exactly as it does alone, and rows share one launch
+    /// again once both are past their first frame.
+    #[test]
+    fn a_request_joining_a_streaming_row_decodes_like_a_solo_run() {
+        use crate::models::architectures::voxtral::lm::tests::{
+            deterministic_embeds, shared_decode_caches,
+        };
+        use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+
+        let device = Device::Cpu;
+        let (lm, acoustic, embeddings, n_acoustic_codebook) = tiny_decode_parts(&device);
+        let parts = VoxtralTtsDecodeParts {
+            language_model: &lm,
+            acoustic_transformer: &acoustic,
+            audio_embeddings: &embeddings,
+            n_acoustic_codebook,
+        };
+        let request = |prompt_len: usize, offset: usize, seed: u64| {
+            let prompt = deterministic_embeds(prompt_len, offset, &device);
+            VoxtralTtsRetainedState::new(
+                Arc::new(VoxtralTtsPreparedArtifact {
+                    prompt_embeddings: prompt.clone(),
+                    prompt_tokens: prompt_len,
+                    source_text: Arc::from("hello"),
+                    voice: Arc::from("default"),
+                    retained_resident_bytes: 64,
+                }),
+                VoxtralTtsGenerationParams {
+                    max_frames: 6,
+                    seed,
+                    ..Default::default()
+                },
+                16,
+            )
+            .unwrap()
+        };
+        let (mut first, mut joining) = (request(5, 3, 11), request(3, 17, 29));
+        let (mut first_solo, mut joining_solo) = (request(5, 3, 11), request(3, 17, 29));
+        let [mut cache, mut joining_cache, mut solo_cache, mut joining_solo_cache]: [_; 4] =
+            shared_decode_caches(4, 977, 8)
+                .1
+                .try_into()
+                .unwrap_or_else(|_| panic!("four caches"));
+        prefill_cohort_spans(
+            &lm,
+            &mut [&mut first, &mut joining, &mut first_solo, &mut joining_solo],
+            &mut [
+                &mut cache,
+                &mut joining_cache,
+                &mut solo_cache,
+                &mut joining_solo_cache,
+            ],
+            &[5, 3, 5, 3],
+        )
+        .unwrap();
+
+        // The first request streams one frame before the second arrives.
+        let streamed =
+            decode_acoustic_cohorts(parts, &mut [&mut first], &mut [&mut cache]).unwrap();
+        let streamed_solo =
+            decode_acoustic_cohorts(parts, &mut [&mut first_solo], &mut [&mut solo_cache]).unwrap();
+        assert_eq!(streamed.steps, streamed_solo.steps);
+        assert!(!streamed.steps[0].finished);
+
+        let mixed = decode_acoustic_cohorts(
+            parts,
+            &mut [&mut first, &mut joining],
+            &mut [&mut cache, &mut joining_cache],
+        )
+        .unwrap();
+        assert_eq!(mixed.acoustic_launch_widths, vec![1, 1]);
+        let first_alone =
+            decode_acoustic_cohorts(parts, &mut [&mut first_solo], &mut [&mut solo_cache]).unwrap();
+        let joining_alone = decode_acoustic_cohorts(
+            parts,
+            &mut [&mut joining_solo],
+            &mut [&mut joining_solo_cache],
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.steps,
+            vec![first_alone.steps[0].clone(), joining_alone.steps[0].clone()]
+        );
+
+        if mixed.steps.iter().all(|step| !step.finished) {
+            let joined = decode_acoustic_cohorts(
+                parts,
+                &mut [&mut first, &mut joining],
+                &mut [&mut cache, &mut joining_cache],
+            )
+            .unwrap();
+            assert_eq!(joined.acoustic_launch_widths, vec![2]);
+            assert_eq!(joined.steps.len(), 2);
         }
     }
 

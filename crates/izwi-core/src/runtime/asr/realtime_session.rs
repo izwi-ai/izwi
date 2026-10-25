@@ -6,7 +6,18 @@ use super::*;
 impl RealtimeAsrSessionLimits {
     /// The engine config's limits, else the environment's, else the
     /// defaults for `backend`.
+    #[cfg(test)]
     pub(super) fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
+        Self::resolve_for_sequences(config, backend, None)
+    }
+
+    /// [`Self::resolve`], with `max_num_seqs` (when set) replacing the
+    /// backend's default session quota: the config and environment still win.
+    pub(super) fn resolve_for_sequences(
+        config: RealtimeAsrSessionConfig,
+        backend: BackendKind,
+        max_num_seqs: Option<usize>,
+    ) -> Result<Self> {
         fn configured<T: Default + PartialEq>(value: Option<T>, field: &str) -> Result<Option<T>> {
             match value {
                 Some(value) if value == T::default() => Err(Error::ConfigError(format!(
@@ -15,9 +26,10 @@ impl RealtimeAsrSessionLimits {
                 value => Ok(value),
             }
         }
-        let default_sessions = match backend {
-            BackendKind::Cuda => DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS,
-            BackendKind::Cpu | BackendKind::Metal => DEFAULT_ASR_REALTIME_MAX_SESSIONS,
+        let default_sessions = match (max_num_seqs, backend) {
+            (Some(seqs), _) if seqs > 0 => seqs,
+            (_, BackendKind::Cuda) => DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS,
+            (_, BackendKind::Cpu | BackendKind::Metal) => DEFAULT_ASR_REALTIME_MAX_SESSIONS,
         };
         let max_sessions = match configured(config.max_sessions, "max_sessions")? {
             Some(sessions) => sessions,
@@ -46,8 +58,20 @@ impl RealtimeAsrSessionLimits {
 }
 
 impl RealtimeAsrSessionPolicy {
-    pub(in crate::runtime) fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
-        Self::new(RealtimeAsrSessionLimits::resolve(config, backend)?)
+    pub(in crate::runtime) fn resolve_for_sequences(
+        config: RealtimeAsrSessionConfig,
+        backend: BackendKind,
+        max_num_seqs: Option<usize>,
+    ) -> Result<Self> {
+        Self::new(RealtimeAsrSessionLimits::resolve_for_sequences(
+            config,
+            backend,
+            max_num_seqs,
+        )?)
+    }
+
+    pub(in crate::runtime) fn max_sessions(&self) -> usize {
+        self.limits.max_sessions
     }
 
     pub(super) fn new(limits: RealtimeAsrSessionLimits) -> Result<Self> {
@@ -65,6 +89,7 @@ impl RealtimeAsrSessionPolicy {
         Ok(Self {
             permits: Arc::new(Semaphore::new(limits.max_sessions)),
             limits,
+            pushes: Arc::default(),
         })
     }
 
@@ -254,6 +279,84 @@ impl RuntimeAsrRealtimeState {
                 );
             }
             self.physical.abort();
+        }
+        result
+    }
+
+    /// [`Self::transact`] over several streams of one model: every row
+    /// hydrates, one operation runs over all of them, then every row stages
+    /// and commits. A failure rolls back every row that has not committed;
+    /// the rows are untouched unless the commit itself failed part way.
+    pub(super) fn transact_batch<T>(
+        rows: &mut [&mut Self],
+        model: &NativeAsrModel,
+        operation: impl FnOnce(&mut [&mut NativeAsrRealtimeState]) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let checkpoints = rows
+            .iter()
+            .map(|row| match &row.native {
+                NativeAsrRealtimeState::Nemotron(state) => {
+                    NativeAsrRealtimeState::Nemotron(state.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = (|| {
+            let mut transactions = Vec::with_capacity(rows.len());
+            for row in rows.iter_mut() {
+                transactions.push(row.physical.begin()?);
+            }
+            for (row, &transaction) in rows.iter_mut().zip(&transactions) {
+                model.hydrate_realtime_physical_state(
+                    &mut row.native,
+                    &row.physical.runtime,
+                    transaction,
+                )?;
+            }
+            let outputs = {
+                let mut natives = rows
+                    .iter_mut()
+                    .map(|row| &mut row.native)
+                    .collect::<Vec<_>>();
+                operation(&mut natives)?
+            };
+            if outputs.len() != rows.len() {
+                return Err(Error::InferenceError(
+                    "realtime ASR batch returned the wrong number of rows".into(),
+                ));
+            }
+            let mut revisions = Vec::with_capacity(rows.len());
+            for (row, &transaction) in rows.iter_mut().zip(&transactions) {
+                let revision = row.physical.revision.checked_add(1).ok_or_else(|| {
+                    Error::InferenceError("realtime ASR physical revision overflowed".into())
+                })?;
+                model.stage_realtime_physical_state(
+                    &mut row.native,
+                    &row.physical.runtime,
+                    transaction,
+                    revision,
+                )?;
+                revisions.push(revision);
+            }
+            for ((row, &transaction), revision) in rows.iter_mut().zip(&transactions).zip(revisions)
+            {
+                row.physical.commit(transaction, revision)?;
+            }
+            Ok(outputs)
+        })();
+        if result.is_err() {
+            for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                if row.physical.active_transaction.is_none() {
+                    continue;
+                }
+                row.native = checkpoint;
+                if let Err(error) = model.clear_realtime_tensor_handles(&mut row.native) {
+                    tracing::error!(
+                        error = %error,
+                        "failed to drain Nemotron tensor handles after aborted operation"
+                    );
+                }
+                row.physical.abort();
+            }
         }
         result
     }

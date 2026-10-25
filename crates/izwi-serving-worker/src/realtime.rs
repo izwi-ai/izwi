@@ -91,10 +91,36 @@ const REALTIME_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 const WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINATION_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Audio frames queued behind the one being pushed join its push, up to
+/// this much audio, so a backlog costs one model push instead of one a frame.
+/// It is well above one push cycle, so a stream that waited behind other work
+/// catches up in its next push.
+const MAX_COALESCED_AUDIO_SECS: usize = 5;
+
 /// One inbound audio frame, decoded and bounds-checked at the reader.
 struct AudioFrame {
     sequence: u32,
     payload: Vec<u8>,
+}
+
+/// Takes `first` plus the frames queued behind it, up to
+/// `MAX_COALESCED_AUDIO_SECS` of audio at `sample_rate`.
+fn take_queued_audio(
+    first: AudioFrame,
+    audio_rx: &mut mpsc::Receiver<AudioFrame>,
+    sample_rate: u32,
+) -> Vec<AudioFrame> {
+    let byte_limit = sample_rate as usize * 2 * MAX_COALESCED_AUDIO_SECS;
+    let mut bytes = first.payload.len();
+    let mut frames = vec![first];
+    while bytes < byte_limit {
+        let Ok(frame) = audio_rx.try_recv() else {
+            break;
+        };
+        bytes += frame.payload.len();
+        frames.push(frame);
+    }
+    frames
 }
 
 enum ClientControl {
@@ -504,13 +530,14 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                             // frames: transcribe the audio sent first.
                             let mut pushed = Ok(());
                             while let (Ok(()), Ok(frame)) = (&pushed, audio_rx.try_recv()) {
+                                let frames = take_queued_audio(frame, &mut audio_rx, sample_rate);
                                 pushed = self
                                     .push_audio(
                                         runner,
                                         &mut stream,
                                         &mut last_audio_sequence,
                                         &mut session_audio_bytes,
-                                        frame,
+                                        frames,
                                         sample_rate,
                                     )
                                     .await;
@@ -553,13 +580,14 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                 frame = audio_rx.recv() => {
                     match frame {
                         Some(frame) => {
+                            let frames = take_queued_audio(frame, &mut audio_rx, sample_rate);
                             if let Err(failure) = self
                                 .push_audio(
                                     runner,
                                     &mut stream,
                                     &mut last_audio_sequence,
                                     &mut session_audio_bytes,
-                                    frame,
+                                    frames,
                                     sample_rate,
                                 )
                                 .await
@@ -641,28 +669,30 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         stream: &mut Option<Box<dyn RealtimeAsrStageStream>>,
         last_audio_sequence: &mut Option<u32>,
         session_audio_bytes: &mut u64,
-        frame: AudioFrame,
+        frames: Vec<AudioFrame>,
         sample_rate: u32,
     ) -> Result<(), StageTerminal> {
-        if last_audio_sequence.is_some_and(|last| frame.sequence <= last) {
-            return Err(StageTerminal::Failed {
-                code: InvocationErrorCode::InvalidInput,
-                message: "audio frame sequence regressed".into(),
-            });
-        }
-        *last_audio_sequence = Some(frame.sequence);
-        *session_audio_bytes = session_audio_bytes.saturating_add(frame.payload.len() as u64);
-        if *session_audio_bytes
-            > self
-                .state
-                .config
-                .realtime_session_limits
-                .max_session_audio_bytes
-        {
-            return Err(StageTerminal::Failed {
-                code: InvocationErrorCode::OutputLimitExceeded,
-                message: "session audio budget exhausted".into(),
-            });
+        for frame in &frames {
+            if last_audio_sequence.is_some_and(|last| frame.sequence <= last) {
+                return Err(StageTerminal::Failed {
+                    code: InvocationErrorCode::InvalidInput,
+                    message: "audio frame sequence regressed".into(),
+                });
+            }
+            *last_audio_sequence = Some(frame.sequence);
+            *session_audio_bytes = session_audio_bytes.saturating_add(frame.payload.len() as u64);
+            if *session_audio_bytes
+                > self
+                    .state
+                    .config
+                    .realtime_session_limits
+                    .max_session_audio_bytes
+            {
+                return Err(StageTerminal::Failed {
+                    code: InvocationErrorCode::OutputLimitExceeded,
+                    message: "session audio budget exhausted".into(),
+                });
+            }
         }
         if stream.is_none() {
             match runner.start_asr_stream(language_arg(&self.admit)).await {
@@ -679,11 +709,9 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         let active = stream
             .as_mut()
             .expect("stream is started before the first push");
-        let samples: Vec<f32> = frame
-            .payload
-            .as_chunks::<2>()
-            .0
+        let samples: Vec<f32> = frames
             .iter()
+            .flat_map(|frame| frame.payload.as_chunks::<2>().0)
             .map(|chunk| i16::from_le_bytes(*chunk) as f32 / 32768.0)
             .collect();
         let events = match active.push_samples(&samples, sample_rate).await {

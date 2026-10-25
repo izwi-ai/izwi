@@ -66,6 +66,8 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scheduler_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_loaded_models: Option<usize>,
@@ -106,6 +108,7 @@ impl RuntimeConfig {
             && self.max_batch_size.is_none()
             && self.physical_execution_mode.is_none()
             && self.max_physical_in_flight.is_none()
+            && self.max_num_seqs.is_none()
             && self.max_scheduler_batch_size.is_none()
             && self.max_loaded_models.is_none()
             && self.model_keep_alive_secs.is_none()
@@ -182,6 +185,7 @@ impl Config {
                 max_batch_size: Some(defaults.max_batch_size),
                 physical_execution_mode: Some(defaults.physical_execution_mode),
                 max_physical_in_flight: Some(defaults.max_physical_in_flight),
+                max_num_seqs: defaults.max_num_seqs,
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
                 max_loaded_models: Some(defaults.max_loaded_models),
                 model_keep_alive_secs: Some(defaults.model_keep_alive_secs),
@@ -223,6 +227,7 @@ impl Config {
             max_batch_size: self.runtime.max_batch_size,
             physical_execution_mode: self.runtime.physical_execution_mode,
             max_physical_in_flight: self.runtime.max_physical_in_flight,
+            max_num_seqs: self.runtime.max_num_seqs,
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
             max_loaded_models: self.runtime.max_loaded_models,
             model_keep_alive_secs: self.runtime.model_keep_alive_secs,
@@ -286,6 +291,7 @@ impl Config {
                         .map_err(|error| anyhow!(error.to_string()))?,
                 )
             }
+            "runtime.max_num_seqs" => self.runtime.max_num_seqs = Some(parse_usize(value)?),
             "runtime.max_scheduler_batch_size" => {
                 self.runtime.max_scheduler_batch_size = Some(parse_usize(value)?)
             }
@@ -382,6 +388,10 @@ impl Config {
                 .runtime
                 .max_physical_in_flight
                 .map(|value| toml::Value::Integer(value.get() as i64)),
+            "runtime.max_num_seqs" => self
+                .runtime
+                .max_num_seqs
+                .map(|value| toml::Value::Integer(value as i64)),
             "runtime.max_scheduler_batch_size" => self
                 .runtime
                 .max_scheduler_batch_size
@@ -573,6 +583,7 @@ mod tests {
                 performance: PerformanceConfigOverrides::default(),
                 backend: Some(BackendPreference::Cpu),
                 max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
+                max_num_seqs: None,
                 physical_execution_mode: Some(PhysicalExecutionMode::Shadow),
                 max_physical_in_flight: Some(PhysicalInFlightLimit::new(4).unwrap()),
                 max_scheduler_batch_size: Some(9),

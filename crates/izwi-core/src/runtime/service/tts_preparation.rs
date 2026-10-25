@@ -206,6 +206,7 @@ impl RuntimeService {
         let speaker = request.tts_speaker_for_execution().map(str::to_string);
         let language = request.language.clone();
         let speed = request.params.speed;
+        let seed = request.params.speech.seed;
         let budget = kokoro_output_budget(&text, speed)?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Kokoro retained request exceeds u64".into()))?;
@@ -284,6 +285,7 @@ impl RuntimeService {
                     speaker.as_deref(),
                     language.as_deref(),
                     speed,
+                    seed,
                 )?);
                 let retained = JobResourceObservation {
                     host_bytes: retained_request_bytes

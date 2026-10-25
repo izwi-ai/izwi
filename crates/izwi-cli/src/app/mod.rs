@@ -32,6 +32,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             max_batch_size,
             physical_execution_mode,
             max_physical_in_flight,
+            max_num_seqs,
             max_scheduler_batch_size,
             max_loaded_models,
             max_retained_sequences,
@@ -59,6 +60,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 max_batch_size,
                 physical_execution_mode,
                 max_physical_in_flight,
+                max_num_seqs,
                 max_scheduler_batch_size,
                 max_loaded_models,
                 max_retained_sequences,
@@ -250,6 +252,7 @@ fn build_serve_args(
     max_batch_size: Option<izwi_core::BatchSizePreference>,
     physical_execution_mode: Option<izwi_core::PhysicalExecutionMode>,
     max_physical_in_flight: Option<izwi_core::PhysicalInFlightLimit>,
+    max_num_seqs: Option<usize>,
     max_scheduler_batch_size: Option<usize>,
     max_loaded_models: Option<usize>,
     max_retained_sequences: Option<usize>,
@@ -275,6 +278,7 @@ fn build_serve_args(
         max_batch_size,
         physical_execution_mode,
         max_physical_in_flight,
+        max_num_seqs,
         max_scheduler_batch_size,
         max_loaded_models,
         max_retained_sequences,
@@ -344,6 +348,8 @@ mod tests {
         std::env::remove_var(izwi_core::serve_runtime::ENV_PHYSICAL_EXECUTION_MODE);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_PHYSICAL_IN_FLIGHT);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_SCHEDULER_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_NUM_SEQS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_ENABLE_CHUNKED_PREFILL);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_RETAINED_SEQUENCES);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_STAGED_TRANSACTIONS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_QUEUED_REQUESTS);
@@ -405,6 +411,7 @@ mod tests {
             None,
             Some(izwi_core::PhysicalExecutionMode::Serial),
             Some(izwi_core::PhysicalInFlightLimit::new(2).unwrap()),
+            Some(6),
             None,
             Some(1),
             None,
@@ -431,6 +438,9 @@ mod tests {
         );
         assert_eq!(args.runtime.max_physical_in_flight.get(), 2);
         assert_eq!(args.runtime.max_loaded_models, 1);
+        assert_eq!(args.runtime.max_num_seqs, Some(6));
+        // A multi-user `--max-num-seqs` turns chunked prefill on.
+        assert!(args.runtime.enable_chunked_prefill);
         assert_eq!(args.runtime.request_timeout_secs, 600);
         assert_eq!(args.runtime.backend, BackendPreference::Cuda);
         assert!(args.runtime.cors_enabled);
@@ -453,6 +463,7 @@ mod tests {
             ServeMode::Server,
             None,
             false,
+            None,
             None,
             None,
             None,
