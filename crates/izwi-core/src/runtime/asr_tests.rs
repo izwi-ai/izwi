@@ -1506,6 +1506,52 @@ fn granite_saa_replay_recorded_chunks() {
 }
 
 #[test]
+fn granite_saa_trims_a_decode_that_looped_to_its_token_limit() {
+    // v2610 on a 49-minute interview: the speaker said "no" a few times
+    // and the decode kept going until the budget ran out, ending mid-word.
+    let looped = format!(
+        "[Speaker 1]: okay, but the chinese are saying, {}n",
+        "no, ".repeat(400)
+    );
+    assert_eq!(
+        trim_trailing_repetition(&looped).as_deref(),
+        Some("[Speaker 1]: okay, but the chinese are saying, no, no, no,")
+    );
+    let phrase_loop = format!("so we built it {}", "we built a refinery ".repeat(9));
+    assert_eq!(
+        trim_trailing_repetition(&phrase_loop).as_deref(),
+        Some("so we built it we built a refinery we built a refinery we built a refinery")
+    );
+    // Repeats a speaker really makes stay.
+    assert_eq!(trim_trailing_repetition("no, no, no, no. what kind of things"), None);
+    assert_eq!(trim_trailing_repetition("[Speaker 1]: thank you"), None);
+}
+
+#[test]
+fn granite_saa_splits_a_looping_chunk_into_overlapping_halves() {
+    let sample_rate = 100;
+    let chunk = AudioChunk {
+        start_sample: 1_000,
+        end_sample: 1_000 + 240 * sample_rate as usize,
+    };
+    let [first, second] = granite_saa_split_chunk(&chunk, sample_rate).expect("240 s splits");
+    assert_eq!(first.start_sample, chunk.start_sample);
+    assert_eq!(second.end_sample, chunk.end_sample);
+    // The halves share the usual 30 s overlap around the middle.
+    assert_eq!(first.end_sample - second.start_sample, 30 * sample_rate as usize);
+    assert_eq!(
+        (first.end_sample + second.start_sample) / 2,
+        chunk.start_sample + 120 * sample_rate as usize
+    );
+    // Halves below the minimum chunk length are not split again.
+    let short = AudioChunk {
+        start_sample: 0,
+        end_sample: 50 * sample_rate as usize,
+    };
+    assert!(granite_saa_split_chunk(&short, sample_rate).is_none());
+}
+
+#[test]
 fn granite_saa_warns_only_when_memory_shortened_the_chunks() {
     let warning = granite_saa_memory_limit_warning(2_940.0, Some(142.0), Some(206.0))
         .expect("a 142 s limit against a 206 s checkpoint limit is memory-bound");

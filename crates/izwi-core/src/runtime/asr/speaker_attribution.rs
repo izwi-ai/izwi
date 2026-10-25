@@ -173,11 +173,72 @@ pub(super) fn speaker_attributed_asr_turns_from_text(raw_text: &str) -> Vec<Spea
         })
 }
 
-pub(super) fn granite_saa_should_use_single_pass(duration_secs: f32, model_limit_secs: Option<f32>) -> bool {
-    let limit = model_limit_secs
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(GRANITE_SAA_HARD_MAX_CHUNK_SECS);
-    duration_secs.is_finite() && duration_secs <= limit
+/// The two halves a chunk caught in a repetition loop is decoded again as,
+/// sharing [`GRANITE_SAA_OVERLAP_SECS`] around its middle; `None` when a half
+/// would be shorter than [`GRANITE_SAA_MIN_CHUNK_SECS`].
+pub(super) fn granite_saa_split_chunk(chunk: &AudioChunk, sample_rate: u32) -> Option<[AudioChunk; 2]> {
+    let seconds = |secs: f32| (secs * sample_rate as f32) as usize;
+    let half_overlap = seconds(GRANITE_SAA_OVERLAP_SECS / 2.0);
+    let length = chunk.end_sample.checked_sub(chunk.start_sample)?;
+    if length / 2 < seconds(GRANITE_SAA_MIN_CHUNK_SECS) {
+        return None;
+    }
+    let middle = chunk.start_sample + length / 2;
+    Some([
+        AudioChunk {
+            start_sample: chunk.start_sample,
+            end_sample: (middle + half_overlap).min(chunk.end_sample),
+        },
+        AudioChunk {
+            start_sample: middle.saturating_sub(half_overlap).max(chunk.start_sample),
+            end_sample: chunk.end_sample,
+        },
+    ])
+}
+
+/// Repeats of one phrase (1–12 words) at the end of `text` past the third,
+/// removed: the tail of a decode that looped until its token limit. A cut
+/// partial word after the loop goes too. `None` when the text does not end
+/// in such a loop.
+pub(super) fn trim_trailing_repetition(text: &str) -> Option<String> {
+    const LOOP_REPEATS: usize = 8;
+    const KEPT_REPEATS: usize = 3;
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let normalized = words
+        .iter()
+        .map(|word| {
+            word.chars()
+                .filter(|ch| ch.is_alphanumeric() || *ch == '\'')
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    for phrase_words in 1..=12 {
+        // The decode stopped mid-loop: up to a phrase's worth of trailing
+        // words (at least one, a word cut mid-token) may follow the repeats.
+        for cut_tail in 0..phrase_words.max(2) {
+            let end = normalized.len().checked_sub(cut_tail)?;
+            if end < phrase_words * LOOP_REPEATS {
+                continue;
+            }
+            let phrase = &normalized[end - phrase_words..end];
+            if phrase.iter().all(String::is_empty) {
+                continue;
+            }
+            let mut repeats = 1;
+            while end >= phrase_words * (repeats + 1)
+                && normalized[end - phrase_words * (repeats + 1)..end - phrase_words * repeats]
+                    == *phrase
+            {
+                repeats += 1;
+            }
+            if repeats >= LOOP_REPEATS {
+                let keep = end - phrase_words * (repeats - KEPT_REPEATS);
+                return Some(words[..keep].join(" "));
+            }
+        }
+    }
+    None
 }
 
 /// A warning when the memory free at load time held a shorter context than
@@ -421,12 +482,21 @@ where
 
     let mut assembler = GraniteSaaTranscriptAssembler::default();
     let mut language_out = language.map(ToOwned::to_owned);
-    let mut warnings = vec![format!(
-        "Granite SAA processed long audio in {} chunks; speaker label continuity across chunks is best-effort.",
-        chunks.len()
-    )];
+    let mut warnings = Vec::new();
+    if chunks.len() > 1 {
+        warnings.push(format!(
+            "Granite SAA processed long audio in {} chunks; speaker label continuity across chunks is best-effort.",
+            chunks.len()
+        ));
+    }
 
-    for (idx, chunk) in chunks.iter().enumerate() {
+    // A chunk that runs out of decode budget (2.4 times what speech needs)
+    // is caught in a repetition loop that ate the rest of its audio. It is
+    // decoded again as two overlapping halves, joined like any other seam.
+    let mut chunks = chunks;
+    let mut idx = 0;
+    while let Some(&chunk) = chunks.get(idx) {
+        let chunk = &chunk;
         if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
             warnings.push(format!(
                 "Granite SAA skipped invalid chunk {} with sample range {}..{}.",
@@ -434,6 +504,7 @@ where
                 chunk.start_sample,
                 chunk.end_sample
             ));
+            idx += 1;
             continue;
         }
 
@@ -535,16 +606,32 @@ where
                 idx + 1
             ));
         }
+        let mut text = transcription.text;
         if let Some(warning) = granite_saa_max_token_warning(idx, &decode_diagnostics) {
-            tracing::warn!(
-                chunk_index = idx + 1,
-                warning = warning.as_str(),
-                "Granite SAA chunk reached decode token limit"
-            );
-            warnings.push(warning);
+            if let Some(halves) = granite_saa_split_chunk(chunk, sample_rate) {
+                tracing::warn!(
+                    chunk_index = idx + 1,
+                    chunk_start_secs = samples_to_seconds_f64(chunk.start_sample, sample_rate),
+                    chunk_end_secs = samples_to_seconds_f64(chunk.end_sample, sample_rate),
+                    "Granite SAA chunk ran out of decode budget; decoding it again in halves"
+                );
+                chunks.splice(idx..=idx, halves);
+                continue;
+            }
+            match trim_trailing_repetition(&text) {
+                Some(trimmed) => {
+                    text = trimmed;
+                    warnings.push(format!(
+                        "Granite SAA chunk {} kept repeating a phrase until its token limit; the repeats were removed and part of its audio may be missing.",
+                        idx + 1
+                    ));
+                }
+                None => warnings.push(warning),
+            }
+            tracing::warn!(chunk_index = idx + 1, "Granite SAA chunk reached decode token limit");
         }
         warnings.extend(assembler.push_chunk_text(
-            transcription.text.as_str(),
+            text.as_str(),
             idx,
             samples_to_seconds_f64(chunk.start_sample, sample_rate),
         ));
@@ -556,6 +643,7 @@ where
             &chunks,
             sample_rate,
         ));
+        idx += 1;
     }
 
     on_progress(granite_saa_complete_progress(&chunks, sample_rate));
@@ -999,49 +1087,6 @@ impl RuntimeService {
             nominal_limit_secs = ?nominal_limit_secs,
             "resolved speaker-attributed ASR invocation audio limit"
         );
-        if granite_saa_should_use_single_pass(duration_secs, model_limit_secs) {
-            let task_language = language_owned.clone();
-            let task_model = model.clone();
-            let max_new_tokens = granite_saa_max_new_tokens(&samples, sample_rate);
-            let observation_job = job.clone();
-            let transcription =
-                self.coordinator
-                    .run_loaded_blocking_stage_with_invocation_paged(
-                        &job,
-                        execution_contract,
-                        state_binding,
-                        WorkUnit::PipelineStage {
-                            name: "asr.speaker_attributed.decode".to_string(),
-                            ordinal: 0,
-                        },
-                        move |leases| {
-                            let _residency_lease = residency_lease;
-                            observation_job.record_materialized_usage(
-                                decoded_audio_observation(retained_input_bytes, samples.len())?,
-                            )?;
-                            granite_saa_transcribe_chunk(
-                                &task_model,
-                                &samples,
-                                sample_rate,
-                                task_language.as_deref(),
-                                None,
-                                max_new_tokens,
-                                granite_saa_single_invocation_cache(leases)?,
-                            )
-                        },
-                    )
-                    .await?;
-
-            return Ok(speaker_attributed_asr_result_from_text_with_warnings(
-                transcription.text.as_str(),
-                transcription.language.or(language_owned),
-                duration_secs,
-                min_speakers,
-                max_speakers,
-                Vec::new(),
-            ));
-        }
-
         let long_form = granite_saa_long_form_transcribe(
             &self.coordinator,
             &job,

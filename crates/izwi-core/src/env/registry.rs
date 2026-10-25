@@ -625,7 +625,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_GRANITE_SAA_CHUNK_MAX_SECS",
         Float,
-        "510 (and <=95% of the model context limit)",
+        "270 (and <=95% of the model context limit)",
         Once,
         "Sets the max chunk length in seconds for Granite speaker-attributed ASR long-form planning.",
     ),

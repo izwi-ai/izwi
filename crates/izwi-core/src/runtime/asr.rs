@@ -98,7 +98,8 @@ use speaker_attribution::{
     granite_saa_chunk_plan, granite_saa_chunk_progress, granite_saa_long_form_config,
     granite_saa_memory_limit_warning,
     granite_saa_decode_diagnostics, granite_saa_max_new_tokens_for_duration,
-    granite_saa_max_token_warning, granite_saa_processing_progress,
+    granite_saa_max_token_warning, granite_saa_processing_progress, granite_saa_split_chunk,
+    trim_trailing_repetition,
     resolve_speaker_attributed_asr_variant, speaker_attributed_asr_result_from_text,
     speaker_attributed_asr_result_from_text_with_warnings, GraniteSaaChunkDecodeDiagnostics,
     GraniteSaaTranscriptAssembler,
@@ -206,7 +207,12 @@ const GRANITE_SAA_MAX_NEW_TOKENS: usize = 4_608;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
 const GRANITE_SAA_NEW_TOKEN_RESERVE: usize = 256;
 const GRANITE_SAA_TARGET_CHUNK_SECS: f32 = 240.0;
-const GRANITE_SAA_HARD_MAX_CHUNK_SECS: f32 = 510.0;
+/// The longest audio one speaker-attributed decode takes. Plus v2610's
+/// context would allow nine minutes, but on a 16 GB Mac a 461 s decode ran
+/// out of Metal memory (an F32 language model, and prefill attention that
+/// grows with the square of the prompt) while 260 s decodes fit; the
+/// 4.1 checkpoints before it stop at ~196 s anyway.
+const GRANITE_SAA_HARD_MAX_CHUNK_SECS: f32 = 270.0;
 /// Audio two consecutive chunks share: enough words for [`saa_seam`] to
 /// align, and usually both speakers of a conversation.
 const GRANITE_SAA_OVERLAP_SECS: f32 = 30.0;

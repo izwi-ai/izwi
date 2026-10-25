@@ -98,7 +98,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_ROPE_CACHE_ATTENTION_DTYPE` | flag | on for Metal, off elsewhere | first use | Builds the Granite RoPE cache in F16 when the attention core runs in F16. |
 | `IZWI_GRANITE_ROPE_KERNEL` | flag | on for CUDA, off elsewhere | first use | Allows the THD-layout fused RoPE kernel in Granite attention when the BSHD/BHTD kernels are not used. |
 | `IZWI_GRANITE_ROPE_PAIR_BSHD_KERNEL` | flag | on for Metal, off elsewhere | first use | Allows the fused BSHD-layout RoPE pair kernel in Granite attention (even head_dim, F16/F32). |
-| `IZWI_GRANITE_SAA_CHUNK_MAX_SECS` | number | 510 (and <=95% of the model context limit) | first use | Sets the max chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
+| `IZWI_GRANITE_SAA_CHUNK_MAX_SECS` | number | 270 (and <=95% of the model context limit) | first use | Sets the max chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
 | `IZWI_GRANITE_SAA_CHUNK_MIN_SECS` | number | `30` | first use | Sets the minimum chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
 | `IZWI_GRANITE_SAA_CHUNK_OVERLAP_SECS` | number | `30` | first use | Sets the overlap in seconds between Granite speaker-attributed ASR chunks (capped at 45% of target). |
 | `IZWI_GRANITE_SAA_CHUNK_SILENCE_SEARCH_SECS` | number | `20` | first use | Sets the window in seconds, before the max chunk length, in which Granite speaker-attributed ASR cuts each chunk at the longest pause. |
