@@ -59,18 +59,21 @@ interface NewDiarizationModalProps {
   selectedModelReady: boolean;
   diarizationModels: ModelInfo[];
   onSelectModel: (variant: string) => void;
+  /** Models eligible as the stack's ASR and aligner, for their pickers. */
+  asrModels?: ModelInfo[];
+  alignerModels?: ModelInfo[];
+  onSelectAsrModel?: (variant: string) => void;
+  onSelectAlignerModel?: (variant: string) => void;
   pipelineAsrModelId?: string | null;
   pipelineAlignerModelId?: string | null;
   pipelineLlmModelId?: string | null;
+  /** Whether the stack's ASR and aligner are both loaded. */
   pipelineModelsReady?: boolean;
   /** Whether the summary model is loaded; it joins the stack only when a
    * summary is requested. */
   summaryModelReady?: boolean;
   onModelRequired: () => void;
   onPipelineModelsRequired: () => void;
-  /** The stack without the summary model. */
-  managedModelCount?: number;
-  readyManagedModelCount?: number;
   canUnloadAnyManagedModels?: boolean;
   isManagedModelActionBusy?: boolean;
   onOpenModelManager: () => void;
@@ -96,6 +99,31 @@ function stopMediaStream(stream: MediaStream): void {
   stream.getTracks().forEach((track) => track.stop());
 }
 
+/**
+ * A role's picker options: names, with the status only for a model that
+ * isn't on this device, and a pick that left the catalog kept visible.
+ */
+function modelPickerOptions(
+  models: ModelInfo[],
+  selected: string | null,
+): Array<{ variant: string; label: string }> {
+  const options = models.map((model) => {
+    const name = getModelDisplayName(model.variant, model.display_name);
+    return {
+      variant: model.variant,
+      label:
+        model.status === "not_downloaded" ||
+        model.status === "downloading" ||
+        model.status === "error"
+          ? `${name} (${getModelStatusLabel(model.status).toLowerCase()})`
+          : name,
+    };
+  });
+  return selected != null && !models.some((model) => model.variant === selected)
+    ? [{ variant: selected, label: `${selected} (not in catalog)` }, ...options]
+    : options;
+}
+
 const DIARIZATION_MODEL_REQUIRED_ERROR =
   "Select and load a diarization model before creating a run.";
 const CLASSIC_PIPELINE_REQUIRED_ERROR =
@@ -112,6 +140,10 @@ export function NewDiarizationModal({
   selectedModelReady,
   diarizationModels,
   onSelectModel,
+  asrModels = [],
+  alignerModels = [],
+  onSelectAsrModel,
+  onSelectAlignerModel,
   pipelineAsrModelId = null,
   pipelineAlignerModelId = null,
   pipelineLlmModelId = null,
@@ -119,8 +151,6 @@ export function NewDiarizationModal({
   summaryModelReady = false,
   onModelRequired,
   onPipelineModelsRequired,
-  managedModelCount = 0,
-  readyManagedModelCount = 0,
   canUnloadAnyManagedModels = false,
   isManagedModelActionBusy = false,
   onOpenModelManager,
@@ -584,12 +614,17 @@ export function NewDiarizationModal({
     }
   }, [discardActiveRecording, isRecording]);
 
+  // The stack is the picked diarizer, ASR and aligner, each loaded, plus the
+  // summary model only when a summary is asked for.
   const countsSummaryModel = generateSummary && pipelineLlmModelId != null;
-  const stackModelCount = managedModelCount + (countsSummaryModel ? 1 : 0);
-  const readyStackModelCount =
-    readyManagedModelCount + (countsSummaryModel && summaryModelReady ? 1 : 0);
   const allManagedModelsReady =
-    stackModelCount > 0 && readyStackModelCount === stackModelCount;
+    selectedModel != null &&
+    selectedModelReady &&
+    (isGranitePipeline ||
+      (pipelineAsrModelId != null &&
+        pipelineAlignerModelId != null &&
+        pipelineModelsReady)) &&
+    (!countsSummaryModel || summaryModelReady);
   const readinessStatusLabel = allManagedModelsReady
     ? "Loaded"
     : isManagedModelActionBusy
@@ -597,28 +632,14 @@ export function NewDiarizationModal({
       : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
   const readinessLabel = "Diarization stack";
-  const selectedModelInCatalog =
-    selectedModel != null &&
-    diarizationModels.some((model) => model.variant === selectedModel);
-  // Names, with the status only for a model that isn't on this device.
-  const modelOptions = diarizationModels.map((model) => {
-    const name = getModelDisplayName(model.variant, model.display_name);
-    return {
-      variant: model.variant,
-      label:
-        model.status === "not_downloaded" ||
-        model.status === "downloading" ||
-        model.status === "error"
-          ? `${name} (${getModelStatusLabel(model.status).toLowerCase()})`
-          : name,
-    };
-  });
-  const pickerOptions = selectedModel != null && !selectedModelInCatalog
-    ? [
-        { variant: selectedModel, label: `${selectedModel} (not in catalog)` },
-        ...modelOptions,
-      ]
-    : modelOptions;
+  const pickerOptions = modelPickerOptions(diarizationModels, selectedModel);
+  const asrPickerOptions = modelPickerOptions(asrModels, pipelineAsrModelId);
+  const alignerPickerOptions = modelPickerOptions(
+    alignerModels,
+    pipelineAlignerModelId,
+  );
+  const pickerClassName =
+    "flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)";
   const submissionStatusLabel =
     uploadState?.phase === "preparing"
       ? "Preparing"
@@ -735,7 +756,7 @@ export function NewDiarizationModal({
               value={selectedModel ?? ""}
               onChange={(event) => onSelectModel(event.target.value)}
               disabled={isSubmitting || isRecording}
-              className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
+              className={pickerClassName}
             >
               {pickerOptions.map((option) => (
                 <option key={option.variant} value={option.variant}>
@@ -744,6 +765,46 @@ export function NewDiarizationModal({
               ))}
             </select>
           </CreationField>
+
+          {!isGranitePipeline ? (
+            <>
+              <CreationField label="ASR model" htmlFor="diarization-asr-model">
+                <select
+                  id="diarization-asr-model"
+                  aria-label="ASR model"
+                  value={pipelineAsrModelId ?? ""}
+                  onChange={(event) => onSelectAsrModel?.(event.target.value)}
+                  disabled={isSubmitting || isRecording || !onSelectAsrModel}
+                  className={pickerClassName}
+                >
+                  {asrPickerOptions.map((option) => (
+                    <option key={option.variant} value={option.variant}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </CreationField>
+
+              <CreationField label="Aligner" htmlFor="diarization-aligner-model">
+                <select
+                  id="diarization-aligner-model"
+                  aria-label="Aligner"
+                  value={pipelineAlignerModelId ?? ""}
+                  onChange={(event) =>
+                    onSelectAlignerModel?.(event.target.value)
+                  }
+                  disabled={isSubmitting || isRecording || !onSelectAlignerModel}
+                  className={pickerClassName}
+                >
+                  {alignerPickerOptions.map((option) => (
+                    <option key={option.variant} value={option.variant}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </CreationField>
+            </>
+          ) : null}
 
           <ModelRow
             name={readinessLabel}

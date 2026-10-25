@@ -28,13 +28,24 @@ import type { ModelDownloadProgressMap } from "@/features/models/downloadProgres
 import { VIEW_CONFIGS } from "@/types";
 import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
 
-/** Pages that keep their own model choice. */
+/**
+ * Diarization-stack roles that keep their own model choice, apart from the
+ * transcription page's ASR choice: any diarizer, ASR and aligner the user
+ * picks make up the stack.
+ */
+export type PipelineRoleKey =
+  | "diarization"
+  | "diarization-asr"
+  | "diarization-aligner";
+
+/** Pages (and pipeline roles) that keep their own model choice. */
 export type ModelRouteKey =
   | "chat"
   | "text-to-speech"
   | "studio"
   | "voices"
-  | "transcription";
+  | "transcription"
+  | PipelineRoleKey;
 
 interface ModelCatalogContextValue {
   models: ModelInfo[];
@@ -42,6 +53,8 @@ interface ModelCatalogContextValue {
   selectedModel: string | null;
   /** A page's own choice, else the model chosen last. */
   selectedModelFor: (route: ModelRouteKey) => string | null;
+  /** A pipeline role's own choice, with no fallback. */
+  rolePickFor: (role: PipelineRoleKey) => string | null;
   loading: boolean;
   error: string | null;
   catalogError: string | null;
@@ -50,6 +63,8 @@ interface ModelCatalogContextValue {
   residencySummary: ModelResidencySummary | null;
   removedModels: RemovedModelInfo[];
   selectModel: (variant: string | null, route?: ModelRouteKey) => void;
+  /** Picks a pipeline role's model without changing any page's choice. */
+  pickRoleModel: (role: PipelineRoleKey, variant: string | null) => void;
   reportError: (message: string) => void;
   clearError: () => void;
   refreshModels: () => Promise<boolean>;
@@ -267,6 +282,11 @@ export function ModelCatalogProvider({
   const selectedModelFor = useCallback(
     (route: ModelRouteKey) => routeSelections[route] ?? selectedModel,
     [routeSelections, selectedModel],
+  );
+
+  const rolePickFor = useCallback(
+    (role: PipelineRoleKey) => routeSelections[role] ?? null,
+    [routeSelections],
   );
 
   const reportError = useCallback((message: string) => {
@@ -1143,6 +1163,7 @@ export function ModelCatalogProvider({
       models,
       selectedModel,
       selectedModelFor,
+      rolePickFor,
       loading,
       error,
       catalogError,
@@ -1151,6 +1172,7 @@ export function ModelCatalogProvider({
       residencySummary,
       removedModels,
       selectModel,
+      pickRoleModel: adoptRouteSelection,
       reportError,
       clearError,
       refreshModels,
@@ -1162,6 +1184,7 @@ export function ModelCatalogProvider({
       deleteModel,
     }),
     [
+      adoptRouteSelection,
       cancelModelDownload,
       clearError,
       deleteModel,
@@ -1176,6 +1199,7 @@ export function ModelCatalogProvider({
       removedModels,
       reportError,
       residencySummary,
+      rolePickFor,
       selectModel,
       selectedModel,
       selectedModelFor,

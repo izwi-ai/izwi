@@ -38,8 +38,9 @@ import {
   isSpeakerAttributedAsrVariant,
   isTranscriptionAlignerModel,
   isTranscriptionSummaryModel,
-  resolveDiarizationRouteModel,
+  resolveDiarizationStackRole,
 } from "@/features/speech-text/modelFilters";
+import type { PipelineRoleKey } from "@/app/providers/ModelCatalogProvider";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
 import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
@@ -67,6 +68,8 @@ type ModelModalContext =
   | "diarization";
 type DiarizationPipelineMode = "classic" | "granite";
 
+const noRolePick = (): string | null => null;
+
 interface TranscriptionPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
@@ -79,6 +82,10 @@ interface TranscriptionPageProps {
   onDelete: (variant: string) => void;
   onSelect: (variant: string) => void;
   onError: (message: string) => void;
+  /** The diarization stack's own picks per role (diarizer, ASR, aligner). */
+  rolePickFor?: (role: PipelineRoleKey) => string | null;
+  onPickRoleModel?: (role: PipelineRoleKey, variant: string | null) => void;
+  onLoadForRole?: (variant: string, role: PipelineRoleKey | null) => void;
   speechTextMode?: "transcription" | "speaker_attributed_asr";
 }
 
@@ -94,6 +101,9 @@ export function TranscriptionPage({
   onDelete,
   onSelect,
   onError,
+  rolePickFor = noRolePick,
+  onPickRoleModel,
+  onLoadForRole,
   speechTextMode = "transcription",
 }: TranscriptionPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
@@ -241,41 +251,42 @@ export function TranscriptionPage({
       )?.status ?? null,
     [resolvedSpeakerAttributedAsrModel, speakerAttributedAsrModels],
   );
-  const resolvedDiarizationModel = useMemo(
+  // The diarization stack is one diarizer, one ASR and one aligner: each the
+  // user's pick for its role, else a loaded model, else the default.
+  const diarizerRole = useMemo(
     () =>
-      resolveDiarizationRouteModel({
-        models: diarizationModels,
-        selectedModel,
+      resolveDiarizationStackRole({
+        models,
+        eligibleModels: diarizationModels,
+        pick: rolePickFor("diarization"),
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
       }),
-    [diarizationModels, selectedModel],
+    [diarizationModels, models, rolePickFor],
   );
-  const diarizationModelReady =
-    resolvedDiarizationModel != null &&
-    diarizationModels.some(
-      (model) =>
-        model.variant === resolvedDiarizationModel && model.status === "ready",
-    );
-  const resolvedDiarizationAsrModel = useMemo(
+  const diarizationAsrRole = useMemo(
     () =>
-      resolvePreferredRouteModel({
-        models: diarizationAsrPipelineModels,
-        selectedModel: null,
+      resolveDiarizationStackRole({
+        models,
+        eligibleModels: diarizationAsrPipelineModels,
+        pick: rolePickFor("diarization-asr"),
         preferredVariants: DIARIZATION_PREFERRED_ASR_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
-    [diarizationAsrPipelineModels],
+    [diarizationAsrPipelineModels, models, rolePickFor],
   );
-  const resolvedDiarizationAlignerModel = useMemo(
+  const diarizationAlignerRole = useMemo(
     () =>
-      resolvePreferredRouteModel({
-        models: diarizationAlignerPipelineModels,
-        selectedModel: null,
+      resolveDiarizationStackRole({
+        models,
+        eligibleModels: diarizationAlignerPipelineModels,
+        pick: rolePickFor("diarization-aligner"),
         preferredVariants: DIARIZATION_PREFERRED_ALIGNER_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
-    [diarizationAlignerPipelineModels],
+    [diarizationAlignerPipelineModels, models, rolePickFor],
   );
+  const resolvedDiarizationModel = diarizerRole.variant;
+  const diarizationModelReady = diarizerRole.ready;
+  const resolvedDiarizationAsrModel = diarizationAsrRole.variant;
+  const resolvedDiarizationAlignerModel = diarizationAlignerRole.variant;
   const resolvedDiarizationLlmModel = useMemo(
     () =>
       resolvePreferredRouteModel({
@@ -286,22 +297,9 @@ export function TranscriptionPage({
       }),
     [diarizationLlmPipelineModels],
   );
-  const diarizationAsrModelReady =
-    resolvedDiarizationAsrModel != null &&
-    diarizationAsrPipelineModels.some(
-      (model) =>
-        model.variant === resolvedDiarizationAsrModel && model.status === "ready",
-    );
-  const diarizationAlignerModelReady =
-    resolvedDiarizationAlignerModel != null &&
-    diarizationAlignerPipelineModels.some(
-      (model) =>
-        model.variant === resolvedDiarizationAlignerModel &&
-        model.status === "ready",
-    );
   const diarizationPipelineMode: DiarizationPipelineMode = "classic";
   const diarizationPipelineModelsReady =
-    diarizationAsrModelReady && diarizationAlignerModelReady;
+    diarizationAsrRole.ready && diarizationAlignerRole.ready;
   const baseDiarizationPipelineModels = useMemo(
     () => [
       ...diarizationModels,
@@ -336,14 +334,6 @@ export function TranscriptionPage({
       resolvedDiarizationModel,
     ],
   );
-  // The summary model joins the dialog's stack only when a summary is asked
-  // for, so the dialog counts it separately.
-  const diarizationStackModels = diarizationManagedModels.filter(
-    (model) => model.variant !== resolvedDiarizationLlmModel,
-  );
-  const readyDiarizationStackModelCount = diarizationStackModels.filter(
-    (model) => model.status === "ready",
-  ).length;
   const diarizationSummaryModelReady =
     resolvedDiarizationLlmModel != null &&
     diarizationLlmPipelineModels.some(
@@ -549,6 +539,28 @@ export function TranscriptionPage({
     setNewSpeechTextMode(requestedMode);
     setIsNewTranscriptionModalOpen(true);
   }, [recordId, searchParams]);
+  // Loading from the diarization models dialog is choosing that model for
+  // the role it fills (the summary model has no pick of its own).
+  const handleLoadDiarizationStackModel = useCallback(
+    (variant: string) => {
+      if (!onLoadForRole) {
+        onLoad(variant);
+        return;
+      }
+      const model = models.find((candidate) => candidate.variant === variant);
+      const role: PipelineRoleKey | null = !model
+        ? null
+        : isDiarizationModel(model)
+          ? "diarization"
+          : isDiarizationPipelineAlignerModel(model)
+            ? "diarization-aligner"
+            : isDiarizationPipelineAsrModel(model)
+              ? "diarization-asr"
+              : null;
+      onLoadForRole(variant, role);
+    },
+    [models, onLoad, onLoadForRole],
+  );
   const handleUnloadAllDiarizationManagedModels = useCallback(() => {
     for (const model of diarizationManagedModels) {
       if (model.status === "ready") {
@@ -1060,7 +1072,22 @@ export function TranscriptionPage({
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
                       diarizationModels={diarizationModels}
-                      onSelectModel={onSelect}
+                      onSelectModel={(variant) =>
+                        onPickRoleModel?.("diarization", variant)
+                      }
+                      asrModels={diarizationAsrPipelineModels}
+                      alignerModels={diarizationAlignerPipelineModels}
+                      onSelectAsrModel={
+                        onPickRoleModel
+                          ? (variant) => onPickRoleModel("diarization-asr", variant)
+                          : undefined
+                      }
+                      onSelectAlignerModel={
+                        onPickRoleModel
+                          ? (variant) =>
+                              onPickRoleModel("diarization-aligner", variant)
+                          : undefined
+                      }
                       pipelineAsrModelId={resolvedDiarizationAsrModel}
                       pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
@@ -1076,8 +1103,6 @@ export function TranscriptionPage({
                           "Load ASR and forced aligner models before diarization.",
                         );
                       }}
-                      managedModelCount={diarizationStackModels.length}
-                      readyManagedModelCount={readyDiarizationStackModelCount}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}
@@ -1133,7 +1158,7 @@ export function TranscriptionPage({
         downloadProgress={downloadProgress}
         onDownload={onDownload}
         onCancelDownload={onCancelDownload}
-        onLoad={onLoad}
+        onLoad={isDiarizationModelModal ? handleLoadDiarizationStackModel : onLoad}
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}

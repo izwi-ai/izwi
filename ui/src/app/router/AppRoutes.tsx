@@ -114,6 +114,7 @@ export function AppRoutes() {
   const {
     models,
     selectedModelFor,
+    rolePickFor,
     loading,
     catalogError,
     downloadProgress,
@@ -121,6 +122,7 @@ export function AppRoutes() {
     residencySummary,
     removedModels,
     selectModel,
+    pickRoleModel,
     reportError,
     refreshModels,
     downloadModel,
@@ -148,6 +150,15 @@ export function AppRoutes() {
     onError: reportError,
     onRefresh: refreshModels,
   });
+  // The transcription page also hosts the diarization stack, whose roles
+  // keep their own picks.
+  const speechTextPageProps: SharedPageProps = {
+    ...pageProps("transcription"),
+    rolePickFor,
+    onPickRoleModel: pickRoleModel,
+    onLoadForRole: (variant, role) =>
+      void loadModel(variant, role ? { route: role } : undefined),
+  };
 
   const voicePageProps: VoiceRouteProps = {
     models,
@@ -229,11 +240,11 @@ export function AppRoutes() {
           />
           <Route
             path="/transcription"
-            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
+            element={withSuspense(<SpeechTextPage {...speechTextPageProps} />)}
           />
           <Route
             path="/transcription/:recordId"
-            element={withSuspense(<SpeechTextPage {...pageProps("transcription")} />)}
+            element={withSuspense(<SpeechTextPage {...speechTextPageProps} />)}
           />
           <Route path="/diarization" element={<LegacyDiarizationRedirect />} />
           <Route

@@ -46,6 +46,7 @@ const componentMocks = vi.hoisted(() => ({
       title,
       zIndexClassName,
       onUseModel,
+      onLoad,
       models = [],
       sections = [],
     }: {
@@ -53,6 +54,7 @@ const componentMocks = vi.hoisted(() => ({
       title: string;
       zIndexClassName?: string;
       onUseModel?: (variant: string) => void;
+      onLoad?: (variant: string) => void;
       models?: ModelInfo[];
       sections?: Array<{ title?: string }>;
     }) =>
@@ -69,6 +71,12 @@ const componentMocks = vi.hoisted(() => ({
             onClick={() => onUseModel?.("Parakeet-TDT-0.6B-v3")}
           >
             Use mocked model
+          </button>
+          <button
+            type="button"
+            onClick={() => onLoad?.("Parakeet-TDT-0.6B-v3")}
+          >
+            Load mocked model
           </button>
         </div>
       ) : null,
@@ -209,6 +217,14 @@ const DIARIZATION_STACK_CAPABILITIES: Record<
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
   },
+  "Granite-Speech-5.0-2B-GGUF": {
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+  },
+  "Parakeet-TDT-0.6B-v3": {
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+  },
   "Qwen3-ForcedAligner-0.6B": { forced_alignment: true },
   "Qwen3.5-4B": { openai_chat_completions: true },
 };
@@ -331,6 +347,9 @@ describe("TranscriptionPage detail route", () => {
     baseProps.onDelete = vi.fn();
     baseProps.onSelect = vi.fn();
     baseProps.onError = vi.fn();
+    baseProps.rolePickFor = undefined;
+    baseProps.onPickRoleModel = undefined;
+    baseProps.onLoadForRole = undefined;
 
     apiMocks.transcriptionRecordAudioUrl.mockReturnValue("/audio/transcription.wav");
     apiMocks.speakerAttributedAsrRecordAudioUrl.mockReturnValue("/audio/saa.wav");
@@ -1421,11 +1440,15 @@ describe("TranscriptionPage detail route", () => {
   it("surfaces a stale diarization selection instead of silently re-resolving", async () => {
     baseProps.models = [
       stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
     ];
-    baseProps.selectedModel = "Nemotron-3-Diarization";
+    baseProps.rolePickFor = (role) =>
+      role === "diarization" ? "Nemotron-3-Diarization" : null;
 
     renderRoute("/transcription");
     await openNewDiarization();
+    expect(screen.getByText("Not loaded")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Record audio/i }));
 
     expect(
@@ -1477,6 +1500,133 @@ describe("TranscriptionPage detail route", () => {
       ),
     ).not.toBeInTheDocument();
     expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("counts any loaded diarizer, ASR and aligner as the loaded stack", async () => {
+    // Not the default trio: Nemotron, Granite 5.0 GGUF and the aligner are
+    // loaded; the preferred Sortformer and Whisper are only on disk.
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
+      stackModel("Nemotron-3-Diarization", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "downloaded"),
+      stackModel("Granite-Speech-5.0-2B-GGUF", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "downloaded"),
+    ];
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "ASR model" })).toHaveValue(
+      "Granite-Speech-5.0-2B-GGUF",
+    );
+    expect(screen.getByRole("combobox", { name: "Aligner" })).toHaveValue(
+      "Qwen3-ForcedAligner-0.6B",
+    );
+
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const fileInput = uploadButtons[uploadButtons.length - 1]?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model_id: "Nemotron-3-Diarization",
+          asr_model_id: "Granite-Speech-5.0-2B-GGUF",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+        }),
+        expect.anything(),
+      ),
+    );
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("uses each role's pick and reports a picked model that is not loaded", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Parakeet-TDT-0.6B-v3", "downloaded"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+    ];
+    baseProps.rolePickFor = (role) =>
+      role === "diarization-asr" ? "Parakeet-TDT-0.6B-v3" : null;
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(screen.getByRole("combobox", { name: "ASR model" })).toHaveValue(
+      "Parakeet-TDT-0.6B-v3",
+    );
+    // The loaded Whisper is not swapped in for the user's pick.
+    expect(screen.getByText("Not loaded")).toBeInTheDocument();
+  });
+
+  it("stores the dialog's model choices per stack role", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Nemotron-3-Diarization", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Parakeet-TDT-0.6B-v3", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+    ];
+    baseProps.onPickRoleModel = vi.fn();
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Diarization model" }), {
+      target: { value: "Nemotron-3-Diarization" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "ASR model" }), {
+      target: { value: "Parakeet-TDT-0.6B-v3" },
+    });
+
+    expect(baseProps.onPickRoleModel).toHaveBeenCalledWith(
+      "diarization",
+      "Nemotron-3-Diarization",
+    );
+    expect(baseProps.onPickRoleModel).toHaveBeenCalledWith(
+      "diarization-asr",
+      "Parakeet-TDT-0.6B-v3",
+    );
+    // The transcription page's own ASR choice is left alone.
+    expect(baseProps.onSelect).not.toHaveBeenCalled();
+  });
+
+  it("makes a model loaded from the diarization models dialog its role's pick", async () => {
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Parakeet-TDT-0.6B-v3", "downloaded"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+    ];
+    baseProps.onLoadForRole = vi.fn();
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change diarization models" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Load mocked model" }),
+    );
+
+    expect(baseProps.onLoadForRole).toHaveBeenCalledWith(
+      "Parakeet-TDT-0.6B-v3",
+      "diarization-asr",
+    );
+    expect(baseProps.onLoad).not.toHaveBeenCalled();
   });
 
   it("shows no bulk load action before the diarization stack is ready", async () => {

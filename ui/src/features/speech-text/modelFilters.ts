@@ -65,16 +65,6 @@ export function isTranscriptionSummaryModel(model: ModelInfo): boolean {
   return hasCapability(model, "openai_chat_completions");
 }
 
-/**
- * Name-based display heuristic for a selected id that is no longer in the
- * catalog (no model object exists to read capabilities from). Selection
- * itself never consults this.
- */
-export function isDiarizationVariant(variant: string): boolean {
-  const normalized = variant.toLowerCase();
-  return normalized.includes("sortformer") || normalized.includes("diar");
-}
-
 export function isSpeakerAttributedAsrVariant(variant: string): boolean {
   // Speaker-attributed ASR is a Granite-only pipeline today; the server
   // rejects other models for that job kind.
@@ -127,33 +117,55 @@ export function collectManagedModels(options: {
     .filter((model): model is ModelInfo => model !== null);
 }
 
+/** One diarization-stack role (diarizer, ASR or aligner), resolved. */
+export interface DiarizationStackRole {
+  /** The model the role uses, or null when no model is eligible. */
+  variant: string | null;
+  ready: boolean;
+  /** The user's pick left the catalog; the role counts as not loaded. */
+  missing: boolean;
+}
+
 /**
- * Resolves the diarization model a route should use. A user-selected
- * diarization variant that has vanished from the catalog surfaces as-is (the
- * readiness gate reports it as missing) instead of silently re-resolving to
- * the route's preferred model — the user's pick is the source of truth.
- *
- * When falling back (no selection, or a non-diarization one such as the last
- * loaded pipeline model), a READY diarization model wins over a not-loaded
- * preferred default: having loaded the stack should be enough to run.
+ * Resolves one diarization-stack role. The user's pick is the source of
+ * truth while it is eligible: a pick that vanished from the catalog surfaces
+ * as missing (never silently swapped), and one no longer eligible for the
+ * role is ignored. Without a usable pick, a loaded model wins over a
+ * not-loaded default; the preferred list orders defaults and never gates
+ * readiness: loaded preferred, then any loaded eligible model, then the
+ * preferred default, then the first eligible model.
  */
-export function resolveDiarizationRouteModel(options: {
+export function resolveDiarizationStackRole(options: {
+  /** The whole catalog, to tell a deleted pick from an ineligible one. */
   models: ModelInfo[];
-  selectedModel: string | null;
+  /** The models eligible for this role. */
+  eligibleModels: ModelInfo[];
+  pick: string | null;
   preferredVariants: readonly string[];
-}): string | null {
-  const { models, selectedModel, preferredVariants } = options;
-  if (
-    selectedModel != null &&
-    isDiarizationVariant(selectedModel) &&
-    !models.some((model) => model.variant === selectedModel)
-  ) {
-    return selectedModel;
+}): DiarizationStackRole {
+  const { models, eligibleModels, pick, preferredVariants } = options;
+  if (pick) {
+    const picked = eligibleModels.find((model) => model.variant === pick);
+    if (picked) {
+      return { variant: pick, ready: picked.status === "ready", missing: false };
+    }
+    if (!models.some((model) => model.variant === pick)) {
+      return { variant: pick, ready: false, missing: true };
+    }
   }
-  return resolvePreferredRouteModel({
-    models,
-    selectedModel,
+  const variant = resolvePreferredRouteModel({
+    models: eligibleModels,
+    selectedModel: null,
     preferredVariants,
     preferAnyPreferredBeforeReadyAny: false,
   });
+  return {
+    variant,
+    ready:
+      variant != null &&
+      eligibleModels.some(
+        (model) => model.variant === variant && model.status === "ready",
+      ),
+    missing: false,
+  };
 }
