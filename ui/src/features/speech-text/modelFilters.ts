@@ -32,16 +32,11 @@ export function isDiarizationModel(model: ModelInfo): boolean {
 }
 
 export function isDiarizationPipelineAsrModel(model: ModelInfo): boolean {
-  // A speaker-attributed ASR model serves the dedicated speaker-attributed
-  // pipeline (its transcripts are speaker turns, not plain text); the
-  // server's job kinds keep the two apart and the pipeline groups mirror
-  // that split.
-  if (isSpeakerAttributedAsrModel(model)) {
-    return false;
-  }
-  // The pipeline transcribes as a speech-to-text job: audio-chat models
-  // serve /audio/transcriptions but cannot run one, and the server rejects
-  // them as the pipeline ASR.
+  // A speaker-attributed model (Granite Speech 4.1 Plus) belongs here too:
+  // the pipeline asks it for a plain transcript, and the diarizer supplies
+  // the speakers. The pipeline transcribes as a speech-to-text job:
+  // audio-chat models serve /audio/transcriptions but cannot run one, and
+  // the server rejects them as the pipeline ASR.
   return (
     hasCapability(model, "openai_audio_transcriptions") &&
     hasCapability(model, "speech_to_text_jobs")

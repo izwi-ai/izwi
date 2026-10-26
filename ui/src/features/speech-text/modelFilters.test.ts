@@ -172,14 +172,14 @@ describe("isDiarizationPipelineAsrModel", () => {
     }
   });
 
-  it("keeps speaker-attributed ASR models out of the pipeline ASR", () => {
+  it("offers speaker-attributed ASR models as the pipeline ASR too", () => {
     const plus = withCapabilities("Granite-Speech-4.1-2B-Plus", {
       openai_audio_transcriptions: true,
       speech_to_text_jobs: true,
       speaker_attributed_asr: true,
     });
     expect(isSpeakerAttributedAsrModel(plus)).toBe(true);
-    expect(isDiarizationPipelineAsrModel(plus)).toBe(false);
+    expect(isDiarizationPipelineAsrModel(plus)).toBe(true);
   });
 
   it("finds an installed Granite Speech 5.0 for the speaker-attribution hint", () => {

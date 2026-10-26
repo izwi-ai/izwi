@@ -1685,13 +1685,14 @@ describe("TranscriptionPage detail route", () => {
     expect(baseProps.onError).not.toHaveBeenCalled();
   });
 
-  it("keeps Granite out of diarization model groups", async () => {
+  it("offers Granite Speech 4.1 Plus as a diarization ASR model in order", async () => {
     hookMocks.useRouteModelSelection.mockImplementation(
       useOpenableRouteModelSelection,
     );
     baseProps.models = [
       stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
       stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Granite-Speech-5.0-2B-GGUF", "downloaded"),
       stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
       stackModel("Qwen3.5-4B", "ready"),
       stackModel("Granite-Speech-4.1-2B-Plus", "ready"),
@@ -1702,13 +1703,23 @@ describe("TranscriptionPage detail route", () => {
     await openNewDiarization();
     expect(screen.getByText("Diarization stack")).toBeInTheDocument();
     expect(screen.getByText("Loaded")).toBeInTheDocument();
+    // Sorted with the other ASR models, ahead of Granite Speech 5.0.
+    const asrOptions = Array.from(
+      (screen.getByRole("combobox", { name: "ASR model" }) as HTMLSelectElement)
+        .options,
+    ).map((option) => option.value);
+    expect(asrOptions).toEqual([
+      "Granite-Speech-4.1-2B-Plus",
+      "Granite-Speech-5.0-2B-GGUF",
+      "Whisper-Large-v3-Turbo",
+    ]);
 
     fireEvent.click(
       screen.getByRole("button", { name: "Change diarization models" }),
     );
 
     const modelModal = await screen.findByTestId("route-model-modal");
-    expect(modelModal.getAttribute("data-models")).not.toContain(
+    expect(modelModal.getAttribute("data-models")).toContain(
       "Granite-Speech-4.1-2B-Plus",
     );
     expect(modelModal.getAttribute("data-models")).toContain(
