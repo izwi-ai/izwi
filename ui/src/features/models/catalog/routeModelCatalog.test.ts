@@ -124,7 +124,9 @@ describe("route model catalog", () => {
     expect(selected).toBe("Qwen3.5-4B");
   });
 
-  it("prefers the diarization ASR pipeline variant over a non-preferred ready model", () => {
+  it("resolves a ready ASR for the diarization stack over a downloaded default", () => {
+    // The stack resolves roles ready-first: the preferred list orders
+    // defaults, it never makes a loaded model count as not loaded.
     const selected = resolvePreferredRouteModel({
       models: [
         { variant: "Whisper-Large-v3-Turbo", status: "downloaded" },
@@ -132,10 +134,10 @@ describe("route model catalog", () => {
       ],
       selectedModel: null,
       preferredVariants: DIARIZATION_PREFERRED_ASR_MODELS,
-      preferAnyPreferredBeforeReadyAny: true,
+      preferAnyPreferredBeforeReadyAny: false,
     });
 
-    expect(selected).toBe("Whisper-Large-v3-Turbo");
+    expect(selected).toBe("Parakeet-TDT-0.6B-v3");
   });
 
   it("keeps larger ASR models discoverable without making them the default transcription pick", () => {

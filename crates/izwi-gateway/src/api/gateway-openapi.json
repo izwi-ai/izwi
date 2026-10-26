@@ -331,6 +331,10 @@
           "saved_voice_reuse": {
             "type": "boolean"
           },
+          "speaker_attributed_asr": {
+            "description": "Speaker-attributed ASR jobs: the model writes speaker turns itself.",
+            "type": "boolean"
+          },
           "speech_to_text_jobs": {
             "type": "boolean"
           },
@@ -378,6 +382,7 @@
           "speech_to_text_realtime",
           "speech_translation",
           "keyword_biasing",
+          "speaker_attributed_asr",
           "diarization_records",
           "text_to_speech_records",
           "voice_design_records",

@@ -109,7 +109,11 @@ const baseModels: ModelInfo[] = [
 
 const graniteModel: ModelInfo = {
   variant: "Granite-Speech-4.1-2B-Plus",
-  route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+  route_capabilities: caps({
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+    speaker_attributed_asr: true,
+  }),
   status: "ready" as const,
   local_path: "/models/granite",
   size_bytes: null,
@@ -428,7 +432,7 @@ describe("DiarizationPage record detail", () => {
     );
   });
 
-  it("opens the diarization models, without Granite, from the record menu", async () => {
+  it("opens the diarization models, Granite Plus among the ASRs, from the record menu", async () => {
     const props = createRouteProps({
       models: [...baseModels, graniteModel],
     });
@@ -445,7 +449,7 @@ describe("DiarizationPage record detail", () => {
     const modelModal = await screen.findByTestId("route-model-modal");
     expect(modelModal).toHaveTextContent("Diarization models");
     expect(modelModal.getAttribute("data-models")).toBe(
-      "diar_streaming_sortformer_4spk-v2.1,Whisper-Large-v3-Turbo,Qwen3-ForcedAligner-0.6B,Qwen3.5-4B",
+      "diar_streaming_sortformer_4spk-v2.1,Granite-Speech-4.1-2B-Plus,Whisper-Large-v3-Turbo,Qwen3-ForcedAligner-0.6B,Qwen3.5-4B",
     );
     expect(modelModal.getAttribute("data-sections")).toBe(
       "Diarization,ASR,Forced Aligner,Summary",

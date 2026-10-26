@@ -226,4 +226,76 @@ describe("TranscriptionReviewWorkspace", () => {
       inline: "nearest",
     });
   });
+
+  it("reads speaker-attributed turns as one flowing transcript", () => {
+    const { container } = render(
+      <TranscriptionReviewWorkspace
+        record={{
+          ...record,
+          transcription: "",
+          segments: [],
+          words: [],
+          speaker_attributed_text:
+            "[Speaker 1]: Hi everybody. [Speaker 2]: Thank you. [Speaker 1]: How did it start?",
+          speaker_turns: [
+            { speaker: "Speaker 1", text: "Hi everybody." },
+            { speaker: "Speaker 2", text: "Thank you." },
+            { speaker: "Speaker 2", text: "It's great to be here." },
+            { speaker: "Speaker 1", text: "How did it start?" },
+          ],
+        }}
+        audioUrl="/audio/meeting.wav"
+      />,
+    );
+
+    expect(screen.getAllByRole("heading", { name: "Transcript" })).toHaveLength(1);
+    expect(screen.getAllByText("Speaker 1")).toHaveLength(2);
+    expect(screen.getAllByText("Speaker 2")).toHaveLength(1);
+    expect(
+      screen.getByText("Thank you. It's great to be here."),
+    ).toBeInTheDocument();
+    expect(container.textContent).not.toContain("[Speaker");
+    // Untimed turns are text, not seek buttons, and stay off the timeline.
+    expect(screen.getByText("Hi everybody.").closest("button")).toBeNull();
+    expect(screen.getByText("2 identified")).toBeInTheDocument();
+    expect(screen.getByText("Off")).toBeInTheDocument();
+  });
+
+  it("lets timed speaker turns seek and highlight during playback", () => {
+    const { container } = render(
+      <TranscriptionReviewWorkspace
+        record={{
+          ...record,
+          segments: [],
+          words: [],
+          speaker_attributed_text: null,
+          speaker_turns: [
+            { speaker: "Speaker 1", text: "Question?", start: 0, end: 2 },
+            { speaker: "Speaker 2", text: "Answer.", start: 2.5, end: 6 },
+          ],
+        }}
+        audioUrl="/audio/meeting.wav"
+      />,
+    );
+
+    const audio = container.querySelector("audio");
+    Object.defineProperty(audio, "duration", { configurable: true, value: 6 });
+    Object.defineProperty(audio, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+    fireEvent.loadedMetadata(audio!);
+
+    const answer = screen.getByText("Answer.").closest("button");
+    expect(answer).not.toBeNull();
+    fireEvent.click(answer!);
+    expect(audio!.currentTime).toBe(2.5);
+
+    audio!.currentTime = 3;
+    fireEvent.timeUpdate(audio!);
+    expect(answer).toHaveAttribute("data-active", "true");
+    expect(screen.getByText("Turn-level")).toBeInTheDocument();
+  });
 });
+

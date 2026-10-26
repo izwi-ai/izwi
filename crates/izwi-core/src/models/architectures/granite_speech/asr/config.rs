@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::rope::{rope_frequencies, RopeFrequencies, RopeScaling};
 
 const BASE_MODEL_TYPE: &str = "granite_speech";
 const PLUS_MODEL_TYPE: &str = "granite_speech_plus";
@@ -155,9 +156,9 @@ pub struct GraniteTextConfig {
     pub rms_norm_eps: f64,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
-    /// transformers v4 RoPE scaling and its v5 replacement. The 4.1 runtime
-    /// implements default RoPE only, so [`GraniteSpeechConfig::validate`]
-    /// rejects any other `rope_type` instead of silently dropping it.
+    /// transformers v4 RoPE scaling and its v5 replacement: default RoPE, or
+    /// YaRN for plus v2610 (see [`GraniteTextConfig::rope_scaling`]). Any
+    /// other `rope_type` is rejected instead of silently dropped.
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
     #[serde(default)]
@@ -310,7 +311,7 @@ impl GraniteSpeechConfig {
             )));
         }
 
-        self.text_config.validate_default_rope()?;
+        self.text_config.rope_scaling()?;
 
         let encoder = &self.encoder_config;
         // transformers' base encoder has no concatenation; only plus exports
@@ -380,27 +381,26 @@ impl GraniteSpeechConfig {
 }
 
 impl GraniteTextConfig {
-    /// A checkpoint whose language model uses RoPE scaling (Granite Speech
-    /// 5.0, or plus re-published with YaRN) must not load here: without the
-    /// scaling it would run and quietly transcribe worse.
-    fn validate_default_rope(&self) -> Result<()> {
-        for (field, value) in [
-            ("rope_scaling", &self.rope_scaling),
+    /// The language model's RoPE, from `rope_parameters` (transformers v5)
+    /// or `rope_scaling` (v4): default for the checkpoints through June 2026,
+    /// YaRN for plus v2610, which applies it at every length. Any other type
+    /// is an error: run without its scaling, a checkpoint would load and
+    /// quietly transcribe worse.
+    pub fn rope_scaling(&self) -> Result<RopeScaling> {
+        let declared = [
             ("rope_parameters", &self.rope_parameters),
-        ] {
-            let Some(params) = value.as_ref().filter(|value| !value.is_null()) else {
-                continue;
-            };
-            let rope_type = params
-                .get("rope_type")
-                .or_else(|| params.get("type"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("default");
-            if rope_type != "default" {
-                return Err(Error::ModelLoadError(format!(
-                    "Granite Speech 4.1 implements default RoPE only, but text_config.{field} declares rope_type {rope_type:?}"
-                )));
-            }
+            ("rope_scaling", &self.rope_scaling),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| {
+            value
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(|value| (field, value))
+        })
+        .collect::<Vec<_>>();
+        let mut scaling = None;
+        for (field, params) in declared {
             if let Some(theta) = params.get("rope_theta").and_then(serde_json::Value::as_f64) {
                 if theta != self.rope_theta {
                     return Err(Error::ModelLoadError(format!(
@@ -409,8 +409,39 @@ impl GraniteTextConfig {
                     )));
                 }
             }
+            let parsed = RopeScaling::from_config_value(Some(params), self.max_position_embeddings)
+                .map_err(|err| {
+                    Error::ModelLoadError(format!("Granite Speech text_config.{field}: {err}"))
+                })?;
+            match scaling {
+                Some(earlier) if earlier != parsed => {
+                    return Err(Error::ModelLoadError(format!(
+                        "Granite Speech text_config.rope_parameters and rope_scaling disagree: {} vs {}",
+                        RopeScaling::name(earlier),
+                        parsed.name()
+                    )));
+                }
+                _ => scaling = Some(parsed),
+            }
         }
-        Ok(())
+        Ok(scaling.unwrap_or(RopeScaling::Default))
+    }
+
+    /// The decoder context the checkpoint runs at: YaRN extends the
+    /// pretrained context by its factor (16,384 for plus v2610, whose config
+    /// keeps `max_position_embeddings` at the pretrained 4,096).
+    pub fn decoder_context(&self) -> usize {
+        match self.rope_scaling() {
+            Ok(RopeScaling::Yarn(yarn)) => self.max_position_embeddings.max(
+                (yarn.original_max_position_embeddings as f64 * yarn.factor).round() as usize,
+            ),
+            _ => self.max_position_embeddings,
+        }
+    }
+
+    /// Per-pair RoPE frequencies for a `head_dim` head, scaling included.
+    pub fn rope_frequencies(&self, head_dim: usize) -> Result<RopeFrequencies> {
+        rope_frequencies(head_dim, self.rope_theta, &self.rope_scaling()?)
     }
 }
 
@@ -806,11 +837,11 @@ mod tests {
             .contains("context_size 513"));
     }
 
-    /// The published 4.1 configs declare default RoPE in the v5 form; YaRN in
-    /// either form (Granite Speech 5.0's v4 `rope_scaling`, the re-published
-    /// plus's v5 `rope_parameters`) is a checkpoint this runtime cannot run.
+    /// The published 4.1 configs declare default RoPE in the v5 form; plus
+    /// v2610 declares YaRN, which runs here with the decoder context it
+    /// extends to. Other types, and a theta that disagrees, are rejected.
     #[test]
-    fn validate_rejects_rope_scaling_the_runtime_does_not_implement() {
+    fn validate_accepts_default_and_yarn_rope_and_rejects_the_rest() {
         let base = || -> serde_json::Value {
             serde_json::from_str(
                 &fs::read_to_string(fixture_dir("base").join("config.json")).unwrap(),
@@ -829,32 +860,27 @@ mod tests {
             published.validate().unwrap(),
             GraniteSpeechCheckpointKind::Base
         );
+        assert_eq!(published.text_config.rope_scaling().unwrap(), RopeScaling::Default);
+        assert_eq!(published.text_config.decoder_context(), 4096);
 
-        let yarn = serde_json::json!({
+        // Plus v2610: YaRN in the v5 form, max_position_embeddings left at
+        // the pretrained 4096.
+        let mut plus_v2610 = base();
+        plus_v2610["text_config"]["rope_parameters"] = serde_json::json!({
             "factor": 4.0,
             "original_max_position_embeddings": 4096,
+            "rope_theta": 10000,
             "rope_type": "yarn"
         });
-        let mut granite_5 = base();
-        granite_5["text_config"]["rope_scaling"] = yarn.clone();
-        granite_5["text_config"]["max_position_embeddings"] = serde_json::json!(16384);
-        granite_5["text_config"]
-            .as_object_mut()
-            .unwrap()
-            .remove("rope_parameters");
-        let err = parse(granite_5).validate().unwrap_err().to_string();
-        assert!(
-            err.contains("rope_scaling declares rope_type \"yarn\""),
-            "{err}"
-        );
-
-        let mut plus_v2610 = base();
-        plus_v2610["text_config"]["rope_parameters"] = yarn;
-        let err = parse(plus_v2610).validate().unwrap_err().to_string();
-        assert!(
-            err.contains("rope_parameters declares rope_type \"yarn\""),
-            "{err}"
-        );
+        let plus_v2610 = parse(plus_v2610);
+        assert!(plus_v2610.validate().is_ok());
+        assert!(matches!(
+            plus_v2610.text_config.rope_scaling().unwrap(),
+            RopeScaling::Yarn(yarn) if yarn.factor == 4.0 && yarn.original_max_position_embeddings == 4096
+        ));
+        assert_eq!(plus_v2610.text_config.decoder_context(), 16_384);
+        let frequencies = plus_v2610.text_config.rope_frequencies(128).unwrap();
+        assert!((frequencies.attention_scale - (0.1 * 4f64.ln() + 1.0)).abs() < 1e-12);
 
         let mut legacy_key = base();
         legacy_key["text_config"]["rope_scaling"] =
@@ -865,6 +891,15 @@ mod tests {
         theta["text_config"]["rope_parameters"]["rope_theta"] = serde_json::json!(500000);
         let err = parse(theta).validate().unwrap_err().to_string();
         assert!(err.contains("disagrees with rope_theta"), "{err}");
+
+        let mut conflicting = base();
+        conflicting["text_config"]["rope_scaling"] = serde_json::json!({
+            "factor": 4.0,
+            "original_max_position_embeddings": 4096,
+            "rope_type": "yarn"
+        });
+        let err = parse(conflicting).validate().unwrap_err().to_string();
+        assert!(err.contains("disagree"), "{err}");
     }
 
     #[test]

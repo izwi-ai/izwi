@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import type { ModelInfo } from "@/api";
 import {
+  installedGraniteSpeech5Model,
   isDiarizationPipelineAsrModel,
-  resolveDiarizationRouteModel,
+  isSpeakerAttributedAsrModel,
+  resolveDiarizationStackRole,
 } from "@/features/speech-text/modelFilters";
 
 function model(variant: string, status: ModelInfo["status"] = "ready"): ModelInfo {
@@ -17,86 +19,90 @@ function model(variant: string, status: ModelInfo["status"] = "ready"): ModelInf
   };
 }
 
-describe("resolveDiarizationRouteModel", () => {
-  const preferredVariants = ["diar_streaming_sortformer_4spk-v2.1"] as const;
+describe("resolveDiarizationStackRole", () => {
+  const preferredAsr = ["Whisper-Large-v3-Turbo"] as const;
 
-  it("honors a selected diarization variant that is present in the catalog", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [model("diar_streaming_sortformer_4spk-v2.1", "downloaded")],
-      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
-      preferredVariants,
+  function resolveAsr(models: ModelInfo[], pick: string | null) {
+    return resolveDiarizationStackRole({
+      models,
+      eligibleModels: models.filter((candidate) => candidate.variant !== "Qwen3.5-4B"),
+      pick,
+      preferredVariants: preferredAsr,
     });
+  }
 
-    expect(resolved).toBe("diar_streaming_sortformer_4spk-v2.1");
+  it("uses a loaded model over a downloaded preferred default", () => {
+    // The reported bug: Parakeet (or Granite 5.0) loaded, Whisper only on
+    // disk. The stack must count the loaded model, not demand Whisper.
+    expect(
+      resolveAsr(
+        [
+          model("Whisper-Large-v3-Turbo", "downloaded"),
+          model("Granite-Speech-5.0-2B-GGUF"),
+        ],
+        null,
+      ),
+    ).toEqual({ variant: "Granite-Speech-5.0-2B-GGUF", ready: true, missing: false });
   });
 
-  it("surfaces a selected diarization variant that vanished from the catalog", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [model("diar_streaming_sortformer_4spk-v2.1")],
-      selectedModel: "Nemotron-3-Diarization",
-      preferredVariants,
-    });
-
-    expect(resolved).toBe("Nemotron-3-Diarization");
+  it("prefers the loaded default over other loaded models", () => {
+    expect(
+      resolveAsr(
+        [model("Parakeet-TDT-0.6B-v3"), model("Whisper-Large-v3-Turbo")],
+        null,
+      ).variant,
+    ).toBe("Whisper-Large-v3-Turbo");
   });
 
-  it("falls back to the preferred list for a non-diarization selection", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [model("diar_streaming_sortformer_4spk-v2.1", "downloaded")],
-      selectedModel: "Qwen3.5-4B",
-      preferredVariants,
-    });
-
-    expect(resolved).toBe("diar_streaming_sortformer_4spk-v2.1");
+  it("falls back to the preferred default when nothing is loaded", () => {
+    expect(
+      resolveAsr(
+        [
+          model("Parakeet-TDT-0.6B-v3", "downloaded"),
+          model("Whisper-Large-v3-Turbo", "not_downloaded"),
+        ],
+        null,
+      ),
+    ).toEqual({ variant: "Whisper-Large-v3-Turbo", ready: false, missing: false });
   });
 
-  it("falls back to a ready diarization model when nothing is selected", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [
-        model("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
-        model("Nemotron-3-Diarization"),
-      ],
-      selectedModel: null,
-      preferredVariants,
-    });
-
-    expect(resolved).toBe("Nemotron-3-Diarization");
+  it("honours the pick among several loaded models", () => {
+    expect(
+      resolveAsr(
+        [
+          model("Parakeet-TDT-0.6B-v3"),
+          model("Whisper-Large-v3-Turbo"),
+          model("Granite-Speech-5.0-2B-GGUF"),
+        ],
+        "Parakeet-TDT-0.6B-v3",
+      ),
+    ).toEqual({ variant: "Parakeet-TDT-0.6B-v3", ready: true, missing: false });
   });
 
-  it("resolves a loaded diarization model over a not-loaded preferred default", () => {
-    // The user's scenario: the pipeline models were loaded (the aligner last,
-    // so the global selection is not a diarization variant) and the preferred
-    // default v2.1 was never loaded — the ready Nemotron must win.
-    const resolved = resolveDiarizationRouteModel({
-      models: [
-        model("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
-        model("Nemotron-3-Diarization"),
-      ],
-      selectedModel: "Qwen3-ForcedAligner-0.6B",
-      preferredVariants,
-    });
-
-    expect(resolved).toBe("Nemotron-3-Diarization");
+  it("keeps a pick that is not loaded rather than swapping in a loaded model", () => {
+    expect(
+      resolveAsr(
+        [model("Parakeet-TDT-0.6B-v3", "downloaded"), model("Whisper-Large-v3-Turbo")],
+        "Parakeet-TDT-0.6B-v3",
+      ),
+    ).toEqual({ variant: "Parakeet-TDT-0.6B-v3", ready: false, missing: false });
   });
 
-  it("keeps the preferred default when no diarization model is ready", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [model("diar_streaming_sortformer_4spk-v2.1", "downloaded")],
-      selectedModel: null,
-      preferredVariants,
-    });
-
-    expect(resolved).toBe("diar_streaming_sortformer_4spk-v2.1");
+  it("surfaces a pick that left the catalog as missing", () => {
+    expect(
+      resolveAsr([model("Whisper-Large-v3-Turbo")], "Removed-ASR"),
+    ).toEqual({ variant: "Removed-ASR", ready: false, missing: true });
   });
 
-  it("prefers a ready preferred model over other ready models", () => {
-    const resolved = resolveDiarizationRouteModel({
-      models: [model("diar_streaming_sortformer_4spk-v2.1"), model("Nemotron-3-Diarization")],
-      selectedModel: null,
-      preferredVariants,
-    });
+  it("ignores a pick that is no longer eligible for the role", () => {
+    expect(
+      resolveAsr([model("Whisper-Large-v3-Turbo"), model("Qwen3.5-4B")], "Qwen3.5-4B")
+        .variant,
+    ).toBe("Whisper-Large-v3-Turbo");
+  });
 
-    expect(resolved).toBe("diar_streaming_sortformer_4spk-v2.1");
+  it("reports no model when none is eligible", () => {
+    expect(resolveAsr([], null)).toEqual({ variant: null, ready: false, missing: false });
   });
 });
 
@@ -152,4 +158,43 @@ describe("isDiarizationPipelineAsrModel", () => {
       ),
     ).toBe(false);
   });
+
+  it("offers Granite Speech 5.0 and its GGUF as the pipeline ASR", () => {
+    for (const variant of ["Granite-Speech-5.0-2B", "Granite-Speech-5.0-2B-GGUF"]) {
+      expect(
+        isDiarizationPipelineAsrModel(
+          withCapabilities(variant, {
+            openai_audio_transcriptions: true,
+            speech_to_text_jobs: true,
+          }),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("offers speaker-attributed ASR models as the pipeline ASR too", () => {
+    const plus = withCapabilities("Granite-Speech-4.1-2B-Plus", {
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      speaker_attributed_asr: true,
+    });
+    expect(isSpeakerAttributedAsrModel(plus)).toBe(true);
+    expect(isDiarizationPipelineAsrModel(plus)).toBe(true);
+  });
+
+  it("finds an installed Granite Speech 5.0 for the speaker-attribution hint", () => {
+    const asr = { openai_audio_transcriptions: true, speech_to_text_jobs: true };
+    expect(
+      installedGraniteSpeech5Model([
+        { ...withCapabilities("Granite-Speech-5.0-2B", asr), status: "not_downloaded" },
+        withCapabilities("Granite-Speech-5.0-2B-GGUF", asr),
+      ])?.variant,
+    ).toBe("Granite-Speech-5.0-2B-GGUF");
+    expect(
+      installedGraniteSpeech5Model([
+        { ...withCapabilities("Granite-Speech-5.0-2B", asr), status: "not_downloaded" },
+      ]),
+    ).toBeNull();
+  });
 });
+

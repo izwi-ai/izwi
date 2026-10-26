@@ -38,6 +38,11 @@ pub struct AsrLongFormConfig {
     pub max_context_replay_words: usize,
     /// Maximum consecutive repeat count per character in chunk cleanup.
     pub max_repeated_chars: usize,
+    /// Cut each chunk in the middle of the longest pause in the search window
+    /// instead of at the quiet frame nearest the preferred boundary. Long
+    /// pauses are where speakers usually change, and a cut there keeps a
+    /// phrase whole on both sides of the seam.
+    pub prefer_longest_pause: bool,
 }
 
 impl Default for AsrLongFormConfig {
@@ -56,6 +61,7 @@ impl Default for AsrLongFormConfig {
             min_context_replay_words: 8,
             max_context_replay_words: 120,
             max_repeated_chars: 8,
+            prefer_longest_pause: false,
         }
     }
 }
@@ -222,15 +228,30 @@ pub fn plan_audio_chunks(
 
         let mut split = preferred_end.clamp(min_end, max_end);
         if search_high > search_low + frame_samples {
-            if let Some(found) = choose_split_point(
-                samples,
-                search_low,
-                search_high,
-                preferred_end,
-                frame_samples,
-                config.silence_energy_quantile,
-                config.silence_energy_scale,
-            ) {
+            let found = if config.prefer_longest_pause {
+                choose_longest_pause_split_point(
+                    samples,
+                    search_low,
+                    search_high,
+                    preferred_end,
+                    frame_samples,
+                    config.silence_energy_scale,
+                )
+            } else {
+                None
+            }
+            .or_else(|| {
+                choose_split_point(
+                    samples,
+                    search_low,
+                    search_high,
+                    preferred_end,
+                    frame_samples,
+                    config.silence_energy_quantile,
+                    config.silence_energy_scale,
+                )
+            });
+            if let Some(found) = found {
                 split = found;
             }
         }
@@ -874,6 +895,82 @@ fn choose_split_point(
         .map(|(p, _)| *p)
 }
 
+/// The middle of the longest pause in `low..=high` (ties go to the pause
+/// nearest `preferred`), or `None` when no frame is quiet.
+///
+/// Pauses are a small share of conversational audio, so the quiet threshold
+/// scales the window's 5th-percentile energy (the noise floor) and never
+/// exceeds half the median, which is speech; a single louder frame inside a
+/// pause (a click, a breath) does not split it.
+fn choose_longest_pause_split_point(
+    samples: &[f32],
+    low: usize,
+    high: usize,
+    preferred: usize,
+    frame_samples: usize,
+    silence_scale: f32,
+) -> Option<usize> {
+    const NOISE_FLOOR_QUANTILE: f32 = 0.05;
+
+    if high <= low || low >= samples.len() {
+        return None;
+    }
+
+    let mut frames = Vec::new();
+    let mut pos = low;
+    while pos <= high && pos < samples.len() {
+        frames.push((pos, local_energy(samples, pos, frame_samples)));
+        match pos.checked_add(frame_samples) {
+            Some(next) if next > pos => pos = next,
+            _ => break,
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+
+    let mut energies: Vec<f32> = frames.iter().map(|(_, e)| *e).collect();
+    let floor = percentile(&mut energies, NOISE_FLOOR_QUANTILE);
+    let median = percentile(&mut energies, 0.5);
+    let threshold = (floor * silence_scale.max(1.0) + 1e-5).min(median * 0.5 + 1e-5);
+
+    let below: Vec<bool> = frames.iter().map(|(_, e)| *e <= threshold).collect();
+    let quiet: Vec<bool> = below
+        .iter()
+        .enumerate()
+        .map(|(index, &is_below)| {
+            is_below
+                || (index > 0
+                    && below[index - 1]
+                    && below.get(index + 1).copied().unwrap_or(false))
+        })
+        .collect();
+
+    // (run length in frames, distance of its middle from `preferred`, middle)
+    let mut best: Option<(usize, usize, usize)> = None;
+    let mut run_start: Option<usize> = None;
+    // A loud sentinel after the last frame closes a run that reaches the end.
+    for (index, &is_quiet) in quiet.iter().chain(std::iter::once(&false)).enumerate() {
+        match (is_quiet, run_start) {
+            (true, None) => run_start = Some(index),
+            (false, Some(first)) => {
+                let length = index - first;
+                let middle = frames[first + (length - 1) / 2].0;
+                let distance = middle.abs_diff(preferred);
+                let better = best.is_none_or(|(best_length, best_distance, _)| {
+                    length > best_length || (length == best_length && distance < best_distance)
+                });
+                if better {
+                    best = Some((length, distance, middle));
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    best.map(|(_, _, middle)| middle)
+}
+
 fn local_energy(samples: &[f32], center: usize, window: usize) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -1406,6 +1503,56 @@ mod tests {
         assert!(!scan_speech_presence(&[], 16_000, &config).no_speech);
         assert!(!scan_speech_presence(&[0.0; 100], 16_000, &config).no_speech);
         assert!(!scan_speech_presence(&[0.0; 16_000], 0, &config).no_speech);
+    }
+
+    /// 60 s of "speech" at 1 kHz with a 0.2 s gap at 28 s (next to the
+    /// preferred cut) and a 1.5 s pause at 22-23.5 s.
+    fn speech_with_short_and_long_pause() -> Vec<f32> {
+        let mut samples = vec![0.3f32; 60_000];
+        samples[28_000..28_200].fill(0.0);
+        samples[22_000..23_500].fill(0.0);
+        samples
+    }
+
+    fn pause_test_config(prefer_longest_pause: bool) -> AsrLongFormConfig {
+        AsrLongFormConfig {
+            target_chunk_secs: 28.0,
+            hard_max_chunk_secs: 35.0,
+            silence_search_secs: 8.0,
+            min_chunk_secs: 10.0,
+            overlap_secs: 0.0,
+            prefer_longest_pause,
+            ..AsrLongFormConfig::default()
+        }
+    }
+
+    #[test]
+    fn longest_pause_mode_cuts_in_the_middle_of_the_longest_pause() {
+        let samples = speech_with_short_and_long_pause();
+        let chunks = plan_audio_chunks(&samples, 1_000, &pause_test_config(true), None);
+        let cut = chunks[0].end_sample;
+        assert!(
+            (22_000..23_500).contains(&cut) && cut.abs_diff(22_750) <= 40,
+            "cut at {cut}, expected the middle of the 22.0-23.5 s pause"
+        );
+    }
+
+    #[test]
+    fn default_mode_still_cuts_at_the_quiet_frame_nearest_the_target() {
+        let samples = speech_with_short_and_long_pause();
+        let chunks = plan_audio_chunks(&samples, 1_000, &pause_test_config(false), None);
+        let cut = chunks[0].end_sample;
+        assert!(
+            (28_000..28_200).contains(&cut),
+            "cut at {cut}, expected the short gap next to the 28 s target"
+        );
+    }
+
+    #[test]
+    fn longest_pause_mode_falls_back_without_quiet_frames() {
+        let samples = vec![0.3f32; 60_000];
+        let chunks = plan_audio_chunks(&samples, 1_000, &pause_test_config(true), None);
+        assert!(chunks[0].end_sample <= 35_000 && chunks[0].end_sample >= 20_000);
     }
 
     #[test]

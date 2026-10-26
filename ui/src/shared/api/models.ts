@@ -33,6 +33,8 @@ export interface ModelRouteCapabilities {
   speech_translation?: boolean;
   /** The model accepts a keyword list to bias recognition toward. */
   keyword_biasing?: boolean;
+  /** The model writes speaker turns itself (speaker-attributed ASR jobs). */
+  speaker_attributed_asr?: boolean;
   diarization_records: boolean;
   text_to_speech_records: boolean;
   voice_design_records: boolean;

@@ -1108,8 +1108,10 @@ async fn retry_policy_delays_claims_and_enforces_attempt_budget() {
         raw::statement(
             db,
             "UPDATE job_stages SET available_at = ?1 WHERE id = ?2",
+            // Due by the store's own (database) clock, which can trail the
+            // wall clock by a few milliseconds.
             vec![
-                current_timestamp_millis().saturating_sub(1).into(),
+                store.now_millis().saturating_sub(1).into(),
                 stage.id.clone().into(),
             ],
         )

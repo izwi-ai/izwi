@@ -78,7 +78,10 @@ const REQUIRED_ARTIFACTS: &[&str] = &[
     "tokenizer_config.json",
 ];
 
-const UNTIED_LM_HEAD_TENSOR: &str = "language_model.lm_head.weight";
+/// Where the language model's `model.*` tensors live: `language_model` in
+/// the checkpoints through June 2026, one level deeper in plus v2610 (repo
+/// `e69efe37`), which moved every LM tensor to `language_model.model.model.*`.
+const GRANITE_LM_ROOTS: [&str; 2] = ["language_model", "language_model.model"];
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
 /// Plus's card evaluates timestamps on segments up to 3.5 minutes (trained
 /// on up to 5), so one timestamp invocation covers at most that much audio.
@@ -590,6 +593,7 @@ impl GraniteSpeechAsrModel {
         }
         validate_granite_lm_head_layout(
             config.tie_word_embeddings(),
+            artifacts.lm_root,
             artifacts.has_untied_lm_head,
         )?;
         let shards = artifacts.shard_paths;
@@ -605,6 +609,7 @@ impl GraniteSpeechAsrModel {
         let encoder_precision = resolve_granite_encoder_projection_precision(&device, speech_dtype);
         let runtime = GraniteSpeechRuntime::load(
             &shards,
+            artifacts.lm_root,
             &config,
             &device,
             dtype,
@@ -675,7 +680,7 @@ impl GraniteSpeechAsrModel {
             stage_graphs,
             retained,
             invocation,
-            self.config.text_config.max_position_embeddings,
+            self.config.text_config.decoder_context(),
         )
     }
 
@@ -1028,7 +1033,7 @@ impl GraniteSpeechAsrModel {
         let encoder_frames = usize::try_from(samples / hop / 2 + 2)
             .map_err(|_| Error::Overloaded("Granite Speech maximum frames exceed usize".into()))?;
         let encoder_dim = self.config.encoder_config.input_dim;
-        let prompt_tokens = self.config.text_config.max_position_embeddings;
+        let prompt_tokens = self.config.text_config.decoder_context();
         let windows = encoder_frames.saturating_add(self.config.window_size.max(1) - 1)
             / self.config.window_size.max(1);
         let audio_tokens = windows
@@ -1404,6 +1409,11 @@ impl GraniteSpeechAsrModel {
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(DEFAULT_MAX_AUDIO_SECONDS)
+    }
+
+    /// The decoder context the checkpoint was built for (YaRN included).
+    pub(crate) fn nominal_decoder_context(&self) -> usize {
+        self.config.text_config.decoder_context()
     }
 
     /// Decoder-prompt tokens added per second of audio: 16 kHz mel at hop 160
@@ -2519,21 +2529,39 @@ pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>>
 
 struct GraniteSpeechArtifacts {
     shard_paths: Vec<PathBuf>,
+    /// One of [`GRANITE_LM_ROOTS`].
+    lm_root: &'static str,
     has_untied_lm_head: bool,
 }
 
 /// The output head the config resolves must be the one the checkpoint ships:
 /// an untied head needs its own tensor, and a tied config must not silently
 /// discard a trained one.
-fn validate_granite_lm_head_layout(tied: bool, has_untied_lm_head: bool) -> Result<()> {
+fn validate_granite_lm_head_layout(
+    tied: bool,
+    lm_root: &str,
+    has_untied_lm_head: bool,
+) -> Result<()> {
     match (tied, has_untied_lm_head) {
         (false, false) => Err(Error::ModelLoadError(format!(
-            "Granite Speech config unties the output head but the checkpoint index has no {UNTIED_LM_HEAD_TENSOR}"
+            "Granite Speech config unties the output head but the checkpoint index has no {lm_root}.lm_head.weight"
         ))),
         (true, true) => Err(Error::ModelLoadError(format!(
-            "Granite Speech config ties the output head to the embedding but the checkpoint ships {UNTIED_LM_HEAD_TENSOR}"
+            "Granite Speech config ties the output head to the embedding but the checkpoint ships {lm_root}.lm_head.weight"
         ))),
         _ => Ok(()),
+    }
+}
+
+/// The root of the language model's tensors: plus v2610's nested layout
+/// when the index has its embedding there, else the original one (a broken
+/// index then fails when the tensors are read).
+fn granite_lm_root(weight_map: &serde_json::Map<String, serde_json::Value>) -> &'static str {
+    let [flat, nested] = GRANITE_LM_ROOTS;
+    if weight_map.contains_key(&format!("{nested}.model.embed_tokens.weight")) {
+        nested
+    } else {
+        flat
     }
 }
 
@@ -2600,9 +2628,11 @@ fn granite_speech_artifacts(model_dir: &Path) -> Result<GraniteSpeechArtifacts> 
         shard_paths.push(path);
     }
 
+    let lm_root = granite_lm_root(weight_map);
     Ok(GraniteSpeechArtifacts {
         shard_paths,
-        has_untied_lm_head: weight_map.contains_key(UNTIED_LM_HEAD_TENSOR),
+        lm_root,
+        has_untied_lm_head: weight_map.contains_key(&format!("{lm_root}.lm_head.weight")),
     })
 }
 
@@ -3282,16 +3312,41 @@ mod tests {
 
     #[test]
     fn lm_head_layout_must_match_the_resolved_tie() {
-        validate_granite_lm_head_layout(true, false).unwrap();
-        validate_granite_lm_head_layout(false, true).unwrap();
-        assert!(validate_granite_lm_head_layout(false, false)
+        validate_granite_lm_head_layout(true, "language_model", false).unwrap();
+        validate_granite_lm_head_layout(false, "language_model", true).unwrap();
+        assert!(validate_granite_lm_head_layout(false, "language_model", false)
             .unwrap_err()
             .to_string()
             .contains("has no language_model.lm_head.weight"));
-        assert!(validate_granite_lm_head_layout(true, true)
+        assert!(validate_granite_lm_head_layout(true, "language_model.model", true)
             .unwrap_err()
             .to_string()
-            .contains("ships language_model.lm_head.weight"));
+            .contains("ships language_model.model.lm_head.weight"));
+    }
+
+    /// Plus v2610 moved every language-model tensor one level down; the
+    /// encoder and projector kept their names.
+    #[test]
+    fn artifact_validation_finds_the_language_model_root() {
+        for (embedding, root) in [
+            ("language_model.model.embed_tokens.weight", "language_model"),
+            ("language_model.model.model.embed_tokens.weight", "language_model.model"),
+        ] {
+            let dir = temp_model_dir();
+            write_required_non_weight_files(&dir);
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                format!(
+                    r#"{{"weight_map":{{"{embedding}":"model-00001-of-00003.safetensors","encoder.input_linear.weight":"model-00001-of-00003.safetensors"}}}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("model-00001-of-00003.safetensors"), []).unwrap();
+            let artifacts = granite_speech_artifacts(&dir).unwrap();
+            assert_eq!(artifacts.lm_root, root);
+            assert!(!artifacts.has_untied_lm_head);
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     #[test]

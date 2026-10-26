@@ -659,6 +659,75 @@ describe("ModelCatalogProvider per-page choices", () => {
     ).toEqual({ chat: "Qwen3.5-4B", "text-to-speech": "Kokoro-82M" });
   });
 
+  it("keeps diarization stack picks per role, apart from the page's choice", async () => {
+    function RoleProbe() {
+      const { rolePickFor, selectedModelFor, selectModel, pickRoleModel, loadModel } =
+        useModelCatalog();
+      return (
+        <div>
+          <span data-testid="transcription-choice">
+            {selectedModelFor("transcription") ?? "none"}
+          </span>
+          <span data-testid="asr-pick">{rolePickFor("diarization-asr") ?? "none"}</span>
+          <span data-testid="aligner-pick">
+            {rolePickFor("diarization-aligner") ?? "none"}
+          </span>
+          <button
+            type="button"
+            onClick={() => selectModel("Qwen3.5-4B", "transcription")}
+          >
+            Pick transcription
+          </button>
+          <button
+            type="button"
+            onClick={() => pickRoleModel("diarization-asr", "Kokoro-82M")}
+          >
+            Pick stack ASR
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void loadModel("Kokoro-82M", { route: "diarization-aligner" })
+            }
+          >
+            Load stack aligner
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <NotificationProvider>
+        <ModelCatalogProvider>
+          <RoleProbe />
+        </ModelCatalogProvider>
+      </NotificationProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Pick transcription" }));
+    // A role with no pick of its own does not borrow the page's choice.
+    expect(screen.getByTestId("asr-pick")).toHaveTextContent("none");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pick stack ASR" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load stack aligner" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("aligner-pick")).toHaveTextContent("Kokoro-82M"),
+    );
+    expect(screen.getByTestId("asr-pick")).toHaveTextContent("Kokoro-82M");
+    expect(screen.getByTestId("transcription-choice")).toHaveTextContent(
+      "Qwen3.5-4B",
+    );
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("izwi.modelCatalog.routeSelections") ?? "{}",
+      ),
+    ).toEqual({
+      transcription: "Qwen3.5-4B",
+      "diarization-asr": "Kokoro-82M",
+      "diarization-aligner": "Kokoro-82M",
+    });
+  });
+
   it("shows why a load may be slow", async () => {
     apiMocks.loadModel.mockResolvedValue({
       status: "loaded",

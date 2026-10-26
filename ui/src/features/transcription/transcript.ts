@@ -18,6 +18,22 @@ export interface TranscriptionTranscriptEntry {
   timed: boolean;
 }
 
+/** One speaker turn of a speaker-attributed transcript, for display. */
+export interface SpeakerTranscriptBlock {
+  /** Display label without brackets ("Speaker 1"). */
+  speaker: string;
+  /** Order of the speaker's first appearance, for a stable colour. */
+  speakerIndex: number;
+  text: string;
+  /** Seconds; meaningful only when `timed`. */
+  start: number;
+  end: number;
+  timed: boolean;
+}
+
+/** The label the server gives text the model left without a speaker tag. */
+const UNKNOWN_SPEAKER = "UNKNOWN";
+
 type TranscriptRecordLike = Pick<
   TranscriptionRecord,
   | "duration_secs"
@@ -193,12 +209,7 @@ function buildEntriesFromSpeakerTurns(
       if (!text) {
         return null;
       }
-      const hasTiming =
-        typeof turn.start === "number" &&
-        Number.isFinite(turn.start) &&
-        typeof turn.end === "number" &&
-        Number.isFinite(turn.end) &&
-        turn.end > turn.start;
+      const hasTiming = hasTurnTiming(turn);
       const fallbackEnd =
         typeof durationSecs === "number" && Number.isFinite(durationSecs)
           ? Math.max(durationSecs, 0)
@@ -222,6 +233,82 @@ function buildEntriesFromSpeakerTurns(
       left.timed && right.timed ? left.start - right.start : left.index - right.index,
     )
     .map(({ index: _index, ...entry }) => entry);
+}
+
+function speakerDisplayName(speaker: string): string {
+  const normalized = normalizeTranscriptText(speaker)
+    .replace(/^\[(.*)\]$/, "$1")
+    .trim();
+  if (!normalized || normalized.toUpperCase() === UNKNOWN_SPEAKER) {
+    return "Unknown speaker";
+  }
+  return normalized;
+}
+
+function hasTurnTiming(turn: SpeakerAttributedAsrTurn): boolean {
+  return (
+    typeof turn.start === "number" &&
+    Number.isFinite(turn.start) &&
+    typeof turn.end === "number" &&
+    Number.isFinite(turn.end) &&
+    turn.end > turn.start
+  );
+}
+
+/**
+ * Speaker turns as one continuous document: labels without brackets, empty
+ * turns dropped, and consecutive turns of the same speaker joined (chunked
+ * long-form output can split one turn at a chunk seam). Turns stay in record
+ * order unless every turn is timed, in which case they follow the audio.
+ */
+export function speakerTurnBlocksFromRecord(
+  record: Pick<TranscriptRecordLike, "speaker_turns"> | null | undefined,
+): SpeakerTranscriptBlock[] {
+  const turns = (record?.speaker_turns ?? [])
+    .map((turn, index) => {
+      const text = normalizeTranscriptText(turn.text ?? "");
+      if (!text) {
+        return null;
+      }
+      const timed = hasTurnTiming(turn);
+      return {
+        speaker: speakerDisplayName(turn.speaker ?? ""),
+        text,
+        start: timed ? Number(turn.start) : 0,
+        end: timed ? Number(turn.end) : 0,
+        timed,
+        index,
+      };
+    })
+    .filter((turn): turn is NonNullable<typeof turn> => turn !== null);
+
+  const ordered = turns.every((turn) => turn.timed)
+    ? [...turns].sort((left, right) => left.start - right.start || left.index - right.index)
+    : turns;
+
+  const speakerOrder = new Map<string, number>();
+  const blocks: SpeakerTranscriptBlock[] = [];
+  for (const turn of ordered) {
+    if (!speakerOrder.has(turn.speaker)) {
+      speakerOrder.set(turn.speaker, speakerOrder.size);
+    }
+    const previous = blocks[blocks.length - 1];
+    if (previous && previous.speaker === turn.speaker) {
+      previous.text = `${previous.text} ${turn.text}`;
+      previous.timed = previous.timed && turn.timed;
+      previous.end = Math.max(previous.end, turn.end);
+      continue;
+    }
+    blocks.push({
+      speaker: turn.speaker,
+      speakerIndex: speakerOrder.get(turn.speaker) ?? 0,
+      text: turn.text,
+      start: turn.start,
+      end: turn.end,
+      timed: turn.timed,
+    });
+  }
+  return blocks;
 }
 
 function buildFallbackEntry(

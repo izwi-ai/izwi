@@ -35,6 +35,7 @@ use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::exact::exact_concat_rows;
+use crate::models::shared::rope::RopeFrequencies;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
@@ -679,8 +680,12 @@ fn profile_elapsed(start: Option<Instant>) -> Duration {
 }
 
 impl GraniteSpeechRuntime {
+    /// `lm_root` is where the language model's `model.*` tensors live:
+    /// `language_model` through June 2026, `language_model.model` in plus
+    /// v2610.
     pub fn load(
         shard_paths: &[PathBuf],
+        lm_root: &str,
         config: &GraniteSpeechConfig,
         device: &DeviceProfile,
         dtype: DType,
@@ -751,7 +756,7 @@ impl GraniteSpeechRuntime {
                 return GraniteLanguageModel::load_with_execution_plan(
                     &config.text_config,
                     config.tie_word_embeddings(),
-                    vb.pp("language_model"),
+                    vb.pp(lm_root),
                     lm_plan,
                 );
             }
@@ -768,7 +773,7 @@ impl GraniteSpeechRuntime {
             GraniteLanguageModel::load_with_execution_plan(
                 &config.text_config,
                 config.tie_word_embeddings(),
-                f32_vb.pp("language_model"),
+                f32_vb.pp(lm_root),
                 GraniteTextExecutionPlan::BASE_DTYPE,
             )
         };
@@ -2724,13 +2729,7 @@ impl GraniteLanguageModel {
             layer.self_attn.f16_attention_core,
             granite_rope_cache_attention_dtype_enabled(&self.device),
         );
-        GraniteRopeCache::build(
-            total_len,
-            layer.self_attn.head_dim,
-            layer.self_attn.rope_theta,
-            &self.device,
-            dtype,
-        )
+        GraniteRopeCache::build(total_len, &layer.self_attn.rope, &self.device, dtype)
         .map(Some)
     }
 
@@ -3036,9 +3035,8 @@ impl GraniteLanguageModel {
                     .unwrap_or_else(|| {
                         build_rope_cache(
                             x.dim(1)?,
-                            layer.self_attn.head_dim,
                             start_pos,
-                            layer.self_attn.rope_theta,
+                            &layer.self_attn.rope,
                             x.device(),
                             x.dtype(),
                         )
@@ -3435,7 +3433,9 @@ struct GraniteTextAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    /// Per-pair frequencies with the checkpoint's RoPE scaling (YaRN for
+    /// plus v2610) applied; every cos/sin table is built from these.
+    rope: RopeFrequencies,
     attention_multiplier: f32,
 }
 
@@ -3473,7 +3473,7 @@ impl GraniteTextAttention {
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim,
-            rope_theta: config.rope_theta,
+            rope: config.rope_frequencies(head_dim)?,
             attention_multiplier: config.attention_multiplier,
         })
     }
@@ -3514,9 +3514,8 @@ impl GraniteTextAttention {
             None => {
                 let (cos, sin) = build_rope_cache(
                     seq_len,
-                    self.head_dim,
                     start_pos,
-                    self.rope_theta,
+                    &self.rope,
                     x.device(),
                     q.dtype(),
                 )?;
@@ -3713,14 +3712,7 @@ impl GraniteTextAttention {
         k: &Tensor,
         position: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let (cos, sin) = build_rope_cache(
-            1,
-            self.head_dim,
-            position,
-            self.rope_theta,
-            q.device(),
-            q.dtype(),
-        )?;
+        let (cos, sin) = build_rope_cache(1, position, &self.rope, q.device(), q.dtype())?;
         let rope = GraniteRopeSlice::new(cos, sin)?;
         if granite_rope_pair_bshd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
             if let Some((q, k)) = try_fused_rope_pair_bshd(q, k, &rope.packed) {
@@ -3799,12 +3791,11 @@ impl GraniteRopeSlice {
 impl GraniteRopeCache {
     fn build(
         total_len: usize,
-        head_dim: usize,
-        rope_theta: f64,
+        rope: &RopeFrequencies,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        let (cos, sin) = build_rope_cache(total_len, head_dim, 0, rope_theta, device, dtype)?;
+        let (cos, sin) = build_rope_cache(total_len, 0, rope, device, dtype)?;
         let packed = Tensor::cat(&[&cos, &sin], 1)?;
         Ok(Self { cos, sin, packed })
     }
@@ -3823,26 +3814,17 @@ impl GraniteRopeCache {
     }
 }
 
+/// `[seq_len, head_dim / 2]` cos and sin for positions `start_pos..`,
+/// computed on the host in F64 (see [`RopeFrequencies::cos_sin_table`]).
 fn build_rope_cache(
     seq_len: usize,
-    head_dim: usize,
     start_pos: usize,
-    rope_theta: f64,
+    rope: &RopeFrequencies,
     device: &Device,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
-    let half_dim = head_dim / 2;
-    let mut cos = Vec::with_capacity(seq_len * half_dim);
-    let mut sin = Vec::with_capacity(seq_len * half_dim);
-    for pos in start_pos..start_pos + seq_len {
-        for idx in 0..half_dim {
-            let power = (2.0 * idx as f64) / head_dim as f64;
-            let inv = 1.0 / rope_theta.powf(power);
-            let angle = pos as f64 * inv;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
+    let half_dim = rope.inv_freq.len();
+    let (cos, sin) = rope.cos_sin_table(start_pos, seq_len);
     Ok((
         Tensor::from_vec(cos, (seq_len, half_dim), device)?.to_dtype(dtype)?,
         Tensor::from_vec(sin, (seq_len, half_dim), device)?.to_dtype(dtype)?,
@@ -4995,13 +4977,43 @@ mod tests {
         assert_tensor_close(&up, &up_proj.forward(&input).unwrap());
     }
 
+    fn default_rope(head_dim: usize) -> RopeFrequencies {
+        crate::models::shared::rope::rope_frequencies(
+            head_dim,
+            10_000.0,
+            &crate::models::shared::rope::RopeScaling::Default,
+        )
+        .unwrap()
+    }
+
+    /// The shared F64 helper reproduces the 4.1 runtime's own default RoPE
+    /// table, so checkpoints without YaRN decode as before.
+    #[test]
+    fn default_rope_table_matches_the_previous_formula() {
+        let head_dim = 128;
+        let positions = 8_192;
+        let (cos, sin) = default_rope(head_dim).cos_sin_table(0, positions);
+        let mut max_diff = 0f32;
+        for pos in 0..positions {
+            for idx in 0..head_dim / 2 {
+                let inv = 1.0 / 10_000f64.powf((2.0 * idx as f64) / head_dim as f64);
+                let angle = pos as f64 * inv;
+                let at = pos * head_dim / 2 + idx;
+                max_diff = max_diff
+                    .max((cos[at] - angle.cos() as f32).abs())
+                    .max((sin[at] - angle.sin() as f32).abs());
+            }
+        }
+        assert!(max_diff <= 1e-6, "max diff {max_diff}");
+    }
+
     #[test]
     fn granite_rope_cache_slice_matches_direct_build() {
         let device = Device::Cpu;
-        let cache = GraniteRopeCache::build(16, 4, 10000.0, &device, DType::F32).unwrap();
+        let cache = GraniteRopeCache::build(16, &default_rope(4), &device, DType::F32).unwrap();
         let cached = cache.slice(5, 3).unwrap();
         let (direct_cos, direct_sin) =
-            build_rope_cache(3, 4, 5, 10000.0, &device, DType::F32).unwrap();
+            build_rope_cache(3, 5, &default_rope(4), &device, DType::F32).unwrap();
         let direct_packed = Tensor::cat(&[&direct_cos, &direct_sin], 1).unwrap();
 
         assert_tensor_close(&cached.cos, &direct_cos);
@@ -5146,7 +5158,8 @@ mod tests {
         )
         .expect("x");
         let (cos, sin) =
-            build_rope_cache(seq_len, head_dim, 0, 10000.0, &device, DType::F32).expect("cache");
+            build_rope_cache(seq_len, 0, &default_rope(head_dim), &device, DType::F32)
+                .expect("cache");
 
         let manual = apply_rotary_emb(&x, &cos, &sin).expect("manual");
         let (kernel, _) = try_apply_granite_rope_pair_thd(
@@ -5185,7 +5198,8 @@ mod tests {
         )
         .expect("k");
         let (cos, sin) =
-            build_rope_cache(seq_len, head_dim, 0, 10000.0, &device, DType::F32).expect("cache");
+            build_rope_cache(seq_len, 0, &default_rope(head_dim), &device, DType::F32)
+                .expect("cache");
 
         let q_manual = apply_rotary_emb(&q, &cos, &sin).expect("manual q");
         let k_manual = apply_rotary_emb(&k, &cos, &sin).expect("manual k");

@@ -17,6 +17,7 @@ import {
   diarizationSummaryStatusLabel,
   normalizeDiarizationSummaryStatus,
 } from "../utils/diarizationSummary";
+import { speakerAccent } from "../utils/speakerAccent";
 
 interface DiarizationReviewWorkspaceProps {
   record: Pick<
@@ -49,12 +50,6 @@ interface DiarizationReviewWorkspaceProps {
   summaryModelGuidance?: string | null;
 }
 
-type SpeakerAccent = {
-  solid: string;
-  soft: string;
-  border: string;
-};
-
 type ConfidenceFlag = {
   entryIndex: number;
   start: number;
@@ -75,15 +70,6 @@ function formatDurationLabel(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = Math.round(seconds % 60);
   return `${minutes}m ${remainingSeconds}s`;
-}
-
-function speakerAccent(index: number): SpeakerAccent {
-  const hue = (index * 67 + 154) % 360;
-  return {
-    solid: `hsl(${hue} 72% 52%)`,
-    soft: `hsla(${hue} 72% 52% / 0.16)`,
-    border: `hsla(${hue} 72% 52% / 0.4)`,
-  };
 }
 
 function isEntryActive(

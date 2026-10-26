@@ -1379,11 +1379,12 @@ fn granite_saa_decode_budget_uses_saa_sized_limit() {
         GRANITE_SAA_MIN_NEW_TOKENS
     );
     assert_eq!(granite_saa_max_new_tokens_for_duration(240.0), 2176);
+    assert_eq!(granite_saa_max_new_tokens_for_duration(510.0), 4336);
     assert_eq!(
-        granite_saa_max_new_tokens_for_duration(510.0),
+        granite_saa_max_new_tokens_for_duration(600.0),
         GRANITE_SAA_MAX_NEW_TOKENS
     );
-    assert!(granite_saa_max_new_tokens_for_duration(510.0) < 10_000);
+    assert!(granite_saa_max_new_tokens_for_duration(600.0) < 10_000);
 
     if let Some(previous) = previous {
         std::env::set_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS", previous);
@@ -1414,12 +1415,14 @@ fn granite_saa_assembler_dedupes_overlap_and_preserves_turns() {
         .push_chunk_text(
             "[Speaker 1]: hello there [Speaker 2]: hi back from me now",
             0,
+            0.0,
         )
         .is_empty());
     assert!(assembler
         .push_chunk_text(
             "[Speaker 2]: hi back from me now and more [Speaker 1]: ok",
             1,
+            170.0,
         )
         .is_empty());
 
@@ -1432,81 +1435,143 @@ fn granite_saa_assembler_dedupes_overlap_and_preserves_turns() {
 }
 
 #[test]
-fn granite_saa_assembler_maps_reset_label_when_overlap_proves_continuity() {
+fn granite_saa_assembler_relinks_labels_a_chunk_numbered_afresh() {
+    // The second chunk opens on the guest, so Granite calls the guest
+    // "Speaker 1" there; the shared words link it back to "Speaker 2".
     let mut assembler = GraniteSaaTranscriptAssembler::default();
     assembler.push_chunk_text(
-        "[Speaker 1]: first person [Speaker 2]: boundary overlap words now",
+        "[Speaker 1]: how did it all start [Speaker 2]: well I started as a trading company in nineteen seventy eight",
         0,
+        0.0,
     );
-    let warnings =
-        assembler.push_chunk_text("[Speaker 1]: boundary overlap words now continuing", 1);
+    let warnings = assembler.push_chunk_text(
+        "[Speaker 1]: as a trading company in nineteen seventy eight [Speaker 2]: what kind of things did you trade [Speaker 1]: cement",
+        1,
+        170.0,
+    );
 
-    assert!(warnings.iter().any(|warning| warning.contains("mapped it")));
+    assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
         assembler.text(),
-        "[Speaker 1]: first person [Speaker 2]: boundary overlap words now continuing"
+        "[Speaker 1]: how did it all start [Speaker 2]: well I started as a trading company in nineteen seventy eight [Speaker 1]: what kind of things did you trade [Speaker 2]: cement"
     );
 }
 
 #[test]
-fn granite_saa_prefix_text_is_bounded_on_turn_boundaries() {
+fn granite_saa_assembler_flags_a_seam_it_could_only_guess() {
     let mut assembler = GraniteSaaTranscriptAssembler::default();
-    for idx in 0..32 {
-        let speaker = if idx % 2 == 0 { 1 } else { 2 };
-        assembler.push_chunk_text(format!("[Speaker {speaker}]: turn {idx}").as_str(), idx);
-    }
+    assembler.push_chunk_text("[Speaker 1]: question [Speaker 2]: a long answer", 0, 0.0);
+    let warnings = assembler.push_chunk_text(
+        "[Speaker 1]: unrelated words [Speaker 2]: another question",
+        2,
+        367.6,
+    );
 
-    let prefix = assembler.prefix_text();
-    assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
-    assert!(prefix.contains("[Speaker 1]:"));
-    assert!(!prefix.contains("turn 0"));
-}
-
-#[test]
-fn granite_saa_chunk_prefix_defaults_to_none() {
-    let _guard = env_lock().lock().expect("env lock poisoned");
-    let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
-    std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
-    let mut assembler = GraniteSaaTranscriptAssembler::default();
-    assembler.push_chunk_text("[Speaker 1]: prior audio text", 0);
-
-    assert_eq!(GraniteSaaPrefixMode::from_env(), GraniteSaaPrefixMode::None);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("from 6:08 on are a best guess"), "{}", warnings[0]);
+    assert!(warnings[0].contains("chunk 3"), "{}", warnings[0]);
+    // The chunk's first speaker continues the transcript's last one.
     assert_eq!(
-        granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env()),
-        None
+        assembler.text(),
+        "[Speaker 1]: question [Speaker 2]: a long answer unrelated words [Speaker 1]: another question"
     );
+}
 
-    if let Some(previous) = previous {
-        std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
-    } else {
-        std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
+/// Replays the chunk texts of a real long-form run through the assembler,
+/// to tune seam linking against a reference without decoding again. Input
+/// (`IZWI_SAA_REPLAY_CHUNKS`): a JSON array of `{chunk_start_secs, text}`
+/// taken from the `Granite SAA chunk text` debug lines; output
+/// (`IZWI_SAA_REPLAY_OUT`): the speaker turns as JSON.
+#[test]
+#[ignore = "needs IZWI_SAA_REPLAY_CHUNKS from a real run"]
+fn granite_saa_replay_recorded_chunks() {
+    #[derive(serde::Deserialize)]
+    struct RecordedChunk {
+        chunk_start_secs: f64,
+        text: String,
     }
+    let input = std::env::var("IZWI_SAA_REPLAY_CHUNKS").expect("IZWI_SAA_REPLAY_CHUNKS");
+    let output = std::env::var("IZWI_SAA_REPLAY_OUT").expect("IZWI_SAA_REPLAY_OUT");
+    let chunks: Vec<RecordedChunk> =
+        serde_json::from_slice(&std::fs::read(input).expect("read chunks")).expect("chunks json");
+    let mut assembler = GraniteSaaTranscriptAssembler::default();
+    for (index, chunk) in chunks.iter().enumerate() {
+        for warning in assembler.push_chunk_text(&chunk.text, index, chunk.chunk_start_secs) {
+            eprintln!("{warning}");
+        }
+    }
+    let turns = speaker_attributed_asr_result_from_text(&assembler.text(), None, 0.0, None, None)
+        .speaker_turns;
+    std::fs::write(output, serde_json::to_vec_pretty(&turns).unwrap()).expect("write turns");
 }
 
 #[test]
-fn granite_saa_chunk_prefix_full_mode_is_explicit_and_bounded() {
-    let _guard = env_lock().lock().expect("env lock poisoned");
-    let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
-    std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", "full");
-    let mut assembler = GraniteSaaTranscriptAssembler::default();
-    for idx in 0..32 {
-        assembler.push_chunk_text(format!("[Speaker 1]: turn {idx}").as_str(), idx);
-    }
-
-    let prefix = granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env())
-        .expect("full prefix");
-    assert_eq!(
-        GraniteSaaPrefixMode::from_env(),
-        GraniteSaaPrefixMode::FullTranscript
+fn granite_saa_trims_a_decode_that_looped_to_its_token_limit() {
+    // v2610 on a 49-minute interview: the speaker said "no" a few times
+    // and the decode kept going until the budget ran out, ending mid-word.
+    let looped = format!(
+        "[Speaker 1]: okay, but the chinese are saying, {}n",
+        "no, ".repeat(400)
     );
-    assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
-    assert!(prefix.contains("[Speaker 1]:"));
+    assert_eq!(
+        trim_trailing_repetition(&looped).as_deref(),
+        Some("[Speaker 1]: okay, but the chinese are saying, no, no, no,")
+    );
+    let phrase_loop = format!("so we built it {}", "we built a refinery ".repeat(9));
+    assert_eq!(
+        trim_trailing_repetition(&phrase_loop).as_deref(),
+        Some("so we built it we built a refinery we built a refinery we built a refinery")
+    );
+    // Repeats a speaker really makes stay.
+    assert_eq!(trim_trailing_repetition("no, no, no, no. what kind of things"), None);
+    assert_eq!(trim_trailing_repetition("[Speaker 1]: thank you"), None);
+}
 
-    if let Some(previous) = previous {
-        std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
-    } else {
-        std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
-    }
+#[test]
+fn granite_saa_splits_a_looping_chunk_into_overlapping_halves() {
+    let sample_rate = 100;
+    let chunk = AudioChunk {
+        start_sample: 1_000,
+        end_sample: 1_000 + 240 * sample_rate as usize,
+    };
+    let [first, second] = granite_saa_split_chunk(&chunk, sample_rate).expect("240 s splits");
+    assert_eq!(first.start_sample, chunk.start_sample);
+    assert_eq!(second.end_sample, chunk.end_sample);
+    // The halves share the usual 30 s overlap around the middle.
+    assert_eq!(first.end_sample - second.start_sample, 30 * sample_rate as usize);
+    assert_eq!(
+        (first.end_sample + second.start_sample) / 2,
+        chunk.start_sample + 120 * sample_rate as usize
+    );
+    // Halves below the minimum chunk length are not split again.
+    let short = AudioChunk {
+        start_sample: 0,
+        end_sample: 50 * sample_rate as usize,
+    };
+    assert!(granite_saa_split_chunk(&short, sample_rate).is_none());
+}
+
+#[test]
+fn granite_saa_warns_only_when_memory_shortened_the_chunks() {
+    let warning = granite_saa_memory_limit_warning(2_940.0, Some(142.0), Some(206.0))
+        .expect("a 142 s limit against a 206 s checkpoint limit is memory-bound");
+    assert!(warning.contains("at most 142 s instead of 206 s"), "{warning}");
+    // Audio that fits one decode, a limit at the checkpoint's, or no limit
+    // at all says nothing.
+    assert_eq!(granite_saa_memory_limit_warning(120.0, Some(142.0), Some(206.0)), None);
+    assert_eq!(granite_saa_memory_limit_warning(2_940.0, Some(206.0), Some(206.0)), None);
+    assert_eq!(granite_saa_memory_limit_warning(2_940.0, None, Some(206.0)), None);
+}
+
+#[test]
+fn granite_saa_long_form_cuts_at_the_longest_pause_before_the_cap() {
+    let cfg = granite_saa_long_form_config(Some(206.0));
+    assert!(cfg.prefer_longest_pause);
+    assert!((cfg.hard_max_chunk_secs - 195.7).abs() < 0.01);
+    // The pause search spans the last 2 x 20 s up to the cap.
+    assert!((cfg.target_chunk_secs - (cfg.hard_max_chunk_secs - 20.0)).abs() < 0.01);
+    assert!((cfg.silence_search_secs - 20.0).abs() < f32::EPSILON);
+    assert!((cfg.overlap_secs - 30.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -1594,6 +1659,17 @@ fn speaker_attributed_asr_rejects_non_granite_models() {
     let err = resolve_speaker_attributed_asr_variant(Some("Whisper-Large-v3-Turbo"))
         .expect_err("SAA should be Granite-only");
     assert!(err.to_string().contains("Granite-Speech-4.1-2B-Plus"));
+    // Granite Speech 5.0 has no speaker task; the error says where its
+    // speakers come from instead.
+    for variant in ["Granite-Speech-5.0-2B", "Granite-Speech-5.0-2B-GGUF"] {
+        let err = resolve_speaker_attributed_asr_variant(Some(variant))
+            .expect_err("Granite Speech 5.0 has no speaker attribution");
+        assert!(err.to_string().contains("diarization run"), "{err}");
+    }
+    assert_eq!(
+        resolve_speaker_attributed_asr_variant(None).unwrap(),
+        ModelVariant::GraniteSpeech412BPlus
+    );
 }
 
 #[test]

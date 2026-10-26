@@ -244,7 +244,7 @@ fn granite_speech_required_files(variant: ModelVariant) -> &'static [&'static st
     }
 }
 
-/// Exact shard sizes from the HF trees (base de575db6, plus 1454e6e1). The
+/// Exact shard sizes from the HF trees (base de575db6, plus e69efe37). The
 /// shards are named `model-0000N-of-00003.safetensors`, which the generic
 /// `model.safetensors` estimate never matched.
 fn granite_speech_shard_size(variant: ModelVariant, file: &str) -> Option<u64> {
@@ -253,7 +253,7 @@ fn granite_speech_shard_size(variant: ModelVariant, file: &str) -> Option<u64> {
         .strip_suffix("-of-00003.safetensors")?;
     let sizes: [u64; 3] = match variant {
         ModelVariant::GraniteSpeech412B => [2_143_518_808, 2_143_963_456, 339_045_512],
-        ModelVariant::GraniteSpeech412BPlus => [1_992_505_016, 1_993_777_408, 237_587_992],
+        ModelVariant::GraniteSpeech412BPlus => [1_994_213_120, 1_996_752_408, 232_907_080],
         _ => return None,
     };
     match shard {

@@ -98,13 +98,12 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_ROPE_CACHE_ATTENTION_DTYPE` | flag | on for Metal, off elsewhere | first use | Builds the Granite RoPE cache in F16 when the attention core runs in F16. |
 | `IZWI_GRANITE_ROPE_KERNEL` | flag | on for CUDA, off elsewhere | first use | Allows the THD-layout fused RoPE kernel in Granite attention when the BSHD/BHTD kernels are not used. |
 | `IZWI_GRANITE_ROPE_PAIR_BSHD_KERNEL` | flag | on for Metal, off elsewhere | first use | Allows the fused BSHD-layout RoPE pair kernel in Granite attention (even head_dim, F16/F32). |
-| `IZWI_GRANITE_SAA_CHUNK_MAX_SECS` | number | 510 (and <=95% of the model context limit) | first use | Sets the max chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
+| `IZWI_GRANITE_SAA_CHUNK_MAX_SECS` | number | 270 (and <=95% of the model context limit) | first use | Sets the max chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
 | `IZWI_GRANITE_SAA_CHUNK_MIN_SECS` | number | `30` | first use | Sets the minimum chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
-| `IZWI_GRANITE_SAA_CHUNK_OVERLAP_SECS` | number | `12` | first use | Sets the overlap in seconds between Granite speaker-attributed ASR chunks (capped at 45% of target). |
-| `IZWI_GRANITE_SAA_CHUNK_SILENCE_SEARCH_SECS` | number | `12` | first use | Sets the silence-search window in seconds around Granite speaker-attributed ASR chunk boundaries. |
-| `IZWI_GRANITE_SAA_CHUNK_TARGET_SECS` | number | `240` | first use | Sets the preferred chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
-| `IZWI_GRANITE_SAA_MAX_NEW_TOKENS` | integer | 256 + 8 per audio second, clamped 800..2500 | first use | Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer). |
-| `IZWI_GRANITE_SAA_PREFIX_MODE` | choice | `none` | first use | Selects the prefix fed to each Granite SAA chunk: full, full_transcript or legacy = full transcript; anything else = none. |
+| `IZWI_GRANITE_SAA_CHUNK_OVERLAP_SECS` | number | `30` | first use | Sets the overlap in seconds between Granite speaker-attributed ASR chunks (capped at 45% of target). |
+| `IZWI_GRANITE_SAA_CHUNK_SILENCE_SEARCH_SECS` | number | `20` | first use | Sets the window in seconds, before the max chunk length, in which Granite speaker-attributed ASR cuts each chunk at the longest pause. |
+| `IZWI_GRANITE_SAA_CHUNK_TARGET_SECS` | number | 240 (at most the max chunk length minus the silence-search window) | first use | Sets the preferred chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
+| `IZWI_GRANITE_SAA_MAX_NEW_TOKENS` | integer | 256 + 8 per audio second, clamped 800..4608 | first use | Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer). |
 | `IZWI_GRANITE_SPEECH_DTYPE` | choice | auto (family/backend default) | startup | Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths. |
 | `IZWI_GRANITE_TOKEN_DEBUG` | flag | `false` | first use | Adds per-token debug detail to Granite diagnostics; IZWI_GRANITE_TOKEN_DIAGNOSTICS is an alias. |
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
