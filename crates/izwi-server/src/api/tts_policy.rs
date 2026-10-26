@@ -29,7 +29,8 @@ pub(crate) struct SpeechVoiceRequest {
 }
 
 /// The one capability-driven voice contract every speech route applies
-/// (TPIPE-12): a reference comes as audio and transcript together; a model
+/// (TPIPE-12): a reference is its audio, with its transcript for every model
+/// that conditions on the reference's words (all but Chatterbox); a model
 /// is given only the voice inputs it supports; and a model whose only voice
 /// mode is a reference (Qwen Base, VibeVoice, Fish) or a description (Qwen
 /// VoiceDesign) must be given one.
@@ -41,12 +42,12 @@ pub(crate) fn validate_speech_voice(
     let capabilities = variant.speech_capabilities().ok_or_else(|| {
         ApiError::bad_request(format!("{variant} is not a text-to-speech model."))
     })?;
-    if voice.reference_audio != voice.reference_text {
+    if voice.reference_text && !voice.reference_audio {
         return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
+            "`reference_text` was given without `reference_audio`.",
         ));
     }
-    let reference = voice.reference_audio && voice.reference_text;
+    let reference = voice.reference_audio;
     if voice.speaker && !capabilities.supports_builtin_voices {
         return Err(ApiError::bad_request(format!(
             "{variant} does not support built-in speaker selection.",
@@ -56,6 +57,11 @@ pub(crate) fn validate_speech_voice(
         return Err(ApiError::bad_request(format!(
             "{variant} does not support reference or saved voices.",
         )));
+    }
+    if reference && capabilities.reference_transcript_required && !voice.reference_text {
+        return Err(ApiError::bad_request(
+            "Provide both `reference_audio` and `reference_text` together.",
+        ));
     }
     if voice.voice_description && !capabilities.supports_voice_description {
         return Err(ApiError::bad_request(format!(
@@ -75,9 +81,14 @@ pub(crate) fn validate_speech_voice(
         && !capabilities.supports_voice_description
         && !reference
     {
-        return Err(ApiError::bad_request(format!(
-            "{variant} requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-        )));
+        let message = if capabilities.reference_transcript_required {
+            format!(
+                "{variant} requires `saved_voice_id` or both `reference_audio` and `reference_text`."
+            )
+        } else {
+            format!("{variant} requires `saved_voice_id` or `reference_audio`.")
+        };
+        return Err(ApiError::bad_request(message));
     }
     if capabilities.supports_voice_description
         && !capabilities.supports_builtin_voices
@@ -351,6 +362,30 @@ fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transcript_is_required_only_by_models_that_condition_on_it() {
+        let voice = |reference_audio, reference_text| SpeechVoiceRequest {
+            reference_audio,
+            reference_text,
+            ..Default::default()
+        };
+        let chatterbox = ModelVariant::Chatterbox500M;
+        validate_speech_voice(chatterbox, voice(true, false)).expect("audio alone clones");
+        validate_speech_voice(chatterbox, voice(true, true)).expect("a transcript is ignored");
+        let err = validate_speech_voice(chatterbox, voice(false, true)).unwrap_err();
+        assert!(err.message.contains("without `reference_audio`"));
+
+        for variant in [ModelVariant::FishAudioS2Pro, ModelVariant::VibeVoice15BTts] {
+            let err = validate_speech_voice(variant, voice(true, false)).unwrap_err();
+            assert!(err.message.contains("Provide both"), "{variant}");
+            validate_speech_voice(variant, voice(true, true)).expect("audio and transcript");
+            let err = validate_speech_voice(variant, voice(false, false)).unwrap_err();
+            assert!(err
+                .message
+                .contains("both `reference_audio` and `reference_text`"));
+        }
+    }
 
     /// TPIPE-19: an explicit Voxtral budget up to CUDA's 2,048 frames
     /// reaches the runtime (which clamps it to the loaded backend's limit),

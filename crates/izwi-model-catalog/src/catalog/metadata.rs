@@ -836,6 +836,7 @@ impl ModelVariant {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -847,6 +848,7 @@ impl ModelVariant {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -856,6 +858,7 @@ impl ModelVariant {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: true,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -867,6 +870,7 @@ impl ModelVariant {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: true,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -876,6 +880,7 @@ impl ModelVariant {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::KOKORO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: true,
@@ -885,6 +890,7 @@ impl ModelVariant {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -894,6 +900,7 @@ impl ModelVariant {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -903,6 +910,7 @@ impl ModelVariant {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -912,6 +920,7 @@ impl ModelVariant {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -920,7 +929,8 @@ impl ModelVariant {
             Self::Chatterbox500M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::CHATTERBOX_BUILT_IN_VOICE_COUNT),
-                supports_reference_voice: false,
+                supports_reference_voice: true,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: false,
                 supports_speed_control: false,
@@ -1345,6 +1355,10 @@ pub struct SpeechModelCapabilities {
     pub supports_builtin_voices: bool,
     pub built_in_voice_count: Option<usize>,
     pub supports_reference_voice: bool,
+    /// Whether a reference voice needs its transcript. Every reference
+    /// family but Chatterbox conditions on the reference's words; Chatterbox
+    /// takes the audio alone.
+    pub reference_transcript_required: bool,
     pub supports_voice_description: bool,
     pub supports_streaming: bool,
     pub supports_speed_control: bool,
@@ -1727,6 +1741,7 @@ mod tests {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(ModelVariant::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1766,6 +1781,7 @@ mod tests {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1798,6 +1814,7 @@ mod tests {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1807,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn chatterbox_exposes_default_voice_final_only_tts() {
+    fn chatterbox_exposes_default_voice_and_audio_only_clones_final_only() {
         let variant = ModelVariant::Chatterbox500M;
         assert!(variant.is_tts());
         assert!(variant.is_enabled());
@@ -1832,12 +1849,23 @@ mod tests {
             vec![("exaggeration", 0.5), ("cfg_weight", 0.5), ("min_p", 0.05)]
         );
         assert!(ModelVariant::Kokoro82M.speech_controls().is_empty());
+        // Every other reference family conditions on the reference's words.
+        for other in [
+            ModelVariant::FishAudioS2Pro,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Qwen3Tts12Hz06BBase,
+        ] {
+            let capabilities = other.speech_capabilities().unwrap();
+            assert!(capabilities.supports_reference_voice, "{other}");
+            assert!(capabilities.reference_transcript_required, "{other}");
+        }
         assert_eq!(
             variant.speech_capabilities(),
             Some(SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(1),
-                supports_reference_voice: false,
+                supports_reference_voice: true,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: false,
                 supports_speed_control: false,
@@ -1954,6 +1982,7 @@ mod tests {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
+                reference_transcript_required: true,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1970,6 +1999,7 @@ mod tests {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(ModelVariant::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1982,6 +2012,7 @@ mod tests {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(ModelVariant::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: true,
                 supports_streaming: true,
                 supports_speed_control: false,
@@ -1998,6 +2029,7 @@ mod tests {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(ModelVariant::KOKORO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: true,
@@ -2014,6 +2046,7 @@ mod tests {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(ModelVariant::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
+                reference_transcript_required: false,
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: false,

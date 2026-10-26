@@ -128,6 +128,10 @@ pub struct AdminSpeechModelCapabilities {
     pub supports_builtin_voices: bool,
     pub built_in_voice_count: Option<usize>,
     pub supports_reference_voice: bool,
+    /// Whether a reference voice needs its transcript. Every reference
+    /// family but Chatterbox conditions on the reference's words; Chatterbox
+    /// takes the audio alone.
+    pub reference_transcript_required: bool,
     pub supports_voice_description: bool,
     pub supports_streaming: bool,
     /// What a streaming request delivers on this server (TPIPE-3):
@@ -344,6 +348,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_builtin_voices: capabilities.supports_builtin_voices,
             built_in_voice_count: capabilities.built_in_voice_count,
             supports_reference_voice: capabilities.supports_reference_voice,
+            reference_transcript_required: capabilities.reference_transcript_required,
             supports_voice_description: capabilities.supports_voice_description,
             supports_streaming: capabilities.supports_streaming,
             streaming_mode: None,

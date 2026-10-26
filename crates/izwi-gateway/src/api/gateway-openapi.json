@@ -534,6 +534,10 @@
             },
             "type": "array"
           },
+          "reference_transcript_required": {
+            "description": "Whether a reference voice needs its transcript. Every reference\nfamily but Chatterbox conditions on the reference's words; Chatterbox\ntakes the audio alone.",
+            "type": "boolean"
+          },
           "streaming_mode": {
             "description": "What a streaming request delivers on this server (TPIPE-3):\n`chunked` (audio as the model commits it) or `unsupported`.",
             "type": [
@@ -563,6 +567,7 @@
         "required": [
           "supports_builtin_voices",
           "supports_reference_voice",
+          "reference_transcript_required",
           "supports_voice_description",
           "supports_streaming",
           "supports_speed_control",

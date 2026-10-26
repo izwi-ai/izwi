@@ -2593,9 +2593,11 @@ fn validate_reference_voice_selection(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
-    if has_direct_reference_audio != has_direct_reference_text {
+    // Whether the transcript is needed too depends on the model, which the
+    // voice contract checks once the model is known.
+    if has_direct_reference_text && !has_direct_reference_audio {
         return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
+            "`reference_text` was given without `reference_audio`.",
         ));
     }
 
@@ -2732,9 +2734,16 @@ fn normalize_for_model_capabilities(
                     "Voice cloning requests require a model with reference-voice support.",
                 ));
             }
-            if !has_reference_audio || !has_reference_text {
+            if capabilities.reference_transcript_required
+                && (!has_reference_audio || !has_reference_text)
+            {
                 return Err(ApiError::bad_request(
                     "Voice cloning requests require `saved_voice_id` or both `reference_audio` and `reference_text`.",
+                ));
+            }
+            if !has_reference_audio {
+                return Err(ApiError::bad_request(
+                    "Voice cloning requests require `saved_voice_id` or `reference_audio`.",
                 ));
             }
         }
@@ -3364,16 +3373,43 @@ mod tests {
     }
 
     #[test]
-    fn reference_audio_and_text_must_be_provided_together() {
+    fn reference_text_needs_reference_audio() {
         let err = validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
+            reference_text: Some("words".to_string()),
+            ..base_request()
+        })
+        .expect_err("a transcript alone must fail");
+        assert!(err.message.contains("without `reference_audio`"));
+
+        // Audio alone is the model's call (see the voice-contract tests).
+        validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
             reference_audio: Some("abc".to_string()),
             ..base_request()
         })
-        .expect_err("expected incomplete reference inputs to fail");
+        .expect("audio alone passes the model-independent check");
+    }
 
+    #[test]
+    fn audio_only_cloning_is_for_models_that_take_no_transcript() {
+        let audio_only = || CreateSpeechHistoryRecordRequest {
+            reference_audio: Some("UklGRg==".to_string()),
+            ..base_request()
+        };
+        normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            ModelVariant::Chatterbox500M,
+            audio_only(),
+        )
+        .expect("Chatterbox clones from audio alone");
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            ModelVariant::FishAudioS2Pro,
+            audio_only(),
+        )
+        .expect_err("Fish conditions on the transcript");
         assert!(err
             .message
-            .contains("Provide both `reference_audio` and `reference_text` together."));
+            .contains("require `saved_voice_id` or both `reference_audio` and `reference_text`"));
     }
 
     #[test]
