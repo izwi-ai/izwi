@@ -72,6 +72,9 @@ pub struct ChatterboxStream {
     /// Samples handed over so far.
     samples: usize,
     done: bool,
+    /// Samples cut from the end of the utterance (the multilingual
+    /// edition's last token).
+    dropped_tail: usize,
 }
 
 struct StreamWindow {
@@ -100,6 +103,7 @@ impl ChatterboxStream {
         vocoder: &HiftVocoder,
         watermarker: Option<&PerthWatermarker>,
         sample_rate: u32,
+        dropped_tail: usize,
     ) -> Self {
         Self {
             plan,
@@ -111,6 +115,7 @@ impl ChatterboxStream {
             watermark: watermarker.map(|watermarker| watermarker.stream(sample_rate)),
             samples: 0,
             done: false,
+            dropped_tail,
         }
     }
 
@@ -231,6 +236,9 @@ impl ChatterboxStream {
         let mel: Tensor = mel.narrow(1, skip, keep)?.contiguous()?;
         let last = window.last;
         let mut samples = vocoder.vocode_stream(&mut self.vocoder, &mel, last)?;
+        if last && self.dropped_tail > 0 && window.end > 1 {
+            samples.truncate(samples.len().saturating_sub(self.dropped_tail));
+        }
         if let (Some(watermarker), Some(stream)) = (watermarker, self.watermark.as_mut()) {
             samples = watermarker.push(stream, &samples, last)?;
         }

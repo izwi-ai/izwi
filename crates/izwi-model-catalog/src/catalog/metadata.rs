@@ -298,6 +298,15 @@ pub enum ModelVariant {
         alias = "Chatterbox 500M"
     )]
     Chatterbox500M,
+    /// Resemble AI's Chatterbox Multilingual (23 languages, the same T3
+    /// with a grapheme vocabulary, the English S3Gen)
+    #[serde(
+        rename = "Chatterbox-Multilingual-500M",
+        alias = "chatterbox-multilingual",
+        alias = "Chatterbox Multilingual",
+        alias = "Chatterbox-Multilingual"
+    )]
+    ChatterboxMultilingual500M,
 }
 
 impl ModelVariant {
@@ -392,7 +401,9 @@ impl ModelVariant {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
-            Self::Chatterbox500M => Some(Self::CHATTERBOX_ARTIFACT_REVISION),
+            Self::Chatterbox500M | Self::ChatterboxMultilingual500M => {
+                Some(Self::CHATTERBOX_ARTIFACT_REVISION)
+            }
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -461,7 +472,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
             Self::FishAudioS2Pro => "fishaudio/s2-pro",
-            Self::Chatterbox500M => "ResembleAI/chatterbox",
+            Self::Chatterbox500M | Self::ChatterboxMultilingual500M => "ResembleAI/chatterbox",
         }
     }
 
@@ -515,6 +526,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
             Self::FishAudioS2Pro => "Fish Audio S2 Pro",
             Self::Chatterbox500M => "Chatterbox",
+            Self::ChatterboxMultilingual500M => "Chatterbox Multilingual",
         }
     }
 
@@ -568,6 +580,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts => "VibeVoice-1.5B",
             Self::FishAudioS2Pro => "FishAudio-S2-Pro",
             Self::Chatterbox500M => "Chatterbox-500M",
+            Self::ChatterboxMultilingual500M => "Chatterbox-Multilingual-500M",
         }
     }
 
@@ -621,6 +634,9 @@ impl ModelVariant {
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
             Self::Chatterbox500M => 3_229_396_676, // five pinned HF files (3,191,966,992 B) + PerTh checkpoint (37,429,684 B)
+            // Its T3 and tokenizer (2,144,059,741 B), the English S3Gen,
+            // voice encoder and default voice (1,062,287,778 B) and PerTh.
+            Self::ChatterboxMultilingual500M => 3_243_777_203,
         }
     }
 
@@ -689,7 +705,7 @@ impl ModelVariant {
             Self::FishAudioS2Pro => 24.0,
             // 3.2 GB of F32 weights, two guided KV branches (~0.6 GB per
             // 1,000-token request at F32) and the flow's attention workspace.
-            Self::Chatterbox500M => 6.0,
+            Self::Chatterbox500M | Self::ChatterboxMultilingual500M => 6.0,
         }
     }
 
@@ -801,7 +817,10 @@ impl ModelVariant {
     pub fn license_label(&self) -> Option<&'static str> {
         match self {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
-            Self::VibeVoiceAsr | Self::VibeVoice15BTts | Self::Chatterbox500M => Some("MIT"),
+            Self::VibeVoiceAsr
+            | Self::VibeVoice15BTts
+            | Self::Chatterbox500M
+            | Self::ChatterboxMultilingual500M => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412B
@@ -926,7 +945,7 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
-            Self::Chatterbox500M => SpeechModelCapabilities {
+            Self::Chatterbox500M | Self::ChatterboxMultilingual500M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::CHATTERBOX_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: true,
@@ -1203,7 +1222,7 @@ impl ModelVariant {
             Self::Nemotron3Diarization => true,
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
-            Self::Chatterbox500M => true,
+            Self::Chatterbox500M | Self::ChatterboxMultilingual500M => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1258,6 +1277,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts,
             Self::FishAudioS2Pro,
             Self::Chatterbox500M,
+            Self::ChatterboxMultilingual500M,
         ]
     }
 }

@@ -368,7 +368,7 @@ impl ModelVariant {
             Voxtral4BTts2603 => ModelFamily::VoxtralTts,
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             FishAudioS2Pro => ModelFamily::FishS2Tts,
-            Chatterbox500M => ModelFamily::ChatterboxTts,
+            Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -630,6 +630,9 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     }
 
     if normalized.contains("chatterbox") {
+        if normalized.contains("multilingual") || normalized.contains("mtl") {
+            return Some(ChatterboxMultilingual500M);
+        }
         return Some(Chatterbox500M);
     }
 

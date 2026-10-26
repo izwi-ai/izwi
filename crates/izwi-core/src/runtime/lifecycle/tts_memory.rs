@@ -25,11 +25,11 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::config::{
-    S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE,
+    S3GEN_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE,
 };
 use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::chatterbox::{
-    chatterbox_t3_precision, CHATTERBOX_REFERENCE_VOICE_CACHE,
+    chatterbox_t3_precision, ChatterboxEdition, CHATTERBOX_REFERENCE_VOICE_CACHE,
 };
 use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
@@ -90,7 +90,7 @@ pub(super) fn residency_plan(
         ModelFamily::KokoroTts => kokoro_plan(model_path, backend),
         ModelFamily::VibeVoiceTts => vibevoice_tts_plan(model_path, device, backend),
         ModelFamily::VoxtralTts => voxtral_tts_plan(model_path, device, backend),
-        ModelFamily::ChatterboxTts => chatterbox_tts_plan(model_path, device, backend),
+        ModelFamily::ChatterboxTts => chatterbox_tts_plan(variant, model_path, device, backend),
         _ => Ok(None),
     }
 }
@@ -307,16 +307,17 @@ fn price_kokoro(files: &[CensusFile], backend: BackendKind) -> Result<AsrResiden
 const CHATTERBOX_VOICE_BYTES: u64 = 1024 * 1024;
 
 fn chatterbox_tts_plan(
+    variant: ModelVariant,
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
-    let paths = [
-        T3_WEIGHTS_FILE,
-        S3GEN_WEIGHTS_FILE,
-        VOICE_ENCODER_WEIGHTS_FILE,
-    ]
-    .map(|file| model_path.join(file));
+    let Some(edition) = ChatterboxEdition::of(variant) else {
+        return Ok(None);
+    };
+    let t3_file = edition.t3_weights_file();
+    let paths =
+        [t3_file, S3GEN_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE].map(|file| model_path.join(file));
     let Some(mut files) = census_of(&paths)? else {
         return Ok(None);
     };
@@ -325,10 +326,10 @@ fn chatterbox_tts_plan(
         files.push(perth_encoder_census(&perth)?);
     }
     let t3_dtype = chatterbox_t3_precision(device).dtype;
-    let plan = price_chatterbox_tts(&files, backend, t3_dtype)?;
+    let plan = price_chatterbox_tts(&files, backend, t3_file, t3_dtype)?;
     if t3_dtype != DType::F32 {
         // A T3 that fails its load-time self-check reloads in F32.
-        let dense = price_chatterbox_tts(&files, backend, DType::F32)?;
+        let dense = price_chatterbox_tts(&files, backend, t3_file, DType::F32)?;
         return Ok(Some(plan.with_fallback_peak(&dense)));
     }
     Ok(Some(plan))
@@ -373,12 +374,13 @@ fn perth_encoder_census(checkpoint: &Path) -> Result<CensusFile> {
 fn price_chatterbox_tts(
     files: &[CensusFile],
     backend: BackendKind,
+    t3_file: &str,
     t3_dtype: DType,
 ) -> Result<AsrResidencyPlan> {
     const UNREAD: [&str; 2] = ["text_head.", "tfmr.embed_tokens."];
     let mut ledger = Ledger::staged(backend);
     for file in files {
-        let dtype = if file.path.ends_with(T3_WEIGHTS_FILE) {
+        let dtype = if file.path.ends_with(t3_file) {
             t3_dtype
         } else {
             DType::F32
@@ -489,6 +491,7 @@ mod tests {
     };
     use super::*;
     use crate::engine::ResourceAmount;
+    use crate::models::architectures::chatterbox::config::T3_WEIGHTS_FILE;
     use crate::models::architectures::qwen3::tts::tests::cache_test_config;
 
     const BACKENDS: [BackendKind; 3] = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
@@ -644,7 +647,7 @@ mod tests {
                         BackendKind::Metal => DType::F16,
                         BackendKind::Cuda => DType::BF16,
                     };
-                    price_chatterbox_tts(&chatterbox, b, t3_dtype).unwrap()
+                    price_chatterbox_tts(&chatterbox, b, T3_WEIGHTS_FILE, t3_dtype).unwrap()
                 }),
                 [2.99, 2.00, 2.00],
             ),

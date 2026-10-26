@@ -25,6 +25,15 @@ pub enum ChatterboxEdition {
 }
 
 impl ChatterboxEdition {
+    /// The edition a catalog variant serves.
+    pub fn of(variant: crate::catalog::ModelVariant) -> Option<Self> {
+        match variant {
+            crate::catalog::ModelVariant::Chatterbox500M => Some(Self::English),
+            crate::catalog::ModelVariant::ChatterboxMultilingual500M => Some(Self::Multilingual),
+            _ => None,
+        }
+    }
+
     pub fn t3_weights_file(self) -> &'static str {
         match self {
             Self::English => T3_WEIGHTS_FILE,
@@ -51,6 +60,23 @@ impl ChatterboxEdition {
     /// attention, it decodes to ~40 ms of noise); the English one keeps it.
     pub fn drops_final_token_audio(self) -> bool {
         self == Self::Multilingual
+    }
+
+    /// The languages a request may name, by code and English name.
+    pub fn languages(self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Self::English => vec![("en", "English")],
+            Self::Multilingual => super::text::supported_multilingual_language_names(),
+        }
+    }
+
+    /// The language tag a request's `language` selects: English for the
+    /// English edition (which refuses any other), else a supported code.
+    pub fn language_tag(self, language: Option<&str>) -> crate::error::Result<&'static str> {
+        match self {
+            Self::English => super::text::english_language(language).map(|()| "en"),
+            Self::Multilingual => super::text::multilingual_language(language),
+        }
     }
 }
 

@@ -143,6 +143,28 @@ const CHATTERBOX_FILES: &[&str] = &[
     PERTH_CHECKPOINT_FILE,
 ];
 
+/// The multilingual edition's files: its T3 and grapheme tokenizer, then
+/// the English S3Gen and voice encoder in place of the pickled `s3gen.pt`
+/// and `ve.pt` upstream's multilingual loader reads (bit-identical tensor
+/// for tensor at this revision; `chatterbox::multilingual_tests` checks),
+/// the default voice and the watermark.
+const CHATTERBOX_MULTILINGUAL_FILES: &[&str] = &[
+    "t3_mtl23ls_v2.safetensors",
+    "grapheme_mtl_merged_expanded_v1.json",
+    "s3gen.safetensors",
+    "ve.safetensors",
+    "conds.pt",
+    PERTH_CHECKPOINT_FILE,
+];
+
+fn chatterbox_files(variant: ModelVariant) -> &'static [&'static str] {
+    if variant == ModelVariant::ChatterboxMultilingual500M {
+        CHATTERBOX_MULTILINGUAL_FILES
+    } else {
+        CHATTERBOX_FILES
+    }
+}
+
 const FISH_S2_PRO_FILES: &[&str] = &[
     "README.md",
     "LICENSE.md",
@@ -1604,7 +1626,7 @@ impl ModelDownloader {
                 .iter()
                 .all(|file| path.join(file).exists()),
             // The watermarker is needed only while the watermark is on.
-            ModelFamily::ChatterboxTts => CHATTERBOX_FILES.iter().all(|file| {
+            ModelFamily::ChatterboxTts => chatterbox_files(variant).iter().all(|file| {
                 (*file == PERTH_CHECKPOINT_FILE
                     && !crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true))
                     || path.join(file).exists()
@@ -2294,7 +2316,7 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
-            ModelFamily::ChatterboxTts => CHATTERBOX_FILES
+            ModelFamily::ChatterboxTts => chatterbox_files(variant)
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
@@ -2776,6 +2798,8 @@ impl ModelDownloader {
         if variant.family() == ModelFamily::ChatterboxTts {
             match file {
                 "t3_cfg.safetensors" => 2_129_653_744,
+                "t3_mtl23ls_v2.safetensors" => 2_143_989_752,
+                "grapheme_mtl_merged_expanded_v1.json" => 69_989,
                 "s3gen.safetensors" => 1_056_484_620,
                 "ve.safetensors" => 5_695_784,
                 "conds.pt" => 107_374,
@@ -3024,6 +3048,37 @@ impl ModelDownloader {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// The multilingual edition takes its own T3 and grapheme tokenizer and
+    /// shares the English S3Gen, voice encoder, default voice and watermark.
+    #[test]
+    fn chatterbox_multilingual_takes_its_own_t3_and_tokenizer() {
+        let (downloader, _) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::ChatterboxMultilingual500M);
+        for file in [
+            "t3_mtl23ls_v2.safetensors",
+            "grapheme_mtl_merged_expanded_v1.json",
+            "s3gen.safetensors",
+            "ve.safetensors",
+            "conds.pt",
+            PERTH_CHECKPOINT_FILE,
+        ] {
+            assert!(files.contains(&file.to_string()), "{file}");
+        }
+        assert!(!files.contains(&"t3_cfg.safetensors".to_string()));
+        assert!(!files.contains(&"tokenizer.json".to_string()));
+        let total = files
+            .iter()
+            .map(|file| {
+                downloader
+                    .get_single_file_size_estimate(ModelVariant::ChatterboxMultilingual500M, file)
+            })
+            .sum::<u64>();
+        assert_eq!(
+            total,
+            ModelVariant::ChatterboxMultilingual500M.estimated_size()
+        );
+    }
 
     /// Chatterbox's PerTh checkpoint comes from its GitHub repository by
     /// commit, at its exact size; every other file of the model stays on the

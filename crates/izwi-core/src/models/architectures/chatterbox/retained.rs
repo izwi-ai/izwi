@@ -58,7 +58,7 @@ impl ChatterboxRuntime {
         params: &ChatterboxGenerationParams,
     ) -> Result<ChatterboxPreparedArtifact> {
         params.validate()?;
-        let text_ids = self.tokenizer().text_sequence(text)?;
+        let text_ids = self.tokenizer().text_sequence_for(text, params.language)?;
         let conditioning = self.t3().conditioning(&voice.t3, params.exaggeration)?;
         let (conditional, unconditional) =
             self.t3()

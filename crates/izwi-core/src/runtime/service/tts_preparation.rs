@@ -116,6 +116,7 @@ pub(super) fn chatterbox_tts_request_params(
             .seed
             .filter(|seed| *seed != 0)
             .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+        language: defaults.language,
     };
     generation.validate()?;
     Ok(generation)
@@ -992,7 +993,8 @@ impl RuntimeService {
         let reference_audio = request
             .tts_reference_audio_for_execution()
             .map(str::to_string);
-        let params = chatterbox_tts_request_params(&request.params, &request.id)?;
+        let mut params = chatterbox_tts_request_params(&request.params, &request.id)?;
+        params.language = model.runtime().language_tag(request.language.as_deref())?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Chatterbox retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;

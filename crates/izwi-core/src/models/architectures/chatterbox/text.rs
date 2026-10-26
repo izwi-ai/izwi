@@ -100,10 +100,19 @@ pub fn multilingual_language(language: Option<&str>) -> Result<&'static str> {
 
 /// The codes [`multilingual_language`] accepts.
 pub fn supported_multilingual_languages() -> Vec<&'static str> {
+    supported_multilingual_language_names()
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect()
+}
+
+/// The languages [`multilingual_language`] accepts, by code and English
+/// name.
+pub fn supported_multilingual_language_names() -> Vec<(&'static str, &'static str)> {
     MULTILINGUAL_LANGUAGES
         .iter()
-        .map(|(code, _)| *code)
-        .filter(|code| !UNPORTED_LANGUAGES.contains(code))
+        .copied()
+        .filter(|(code, _)| !UNPORTED_LANGUAGES.contains(code))
         .collect()
 }
 

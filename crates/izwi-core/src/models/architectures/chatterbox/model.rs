@@ -18,8 +18,8 @@ use super::retained::{
 };
 use super::stream::{ChatterboxStreamUnit, CHATTERBOX_STREAM_PLAN};
 use super::{
-    config, ChatterboxAcoustic, ChatterboxGenerationParams, ChatterboxPreparedVoice,
-    ChatterboxRuntime, S3GEN_SAMPLE_RATE,
+    config, ChatterboxAcoustic, ChatterboxEdition, ChatterboxGenerationParams,
+    ChatterboxPreparedVoice, ChatterboxRuntime, S3GEN_SAMPLE_RATE,
 };
 use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
@@ -80,11 +80,9 @@ pub fn chatterbox_t3_precision(device: &DeviceProfile) -> DTypeSelection {
 
 impl ChatterboxTtsModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        if variant != ModelVariant::Chatterbox500M {
-            return Err(Error::InvalidInput(format!(
-                "Unsupported Chatterbox variant: {variant}"
-            )));
-        }
+        let edition = ChatterboxEdition::of(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Chatterbox variant: {variant}"))
+        })?;
         let watermark = crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true);
         if !watermark {
             tracing::warn!(
@@ -100,7 +98,15 @@ impl ChatterboxTtsModel {
             &selection,
             true,
             DType::F32,
-            |t3_dtype| ChatterboxRuntime::load(model_dir, &device.device, t3_dtype, watermark),
+            |t3_dtype| {
+                ChatterboxRuntime::load_edition(
+                    model_dir,
+                    edition,
+                    &device.device,
+                    t3_dtype,
+                    watermark,
+                )
+            },
             ChatterboxRuntime::numeric_self_check,
         )?;
         tracing::info!(

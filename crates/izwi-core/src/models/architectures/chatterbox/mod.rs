@@ -31,6 +31,8 @@ mod clone_reference_tests;
 #[cfg(test)]
 mod fixture_support;
 #[cfg(test)]
+mod multilingual_tests;
+#[cfg(test)]
 mod perth_reference_tests;
 #[cfg(test)]
 mod reference_tests;
@@ -45,8 +47,8 @@ use serde::Serialize;
 
 pub use conds::{ChatterboxVoice, S3GenVoiceReference, T3VoiceConditioning};
 pub use config::{
-    chatterbox_auto_max_speech_tokens, ChatterboxSamplingDefaults, HiftConfig, S3GenConfig,
-    T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
+    chatterbox_auto_max_speech_tokens, ChatterboxEdition, ChatterboxSamplingDefaults, HiftConfig,
+    S3GenConfig, T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
 };
 pub(crate) use model::ChatterboxAcousticProgress;
 pub use model::{
@@ -86,6 +88,7 @@ pub enum ChatterboxAcoustic {
 /// The loaded networks of one Chatterbox model.
 pub struct ChatterboxRuntime {
     model_dir: PathBuf,
+    edition: ChatterboxEdition,
     tokenizer: ChatterboxTextTokenizer,
     t3: T3Model,
     flow: S3GenFlow,
@@ -122,6 +125,9 @@ pub struct ChatterboxGenerationParams {
     pub max_speech_tokens: usize,
     /// Positive; drives T3 sampling, the flow noise and the vocoder source.
     pub seed: u64,
+    /// The multilingual tag (`text::multilingual_language`); the English
+    /// edition ignores it.
+    pub language: &'static str,
 }
 
 impl ChatterboxGenerationParams {
@@ -138,6 +144,7 @@ impl ChatterboxGenerationParams {
             exaggeration: d.exaggeration,
             max_speech_tokens: d.max_speech_tokens,
             seed,
+            language: "en",
         }
     }
 
@@ -184,22 +191,52 @@ pub struct ChatterboxGenerationOutput {
 }
 
 impl ChatterboxRuntime {
-    /// Load the networks in `model_dir`, T3 in `t3_dtype` and the rest in
-    /// F32; with `watermark`, also PerTh, whose checkpoint must then be there.
+    /// Load the English networks in `model_dir`, T3 in `t3_dtype` and the
+    /// rest in F32; with `watermark`, also PerTh, whose checkpoint must then
+    /// be there.
     pub fn load(
         model_dir: &Path,
         device: &Device,
         t3_dtype: DType,
         watermark: bool,
     ) -> Result<Self> {
-        let t3_cfg = T3Config::english();
-        let tokenizer = ChatterboxTextTokenizer::load(
-            &model_dir.join(config::TOKENIZER_FILE),
-            t3_cfg.start_text_token,
-            t3_cfg.stop_text_token,
+        Self::load_edition(
+            model_dir,
+            ChatterboxEdition::English,
+            device,
+            t3_dtype,
+            watermark,
+        )
+    }
+
+    /// [`Self::load`] for `edition`, which picks the T3 checkpoint, its
+    /// geometry and the text frontend.
+    pub fn load_edition(
+        model_dir: &Path,
+        edition: ChatterboxEdition,
+        device: &Device,
+        t3_dtype: DType,
+        watermark: bool,
+    ) -> Result<Self> {
+        let t3_cfg = edition.t3_config();
+        let tokenizer_path = model_dir.join(edition.tokenizer_file());
+        let tokenizer = match edition {
+            ChatterboxEdition::English => ChatterboxTextTokenizer::load(
+                &tokenizer_path,
+                t3_cfg.start_text_token,
+                t3_cfg.stop_text_token,
+            )?,
+            ChatterboxEdition::Multilingual => ChatterboxTextTokenizer::load_multilingual(
+                &tokenizer_path,
+                t3_cfg.start_text_token,
+                t3_cfg.stop_text_token,
+            )?,
+        };
+        let t3_vb = weights::mmap_safetensors(
+            &model_dir.join(edition.t3_weights_file()),
+            t3_dtype,
+            device,
         )?;
-        let t3_vb =
-            weights::mmap_safetensors(&model_dir.join(config::T3_WEIGHTS_FILE), t3_dtype, device)?;
         let t3 = T3Model::load(t3_cfg, t3_vb)?;
         let s3gen_vb = weights::mmap_safetensors(
             &model_dir.join(config::S3GEN_WEIGHTS_FILE),
@@ -234,6 +271,7 @@ impl ChatterboxRuntime {
         };
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
+            edition,
             tokenizer,
             t3,
             flow,
@@ -302,6 +340,26 @@ impl ChatterboxRuntime {
 
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
+    }
+
+    pub fn edition(&self) -> ChatterboxEdition {
+        self.edition
+    }
+
+    /// The language tag a request's `language` selects
+    /// ([`ChatterboxEdition::language_tag`]).
+    pub fn language_tag(&self, language: Option<&str>) -> Result<&'static str> {
+        self.edition.language_tag(language)
+    }
+
+    /// Samples dropped from the end of an utterance: the multilingual
+    /// edition cuts the last speech token's audio, as `mtl_tts.py` does.
+    fn dropped_tail_samples(&self) -> usize {
+        if self.edition.drops_final_token_audio() {
+            config::MEL_FRAMES_PER_TOKEN * config::SAMPLES_PER_MEL_FRAME
+        } else {
+            0
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -375,7 +433,7 @@ impl ChatterboxRuntime {
             ));
         }
         let cfg = self.t3.config().clone();
-        let text_ids = self.tokenizer.text_sequence(text)?;
+        let text_ids = self.tokenizer.text_sequence_for(text, params.language)?;
         let started = Instant::now();
         let conditioning = self.t3.conditioning(&voice.t3, params.exaggeration)?;
         let (cond_embeds, uncond_embeds) =
@@ -480,6 +538,7 @@ impl ChatterboxRuntime {
             &self.vocoder,
             self.watermarker.as_ref(),
             S3GEN_SAMPLE_RATE,
+            self.dropped_tail_samples(),
         )
     }
 
@@ -560,6 +619,12 @@ impl ChatterboxRuntime {
                 let mel = self.flow.finish(state)?;
                 let mut samples = self.vocoder.vocode(&mel, seed)?;
                 hift::apply_trim_fade(&mut samples);
+                let dropped = self.dropped_tail_samples();
+                if dropped > 0 {
+                    // Upstream keeps max(1, tokens − 1) tokens' samples.
+                    let keep = speech_tokens.len().saturating_sub(1).max(1) * dropped;
+                    samples.truncate(keep);
+                }
                 if let Some(watermarker) = &self.watermarker {
                     samples = watermarker.apply(&samples, S3GEN_SAMPLE_RATE)?;
                 }
