@@ -240,9 +240,10 @@ model and bundled voice assets inherit a CC BY-NC 4.0 license.
 `Chatterbox-500M` (English, 24 kHz, MIT) speaks with its built-in `default`
 voice or clones from reference audio alone. It returns each utterance whole
 (no streaming yet), has no speed control or voice design, and runs slower than
-real time (a real-time factor of about 3 with two concurrent requests on an
-Apple M1 Pro with Metal). Long text is split between sentences and spoken in
-full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
+real time (a real-time factor of about 2.2 for one request on an Apple M1 Pro
+with Metal, where its T3 model runs in F16 and the model takes about 2.6 GB;
+set `IZWI_METAL_DTYPE=f32` to keep it in F32). Long text is split between
+sentences and spoken in full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
 operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 

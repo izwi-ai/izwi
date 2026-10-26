@@ -89,7 +89,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - Source builds still require the CUDA toolkit and remain useful for development or fallback validation.
 - The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts. It targets compute capability 8.0 (Ampere) and newer unless built with another `CUDA_COMPUTE_CAP`.
 - On macOS 15+, the recommended GPU path is Metal, not CUDA. macOS 12-14 are CPU-only.
-- `Chatterbox-500M` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. It runs in F32 and is verified end to end on CPU and Metal.
+- `Chatterbox-500M` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. Its T3 speech-token model runs in BF16 on CUDA devices with BF16, F16 on Metal and F32 on CPU, behind a load-time self-check that falls back to F32; its other networks run in F32. It is verified end to end on CPU and Metal.
 
 ### Qwen3.8 CUDA weight residency
 
