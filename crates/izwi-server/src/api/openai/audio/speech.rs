@@ -561,6 +561,12 @@ async fn stream_speech(
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
     let mut gen_request = build_generation_request(&req, correlation_id, true, variant);
+    // Long text streams as long-form segments, as a final-only request splits.
+    crate::api::tts_long_form::defer_automatic_budget_to_long_form(
+        &mut gen_request,
+        variant,
+        req.max_output_tokens.or(req.max_tokens),
+    );
     let planned_segment_count = if variant == ModelVariant::FishAudioS2Pro {
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &req.input,
@@ -570,7 +576,8 @@ async fn stream_speech(
         .segments
         .len()
     } else {
-        1
+        crate::api::tts_long_form::expand_generation_requests_for_long_form(&gen_request, variant)
+            .len()
     };
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
@@ -659,9 +666,14 @@ async fn stream_speech(
                 )
                 .await
             } else {
-                generation_engine
-                    .generate_streaming(gen_request, chunk_tx)
-                    .await
+                crate::api::tts_long_form::generate_long_form_stream(
+                    &generation_engine,
+                    variant,
+                    gen_request,
+                    chunk_tx,
+                    fallback_sample_rate,
+                )
+                .await
             }
         });
 
