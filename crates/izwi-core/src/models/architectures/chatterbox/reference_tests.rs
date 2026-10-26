@@ -326,7 +326,7 @@ fn run_leg(device: DeviceProfile, tolerance: Tolerance, label: &str) {
     if !dir.join(config::T3_WEIGHTS_FILE).is_file() {
         panic!("Chatterbox checkpoint not found at {}", dir.display());
     }
-    let runtime = ChatterboxRuntime::load(&dir, &device.device, DType::F32).unwrap();
+    let runtime = ChatterboxRuntime::load(&dir, &device.device, DType::F32, false).unwrap();
 
     for case in &fixture.text_cases {
         let ids = runtime
@@ -650,7 +650,8 @@ fn chatterbox_estimator_cost_by_rows_and_frames_on_metal() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let runtime = ChatterboxRuntime::load(&model_dir(), &profile.device, DType::F32).unwrap();
+    let runtime =
+        ChatterboxRuntime::load(&model_dir(), &profile.device, DType::F32, false).unwrap();
     for (batch, frames) in [(2, 250), (2, 500), (2, 1000), (4, 500), (8, 500), (16, 500)] {
         runtime.flow().probe_estimator(batch, frames).unwrap();
         let runs = 5;

@@ -27,6 +27,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::config::{
     S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE,
 };
+use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::chatterbox::CHATTERBOX_REFERENCE_VOICE_CACHE;
 use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
@@ -313,16 +314,48 @@ fn chatterbox_tts_plan(
         VOICE_ENCODER_WEIGHTS_FILE,
     ]
     .map(|file| model_path.join(file));
-    let Some(files) = census_of(&paths)? else {
+    let Some(mut files) = census_of(&paths)? else {
         return Ok(None);
     };
+    let perth = model_path.join(PERTH_CHECKPOINT_FILE);
+    if crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true) && perth.is_file() {
+        files.push(perth_encoder_census(&perth)?);
+    }
     price_chatterbox_tts(&files, backend).map(Some)
 }
 
-/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, and the
+/// The PerTh encoder's tensors in the checkpoint's `model` state dict (the
+/// loader never reads the decoder).
+fn perth_encoder_census(checkpoint: &Path) -> Result<CensusFile> {
+    let infos = read_pth_tensor_info(checkpoint, false, Some("model")).map_err(|error| {
+        Error::ModelLoadError(format!(
+            "Cannot read the PerTh checkpoint {}: {error}",
+            checkpoint.display()
+        ))
+    })?;
+    let tensors = infos
+        .into_iter()
+        .filter(|info| info.name.starts_with("encoder."))
+        .map(|info| {
+            let elements = u64::try_from(info.layout.shape().elem_count()).unwrap_or(u64::MAX);
+            CensusTensor {
+                name: format!("perth.{}", info.name),
+                dtype: StoredDType::Dense(info.dtype),
+                shape: info.layout.shape().dims().to_vec(),
+                stored_bytes: elements.saturating_mul(info.dtype.size_in_bytes() as u64),
+            }
+        })
+        .collect();
+    Ok(CensusFile {
+        path: checkpoint.to_path_buf(),
+        tensors,
+    })
+}
+
+/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, the
 /// reference encoders a cloned voice needs (voice encoder, S3 tokenizer,
-/// CAMPPlus), read from memory-mapped safetensors at their stored F32 and
-/// kept F32 on every backend. Left out, as the loader never reads them: T3's
+/// CAMPPlus) and, when it watermarks, the PerTh encoder, read at their
+/// stored F32 and kept F32 on every backend. Left out, as the loader never reads them: T3's
 /// text head, the Llama trunk's own token table and CAMPPlus's batch-norm
 /// step counters. HiFT's weight-norm halves and CAMPPlus's batch norms are
 /// priced whole, a slight overestimate of what they fold into.
@@ -337,7 +370,13 @@ fn price_chatterbox_tts(files: &[CensusFile], backend: BackendKind) -> Result<As
                 && !tensor.name.ends_with(".num_batches_tracked")
         })
     {
-        ledger.var(tensor, Source::Mapped, &[DType::F32])?;
+        // The PerTh encoder comes through a host buffer, like Kokoro's.
+        let source = if tensor.name.starts_with("perth.") {
+            Source::Copied
+        } else {
+            Source::Mapped
+        };
+        ledger.var(tensor, source, &[DType::F32])?;
     }
     let voices = 1 + CHATTERBOX_REFERENCE_VOICE_CACHE as u64;
     AsrResidencyPlan::from_ledger(ledger, voices * CHATTERBOX_VOICE_BYTES)

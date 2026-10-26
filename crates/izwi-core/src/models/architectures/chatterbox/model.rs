@@ -54,6 +54,8 @@ pub struct ChatterboxTtsDiagnostics {
     pub dtype: String,
     pub context_tokens: usize,
     pub max_speech_tokens: usize,
+    /// Rendered audio carries the PerTh watermark.
+    pub watermarked: bool,
 }
 
 impl ChatterboxTtsModel {
@@ -64,7 +66,13 @@ impl ChatterboxTtsModel {
             )));
         }
         // F32 everywhere until the per-component precision gates pass.
-        let runtime = ChatterboxRuntime::load(model_dir, &device.device, DType::F32)?;
+        let watermark = crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true);
+        if !watermark {
+            tracing::warn!(
+                "IZWI_CHATTERBOX_WATERMARK is false: Chatterbox audio is served without its PerTh watermark"
+            );
+        }
+        let runtime = ChatterboxRuntime::load(model_dir, &device.device, DType::F32, watermark)?;
         let default_voice = Arc::new(runtime.default_voice().clone());
         Ok(Self {
             model_identity: NEXT_CHATTERBOX_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -150,6 +158,7 @@ impl ChatterboxTtsModel {
             dtype: format!("{:?}", self.runtime.dtype()),
             context_tokens: self.context_tokens(),
             max_speech_tokens: ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
+            watermarked: self.runtime.watermarked(),
         }
     }
 

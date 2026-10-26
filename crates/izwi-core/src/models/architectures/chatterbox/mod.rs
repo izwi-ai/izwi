@@ -56,6 +56,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use hift::HiftVocoder;
 use noise::{NoiseStream, SplitMix64};
+use perth::PerthWatermarker;
 use reference::ChatterboxReferenceEncoders;
 use s3gen::{S3GenFlow, S3GenFlowState, S3GenPreparedVoice};
 use t3::{T3ForwardRow, T3Model, T3PreparedVoice};
@@ -83,6 +84,8 @@ pub struct ChatterboxRuntime {
     vocoder: HiftVocoder,
     /// Voice encoder, S3 tokenizer and CAMPPlus: a voice from audio alone.
     reference: ChatterboxReferenceEncoders,
+    /// PerTh, applied to every rendered waveform when loaded.
+    watermarker: Option<PerthWatermarker>,
     default_voice: ChatterboxPreparedVoice,
     device: Device,
     dtype: DType,
@@ -171,7 +174,9 @@ pub struct ChatterboxGenerationOutput {
 }
 
 impl ChatterboxRuntime {
-    pub fn load(model_dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    /// Load the networks in `model_dir`; with `watermark`, also PerTh, whose
+    /// checkpoint must then be there.
+    pub fn load(model_dir: &Path, device: &Device, dtype: DType, watermark: bool) -> Result<Self> {
         let t3_cfg = T3Config::english();
         let tokenizer = ChatterboxTextTokenizer::load(
             &model_dir.join(config::TOKENIZER_FILE),
@@ -191,6 +196,19 @@ impl ChatterboxRuntime {
             device,
         )?;
         let reference = ChatterboxReferenceEncoders::load(ve_vb, s3gen_vb)?;
+        let watermarker = if watermark {
+            let checkpoint = model_dir.join(perth::PERTH_CHECKPOINT_FILE);
+            if !checkpoint.is_file() {
+                return Err(Error::ModelLoadError(format!(
+                    "Chatterbox's PerTh watermarker ({}) is missing; download the model again, or \
+                     set IZWI_CHATTERBOX_WATERMARK=false to serve it unwatermarked",
+                    perth::PERTH_CHECKPOINT_FILE
+                )));
+            }
+            Some(PerthWatermarker::load(&checkpoint, device)?)
+        } else {
+            None
+        };
         let default = ChatterboxVoice::load_default(&model_dir.join(config::DEFAULT_VOICE_FILE))?;
         let default_voice = ChatterboxPreparedVoice {
             t3: t3.prepare_voice(&default.t3)?,
@@ -203,10 +221,16 @@ impl ChatterboxRuntime {
             flow,
             vocoder,
             reference,
+            watermarker,
             default_voice,
             device: device.clone(),
             dtype,
         })
+    }
+
+    /// Whether rendered audio carries the PerTh watermark.
+    pub fn watermarked(&self) -> bool {
+        self.watermarker.is_some()
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -425,6 +449,9 @@ impl ChatterboxRuntime {
                 let mel = self.flow.finish(state)?;
                 let mut samples = self.vocoder.vocode(&mel, seed)?;
                 hift::apply_trim_fade(&mut samples);
+                if let Some(watermarker) = &self.watermarker {
+                    samples = watermarker.apply(&samples, S3GEN_SAMPLE_RATE)?;
+                }
                 if samples.iter().any(|sample| !sample.is_finite()) {
                     return Err(Error::InferenceError(
                         "Chatterbox vocoder produced non-finite samples".into(),
