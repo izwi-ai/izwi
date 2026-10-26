@@ -843,6 +843,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::Lfm25Audio
                 | crate::catalog::ModelFamily::VibeVoiceTts
                 | crate::catalog::ModelFamily::VoxtralTts
+                | crate::catalog::ModelFamily::ChatterboxTts
         )
     }
 
@@ -1856,7 +1857,8 @@ mod tests {
             Some(ModelVariant::CHATTERBOX_ARTIFACT_REVISION)
         );
         assert_eq!(variant.license_label(), Some("MIT"));
-        assert!(!variant.streams_on_its_tts_route());
+        // A stream runs on its TTS route's retained graph.
+        assert!(variant.streams_on_its_tts_route());
         assert_eq!(variant.tts_output_sample_rate_hint(), Some(24_000));
         assert_eq!(variant.tts_max_output_seconds_hint(), Some(40.0));
         let controls = variant

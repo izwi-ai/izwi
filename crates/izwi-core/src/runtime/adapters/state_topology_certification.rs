@@ -100,7 +100,7 @@ fn certified_topology(
         // Chatterbox retains one page domain per guidance branch (each its
         // own group and arena); the acoustic stage, whole or windowed,
         // leases scratch only.
-        (ChatterboxTts, Tts | StreamingTts) => RetainedPagedPagedAndInvocationScratch,
+        (ChatterboxTts, Tts) => RetainedPagedPagedAndInvocationScratch,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.
