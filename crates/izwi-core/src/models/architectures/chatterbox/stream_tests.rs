@@ -15,6 +15,9 @@
 //!   PerTh's detector score on each.
 //!
 //! WAVs land in `target/chatterbox-e2e/out/stream/` for transcription.
+//! With `IZWI_STREAM_REFERENCE` (a 16-bit mono WAV) the voice is a clone
+//! of its first 10 s, and each stream's voice-encoder cosine to it is
+//! reported too.
 //!
 //! Run: `IZWI_CHATTERBOX_MODEL_DIR=… cargo test -p izwi-core --release
 //! --features metal --lib chatterbox::stream_tests -- --ignored --nocapture`
@@ -203,7 +206,24 @@ fn streamed_windows_against_final_only_on_metal() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| vec![CHATTERBOX_STREAM_PLAN]);
-    let voice = runtime.default_voice().clone();
+    // A clone from a 16-bit mono WAV's first 10 s, or the bundled voice.
+    let reference = std::env::var_os("IZWI_STREAM_REFERENCE").map(|path| {
+        let mut reader = hound::WavReader::open(PathBuf::from(path)).unwrap();
+        let rate = reader.spec().sample_rate;
+        let samples = reader
+            .samples::<i16>()
+            .take(10 * rate as usize)
+            .map(|sample| sample.unwrap() as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        (samples, rate)
+    });
+    let voice = match &reference {
+        Some((samples, rate)) => runtime.prepare_voice_from_audio(samples, *rate).unwrap(),
+        None => runtime.default_voice().clone(),
+    };
+    let reference_embedding = reference
+        .as_ref()
+        .map(|(samples, rate)| embed(&sinc_resample(samples, *rate, S3GEN_SAMPLE_RATE)));
     let cfg = runtime.t3().config().clone();
     for (index, text) in SENTENCES.iter().enumerate() {
         let seed = 41 + index as u64;
@@ -285,7 +305,15 @@ fn streamed_windows_against_final_only_on_metal() {
             );
             write_wav(&name, &audio);
             let report = seams(&audio, &whole.samples, &seam_at);
-            let similarity = cosine(&embed(&audio), &whole_embedding);
+            let embedding = embed(&audio);
+            let similarity = cosine(&embedding, &whole_embedding);
+            if let Some(reference) = &reference_embedding {
+                eprintln!(
+                    "    VE cosine to the reference: streamed {:.3}, final-only {:.3}",
+                    cosine(&embedding, reference),
+                    cosine(&whole_embedding, reference)
+                );
+            }
             let score = detector.detect(&audio, S3GEN_SAMPLE_RATE).unwrap();
             eprintln!(
                 "  plan {:?}: {} windows {:?} ms, acoustic {:.0} ms ({:.2}× final-only), first audio {:.0} ms",

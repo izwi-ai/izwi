@@ -51,12 +51,17 @@ impl ChatterboxStreamPlan {
     }
 }
 
-/// The default plan, chosen by `stream_tests` on Metal.
+/// The default plan, chosen by `stream_tests` on Metal (M1 Pro, a 10 s
+/// cloned reference): with the whole reference prompt every window cost
+/// most of a final-only flow, so a stream cost 2.1-2.4x final-only and
+/// first audio took 4.7 s. Keeping the prompt's latest 50 tokens (2 s) cut
+/// that to 0.9-1.1x and 2.0 s, with the same Whisper transcripts, no seam
+/// clicks and voice-encoder cosine to the reference 0.94 against 0.95-0.96.
 pub const CHATTERBOX_STREAM_PLAN: ChatterboxStreamPlan = ChatterboxStreamPlan {
     first_tokens: 25,
     max_tokens: 100,
     left_context_tokens: 25,
-    prompt_tokens: 0,
+    prompt_tokens: 50,
 };
 
 /// A streamed utterance's acoustic progress.
