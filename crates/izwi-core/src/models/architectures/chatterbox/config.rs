@@ -222,15 +222,19 @@ pub struct ChatterboxSamplingDefaults {
     pub max_speech_tokens: usize,
 }
 
-/// A speech-token budget for `text` when the request sets none: 50 tokens
-/// plus two per character (12.5 characters a second at 25 tokens a second,
-/// slower than read speech), capped at the per-utterance limit. It bounds
-/// the runaway generations upstream sees (resemble-ai/chatterbox#531, the
-/// budget its PR #570 proposes) without cutting real speech.
+/// A speech-token budget for `text` when the request sets none: 50 tokens,
+/// two per character (12.5 characters a second at 25 tokens a second,
+/// slower than read speech) and 16 more per digit, capped at the
+/// per-utterance limit. A digit is read as a word of its own: "3.14159…"
+/// read out one digit at a time takes ~16 tokens a digit, and a date or a
+/// sum several. It bounds the runaway generations upstream sees
+/// (resemble-ai/chatterbox#531, the budget its PR #570 proposes) without
+/// cutting real speech.
 pub fn chatterbox_auto_max_speech_tokens(text: &str) -> usize {
     let chars = text.chars().filter(|ch| !ch.is_whitespace()).count()
         + text.split_whitespace().count().saturating_sub(1);
-    (50 + 2 * chars).min(CHATTERBOX_DEFAULTS.max_speech_tokens)
+    let digits = text.chars().filter(char::is_ascii_digit).count();
+    (50 + 2 * chars + 16 * digits).min(CHATTERBOX_DEFAULTS.max_speech_tokens)
 }
 
 pub const CHATTERBOX_DEFAULTS: ChatterboxSamplingDefaults = ChatterboxSamplingDefaults {
@@ -252,6 +256,8 @@ mod tests {
         assert_eq!(chatterbox_auto_max_speech_tokens("hi"), 54);
         // Runs of whitespace count once.
         assert_eq!(chatterbox_auto_max_speech_tokens("a  b"), 56);
+        // Each digit can be a spoken word.
+        assert_eq!(chatterbox_auto_max_speech_tokens("call 4417"), 50 + 18 + 64);
         assert_eq!(
             chatterbox_auto_max_speech_tokens(&"word ".repeat(400)),
             1000
