@@ -309,7 +309,7 @@ pub mod saved_voices {
         pub created_at: i64,
         pub updated_at: i64,
         pub name: String,
-        pub reference_text: String,
+        pub reference_text: Option<String>,
         pub audio_mime_type: String,
         pub audio_filename: Option<String>,
         pub audio_storage_path: String,

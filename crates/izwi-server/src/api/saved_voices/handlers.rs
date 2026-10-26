@@ -145,7 +145,9 @@ pub async fn create_saved_voice(
     ApiJson(req): ApiJson<CreateSavedVoiceRequest>,
 ) -> Result<Json<SavedVoice>, ApiError> {
     let name = required_trimmed(req.name.as_deref(), "name")?;
-    let reference_text = required_trimmed(req.reference_text.as_deref(), "reference_text")?;
+    // Optional: a voice for a model that clones from audio alone needs no
+    // transcript; a model that conditions on one refuses the voice at use.
+    let reference_text = req.reference_text.filter(|text| !text.trim().is_empty());
     // A designed voice is synthetic; any other is someone's real voice.
     if req.source_route_kind != Some(SavedVoiceSourceRouteKind::VoiceDesign)
         && req.consent != Some(true)

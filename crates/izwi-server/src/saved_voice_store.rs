@@ -72,7 +72,9 @@ pub struct SavedVoice {
     pub created_at: u64,
     pub updated_at: u64,
     pub name: String,
-    pub reference_text: String,
+    /// What the reference says; a voice for a model that clones from audio
+    /// alone (Chatterbox) may have none.
+    pub reference_text: Option<String>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub source_route_kind: Option<SavedVoiceSourceRouteKind>,
@@ -113,7 +115,7 @@ pub struct StoredSavedVoiceAudio {
 #[derive(Debug, Clone)]
 pub struct NewSavedVoice {
     pub name: String,
-    pub reference_text: String,
+    pub reference_text: Option<String>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
@@ -267,8 +269,12 @@ impl SavedVoiceStore {
         let now = now_unix_millis_i64();
         let voice_id = new_uuid();
         let name = sanitize_required_text(voice.name.as_str(), 120, "name")?;
-        let reference_text =
-            sanitize_required_text(voice.reference_text.as_str(), 4_000, "reference_text")?;
+        let reference_text = voice
+            .reference_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| sanitize_required_text(text, 4_000, "reference_text"))
+            .transpose()?;
         let audio_mime_type = sanitize_audio_mime_type(voice.audio_mime_type.as_str());
         let audio_filename = sanitize_optional_text(voice.audio_filename.as_deref(), 260);
         let source_route_kind = voice
@@ -453,7 +459,9 @@ fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
 }
 
 fn map_saved_voice_summary(row: &QueryResult) -> anyhow::Result<SavedVoiceSummary> {
-    let reference_text: String = row.try_get_by_index(4)?;
+    let reference_text: String = row
+        .try_get_by_index::<Option<String>>(4)?
+        .unwrap_or_default();
     let source_route_raw: Option<String> = row.try_get_by_index(7)?;
     let allowed_uses_raw: String = row.try_get_by_index(11)?;
 
@@ -586,7 +594,7 @@ mod tests {
         );
         let voice = |name: &str| NewSavedVoice {
             name: name.to_string(),
-            reference_text: "A calm reference sample".to_string(),
+            reference_text: Some("A calm reference sample".to_string()),
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: None,
             audio_bytes: vec![1, 2, 3, 4],
@@ -611,6 +619,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_voice_may_omit_its_transcript() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let voice = |name: &str, transcript: Option<&str>| NewSavedVoice {
+            name: name.to_string(),
+            reference_text: transcript.map(str::to_string),
+            audio_mime_type: "audio/wav".to_string(),
+            audio_filename: None,
+            audio_bytes: vec![1, 2, 3, 4],
+            source_route_kind: None,
+            source_record_id: None,
+        };
+        let without = store
+            .create_voice(voice("Audio only", None))
+            .await
+            .expect("a voice without a transcript");
+        assert_eq!(without.reference_text, None);
+        let blank = store
+            .create_voice(voice("Blank", Some("   ")))
+            .await
+            .expect("a blank transcript is none");
+        assert_eq!(blank.reference_text, None);
+        let read = store
+            .get_voice(without.id.clone())
+            .await
+            .expect("voice reads")
+            .expect("voice exists");
+        assert_eq!(read.reference_text, None);
+        let (voices, _) = store
+            .list_voices_page(10, None, None)
+            .await
+            .expect("voices list");
+        let listed = voices
+            .iter()
+            .find(|voice| voice.id == without.id)
+            .expect("listed");
+        assert_eq!(listed.reference_text_preview, "No reference text");
+        assert_eq!(listed.reference_text_chars, 0);
+    }
+
+    #[tokio::test]
     async fn creates_lists_reads_audio_and_deletes_voice() {
         let _guard = env_lock();
         let (_temp, store) = setup_store();
@@ -618,7 +667,7 @@ mod tests {
         let created = store
             .create_voice(NewSavedVoice {
                 name: "  Demo Voice ".to_string(),
-                reference_text: " A calm reference sample ".to_string(),
+                reference_text: Some(" A calm reference sample ".to_string()),
                 audio_mime_type: "audio/wav".to_string(),
                 audio_filename: Some("demo.wav".to_string()),
                 audio_bytes: vec![1, 2, 3, 4],

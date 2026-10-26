@@ -2576,7 +2576,7 @@ async fn resolve_saved_voice_selection(
     let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
-    req.reference_text = Some(saved_voice.reference_text);
+    req.reference_text = saved_voice.reference_text;
     Ok(req)
 }
 
@@ -2705,6 +2705,11 @@ fn normalize_for_model_capabilities(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
+    let has_saved_voice = req
+        .saved_voice_id
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
 
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
@@ -2734,7 +2739,10 @@ fn normalize_for_model_capabilities(
                     "Voice cloning requests require a model with reference-voice support.",
                 ));
             }
+            // A saved voice's missing transcript is the voice contract's
+            // to report, below.
             if capabilities.reference_transcript_required
+                && !has_saved_voice
                 && (!has_reference_audio || !has_reference_text)
             {
                 return Err(ApiError::bad_request(
@@ -2756,6 +2764,7 @@ fn normalize_for_model_capabilities(
             speaker: has_speaker,
             reference_audio: has_reference_audio,
             reference_text: has_reference_text,
+            saved_voice: has_saved_voice,
             voice_description: has_voice_description,
         },
     )?;

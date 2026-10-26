@@ -520,7 +520,7 @@ async fn resolve_saved_voice_request(
     let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
-    req.reference_text = Some(saved_voice.reference_text);
+    req.reference_text = saved_voice.reference_text;
     Ok(req)
 }
 
@@ -541,6 +541,7 @@ fn validate_speech_voice_contract(
             speaker,
             reference_audio: present(req.reference_audio.as_deref()),
             reference_text: present(req.reference_text.as_deref()),
+            saved_voice: present(req.saved_voice_id.as_deref()),
             voice_description: present(req.instructions.as_deref()),
         },
     )

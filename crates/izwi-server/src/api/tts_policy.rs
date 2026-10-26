@@ -24,6 +24,8 @@ pub(crate) struct SpeechVoiceRequest {
     pub(crate) speaker: bool,
     pub(crate) reference_audio: bool,
     pub(crate) reference_text: bool,
+    /// The reference came from a saved voice (`saved_voice_id`).
+    pub(crate) saved_voice: bool,
     /// A voice description (VoiceDesign `instructions`).
     pub(crate) voice_description: bool,
 }
@@ -59,9 +61,14 @@ pub(crate) fn validate_speech_voice(
         )));
     }
     if reference && capabilities.reference_transcript_required && !voice.reference_text {
-        return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
-        ));
+        return Err(ApiError::bad_request(if voice.saved_voice {
+            format!(
+                "This saved voice has no transcript, which {variant} needs. Use a voice saved \
+                 with one, or a model that clones from audio alone."
+            )
+        } else {
+            "Provide both `reference_audio` and `reference_text` together.".to_string()
+        }));
     }
     if voice.voice_description && !capabilities.supports_voice_description {
         return Err(ApiError::bad_request(format!(
@@ -372,6 +379,16 @@ mod tests {
         };
         let chatterbox = ModelVariant::Chatterbox500M;
         validate_speech_voice(chatterbox, voice(true, false)).expect("audio alone clones");
+        let saved_without_transcript = SpeechVoiceRequest {
+            reference_audio: true,
+            saved_voice: true,
+            ..Default::default()
+        };
+        validate_speech_voice(chatterbox, saved_without_transcript)
+            .expect("a saved voice without a transcript serves Chatterbox");
+        let err = validate_speech_voice(ModelVariant::FishAudioS2Pro, saved_without_transcript)
+            .unwrap_err();
+        assert!(err.message.contains("saved voice has no transcript"));
         validate_speech_voice(chatterbox, voice(true, true)).expect("a transcript is ignored");
         let err = validate_speech_voice(chatterbox, voice(false, true)).unwrap_err();
         assert!(err.message.contains("without `reference_audio`"));

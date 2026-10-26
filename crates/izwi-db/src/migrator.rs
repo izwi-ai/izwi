@@ -47,6 +47,7 @@ impl Schema {
                 ),
                 (11, "voice session chat threads"),
                 (12, "transcription translation target and keywords"),
+                (13, "saved voices without a transcript"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -213,6 +214,16 @@ async fn apply_migration<C: ConnectionTrait>(
         (Schema::App, 12) => {
             for column in TRANSCRIPTION_TASK_COLUMNS {
                 ensure_column(db, column).await?;
+            }
+        }
+        (Schema::App, 13) => {
+            if backend == DbBackend::Postgres {
+                db.execute_unprepared(SAVED_VOICE_TRANSCRIPT_OPTIONAL)
+                    .await?;
+            } else {
+                for statement in SQLITE_SAVED_VOICE_TRANSCRIPT_OPTIONAL {
+                    db.execute_unprepared(statement).await?;
+                }
             }
         }
         (Schema::Fleet, 1) => {
@@ -1176,6 +1187,48 @@ const TRANSCRIPTION_TASK_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 13: a saved voice may omit its transcript, as a model that
+/// clones from audio alone (Chatterbox) needs none. PostgreSQL drops the
+/// constraint in place.
+const SAVED_VOICE_TRANSCRIPT_OPTIONAL: &str =
+    "ALTER TABLE saved_voices ALTER COLUMN reference_text DROP NOT NULL";
+
+/// Migration 13 on SQLite, which cannot drop a constraint: the table rebuilt
+/// with the same columns, defaults and indexes, `reference_text` nullable.
+const SQLITE_SAVED_VOICE_TRANSCRIPT_OPTIONAL: &[&str] = &[
+    r#"
+    CREATE TABLE saved_voices_m13 (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL COLLATE NOCASE,
+        reference_text TEXT NULL,
+        audio_mime_type TEXT NOT NULL,
+        audio_filename TEXT NULL,
+        audio_storage_path TEXT NOT NULL,
+        source_route_kind TEXT NULL,
+        source_record_id TEXT NULL,
+        permission_scope TEXT NOT NULL DEFAULT 'legacy_local',
+        consent_status TEXT NOT NULL DEFAULT 'granted',
+        allowed_uses_json TEXT NOT NULL DEFAULT '["local_tts","voice_clone_reference"]',
+        permission_provenance TEXT NULL,
+        permission_revoked_at INTEGER NULL
+    )
+    "#,
+    "INSERT INTO saved_voices_m13 (id, created_at, updated_at, name, reference_text, \
+     audio_mime_type, audio_filename, audio_storage_path, source_route_kind, source_record_id, \
+     permission_scope, consent_status, allowed_uses_json, permission_provenance, \
+     permission_revoked_at) \
+     SELECT id, created_at, updated_at, name, reference_text, audio_mime_type, audio_filename, \
+     audio_storage_path, source_route_kind, source_record_id, permission_scope, consent_status, \
+     allowed_uses_json, permission_provenance, permission_revoked_at FROM saved_voices",
+    "DROP TABLE saved_voices",
+    "ALTER TABLE saved_voices_m13 RENAME TO saved_voices",
+    "CREATE UNIQUE INDEX idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE)",
+    "CREATE INDEX idx_saved_voices_updated_at ON saved_voices(updated_at DESC, created_at DESC)",
+    "CREATE INDEX idx_saved_voices_audio_path ON saved_voices(audio_storage_path)",
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "provider_write_reservations",
@@ -1715,6 +1768,8 @@ pub(crate) fn postgres_schema_sql() -> String {
     for column in TRANSCRIPTION_TASK_COLUMNS {
         push(&add_column(column));
     }
+    // Migration 13.
+    push(SAVED_VOICE_TRANSCRIPT_OPTIONAL);
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1981,6 +2036,68 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_12_keeps_its_voices_and_lets_new_ones_omit_transcripts() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let backend = db.get_database_backend();
+        // Back to migration 12: the table as the baseline created it.
+        db.execute_unprepared("DROP TABLE saved_voices")
+            .await
+            .expect("table drops");
+        for statement in BASELINE_SCHEMA
+            .iter()
+            .chain(MEDIA_REFERENCE_INDEXES)
+            .filter(|statement| statement.contains("saved_voices"))
+        {
+            db.execute_unprepared(&dialect_ddl(backend, statement))
+                .await
+                .expect("migration 12 table");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 13",
+        )
+        .await
+        .expect("version row deletes");
+        let insert = |id: &str, name: &str, transcript: &str| {
+            format!(
+                "INSERT INTO saved_voices (id, created_at, updated_at, name, reference_text, \
+                 audio_mime_type, audio_storage_path) \
+                 VALUES ('{id}', 1, 1, '{name}', {transcript}, 'audio/wav', '{id}.wav')"
+            )
+        };
+        db.execute_unprepared(&insert("v1", "Narrator", "'spoken words'"))
+            .await
+            .expect("a voice with its transcript");
+        assert!(
+            db.execute_unprepared(&insert("v2", "Clone", "NULL"))
+                .await
+                .is_err(),
+            "migration 12 requires a transcript"
+        );
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert_eq!(
+            text(
+                db,
+                "SELECT reference_text FROM saved_voices WHERE id = 'v1'"
+            )
+            .await
+            .as_deref(),
+            Some("spoken words")
+        );
+        db.execute_unprepared(&insert("v2", "Clone", "NULL"))
+            .await
+            .expect("a voice without a transcript");
+        assert!(
+            db.execute_unprepared(&insert("v3", "narrator", "NULL"))
+                .await
+                .is_err(),
+            "names stay unique regardless of case"
+        );
     }
 
     async fn text(db: &DatabaseConnection, sql: &str) -> Option<String> {
