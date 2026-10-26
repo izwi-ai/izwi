@@ -69,14 +69,14 @@ Different features require different models:
 | Voice | TTS + ASR + Chat model (or unified `LFM2.5-Audio-1.5B-GGUF`) |
 | Chat | Chat model (Qwen3.5, Qwen3.6, Qwen3.8, or LFM2.5) |
 | Speaker Attributed ASR | `Granite-Speech-4.1-2B-Plus` |
-| Voices | Built-in voice model for presets; Base, VibeVoice or `FishAudio-S2-Pro` model for cloning; VoiceDesign model for design |
+| Voices | Built-in voice model for presets; Base, VibeVoice, `FishAudio-S2-Pro` or `Chatterbox-500M` model for cloning; VoiceDesign model for design |
 | Text-to-Speech | TTS model |
 | Studio | TTS model |
 | Settings | No model required |
 | Transcription | ASR model (`Parakeet-TDT-0.6B-v3` default; Qwen3/Whisper/Granite Speech/LFM2.5 also supported) |
 | Diarization | `diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization` (+ optional ASR and aligner models) |
 | Forced Alignment | `Qwen3-ForcedAligner-0.6B` |
-| Voice Cloning | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-1.7B-Base`, `VibeVoice-1.5B` or `FishAudio-S2-Pro` |
+| Voice Cloning | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-1.7B-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro` or `Chatterbox-500M` |
 | Voice Design | Qwen3 TTS VoiceDesign model (`Qwen3-TTS-12Hz-1.7B-VoiceDesign*`) |
 
 ---

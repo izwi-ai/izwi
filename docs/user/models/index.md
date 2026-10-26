@@ -20,6 +20,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Voxtral TTS | `Voxtral-4B-TTS-2603` |
 | VibeVoice TTS | `VibeVoice-1.5B` |
 | Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
+| Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
@@ -34,6 +35,14 @@ Those endpoints only show variants that are enabled for download/use.
 > `VibeVoice-1.5B` is a Microsoft long-form TTS model with reference-voice
 > cloning. It uses saved or direct reference voices rather than built-in speaker
 > presets.
+
+> `Chatterbox-500M` is Resemble AI's English TTS model (MIT code and weights):
+> a 0.5B Llama speech-token model with classifier-free guidance, then S3Gen flow
+> matching and a HiFT vocoder, with 24 kHz output. It has one built-in voice
+> (`default`) and clones from reference audio alone, without a transcript. Every
+> utterance carries Resemble AI's imperceptible PerTh watermark (the catalog
+> labels it **Watermarked**), whose checkpoint is downloaded from GitHub rather
+> than Hugging Face (see [Manual Downloads](/models/manual-download#chatterbox)).
 
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
@@ -138,6 +147,9 @@ izwi pull Granite-Speech-5.0-2B-GGUF
 # Download Microsoft VibeVoice models
 izwi pull VibeVoice-1.5B
 izwi pull VibeVoice-ASR
+
+# Download Resemble AI Chatterbox (about 3.2 GB)
+izwi pull Chatterbox-500M
 ```
 
 ### Via Web UI

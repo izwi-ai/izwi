@@ -74,10 +74,13 @@ izwi tts "Your text here" --output output.wav
 | `--speaker`, `-s` | Voice/speaker ID | Model default (Kokoro: `af_heart`) |
 | `--saved-voice-id` | Reuse a saved reference voice | — |
 | `--reference-audio` | Reference audio file for cloning | — |
-| `--reference-text` | Transcript for the reference audio | — |
+| `--reference-text` | Transcript for the reference audio (needs `--reference-audio`; optional for Chatterbox) | — |
 | `--reference-text-file` | File containing the reference transcript | — |
 | `--instructions` | Voice-design direction prompt | — |
 | `--temperature`, `-t` | Sampling temperature | Model default |
+| `--exaggeration` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
+| `--cfg-weight` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
+| `--min-p` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
 | `--play`, `-p` | Play the saved file with the system player (WAV only) | — |
 | `--stream` | Stream the audio as it is generated into a WAV file and report time to first audio | — |
 
@@ -122,6 +125,20 @@ izwi tts "This line uses the reference voice." \
   --output cloned.wav
 ```
 
+**Clone with Chatterbox (no transcript), more expressive:**
+
+```bash
+izwi tts "This line uses the reference voice with more emotion." \
+  --model Chatterbox-500M \
+  --reference-audio samples/reference.wav \
+  --exaggeration 0.7 \
+  --cfg-weight 0.3 \
+  --output expressive.wav
+```
+
+For expressive or fast-talking reference voices, Resemble AI suggests a lower
+`--cfg-weight` (about 0.3) with `--exaggeration` around 0.7 or higher.
+
 **Reuse a saved voice:**
 
 ```bash
@@ -149,6 +166,9 @@ izwi tts "This line uses a designed voice." \
 3. Select a voice (if available)
 4. Click **Generate**
 5. Play or download the audio
+
+With Chatterbox selected, the dialog shows sliders for exaggeration, CFG weight
+and min-p, and streaming is unavailable.
 
 ### Features
 
@@ -209,13 +229,21 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~4.2 GB | Better | Medium |
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice | Medium |
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
+| `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B` or `FishAudio-S2-Pro`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro` or `Chatterbox-500M`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603` or `LFM2.5-Audio-1.5B-GGUF`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its
 model and bundled voice assets inherit a CC BY-NC 4.0 license.
+`Chatterbox-500M` (English, 24 kHz, MIT) speaks with its built-in `default`
+voice or clones from reference audio alone. It returns each utterance whole
+(no streaming yet), has no speed control or voice design, and runs slower than
+real time (a real-time factor of about 3 with two concurrent requests on an
+Apple M1 Pro with Metal). Long text is split between sentences and spoken in
+full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
+operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---

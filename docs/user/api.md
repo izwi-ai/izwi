@@ -359,12 +359,35 @@ Request fields:
 | `speed` | Optional model-dependent speed control. |
 | `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. |
 | `temperature`, `top_k` | Optional sampling controls. |
+| `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
+| `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
+| `min_p` | Chatterbox only. Min-p sampling threshold, 0 to 1 (default `0.05`). |
 | `max_tokens`, `max_output_tokens` | Optional output token budget aliases. |
 | `instructions` | Voice-design prompt for voice-design models. |
 | `reference_audio` | Base64 audio for voice cloning. |
-| `reference_text` | Transcript of the reference audio. |
+| `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
 | `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. |
+
+`exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
+history create routes. Any other model returns `400` if one is set, and a value
+out of range returns `400`.
+
+`Chatterbox-500M` specifics:
+
+- It speaks with its built-in `default` voice, or clones from `reference_audio`
+  (or a saved voice) alone.
+- Its other sampling defaults are `temperature` 0.8, repetition penalty 1.2 and
+  top-p 1.0.
+- It returns the whole utterance when it is ready. `stream: true`, `speed` and
+  `instructions` (voice descriptions) each return `400`.
+- One request speaks at most 1,000 speech tokens (about 40 s). Without
+  `max_tokens`, Izwi sets a budget from the text (50 tokens, plus 2 per
+  character, plus 16 per digit) and splits longer text between whole sentences
+  into long-form segments joined by a short faded pause, so long passages are
+  spoken in full. An explicit `max_tokens` is used as given, without splitting.
+- Every utterance carries Resemble AI's imperceptible PerTh watermark. Set
+  `IZWI_CHATTERBOX_WATERMARK=false` before the model loads to turn it off.
 
 Non-stream response:
 
@@ -774,12 +797,14 @@ Reusable voice clone references:
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/v1/voices` | List saved voices with cursor pagination. |
-| `POST` | `/v1/voices` | Create a saved voice from reference audio/text or a generated voice source. |
+| `POST` | `/v1/voices` | Create a saved voice from reference audio (transcript optional) or a generated voice source. |
 | `GET` | `/v1/voices/{voice_id}` | Fetch saved voice metadata. |
 | `DELETE` | `/v1/voices/{voice_id}` | Delete saved voice and audio. |
 | `GET` | `/v1/voices/{voice_id}/audio` | Fetch saved reference audio. |
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
+
+A voice saved without a transcript works with `Chatterbox-500M`, which clones from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) return `400` for it, asking for a voice saved with one.
 
 Saved voice records include a local permission baseline:
 `permission_scope`, `consent_status`, `allowed_uses`,

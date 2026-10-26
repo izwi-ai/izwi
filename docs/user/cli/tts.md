@@ -46,15 +46,21 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `-s, --speaker <VOICE>` | Built-in voice/speaker ID, or VibeVoice speaker label | model default |
 | `--saved-voice-id <ID>` | Reuse a saved reference voice from `/v1/voices` | — |
 | `--reference-audio <PATH>` | Reference audio file for voice cloning | — |
-| `--reference-text <TEXT>` | Transcript for the reference audio | — |
+| `--reference-text <TEXT>` | Transcript for the reference audio; needs `--reference-audio` (optional for Chatterbox) | — |
 | `--reference-text-file <PATH>` | File containing the reference transcript | — |
 | `--instructions <TEXT>` | Voice direction prompt for voice-design models | — |
 | `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
 | `-t, --temperature <TEMP>` | Sampling temperature | model default |
+| `--exaggeration <F>` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
+| `--cfg-weight <F>` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
+| `--min-p <F>` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
 | `--stream` | Stream audio as it is generated into a WAV file and report time to first audio (WAV only) | — |
 | `-p, --play` | Play the saved WAV with the system player (afplay on macOS; paplay, aplay, ffplay or play on Linux; PowerShell on Windows). Not with `--format pcm`. | — |
+
+`--exaggeration`, `--cfg-weight` and `--min-p` are sent only when set, and the
+server refuses one the chosen model does not support.
 
 ---
 
@@ -138,6 +144,25 @@ izwi tts "Generate with the saved reference transcript." \
   --output cloned-long.wav
 ```
 
+### Chatterbox
+
+`Chatterbox-500M` speaks with its built-in `default` voice, or clones from
+`--reference-audio` alone (a transcript is optional and ignored):
+
+```bash
+izwi tts "This sentence will use the reference voice." \
+  --model Chatterbox-500M \
+  --reference-audio samples/reference.wav \
+  --exaggeration 0.7 \
+  --cfg-weight 0.3 \
+  --output chatterbox.wav
+```
+
+For expressive or fast-talking reference voices, Resemble AI suggests a lower
+`--cfg-weight` (about 0.3) with `--exaggeration` around 0.7 or higher.
+Chatterbox returns the whole utterance when it is ready, so it refuses
+`--stream`; it also refuses `--speed` and `--instructions`.
+
 ### Saved voice reuse
 
 Saved voices created through Voice Studio or `/v1/voices` can be reused without
@@ -194,6 +219,7 @@ Izwi saves the streamed audio, then plays it.
 | `VibeVoice-1.5B` | Long-form/reference voice | Reference-voice TTS with long-form positioning |
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
+| `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 
 ---
