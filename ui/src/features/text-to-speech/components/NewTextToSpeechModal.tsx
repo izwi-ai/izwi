@@ -5,6 +5,8 @@ import {
   api,
   type ModelInfo,
   type SavedVoiceSummary,
+  type SpeechControlId,
+  type SpeechControlRange,
   type SpeechHistoryRecord,
   type SpeechHistoryRecordCreateRequest,
 } from "@/api";
@@ -51,6 +53,27 @@ type EffectiveVoiceWorkflow =
   | "voice_description"
   | "unsupported";
 
+const SPEECH_CONTROL_LABELS: Record<SpeechControlId, string> = {
+  exaggeration: "Exaggeration",
+  cfg_weight: "Guidance",
+  min_p: "Min-p",
+};
+
+/** The controls a request sets: only values moved off the model's default. */
+function changedSpeechControls(
+  controls: SpeechControlRange[],
+  values: Partial<Record<SpeechControlId, number>>,
+): Partial<Record<SpeechControlId, number>> {
+  const changed: Partial<Record<SpeechControlId, number>> = {};
+  for (const range of controls) {
+    const value = values[range.control];
+    if (value !== undefined && Math.abs(value - range.default) > 0.001) {
+      changed[range.control] = value;
+    }
+  }
+  return changed;
+}
+
 function savedVoiceLabel(voice: SavedVoiceSummary): string {
   const source =
     voice.source_route_kind === "voice_cloning"
@@ -82,6 +105,9 @@ export function NewTextToSpeechModal({
   const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
+  const [controlValues, setControlValues] = useState<
+    Partial<Record<SpeechControlId, number>>
+  >({});
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [modelActionPending, setModelActionPending] = useState<
@@ -101,6 +127,10 @@ export function NewTextToSpeechModal({
   const supportsVoiceDescription =
     capabilities?.supports_voice_description ?? false;
   const supportsStreaming = capabilities?.supports_streaming ?? false;
+  const speechControls = useMemo(
+    () => capabilities?.controls ?? [],
+    [capabilities],
+  );
   const effectiveVoiceWorkflow: EffectiveVoiceWorkflow = supportsReferenceVoices
     ? "saved_voice"
     : supportsBuiltInVoices
@@ -145,6 +175,7 @@ export function NewTextToSpeechModal({
     setSpeaker(initialSpeaker || "Vivian");
     setSavedVoiceId(initialSavedVoiceId || "");
     setVoiceDescription("");
+    setControlValues({});
     setStreamingEnabled(true);
     setIsSubmitting(false);
     setModelActionPending(null);
@@ -312,6 +343,7 @@ export function NewTextToSpeechModal({
           : undefined,
       // Only a model with speed control gets one (Kokoro); 1× sends none.
       speed: supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
+      ...changedSpeechControls(speechControls, controlValues),
     };
 
     setIsSubmitting(true);
@@ -342,6 +374,8 @@ export function NewTextToSpeechModal({
     savedVoiceId,
     selectedModel,
     selectedModelReady,
+    speechControls,
+    controlValues,
     speed,
     streamAvailable,
     streamingEnabled,
@@ -426,6 +460,33 @@ export function NewTextToSpeechModal({
                   />
                 </CreationField>
               ) : null}
+
+              {speechControls.map((range) => {
+                const value = controlValues[range.control] ?? range.default;
+                const label = SPEECH_CONTROL_LABELS[range.control];
+                return (
+                  <CreationField
+                    key={range.control}
+                    label={label}
+                    hint={value.toFixed(2)}
+                  >
+                    <Slider
+                      aria-label={label}
+                      min={range.min}
+                      max={range.max}
+                      step={0.05}
+                      value={[value]}
+                      onValueChange={([next]) =>
+                        setControlValues((current) => ({
+                          ...current,
+                          [range.control]: next ?? range.default,
+                        }))
+                      }
+                      disabled={isSubmitting}
+                    />
+                  </CreationField>
+                );
+              })}
 
               {usesBuiltInVoiceSelection ? (
                 <CreationField label="Built-in voice">
@@ -563,7 +624,8 @@ export function NewTextToSpeechModal({
               <CreationOption
                 title="Stream results"
                 description="Start listening before the full take is ready."
-                checked={streamingEnabled}
+                // A final-only model shows streaming off, not a disabled "on".
+                checked={streamingEnabled && streamAvailable}
                 onCheckedChange={setStreamingEnabled}
                 disabled={isSubmitting || !streamAvailable}
               />

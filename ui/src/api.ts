@@ -15,6 +15,8 @@ export type {
   ModelStorage,
   ModelsResponse,
   RemovedModelInfo,
+  SpeechControlId,
+  SpeechControlRange,
   SpeechModelCapabilities,
 } from "@/shared/api/models";
 

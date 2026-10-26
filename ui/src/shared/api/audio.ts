@@ -168,6 +168,9 @@ export interface SpeechHistoryRecordCreateRequest {
   max_tokens?: number;
   max_output_tokens?: number;
   top_k?: number;
+  exaggeration?: number;
+  cfg_weight?: number;
+  min_p?: number;
 }
 
 type SpeechHistoryRecordStreamEvent =
@@ -1639,6 +1642,9 @@ export class AudioApiClient {
       max_tokens: request.max_tokens,
       max_output_tokens: request.max_output_tokens,
       top_k: request.top_k,
+      exaggeration: request.exaggeration,
+      cfg_weight: request.cfg_weight,
+      min_p: request.min_p,
       stream,
     };
   }

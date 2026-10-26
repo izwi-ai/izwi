@@ -59,6 +59,15 @@ export function isFishS2TtsVariant(variant: string): boolean {
   );
 }
 
+export function isChatterboxVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "chatterbox-500m" ||
+    normalized === "resembleai/chatterbox" ||
+    normalized === "chatterbox"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -132,6 +141,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isFishS2TtsVariant(variant)) {
     return [];
   }
+  if (isChatterboxVariant(variant)) {
+    return CHATTERBOX_SPEAKERS;
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -143,15 +155,16 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "custom-voice",
     label: "Text to Speech",
     description:
-      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral)",
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") ||
       isKokoroVariant(variant) ||
-      isVoxtralTtsVariant(variant),
+      isVoxtralTtsVariant(variant) ||
+      isChatterboxVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, or Voxtral TTS model to generate speech",
+      "Load a CustomVoice, Kokoro, Voxtral, or Chatterbox TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -305,6 +318,15 @@ const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
     name: "UK Male",
     language: "English",
     description: "UK male preset voice",
+  },
+];
+
+const CHATTERBOX_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "default",
+    name: "Default",
+    language: "English",
+    description: "Chatterbox's bundled voice",
   },
 ];
 

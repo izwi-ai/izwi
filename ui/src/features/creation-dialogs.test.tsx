@@ -49,6 +49,53 @@ describe("viewport-safe creation dialogs", () => {
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
   });
 
+  it("offers a final-only model's speech controls with streaming off", () => {
+    const chatterbox = {
+      variant: "Chatterbox-500M",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        supports_reference_voice: false,
+        supports_voice_description: false,
+        supports_streaming: false,
+        supports_speed_control: false,
+        supports_auto_long_form: false,
+        controls: [
+          { control: "exaggeration", min: 0, max: 2, default: 0.5 },
+          { control: "cfg_weight", min: 0, max: 1, default: 0.5 },
+          { control: "min_p", min: 0, max: 1, default: 0.05 },
+        ],
+      },
+    } as ModelInfo;
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={chatterbox.variant}
+        selectedModelInfo={chatterbox}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={vi.fn()}
+      />,
+    );
+
+    for (const [name, value] of [
+      ["Exaggeration", "0.5"],
+      ["Guidance", "0.5"],
+      ["Min-p", "0.05"],
+    ]) {
+      expect(screen.getByRole("slider", { name })).toHaveAttribute(
+        "aria-valuenow",
+        value,
+      );
+    }
+    const stream = screen.getByRole("switch", { name: /Stream results/i });
+    expect(stream).not.toBeChecked();
+    expect(stream).toBeDisabled();
+  });
+
   it("keeps the transcription title, upload action, and final setting reachable", () => {
     render(
       <NewTranscriptionModal

@@ -8,6 +8,18 @@ export interface SpeechModelCapabilities {
   supports_streaming: boolean;
   supports_speed_control: boolean;
   supports_auto_long_form: boolean;
+  /** Model-specific controls a request may set (Chatterbox). */
+  controls?: SpeechControlRange[];
+}
+
+export type SpeechControlId = "exaggeration" | "cfg_weight" | "min_p";
+
+export interface SpeechControlRange {
+  control: SpeechControlId;
+  min: number;
+  max: number;
+  /** The model's own value when the request leaves the control unset. */
+  default: number;
 }
 
 export type ChatReasoningEffort = "xhigh" | "medium" | "low";

@@ -12,6 +12,7 @@ export const PROVIDER_ORDER = [
   "Mistral AI",
   "hexgrad",
   "Fish Audio",
+  "Resemble AI",
   "Other",
 ] as const;
 
@@ -70,6 +71,12 @@ export function getModelProviderLabel(variant: string): string {
   if (variant.startsWith("Kokoro-")) return "hexgrad";
   if (variant.startsWith("FishAudio-") || variant.startsWith("fishaudio/")) {
     return "Fish Audio";
+  }
+  if (
+    variant.startsWith("Chatterbox-") ||
+    variant.startsWith("ResembleAI/chatterbox")
+  ) {
+    return "Resemble AI";
   }
   return "Other";
 }
@@ -206,6 +213,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "tts",
     capabilities: ["Text to Speech", "Voice Cloning", "Reference Voice"],
     size: "10.7 GB",
+  },
+  "Chatterbox-500M": {
+    shortName: "Chatterbox",
+    fullName: "Chatterbox by Resemble AI",
+    description:
+      "Expressive English text-to-speech model with a bundled voice and an emotion-exaggeration control",
+    category: "tts",
+    capabilities: ["Text to Speech", "Exaggeration", "24 kHz"],
+    size: "3.23 GB",
   },
   // Text Chat
   "Qwen3.5-0.8B": {

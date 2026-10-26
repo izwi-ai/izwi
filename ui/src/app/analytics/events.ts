@@ -57,6 +57,7 @@ export function modelCategoryFromVariant(
   if (
     normalized.includes("tts") ||
     normalized.includes("kokoro") ||
+    normalized.includes("chatterbox") ||
     normalized.includes("voicedesign") ||
     normalized.includes("customvoice") ||
     normalized.includes("base")
