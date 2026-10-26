@@ -53,6 +53,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
 | `-t, --temperature <TEMP>` | Sampling temperature | model default |
+| `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`) | model default |
 | `--exaggeration <F>` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight <F>` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
 | `--min-p <F>` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
@@ -160,6 +161,18 @@ izwi tts "This sentence will use the reference voice." \
 
 For expressive or fast-talking reference voices, Resemble AI suggests a lower
 `--cfg-weight` (about 0.3) with `--exaggeration` around 0.7 or higher.
+
+`Chatterbox-Multilingual-500M` speaks the language `--language` names (English
+without one), with the same voices and controls:
+
+```bash
+izwi tts "Habari za asubuhi, karibu sana." \
+  --model Chatterbox-Multilingual-500M \
+  --language sw \
+  --output swahili.wav
+```
+
+`Chatterbox-500M` returns `400` for any language but English.
 Chatterbox returns the whole utterance when it is ready, so it refuses
 `--stream`; it also refuses `--speed` and `--instructions`.
 
@@ -220,6 +233,7 @@ Izwi saves the streamed audio, then plays it.
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
+| `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 21 languages chosen with `--language`; watermarked, 24 kHz output, MIT |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 
 ---

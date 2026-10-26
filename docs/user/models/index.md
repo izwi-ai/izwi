@@ -21,6 +21,7 @@ Those endpoints only show variants that are enabled for download/use.
 | VibeVoice TTS | `VibeVoice-1.5B` |
 | Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
 | Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
+| Chatterbox Multilingual (21 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
@@ -43,6 +44,14 @@ Those endpoints only show variants that are enabled for download/use.
 > utterance carries Resemble AI's imperceptible PerTh watermark (the catalog
 > labels it **Watermarked**), whose checkpoint is downloaded from GitHub rather
 > than Hugging Face (see [Manual Downloads](/models/manual-download#chatterbox)).
+
+> `Chatterbox-Multilingual-500M` is the same design trained on 23 languages,
+> with its own speech-token model (`t3_mtl23ls_v2`) and grapheme tokenizer and
+> the English model's S3Gen, voice encoder, default voice and watermark. Izwi
+> speaks 21 of its languages: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish. Chinese and Japanese need text
+> processing Izwi has not ported yet and return `400`. A request names its
+> language in `language` (a code such as `fr` or a name such as `French`);
+> without one it speaks English.
 
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
@@ -148,8 +157,9 @@ izwi pull Granite-Speech-5.0-2B-GGUF
 izwi pull VibeVoice-1.5B
 izwi pull VibeVoice-ASR
 
-# Download Resemble AI Chatterbox (about 3.2 GB)
+# Download Resemble AI Chatterbox (about 3.2 GB each)
 izwi pull Chatterbox-500M
+izwi pull Chatterbox-Multilingual-500M
 ```
 
 ### Via Web UI

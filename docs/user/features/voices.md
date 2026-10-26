@@ -52,7 +52,7 @@ surface is `/v1/voices`, and `izwi tts` can reuse a saved voice with
 `--saved-voice-id`.
 
 A cloned voice can be saved without its transcript. Such an audio-only voice
-works with `Chatterbox-500M`, which clones from audio alone; models that need a
+works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone; models that need a
 transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) refuse it with a
 `400` asking for one.
 

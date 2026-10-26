@@ -22,7 +22,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | LFM2.5 Audio | Four English regional presets |
 | VibeVoice-1.5B | Reference voice or saved voice only; no built-in presets |
 | FishAudio-S2-Pro | Reference voice or saved voice only |
-| Chatterbox-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
+| Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
 | Qwen3 Base | Reference voice or saved voice only |
 | Qwen3 VoiceDesign | Prompt instructions, then optional saved voice reuse |
 
@@ -125,7 +125,7 @@ izwi tts "Hello from Bella." \
 
 | ID | Voice |
 |----|-------|
-| `default` | The English voice bundled with the model (`conds.pt`) |
+| `default` | The English voice bundled with the model (`conds.pt`); Chatterbox Multilingual speaks other languages with it too |
 
 ---
 

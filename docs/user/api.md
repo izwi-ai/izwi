@@ -357,7 +357,7 @@ Request fields:
 | `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
 | `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
 | `speed` | Optional model-dependent speed control. |
-| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. |
+| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `GET /v1/admin/models` lists a Chatterbox model's languages in `speech_capabilities.languages`. |
 | `temperature`, `top_k` | Optional sampling controls. |
 | `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
@@ -388,6 +388,12 @@ out of range returns `400`.
   spoken in full. An explicit `max_tokens` is used as given, without splitting.
 - Every utterance carries Resemble AI's imperceptible PerTh watermark. Set
   `IZWI_CHATTERBOX_WATERMARK=false` before the model loads to turn it off.
+
+`Chatterbox-Multilingual-500M` takes the same fields and speaks the `language`
+the request names: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish (codes `ar`, `da`, `nl`, `en`, `fi`, `fr`,
+`de`, `el`, `he`, `hi`, `it`, `ko`, `ms`, `no`, `pl`, `pt`, `ru`, `es`, `sw`,
+`sv`, `tr`). Without `language`, or with `Auto`, it speaks English. Chinese and
+Japanese return `400` until Izwi has their text processing.
 
 Non-stream response:
 
@@ -804,7 +810,7 @@ Reusable voice clone references:
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
 
-A voice saved without a transcript works with `Chatterbox-500M`, which clones from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) return `400` for it, asking for a voice saved with one.
+A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) return `400` for it, asking for a voice saved with one.
 
 Saved voice records include a local permission baseline:
 `permission_scope`, `consent_status`, `allowed_uses`,

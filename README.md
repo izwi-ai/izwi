@@ -101,7 +101,7 @@ at `http://localhost:8080/docs`, and the raw OpenAPI document is available at
 Run `izwi list` to see the enabled catalog. Current families include:
 
 - **TTS:** Qwen3-TTS, Kokoro-82M, Voxtral TTS, VibeVoice, Fish Audio S2 Pro,
-  Chatterbox, and LFM2.5 Audio.
+  Chatterbox (English and multilingual), and LFM2.5 Audio.
 - **ASR:** Parakeet, Whisper, Qwen3-ASR, Nemotron 3.5 ASR, VibeVoice ASR,
   Granite Speech 4.1, LFM2.5 Audio, and Voxtral Mini.
 - **Diarization and alignment:** Sortformer and Nemotron 3 diarization, and

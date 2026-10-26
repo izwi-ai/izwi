@@ -86,8 +86,11 @@ izwi tts "This sentence uses a transcript file." \
   --output cloned-from-file.wav
 ```
 
-`Chatterbox-500M` clones from the reference audio alone. It does not condition
-on the reference's words, so a transcript is optional and ignored:
+`Chatterbox-500M` and `Chatterbox-Multilingual-500M` clone from the reference
+audio alone. They do not condition on the reference's words, so a transcript is
+optional and ignored. With the multilingual model, a reference in a language
+other than the request's tends to lend the output its accent; Resemble AI
+suggests a matching reference, or `cfg_weight` 0 to soften the accent:
 
 ```bash
 izwi tts "This sentence will use the cloned voice." \
@@ -126,7 +129,7 @@ POST /v1/audio/speech
 | `model` | String | Base model ID (for example `Qwen3-TTS-12Hz-0.6B-Base`) |
 | `input` | String | Text to synthesize |
 | `reference_audio` | String | Base64-encoded reference audio |
-| `reference_text` | String | Transcript of reference audio (optional and ignored for `Chatterbox-500M`) |
+| `reference_text` | String | Transcript of reference audio (optional and ignored for Chatterbox) |
 | `saved_voice_id` | String | Optional saved voice reference to reuse instead of resending audio |
 
 ### Example (curl)
@@ -197,6 +200,7 @@ saved voice routes and exact fields.
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
+| `Chatterbox-Multilingual-500M` | ~3.2 GB | 21 languages (set `language`); clones from audio alone |
 
 Larger models produce more accurate voice clones.
 
@@ -211,7 +215,7 @@ Voice cloning is a powerful technology. Please use it responsibly:
 - **Respect privacy** — Don't clone voices without authorization
 - **Legal compliance** — Follow applicable laws and regulations
 
-`Chatterbox-500M` marks every utterance with Resemble AI's imperceptible PerTh
+Both Chatterbox models mark every utterance with Resemble AI's imperceptible PerTh
 watermark, which Resemble AI's open-source `perth` package can detect.
 
 ---

@@ -144,6 +144,23 @@ copy you place yourself with `shasum -a 256` (macOS) or `sha256sum` (Linux).
 If the server runs with `IZWI_CHATTERBOX_WATERMARK=false`, the model loads
 without the watermarker and the checkpoint is not needed.
 
+`Chatterbox-Multilingual-500M` (about 3.2 GB) takes its own speech-token model
+and tokenizer from the same repository and revision, with the English S3Gen,
+voice encoder, default voice and the same PerTh checkpoint:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Chatterbox-Multilingual-500M"
+
+huggingface-cli download ResembleAI/chatterbox \
+  t3_mtl23ls_v2.safetensors grapheme_mtl_merged_expanded_v1.json \
+  s3gen.safetensors ve.safetensors conds.pt \
+  --revision 5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/perth_net_250000.pth.tar" \
+  https://raw.githubusercontent.com/resemble-ai/Perth/ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar
+```
+
 ---
 
 ## Resuming Interrupted Downloads

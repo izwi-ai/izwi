@@ -78,6 +78,7 @@ izwi tts "Your text here" --output output.wav
 | `--reference-text-file` | File containing the reference transcript | — |
 | `--instructions` | Voice-design direction prompt | — |
 | `--temperature`, `-t` | Sampling temperature | Model default |
+| `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; a hint for Qwen3-TTS) | Model default |
 | `--exaggeration` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
 | `--min-p` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
@@ -168,7 +169,8 @@ izwi tts "This line uses a designed voice." \
 5. Play or download the audio
 
 With Chatterbox selected, the dialog shows sliders for exaggeration, CFG weight
-and min-p, and streaming is unavailable.
+and min-p, and streaming is unavailable. With Chatterbox Multilingual it also
+asks which language the text is in.
 
 ### Features
 
@@ -230,8 +232,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice | Medium |
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
+| `Chatterbox-Multilingual-500M` | ~3.2 GB | 21 languages, reference voice, emotion control | Slow |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro` or `Chatterbox-500M`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` or `Chatterbox-Multilingual-500M`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603` or `LFM2.5-Audio-1.5B-GGUF`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
@@ -245,6 +248,9 @@ with Metal, where its T3 model runs in F16 and the model takes about 2.6 GB;
 set `IZWI_METAL_DTYPE=f32` to keep it in F32). Long text is split between
 sentences and spoken in full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
 operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
+`Chatterbox-Multilingual-500M` does the same in Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish, named per
+request with `language` (English when unset). Chinese and Japanese are not
+supported yet.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---
