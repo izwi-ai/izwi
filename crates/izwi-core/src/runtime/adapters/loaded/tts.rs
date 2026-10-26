@@ -535,9 +535,10 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
             .saturating_mul(self.max_batch_size as u64);
+        // Hands over the rendered waveform.
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
-            "tts.acoustic.chatterbox.scalar",
+            "tts.finalize.chatterbox.scalar",
             &profile,
             NativeBatchMode::None,
         );
@@ -547,10 +548,31 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         finalize.max_batch_size = 1;
         finalize.concurrency = ConcurrencyClass::Exclusive;
         finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        // One acoustic unit per quantum: the S3Gen encoder, an Euler step,
+        // or HiFT, so other requests' quanta run between them.
+        let mut acoustic = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            "tts.acoustic.chatterbox.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        acoustic.selector = StageWorkSelector::SequenceAudioDecode;
+        acoustic.progress = StageProgressKind::Iterative;
+        acoustic.shape_policy = StageShapePolicy::Exact;
+        acoustic.max_batch_size = 1;
+        acoustic.concurrency = ConcurrencyClass::Exclusive;
+        acoustic.max_work_units = 1;
         // S3Gen's flow attention over up to 2 × 1,250 tokens of frames, both
         // CFG rows, plus the vocoder's upsampled activations.
-        finalize.max_workspace_bytes = 1024 * 1024 * 1024;
-        for stage in [&mut preparation, &mut prefill, &mut decode, &mut finalize] {
+        acoustic.max_workspace_bytes = 1024 * 1024 * 1024;
+        for stage in [
+            &mut preparation,
+            &mut prefill,
+            &mut decode,
+            &mut finalize,
+            &mut acoustic,
+        ] {
             stage.output_visibility = OutputVisibility::AfterQuantumCommit;
             stage.validate()?;
         }
@@ -561,7 +583,7 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata: self.metadata,
             execution_profile: profile,
-            stages: Arc::from([preparation, prefill, decode, finalize]),
+            stages: Arc::from([preparation, prefill, decode, finalize, acoustic]),
         })
     }
 }

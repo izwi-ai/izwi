@@ -173,6 +173,7 @@ impl NativeExecutor {
                 && matches!(
                     scheduled_req.work,
                     crate::engine::WorkUnit::SequenceFinalize { .. }
+                        | crate::engine::WorkUnit::SequenceAudioDecode { .. }
                 )
             {
                 if managed_cache.is_some() {
@@ -180,7 +181,14 @@ impl NativeExecutor {
                         "Chatterbox acoustic stage unexpectedly received managed KV state".into(),
                     ));
                 }
-                return self.chatterbox_tts_finalize_request(request, scheduled_req);
+                return if matches!(
+                    scheduled_req.work,
+                    crate::engine::WorkUnit::SequenceAudioDecode { .. }
+                ) {
+                    self.chatterbox_tts_acoustic_request(request, scheduled_req)
+                } else {
+                    self.chatterbox_tts_finalize_request(request, scheduled_req)
+                };
             }
             if request.task_type == TaskType::TTS
                 && request.model_variant.is_some_and(|variant| {

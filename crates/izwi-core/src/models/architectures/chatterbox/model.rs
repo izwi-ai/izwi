@@ -16,8 +16,8 @@ use super::retained::{
     ChatterboxPrefillStep, ChatterboxPreparedArtifact, ChatterboxRetainedState, ChatterboxStepRow,
 };
 use super::{
-    config, ChatterboxGenerationParams, ChatterboxPreparedVoice, ChatterboxRuntime,
-    S3GEN_SAMPLE_RATE,
+    config, ChatterboxAcoustic, ChatterboxGenerationParams, ChatterboxPreparedVoice,
+    ChatterboxRuntime, S3GEN_SAMPLE_RATE,
 };
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelVariant;
@@ -171,21 +171,44 @@ impl ChatterboxTtsModel {
         chatterbox_decode_batch(self.runtime.t3(), rows)
     }
 
-    /// S3Gen and HiFT for a request whose T3 has stopped; marks it
-    /// finished. Returns the samples at 24 kHz.
-    pub(crate) fn retained_acoustic_finalize(
+    /// One acoustic unit (S3Gen encoder, an Euler step, or HiFT) for a
+    /// request whose T3 has stopped. Returns true once its waveform is
+    /// rendered.
+    pub(crate) fn retained_acoustic_step(
         &self,
         state: &mut ChatterboxRetainedState,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<bool> {
         if state.phase() != ChatterboxPhase::Acoustic {
             return Err(Error::InvalidInput(
                 "Chatterbox acoustic stage is not ready".into(),
             ));
         }
         let tokens = state.renderable_tokens(self.runtime.t3())?;
-        let (samples, _) =
-            self.runtime
-                .render(&state.artifact.voice, &tokens, state.params.seed)?;
+        self.runtime.acoustic_step(
+            &state.artifact.voice,
+            &tokens,
+            state.params.seed,
+            &mut state.acoustic,
+        )
+    }
+
+    /// Hand over a rendered waveform (24 kHz) and mark the request finished.
+    pub(crate) fn retained_acoustic_finalize(
+        &self,
+        state: &mut ChatterboxRetainedState,
+    ) -> Result<Vec<f32>> {
+        if state.phase() != ChatterboxPhase::Acoustic
+            || !matches!(state.acoustic, ChatterboxAcoustic::Rendered(_))
+        {
+            return Err(Error::InvalidInput(
+                "Chatterbox finalized before its waveform was rendered".into(),
+            ));
+        }
+        let ChatterboxAcoustic::Rendered(samples) =
+            std::mem::replace(&mut state.acoustic, ChatterboxAcoustic::Pending)
+        else {
+            unreachable!("checked above");
+        };
         state.mark_finished()?;
         Ok(samples)
     }

@@ -44,9 +44,22 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use hift::HiftVocoder;
 use noise::{NoiseStream, SplitMix64};
-use s3gen::{S3GenFlow, S3GenPreparedVoice};
+use s3gen::{S3GenFlow, S3GenFlowState, S3GenPreparedVoice};
 use t3::{T3ForwardRow, T3Model, T3PreparedVoice};
 use text::ChatterboxTextTokenizer;
+
+/// Where one utterance's acoustic stage stands. Each
+/// [`ChatterboxRuntime::acoustic_step`] runs one unit (the S3Gen encoder,
+/// one Euler step, or the vocoder), so a scheduler can interleave other
+/// work between them.
+pub enum ChatterboxAcoustic {
+    /// T3 has stopped; S3Gen has not started.
+    Pending,
+    /// The flow ODE, some of its Euler steps taken.
+    Flow(S3GenFlowState),
+    /// The finished 24 kHz waveform, trim fade applied.
+    Rendered(Vec<f32>),
+}
 
 /// The loaded networks of one Chatterbox model.
 pub struct ChatterboxRuntime {
@@ -320,27 +333,80 @@ impl ChatterboxRuntime {
         speech_tokens: &[u32],
         seed: u64,
     ) -> Result<(Vec<f32>, f32)> {
-        if speech_tokens.is_empty() {
-            return Err(Error::InferenceError(
-                "Chatterbox generated no renderable speech tokens".into(),
-            ));
-        }
         let started = Instant::now();
-        let frames = S3GenFlow::total_frames(voice.s3gen.prompt_tokens(), speech_tokens.len());
-        let noise = SplitMix64::for_stream(seed, NoiseStream::FlowNoise)
-            .standard_normals(self.flow.config().mel_bins * frames);
-        let mel = self
-            .flow
-            .generate_mel(&voice.s3gen, speech_tokens, &noise)?;
-        let flow_ms = started.elapsed().as_secs_f32() * 1000.0;
-        let mut samples = self.vocoder.vocode(&mel, seed)?;
-        hift::apply_trim_fade(&mut samples);
-        if samples.iter().any(|sample| !sample.is_finite()) {
-            return Err(Error::InferenceError(
-                "Chatterbox vocoder produced non-finite samples".into(),
-            ));
+        let mut flow_ms = 0.0;
+        let mut progress = ChatterboxAcoustic::Pending;
+        while !self.acoustic_step(voice, speech_tokens, seed, &mut progress)? {
+            if matches!(&progress, ChatterboxAcoustic::Flow(state)
+                if state.steps_done() == self.flow.config().cfm_steps)
+            {
+                flow_ms = started.elapsed().as_secs_f32() * 1000.0;
+            }
         }
+        let ChatterboxAcoustic::Rendered(samples) = progress else {
+            unreachable!("acoustic_step reports done only once rendered");
+        };
         Ok((samples, flow_ms))
+    }
+
+    /// Acoustic units one utterance takes: the encoder, each Euler step and
+    /// the vocoder.
+    pub fn acoustic_units(&self) -> usize {
+        self.flow.config().cfm_steps + 2
+    }
+
+    /// Run the next acoustic unit of `speech_tokens`, waiting for the device
+    /// so the unit's cost lands in its own quantum. Returns true once the
+    /// waveform is rendered.
+    pub fn acoustic_step(
+        &self,
+        voice: &ChatterboxPreparedVoice,
+        speech_tokens: &[u32],
+        seed: u64,
+        progress: &mut ChatterboxAcoustic,
+    ) -> Result<bool> {
+        let next = match progress {
+            ChatterboxAcoustic::Pending => {
+                if speech_tokens.is_empty() {
+                    return Err(Error::InferenceError(
+                        "Chatterbox generated no renderable speech tokens".into(),
+                    ));
+                }
+                let frames =
+                    S3GenFlow::total_frames(voice.s3gen.prompt_tokens(), speech_tokens.len());
+                let noise = SplitMix64::for_stream(seed, NoiseStream::FlowNoise)
+                    .standard_normals(self.flow.config().mel_bins * frames);
+                Some(ChatterboxAcoustic::Flow(self.flow.begin(
+                    &voice.s3gen,
+                    speech_tokens,
+                    &noise,
+                    true,
+                )?))
+            }
+            ChatterboxAcoustic::Flow(state)
+                if state.steps_done() < self.flow.config().cfm_steps =>
+            {
+                self.flow.step(state, 1)?;
+                None
+            }
+            ChatterboxAcoustic::Flow(state) => {
+                let mel = self.flow.finish(state)?;
+                let mut samples = self.vocoder.vocode(&mel, seed)?;
+                hift::apply_trim_fade(&mut samples);
+                if samples.iter().any(|sample| !sample.is_finite()) {
+                    return Err(Error::InferenceError(
+                        "Chatterbox vocoder produced non-finite samples".into(),
+                    ));
+                }
+                Some(ChatterboxAcoustic::Rendered(samples))
+            }
+            ChatterboxAcoustic::Rendered(_) => None,
+        };
+        if let Some(next) = next {
+            *progress = next;
+        }
+        self.device.synchronize()?;
+        Ok(matches!(progress, ChatterboxAcoustic::Rendered(_)))
     }
 }
 

@@ -1,6 +1,8 @@
 //! Chatterbox TTS execution: batched T3 prefill and decode over each
-//! request's two retained paged caches, and the acoustic stage (S3Gen flow,
-//! HiFT, trim fade) as a scheduler-visible `SequenceFinalize` quantum.
+//! request's two retained paged caches, then the acoustic stage (S3Gen
+//! encoder, each Euler step, HiFT) one `SequenceAudioDecode` quantum per
+//! unit, so other requests' work runs between them, and a `SequenceFinalize`
+//! quantum that hands over the waveform.
 
 use std::sync::Arc;
 
@@ -329,7 +331,7 @@ impl NativeExecutor {
                 let result = if done {
                     ModelSessionResult::yielded(
                         output,
-                        crate::engine::YieldReason::AwaitingFinalization,
+                        crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 },
                     )
                     .with_managed_cache_append(0)
                 } else {
@@ -342,8 +344,68 @@ impl NativeExecutor {
         collect_outputs(outputs)
     }
 
-    /// The acoustic stage: S3Gen and HiFT for a request whose T3 stopped.
-    /// Final-only: the whole utterance in one output.
+    /// One acoustic unit for a request whose T3 stopped: the S3Gen encoder,
+    /// an Euler step, or HiFT. Yields for the next unit until the waveform is
+    /// rendered, then for finalization.
+    pub(super) fn chatterbox_tts_acoustic_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        if !matches!(
+            scheduled.work,
+            crate::engine::WorkUnit::SequenceAudioDecode { max_frames: 1 }
+        ) || scheduled.is_prefill
+        {
+            return Err(Error::InvalidInput(
+                "Chatterbox acoustic stage requires one audio-decode unit".into(),
+            ));
+        }
+        let (model, mut lease) = self.checkout_chatterbox_acoustic(request, scheduled)?;
+        lease.mark_dirty();
+        let started = std::time::Instant::now();
+        let rendered = Self::run_blocking(|| {
+            model.retained_acoustic_step(&mut lease.require_state_mut()?.state)
+        });
+        // A failed unit leaves the lease dirty, so its partial state is
+        // discarded with the request.
+        let rendered = rendered?;
+        tracing::debug!(
+            request_id = %request.id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            rendered,
+            "Chatterbox acoustic unit"
+        );
+        lease.mark_clean();
+        lease.restore()?;
+        if request.is_cancelled() {
+            return Err(Error::Cancelled(request.id.clone()));
+        }
+        let reason = if rendered {
+            crate::engine::YieldReason::AwaitingFinalization
+        } else {
+            crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+        };
+        Ok(ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: Some(AudioOutput::empty(S3GEN_SAMPLE_RATE)),
+                text: None,
+                input_transcription: None,
+                tokens_processed: 0,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+                logprobs: Vec::new(),
+            },
+            reason,
+        ))
+    }
+
+    /// Hand over the rendered waveform. Final-only: the whole utterance in
+    /// one output.
     pub(super) fn chatterbox_tts_finalize_request(
         &self,
         request: &EngineCoreRequest,
@@ -357,9 +419,40 @@ impl NativeExecutor {
         ) || scheduled.is_prefill
         {
             return Err(Error::InvalidInput(
-                "Chatterbox acoustic stage requires an exact sequence-finalize quantum".into(),
+                "Chatterbox finalization requires an exact sequence-finalize quantum".into(),
             ));
         }
+        if request.is_cancelled() {
+            return Err(Error::Cancelled(request.id.clone()));
+        }
+        let (model, mut lease) = self.checkout_chatterbox_acoustic(request, scheduled)?;
+        let samples = model.retained_acoustic_finalize(&mut lease.require_state_mut()?.state)?;
+        lease.release()?;
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::new(samples, S3GEN_SAMPLE_RATE)),
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+            logprobs: Vec::new(),
+        }))
+    }
+
+    /// The model and the request's retained state for an acoustic quantum,
+    /// fenced to the model that generated its tokens.
+    fn checkout_chatterbox_acoustic<'a>(
+        &'a self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<(
+        crate::models::registry::ChatterboxTtsModelLease,
+        ExecutorStateLease<'a, ActiveChatterboxTtsDecode>,
+    )> {
         let variant = Self::resolve_variant(request)?;
         if variant.family() != ModelFamily::ChatterboxTts {
             return Err(Error::InvalidInput(
@@ -382,33 +475,7 @@ impl NativeExecutor {
                 "Chatterbox acoustic state crossed its model fence".into(),
             ));
         }
-        lease.mark_dirty();
-        let samples = Self::run_blocking(|| {
-            model.retained_acoustic_finalize(&mut lease.require_state_mut()?.state)
-        });
-        let samples = match samples {
-            Ok(samples) if !request.is_cancelled() => samples,
-            result => {
-                lease.mark_clean();
-                lease.restore()?;
-                return result.and_then(|_| Err(Error::Cancelled(request.id.clone())));
-            }
-        };
-        lease.mark_clean();
-        lease.release()?;
-        Ok(ModelSessionResult::sequence(ExecutorOutput {
-            request_id: request.id.clone(),
-            audio: Some(AudioOutput::new(samples, S3GEN_SAMPLE_RATE)),
-            text: None,
-            input_transcription: None,
-            tokens_processed: 0,
-            tokens_generated: 0,
-            finished: true,
-            phase_timing_override: None,
-            asr_diagnostics: None,
-            error: None,
-            logprobs: Vec::new(),
-        }))
+        Ok((model, lease))
     }
 }
 

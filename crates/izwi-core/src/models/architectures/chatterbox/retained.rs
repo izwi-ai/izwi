@@ -17,8 +17,8 @@ use super::noise::{NoiseStream, SplitMix64};
 use super::sampling;
 use super::t3::{T3ForwardRow, T3Model};
 use super::{
-    renderable_speech_tokens, ChatterboxGenerationParams, ChatterboxPreparedVoice,
-    ChatterboxRuntime, ChatterboxStopReason,
+    renderable_speech_tokens, ChatterboxAcoustic, ChatterboxGenerationParams,
+    ChatterboxPreparedVoice, ChatterboxRuntime, ChatterboxStopReason,
 };
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
@@ -116,6 +116,8 @@ pub(crate) struct ChatterboxRetainedState {
     rng: SplitMix64,
     phase: ChatterboxPhase,
     stop_reason: Option<ChatterboxStopReason>,
+    /// S3Gen and HiFT progress once T3 has stopped, one unit per quantum.
+    pub(crate) acoustic: ChatterboxAcoustic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,7 @@ impl ChatterboxRetainedState {
             history: vec![start_speech_token],
             phase: ChatterboxPhase::Prefill,
             stop_reason: None,
+            acoustic: ChatterboxAcoustic::Pending,
         })
     }
 
