@@ -218,9 +218,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Chatterbox",
     fullName: "Chatterbox by Resemble AI",
     description:
-      "Expressive English text-to-speech model with a bundled voice and an emotion-exaggeration control",
+      "Expressive English text-to-speech with a bundled voice, cloning from a few seconds of audio and an emotion-exaggeration control. Its audio carries Resemble AI's imperceptible PerTh watermark.",
     category: "tts",
-    capabilities: ["Text to Speech", "Exaggeration", "24 kHz"],
+    capabilities: [
+      "Text to Speech",
+      "Voice Cloning",
+      "Exaggeration",
+      "Watermarked",
+      "24 kHz",
+    ],
     size: "3.23 GB",
   },
   // Text Chat
