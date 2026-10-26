@@ -173,8 +173,9 @@ izwi tts "Habari za asubuhi, karibu sana." \
 ```
 
 `Chatterbox-500M` returns `400` for any language but English.
-Chatterbox returns the whole utterance when it is ready, so it refuses
-`--stream`; it also refuses `--speed` and `--instructions`.
+With `--stream`, Chatterbox's first audio arrives after about 2 s on an Apple
+M1 Pro (Metal); the rest follows in windows. It refuses `--speed` and
+`--instructions`.
 
 ### Saved voice reuse
 

@@ -367,7 +367,7 @@ Request fields:
 | `reference_audio` | Base64 audio for voice cloning. |
 | `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
-| `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. |
+| `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
 `exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
 history create routes. Any other model returns `400` if one is set, and a value
@@ -379,8 +379,13 @@ out of range returns `400`.
   (or a saved voice) alone.
 - Its other sampling defaults are `temperature` 0.8, repetition penalty 1.2 and
   top-p 1.0.
-- It returns the whole utterance when it is ready. `stream: true`, `speed` and
-  `instructions` (voice descriptions) each return `400`.
+- With `stream: true` it streams audio as T3 samples speech tokens: the first
+  second arrives once 25 tokens are sampled, then windows of 2 and 4 s (about
+  2 s to first audio for one request on an Apple M1 Pro with Metal). It runs
+  slower than real time there, so chunks can arrive seconds apart; buffer
+  before playing. A streamed request's audio matches the final-only response
+  for the same `seed` in length and words, not sample for sample.
+- `speed` and `instructions` (voice descriptions) each return `400`.
 - One request speaks at most 1,000 speech tokens (about 40 s). Without
   `max_tokens`, Izwi sets a budget from the text (50 tokens, plus 2 per
   character, plus 16 per digit) and splits longer text between whole sentences

@@ -169,8 +169,8 @@ izwi tts "This line uses a designed voice." \
 5. Play or download the audio
 
 With Chatterbox selected, the dialog shows sliders for exaggeration, CFG weight
-and min-p, and streaming is unavailable. With Chatterbox Multilingual it also
-asks which language the text is in.
+and min-p. With Chatterbox Multilingual it also asks which language the text is
+in.
 
 ### Features
 
@@ -241,11 +241,12 @@ For prompt-based voice design, use **VoiceDesign** variants.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its
 model and bundled voice assets inherit a CC BY-NC 4.0 license.
 `Chatterbox-500M` (English, 24 kHz, MIT) speaks with its built-in `default`
-voice or clones from reference audio alone. It returns each utterance whole
-(no streaming yet), has no speed control or voice design, and runs slower than
-real time (a real-time factor of about 2.2 for one request on an Apple M1 Pro
-with Metal, where its T3 model runs in F16 and the model takes about 2.6 GB;
-set `IZWI_METAL_DTYPE=f32` to keep it in F32). Long text is split between
+voice or clones from reference audio alone. It streams (first audio in about
+2 s on an Apple M1 Pro with Metal), has no speed control or voice design, and
+runs slower than real time (a real-time factor of about 2.2 for one request on
+that Mac, where its T3 model runs in F16 and the model takes about 2.6 GB;
+set `IZWI_METAL_DTYPE=f32` to keep it in F32), so streamed audio can pause
+between windows. Long text is split between
 sentences and spoken in full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
 operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
 `Chatterbox-Multilingual-500M` does the same in Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish, named per
