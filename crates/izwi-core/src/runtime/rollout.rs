@@ -99,6 +99,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 | ModelFamily::Lfm2Chat,
             CapabilityKind::Chat
         ) | (ModelFamily::Qwen3Asr, CapabilityKind::Asr)
+            | (ModelFamily::VibeVoiceAsr, CapabilityKind::Asr)
             | (
                 ModelFamily::Lfm25Audio,
                 CapabilityKind::Asr | CapabilityKind::Tts
@@ -305,6 +306,15 @@ mod tests {
             validate_managed_state_plan_eligibility(
                 ModelVariant::Voxtral4BTts2603,
                 CapabilityKind::Tts,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::VibeVoiceAsr,
+                CapabilityKind::Asr,
                 &plan,
             )
             .unwrap(),
