@@ -1,0 +1,89 @@
+{
+ "about": "Two everyday sentences per language the multilingual frontend supports; tokenizer coverage and the V2/V3 intelligibility comparison use them.",
+ "sentences": {
+  "ar": [
+   "مرحبا، كيف حالك اليوم؟",
+   "الطقس جميل في المدينة."
+  ],
+  "da": [
+   "Hej, hvordan har du det i dag?",
+   "Vejret er dejligt i byen."
+  ],
+  "de": [
+   "Hallo, wie geht es dir heute?",
+   "Das Wetter in der Stadt ist schön."
+  ],
+  "el": [
+   "Γεια σου, πώς είσαι σήμερα;",
+   "Ο καιρός στην πόλη είναι ωραίος."
+  ],
+  "en": [
+   "Hello, how are you today?",
+   "The weather in the city is lovely."
+  ],
+  "es": [
+   "Hola, ¿cómo estás hoy?",
+   "El tiempo en la ciudad es agradable."
+  ],
+  "fi": [
+   "Hei, mitä kuuluu tänään?",
+   "Sää on kaupungissa kaunis."
+  ],
+  "fr": [
+   "Bonjour, comment allez-vous aujourd'hui ?",
+   "Il fait beau en ville."
+  ],
+  "he": [
+   "שלום, מה שלומך היום?",
+   "מזג האוויר בעיר נעים."
+  ],
+  "hi": [
+   "नमस्ते, आज आप कैसे हैं?",
+   "शहर में मौसम सुहावना है।"
+  ],
+  "it": [
+   "Ciao, come stai oggi?",
+   "Il tempo in città è bello."
+  ],
+  "ko": [
+   "안녕하세요, 오늘 기분이 어떠세요?",
+   "도시의 날씨가 좋습니다."
+  ],
+  "ms": [
+   "Helo, apa khabar hari ini?",
+   "Cuaca di bandar ini sangat baik."
+  ],
+  "nl": [
+   "Hallo, hoe gaat het vandaag met je?",
+   "Het weer in de stad is mooi."
+  ],
+  "no": [
+   "Hei, hvordan har du det i dag?",
+   "Været i byen er fint."
+  ],
+  "pl": [
+   "Cześć, jak się dzisiaj masz?",
+   "Pogoda w mieście jest piękna."
+  ],
+  "pt": [
+   "Olá, como você está hoje?",
+   "O tempo na cidade está agradável."
+  ],
+  "ru": [
+   "Привет, как у тебя дела сегодня?",
+   "Погода в городе прекрасная."
+  ],
+  "sv": [
+   "Hej, hur mår du idag?",
+   "Vädret i staden är fint."
+  ],
+  "sw": [
+   "Habari, hujambo leo?",
+   "Hali ya hewa mjini ni nzuri."
+  ],
+  "tr": [
+   "Merhaba, bugün nasılsın?",
+   "Şehirde hava çok güzel."
+  ]
+ }
+}

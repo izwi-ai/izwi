@@ -11,6 +11,49 @@ pub const VOICE_ENCODER_WEIGHTS_FILE: &str = "ve.safetensors";
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 pub const DEFAULT_VOICE_FILE: &str = "conds.pt";
 
+/// The multilingual checkpoint's own files (`mtl_tts.py`); it shares the
+/// English S3Gen, voice encoder, default voice and watermark.
+pub const MULTILINGUAL_T3_WEIGHTS_FILE: &str = "t3_mtl23ls_v2.safetensors";
+pub const MULTILINGUAL_TOKENIZER_FILE: &str = "grapheme_mtl_merged_expanded_v1.json";
+
+/// Which Chatterbox checkpoint a runtime serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatterboxEdition {
+    English,
+    /// 23 languages (21 with izwi's frontend), tagged per request.
+    Multilingual,
+}
+
+impl ChatterboxEdition {
+    pub fn t3_weights_file(self) -> &'static str {
+        match self {
+            Self::English => T3_WEIGHTS_FILE,
+            Self::Multilingual => MULTILINGUAL_T3_WEIGHTS_FILE,
+        }
+    }
+
+    pub fn tokenizer_file(self) -> &'static str {
+        match self {
+            Self::English => TOKENIZER_FILE,
+            Self::Multilingual => MULTILINGUAL_TOKENIZER_FILE,
+        }
+    }
+
+    pub fn t3_config(self) -> T3Config {
+        match self {
+            Self::English => T3Config::english(),
+            Self::Multilingual => T3Config::multilingual(),
+        }
+    }
+
+    /// Whether the last speech token's audio is dropped: the multilingual
+    /// path cuts it (`mtl_tts.py`: emitted just before EOS with degraded
+    /// attention, it decodes to ~40 ms of noise); the English one keeps it.
+    pub fn drops_final_token_audio(self) -> bool {
+        self == Self::Multilingual
+    }
+}
+
 /// Text tokens one request may carry (framing included); longer text is
 /// split across requests. Well inside the learned 2,050-position table.
 pub const MAX_TEXT_TOKENS: usize = 1024;
@@ -87,6 +130,15 @@ impl T3Config {
             speech_cond_prompt_len: 150,
             perceiver_queries: 32,
             perceiver_heads: 4,
+        }
+    }
+
+    /// The multilingual checkpoints: the same Llama-520M with a 2,454-token
+    /// grapheme vocabulary (`T3Config.multilingual`).
+    pub fn multilingual() -> Self {
+        Self {
+            text_vocab_size: 2454,
+            ..Self::english()
         }
     }
 
