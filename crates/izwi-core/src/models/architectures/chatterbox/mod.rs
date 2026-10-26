@@ -15,6 +15,8 @@ pub mod hift;
 mod model;
 pub mod noise;
 mod physical;
+pub mod reference;
+pub mod reference_dsp;
 pub(crate) mod retained;
 pub mod s3gen;
 pub mod sampling;
@@ -22,6 +24,8 @@ pub mod t3;
 pub mod text;
 mod weights;
 
+#[cfg(test)]
+mod clone_reference_tests;
 #[cfg(test)]
 mod reference_tests;
 
@@ -36,7 +40,10 @@ pub use config::{
     chatterbox_auto_max_speech_tokens, ChatterboxSamplingDefaults, HiftConfig, S3GenConfig,
     T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
 };
-pub use model::{ChatterboxTtsDiagnostics, ChatterboxTtsModel, CHATTERBOX_DEFAULT_VOICE};
+pub use model::{
+    ChatterboxTtsDiagnostics, ChatterboxTtsModel, CHATTERBOX_DEFAULT_VOICE,
+    CHATTERBOX_REFERENCE_VOICE_CACHE,
+};
 pub(crate) use physical::{CHATTERBOX_COND_DOMAIN, CHATTERBOX_UNCOND_DOMAIN};
 pub use sampling::T3SamplingParams;
 
@@ -44,6 +51,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use hift::HiftVocoder;
 use noise::{NoiseStream, SplitMix64};
+use reference::ChatterboxReferenceEncoders;
 use s3gen::{S3GenFlow, S3GenFlowState, S3GenPreparedVoice};
 use t3::{T3ForwardRow, T3Model, T3PreparedVoice};
 use text::ChatterboxTextTokenizer;
@@ -68,6 +76,8 @@ pub struct ChatterboxRuntime {
     t3: T3Model,
     flow: S3GenFlow,
     vocoder: HiftVocoder,
+    /// Voice encoder, S3 tokenizer and CAMPPlus: a voice from audio alone.
+    reference: ChatterboxReferenceEncoders,
     default_voice: ChatterboxPreparedVoice,
     device: Device,
     dtype: DType,
@@ -170,6 +180,12 @@ impl ChatterboxRuntime {
             weights::mmap_safetensors(&model_dir.join(config::S3GEN_WEIGHTS_FILE), dtype, device)?;
         let flow = S3GenFlow::load(S3GenConfig::current(), s3gen_vb.clone())?;
         let vocoder = HiftVocoder::load(HiftConfig::current(), s3gen_vb.pp("mel2wav"))?;
+        let ve_vb = weights::mmap_safetensors(
+            &model_dir.join(config::VOICE_ENCODER_WEIGHTS_FILE),
+            dtype,
+            device,
+        )?;
+        let reference = ChatterboxReferenceEncoders::load(ve_vb, s3gen_vb)?;
         let default = ChatterboxVoice::load_default(&model_dir.join(config::DEFAULT_VOICE_FILE))?;
         let default_voice = ChatterboxPreparedVoice {
             t3: t3.prepare_voice(&default.t3)?,
@@ -181,6 +197,7 @@ impl ChatterboxRuntime {
             t3,
             flow,
             vocoder,
+            reference,
             default_voice,
             device: device.clone(),
             dtype,
@@ -225,6 +242,16 @@ impl ChatterboxRuntime {
             t3: self.t3.prepare_voice(&voice.t3)?,
             s3gen: self.flow.prepare_voice(&voice.s3gen)?,
         })
+    }
+
+    /// A voice from mono reference `samples` at `sample_rate` alone (no
+    /// transcript): upstream's `prepare_conditionals`.
+    pub fn prepare_voice_from_audio(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<ChatterboxPreparedVoice> {
+        self.prepare_voice(&self.reference.prepare_voice(samples, sample_rate)?)
     }
 
     /// T3 positions one request needs: conditioning, framed text, the two

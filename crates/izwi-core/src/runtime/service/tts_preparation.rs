@@ -1,6 +1,8 @@
 //! TTS request preparation: the per-family synthesis inputs, artifacts and
 //! resources each TTS family binds before admission.
 
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 /// VibeVoice sampling for a request: unset fields keep the reference demo's
@@ -984,8 +986,12 @@ impl RuntimeService {
             .ok_or_else(|| Error::InvalidInput("Chatterbox request is missing text".into()))?
             .trim()
             .to_string();
-        // One built-in voice: any speaker name the route let through (an
-        // OpenAI preset name included) selects it.
+        // A reference wins over a voice name; otherwise any name the route
+        // let through (an OpenAI preset name included) selects the one
+        // built-in voice.
+        let reference_audio = request
+            .tts_reference_audio_for_execution()
+            .map(str::to_string);
         let params = chatterbox_tts_request_params(&request.params, &request.id)?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Chatterbox retained request exceeds u64".into()))?;
@@ -1045,9 +1051,17 @@ impl RuntimeService {
                         "Chatterbox preparation must remain scalar".into(),
                     ));
                 }
+                let voice = reference_audio
+                    .as_deref()
+                    .map(|audio| {
+                        let digest: [u8; 32] = Sha256::digest(audio.as_bytes()).into();
+                        model_for_preparation
+                            .reference_voice(digest, || decode_reference_audio_base64(audio))
+                    })
+                    .transpose()?;
                 let artifact = model_for_preparation.prepare_retained_artifact(
                     &text,
-                    None,
+                    voice,
                     &params_for_preparation,
                 )?;
                 Ok(vec![Ok(PreparationArtifact {

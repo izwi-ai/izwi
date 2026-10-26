@@ -24,7 +24,10 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::chatterbox::config::{S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE};
+use crate::models::architectures::chatterbox::config::{
+    S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE,
+};
+use crate::models::architectures::chatterbox::CHATTERBOX_REFERENCE_VOICE_CACHE;
 use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
     KOKORO_MODEL_MEMO_MAX_BYTES,
@@ -295,44 +298,49 @@ fn price_kokoro(files: &[CensusFile], backend: BackendKind) -> Result<AsrResiden
     AsrResidencyPlan::from_ledger(ledger, KOKORO_MODEL_MEMO_MAX_BYTES)
 }
 
-/// Device bytes of the bundled default voice once prepared (`conds.pt`: a
-/// reference mel, prompt tokens and two speaker vectors), well under this.
-const CHATTERBOX_DEFAULT_VOICE_BYTES: u64 = 1024 * 1024;
+/// Device bytes of one prepared Chatterbox voice (a reference mel of up to
+/// 10 s, prompt tokens and two speaker vectors), well under this; a model
+/// keeps the default voice and a bounded cache of cloned ones.
+const CHATTERBOX_VOICE_BYTES: u64 = 1024 * 1024;
 
 fn chatterbox_tts_plan(
     model_path: &Path,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
-    let paths = [T3_WEIGHTS_FILE, S3GEN_WEIGHTS_FILE].map(|file| model_path.join(file));
+    let paths = [
+        T3_WEIGHTS_FILE,
+        S3GEN_WEIGHTS_FILE,
+        VOICE_ENCODER_WEIGHTS_FILE,
+    ]
+    .map(|file| model_path.join(file));
     let Some(files) = census_of(&paths)? else {
         return Ok(None);
     };
     price_chatterbox_tts(&files, backend).map(Some)
 }
 
-/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, read from
-/// memory-mapped safetensors at their stored F32 and kept F32 on every
-/// backend. Left out, as the loader never reads them: T3's text head and
-/// the Llama trunk's own token table, and S3Gen's reference encoders
-/// (`tokenizer.*`, `speaker_encoder.*`), since the default voice comes
-/// prepared. HiFT's weight-norm halves are priced whole, a slight
-/// overestimate of the kernels they fold into.
+/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, and the
+/// reference encoders a cloned voice needs (voice encoder, S3 tokenizer,
+/// CAMPPlus), read from memory-mapped safetensors at their stored F32 and
+/// kept F32 on every backend. Left out, as the loader never reads them: T3's
+/// text head, the Llama trunk's own token table and CAMPPlus's batch-norm
+/// step counters. HiFT's weight-norm halves and CAMPPlus's batch norms are
+/// priced whole, a slight overestimate of what they fold into.
 fn price_chatterbox_tts(files: &[CensusFile], backend: BackendKind) -> Result<AsrResidencyPlan> {
-    const UNREAD: [&str; 4] = [
-        "text_head.",
-        "tfmr.embed_tokens.",
-        "tokenizer.",
-        "speaker_encoder.",
-    ];
+    const UNREAD: [&str; 2] = ["text_head.", "tfmr.embed_tokens."];
     let mut ledger = Ledger::new(backend);
     for tensor in files
         .iter()
         .flat_map(|file| file.tensors.iter())
-        .filter(|tensor| !UNREAD.iter().any(|prefix| tensor.name.starts_with(prefix)))
+        .filter(|tensor| {
+            !UNREAD.iter().any(|prefix| tensor.name.starts_with(prefix))
+                && !tensor.name.ends_with(".num_batches_tracked")
+        })
     {
         ledger.var(tensor, Source::Mapped, &[DType::F32])?;
     }
-    AsrResidencyPlan::from_ledger(ledger, CHATTERBOX_DEFAULT_VOICE_BYTES)
+    let voices = 1 + CHATTERBOX_REFERENCE_VOICE_CACHE as u64;
+    AsrResidencyPlan::from_ledger(ledger, voices * CHATTERBOX_VOICE_BYTES)
 }
 
 fn vibevoice_tts_plan(
@@ -481,13 +489,18 @@ mod tests {
     }
 
     /// The published Chatterbox headers (`tests/fixtures/chatterbox`), recast
-    /// as a residency fixture of the two files its loader reads.
+    /// as a residency fixture of the three files its loader reads.
     fn chatterbox_census() -> Vec<CensusFile> {
         let doc: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/chatterbox/tensor_census.json"
         ))
         .unwrap();
-        let files = [T3_WEIGHTS_FILE, S3GEN_WEIGHTS_FILE].map(|name| {
+        let files = [
+            T3_WEIGHTS_FILE,
+            S3GEN_WEIGHTS_FILE,
+            VOICE_ENCODER_WEIGHTS_FILE,
+        ]
+        .map(|name| {
             let mut total_bytes = 0u64;
             let tensors = doc["files"][name]["tensors"]
                 .as_object()
@@ -532,8 +545,9 @@ mod tests {
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
     ///   CUDA (5.04 GiB exact); on Metal its fused LM projections are joined
     ///   at their exact size too (5.41 GiB allocated before, from 5.86).
-    /// - Chatterbox is F32 everywhere: T3 and S3Gen's flow and HiFT, 2.48 GiB
-    ///   of its 3.19 GB of files (the reference encoders wait for cloning).
+    /// - Chatterbox is F32 everywhere: T3, S3Gen's flow and HiFT and the
+    ///   reference encoders (all of its files but T3's text head), plus the
+    ///   default voice and 16 cached clones: 2.99 GiB.
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
@@ -567,7 +581,7 @@ mod tests {
             (
                 "Chatterbox-500M",
                 Box::new(|b| price_chatterbox_tts(&chatterbox, b).unwrap()),
-                [2.48, 2.48, 2.48],
+                [2.99, 2.99, 2.99],
             ),
         ];
         for (label, plan, [cpu, metal, cuda]) in rows {

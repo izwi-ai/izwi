@@ -1,9 +1,10 @@
 //! The engine-facing Chatterbox model: load, state contract, and the
 //! retained prefill / decode / acoustic steps the executor drives.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_core::DType;
 use serde::Serialize;
@@ -28,6 +29,10 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 /// The name of the one built-in voice (`conds.pt`).
 pub const CHATTERBOX_DEFAULT_VOICE: &str = "default";
 
+/// Voices prepared from reference audio that a model keeps for reuse, least
+/// recently used first out. Each holds a few hundred KB on the device.
+pub const CHATTERBOX_REFERENCE_VOICE_CACHE: usize = 16;
+
 static NEXT_CHATTERBOX_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 pub struct ChatterboxTtsModel {
@@ -35,6 +40,10 @@ pub struct ChatterboxTtsModel {
     variant: ModelVariant,
     runtime: ChatterboxRuntime,
     default_voice: Arc<ChatterboxPreparedVoice>,
+    /// Voices prepared from reference audio, keyed by a digest of the
+    /// reference payload. The model is one checkpoint on one device at one
+    /// dtype, so unloading it drops every entry.
+    reference_voices: Mutex<VecDeque<([u8; 32], Arc<ChatterboxPreparedVoice>)>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +71,7 @@ impl ChatterboxTtsModel {
             variant,
             runtime,
             default_voice,
+            reference_voices: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -83,6 +93,47 @@ impl ChatterboxTtsModel {
 
     pub fn default_voice(&self) -> Arc<ChatterboxPreparedVoice> {
         self.default_voice.clone()
+    }
+
+    /// The voice of a reference payload with `digest`: cached, or prepared
+    /// from the audio `decode` returns (mono samples and their rate).
+    pub(crate) fn reference_voice(
+        &self,
+        digest: [u8; 32],
+        decode: impl FnOnce() -> Result<(Vec<f32>, u32)>,
+    ) -> Result<Arc<ChatterboxPreparedVoice>> {
+        if let Some(voice) = self.take_cached_voice(&digest) {
+            return Ok(voice);
+        }
+        let (samples, sample_rate) = decode()?;
+        let voice = Arc::new(
+            self.runtime
+                .prepare_voice_from_audio(&samples, sample_rate)?,
+        );
+        let mut voices = self
+            .reference_voices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !voices.iter().any(|(cached, _)| *cached == digest) {
+            if voices.len() == CHATTERBOX_REFERENCE_VOICE_CACHE {
+                voices.pop_front();
+            }
+            voices.push_back((digest, voice.clone()));
+        }
+        Ok(voice)
+    }
+
+    /// A cached voice, moved to the most recently used end.
+    fn take_cached_voice(&self, digest: &[u8; 32]) -> Option<Arc<ChatterboxPreparedVoice>> {
+        let mut voices = self
+            .reference_voices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = voices.iter().position(|(cached, _)| cached == digest)?;
+        let entry = voices.remove(index)?;
+        let voice = entry.1.clone();
+        voices.push_back(entry);
+        Some(voice)
     }
 
     /// Positions one T3 sequence may reach: conditioning, the longest text
