@@ -2,7 +2,8 @@
 //! request's two retained paged caches, then the acoustic stage (S3Gen
 //! encoder, each Euler step, HiFT) one `SequenceAudioDecode` quantum per
 //! unit, so other requests' work runs between them, and a `SequenceFinalize`
-//! quantum that hands over the waveform.
+//! quantum that hands over the waveform. A streamed request renders windows
+//! the same way while T3 runs, each window's samples staged on its stream.
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use crate::models::architectures::chatterbox::retained::{
     ChatterboxQuantumCheckpoint, ChatterboxStepRow,
 };
 use crate::models::architectures::chatterbox::{
-    CHATTERBOX_COND_DOMAIN, CHATTERBOX_UNCOND_DOMAIN, S3GEN_SAMPLE_RATE,
+    ChatterboxAcousticProgress, CHATTERBOX_COND_DOMAIN, CHATTERBOX_UNCOND_DOMAIN, S3GEN_SAMPLE_RATE,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -183,7 +184,9 @@ impl NativeExecutor {
                 lease.install_state(ActiveChatterboxTtsDecode {
                     variant,
                     model: model.clone(),
-                    state: model.new_retained_state(artifact, params)?,
+                    state: model.new_retained_state(artifact, params, request.streaming)?,
+                    stream_sequence: 0,
+                    streamed_samples: 0,
                 })?;
             }
             let active = lease.require_state_mut()?;
@@ -311,6 +314,8 @@ impl NativeExecutor {
                 }
                 row.checkpoint = None;
                 let mut lease = row.lease.take().expect("armed Chatterbox lease");
+                let window_due =
+                    !done && model.retained_window_due(&lease.require_state_mut()?.state);
                 lease.mark_clean();
                 lease.restore()?;
                 // A row that sampled its stop token this step does not run
@@ -334,6 +339,13 @@ impl NativeExecutor {
                         crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 },
                     )
                     .with_managed_cache_append(0)
+                } else if window_due {
+                    // A streamed window's tokens are in: render it before
+                    // the next decode step.
+                    ModelSessionResult::yielded(
+                        output,
+                        crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 },
+                    )
                 } else {
                     ModelSessionResult::sequence(output)
                 };
@@ -344,9 +356,11 @@ impl NativeExecutor {
         collect_outputs(outputs)
     }
 
-    /// One acoustic unit for a request whose T3 stopped: the S3Gen encoder,
-    /// an Euler step, or HiFT. Yields for the next unit until the waveform is
-    /// rendered, then for finalization.
+    /// One acoustic unit: the S3Gen encoder, an Euler step, or HiFT, of a
+    /// final-only request whose T3 stopped or of a streamed request's
+    /// window. Yields for the next unit until the waveform or window is
+    /// done; a finished window's samples go on the stream, then T3 resumes,
+    /// another window runs, or the request finalizes.
     pub(super) fn chatterbox_tts_acoustic_request(
         &self,
         request: &EngineCoreRequest,
@@ -364,28 +378,60 @@ impl NativeExecutor {
         let (model, mut lease) = self.checkout_chatterbox_acoustic(request, scheduled)?;
         lease.mark_dirty();
         let started = std::time::Instant::now();
-        let rendered = Self::run_blocking(|| {
+        let progress = Self::run_blocking(|| {
             model.retained_acoustic_step(&mut lease.require_state_mut()?.state)
         });
         // A failed unit leaves the lease dirty, so its partial state is
         // discarded with the request.
-        let rendered = rendered?;
+        let progress = progress?;
         tracing::debug!(
             request_id = %request.id,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            rendered,
+            window = matches!(progress, ChatterboxAcousticProgress::Window(_)),
+            rendered = matches!(progress, ChatterboxAcousticProgress::Rendered),
             "Chatterbox acoustic unit"
         );
-        lease.mark_clean();
-        lease.restore()?;
         if request.is_cancelled() {
             return Err(Error::Cancelled(request.id.clone()));
         }
-        let reason = if rendered {
-            crate::engine::YieldReason::AwaitingFinalization
-        } else {
-            crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+        let reason = match progress {
+            ChatterboxAcousticProgress::Working => {
+                crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+            }
+            ChatterboxAcousticProgress::Rendered => {
+                crate::engine::YieldReason::AwaitingFinalization
+            }
+            ChatterboxAcousticProgress::Window(samples) => {
+                let active = lease.require_state_mut()?;
+                active.streamed_samples += samples.len();
+                if let Some(tx) = Self::stream_sender(request) {
+                    Self::stream_audio_with_policy(
+                        &tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active.stream_sequence,
+                        samples,
+                        S3GEN_SAMPLE_RATE,
+                        false,
+                    )?;
+                }
+                if active
+                    .state
+                    .stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.done())
+                {
+                    crate::engine::YieldReason::AwaitingFinalization
+                } else if model.retained_window_due(&active.state) {
+                    crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+                } else {
+                    // Back to T3 for the next window's tokens.
+                    crate::engine::YieldReason::QuantumExhausted
+                }
+            }
         };
+        lease.mark_clean();
+        lease.restore()?;
         Ok(ModelSessionResult::yielded(
             ExecutorOutput {
                 request_id: request.id.clone(),
@@ -404,8 +450,8 @@ impl NativeExecutor {
         ))
     }
 
-    /// Hand over the rendered waveform. Final-only: the whole utterance in
-    /// one output.
+    /// Hand over the rendered waveform: the whole utterance in one output,
+    /// or, for a stream whose windows sent it all, the end-of-stream marker.
     pub(super) fn chatterbox_tts_finalize_request(
         &self,
         request: &EngineCoreRequest,
@@ -426,11 +472,28 @@ impl NativeExecutor {
             return Err(Error::Cancelled(request.id.clone()));
         }
         let (model, mut lease) = self.checkout_chatterbox_acoustic(request, scheduled)?;
-        let samples = model.retained_acoustic_finalize(&mut lease.require_state_mut()?.state)?;
+        let active = lease.require_state_mut()?;
+        let samples = model.retained_acoustic_finalize(&mut active.state)?;
+        let audio = if active.state.stream.is_some() {
+            if let Some(tx) = Self::stream_sender(request) {
+                Self::stream_audio_with_policy(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active.stream_sequence,
+                    Vec::new(),
+                    S3GEN_SAMPLE_RATE,
+                    true,
+                )?;
+            }
+            AudioOutput::streamed(active.streamed_samples, S3GEN_SAMPLE_RATE)
+        } else {
+            AudioOutput::new(samples, S3GEN_SAMPLE_RATE)
+        };
         lease.release()?;
         Ok(ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
-            audio: Some(AudioOutput::new(samples, S3GEN_SAMPLE_RATE)),
+            audio: Some(audio),
             text: None,
             input_transcription: None,
             tokens_processed: 0,

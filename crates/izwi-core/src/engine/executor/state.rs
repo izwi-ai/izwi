@@ -175,6 +175,9 @@ pub(super) struct ActiveChatterboxTtsDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: ChatterboxTtsModelLease,
     pub(super) state: ChatterboxRetainedState,
+    /// A streamed request's next chunk sequence and samples sent so far.
+    pub(super) stream_sequence: usize,
+    pub(super) streamed_samples: usize,
 }
 
 pub(super) struct ActiveVoxtralRealtime {

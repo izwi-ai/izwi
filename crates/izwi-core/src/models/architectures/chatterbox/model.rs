@@ -16,6 +16,7 @@ use super::retained::{
     chatterbox_decode_batch, chatterbox_prefill_batch, ChatterboxDecodeStep, ChatterboxPhase,
     ChatterboxPrefillStep, ChatterboxPreparedArtifact, ChatterboxRetainedState, ChatterboxStepRow,
 };
+use super::stream::{ChatterboxStreamUnit, CHATTERBOX_STREAM_PLAN};
 use super::{
     config, ChatterboxAcoustic, ChatterboxGenerationParams, ChatterboxPreparedVoice,
     ChatterboxRuntime, S3GEN_SAMPLE_RATE,
@@ -57,6 +58,16 @@ pub struct ChatterboxTtsDiagnostics {
     pub max_speech_tokens: usize,
     /// Rendered audio carries the PerTh watermark.
     pub watermarked: bool,
+}
+
+/// What one acoustic unit did.
+pub(crate) enum ChatterboxAcousticProgress {
+    /// More units of this window or utterance follow.
+    Working,
+    /// A streamed window finished; these samples are settled.
+    Window(Vec<f32>),
+    /// The final-only waveform is rendered.
+    Rendered,
 }
 
 /// The dtype T3 loads in on `device`, and why: the device's Chatterbox
@@ -228,17 +239,30 @@ impl ChatterboxTtsModel {
         Ok(Arc::new(artifact))
     }
 
+    /// A request's state; a `streaming` one renders windows while T3 runs.
     pub(crate) fn new_retained_state(
         &self,
         artifact: Arc<ChatterboxPreparedArtifact>,
         params: ChatterboxGenerationParams,
+        streaming: bool,
     ) -> Result<ChatterboxRetainedState> {
+        let stream = streaming.then(|| self.runtime.stream(CHATTERBOX_STREAM_PLAN, params.seed));
         ChatterboxRetainedState::new(
             artifact,
             params,
             self.runtime.t3().config().start_speech_token,
             self.context_tokens(),
+            stream,
         )
+    }
+
+    /// Whether a streamed request has a window to render now.
+    pub(crate) fn retained_window_due(&self, state: &ChatterboxRetainedState) -> bool {
+        state.stream.as_ref().is_some_and(|stream| {
+            let available = state.streamable_tokens(self.runtime.t3()).len();
+            self.runtime
+                .stream_window_due(stream, available, state.stopped())
+        })
     }
 
     pub(crate) fn retained_prefill_batch(
@@ -256,32 +280,63 @@ impl ChatterboxTtsModel {
         chatterbox_decode_batch(self.runtime.t3(), rows)
     }
 
-    /// One acoustic unit (S3Gen encoder, an Euler step, or HiFT) for a
-    /// request whose T3 has stopped. Returns true once its waveform is
-    /// rendered.
+    /// One acoustic unit (S3Gen encoder, an Euler step, or HiFT): of a
+    /// streamed request's current window, or of a final-only request's
+    /// whole utterance once T3 has stopped.
     pub(crate) fn retained_acoustic_step(
         &self,
         state: &mut ChatterboxRetainedState,
-    ) -> Result<bool> {
+    ) -> Result<ChatterboxAcousticProgress> {
+        if let Some(mut stream) = state.stream.take() {
+            let tokens = state.streamable_tokens(self.runtime.t3());
+            let unit = self.runtime.stream_step(
+                &state.artifact.voice,
+                &tokens,
+                &mut stream,
+                state.stopped(),
+            );
+            state.stream = Some(stream);
+            return Ok(match unit? {
+                ChatterboxStreamUnit::Rendering => ChatterboxAcousticProgress::Working,
+                ChatterboxStreamUnit::Rendered(samples) => {
+                    ChatterboxAcousticProgress::Window(samples)
+                }
+            });
+        }
         if state.phase() != ChatterboxPhase::Acoustic {
             return Err(Error::InvalidInput(
                 "Chatterbox acoustic stage is not ready".into(),
             ));
         }
         let tokens = state.renderable_tokens(self.runtime.t3())?;
-        self.runtime.acoustic_step(
+        let rendered = self.runtime.acoustic_step(
             &state.artifact.voice,
             &tokens,
             state.params.seed,
             &mut state.acoustic,
-        )
+        )?;
+        Ok(if rendered {
+            ChatterboxAcousticProgress::Rendered
+        } else {
+            ChatterboxAcousticProgress::Working
+        })
     }
 
-    /// Hand over a rendered waveform (24 kHz) and mark the request finished.
+    /// Hand over a rendered waveform (24 kHz) and mark the request finished;
+    /// a stream has handed over everything with its last window.
     pub(crate) fn retained_acoustic_finalize(
         &self,
         state: &mut ChatterboxRetainedState,
     ) -> Result<Vec<f32>> {
+        if let Some(stream) = &state.stream {
+            if state.phase() != ChatterboxPhase::Acoustic || !stream.done() {
+                return Err(Error::InvalidInput(
+                    "Chatterbox stream finalized before its last window".into(),
+                ));
+            }
+            state.mark_finished()?;
+            return Ok(Vec::new());
+        }
         if state.phase() != ChatterboxPhase::Acoustic
             || !matches!(state.acoustic, ChatterboxAcoustic::Rendered(_))
         {

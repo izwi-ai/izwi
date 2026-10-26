@@ -21,6 +21,7 @@ pub mod reference_dsp;
 pub(crate) mod retained;
 pub mod s3gen;
 pub mod sampling;
+pub mod stream;
 pub mod t3;
 pub mod text;
 mod weights;
@@ -33,6 +34,8 @@ mod fixture_support;
 mod perth_reference_tests;
 #[cfg(test)]
 mod reference_tests;
+#[cfg(all(test, feature = "metal"))]
+mod stream_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -45,6 +48,7 @@ pub use config::{
     chatterbox_auto_max_speech_tokens, ChatterboxSamplingDefaults, HiftConfig, S3GenConfig,
     T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
 };
+pub(crate) use model::ChatterboxAcousticProgress;
 pub use model::{
     chatterbox_t3_precision, ChatterboxTtsDiagnostics, ChatterboxTtsModel,
     CHATTERBOX_DEFAULT_VOICE, CHATTERBOX_REFERENCE_VOICE_CACHE,
@@ -62,6 +66,7 @@ use noise::{NoiseStream, SplitMix64};
 use perth::PerthWatermarker;
 use reference::ChatterboxReferenceEncoders;
 use s3gen::{S3GenFlow, S3GenFlowState, S3GenPreparedVoice};
+use stream::{ChatterboxStream, ChatterboxStreamPlan, ChatterboxStreamUnit};
 use t3::{T3ForwardRow, T3Model, T3PreparedVoice};
 use text::ChatterboxTextTokenizer;
 
@@ -467,6 +472,50 @@ impl ChatterboxRuntime {
         Ok((samples, flow_ms))
     }
 
+    /// A streamed utterance seeded `seed`, windowed by `plan`.
+    pub fn stream(&self, plan: ChatterboxStreamPlan, seed: u64) -> ChatterboxStream {
+        ChatterboxStream::new(
+            plan,
+            seed,
+            &self.vocoder,
+            self.watermarker.as_ref(),
+            S3GEN_SAMPLE_RATE,
+        )
+    }
+
+    /// Whether `stream` has a window to run with `available` streamable
+    /// tokens and T3 `stopped` or not.
+    pub fn stream_window_due(
+        &self,
+        stream: &ChatterboxStream,
+        available: usize,
+        stopped: bool,
+    ) -> bool {
+        stream.window_due(available, stopped, self.flow.config().pre_lookahead_len)
+    }
+
+    /// Run the next unit of `stream`'s window over `tokens` (the streamable
+    /// tokens so far), waiting for the device as [`Self::acoustic_step`]
+    /// does.
+    pub fn stream_step(
+        &self,
+        voice: &ChatterboxPreparedVoice,
+        tokens: &[u32],
+        stream: &mut ChatterboxStream,
+        stopped: bool,
+    ) -> Result<ChatterboxStreamUnit> {
+        let unit = stream.step(
+            &self.flow,
+            &self.vocoder,
+            self.watermarker.as_ref(),
+            &voice.s3gen,
+            tokens,
+            stopped,
+        )?;
+        self.device.synchronize()?;
+        Ok(unit)
+    }
+
     /// Acoustic units one utterance takes: the encoder, each Euler step and
     /// the vocoder.
     pub fn acoustic_units(&self) -> usize {
@@ -531,6 +580,18 @@ impl ChatterboxRuntime {
     }
 }
 
+/// The tokens a stream renders: those before the first stop token that are
+/// acoustic codes. Unlike [`renderable_speech_tokens`] it never drops what
+/// came before a stray start token, since that audio may already be out.
+pub fn streamable_speech_tokens(sampled: &[u32], cfg: &T3Config) -> Vec<u32> {
+    sampled
+        .iter()
+        .take_while(|&&token| token != cfg.stop_speech_token)
+        .copied()
+        .filter(|&token| token < cfg.acoustic_code_count())
+        .collect()
+}
+
 /// Upstream's post-T3 filtering (`drop_invalid_tokens`, then `< 6561`):
 /// drop everything up to the first start token, cut at the first stop
 /// token, and keep only codes S3Gen can render.
@@ -564,6 +625,10 @@ mod tests {
         assert_eq!(renderable_speech_tokens(&[5, 6561, 8, 9], &cfg), vec![8, 9]);
         assert_eq!(renderable_speech_tokens(&[5, 7000, 9], &cfg), vec![5, 9]);
         assert!(renderable_speech_tokens(&[6562, 5], &cfg).is_empty());
+        assert_eq!(
+            streamable_speech_tokens(&[5, 6561, 8, 6562, 9], &cfg),
+            vec![5, 8]
+        );
     }
 
     #[test]

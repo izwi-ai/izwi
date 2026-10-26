@@ -15,10 +15,11 @@ use candle_core::Tensor;
 
 use super::noise::{NoiseStream, SplitMix64};
 use super::sampling;
+use super::stream::ChatterboxStream;
 use super::t3::{T3ForwardRow, T3Model};
 use super::{
-    renderable_speech_tokens, ChatterboxAcoustic, ChatterboxGenerationParams,
-    ChatterboxPreparedVoice, ChatterboxRuntime, ChatterboxStopReason,
+    renderable_speech_tokens, streamable_speech_tokens, ChatterboxAcoustic,
+    ChatterboxGenerationParams, ChatterboxPreparedVoice, ChatterboxRuntime, ChatterboxStopReason,
 };
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
@@ -118,6 +119,9 @@ pub(crate) struct ChatterboxRetainedState {
     stop_reason: Option<ChatterboxStopReason>,
     /// S3Gen and HiFT progress once T3 has stopped, one unit per quantum.
     pub(crate) acoustic: ChatterboxAcoustic,
+    /// A streamed request's windows, rendered while T3 runs; `None`
+    /// renders the whole utterance once T3 has stopped.
+    pub(crate) stream: Option<ChatterboxStream>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +150,7 @@ impl ChatterboxRetainedState {
         params: ChatterboxGenerationParams,
         start_speech_token: u32,
         context_limit: usize,
+        stream: Option<ChatterboxStream>,
     ) -> Result<Self> {
         params.validate()?;
         if params.sampling.guided() != artifact.unconditional.is_some() {
@@ -169,6 +174,7 @@ impl ChatterboxRetainedState {
             phase: ChatterboxPhase::Prefill,
             stop_reason: None,
             acoustic: ChatterboxAcoustic::Pending,
+            stream,
         })
     }
 
@@ -200,6 +206,19 @@ impl ChatterboxRetainedState {
 
     pub(crate) fn stop_reason(&self) -> Option<ChatterboxStopReason> {
         self.stop_reason
+    }
+
+    /// Whether T3 has sampled its last token.
+    pub(crate) fn stopped(&self) -> bool {
+        matches!(
+            self.phase,
+            ChatterboxPhase::Acoustic | ChatterboxPhase::Finished
+        )
+    }
+
+    /// The tokens a stream renders, as far as T3 has sampled.
+    pub(crate) fn streamable_tokens(&self, model: &T3Model) -> Vec<u32> {
+        streamable_speech_tokens(&self.history[1..], model.config())
     }
 
     /// Positions the caches must hold now.
