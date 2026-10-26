@@ -38,7 +38,8 @@ impl ModelLifecycleController {
             | ModelFamily::KokoroTts
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
-            | ModelFamily::FishS2Tts => {
+            | ModelFamily::FishS2Tts
+            | ModelFamily::ChatterboxTts => {
                 if matches!(
                     family,
                     ModelFamily::Qwen3Tts
@@ -47,6 +48,7 @@ impl ModelLifecycleController {
                         | ModelFamily::VoxtralTts
                         | ModelFamily::VibeVoiceTts
                         | ModelFamily::FishS2Tts
+                        | ModelFamily::ChatterboxTts
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }

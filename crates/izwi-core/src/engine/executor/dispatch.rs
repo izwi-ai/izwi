@@ -168,6 +168,22 @@ impl NativeExecutor {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if request.task_type == TaskType::TTS
                 && request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::ChatterboxTts
+                })
+                && matches!(
+                    scheduled_req.work,
+                    crate::engine::WorkUnit::SequenceFinalize { .. }
+                )
+            {
+                if managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "Chatterbox acoustic stage unexpectedly received managed KV state".into(),
+                    ));
+                }
+                return self.chatterbox_tts_finalize_request(request, scheduled_req);
+            }
+            if request.task_type == TaskType::TTS
+                && request.model_variant.is_some_and(|variant| {
                     variant.family() == crate::catalog::ModelFamily::VoxtralTts
                 })
                 && matches!(
@@ -305,6 +321,23 @@ impl NativeExecutor {
                         reservation,
                     )?;
                     self.voxtral_tts_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::ChatterboxTts
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.chatterbox_tts_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(state),
+                    )
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -813,6 +846,42 @@ impl NativeExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = self.voxtral_tts_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
+    pub(super) fn execute_static_chatterbox_tts_prefill_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("static Chatterbox row lost request".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                rows.and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.chatterbox_tts_batch_with_managed(&ordered, scheduled, managed)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,

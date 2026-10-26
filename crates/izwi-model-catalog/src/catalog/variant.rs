@@ -11,6 +11,7 @@ pub enum ModelFamily {
     VoxtralTts,
     VibeVoiceTts,
     FishS2Tts,
+    ChatterboxTts,
     ParakeetAsr,
     WhisperAsr,
     Qwen3Asr,
@@ -55,6 +56,7 @@ impl ModelFamily {
             | Self::VoxtralTts
             | Self::VibeVoiceTts
             | Self::FishS2Tts
+            | Self::ChatterboxTts
             | Self::SortformerDiarization
             | Self::Qwen3Chat
             | Self::Qwen3MoeChat
@@ -366,6 +368,7 @@ impl ModelVariant {
             Voxtral4BTts2603 => ModelFamily::VoxtralTts,
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             FishAudioS2Pro => ModelFamily::FishS2Tts,
+            Chatterbox500M => ModelFamily::ChatterboxTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -398,7 +401,8 @@ impl ModelVariant {
             | ModelFamily::KokoroTts
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
-            | ModelFamily::FishS2Tts => ModelTask::Tts,
+            | ModelFamily::FishS2Tts
+            | ModelFamily::ChatterboxTts => ModelTask::Tts,
             ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -623,6 +627,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         {
             return Some(VibeVoice15BTts);
         }
+    }
+
+    if normalized.contains("chatterbox") {
+        return Some(Chatterbox500M);
     }
 
     if normalized.contains("fishaudio")

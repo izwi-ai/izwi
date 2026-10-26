@@ -2212,6 +2212,11 @@ pub struct SpeechRequest {
     pub reference_audio: Option<String>,
     pub reference_text: Option<String>,
     pub saved_voice_id: Option<String>,
+    /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
+    /// `exaggeration`, `min_p`, ...); a control the model does not take is
+    /// refused.
+    #[serde(flatten)]
+    pub sampling: crate::api::tts_policy::SpeechSamplingRequest,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

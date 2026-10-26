@@ -14,6 +14,7 @@ enum CertifiedTopology {
     RetainedPagedRing,
     RetainedPagedRotatingAndInvocationScratch,
     RetainedPagedAndInvocationScratch,
+    RetainedPagedPagedAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedTensorAndInvocationTensor,
@@ -43,6 +44,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedPagedAndInvocationScratch
+            | Self::RetainedPagedPagedAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
@@ -95,6 +97,9 @@ fn certified_topology(
         (VoxtralTts, Tts) => RetainedPagedAndInvocationScratch,
         (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
+        // Chatterbox retains one page domain per guidance branch (each its
+        // own group and arena); the acoustic stage leases scratch only.
+        (ChatterboxTts, Tts) => RetainedPagedPagedAndInvocationScratch,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.

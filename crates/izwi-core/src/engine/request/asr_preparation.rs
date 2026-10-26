@@ -34,6 +34,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -81,6 +83,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         for (stage_id, cost) in prepared_costs {
@@ -745,6 +749,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -762,6 +767,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -781,6 +787,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

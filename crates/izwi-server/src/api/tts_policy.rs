@@ -1,4 +1,5 @@
 use izwi_core::catalog::ModelFamily;
+use izwi_core::runtime_models::architectures::chatterbox::chatterbox_auto_max_speech_tokens;
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
 };
@@ -118,6 +119,61 @@ pub(crate) fn validate_speech_speed(
     ))
 }
 
+/// Refuse `stream` for a model that only produces a finished utterance,
+/// matching the native speech routes, instead of failing inside the
+/// runtime.
+pub(crate) fn validate_speech_streaming(
+    variant: ModelVariant,
+    streaming: bool,
+) -> Result<(), crate::error::ApiError> {
+    if streaming
+        && variant
+            .speech_capabilities()
+            .is_some_and(|capabilities| !capabilities.supports_streaming)
+    {
+        return Err(crate::error::ApiError::bad_request(format!(
+            "{variant} does not support streaming synthesis. Disable `stream` or choose a model with streaming support."
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a model-specific control (`exaggeration`, `cfg_weight`,
+/// `min_p`) the model does not take, or one outside its range, the way
+/// `speed` is refused, instead of ignoring it.
+pub(crate) fn validate_speech_controls(
+    variant: ModelVariant,
+    sampling: &SpeechSamplingRequest,
+) -> Result<(), crate::error::ApiError> {
+    use izwi_core::catalog::SpeechControl;
+    for (control, value) in [
+        (SpeechControl::Exaggeration, sampling.exaggeration),
+        (SpeechControl::CfgWeight, sampling.cfg_weight),
+        (SpeechControl::MinP, sampling.min_p),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let name = control.as_str();
+        let Some(range) = variant
+            .speech_controls()
+            .iter()
+            .find(|range| range.control == control)
+        else {
+            return Err(crate::error::ApiError::bad_request(format!(
+                "{variant} does not support `{name}`; omit it"
+            )));
+        };
+        if !value.is_finite() || value < range.min || value > range.max {
+            return Err(crate::error::ApiError::bad_request(format!(
+                "`{name}` must be between {} and {} for {variant}; got {value}",
+                range.min, range.max
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse an over-limit speech input with 413 before any model loads.
 pub(crate) fn check_tts_input_length(text: &str) -> Result<(), crate::error::ApiError> {
     let limit = tts_max_text_bytes();
@@ -165,6 +221,16 @@ pub struct SpeechSamplingRequest {
     /// read them themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalize_text: Option<bool>,
+    /// Min-p sampling threshold, in [0, 1] (Chatterbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Emotion intensity, in [0, 2] (Chatterbox; its default is 0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exaggeration: Option<f32>,
+    /// Classifier-free guidance weight, in [0, 1]; 0 turns guidance off
+    /// (Chatterbox; its default is 0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_weight: Option<f32>,
 }
 
 impl SpeechSamplingRequest {
@@ -188,6 +254,9 @@ impl SpeechSamplingRequest {
             cfg_scale: self.cfg_scale,
             diffusion_steps: self.diffusion_steps,
             normalize_text: self.normalize_text,
+            min_p: self.min_p,
+            exaggeration: self.exaggeration,
+            cfg_weight: self.cfg_weight,
         }
     }
 }
@@ -223,6 +292,9 @@ pub(crate) fn resolve_tts_output_frames(
         Some(0) | None if variant == ModelVariant::FishAudioS2Pro => {
             Some(fish_s2_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
+        Some(0) | None if variant.family() == ModelFamily::ChatterboxTts => {
+            Some(chatterbox_auto_max_speech_tokens(text).min(model_max_frames))
+        }
         Some(0) | None if variant.family() == ModelFamily::Qwen3Tts => {
             Some(qwen_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
@@ -245,6 +317,7 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
     let cap = match variant.family() {
         ModelFamily::Qwen3Tts => qwen3_tts_auto_max_output_frames(),
         ModelFamily::VibeVoiceTts => vibevoice_tts_auto_max_output_frames(),
+        ModelFamily::ChatterboxTts => ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
         _ => return false,
     };
     resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)
@@ -365,6 +438,79 @@ mod tests {
         assert_eq!(
             resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", Some(0)),
             resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", None)
+        );
+    }
+
+    #[test]
+    fn chatterbox_controls_are_refused_elsewhere_and_range_checked() {
+        let chatterbox = ModelVariant::Chatterbox500M;
+        let controls = SpeechSamplingRequest {
+            exaggeration: Some(0.9),
+            cfg_weight: Some(0.0),
+            min_p: Some(0.1),
+            ..Default::default()
+        };
+        assert!(validate_speech_controls(chatterbox, &controls).is_ok());
+        assert!(validate_speech_controls(chatterbox, &SpeechSamplingRequest::default()).is_ok());
+
+        let error = validate_speech_controls(ModelVariant::Kokoro82M, &controls).unwrap_err();
+        assert!(
+            error.message.contains("does not support `exaggeration`"),
+            "{}",
+            error.message
+        );
+
+        for (field, request) in [
+            (
+                "exaggeration",
+                SpeechSamplingRequest {
+                    exaggeration: Some(2.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cfg_weight",
+                SpeechSamplingRequest {
+                    cfg_weight: Some(-0.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_p",
+                SpeechSamplingRequest {
+                    min_p: Some(f32::NAN),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = validate_speech_controls(chatterbox, &request).unwrap_err();
+            assert!(error.message.contains(field), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn final_only_models_refuse_streaming() {
+        assert!(validate_speech_streaming(ModelVariant::Chatterbox500M, false).is_ok());
+        let error = validate_speech_streaming(ModelVariant::Chatterbox500M, true).unwrap_err();
+        assert!(
+            error.message.contains("does not support streaming"),
+            "{}",
+            error.message
+        );
+        assert!(validate_speech_streaming(ModelVariant::Kokoro82M, true).is_ok());
+    }
+
+    #[test]
+    fn chatterbox_auto_budget_is_text_sized_and_capped() {
+        let variant = ModelVariant::Chatterbox500M;
+        let short = resolve_tts_output_frames(variant, "Hello there.", None).unwrap();
+        let long = resolve_tts_output_frames(variant, &"word ".repeat(1_000), None).unwrap();
+        assert!(short < 100, "{short}");
+        assert_eq!(long, ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES);
+        assert_eq!(resolve_tts_output_frames(variant, "hi", Some(40)), Some(40));
+        assert_eq!(
+            resolve_tts_output_frames(variant, "hi", Some(usize::MAX)),
+            Some(ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES)
         );
     }
 

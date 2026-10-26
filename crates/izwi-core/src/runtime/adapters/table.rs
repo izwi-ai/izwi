@@ -31,6 +31,7 @@ pub(crate) enum LoadedAdapterKind {
     VibeVoiceTts,
     FishS2Tts,
     VoxtralTts,
+    ChatterboxTts,
     KokoroStaticTts,
     Scalar,
 }
@@ -52,6 +53,7 @@ impl LoadedAdapterKind {
             Self::VibeVoiceTts => "builtin.vibevoice_tts.physical_sequence",
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
+            Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -239,6 +241,13 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
+        // Final-only: the acoustic stage renders the whole utterance.
+        row(
+            F::ChatterboxTts,
+            C::Tts,
+            Loaded::ChatterboxTts,
+            RetainedAndInvocation,
+        ),
         row(
             F::FishS2Tts,
             C::StreamingTts,

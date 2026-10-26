@@ -193,6 +193,34 @@ pub(super) struct FishS2PhysicalTtsAdapterFactory;
 pub(super) struct VoxtralPhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct ChatterboxPhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for ChatterboxPhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::ChatterboxTts.factory_id()
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::ChatterboxTts, metadata, backend_kind)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(ChatterboxTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct KokoroStaticTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
@@ -520,6 +548,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),
         Arc::new(VoxtralPhysicalTtsAdapterFactory),
+        Arc::new(ChatterboxPhysicalTtsAdapterFactory),
         Arc::new(KokoroStaticTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]

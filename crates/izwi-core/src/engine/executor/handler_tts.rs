@@ -298,7 +298,7 @@ fn qwen_tts_decode_iterations(scheduled: &ScheduledRequest) -> usize {
     }
 }
 
-fn resumable_tts_prefill_span(
+pub(super) fn resumable_tts_prefill_span(
     scheduled: &ScheduledRequest,
     prompt_tokens: usize,
 ) -> Result<(usize, usize)> {
@@ -368,7 +368,7 @@ fn continuous_tts_model_call(
     }
 }
 
-fn retained_tts_batch_model_call(
+pub(super) fn retained_tts_batch_model_call(
     mode: crate::engine::NativeBatchMode,
     live_kernel_rows: usize,
 ) -> Option<crate::engine::metrics::EngineModelCall> {
@@ -3915,6 +3915,17 @@ impl NativeExecutor {
                 .is_some_and(|variant| variant.family() == ModelFamily::VoxtralTts)
         }) {
             return self.voxtral_tts_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::ChatterboxTts)
+        }) {
+            return self.chatterbox_tts_batch_with_managed(
                 &ordered_requests,
                 scheduled,
                 managed_caches,

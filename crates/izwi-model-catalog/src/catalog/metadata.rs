@@ -289,6 +289,15 @@ pub enum ModelVariant {
         alias = "FishAudio S2 Pro"
     )]
     FishAudioS2Pro,
+    /// Resemble AI's Chatterbox (English, 0.5B Llama T3 + S3Gen)
+    #[serde(
+        rename = "Chatterbox-500M",
+        alias = "ResembleAI/chatterbox",
+        alias = "chatterbox",
+        alias = "Chatterbox",
+        alias = "Chatterbox 500M"
+    )]
+    Chatterbox500M,
 }
 
 impl ModelVariant {
@@ -321,6 +330,16 @@ impl ModelVariant {
     pub const FISH_S2_PRO_ARTIFACT_REVISION: &'static str =
         "1de9996b6be38b745688de084d87a5633f714e4e";
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    /// Chatterbox's English checkpoint as published 2026-06-10; its five
+    /// English files are unchanged since 2025-05-30.
+    pub const CHATTERBOX_ARTIFACT_REVISION: &'static str =
+        "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18";
+    /// Upstream's per-utterance speech-token budget (`max_new_tokens`),
+    /// about 40 s at 25 tokens per second.
+    pub const CHATTERBOX_MAX_OUTPUT_FRAMES: usize = 1000;
+    pub const CHATTERBOX_FRAME_RATE_HZ: f32 = 25.0;
+    /// One bundled voice (`conds.pt`).
+    pub const CHATTERBOX_BUILT_IN_VOICE_COUNT: usize = 1;
     /// The `.nemo` revisions izwi's Sortformer loader was verified against
     /// (sha256 `8abd3283…2ef8` and `867c53f5…e96d`); a re-published archive
     /// changes graph config and weights together (NDZ-5).
@@ -373,6 +392,7 @@ impl ModelVariant {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
+            Self::Chatterbox500M => Some(Self::CHATTERBOX_ARTIFACT_REVISION),
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -441,6 +461,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
             Self::FishAudioS2Pro => "fishaudio/s2-pro",
+            Self::Chatterbox500M => "ResembleAI/chatterbox",
         }
     }
 
@@ -493,6 +514,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => "Voxtral 4B TTS",
             Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
             Self::FishAudioS2Pro => "Fish Audio S2 Pro",
+            Self::Chatterbox500M => "Chatterbox",
         }
     }
 
@@ -545,6 +567,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => "Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "VibeVoice-1.5B",
             Self::FishAudioS2Pro => "FishAudio-S2-Pro",
+            Self::Chatterbox500M => "Chatterbox-500M",
         }
     }
 
@@ -597,6 +620,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
+            Self::Chatterbox500M => 3_229_396_933, // five pinned HF files (3,191,966,992 B) + PerTh watermarker (37,429,941 B)
         }
     }
 
@@ -663,6 +687,9 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => 16.0,
             Self::VibeVoice15BTts => 12.0,
             Self::FishAudioS2Pro => 24.0,
+            // 3.2 GB of F32 weights, two guided KV branches (~0.6 GB per
+            // 1,000-token request at F32) and the flow's attention workspace.
+            Self::Chatterbox500M => 6.0,
         }
     }
 
@@ -765,6 +792,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::VoxtralTts
                 | crate::catalog::ModelFamily::VibeVoiceTts
                 | crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::ChatterboxTts
         )
     }
 
@@ -773,7 +801,7 @@ impl ModelVariant {
     pub fn license_label(&self) -> Option<&'static str> {
         match self {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
-            Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
+            Self::VibeVoiceAsr | Self::VibeVoice15BTts | Self::Chatterbox500M => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412B
@@ -889,6 +917,15 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
+            Self::Chatterbox500M => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::CHATTERBOX_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
+            },
             _ => return None,
         };
 
@@ -947,6 +984,7 @@ impl ModelVariant {
                 Some(Self::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
             }
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_MAX_OUTPUT_FRAMES),
             _ => None,
         }
     }
@@ -958,6 +996,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::VibeVoiceTts => Some(Self::VIBEVOICE_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_FRAME_RATE_HZ),
             _ => None,
         }
     }
@@ -971,6 +1010,7 @@ impl ModelVariant {
             | crate::catalog::ModelFamily::KokoroTts
             | crate::catalog::ModelFamily::VoxtralTts
             | crate::catalog::ModelFamily::VibeVoiceTts
+            | crate::catalog::ModelFamily::ChatterboxTts
             | crate::catalog::ModelFamily::Lfm25Audio => Some(24_000),
             _ => None,
         }
@@ -1153,6 +1193,7 @@ impl ModelVariant {
             Self::Nemotron3Diarization => true,
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
+            Self::Chatterbox500M => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1206,6 +1247,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603,
             Self::VibeVoice15BTts,
             Self::FishAudioS2Pro,
+            Self::Chatterbox500M,
         ]
     }
 }
@@ -1232,6 +1274,69 @@ pub enum ModelStatus {
     Ready,
     /// Error state
     Error,
+}
+
+/// A model-specific speech control a request may set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechControl {
+    /// Emotion intensity (Chatterbox).
+    Exaggeration,
+    /// Classifier-free guidance weight; 0 turns guidance off (Chatterbox).
+    CfgWeight,
+    /// Min-p sampling threshold (Chatterbox).
+    MinP,
+}
+
+impl SpeechControl {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exaggeration => "exaggeration",
+            Self::CfgWeight => "cfg_weight",
+            Self::MinP => "min_p",
+        }
+    }
+}
+
+/// A control's accepted range and the model's value when it is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeechControlRange {
+    pub control: SpeechControl,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+}
+
+const CHATTERBOX_SPEECH_CONTROLS: &[SpeechControlRange] = &[
+    SpeechControlRange {
+        control: SpeechControl::Exaggeration,
+        min: 0.0,
+        max: 2.0,
+        default: 0.5,
+    },
+    SpeechControlRange {
+        control: SpeechControl::CfgWeight,
+        min: 0.0,
+        max: 1.0,
+        default: 0.5,
+    },
+    SpeechControlRange {
+        control: SpeechControl::MinP,
+        min: 0.0,
+        max: 1.0,
+        default: 0.05,
+    },
+];
+
+impl ModelVariant {
+    /// The model-specific controls a speech request may set; a control not
+    /// listed is refused rather than ignored.
+    pub fn speech_controls(&self) -> &'static [SpeechControlRange] {
+        match self.family() {
+            crate::catalog::ModelFamily::ChatterboxTts => CHATTERBOX_SPEECH_CONTROLS,
+            _ => &[],
+        }
+    }
 }
 
 /// Machine-readable speech feature contract for voice workflows.
@@ -1697,6 +1802,46 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+            })
+        );
+    }
+
+    #[test]
+    fn chatterbox_exposes_default_voice_final_only_tts() {
+        let variant = ModelVariant::Chatterbox500M;
+        assert!(variant.is_tts());
+        assert!(variant.is_enabled());
+        assert_eq!(variant.primary_task(), ModelTask::Tts);
+        assert_eq!(variant.repo_id(), "ResembleAI/chatterbox");
+        assert_eq!(variant.dir_name(), "Chatterbox-500M");
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(ModelVariant::CHATTERBOX_ARTIFACT_REVISION)
+        );
+        assert_eq!(variant.license_label(), Some("MIT"));
+        assert!(!variant.streams_on_its_tts_route());
+        assert_eq!(variant.tts_output_sample_rate_hint(), Some(24_000));
+        assert_eq!(variant.tts_max_output_seconds_hint(), Some(40.0));
+        let controls = variant
+            .speech_controls()
+            .iter()
+            .map(|range| (range.control.as_str(), range.default))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls,
+            vec![("exaggeration", 0.5), ("cfg_weight", 0.5), ("min_p", 0.05)]
+        );
+        assert!(ModelVariant::Kokoro82M.speech_controls().is_empty());
+        assert_eq!(
+            variant.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(1),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
             })
         );
     }

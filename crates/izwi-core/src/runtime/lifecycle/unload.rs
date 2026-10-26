@@ -112,6 +112,10 @@ impl ModelLifecycleController {
                 self.model_registry.unload_fish_s2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::ChatterboxTts => {
+                self.model_registry.unload_chatterbox_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::Tokenizer => {
                 let mut tokenizer_guard = self.tokenizer.write().await;
                 *tokenizer_guard = None;

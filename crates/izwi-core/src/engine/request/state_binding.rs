@@ -168,6 +168,17 @@ impl EngineCoreRequest {
         phase: super::super::SequencePhase,
         input: InputRange,
     ) -> Result<InputRange> {
+        // An unguided Chatterbox request never runs its unconditional
+        // sequence; an empty span leaves that cache unreserved.
+        if domain == crate::models::architectures::chatterbox::CHATTERBOX_UNCOND_DOMAIN
+            && self
+                .incremental_model_execution_ready
+                .as_ref()
+                .and_then(|ready| ready.chatterbox_tts.as_ref())
+                .is_some_and(|artifact| artifact.unconditional.is_none())
+        {
+            return InputRange::new(0, 0);
+        }
         let is_vibevoice_tts =
             self.incremental_model_execution_ready
                 .as_ref()
@@ -453,6 +464,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::ChatterboxTts(_)) {
+            let prepared = ready.chatterbox_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Chatterbox request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.chatterbox_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Chatterbox request {} is missing its sealed generation parameters",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::ChatterboxTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || self.params.max_tokens != params.max_speech_tokens
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Chatterbox request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
             let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -522,6 +556,13 @@ impl EngineCoreRequest {
                 if ready.model_variant.family() == ModelFamily::VoxtralTts
                     && ready.voxtral_tts.is_some()
                     && ready.voxtral_tts_params.is_some() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::ChatterboxTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::ChatterboxTts
+                    && ready.chatterbox_tts.is_some()
+                    && ready.chatterbox_tts_params.is_some() =>
             {
                 Ok(())
             }
@@ -595,6 +636,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())

@@ -136,6 +136,19 @@ pub struct AdminSpeechModelCapabilities {
     pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+    /// Model-specific controls a speech request may set, each with its
+    /// range and the model's default (Chatterbox: `exaggeration`,
+    /// `cfg_weight`, `min_p`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<AdminSpeechControlRange>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminSpeechControlRange {
+    pub control: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -260,9 +273,9 @@ impl AdminModelInfo {
             route_capabilities: AdminModelRouteCapabilities::from_variant(variant),
             batch_capabilities: AdminModelBatchCapabilities::from_variant(variant),
             chat_capabilities: info.chat_capabilities.map(AdminChatModelCapabilities::from),
-            speech_capabilities: info
-                .speech_capabilities
-                .map(AdminSpeechModelCapabilities::from),
+            speech_capabilities: info.speech_capabilities.map(|capabilities| {
+                AdminSpeechModelCapabilities::from(capabilities).with_controls(variant)
+            }),
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
             cuda_quantization: serde_json::to_value(info.cuda_quantization)
@@ -336,7 +349,24 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             streaming_mode: None,
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
+            controls: Vec::new(),
         }
+    }
+}
+
+impl AdminSpeechModelCapabilities {
+    fn with_controls(mut self, variant: ModelVariant) -> Self {
+        self.controls = variant
+            .speech_controls()
+            .iter()
+            .map(|range| AdminSpeechControlRange {
+                control: range.control.as_str(),
+                min: range.min,
+                max: range.max,
+                default: range.default,
+            })
+            .collect();
+        self
     }
 }
 

@@ -23,6 +23,8 @@ use super::{
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::chatterbox::retained::ChatterboxPreparedArtifact;
+use crate::models::architectures::chatterbox::ChatterboxGenerationParams;
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
 use crate::models::architectures::kokoro::KokoroPreparedRequest;
@@ -43,9 +45,9 @@ use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArti
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
-    AsrModelLease, ChatModelLease, FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease,
-    NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease,
-    VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+    AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease,
+    KokoroTtsModelLease, Lfm25AudioModelLease, NativeAsrModel, NativeChatModel,
+    NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -421,6 +423,7 @@ enum PreparedIncrementalModel {
     VibeVoiceTts(VibeVoiceTtsModelLease),
     FishS2Tts(FishS2TtsModelLease),
     VoxtralTts(VoxtralTtsModelLease),
+    ChatterboxTts(ChatterboxTtsModelLease),
     KokoroTts(KokoroTtsModelLease),
 }
 
@@ -434,6 +437,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
             Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
+            Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
@@ -451,6 +455,8 @@ pub(super) struct IncrementalModelExecutionReady {
     fish_s2_tts_params: Option<FishS2GenerationParams>,
     voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
     voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
+    chatterbox_tts: Option<Arc<ChatterboxPreparedArtifact>>,
+    chatterbox_tts_params: Option<ChatterboxGenerationParams>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

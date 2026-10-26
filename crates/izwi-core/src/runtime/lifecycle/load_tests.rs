@@ -3681,6 +3681,13 @@ fn tts_state_floor_covers_one_full_request_per_family() {
             ModelFamily::VibeVoiceTts => 96 + vibevoice_tts_auto_max_frames_for_text(&flood),
             // A preset voice prompt plus CUDA's frame maximum.
             ModelFamily::VoxtralTts => 256 + ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES,
+            // Conditioning, the longest text one request takes, both start
+            // tokens and the speech budget.
+            ModelFamily::ChatterboxTts => {
+                34 + crate::models::architectures::chatterbox::config::MAX_TEXT_TOKENS
+                    + 2
+                    + ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES
+            }
             _ => {
                 assert_eq!(floor(variant), 0, "{variant}");
                 continue;

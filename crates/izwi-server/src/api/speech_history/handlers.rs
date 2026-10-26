@@ -2705,6 +2705,7 @@ fn normalize_for_model_capabilities(
         .unwrap_or(false);
 
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
+    crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(

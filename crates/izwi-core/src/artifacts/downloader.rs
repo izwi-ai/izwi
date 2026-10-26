@@ -130,6 +130,16 @@ const VIBEVOICE_QWEN_TOKENIZER_FILES: &[&str] = &[
     "special_tokens_map.json",
 ];
 
+/// The English loader's files at the pinned revision (5bb1f6ee); the repo
+/// also holds the multilingual and legacy checkpoints, which it never reads.
+const CHATTERBOX_FILES: &[&str] = &[
+    "t3_cfg.safetensors",
+    "s3gen.safetensors",
+    "ve.safetensors",
+    "tokenizer.json",
+    "conds.pt",
+];
+
 const FISH_S2_PRO_FILES: &[&str] = &[
     "README.md",
     "LICENSE.md",
@@ -1500,6 +1510,9 @@ impl ModelDownloader {
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::ChatterboxTts => {
+                CHATTERBOX_FILES.iter().all(|file| path.join(file).exists())
+            }
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -2189,6 +2202,10 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
+            ModelFamily::ChatterboxTts => CHATTERBOX_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -2652,8 +2669,16 @@ impl ModelDownloader {
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
         // The published files' sizes (unsloth Qwen3.5 GGUF and LiquidAI
-        // LFM2.5-Audio repositories, 2026-10-19).
-        if file == "mmproj-F16.gguf" {
+        // LFM2.5-Audio repositories, 2026-10-19; Chatterbox at 5bb1f6ee).
+        if variant.family() == ModelFamily::ChatterboxTts {
+            match file {
+                "t3_cfg.safetensors" => 2_129_653_744,
+                "s3gen.safetensors" => 1_056_484_620,
+                "ve.safetensors" => 5_695_784,
+                "conds.pt" => 107_374,
+                _ => 25_470,
+            }
+        } else if file == "mmproj-F16.gguf" {
             match variant {
                 ModelVariant::Qwen3508BGguf => 204_987_232,
                 ModelVariant::Qwen352BGguf => 668_227_264,

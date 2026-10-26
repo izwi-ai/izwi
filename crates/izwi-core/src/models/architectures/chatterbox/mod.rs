@@ -12,6 +12,7 @@
 pub mod conds;
 pub mod config;
 pub mod hift;
+mod model;
 pub mod noise;
 mod physical;
 pub(crate) mod retained;
@@ -32,9 +33,11 @@ use serde::Serialize;
 
 pub use conds::{ChatterboxVoice, S3GenVoiceReference, T3VoiceConditioning};
 pub use config::{
-    ChatterboxSamplingDefaults, HiftConfig, S3GenConfig, T3Config, CHATTERBOX_DEFAULTS,
-    S3GEN_SAMPLE_RATE,
+    chatterbox_auto_max_speech_tokens, ChatterboxSamplingDefaults, HiftConfig, S3GenConfig,
+    T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
 };
+pub use model::{ChatterboxTtsDiagnostics, ChatterboxTtsModel, CHATTERBOX_DEFAULT_VOICE};
+pub(crate) use physical::{CHATTERBOX_COND_DOMAIN, CHATTERBOX_UNCOND_DOMAIN};
 pub use sampling::T3SamplingParams;
 
 use crate::error::{Error, Result};

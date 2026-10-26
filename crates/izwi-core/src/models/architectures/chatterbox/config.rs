@@ -11,6 +11,14 @@ pub const VOICE_ENCODER_WEIGHTS_FILE: &str = "ve.safetensors";
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 pub const DEFAULT_VOICE_FILE: &str = "conds.pt";
 
+/// Text tokens one request may carry (framing included); longer text is
+/// split across requests. Well inside the learned 2,050-position table.
+pub const MAX_TEXT_TOKENS: usize = 1024;
+
+/// Positions one T3 sequence may reach: 34 conditioning positions, the
+/// longest text, both start tokens and the 1,000-token speech budget.
+pub const STATE_CONTEXT_TOKENS: usize = 34 + MAX_TEXT_TOKENS + 2 + 1000;
+
 /// Output sample rate of S3Gen's vocoder.
 pub const S3GEN_SAMPLE_RATE: u32 = 24_000;
 /// Sample rate of the S3 speech tokenizer and the voice encoder.
@@ -214,6 +222,17 @@ pub struct ChatterboxSamplingDefaults {
     pub max_speech_tokens: usize,
 }
 
+/// A speech-token budget for `text` when the request sets none: 50 tokens
+/// plus two per character (12.5 characters a second at 25 tokens a second,
+/// slower than read speech), capped at the per-utterance limit. It bounds
+/// the runaway generations upstream sees (resemble-ai/chatterbox#531, the
+/// budget its PR #570 proposes) without cutting real speech.
+pub fn chatterbox_auto_max_speech_tokens(text: &str) -> usize {
+    let chars = text.chars().filter(|ch| !ch.is_whitespace()).count()
+        + text.split_whitespace().count().saturating_sub(1);
+    (50 + 2 * chars).min(CHATTERBOX_DEFAULTS.max_speech_tokens)
+}
+
 pub const CHATTERBOX_DEFAULTS: ChatterboxSamplingDefaults = ChatterboxSamplingDefaults {
     temperature: 0.8,
     repetition_penalty: 1.2,
@@ -227,6 +246,17 @@ pub const CHATTERBOX_DEFAULTS: ChatterboxSamplingDefaults = ChatterboxSamplingDe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_budget_scales_with_text_and_caps() {
+        assert_eq!(chatterbox_auto_max_speech_tokens("hi"), 54);
+        // Runs of whitespace count once.
+        assert_eq!(chatterbox_auto_max_speech_tokens("a  b"), 56);
+        assert_eq!(
+            chatterbox_auto_max_speech_tokens(&"word ".repeat(400)),
+            1000
+        );
+    }
 
     #[test]
     fn geometry_matches_the_published_tables() {

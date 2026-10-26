@@ -492,6 +492,32 @@
         ],
         "type": "object"
       },
+      "AdminSpeechControlRange": {
+        "properties": {
+          "control": {
+            "type": "string"
+          },
+          "default": {
+            "format": "float",
+            "type": "number"
+          },
+          "max": {
+            "format": "float",
+            "type": "number"
+          },
+          "min": {
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "control",
+          "min",
+          "max",
+          "default"
+        ],
+        "type": "object"
+      },
       "AdminSpeechModelCapabilities": {
         "properties": {
           "built_in_voice_count": {
@@ -500,6 +526,13 @@
               "integer",
               "null"
             ]
+          },
+          "controls": {
+            "description": "Model-specific controls a speech request may set, each with its\nrange and the model's default (Chatterbox: `exaggeration`,\n`cfg_weight`, `min_p`).",
+            "items": {
+              "$ref": "#/components/schemas/AdminSpeechControlRange"
+            },
+            "type": "array"
           },
           "streaming_mode": {
             "description": "What a streaming request delivers on this server (TPIPE-3):\n`chunked` (audio as the model commits it) or `unsupported`.",
@@ -1853,113 +1886,227 @@
         "type": "object"
       },
       "SpeechRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SpeechSamplingRequest",
+            "description": "Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,\n`exaggeration`, `min_p`, ...); a control the model does not take is\nrefused."
+          },
+          {
+            "properties": {
+              "allow_format_fallback": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "input": {
+                "type": "string"
+              },
+              "instructions": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "max_output_tokens": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "max_tokens": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "reference_audio": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reference_text": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "response_format": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "saved_voice_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "speed": {
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "stream": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "stream_format": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "temperature": {
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "top_k": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "voice": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "model",
+              "input"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SpeechSamplingRequest": {
+        "description": "Optional speech-sampling fields a request may set beside `temperature`\nand `top_k`. Anything left unset keeps the model family's reference\ndefault (TPIPE-24): Qwen3-TTS generation_config, LFM 0.8 / top-k 64,\nVibeVoice CFG 1.3 with 10 steps, fish-speech 0.7 / 0.7, Voxtral greedy.",
         "properties": {
-          "allow_format_fallback": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "input": {
-            "type": "string"
-          },
-          "instructions": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "max_output_tokens": {
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "max_tokens": {
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model": {
-            "type": "string"
-          },
-          "reference_audio": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "reference_text": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "response_format": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "saved_voice_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "speed": {
+          "cfg_scale": {
+            "description": "VibeVoice classifier-free guidance scale.",
             "format": "float",
             "type": [
               "number",
               "null"
             ]
           },
-          "stream": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "stream_format": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "temperature": {
+          "cfg_weight": {
+            "description": "Classifier-free guidance weight, in [0, 1]; 0 turns guidance off\n(Chatterbox; its default is 0.5).",
             "format": "float",
             "type": [
               "number",
               "null"
             ]
           },
-          "top_k": {
+          "diffusion_steps": {
+            "description": "VibeVoice diffusion steps per frame.",
             "minimum": 0,
             "type": [
               "integer",
               "null"
             ]
           },
-          "voice": {
+          "exaggeration": {
+            "description": "Emotion intensity, in [0, 2] (Chatterbox; its default is 0.5).",
+            "format": "float",
             "type": [
-              "string",
+              "number",
+              "null"
+            ]
+          },
+          "min_p": {
+            "description": "Min-p sampling threshold, in [0, 1] (Chatterbox).",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "normalize_text": {
+            "description": "Speak numbers, currency, dates, times and units as words (English).\nUnset keeps the model's default: on for Kokoro, off for models that\nread them themselves.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "repetition_penalty": {
+            "description": "Repetition penalty (Qwen3-TTS), >= 1.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "seed": {
+            "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise, Kokoro noise).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subtalker_do_sample": {
+            "description": "Qwen3-TTS residual-codebook sampling.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "subtalker_temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "subtalker_top_k": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subtalker_top_p": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "top_p": {
+            "description": "Nucleus sampling threshold, in (0, 1].",
+            "format": "float",
+            "type": [
+              "number",
               "null"
             ]
           }
         },
-        "required": [
-          "model",
-          "input"
-        ],
         "type": "object"
       },
       "SpeechStreamEvent": {

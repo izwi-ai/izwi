@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
+use crate::models::architectures::chatterbox::retained::ChatterboxRetainedState;
 use crate::models::architectures::fish_s2::FishS2RetainedState;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
@@ -17,9 +18,9 @@ use crate::models::architectures::voxtral::realtime::{
 };
 use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
-    AsrModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
-    NativeChatDecodeState, NativeChatReplayCheckpoint, QwenTtsModelLease, VibeVoiceTtsModelLease,
-    VoxtralModelLease, VoxtralTtsModelLease,
+    AsrModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease, Lfm25AudioModelLease,
+    NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint,
+    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -168,6 +169,12 @@ pub(super) struct ActiveVoxtralTtsDecode {
     pub(super) stream_sequence: usize,
     /// Samples a streamed request has published so far.
     pub(super) streamed_samples: usize,
+}
+
+pub(super) struct ActiveChatterboxTtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: ChatterboxTtsModelLease,
+    pub(super) state: ChatterboxRetainedState,
 }
 
 pub(super) struct ActiveVoxtralRealtime {
