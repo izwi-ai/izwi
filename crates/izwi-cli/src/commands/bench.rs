@@ -6657,7 +6657,7 @@ concurrent = [1, 2]
         let text = std::fs::read_to_string(path).expect("CUDA family manifest");
         let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
         let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
-        assert_eq!(cases.len(), 15);
+        assert_eq!(cases.len(), 16);
         assert!(cases.iter().all(|case| case.model.is_some()));
         assert!(cases
             .iter()
@@ -6706,6 +6706,7 @@ concurrent = [1, 2]
             ("Voxtral-Mini-4B-Realtime-2602", "asr"),
             ("Whisper-Large-v3-Turbo", "asr"),
             ("FishAudio-S2-Pro", "tts"),
+            ("Chatterbox-500M", "tts"),
         ]
         .into_iter()
         .collect();
@@ -6719,7 +6720,7 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid audio performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
-            assert_eq!(cases.len(), 56, "{name}");
+            assert_eq!(cases.len(), 60, "{name}");
             assert!(
                 cases
                     .iter()
@@ -6731,8 +6732,15 @@ concurrent = [1, 2]
                 cases.iter().all(|case| case.iterations == Some(8)),
                 "{name} must collect eight streaming samples per concurrency cell"
             );
+            // A final-only model cannot stream; its unstreamed samples carry
+            // first audio as end to end time instead.
             assert!(
-                cases.iter().all(|case| case.stream == Some(true)),
+                cases.iter().all(|case| {
+                    let final_only = case.model.as_deref().is_some_and(|model| {
+                        case.command == "tts" && tts_model_is_final_only(model)
+                    });
+                    case.stream == Some(!final_only)
+                }),
                 "{name} must collect first-output and inter-event streaming latency"
             );
             for concurrency in [1, 2, 4, 8] {
@@ -6741,7 +6749,7 @@ concurrent = [1, 2]
                         .iter()
                         .filter(|case| case.concurrent == Some(concurrency))
                         .count(),
-                    14,
+                    15,
                     "{name} c{concurrency}"
                 );
             }

@@ -62,6 +62,13 @@ reference_audio = "../../data/fox.wav"
 reference_text_file = "../../data/fox.md"
 
 [[benchmarks]]
+name = "chatterbox-tts-cuda"
+command = "tts"
+model = "Chatterbox-500M"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
 name = "lfm25-audio-tts-cuda"
 command = "tts"
 model = "LFM2.5-Audio-1.5B-GGUF"

@@ -69,3 +69,18 @@ reference_text_file = "../../data/fox.md"
 
 [benchmarks.matrix]
 concurrent = [1, 2, 4, 8]
+
+# Chatterbox returns its audio only when complete, so it runs unstreamed:
+# the evidence gate accepts that only for a final-only model and requires
+# first audio equal to end to end time.
+[[benchmarks]]
+name = "chatterbox-tts-metal-concurrency"
+command = "tts"
+model = "Chatterbox-500M"
+iterations = 8
+warmup = true
+stream = false
+text = "Continuous audio batching should remain responsive and clear."
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
