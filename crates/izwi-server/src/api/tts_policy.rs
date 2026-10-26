@@ -1,5 +1,7 @@
 use izwi_core::catalog::ModelFamily;
-use izwi_core::runtime_models::architectures::chatterbox::chatterbox_auto_max_speech_tokens;
+use izwi_core::runtime_models::architectures::chatterbox::{
+    chatterbox_auto_max_speech_tokens, ChatterboxEdition,
+};
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
 };
@@ -190,6 +192,25 @@ pub(crate) fn validate_speech_controls(
         }
     }
     Ok(())
+}
+
+/// Refuse a `language` the model cannot speak before it loads: the English
+/// Chatterbox takes English only, the multilingual one its supported codes.
+/// Other models read `language` as a hint.
+pub(crate) fn validate_speech_language(
+    variant: ModelVariant,
+    language: Option<&str>,
+) -> Result<(), crate::error::ApiError> {
+    let Some(edition) = ChatterboxEdition::of(variant) else {
+        return Ok(());
+    };
+    match edition.language_tag(language) {
+        Ok(_) => Ok(()),
+        Err(izwi_core::Error::InvalidInput(message)) => {
+            Err(crate::error::ApiError::bad_request(message))
+        }
+        Err(err) => Err(crate::error::core_api_error(err)),
+    }
 }
 
 /// Refuse an over-limit speech input with 413 before any model loads.
@@ -538,6 +559,32 @@ mod tests {
             let error = validate_speech_controls(chatterbox, &request).unwrap_err();
             assert!(error.message.contains(field), "{}", error.message);
         }
+    }
+
+    /// Chatterbox refuses a language its edition cannot speak; other
+    /// models take `language` as a hint.
+    #[test]
+    fn chatterbox_language_follows_its_edition() {
+        let english = ModelVariant::Chatterbox500M;
+        let multilingual = ModelVariant::ChatterboxMultilingual500M;
+        for language in [None, Some("en"), Some("English"), Some("auto")] {
+            assert!(validate_speech_language(english, language).is_ok());
+            assert!(validate_speech_language(multilingual, language).is_ok());
+        }
+        for language in [Some("fr"), Some("Swahili"), Some("ko")] {
+            assert!(validate_speech_language(multilingual, language).is_ok());
+            let error = validate_speech_language(english, language).unwrap_err();
+            assert!(error.message.contains("English only"), "{}", error.message);
+        }
+        for (language, expected) in [
+            ("zh", "text frontend"),
+            ("ja", "text frontend"),
+            ("klingon", "does not speak"),
+        ] {
+            let error = validate_speech_language(multilingual, Some(language)).unwrap_err();
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+        assert!(validate_speech_language(ModelVariant::Kokoro82M, Some("klingon")).is_ok());
     }
 
     /// Streaming is refused only where the model's capabilities say it

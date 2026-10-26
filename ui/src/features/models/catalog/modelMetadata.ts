@@ -230,6 +230,23 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "3.23 GB",
   },
+  "Chatterbox-Multilingual-500M": {
+    shortName: "Chatterbox Multilingual",
+    fullName: "Chatterbox Multilingual by Resemble AI",
+    description:
+      "Chatterbox in 21 languages, chosen per request, with the same bundled voice, cloning and exaggeration control. Its audio carries Resemble AI's imperceptible PerTh watermark.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Multilingual",
+      "Voice Cloning",
+      "Exaggeration",
+      "Streaming",
+      "Watermarked",
+      "24 kHz",
+    ],
+    size: "3.24 GB",
+  },
   // Text Chat
   "Qwen3.5-0.8B": {
     shortName: "Qwen3.5 0.8B",

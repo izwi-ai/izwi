@@ -74,6 +74,9 @@ function changedSpeechControls(
   return changed;
 }
 
+/** The language a multilingual model is asked for until one is chosen. */
+const DEFAULT_SPEECH_LANGUAGE = "en";
+
 /** The saved-voice picker's "no saved voice" choice, for a model that also
  * has built-in voices (Radix Select takes no empty value). */
 const BUILT_IN_VOICE = "__built_in__";
@@ -109,6 +112,7 @@ export function NewTextToSpeechModal({
   const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
+  const [language, setLanguage] = useState(DEFAULT_SPEECH_LANGUAGE);
   const [controlValues, setControlValues] = useState<
     Partial<Record<SpeechControlId, number>>
   >({});
@@ -139,6 +143,21 @@ export function NewTextToSpeechModal({
     () => capabilities?.controls ?? [],
     [capabilities],
   );
+  // A model that speaks several named languages (Chatterbox Multilingual)
+  // is told which one; one with a single language needs no picker.
+  const speechLanguages = useMemo(
+    () =>
+      [...(capabilities?.languages ?? [])].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
+    [capabilities],
+  );
+  const offersLanguage = speechLanguages.length > 1;
+  const resolvedLanguage = speechLanguages.some(
+    (option) => option.code === language,
+  )
+    ? language
+    : (speechLanguages[0]?.code ?? DEFAULT_SPEECH_LANGUAGE);
   const effectiveVoiceWorkflow: EffectiveVoiceWorkflow =
     supportsReferenceVoices && !supportsBuiltInVoices
       ? "saved_voice"
@@ -188,6 +207,7 @@ export function NewTextToSpeechModal({
     setSpeaker(initialSpeaker || "Vivian");
     setSavedVoiceId(initialSavedVoiceId || "");
     setVoiceDescription("");
+    setLanguage(DEFAULT_SPEECH_LANGUAGE);
     setControlValues({});
     setStreamingEnabled(true);
     setIsSubmitting(false);
@@ -361,6 +381,7 @@ export function NewTextToSpeechModal({
           ? resolvedBuiltInSpeaker
           : undefined,
       saved_voice_id: useSavedVoice ? savedVoiceId : undefined,
+      language: offersLanguage ? resolvedLanguage : undefined,
       voice_description:
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
@@ -394,6 +415,8 @@ export function NewTextToSpeechModal({
     onModelRequired,
     onCreateStream,
     effectiveVoiceWorkflow,
+    offersLanguage,
+    resolvedLanguage,
     resolvedBuiltInSpeaker,
     savedVoiceId,
     selectedModel,
@@ -469,6 +492,30 @@ export function NewTextToSpeechModal({
           }
           side={
             <>
+              {offersLanguage ? (
+                <CreationField label="Language">
+                  <Select
+                    value={resolvedLanguage}
+                    onValueChange={setLanguage}
+                    disabled={isSubmitting}
+                  >
+                    <SelectTrigger
+                      aria-label="Language"
+                      className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
+                    >
+                      <SelectValue placeholder="Select language" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {speechLanguages.map((option) => (
+                        <SelectItem key={option.code} value={option.code}>
+                          {option.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </CreationField>
+              ) : null}
+
               {supportsSpeed ? (
                 <CreationField
                   label="Speed"

@@ -18,6 +18,7 @@ use utoipa::ToSchema;
 use crate::error::{core_api_error, ApiError, ErrorClass};
 use crate::state::AppState;
 use izwi_core::model::download::{download_disk_required_bytes, DownloadState};
+use izwi_core::runtime_models::architectures::chatterbox::ChatterboxEdition;
 use izwi_core::{
     parse_model_variant, removed_model_variant, ChatModelCapabilities, ChatReasoningEffort,
     ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
@@ -145,6 +146,16 @@ pub struct AdminSpeechModelCapabilities {
     /// `cfg_weight`, `min_p`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<AdminSpeechControlRange>,
+    /// The only languages a speech request may name in `language`, for a
+    /// model that refuses others (Chatterbox); absent, `language` is a hint.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<AdminSpeechLanguage>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminSpeechLanguage {
+    pub code: &'static str,
+    pub name: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -278,7 +289,9 @@ impl AdminModelInfo {
             batch_capabilities: AdminModelBatchCapabilities::from_variant(variant),
             chat_capabilities: info.chat_capabilities.map(AdminChatModelCapabilities::from),
             speech_capabilities: info.speech_capabilities.map(|capabilities| {
-                AdminSpeechModelCapabilities::from(capabilities).with_controls(variant)
+                AdminSpeechModelCapabilities::from(capabilities)
+                    .with_controls(variant)
+                    .with_languages(variant)
             }),
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
@@ -355,6 +368,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
             controls: Vec::new(),
+            languages: Vec::new(),
         }
     }
 }
@@ -370,6 +384,16 @@ impl AdminSpeechModelCapabilities {
                 max: range.max,
                 default: range.default,
             })
+            .collect();
+        self
+    }
+
+    fn with_languages(mut self, variant: ModelVariant) -> Self {
+        self.languages = ChatterboxEdition::of(variant)
+            .map(ChatterboxEdition::languages)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(code, name)| AdminSpeechLanguage { code, name })
             .collect();
         self
     }
@@ -1242,6 +1266,33 @@ mod tests {
             AdminModelRouteCapabilities::from_variant(ModelVariant::Qwen3Tts12Hz06BBase)
                 .openai_audio_speech
         );
+    }
+
+    /// Chatterbox lists the languages it accepts so a client can offer
+    /// them; a model that takes `language` as a hint lists none.
+    #[test]
+    fn speech_capabilities_list_chatterbox_languages() {
+        let languages = |variant: ModelVariant| {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                ["languages"]
+                .clone()
+        };
+        assert_eq!(
+            languages(ModelVariant::Chatterbox500M),
+            serde_json::json!([{ "code": "en", "name": "English" }])
+        );
+        let multilingual = languages(ModelVariant::ChatterboxMultilingual500M);
+        let codes = multilingual
+            .as_array()
+            .expect("languages")
+            .iter()
+            .map(|language| language["code"].as_str().expect("code"))
+            .collect::<Vec<_>>();
+        assert_eq!(codes.len(), 21);
+        assert!(codes.contains(&"sw") && codes.contains(&"en"));
+        assert!(!codes.contains(&"zh") && !codes.contains(&"ja"));
+        assert!(languages(ModelVariant::Kokoro82M).is_null());
     }
 
     /// P1.0: naming a removed variant (CLI `pull` reads it through this

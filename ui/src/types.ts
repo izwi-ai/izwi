@@ -63,6 +63,7 @@ export function isChatterboxVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
     normalized === "chatterbox-500m" ||
+    normalized === "chatterbox-multilingual-500m" ||
     normalized === "resembleai/chatterbox" ||
     normalized === "chatterbox"
   );

@@ -13,6 +13,14 @@ export interface SpeechModelCapabilities {
   supports_auto_long_form: boolean;
   /** Model-specific controls a request may set (Chatterbox). */
   controls?: SpeechControlRange[];
+  /** The only languages a request may name, for a model that refuses
+   * others (Chatterbox); absent, `language` is a hint. */
+  languages?: SpeechLanguage[];
+}
+
+export interface SpeechLanguage {
+  code: string;
+  name: string;
 }
 
 export type SpeechControlId = "exaggeration" | "cfg_weight" | "min_p";

@@ -518,6 +518,21 @@
         ],
         "type": "object"
       },
+      "AdminSpeechLanguage": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "name"
+        ],
+        "type": "object"
+      },
       "AdminSpeechModelCapabilities": {
         "properties": {
           "built_in_voice_count": {
@@ -531,6 +546,13 @@
             "description": "Model-specific controls a speech request may set, each with its\nrange and the model's default (Chatterbox: `exaggeration`,\n`cfg_weight`, `min_p`).",
             "items": {
               "$ref": "#/components/schemas/AdminSpeechControlRange"
+            },
+            "type": "array"
+          },
+          "languages": {
+            "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox); absent, `language` is a hint.",
+            "items": {
+              "$ref": "#/components/schemas/AdminSpeechLanguage"
             },
             "type": "array"
           },

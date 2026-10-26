@@ -29,6 +29,7 @@ pub struct TtsArgs {
     pub format: AudioFormat,
     pub speed: Option<f32>,
     pub temperature: Option<f32>,
+    pub language: Option<String>,
     pub exaggeration: Option<f32>,
     pub cfg_weight: Option<f32>,
     pub min_p: Option<f32>,
@@ -59,6 +60,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         format,
         speed,
         temperature,
+        language,
         exaggeration,
         cfg_weight,
         min_p,
@@ -101,6 +103,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         format: &format,
         speed,
         temperature,
+        language,
         controls: SpeechControls {
             exaggeration,
             cfg_weight,
@@ -293,6 +296,7 @@ struct BuildRequestArgs<'a> {
     format: &'a AudioFormat,
     speed: Option<f32>,
     temperature: Option<f32>,
+    language: Option<String>,
     controls: SpeechControls,
     stream: bool,
 }
@@ -329,6 +333,9 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     }
     if let Some(temperature) = args.temperature {
         request_body["temperature"] = json!(temperature);
+    }
+    if let Some(language) = normalize_optional_text(args.language) {
+        request_body["language"] = Value::String(language);
     }
     let controls = args.controls;
     for (name, value) in [
@@ -505,6 +512,7 @@ mod tests {
                 format,
                 speed: None,
                 temperature: None,
+                language: None,
                 controls: SpeechControls::default(),
                 stream: false,
             })
@@ -571,6 +579,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: None,
             temperature: None,
+            language: None,
             controls: SpeechControls::default(),
             stream: true,
         })
@@ -593,6 +602,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: None,
             temperature: None,
+            language: None,
             controls: SpeechControls {
                 exaggeration: Some(0.8),
                 cfg_weight: Some(0.0),
@@ -620,6 +630,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -647,6 +658,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -675,6 +687,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: None,
             temperature: None,
+            language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -698,6 +711,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            language: None,
             controls: SpeechControls::default(),
             stream: false,
         })

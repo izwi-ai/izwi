@@ -404,6 +404,11 @@ pub enum Commands {
         #[arg(short, long)]
         temperature: Option<f32>,
 
+        /// Language of the text: a code or name (Chatterbox Multilingual,
+        /// e.g. `fr` or `French`; Qwen3-TTS takes names such as `English`)
+        #[arg(long)]
+        language: Option<String>,
+
         /// Emotion intensity, 0 to 2 (Chatterbox; its default is 0.5)
         #[arg(long)]
         exaggeration: Option<f32>,
