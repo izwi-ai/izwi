@@ -403,6 +403,19 @@ pub enum Commands {
         #[arg(short, long)]
         temperature: Option<f32>,
 
+        /// Emotion intensity, 0 to 2 (Chatterbox; its default is 0.5)
+        #[arg(long)]
+        exaggeration: Option<f32>,
+
+        /// Classifier-free guidance weight, 0 to 1; 0 turns guidance off
+        /// (Chatterbox; its default is 0.5)
+        #[arg(long)]
+        cfg_weight: Option<f32>,
+
+        /// Min-p sampling threshold, 0 to 1 (Chatterbox; its default is 0.05)
+        #[arg(long)]
+        min_p: Option<f32>,
+
         /// Stream the audio as it is generated and write it to a WAV file
         /// (reports the time to first audio)
         #[arg(long)]

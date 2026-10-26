@@ -29,8 +29,20 @@ pub struct TtsArgs {
     pub format: AudioFormat,
     pub speed: Option<f32>,
     pub temperature: Option<f32>,
+    pub exaggeration: Option<f32>,
+    pub cfg_weight: Option<f32>,
+    pub min_p: Option<f32>,
     pub stream: bool,
     pub play: bool,
+}
+
+/// Model-specific speech controls; each is sent only when set, and the
+/// server refuses one the model does not support.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SpeechControls {
+    exaggeration: Option<f32>,
+    cfg_weight: Option<f32>,
+    min_p: Option<f32>,
 }
 
 pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
@@ -47,6 +59,9 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         format,
         speed,
         temperature,
+        exaggeration,
+        cfg_weight,
+        min_p,
         stream,
         play,
     } = args;
@@ -86,6 +101,11 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         format: &format,
         speed,
         temperature,
+        controls: SpeechControls {
+            exaggeration,
+            cfg_weight,
+            min_p,
+        },
         stream,
     })?;
 
@@ -273,6 +293,7 @@ struct BuildRequestArgs<'a> {
     format: &'a AudioFormat,
     speed: Option<f32>,
     temperature: Option<f32>,
+    controls: SpeechControls,
     stream: bool,
 }
 
@@ -306,6 +327,16 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     }
     if let Some(temperature) = args.temperature {
         request_body["temperature"] = json!(temperature);
+    }
+    let controls = args.controls;
+    for (name, value) in [
+        ("exaggeration", controls.exaggeration),
+        ("cfg_weight", controls.cfg_weight),
+        ("min_p", controls.min_p),
+    ] {
+        if let Some(value) = value {
+            request_body[name] = json!(value);
+        }
     }
 
     if let Some(speaker) = normalize_optional_text(args.speaker) {
@@ -472,6 +503,7 @@ mod tests {
                 format,
                 speed: None,
                 temperature: None,
+                controls: SpeechControls::default(),
                 stream: false,
             })
             .expect("request body")
@@ -537,11 +569,39 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: None,
             temperature: None,
+            controls: SpeechControls::default(),
             stream: true,
         })
         .expect("request body");
         assert!(body.get("speed").is_none() && body.get("temperature").is_none());
         assert_eq!(body["response_format"], "pcm");
+    }
+
+    #[test]
+    fn speech_controls_are_sent_only_when_set() {
+        let body = build_request_body(BuildRequestArgs {
+            model: "Chatterbox-500M".to_string(),
+            text: "hello".to_string(),
+            speaker: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            controls: SpeechControls {
+                exaggeration: Some(0.8),
+                cfg_weight: Some(0.0),
+                min_p: None,
+            },
+            stream: false,
+        })
+        .expect("request body");
+        assert_eq!(body["exaggeration"], json!(0.8f32));
+        assert_eq!(body["cfg_weight"], json!(0.0f32));
+        assert!(body.get("min_p").is_none());
     }
 
     #[test]
@@ -558,6 +618,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            controls: SpeechControls::default(),
             stream: false,
         })
         .expect("request body");
@@ -584,6 +645,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            controls: SpeechControls::default(),
             stream: false,
         })
         .expect("request body");
@@ -607,6 +669,7 @@ mod tests {
             format: &AudioFormat::Wav,
             speed: Some(1.0),
             temperature: Some(0.7),
+            controls: SpeechControls::default(),
             stream: false,
         })
         .expect_err("partial reference should fail");
