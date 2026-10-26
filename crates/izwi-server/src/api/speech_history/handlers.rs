@@ -1655,7 +1655,10 @@ async fn hydrate_batch_reference_audio(
     claimed: &ClaimedStage,
     request: &mut CreateSpeechHistoryRecordRequest,
 ) -> anyhow::Result<()> {
-    if request.reference_audio.is_some() || request.reference_text.is_none() {
+    // Enqueueing stores every reference's audio as an input artifact and
+    // drops it from the request; a reference may come without a transcript
+    // (Chatterbox), so the artifact, not the transcript, says there is one.
+    if request.reference_audio.is_some() {
         return Ok(());
     }
 
@@ -1693,7 +1696,11 @@ async fn hydrate_batch_reference_audio(
         return Ok(());
     }
 
-    anyhow::bail!("TTS batch request is missing its reference-audio input artifact")
+    anyhow::ensure!(
+        request.reference_text.is_none() && request.saved_voice_id.is_none(),
+        "TTS batch request is missing its reference-audio input artifact"
+    );
+    Ok(())
 }
 
 async fn publish_speech_audio_runtime_artifact(
