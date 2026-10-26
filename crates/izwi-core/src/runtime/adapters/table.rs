@@ -241,13 +241,22 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
-        // Final-only: the acoustic stage renders the whole utterance.
+        // A stream renders windows while T3 runs; otherwise the acoustic
+        // stage renders the whole utterance once T3 has stopped.
         row(
             F::ChatterboxTts,
             C::Tts,
             Loaded::ChatterboxTts,
             RetainedAndInvocation,
-        ),
+        )
+        .chunked(),
+        row(
+            F::ChatterboxTts,
+            C::StreamingTts,
+            Loaded::ChatterboxTts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
         row(
             F::FishS2Tts,
             C::StreamingTts,

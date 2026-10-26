@@ -540,16 +540,28 @@ mod tests {
         }
     }
 
+    /// Streaming is refused only where the model's capabilities say it
+    /// cannot stream.
     #[test]
-    fn final_only_models_refuse_streaming() {
-        assert!(validate_speech_streaming(ModelVariant::Chatterbox500M, false).is_ok());
-        let error = validate_speech_streaming(ModelVariant::Chatterbox500M, true).unwrap_err();
-        assert!(
-            error.message.contains("does not support streaming"),
-            "{}",
-            error.message
-        );
-        assert!(validate_speech_streaming(ModelVariant::Kokoro82M, true).is_ok());
+    fn streaming_follows_the_model_capability() {
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.is_enabled())
+        {
+            let Some(capabilities) = variant.speech_capabilities() else {
+                continue;
+            };
+            assert!(validate_speech_streaming(variant, false).is_ok(), "{variant}");
+            match validate_speech_streaming(variant, true) {
+                Ok(()) => assert!(capabilities.supports_streaming, "{variant}"),
+                Err(error) => {
+                    assert!(!capabilities.supports_streaming, "{variant}");
+                    assert!(error.message.contains("does not support streaming"));
+                }
+            }
+        }
+        assert!(validate_speech_streaming(ModelVariant::Chatterbox500M, true).is_ok());
     }
 
     #[test]

@@ -107,11 +107,12 @@ def family_cases(family, reference):
             ("med", "med", {"voice": "casual_male"}, False),
         ],
         "fish": [("short", "short", clone, False)],
-        # Final-only: no streaming case. "long" exercises automatic long form,
-        # "clone" cloning from reference audio alone.
+        # "long" exercises automatic long form, "clone" cloning from reference
+        # audio alone, "med_stream" windowed streaming.
         "chatterbox": [
             ("short", "short", {"voice": "default"}, False),
             ("med", "med", {"voice": "default"}, False),
+            ("med_stream", "med", {"voice": "default"}, True),
             ("num", "num", {"voice": "default"}, False),
             ("long", "long", {"voice": "default"}, False),
             ("clone", "med", {"reference_audio": reference[0]}, False),

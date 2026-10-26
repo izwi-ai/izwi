@@ -932,7 +932,7 @@ impl ModelVariant {
                 supports_reference_voice: true,
                 reference_transcript_required: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
@@ -1824,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn chatterbox_exposes_default_voice_and_audio_only_clones_final_only() {
+    fn chatterbox_exposes_default_voice_audio_only_clones_and_streaming() {
         let variant = ModelVariant::Chatterbox500M;
         assert!(variant.is_tts());
         assert!(variant.is_enabled());
@@ -1867,7 +1867,7 @@ mod tests {
                 supports_reference_voice: true,
                 reference_transcript_required: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             })

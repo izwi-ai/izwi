@@ -908,6 +908,7 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::VoxtralTts
                     | izwi_core::catalog::ModelFamily::VibeVoiceTts
                     | izwi_core::catalog::ModelFamily::FishS2Tts
+                    | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Lfm25Audio => variant,
                     other => bail!(
                         "realtime text_to_speech workers support only TTS synthesis families; {model} is {other:?}"

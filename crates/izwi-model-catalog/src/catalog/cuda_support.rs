@@ -490,7 +490,7 @@ impl ModelVariant {
             ),
             ModelFamily::ChatterboxTts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
-                "Chatterbox uses dense Candle CUDA tensor kernels for the T3 Llama decoder (both guidance branches on izwi's paged KV), the S3Gen Conformer encoder and flow-matching U-Net, and the HiFT vocoder; the vocoder's harmonic source and the request noise are synthesised on the host; generation is final-only",
+                "Chatterbox uses dense Candle CUDA tensor kernels for the T3 Llama decoder (both guidance branches on izwi's paged KV), the S3Gen Conformer encoder and flow-matching U-Net, and the HiFT vocoder; the vocoder's harmonic source and the request noise are synthesised on the host; a stream renders windows while T3 runs, each re-running the S3Gen flow over the reference prompt",
             ),
             ModelFamily::VibeVoiceTts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,

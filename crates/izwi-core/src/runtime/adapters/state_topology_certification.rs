@@ -98,8 +98,9 @@ fn certified_topology(
         (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
         // Chatterbox retains one page domain per guidance branch (each its
-        // own group and arena); the acoustic stage leases scratch only.
-        (ChatterboxTts, Tts) => RetainedPagedPagedAndInvocationScratch,
+        // own group and arena); the acoustic stage, whole or windowed,
+        // leases scratch only.
+        (ChatterboxTts, Tts | StreamingTts) => RetainedPagedPagedAndInvocationScratch,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.

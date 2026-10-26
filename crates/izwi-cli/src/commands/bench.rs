@@ -5472,8 +5472,17 @@ mod tests {
 
     #[test]
     fn final_only_tts_models_are_recognised_from_their_capabilities() {
-        assert!(tts_model_is_final_only("Chatterbox-500M"));
-        assert!(!tts_model_is_final_only("Kokoro-82M"));
+        for variant in izwi_core::ModelVariant::all() {
+            let Some(capabilities) = variant.speech_capabilities() else {
+                continue;
+            };
+            assert_eq!(
+                tts_model_is_final_only(&variant.to_string()),
+                !capabilities.supports_streaming,
+                "{variant}"
+            );
+        }
+        assert!(!tts_model_is_final_only("Chatterbox-500M"));
         assert!(!tts_model_is_final_only("not-a-model"));
     }
 

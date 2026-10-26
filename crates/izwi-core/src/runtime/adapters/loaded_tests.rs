@@ -1070,14 +1070,17 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         && variant.family() == crate::catalog::ModelFamily::KokoroTts;
                     let fish_s2_tts = FishS2PhysicalTtsAdapterFactory
                         .supports(execution.metadata(), BackendKind::Cpu);
-                    let retained_tts = execution.metadata().capability == CapabilityKind::Tts
+                    let retained_tts = (execution.metadata().capability == CapabilityKind::Tts
                         && matches!(
                             variant.family(),
                             crate::catalog::ModelFamily::Lfm25Audio
                                 | crate::catalog::ModelFamily::VibeVoiceTts
                                 | crate::catalog::ModelFamily::VoxtralTts
                                 | crate::catalog::ModelFamily::ChatterboxTts
-                        );
+                        ))
+                        // Chatterbox streams on the same retained graph.
+                        || (execution.metadata().capability == CapabilityKind::StreamingTts
+                            && variant.family() == crate::catalog::ModelFamily::ChatterboxTts);
                     let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
                     let nemotron_realtime = execution.metadata().capability

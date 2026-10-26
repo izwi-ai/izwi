@@ -467,9 +467,11 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
-        if streaming.model_native {
+        // One graph serves both: a streamed request's acoustic quanta render
+        // windows while T3 runs and stage each window's samples.
+        if streaming.model_native && self.metadata.streaming_mode == StreamingMode::None {
             return Err(Error::InvalidInput(format!(
-                "Model {} has no native streaming TTS contract; it renders whole utterances",
+                "Model {} has no native streaming TTS contract",
                 self.metadata.model_variant
             )));
         }
@@ -550,7 +552,8 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         finalize.max_work_units = 1;
         finalize.max_workspace_bytes = 0;
         // One acoustic unit per quantum: the S3Gen encoder, an Euler step,
-        // or HiFT, so other requests' quanta run between them.
+        // or HiFT (of the whole utterance or of a streamed window), so other
+        // requests' quanta run between them.
         let mut acoustic = StageDescriptor::from_execution_profile(
             StageId::new(4),
             "tts.acoustic.chatterbox.scalar",

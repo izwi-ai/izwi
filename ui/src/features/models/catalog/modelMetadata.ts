@@ -224,6 +224,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Text to Speech",
       "Voice Cloning",
       "Exaggeration",
+      "Streaming",
       "Watermarked",
       "24 kHz",
     ],
