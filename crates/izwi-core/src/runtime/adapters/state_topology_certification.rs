@@ -58,7 +58,39 @@ impl CertifiedTopology {
             | Self::InvocationTensorStatic => InferenceStateRequirement::Invocation,
         }
     }
+
+    /// Whether the route retains paged K/V between requests.
+    const fn retains_pages(self) -> bool {
+        match self {
+            Self::RetainedPaged
+            | Self::RetainedPagedRing
+            | Self::RetainedPagedRotatingAndInvocationScratch
+            | Self::RetainedPagedAndInvocationScratch
+            | Self::RetainedPagedPagedAndInvocationScratch
+            | Self::RetainedPagedTensorAndInvocationPaged
+            | Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor
+            | Self::RetainedPagedAndInvocationPagedTensor
+            | Self::RetainedPagedAndInvocationPaged
+            | Self::RetainedPagedRingAndInvocationPagedRing
+            | Self::RetainedPagedStaticAndInvocationPagedStatic
+            | Self::RetainedPagedTensorTensor => true,
+            Self::Stateless
+            | Self::RetainedTensorAndInvocationTensor
+            | Self::RetainedAppendRingTensor
+            | Self::InvocationPaged
+            | Self::InvocationPagedRing
+            | Self::InvocationTensor
+            | Self::InvocationTensorStatic => false,
+        }
+    }
 }
+
+/// Retained-page routes whose lifecycle allocator loads managed state without
+/// the rollout provider-eligibility check.
+const UNCHECKED_RETAINED_PAGE_ROUTES: &[(ModelFamily, CapabilityKind)] = &[
+    (ModelFamily::WhisperAsr, CapabilityKind::Asr),
+    (ModelFamily::Voxtral, CapabilityKind::RealtimeAsr),
+];
 
 fn certified_topology(
     variant: ModelVariant,
@@ -184,6 +216,54 @@ fn every_enabled_catalog_backend_route_has_an_explicit_state_topology() {
     }
 
     assert!(certified_cells > 0, "certification matrix was empty");
+}
+
+#[test]
+fn every_checked_retained_page_route_passes_managed_provider_eligibility() {
+    // A route the rollout allowlist omits fails every load with "managed KV
+    // provider route is not validated", so a new retained-page family must
+    // either join the allowlist or be listed as unchecked above.
+    let plan = crate::backends::state::negotiate_state_plan(
+        &crate::kv::v2::test_contract(),
+        &crate::backends::state::StateBackendPlanRequest {
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            page_tokens_hint: Some(16),
+            storage_dtype_hint: None,
+        },
+    )
+    .unwrap();
+    let registry = RuntimeAdapterRegistry::built_in();
+    let mut checked_routes = 0usize;
+
+    for variant in ModelVariant::all().iter().copied() {
+        if !variant.is_enabled() {
+            continue;
+        }
+        for metadata in registry.capabilities_for(variant) {
+            let retains_pages = certified_topology(variant, metadata.capability)
+                .is_some_and(CertifiedTopology::retains_pages);
+            if !retains_pages
+                || UNCHECKED_RETAINED_PAGE_ROUTES.contains(&(variant.family(), metadata.capability))
+            {
+                continue;
+            }
+            crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                variant,
+                metadata.capability,
+                &plan,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "retained-page route {variant}/{:?} cannot load: {error}",
+                    metadata.capability
+                )
+            });
+            checked_routes += 1;
+        }
+    }
+
+    assert!(checked_routes > 0, "no retained-page route was checked");
 }
 
 #[test]
