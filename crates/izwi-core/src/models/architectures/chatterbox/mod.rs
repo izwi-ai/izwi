@@ -14,6 +14,7 @@ pub mod config;
 pub mod hift;
 mod model;
 pub mod noise;
+pub mod perth;
 mod physical;
 pub mod reference;
 pub mod reference_dsp;
@@ -26,6 +27,10 @@ mod weights;
 
 #[cfg(test)]
 mod clone_reference_tests;
+#[cfg(test)]
+mod fixture_support;
+#[cfg(test)]
+mod perth_reference_tests;
 #[cfg(test)]
 mod reference_tests;
 

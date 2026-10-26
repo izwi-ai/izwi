@@ -119,7 +119,7 @@ pub fn trim_silence(input: &[f32], top_db: f32) -> &[f32] {
 }
 
 /// Periodic Hann (`torch.hann_window`, `scipy.signal.get_window("hann")`).
-fn hann_periodic(n: usize) -> Vec<f64> {
+pub(crate) fn hann_periodic(n: usize) -> Vec<f64> {
     (0..n)
         .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
         .collect()
@@ -206,7 +206,7 @@ fn power_frames(signal: &[f32], n_fft: usize, hop: usize, power: i32) -> Vec<Vec
 }
 
 /// Reflect padding of `pad` samples each side (numpy/torch "reflect").
-fn reflect_pad(input: &[f32], pad: usize) -> Vec<f32> {
+pub(crate) fn reflect_pad(input: &[f32], pad: usize) -> Vec<f32> {
     let n = input.len();
     let mut out = Vec::with_capacity(n + 2 * pad);
     for i in (1..=pad).rev() {
