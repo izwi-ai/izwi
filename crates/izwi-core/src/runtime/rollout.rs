@@ -108,6 +108,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
             | (ModelFamily::VibeVoiceTts, CapabilityKind::Tts)
+            | (ModelFamily::VoxtralTts, CapabilityKind::Tts)
             | (
                 ModelFamily::FishS2Tts,
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
@@ -295,6 +296,15 @@ mod tests {
             validate_managed_state_plan_eligibility(
                 ModelVariant::GraniteSpeech412BPlus,
                 CapabilityKind::Asr,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Voxtral4BTts2603,
+                CapabilityKind::Tts,
                 &plan,
             )
             .unwrap(),
