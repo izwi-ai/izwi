@@ -1128,6 +1128,40 @@ mod tests {
         assert_eq!(chunks.len(), 1);
     }
 
+    /// Chatterbox speaks at most 1,000 speech tokens (40 s) per request, so
+    /// text whose automatic budget reaches that splits between sentences
+    /// and each segment gets its own budget below the cap.
+    #[test]
+    fn chatterbox_splits_text_one_request_cannot_finish() {
+        let variant = ModelVariant::Chatterbox500M;
+        let sentence = "The committee reviewed every proposal in detail before the vote. ";
+        let short = sentence.repeat(3);
+        assert!(!crate::api::tts_policy::tts_text_exceeds_one_request(
+            variant, &short
+        ));
+        let request = GenerationRequest::new(short).with_model_variant(variant);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&request, variant).len(),
+            1
+        );
+
+        let long = sentence.repeat(20);
+        assert!(crate::api::tts_policy::tts_text_exceeds_one_request(
+            variant, &long
+        ));
+        let request = GenerationRequest::new(long).with_model_variant(variant);
+        let planned = expand_generation_requests_for_long_form(&request, variant);
+        assert!(planned.len() > 1);
+        for chunk in &planned {
+            assert!(chunk.text.starts_with("The committee") && chunk.text.ends_with("vote."));
+            let budget = chunk.config.options.max_tokens;
+            assert!(
+                budget > 0 && budget < ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
+                "segment budget {budget}"
+            );
+        }
+    }
+
     #[test]
     fn non_qwen_variant_stays_single_chunk() {
         let chunks =
