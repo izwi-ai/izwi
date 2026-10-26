@@ -46,13 +46,16 @@ pub use config::{
     T3Config, CHATTERBOX_DEFAULTS, S3GEN_SAMPLE_RATE,
 };
 pub use model::{
-    ChatterboxTtsDiagnostics, ChatterboxTtsModel, CHATTERBOX_DEFAULT_VOICE,
-    CHATTERBOX_REFERENCE_VOICE_CACHE,
+    chatterbox_t3_precision, ChatterboxTtsDiagnostics, ChatterboxTtsModel,
+    CHATTERBOX_DEFAULT_VOICE, CHATTERBOX_REFERENCE_VOICE_CACHE,
 };
 pub(crate) use physical::{CHATTERBOX_COND_DOMAIN, CHATTERBOX_UNCOND_DOMAIN};
 pub use sampling::T3SamplingParams;
 
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use hift::HiftVocoder;
 use noise::{NoiseStream, SplitMix64};
@@ -88,7 +91,9 @@ pub struct ChatterboxRuntime {
     watermarker: Option<PerthWatermarker>,
     default_voice: ChatterboxPreparedVoice,
     device: Device,
-    dtype: DType,
+    /// T3's weights, activations and retained K/V; every other network
+    /// runs in F32.
+    t3_dtype: DType,
 }
 
 /// A voice embedded for both networks, shared by every request using it.
@@ -174,9 +179,14 @@ pub struct ChatterboxGenerationOutput {
 }
 
 impl ChatterboxRuntime {
-    /// Load the networks in `model_dir`; with `watermark`, also PerTh, whose
-    /// checkpoint must then be there.
-    pub fn load(model_dir: &Path, device: &Device, dtype: DType, watermark: bool) -> Result<Self> {
+    /// Load the networks in `model_dir`, T3 in `t3_dtype` and the rest in
+    /// F32; with `watermark`, also PerTh, whose checkpoint must then be there.
+    pub fn load(
+        model_dir: &Path,
+        device: &Device,
+        t3_dtype: DType,
+        watermark: bool,
+    ) -> Result<Self> {
         let t3_cfg = T3Config::english();
         let tokenizer = ChatterboxTextTokenizer::load(
             &model_dir.join(config::TOKENIZER_FILE),
@@ -184,15 +194,18 @@ impl ChatterboxRuntime {
             t3_cfg.stop_text_token,
         )?;
         let t3_vb =
-            weights::mmap_safetensors(&model_dir.join(config::T3_WEIGHTS_FILE), dtype, device)?;
+            weights::mmap_safetensors(&model_dir.join(config::T3_WEIGHTS_FILE), t3_dtype, device)?;
         let t3 = T3Model::load(t3_cfg, t3_vb)?;
-        let s3gen_vb =
-            weights::mmap_safetensors(&model_dir.join(config::S3GEN_WEIGHTS_FILE), dtype, device)?;
+        let s3gen_vb = weights::mmap_safetensors(
+            &model_dir.join(config::S3GEN_WEIGHTS_FILE),
+            DType::F32,
+            device,
+        )?;
         let flow = S3GenFlow::load(S3GenConfig::current(), s3gen_vb.clone())?;
         let vocoder = HiftVocoder::load(HiftConfig::current(), s3gen_vb.pp("mel2wav"))?;
         let ve_vb = weights::mmap_safetensors(
             &model_dir.join(config::VOICE_ENCODER_WEIGHTS_FILE),
-            dtype,
+            DType::F32,
             device,
         )?;
         let reference = ChatterboxReferenceEncoders::load(ve_vb, s3gen_vb)?;
@@ -224,8 +237,57 @@ impl ChatterboxRuntime {
             watermarker,
             default_voice,
             device: device.clone(),
-            dtype,
+            t3_dtype,
         })
+    }
+
+    /// The load-time check of a T3 below F32: the default voice at the
+    /// largest exaggeration, a guided prefill of a fixed sentence and a few
+    /// greedy decode steps on probe caches. Every probed tensor must be
+    /// finite and inside F16's safe range, or T3 reloads in F32.
+    pub fn numeric_self_check(&self) -> NumericSelfCheckReport {
+        const TEXT: &str = "The quick brown fox jumps over the lazy dog, twice!";
+        const STEPS: usize = 4;
+        run_numeric_self_check(
+            format!("Chatterbox T3 {:?}", self.t3_dtype),
+            F16_SAFE_MAX_ABS,
+            || -> Result<Vec<(String, Tensor)>> {
+                let cfg = self.t3.config();
+                let text_ids = self.tokenizer.text_sequence(TEXT)?;
+                let capacity = self.sequence_tokens(text_ids.len(), STEPS + 2);
+                let scratch = || {
+                    PhysicalPagedKvCache::scratch_for_probe(
+                        &self.device,
+                        self.t3_dtype,
+                        cfg.num_hidden_layers,
+                        cfg.num_attention_heads,
+                        cfg.head_dim,
+                        capacity,
+                    )
+                };
+                let (mut cond_cache, mut uncond_cache) = (scratch()?, scratch()?);
+                let conditioning = self.t3.conditioning(&self.default_voice.t3, 2.0)?;
+                let (cond, uncond) = self.t3.prefill_embeds(&conditioning, &text_ids, true)?;
+                let mut logits =
+                    self.forward_pair(cond, uncond, &mut cond_cache, Some(&mut uncond_cache))?;
+                let mut probed = vec![
+                    ("conditioning".to_string(), conditioning),
+                    ("prefill logits".to_string(), logits.clone()),
+                ];
+                for step in 0..STEPS {
+                    let token = logits.get(0)?.argmax(0)?.to_scalar::<u32>()?;
+                    let embed = self.t3.speech_step_embed(token, step + 1)?;
+                    logits = self.forward_pair(
+                        embed.clone(),
+                        Some(embed),
+                        &mut cond_cache,
+                        Some(&mut uncond_cache),
+                    )?;
+                }
+                probed.push(("decode logits".to_string(), logits));
+                Ok(probed)
+            },
+        )
     }
 
     /// Whether rendered audio carries the PerTh watermark.
@@ -241,8 +303,8 @@ impl ChatterboxRuntime {
         &self.device
     }
 
-    pub fn dtype(&self) -> DType {
-        self.dtype
+    pub fn t3_dtype(&self) -> DType {
+        self.t3_dtype
     }
 
     pub fn t3(&self) -> &T3Model {

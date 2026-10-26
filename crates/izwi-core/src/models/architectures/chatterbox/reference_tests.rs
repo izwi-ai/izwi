@@ -633,6 +633,144 @@ fn chatterbox_matches_the_f32_reference_on_metal() {
     );
 }
 
+/// T3 in F16 (the Metal policy) against T3 in F32 on the same device,
+/// teacher-forced on upstream's sampled tokens: each guidance row's argmax
+/// and the sampler's processed (guided, penalised) argmax must match F32's
+/// except where F32's top two are within `NEAR_TIE`, and the load-time
+/// self-check must pass.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the Chatterbox checkpoint (IZWI_CHATTERBOX_MODEL_DIR)"]
+fn t3_f16_tracks_f32_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    const NEAR_TIE: f32 = 0.25;
+    let _lease = crate::backends::metal_test_device_or_skip("t3_f16_tracks_f32_on_metal");
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let device = profile.device.clone();
+    let fixture = fixture();
+    let fx = &fixture.t3;
+    let dir = model_dir();
+    let voice = ChatterboxVoice::load_default(&dir.join(config::DEFAULT_VOICE_FILE)).unwrap();
+
+    // Both rows' logits at the prefill and after each teacher-forced token.
+    let run = |dtype: DType| -> Vec<Vec<Vec<f32>>> {
+        let vb =
+            weights::mmap_safetensors(&dir.join(config::T3_WEIGHTS_FILE), dtype, &device).unwrap();
+        let t3 = t3::T3Model::load(T3Config::english(), vb).unwrap();
+        let cfg = t3.config().clone();
+        let prepared = t3.prepare_voice(&voice.t3).unwrap();
+        let conditioning = t3.conditioning(&prepared, fx.exaggeration).unwrap();
+        let (cond, uncond) = t3
+            .prefill_embeds(&conditioning, &fx.text_ids, true)
+            .unwrap();
+        let capacity = cfg.conditioning_len() + fx.text_ids.len() + 2 + fx.steps.len() + 2;
+        let scratch = || {
+            PhysicalPagedKvCache::scratch_for_probe(
+                &device,
+                dtype,
+                cfg.num_hidden_layers,
+                cfg.num_attention_heads,
+                cfg.head_dim,
+                capacity,
+            )
+            .unwrap()
+        };
+        let (mut cond_cache, mut uncond_cache) = (scratch(), scratch());
+        let mut forward = |cond: Tensor, uncond: Tensor| {
+            t3.forward(&mut [
+                T3ForwardRow {
+                    embeds: cond,
+                    cache: &mut cond_cache,
+                },
+                T3ForwardRow {
+                    embeds: uncond,
+                    cache: &mut uncond_cache,
+                },
+            ])
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+        };
+        let mut positions = vec![forward(cond, uncond.unwrap())];
+        for (index, step) in fx.steps.iter().enumerate() {
+            let embed = t3.speech_step_embed(step.next, index + 1).unwrap();
+            positions.push(forward(embed.clone(), embed));
+        }
+        positions
+    };
+    let reference = run(DType::F32);
+    let lowered = run(DType::F16);
+
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index)
+            .unwrap()
+    };
+    let margin = |values: &[f32]| {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        sorted[0] - sorted[1]
+    };
+    let params = T3SamplingParams {
+        cfg_weight: fx.cfg_weight,
+        ..ChatterboxGenerationParams::defaults(1).sampling
+    };
+    let cfg = T3Config::english();
+    let mut history = vec![cfg.start_speech_token];
+    let (mut rows, mut row_agree, mut guided_agree, mut max_error) = (0, 0, 0, 0f32);
+    let (mut row_exact, mut guided_exact) = (0, 0);
+    for (index, (f32_rows, f16_rows)) in reference.iter().zip(&lowered).enumerate() {
+        assert!(
+            f16_rows.iter().flatten().all(|v| v.is_finite()),
+            "position {index}"
+        );
+        for (a, b) in f32_rows.iter().zip(f16_rows) {
+            rows += 1;
+            row_exact += usize::from(argmax(a) == argmax(b));
+            if argmax(a) == argmax(b) || margin(a) < NEAR_TIE {
+                row_agree += 1;
+            }
+            let top = argmax(a);
+            max_error = max_error.max((a[top] - b[top]).abs());
+        }
+        let guided = |rows: &[Vec<f32>]| {
+            sampling::process_logits(&rows[0], Some(&rows[1]), &history, &params).unwrap()
+        };
+        let (a, b) = (guided(f32_rows), guided(f16_rows));
+        guided_exact += usize::from(argmax(&a) == argmax(&b));
+        if argmax(&a) == argmax(&b) || margin(&a) < NEAR_TIE {
+            guided_agree += 1;
+        }
+        if let Some(step) = fx.steps.get(index) {
+            history.push(step.next);
+        }
+    }
+    let positions = reference.len();
+    eprintln!(
+        "T3 F16 vs F32 on Metal: rows {row_agree}/{rows} ({row_exact} exact), guided \
+         {guided_agree}/{positions} ({guided_exact} exact), max top-1 logit error {max_error:.3}"
+    );
+    assert_eq!(row_agree, rows, "a row argmax flipped outside a near-tie");
+    assert_eq!(
+        guided_agree, positions,
+        "a guided argmax flipped outside a near-tie"
+    );
+    assert!(max_error < 0.5, "top-1 logit error {max_error}");
+
+    let runtime = ChatterboxRuntime::load(&dir, &device, DType::F16, false).unwrap();
+    let report = runtime.numeric_self_check();
+    eprintln!("{}", report.reason);
+    assert!(report.passed, "{}", report.reason);
+}
+
 /// How one Euler step's estimator call scales with rows and frames on
 /// Metal: whether batching acoustic steps across requests would pay.
 /// `batch` counts both guidance rows of each request.

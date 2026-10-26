@@ -20,10 +20,11 @@ use super::{
     config, ChatterboxAcoustic, ChatterboxGenerationParams, ChatterboxPreparedVoice,
     ChatterboxRuntime, S3GEN_SAMPLE_RATE,
 };
-use crate::backends::DeviceProfile;
-use crate::catalog::ModelVariant;
+use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
+use crate::catalog::{ModelFamily, ModelVariant};
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::load_with_precision_fallback;
 use crate::models::shared::attention::paged::default_kv_page_size;
 
 /// The name of the one built-in voice (`conds.pt`).
@@ -58,6 +59,14 @@ pub struct ChatterboxTtsDiagnostics {
     pub watermarked: bool,
 }
 
+/// The dtype T3 loads in on `device`, and why: the device's Chatterbox
+/// policy, which `IZWI_METAL_DTYPE` overrides on Metal.
+pub fn chatterbox_t3_precision(device: &DeviceProfile) -> DTypeSelection {
+    device.resolve_dtype(
+        DTypeSelectionRequest::new(None).with_model_family(ModelFamily::ChatterboxTts),
+    )
+}
+
 impl ChatterboxTtsModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::Chatterbox500M {
@@ -65,14 +74,30 @@ impl ChatterboxTtsModel {
                 "Unsupported Chatterbox variant: {variant}"
             )));
         }
-        // F32 everywhere until the per-component precision gates pass.
         let watermark = crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true);
         if !watermark {
             tracing::warn!(
                 "IZWI_CHATTERBOX_WATERMARK is false: Chatterbox audio is served without its PerTh watermark"
             );
         }
-        let runtime = ChatterboxRuntime::load(model_dir, &device.device, DType::F32, watermark)?;
+        // T3 at the device's Chatterbox dtype (F16 on Metal, BF16 on CUDA
+        // with BF16) when its load-time self-check passes, else F32; every
+        // other network stays F32.
+        let selection = chatterbox_t3_precision(&device);
+        let (runtime, precision) = load_with_precision_fallback(
+            "Chatterbox T3",
+            &selection,
+            true,
+            DType::F32,
+            |t3_dtype| ChatterboxRuntime::load(model_dir, &device.device, t3_dtype, watermark),
+            ChatterboxRuntime::numeric_self_check,
+        )?;
+        tracing::info!(
+            "Chatterbox T3 dtype on {:?}: {:?} ({})",
+            device.kind,
+            precision.loaded,
+            precision.reason
+        );
         let default_voice = Arc::new(runtime.default_voice().clone());
         Ok(Self {
             model_identity: NEXT_CHATTERBOX_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -155,7 +180,7 @@ impl ChatterboxTtsModel {
             model_family: "chatterbox_tts",
             variant: self.variant.to_string(),
             sample_rate: S3GEN_SAMPLE_RATE,
-            dtype: format!("{:?}", self.runtime.dtype()),
+            dtype: format!("{:?}", self.runtime.t3_dtype()),
             context_tokens: self.context_tokens(),
             max_speech_tokens: ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
             watermarked: self.runtime.watermarked(),
@@ -164,7 +189,7 @@ impl ChatterboxTtsModel {
 
     /// Bytes of one retained K/V element.
     pub(crate) fn state_element_bytes(&self) -> usize {
-        self.runtime.dtype().size_in_bytes()
+        self.runtime.t3_dtype().size_in_bytes()
     }
 
     pub(crate) fn physical_state_spec(
@@ -173,7 +198,7 @@ impl ChatterboxTtsModel {
     ) -> Result<ChatterboxPhysicalStateSpec> {
         let retained = chatterbox_retained_contract(
             self.runtime.t3().config(),
-            self.runtime.dtype(),
+            self.runtime.t3_dtype(),
             default_kv_page_size(),
         )?;
         chatterbox_physical_state_spec(stage_graphs, retained, self.context_tokens())

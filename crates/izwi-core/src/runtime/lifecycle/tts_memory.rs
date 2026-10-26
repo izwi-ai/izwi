@@ -28,7 +28,9 @@ use crate::models::architectures::chatterbox::config::{
     S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE, VOICE_ENCODER_WEIGHTS_FILE,
 };
 use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
-use crate::models::architectures::chatterbox::CHATTERBOX_REFERENCE_VOICE_CACHE;
+use crate::models::architectures::chatterbox::{
+    chatterbox_t3_precision, CHATTERBOX_REFERENCE_VOICE_CACHE,
+};
 use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
     KOKORO_MODEL_MEMO_MAX_BYTES,
@@ -88,7 +90,7 @@ pub(super) fn residency_plan(
         ModelFamily::KokoroTts => kokoro_plan(model_path, backend),
         ModelFamily::VibeVoiceTts => vibevoice_tts_plan(model_path, device, backend),
         ModelFamily::VoxtralTts => voxtral_tts_plan(model_path, device, backend),
-        ModelFamily::ChatterboxTts => chatterbox_tts_plan(model_path, backend),
+        ModelFamily::ChatterboxTts => chatterbox_tts_plan(model_path, device, backend),
         _ => Ok(None),
     }
 }
@@ -306,6 +308,7 @@ const CHATTERBOX_VOICE_BYTES: u64 = 1024 * 1024;
 
 fn chatterbox_tts_plan(
     model_path: &Path,
+    device: &DeviceProfile,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = [
@@ -321,7 +324,14 @@ fn chatterbox_tts_plan(
     if crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true) && perth.is_file() {
         files.push(perth_encoder_census(&perth)?);
     }
-    price_chatterbox_tts(&files, backend).map(Some)
+    let t3_dtype = chatterbox_t3_precision(device).dtype;
+    let plan = price_chatterbox_tts(&files, backend, t3_dtype)?;
+    if t3_dtype != DType::F32 {
+        // A T3 that fails its load-time self-check reloads in F32.
+        let dense = price_chatterbox_tts(&files, backend, DType::F32)?;
+        return Ok(Some(plan.with_fallback_peak(&dense)));
+    }
+    Ok(Some(plan))
 }
 
 /// The PerTh encoder's tensors in the checkpoint's `model` state dict (the
@@ -352,31 +362,39 @@ fn perth_encoder_census(checkpoint: &Path) -> Result<CensusFile> {
     })
 }
 
-/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, the
-/// reference encoders a cloned voice needs (voice encoder, S3 tokenizer,
-/// CAMPPlus) and, when it watermarks, the PerTh encoder, read at their
-/// stored F32 and kept F32 on every backend. Left out, as the loader never reads them: T3's
-/// text head, the Llama trunk's own token table and CAMPPlus's batch-norm
-/// step counters. HiFT's weight-norm halves and CAMPPlus's batch norms are
+/// Chatterbox (`chatterbox/model.rs`), read through the staged loader: T3
+/// at `t3_dtype` (on Metal converted on the host), and S3Gen's flow and
+/// HiFT, the reference encoders a cloned voice needs (voice encoder, S3
+/// tokenizer, CAMPPlus) and, when it watermarks, the PerTh encoder at their
+/// stored F32. Left out, as the loader never reads them: T3's text head,
+/// the Llama trunk's own token table and CAMPPlus's batch-norm step
+/// counters. HiFT's weight-norm halves and CAMPPlus's batch norms are
 /// priced whole, a slight overestimate of what they fold into.
-fn price_chatterbox_tts(files: &[CensusFile], backend: BackendKind) -> Result<AsrResidencyPlan> {
+fn price_chatterbox_tts(
+    files: &[CensusFile],
+    backend: BackendKind,
+    t3_dtype: DType,
+) -> Result<AsrResidencyPlan> {
     const UNREAD: [&str; 2] = ["text_head.", "tfmr.embed_tokens."];
-    let mut ledger = Ledger::new(backend);
-    for tensor in files
-        .iter()
-        .flat_map(|file| file.tensors.iter())
-        .filter(|tensor| {
+    let mut ledger = Ledger::staged(backend);
+    for file in files {
+        let dtype = if file.path.ends_with(T3_WEIGHTS_FILE) {
+            t3_dtype
+        } else {
+            DType::F32
+        };
+        for tensor in file.tensors.iter().filter(|tensor| {
             !UNREAD.iter().any(|prefix| tensor.name.starts_with(prefix))
                 && !tensor.name.ends_with(".num_batches_tracked")
-        })
-    {
-        // The PerTh encoder comes through a host buffer, like Kokoro's.
-        let source = if tensor.name.starts_with("perth.") {
-            Source::Copied
-        } else {
-            Source::Mapped
-        };
-        ledger.var(tensor, source, &[DType::F32])?;
+        }) {
+            // The PerTh encoder comes through a host buffer, like Kokoro's.
+            let source = if tensor.name.starts_with("perth.") {
+                Source::Copied
+            } else {
+                Source::Mapped
+            };
+            ledger.var(tensor, source, &[dtype])?;
+        }
     }
     let voices = 1 + CHATTERBOX_REFERENCE_VOICE_CACHE as u64;
     AsrResidencyPlan::from_ledger(ledger, voices * CHATTERBOX_VOICE_BYTES)
@@ -584,9 +602,10 @@ mod tests {
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
     ///   CUDA (5.04 GiB exact); on Metal its fused LM projections are joined
     ///   at their exact size too (5.41 GiB allocated before, from 5.86).
-    /// - Chatterbox is F32 everywhere: T3, S3Gen's flow and HiFT and the
-    ///   reference encoders (all of its files but T3's text head), plus the
-    ///   default voice and 16 cached clones: 2.99 GiB.
+    /// - Chatterbox keeps S3Gen's flow and HiFT and the reference encoders
+    ///   F32 and runs T3 F32 on CPU, F16 on Metal (host-cast) and BF16 on
+    ///   CUDA, plus the default voice and 16 cached clones: 2.99 GiB on CPU,
+    ///   2.00 GiB elsewhere.
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
@@ -619,8 +638,15 @@ mod tests {
             ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.04, 5.04]),
             (
                 "Chatterbox-500M",
-                Box::new(|b| price_chatterbox_tts(&chatterbox, b).unwrap()),
-                [2.99, 2.99, 2.99],
+                Box::new(|b| {
+                    let t3_dtype = match b {
+                        BackendKind::Cpu => DType::F32,
+                        BackendKind::Metal => DType::F16,
+                        BackendKind::Cuda => DType::BF16,
+                    };
+                    price_chatterbox_tts(&chatterbox, b, t3_dtype).unwrap()
+                }),
+                [2.99, 2.00, 2.00],
             ),
         ];
         for (label, plan, [cpu, metal, cuda]) in rows {

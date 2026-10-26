@@ -6,9 +6,12 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
 
 use crate::error::{Error, Result};
+use crate::models::shared::weights::staged::metal_staged_safetensors;
 
 /// A memory-mapped safetensors file as a `VarBuilder` producing `dtype` on
-/// `device`.
+/// `device`, staged on Metal: a tensor stored in another dtype is converted
+/// on the host and uploaded at its exact size, so a lowered T3 never holds
+/// its F32 upload beside the cast.
 pub(crate) fn mmap_safetensors<'a>(
     path: &Path,
     dtype: DType,
@@ -22,7 +25,7 @@ pub(crate) fn mmap_safetensors<'a>(
     }
     // SAFETY: the file is a read-only model artifact izwi verified on download
     // and does not modify while loaded.
-    unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device) }.map_err(|error| {
+    unsafe { metal_staged_safetensors(&[path], dtype, device) }.map_err(|error| {
         Error::ModelLoadError(format!(
             "Failed to map Chatterbox weights {}: {error}",
             path.display()
