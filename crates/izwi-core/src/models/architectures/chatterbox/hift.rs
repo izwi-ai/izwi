@@ -43,6 +43,24 @@ pub struct HiftVocoder {
     window_sq: Vec<f32>,
 }
 
+/// Mel frames a streamed piece shares with the next (CosyVoice2's
+/// `mel_cache_len`): 160 ms vocoded twice and crossfaded.
+pub const STREAM_CACHE_FRAMES: usize = 8;
+
+/// A streamed utterance's vocoder state between pieces.
+pub struct HiftStream {
+    phases: Vec<f32>,
+    /// Each harmonic's accumulated phase, in cycles.
+    cumulative: Vec<f64>,
+    noise: SplitMix64,
+    /// The previous piece's last mel frames, [80, n], and their source.
+    mel_cache: Option<Tensor>,
+    source_cache: Vec<f32>,
+    /// The previous piece's last samples, not yet emitted.
+    tail: Vec<f32>,
+    started: bool,
+}
+
 struct ResBlock {
     convs1: Vec<Conv1d>,
     convs2: Vec<Conv1d>,
@@ -201,30 +219,50 @@ impl HiftVocoder {
     /// The harmonic source at the output rate for per-frame `f0`, from the
     /// request's phase and noise streams.
     pub fn harmonic_source(&self, f0: &[f32], seed: u64) -> Vec<f32> {
-        let cfg = &self.cfg;
-        let factor = cfg.upsample_factor();
-        let len = f0.len() * factor;
-        let harmonics = cfg.harmonics + 1;
-        let sample_rate = super::config::S3GEN_SAMPLE_RATE as f32;
+        let len = f0.len() * self.cfg.upsample_factor();
+        let harmonics = self.cfg.harmonics + 1;
+        let noise = SplitMix64::for_stream(seed, NoiseStream::SourceNoise)
+            .standard_normals(harmonics * len);
+        let phases = self.start_phases(seed);
+        let mut cumulative = vec![0f64; harmonics];
+        self.source_samples(f0, &phases, &mut cumulative, |h, n| noise[h * len + n])
+    }
+
+    /// The source's random start phase per harmonic (the fundamental's is 0).
+    fn start_phases(&self, seed: u64) -> Vec<f32> {
         let mut phases = SplitMix64::for_stream(seed, NoiseStream::HarmonicPhase)
-            .uniforms(harmonics)
+            .uniforms(self.cfg.harmonics + 1)
             .into_iter()
             .map(|u| -std::f32::consts::PI + 2.0 * std::f32::consts::PI * u)
             .collect::<Vec<_>>();
         phases[0] = 0.0;
-        let noise = SplitMix64::for_stream(seed, NoiseStream::SourceNoise)
-            .standard_normals(harmonics * len);
+        phases
+    }
+
+    /// `SineGen` and the learned mix for `f0`, continuing each harmonic's
+    /// accumulated phase in `cumulative`; `noise(h, n)` is harmonic `h`'s
+    /// noise at sample `n`.
+    fn source_samples(
+        &self,
+        f0: &[f32],
+        phases: &[f32],
+        cumulative: &mut [f64],
+        noise: impl Fn(usize, usize) -> f32,
+    ) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let factor = cfg.upsample_factor();
+        let len = f0.len() * factor;
+        let sample_rate = super::config::S3GEN_SAMPLE_RATE as f32;
         let unvoiced_amp = cfg.nsf_alpha / 3.0;
         let two_pi = 2.0 * std::f64::consts::PI as f32;
         let mut mixed = vec![self.source_bias; len];
-        for h in 0..harmonics {
+        for (h, accumulated) in cumulative.iter_mut().enumerate() {
             let weight = self.source_weights[h];
             let multiple = (h + 1) as f32;
-            let mut cumulative = 0f64;
             for (n, slot) in mixed.iter_mut().enumerate() {
                 let f0 = f0[n / factor];
-                cumulative += f64::from(f0 * multiple / sample_rate);
-                let theta = two_pi * (cumulative as f32).rem_euclid(1.0);
+                *accumulated += f64::from(f0 * multiple / sample_rate);
+                let theta = two_pi * (*accumulated as f32).rem_euclid(1.0);
                 let voiced = f0 > cfg.nsf_voiced_threshold;
                 let noise_amp = if voiced { cfg.nsf_sigma } else { unvoiced_amp };
                 let sine = if voiced {
@@ -232,13 +270,79 @@ impl HiftVocoder {
                 } else {
                     0.0
                 };
-                *slot += weight * (sine + noise_amp * noise[h * len + n]);
+                *slot += weight * (sine + noise_amp * noise(h, n));
             }
         }
         for value in &mut mixed {
             *value = value.tanh();
         }
         mixed
+    }
+
+    /// A streamed utterance's vocoder state, seeded like a whole one.
+    pub fn stream(&self, seed: u64) -> HiftStream {
+        HiftStream {
+            phases: self.start_phases(seed),
+            cumulative: vec![0f64; self.cfg.harmonics + 1],
+            noise: SplitMix64::for_stream(seed, NoiseStream::SourceNoise),
+            mel_cache: None,
+            source_cache: Vec::new(),
+            tail: Vec::new(),
+            started: false,
+        }
+    }
+
+    /// Vocode the next mel frames [80, frames] of a stream and return the
+    /// samples that are now settled. The previous piece's last
+    /// [`STREAM_CACHE_FRAMES`] frames are vocoded again ahead of `mel` with
+    /// the source they had, so the source stays continuous, and their
+    /// samples crossfade with the previous piece's held-back tail
+    /// (CosyVoice's `token2wav`, with a power-complementary fade). Unless
+    /// `last`, this piece's own tail is held back for the next one.
+    pub fn vocode_stream(
+        &self,
+        stream: &mut HiftStream,
+        mel: &Tensor,
+        last: bool,
+    ) -> Result<Vec<f32>> {
+        let factor = self.cfg.upsample_factor();
+        let (mel, cached) = match &stream.mel_cache {
+            Some(cache) => (Tensor::cat(&[cache, mel], 1)?, cache.dim(1)?),
+            None => (mel.clone(), 0),
+        };
+        let frames = mel.dim(1)?;
+        let f0 = self.predict_f0(&mel)?;
+        let harmonics = self.cfg.harmonics + 1;
+        let fresh = (frames - cached) * factor;
+        let noise = stream.noise.standard_normals(harmonics * fresh);
+        let mut source = std::mem::take(&mut stream.source_cache);
+        source.extend(self.source_samples(
+            &f0[cached..],
+            &stream.phases,
+            &mut stream.cumulative,
+            |h, n| noise[n * harmonics + h],
+        ));
+        let mut samples = self.decode(&mel, &source)?;
+        let overlap = stream.tail.len().min(samples.len());
+        for (i, (sample, old)) in samples.iter_mut().zip(&stream.tail).enumerate() {
+            let fade_in =
+                0.5 - 0.5 * (std::f32::consts::PI * (i as f32 + 0.5) / overlap as f32).cos();
+            *sample = *sample * fade_in + old * (1.0 - fade_in);
+        }
+        if !stream.started {
+            apply_trim_fade(&mut samples);
+            stream.started = true;
+        }
+        stream.tail.clear();
+        if !last {
+            let keep = STREAM_CACHE_FRAMES.min(frames);
+            stream.mel_cache = Some(mel.narrow(1, frames - keep, keep)?.contiguous()?);
+            stream.source_cache = source[source.len() - keep * factor..].to_vec();
+            stream.tail = samples.split_off(samples.len() - keep * factor);
+        } else {
+            stream.mel_cache = None;
+        }
+        Ok(samples)
     }
 
     /// Samples for `mel` [80, frames] with the request seed.

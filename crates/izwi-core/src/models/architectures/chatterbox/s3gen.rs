@@ -54,6 +54,26 @@ impl S3GenPreparedVoice {
         (self.prompt_mel.elem_count() + self.speaker.elem_count())
             * self.prompt_mel.dtype().size_in_bytes()
     }
+
+    /// The same voice with only the reference's last `tokens` speech tokens
+    /// and their mel frames (two per token); the whole reference when it is
+    /// no longer or its frames do not pair with its tokens.
+    pub fn tail(&self, tokens: usize) -> Result<Self> {
+        let have = self.prompt_tokens.len();
+        if tokens == 0 || tokens >= have || self.prompt_frames != 2 * have {
+            return Ok(self.clone());
+        }
+        let frames = 2 * tokens;
+        Ok(Self {
+            prompt_tokens: self.prompt_tokens[have - tokens..].to_vec(),
+            prompt_mel: self
+                .prompt_mel
+                .narrow(1, self.prompt_frames - frames, frames)?
+                .contiguous()?,
+            prompt_frames: frames,
+            speaker: self.speaker.clone(),
+        })
+    }
 }
 
 /// Inputs of one flow run after the encoder: everything the Euler steps

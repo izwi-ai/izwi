@@ -80,6 +80,23 @@ impl SplitMix64 {
     }
 }
 
+/// Flow noise for absolute mel frames `first..first + frames` of a streamed
+/// utterance, [bins, frames] row-major as `S3GenFlow::begin` takes it. Each
+/// frame draws its `bins` values from a stream of its own, so a frame gets
+/// the same noise in every window that renders it.
+pub fn frame_flow_noise(seed: u64, first: usize, frames: usize, bins: usize) -> Vec<f32> {
+    let base = stream_seed(seed, NoiseStream::FlowNoise);
+    let mut noise = vec![0f32; bins * frames];
+    for frame in 0..frames {
+        let index = (first + frame) as u64;
+        let values = SplitMix64::new(mix(base ^ mix(index.wrapping_add(1)))).standard_normals(bins);
+        for (bin, value) in values.into_iter().enumerate() {
+            noise[bin * frames + frame] = value;
+        }
+    }
+    noise
+}
+
 /// A request seed: the caller's when it is positive, else one drawn from the
 /// clock, as every izwi sampler treats seed 0.
 pub fn resolve_seed(seed: Option<u64>) -> u64 {
@@ -137,6 +154,18 @@ mod tests {
             / n;
         assert!(mean.abs() < 0.01, "{mean}");
         assert!((var - 1.0).abs() < 0.01, "{var}");
+    }
+
+    #[test]
+    fn frame_noise_does_not_depend_on_the_window() {
+        let bins = 3;
+        let wide = frame_flow_noise(7, 10, 6, bins);
+        let narrow = frame_flow_noise(7, 12, 2, bins);
+        for bin in 0..bins {
+            assert_eq!(narrow[bin * 2], wide[bin * 6 + 2]);
+            assert_eq!(narrow[bin * 2 + 1], wide[bin * 6 + 3]);
+        }
+        assert_ne!(frame_flow_noise(8, 12, 2, bins), narrow);
     }
 
     #[test]
