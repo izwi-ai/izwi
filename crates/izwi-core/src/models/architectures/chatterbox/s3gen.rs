@@ -253,16 +253,14 @@ impl S3GenFlow {
             // Upstream builds t_span in the tensor's dtype (F32).
             let t = Self::schedule(state.step, total) as f32;
             let r = Self::schedule(state.step + 1, total) as f32;
-            let frames = state.x.dim(1)?;
             let zeros = Tensor::zeros_like(&state.mu)?;
             let x = Tensor::stack(&[&state.x, &state.x], 0)?;
             let mu = Tensor::stack(&[&state.mu, &zeros], 0)?;
             let cond = Tensor::stack(&[&state.cond, &zeros], 0)?;
             let speaker = Tensor::stack(&[&state.speaker, &state.speaker.zeros_like()?], 0)?;
-            let mask = Tensor::ones((2, 1, frames), self.dtype, &self.device)?;
             let dxdt = self
                 .estimator
-                .forward(&x, &mask, &mu, &speaker, &cond, f64::from(t))?;
+                .forward(&x, &mu, &speaker, &cond, f64::from(t))?;
             let guided = dxdt
                 .i(0)?
                 .affine(1.0 + rate, 0.0)?
@@ -549,7 +547,7 @@ impl CausalConv {
     }
 }
 
-/// Causal conv, LayerNorm over channels, Mish; masked in and out.
+/// Causal conv, LayerNorm over channels, Mish.
 struct CausalBlock {
     conv: CausalConv,
     norm: LayerNorm,
@@ -563,10 +561,10 @@ impl CausalBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let h = self.conv.forward(&x.broadcast_mul(mask)?)?;
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.conv.forward(x)?;
         let h = self.norm.forward(&h.transpose(1, 2)?)?.transpose(1, 2)?;
-        Ok(mish(&h)?.broadcast_mul(mask)?)
+        mish(&h)
     }
 }
 
@@ -588,11 +586,11 @@ impl CausalResnet {
     }
 
     /// `time` is the Mish of the time embedding, [batch, time_dim].
-    fn forward(&self, x: &Tensor, mask: &Tensor, time: &Tensor) -> Result<Tensor> {
-        let h = self.block1.forward(x, mask)?;
+    fn forward(&self, x: &Tensor, time: &Tensor) -> Result<Tensor> {
+        let h = self.block1.forward(x)?;
         let h = h.broadcast_add(&self.time.forward(time)?.unsqueeze(2)?)?;
-        let h = self.block2.forward(&h, mask)?;
-        Ok(h.add(&self.res.forward(&x.broadcast_mul(mask)?)?)?)
+        let h = self.block2.forward(&h)?;
+        Ok(h.add(&self.res.forward(x)?)?)
     }
 }
 
@@ -630,8 +628,8 @@ impl TransformerBlock {
         })
     }
 
-    /// `x` [batch, frames, dim]; `bias` [batch, 1, 1, frames] key mask.
-    fn forward(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    /// `x` [batch, frames, dim], every frame valid.
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, frames, _) = x.dims3()?;
         let normed = self.norm1.forward(x)?;
         let split = |t: Tensor| -> candle_core::Result<Tensor> {
@@ -639,14 +637,15 @@ impl TransformerBlock {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = split(self.to_q.forward(&normed)?)?;
+        // The scale goes on q, not on the [heads, frames, frames] scores.
+        let q = split(
+            self.to_q
+                .forward(&normed)?
+                .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?,
+        )?;
         let k = split(self.to_k.forward(&normed)?)?;
         let v = split(self.to_v.forward(&normed)?)?;
-        let scores = q
-            .matmul(&k.t()?)?
-            .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?
-            .broadcast_add(bias)?;
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let weights = candle_nn::ops::softmax_last_dim(&q.matmul(&k.t()?)?)?;
         let attended = weights.matmul(&v)?.transpose(1, 2)?.reshape((
             batch,
             frames,
@@ -679,10 +678,10 @@ impl UnetStage {
     }
 
     /// Resnet and transformers; the tail is applied by the caller.
-    fn forward(&self, x: &Tensor, mask: &Tensor, bias: &Tensor, time: &Tensor) -> Result<Tensor> {
-        let mut h = self.resnet.forward(x, mask, time)?.transpose(1, 2)?;
+    fn forward(&self, x: &Tensor, time: &Tensor) -> Result<Tensor> {
+        let mut h = self.resnet.forward(x, time)?.transpose(1, 2)?;
         for block in &self.transformers {
-            h = block.forward(&h, bias)?;
+            h = block.forward(&h)?;
         }
         Ok(h.transpose(1, 2)?.contiguous()?)
     }
@@ -753,11 +752,13 @@ impl CausalUnetEstimator {
     }
 
     /// Velocity for `x`, `mu`, `cond` [batch, 80, frames], `speaker`
-    /// [batch, 80], `mask` [batch, 1, frames].
+    /// [batch, 80]. Every frame is valid: a call carries one request's two
+    /// guidance rows, which share their length, so upstream's padding mask
+    /// is all ones and its multiplies and key bias are left out (the
+    /// broadcasts cost more than the rest of the attention on Metal).
     fn forward(
         &self,
         x: &Tensor,
-        mask: &Tensor,
         mu: &Tensor,
         speaker: &Tensor,
         cond: &Tensor,
@@ -767,30 +768,78 @@ impl CausalUnetEstimator {
         let time = self.time_embedding(t, batch, x.dtype(), x.device())?;
         let speaker = speaker.unsqueeze(2)?.repeat((1, 1, frames))?;
         let h = Tensor::cat(&[x, mu, &speaker, cond], 1)?;
-        // Key-padding bias: 0 where valid, −1e10 where masked.
-        let bias = mask.affine(1e10, -1e10)?.unsqueeze(1)?.contiguous()?;
 
-        let skip = self.down.forward(&h, mask, &bias, &time)?;
+        let skip = self.down.forward(&h, &time)?;
         let mut h = self
             .down
             .tail
             .as_ref()
             .expect("down stage has a tail")
-            .forward(&skip.broadcast_mul(mask)?)?;
+            .forward(&skip)?;
         for stage in &self.mid {
-            h = stage.forward(&h, mask, &bias, &time)?;
+            h = stage.forward(&h, &time)?;
         }
         let h = Tensor::cat(&[&h.narrow(2, 0, skip.dim(2)?)?, &skip], 1)?;
-        let h = self.up.forward(&h, mask, &bias, &time)?;
+        let h = self.up.forward(&h, &time)?;
         let h = self
             .up
             .tail
             .as_ref()
             .expect("up stage has a tail")
-            .forward(&h.broadcast_mul(mask)?)?;
-        let h = self.final_block.forward(&h, mask)?;
-        let out = self.final_proj.forward(&h.broadcast_mul(mask)?)?;
-        Ok(out.broadcast_mul(mask)?)
+            .forward(&h)?;
+        let h = self.final_block.forward(&h)?;
+        Ok(self.final_proj.forward(&h)?)
+    }
+}
+
+#[cfg(test)]
+impl S3GenFlow {
+    /// One estimator call on zeros of `[batch, 80, frames]`, waited for on
+    /// the device: the cost of one Euler step's network (`batch` counts
+    /// both guidance rows).
+    pub(crate) fn probe_estimator(&self, batch: usize, frames: usize) -> Result<()> {
+        let bins = self.cfg.mel_bins;
+        let zeros = Tensor::zeros((batch, bins, frames), self.dtype, &self.device)?;
+        let speaker = Tensor::zeros((batch, bins), self.dtype, &self.device)?;
+        self.estimator
+            .forward(&zeros, &zeros, &speaker, &zeros, 0.5)?;
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// Milliseconds per call of one resnet and one transformer block on
+    /// `[batch, frames]` random activations, each waited for on the device.
+    pub(crate) fn probe_estimator_parts(
+        &self,
+        batch: usize,
+        frames: usize,
+        runs: usize,
+    ) -> Result<Vec<(&'static str, f64)>> {
+        let stage = &self.estimator.mid[0];
+        let dim = self.cfg.estimator_channels;
+        let channels_first = Tensor::randn(0f32, 1.0, (batch, dim, frames), &self.device)?;
+        let tokens = channels_first.transpose(1, 2)?.contiguous()?;
+        let time = Tensor::randn(0f32, 1.0, (batch, self.cfg.time_embed_dim), &self.device)?;
+        let time_it = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
+            f()?;
+            self.device.synchronize()?;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                f()?;
+            }
+            self.device.synchronize()?;
+            Ok(started.elapsed().as_secs_f64() * 1000.0 / runs as f64)
+        };
+        Ok(vec![
+            (
+                "resnet",
+                time_it(&|| stage.resnet.forward(&channels_first, &time))?,
+            ),
+            (
+                "transformer block",
+                time_it(&|| stage.transformers[0].forward(&tokens))?,
+            ),
+        ])
     }
 }
 

@@ -632,3 +632,41 @@ fn chatterbox_matches_the_f32_reference_on_metal() {
         "metal",
     );
 }
+
+/// How one Euler step's estimator call scales with rows and frames on
+/// Metal: whether batching acoustic steps across requests would pay.
+/// `batch` counts both guidance rows of each request.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the Chatterbox checkpoint (IZWI_CHATTERBOX_MODEL_DIR)"]
+fn chatterbox_estimator_cost_by_rows_and_frames_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "chatterbox_estimator_cost_by_rows_and_frames_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let runtime = ChatterboxRuntime::load(&model_dir(), &profile.device, DType::F32).unwrap();
+    for (batch, frames) in [(2, 250), (2, 500), (2, 1000), (4, 500), (8, 500), (16, 500)] {
+        runtime.flow().probe_estimator(batch, frames).unwrap();
+        let runs = 5;
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            runtime.flow().probe_estimator(batch, frames).unwrap();
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+        eprintln!(
+            "estimator rows {batch:2} frames {frames:4}: {ms:7.1} ms per step, {:6.1} ms per request",
+            ms * 2.0 / batch as f64
+        );
+    }
+    for frames in [500, 1000] {
+        for (part, ms) in runtime.flow().probe_estimator_parts(2, frames, 10).unwrap() {
+            eprintln!("rows 2 frames {frames:4} {part:24} {ms:7.2} ms");
+        }
+    }
+}
