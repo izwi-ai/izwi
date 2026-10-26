@@ -2795,9 +2795,9 @@ async fn resolve_tts_bench_reference(
                 .to_string(),
         ));
     }
-    if reference_audio.is_some() != reference_text.is_some() {
+    if reference_text.is_some() && reference_audio.is_none() {
         return Err(CliError::InvalidInput(
-            "Provide --reference-audio and --reference-text together.".to_string(),
+            "--reference-text needs --reference-audio.".to_string(),
         ));
     }
 

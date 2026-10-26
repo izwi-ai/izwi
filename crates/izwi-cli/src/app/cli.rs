@@ -359,7 +359,8 @@ pub enum Commands {
 
         /// Model to use. The default speaks with a built-in voice; voice-clone
         /// models (e.g. qwen3-tts-0.6b-base) need --reference-audio and
-        /// --reference-text or --saved-voice-id.
+        /// --reference-text or --saved-voice-id. Chatterbox clones from
+        /// --reference-audio alone.
         #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 

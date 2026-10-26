@@ -308,9 +308,11 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
                 .to_string(),
         ));
     }
-    if has_reference_audio != has_reference_text {
+    // Whether the transcript is needed too is the model's call (Chatterbox
+    // clones from audio alone); the server says which.
+    if has_reference_text && !has_reference_audio {
         return Err(CliError::InvalidInput(
-            "Provide --reference-audio and --reference-text together.".to_string(),
+            "--reference-text needs --reference-audio.".to_string(),
         ));
     }
 
@@ -656,6 +658,33 @@ mod tests {
     }
 
     #[test]
+    fn request_body_sends_reference_audio_alone() {
+        let dir = tempdir().expect("temp dir");
+        let audio_path = dir.path().join("voice.wav");
+        fs::write(&audio_path, b"RIFF").expect("audio fixture");
+
+        let body = build_request_body(BuildRequestArgs {
+            model: "Chatterbox-500M".to_string(),
+            text: "hello".to_string(),
+            speaker: None,
+            saved_voice_id: None,
+            reference_audio: Some(audio_path),
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            controls: SpeechControls::default(),
+            stream: false,
+        })
+        .expect("request body");
+
+        assert_eq!(body["reference_audio"], "UklGRg==");
+        assert!(body.get("reference_text").is_none());
+    }
+
+    #[test]
     fn request_body_rejects_partial_direct_reference() {
         let err = build_request_body(BuildRequestArgs {
             model: "VibeVoice-1.5B".to_string(),
@@ -672,8 +701,10 @@ mod tests {
             controls: SpeechControls::default(),
             stream: false,
         })
-        .expect_err("partial reference should fail");
+        .expect_err("a transcript without audio should fail");
 
-        assert!(err.to_string().contains("Provide --reference-audio"));
+        assert!(err
+            .to_string()
+            .contains("--reference-text needs --reference-audio"));
     }
 }
