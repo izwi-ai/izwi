@@ -51,7 +51,11 @@ Those endpoints only show variants that are enabled for download/use.
 > speaks 21 of its languages: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish. Chinese and Japanese need text
 > processing Izwi has not ported yet and return `400`. A request names its
 > language in `language` (a code such as `fr` or a name such as `French`);
-> without one it speaks English.
+> without one it speaks English. It uses upstream's default (V2) speech-token
+> model. In Izwi's spot check (two sentences per language, transcribed by
+> Whisper) it was less intelligible in Hebrew, Norwegian and Malay than in the
+> other languages. Hebrew is spoken without vowel points and Russian without
+> stress marks, as upstream does without its optional add-ons.
 
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 

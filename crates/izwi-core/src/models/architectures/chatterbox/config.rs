@@ -12,7 +12,11 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 pub const DEFAULT_VOICE_FILE: &str = "conds.pt";
 
 /// The multilingual checkpoint's own files (`mtl_tts.py`); it shares the
-/// English S3Gen, voice encoder, default voice and watermark.
+/// English S3Gen, voice encoder, default voice and watermark. The T3 is V2,
+/// upstream's default: on the two-sentence-per-language corpus
+/// (`multilingual_corpus.json`, same seeds) Whisper's character error was
+/// 6.3% for V2 against 10.4% for V3, which was worse in Arabic, Danish,
+/// German, Greek, Finnish, Hebrew and Swedish.
 pub const MULTILINGUAL_T3_WEIGHTS_FILE: &str = "t3_mtl23ls_v2.safetensors";
 pub const MULTILINGUAL_TOKENIZER_FILE: &str = "grapheme_mtl_merged_expanded_v1.json";
 
