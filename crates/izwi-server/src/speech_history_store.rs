@@ -450,6 +450,15 @@ pub struct CompleteSpeechHistoryRecord {
     pub stop_reason: Option<String>,
 }
 
+impl CompleteSpeechHistoryRecord {
+    /// Point the record at audio already published under `storage_path`,
+    /// dropping the in-memory copy: a completion carries one audio source.
+    pub fn adopt_published_audio(&mut self, storage_path: String) {
+        self.preexisting_audio_storage_path = Some(storage_path);
+        self.audio_bytes = Vec::new();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpeechAudioReference {
     LegacyPath(String),
@@ -2331,8 +2340,10 @@ mod tests {
         )
         .await
         .expect("published audio should persist");
-        let mut completion = completed_record(Vec::new());
-        completion.preexisting_audio_storage_path = Some(storage_path.clone());
+        // As the batch route builds it: encoded bytes, then the published
+        // object they were persisted as.
+        let mut completion = completed_record(audio_bytes.clone());
+        completion.adopt_published_audio(storage_path.clone());
 
         store
             .complete_record(

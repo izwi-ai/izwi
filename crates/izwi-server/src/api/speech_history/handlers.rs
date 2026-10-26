@@ -1950,7 +1950,7 @@ async fn synthesize_record_internal(
                 )
                 .await
                 .map_err(|err| ApiError::internal(err.to_string()))?;
-                completion.preexisting_audio_storage_path = Some(storage_key);
+                completion.adopt_published_audio(storage_key);
                 Some(artifact)
             }
             None => None,
