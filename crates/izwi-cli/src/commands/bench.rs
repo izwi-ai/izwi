@@ -599,6 +599,10 @@ struct BenchmarkRunConfig {
     reference_text: Option<String>,
     language: Option<String>,
     request_timeout_secs: Option<u64>,
+    /// The model returns its audio only when complete, so a sample's first
+    /// audio is its end to end time and it has no inter-frame gaps.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    final_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2048,6 +2052,7 @@ async fn bench_chat(
             reference_text: None,
             language: None,
             request_timeout_secs: None,
+            final_only: false,
         },
         summary: BenchmarkSummary {
             latency_ms: None,
@@ -2130,6 +2135,7 @@ async fn bench_tts(
     if options.interactive() {
         theme.step(1, 3, &format!("Benchmarking TTS with '{}'", model));
     }
+    let final_only = tts_model_is_final_only(model);
     let started_at = Utc::now();
     let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
@@ -2193,6 +2199,9 @@ async fn bench_tts(
                 .await
                 .map(|mut sample| {
                     sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if final_only && !stream_output {
+                        sample.first_audio_ms = Some(sample.total_ms);
+                    }
                     sample
                 });
                 progress.inc(1);
@@ -2380,6 +2389,7 @@ async fn bench_tts(
             reference_text: reference.reference_text.clone(),
             language: None,
             request_timeout_secs: Some(timeout_secs),
+            final_only,
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
@@ -2704,6 +2714,7 @@ async fn bench_asr(
             reference_text: None,
             language: language.as_deref().map(|value| value.to_string()),
             request_timeout_secs: None,
+            final_only: false,
         },
         summary: BenchmarkSummary {
             latency_ms: stats(&times),
@@ -2966,6 +2977,14 @@ fn handle_tts_benchmark_stream_event(
         }
         _ => Ok(None),
     }
+}
+
+/// Whether `model` returns its audio only when complete (no streaming).
+fn tts_model_is_final_only(model: &str) -> bool {
+    izwi_core::parse_tts_model_variant(model)
+        .ok()
+        .and_then(|variant| variant.speech_capabilities())
+        .is_some_and(|capabilities| !capabilities.supports_streaming)
 }
 
 fn build_tts_bench_request_body(
@@ -5450,6 +5469,13 @@ fn loaded_model_runtime_summary(model: &LoadedModelTelemetrySnapshot) -> String 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn final_only_tts_models_are_recognised_from_their_capabilities() {
+        assert!(tts_model_is_final_only("Chatterbox-500M"));
+        assert!(!tts_model_is_final_only("Kokoro-82M"));
+        assert!(!tts_model_is_final_only("not-a-model"));
+    }
 
     #[test]
     fn audio_stream_benchmarks_record_first_output_and_inter_event_latency() {
