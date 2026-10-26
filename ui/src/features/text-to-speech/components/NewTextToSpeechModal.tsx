@@ -74,6 +74,10 @@ function changedSpeechControls(
   return changed;
 }
 
+/** The saved-voice picker's "no saved voice" choice, for a model that also
+ * has built-in voices (Radix Select takes no empty value). */
+const BUILT_IN_VOICE = "__built_in__";
+
 function savedVoiceLabel(voice: SavedVoiceSummary): string {
   const source =
     voice.source_route_kind === "voice_cloning"
@@ -124,6 +128,10 @@ export function NewTextToSpeechModal({
   const supportsBuiltInVoices = capabilities?.supports_builtin_voices ?? false;
   const supportsReferenceVoices =
     capabilities?.supports_reference_voice ?? false;
+  // Chatterbox clones from audio alone; every other reference model needs
+  // the reference's words, so voices saved without them are left out.
+  const transcriptRequired =
+    capabilities?.reference_transcript_required ?? true;
   const supportsVoiceDescription =
     capabilities?.supports_voice_description ?? false;
   const supportsStreaming = capabilities?.supports_streaming ?? false;
@@ -131,14 +139,19 @@ export function NewTextToSpeechModal({
     () => capabilities?.controls ?? [],
     [capabilities],
   );
-  const effectiveVoiceWorkflow: EffectiveVoiceWorkflow = supportsReferenceVoices
-    ? "saved_voice"
-    : supportsBuiltInVoices
-      ? "built_in_voice"
-      : supportsVoiceDescription
-        ? "voice_description"
-        : "unsupported";
+  const effectiveVoiceWorkflow: EffectiveVoiceWorkflow =
+    supportsReferenceVoices && !supportsBuiltInVoices
+      ? "saved_voice"
+      : supportsBuiltInVoices
+        ? "built_in_voice"
+        : supportsVoiceDescription
+          ? "voice_description"
+          : "unsupported";
   const usesSavedVoiceSelection = effectiveVoiceWorkflow === "saved_voice";
+  // A model with both (Chatterbox) speaks with its built-in voice unless a
+  // saved voice is chosen.
+  const offersSavedVoice = supportsReferenceVoices;
+  const useSavedVoice = offersSavedVoice && Boolean(savedVoiceId);
   const usesBuiltInVoiceSelection =
     effectiveVoiceWorkflow === "built_in_voice";
   const usesVoiceDescription = effectiveVoiceWorkflow === "voice_description";
@@ -260,7 +273,7 @@ export function NewTextToSpeechModal({
   }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
 
   useEffect(() => {
-    if (!isOpen || !usesSavedVoiceSelection) {
+    if (!isOpen || !offersSavedVoice) {
       return;
     }
 
@@ -293,7 +306,15 @@ export function NewTextToSpeechModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, usesSavedVoiceSelection]);
+  }, [isOpen, offersSavedVoice]);
+
+  const usableSavedVoices = useMemo(
+    () =>
+      transcriptRequired
+        ? savedVoices.filter((voice) => voice.reference_text_chars > 0)
+        : savedVoices,
+    [savedVoices, transcriptRequired],
+  );
 
   const submitGeneration = useCallback(async () => {
     if (!selectedModel || !selectedModelReady) {
@@ -327,7 +348,7 @@ export function NewTextToSpeechModal({
       return;
     }
 
-    if (usesBuiltInVoiceSelection && !resolvedBuiltInSpeaker) {
+    if (usesBuiltInVoiceSelection && !useSavedVoice && !resolvedBuiltInSpeaker) {
       setError("Select a built-in voice before starting generation.");
       return;
     }
@@ -335,8 +356,11 @@ export function NewTextToSpeechModal({
     const request: SpeechHistoryRecordCreateRequest = {
       model_id: selectedModel,
       text: trimmedText,
-      speaker: usesBuiltInVoiceSelection ? resolvedBuiltInSpeaker : undefined,
-      saved_voice_id: usesSavedVoiceSelection ? savedVoiceId : undefined,
+      speaker:
+        usesBuiltInVoiceSelection && !useSavedVoice
+          ? resolvedBuiltInSpeaker
+          : undefined,
+      saved_voice_id: useSavedVoice ? savedVoiceId : undefined,
       voice_description:
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
@@ -384,6 +408,7 @@ export function NewTextToSpeechModal({
     voiceDescription,
     usesBuiltInVoiceSelection,
     usesSavedVoiceSelection,
+    useSavedVoice,
     usesVoiceDescription,
     showsVoiceDescription,
   ]);
@@ -512,9 +537,13 @@ export function NewTextToSpeechModal({
                 </CreationField>
               ) : null}
 
-              {usesSavedVoiceSelection ? (
+              {offersSavedVoice ? (
                 <CreationField
-                  label="Saved voice"
+                  label={
+                    usesBuiltInVoiceSelection
+                      ? "Saved voice (optional)"
+                      : "Saved voice"
+                  }
                   hint={
                     savedVoicesLoading ? (
                       "Loading saved voices…"
@@ -522,12 +551,20 @@ export function NewTextToSpeechModal({
                       <span className="text-(--danger-text)">
                         {savedVoicesError}
                       </span>
+                    ) : usesBuiltInVoiceSelection ? (
+                      "A saved voice replaces the built-in one."
                     ) : undefined
                   }
                 >
                   <Select
-                    value={savedVoiceId}
-                    onValueChange={setSavedVoiceId}
+                    value={
+                      usesBuiltInVoiceSelection
+                        ? savedVoiceId || BUILT_IN_VOICE
+                        : savedVoiceId
+                    }
+                    onValueChange={(value) =>
+                      setSavedVoiceId(value === BUILT_IN_VOICE ? "" : value)
+                    }
                     disabled={isSubmitting || savedVoicesLoading}
                   >
                     <SelectTrigger
@@ -537,7 +574,12 @@ export function NewTextToSpeechModal({
                       <SelectValue placeholder="Select saved voice" />
                     </SelectTrigger>
                     <SelectContent>
-                      {savedVoices.map((voice) => (
+                      {usesBuiltInVoiceSelection ? (
+                        <SelectItem value={BUILT_IN_VOICE}>
+                          None (built-in voice)
+                        </SelectItem>
+                      ) : null}
+                      {usableSavedVoices.map((voice) => (
                         <SelectItem key={voice.id} value={voice.id}>
                           {savedVoiceLabel(voice)}
                         </SelectItem>

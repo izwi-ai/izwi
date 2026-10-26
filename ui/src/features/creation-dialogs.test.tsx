@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ModelInfo } from "@/api";
+import { api, type ModelInfo } from "@/api";
 import { NewDiarizationModal } from "@/features/diarization/components/NewDiarizationModal";
 import { NewTextToSpeechModal } from "@/features/text-to-speech/components/NewTextToSpeechModal";
 import { NewTranscriptionModal } from "@/features/transcription/components/NewTranscriptionModal";
@@ -49,13 +49,15 @@ describe("viewport-safe creation dialogs", () => {
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
   });
 
-  it("offers a final-only model's speech controls with streaming off", () => {
+  it("offers a final-only model's speech controls with streaming off", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
     const chatterbox = {
       variant: "Chatterbox-500M",
       status: "ready",
       speech_capabilities: {
         supports_builtin_voices: true,
-        supports_reference_voice: false,
+        supports_reference_voice: true,
+        reference_transcript_required: false,
         supports_voice_description: false,
         supports_streaming: false,
         supports_speed_control: false,
@@ -94,6 +96,13 @@ describe("viewport-safe creation dialogs", () => {
     const stream = screen.getByRole("switch", { name: /Stream results/i });
     expect(stream).not.toBeChecked();
     expect(stream).toBeDisabled();
+
+    // The built-in voice speaks unless a saved one is chosen.
+    expect(screen.getByText("Built-in voice")).toBeInTheDocument();
+    expect(await screen.findByText("Saved voice (optional)")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Saved voice" })).toHaveTextContent(
+      "None (built-in voice)",
+    );
   });
 
   it("keeps the transcription title, upload action, and final setting reachable", () => {

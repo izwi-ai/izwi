@@ -155,6 +155,41 @@ describe("CloneVoiceDialog", () => {
     expect(props.onClose).toHaveBeenCalled();
   });
 
+  it("saves without a transcript for a model that clones from audio alone", async () => {
+    renderDialog({
+      model: "Chatterbox-500M",
+      modelInfo: {
+        variant: "Chatterbox-500M",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          built_in_voice_count: 1,
+          supports_reference_voice: true,
+          reference_transcript_required: false,
+          supports_voice_description: false,
+          supports_streaming: false,
+          supports_speed_control: false,
+          supports_auto_long_form: false,
+        },
+      } as React.ComponentProps<typeof CloneVoiceDialog>["modelInfo"],
+    });
+    await uploadClip("sam-reference.wav");
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Sam, narrator" } });
+    expect(
+      screen.getByLabelText("What's said in the recording (optional)"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "I have permission to clone this voice" }),
+    );
+    expect(saveButton()).toBeEnabled();
+    fireEvent.click(saveButton());
+
+    expect(await screen.findByRole("dialog", { name: "Voice saved" })).toBeInTheDocument();
+    expect(mocks.createSavedVoice).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Sam, narrator", reference_text: undefined }),
+    );
+  });
+
   it.each([
     [2.4, "Too short", "0:02"],
     [31.2, "Too long", "0:32"],

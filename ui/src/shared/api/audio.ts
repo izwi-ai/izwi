@@ -251,7 +251,8 @@ export interface SavedVoice {
   created_at: number;
   updated_at: number;
   name: string;
-  reference_text: string;
+  /** Null for a voice saved without a transcript. */
+  reference_text: string | null;
   audio_mime_type: string;
   audio_filename: string | null;
   source_route_kind: SavedVoiceSourceRouteKind | null;
@@ -260,7 +261,8 @@ export interface SavedVoice {
 
 export interface SavedVoiceCreateRequest {
   name: string;
-  reference_text: string;
+  /** Optional for a model that clones from audio alone. */
+  reference_text?: string;
   audio_base64: string;
   audio_mime_type?: string;
   audio_filename?: string;

@@ -4,6 +4,9 @@ export interface SpeechModelCapabilities {
   supports_builtin_voices: boolean;
   built_in_voice_count: number | null;
   supports_reference_voice: boolean;
+  /** Whether a reference voice needs its transcript (every reference model
+   * but Chatterbox, which clones from the audio alone). */
+  reference_transcript_required?: boolean;
   supports_voice_description: boolean;
   supports_streaming: boolean;
   supports_speed_control: boolean;
