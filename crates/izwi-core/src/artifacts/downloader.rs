@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
+use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
 };
@@ -132,12 +133,14 @@ const VIBEVOICE_QWEN_TOKENIZER_FILES: &[&str] = &[
 
 /// The English loader's files at the pinned revision (5bb1f6ee); the repo
 /// also holds the multilingual and legacy checkpoints, which it never reads.
+/// The PerTh watermarker comes from its own repository ([`PERTH_CHECKPOINT`]).
 const CHATTERBOX_FILES: &[&str] = &[
     "t3_cfg.safetensors",
     "s3gen.safetensors",
     "ve.safetensors",
     "tokenizer.json",
     "conds.pt",
+    PERTH_CHECKPOINT_FILE,
 ];
 
 const FISH_S2_PRO_FILES: &[&str] = &[
@@ -534,6 +537,52 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
+/// A file served outside the Hub from a fixed URL, checked against its size
+/// and SHA-256 once it lands: Chatterbox's PerTh watermarker ships only in
+/// its GitHub repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedFile {
+    url: &'static str,
+    size: u64,
+    sha256: &'static str,
+}
+
+/// resemble-ai/Perth at ff1c8ac5 (MIT): the implicit watermarker's
+/// checkpoint, a regular Git blob served by commit.
+const PERTH_CHECKPOINT: PinnedFile = PinnedFile {
+    url: "https://raw.githubusercontent.com/resemble-ai/Perth/\
+          ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/\
+          perth_net_250000.pth.tar",
+    size: 37_429_684,
+    sha256: "a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670",
+};
+
+/// The pinned source of `variant`'s `local_file`, when it is not on the Hub.
+fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
+    (variant.family() == ModelFamily::ChatterboxTts && local_file == PERTH_CHECKPOINT_FILE)
+        .then_some(PERTH_CHECKPOINT)
+}
+
+/// Whether `path` holds exactly `pinned`'s bytes; a file that does not is
+/// removed.
+async fn verify_pinned_file(path: &Path, pinned: PinnedFile) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let bytes = tokio::fs::read(path).await?;
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != pinned.sha256 {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(Error::DownloadError(format!(
+            "{} does not match its pinned SHA-256 (got {digest}, expected {}); removed it",
+            path.display(),
+            pinned.sha256
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct FileDownloadPlan {
     source_repo: String,
@@ -542,24 +591,44 @@ struct FileDownloadPlan {
     local_file: String,
     expected_size: u64,
     strict_size_check: bool,
+    /// Served from this URL instead of the Hub.
+    pinned: Option<PinnedFile>,
 }
 
 impl FileDownloadPlan {
-    /// The file's `resolve` URL on the Hub at `base`.
+    /// A plan for a pinned file: its own URL and exact size.
+    fn pinned(spec: &ModelFileSpec, pinned: PinnedFile) -> Self {
+        Self {
+            source_repo: spec.source_repo.clone(),
+            source_revision: spec.source_revision.clone(),
+            source_file: spec.source_file.clone(),
+            local_file: spec.local_file.clone(),
+            expected_size: pinned.size,
+            strict_size_check: true,
+            pinned: Some(pinned),
+        }
+    }
+
+    /// The file's `resolve` URL on the Hub at `base`, or its pinned URL.
     fn url(&self, base: &str) -> String {
+        if let Some(pinned) = self.pinned {
+            return pinned.url.to_string();
+        }
         format!(
             "{base}/{}/resolve/{}/{}",
             self.source_repo, self.source_revision, self.source_file
         )
     }
 
-    /// A revision named by commit serves the same bytes forever.
+    /// A revision named by commit serves the same bytes forever, as does a
+    /// pinned URL.
     fn immutable(&self) -> bool {
-        self.source_revision.len() == 40
-            && self
-                .source_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        self.pinned.is_some()
+            || (self.source_revision.len() == 40
+                && self
+                    .source_revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
     }
 
     /// The size the file must have, when the plan knows it exactly.
@@ -1046,6 +1115,30 @@ impl ModelDownloader {
     /// leave no more of the file on disk than any attempt before (for the
     /// same version of the file); one that does resets the count and the
     /// backoff, so a slow, flaky link still finishes a large file.
+    /// Fetch one planned file, then hold a pinned file to its SHA-256.
+    async fn fetch_plan(
+        &self,
+        plan: &FileDownloadPlan,
+        dest: &Path,
+        label: &str,
+        progress: &FileProgress<'_>,
+    ) -> Result<u64> {
+        let bytes = self
+            .fetch_with_retries(
+                &plan.url(HF_BASE_URL),
+                plan.immutable(),
+                plan.exact_size(),
+                dest,
+                label,
+                progress,
+            )
+            .await?;
+        if let Some(pinned) = plan.pinned {
+            verify_pinned_file(dest, pinned).await?;
+        }
+        Ok(bytes)
+    }
+
     async fn fetch_with_retries(
         &self,
         url: &str,
@@ -1510,9 +1603,12 @@ impl ModelDownloader {
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
-            ModelFamily::ChatterboxTts => {
-                CHATTERBOX_FILES.iter().all(|file| path.join(file).exists())
-            }
+            // The watermarker is needed only while the watermark is on.
+            ModelFamily::ChatterboxTts => CHATTERBOX_FILES.iter().all(|file| {
+                (*file == PERTH_CHECKPOINT_FILE
+                    && !crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true))
+                    || path.join(file).exists()
+            }),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -1616,10 +1712,8 @@ impl ModelDownloader {
 
             // Stream download with progress
             match self
-                .fetch_with_retries(
-                    &plan.url(HF_BASE_URL),
-                    plan.immutable(),
-                    plan.exact_size(),
+                .fetch_plan(
+                    plan,
                     &dest,
                     file,
                     &FileProgress {
@@ -1879,10 +1973,8 @@ impl ModelDownloader {
             };
 
             let bytes_downloaded_for_file = match self
-                .fetch_with_retries(
-                    &plan.url(HF_BASE_URL),
-                    plan.immutable(),
-                    plan.exact_size(),
+                .fetch_plan(
+                    plan,
                     &dest,
                     file,
                     &FileProgress {
@@ -2520,7 +2612,9 @@ impl ModelDownloader {
         let mut repo_tree_planning_available = true;
         for spec in &file_specs {
             let repo_key = (spec.source_repo.clone(), spec.source_revision.clone());
-            if repo_tree_indexes.contains_key(&repo_key) {
+            if repo_tree_indexes.contains_key(&repo_key)
+                || pinned_file(variant, &spec.local_file).is_some()
+            {
                 continue;
             }
             match self
@@ -2546,7 +2640,9 @@ impl ModelDownloader {
             let mut skipped = 0usize;
 
             for spec in &file_specs {
-                if let Some(size) = repo_tree_indexes
+                if let Some(pinned) = pinned_file(variant, &spec.local_file) {
+                    plans.push(FileDownloadPlan::pinned(spec, pinned));
+                } else if let Some(size) = repo_tree_indexes
                     .get(&(spec.source_repo.clone(), spec.source_revision.clone()))
                     .and_then(|index| index.get(&spec.source_file))
                 {
@@ -2557,6 +2653,7 @@ impl ModelDownloader {
                         local_file: spec.local_file.clone(),
                         expected_size: *size,
                         strict_size_check: *size > 0,
+                        pinned: None,
                     });
                 } else {
                     if require_exact_bundle {
@@ -2597,6 +2694,10 @@ impl ModelDownloader {
 
         let mut plans = Vec::with_capacity(file_specs.len());
         for spec in &file_specs {
+            if let Some(pinned) = pinned_file(variant, &spec.local_file) {
+                plans.push(FileDownloadPlan::pinned(spec, pinned));
+                continue;
+            }
             let dest = local_dir.join(&spec.local_file);
             match self
                 .get_actual_file_size(&spec.source_repo, &spec.source_revision, &spec.source_file)
@@ -2609,6 +2710,7 @@ impl ModelDownloader {
                     local_file: spec.local_file.clone(),
                     expected_size: size,
                     strict_size_check: true,
+                    pinned: None,
                 }),
                 Err(e) => {
                     if Self::is_not_found_hf_error(&e) {
@@ -2651,6 +2753,7 @@ impl ModelDownloader {
                         local_file: spec.local_file.clone(),
                         expected_size: fallback_size,
                         strict_size_check: false,
+                        pinned: None,
                     });
                 }
             }
@@ -2676,6 +2779,7 @@ impl ModelDownloader {
                 "s3gen.safetensors" => 1_056_484_620,
                 "ve.safetensors" => 5_695_784,
                 "conds.pt" => 107_374,
+                PERTH_CHECKPOINT_FILE => PERTH_CHECKPOINT.size,
                 _ => 25_470,
             }
         } else if file == "mmproj-F16.gguf" {
@@ -2920,6 +3024,65 @@ impl ModelDownloader {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Chatterbox's PerTh checkpoint comes from its GitHub repository by
+    /// commit, at its exact size; every other file of the model stays on the
+    /// Hub.
+    #[test]
+    fn chatterbox_fetches_its_watermarker_from_a_pinned_url() {
+        let (downloader, _) = test_downloader();
+        let variant = ModelVariant::Chatterbox500M;
+        assert!(downloader
+            .get_model_files(variant)
+            .contains(&PERTH_CHECKPOINT_FILE.to_string()));
+        let pinned = pinned_file(variant, PERTH_CHECKPOINT_FILE).expect("pinned");
+        assert_eq!(
+            pinned.url,
+            "https://raw.githubusercontent.com/resemble-ai/Perth/ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar"
+        );
+        assert_eq!(pinned_file(variant, "t3_cfg.safetensors"), None);
+        assert_eq!(
+            pinned_file(ModelVariant::Kokoro82M, PERTH_CHECKPOINT_FILE),
+            None
+        );
+
+        let spec = downloader
+            .get_model_file_specs(variant)
+            .into_iter()
+            .find(|spec| spec.local_file == PERTH_CHECKPOINT_FILE)
+            .expect("spec");
+        let plan = FileDownloadPlan::pinned(&spec, pinned);
+        assert_eq!(plan.url(HF_BASE_URL), pinned.url);
+        assert!(plan.immutable());
+        assert_eq!(plan.exact_size(), Some(37_429_684));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_file_must_match_its_digest() {
+        let dir = std::env::temp_dir().join(format!("izwi-pinned-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        // SHA-256 of "abc".
+        let pinned = PinnedFile {
+            url: "https://example.invalid/file.bin",
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        verify_pinned_file(&path, pinned)
+            .await
+            .expect("matching bytes");
+        let wrong = PinnedFile {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..pinned
+        };
+        let error = verify_pinned_file(&path, wrong).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its pinned SHA-256"));
+        assert!(!path.exists(), "a mismatched file is removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A download needs the bytes still missing; a fresh `.nemo` also needs
     /// its extracted checkpoint beside it.

@@ -147,6 +147,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables recompute preemption: under managed KV pressure, suspend a low-priority session and replay its tokens instead of failing.",
     ),
     CoreEnvVar::new(
+        "IZWI_CHATTERBOX_WATERMARK",
+        Flag,
+        "true",
+        Load,
+        "Marks every Chatterbox utterance with Resemble AI's imperceptible PerTh watermark, as upstream does; false loads the model without the watermarker or its checkpoint.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CHAT_DTYPE",
         Choice,
         "checkpoint/backend default",

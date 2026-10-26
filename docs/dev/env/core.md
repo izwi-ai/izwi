@@ -30,6 +30,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_BUFFER_POOL_MEDIUM` | list | `8,32768` | model load | Sets the medium buffer pool as "count,elements"; malformed values ignored. |
 | `IZWI_BUFFER_POOL_SMALL` | list | `16,4096` | model load | Sets the small buffer pool as "count,elements"; malformed values ignored. |
 | `IZWI_CAPACITY_REPLAY` | flag | `true` | startup | Enables recompute preemption: under managed KV pressure, suspend a low-priority session and replay its tokens instead of failing. |
+| `IZWI_CHATTERBOX_WATERMARK` | flag | `true` | model load | Marks every Chatterbox utterance with Resemble AI's imperceptible PerTh watermark, as upstream does; false loads the model without the watermarker or its checkpoint. |
 | `IZWI_CHAT_DTYPE` | choice | checkpoint/backend default | model load | Overrides the Qwen3 dense chat model dtype (e.g. f32, f16, bf16); takes precedence over IZWI_QWEN_DTYPE. |
 | `IZWI_CHUNKED_PREFILL_THRESHOLD` | integer | 0 (backend automatic chunk) | startup | Sets the chunked-prefill chunk size in tokens; 0 or invalid ignored, leaving the backend's automatic chunk. |
 | `IZWI_CORS` | flag | `false` | startup | Enables CORS on the HTTP server. |

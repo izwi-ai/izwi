@@ -620,7 +620,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
-            Self::Chatterbox500M => 3_229_396_933, // five pinned HF files (3,191,966,992 B) + PerTh watermarker (37,429,941 B)
+            Self::Chatterbox500M => 3_229_396_676, // five pinned HF files (3,191,966,992 B) + PerTh checkpoint (37,429,684 B)
         }
     }
 
