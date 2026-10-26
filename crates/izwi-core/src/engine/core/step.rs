@@ -784,6 +784,7 @@ impl EngineCore {
 
             let mut committed_service_rows = Vec::new();
             let mut committed_decode_work = Vec::new();
+            let step_elapsed = batch.report.elapsed;
             for result in batch.results {
                 let plan_id = result.plan_id;
                 // Per-row facts key on the row's scheduled phase: a mixed
@@ -895,7 +896,7 @@ impl EngineCore {
             self.scheduler
                 .record_committed_batch_service(&committed_service_rows);
             self.scheduler
-                .record_committed_decode_service(&committed_decode_work);
+                .record_committed_decode_service(&committed_decode_work, step_elapsed);
         }
         record_engine_step_model_calls(step_model_calls);
         #[cfg(test)]
