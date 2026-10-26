@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use candle_core::Device;
 
 use super::fixture_support::{reference_signal, sample_error, Sample};
-use super::perth::{frame_mask, stft_magphase, PerthWatermarker, PERTH_CHECKPOINT_FILE};
+use super::perth::{
+    frame_mask, stft_magphase, PerthDetector, PerthWatermarker, PERTH_CHECKPOINT_FILE,
+};
 
 #[derive(serde::Deserialize)]
 struct PerthFixture {
@@ -22,6 +24,20 @@ struct PerthFixture {
     mask: Vec<u8>,
     residual: Sample,
     watermarked: Sample,
+    detector: DetectorScores,
+}
+
+#[derive(serde::Deserialize)]
+struct DetectorScores {
+    original: f32,
+    watermarked: f32,
+}
+
+fn checkpoint() -> PathBuf {
+    std::env::var_os("IZWI_CHATTERBOX_MODEL_DIR")
+        .map(PathBuf::from)
+        .expect("IZWI_CHATTERBOX_MODEL_DIR")
+        .join(PERTH_CHECKPOINT_FILE)
 }
 
 fn fixture() -> PerthFixture {
@@ -56,11 +72,7 @@ fn perth_stft_and_mask_match_upstream() {
 #[ignore = "needs perth_net_250000.pth.tar in IZWI_CHATTERBOX_MODEL_DIR"]
 fn perth_watermark_matches_upstream_on_cpu() {
     let fixture = fixture();
-    let dir = std::env::var_os("IZWI_CHATTERBOX_MODEL_DIR")
-        .map(PathBuf::from)
-        .expect("IZWI_CHATTERBOX_MODEL_DIR");
-    let watermarker =
-        PerthWatermarker::load(&dir.join(PERTH_CHECKPOINT_FILE), &Device::Cpu).unwrap();
+    let watermarker = PerthWatermarker::load(&checkpoint(), &Device::Cpu).unwrap();
     let signal = reference_signal();
 
     let (magspec, _, frames) = stft_magphase(&signal).unwrap();
@@ -84,4 +96,53 @@ fn perth_watermark_matches_upstream_on_cpu() {
     );
     eprintln!("watermarked {error:.2e}");
     assert!(error < 1e-4, "watermarked signal {error}");
+}
+
+/// The detector port scores the reference signal and izwi's watermarked
+/// signal as upstream's detector did, and a stream watermarked piece by
+/// piece is detected like the whole signal.
+#[test]
+#[ignore = "needs perth_net_250000.pth.tar in IZWI_CHATTERBOX_MODEL_DIR"]
+fn perth_detector_and_stream_match_upstream_on_cpu() {
+    let fixture = fixture();
+    let watermarker = PerthWatermarker::load(&checkpoint(), &Device::Cpu).unwrap();
+    let detector = PerthDetector::load(&checkpoint(), &Device::Cpu).unwrap();
+    let signal = reference_signal();
+    let rate = fixture.sample_rate;
+    let whole = watermarker.apply(&signal, rate).unwrap();
+    let (original, marked) = (
+        detector.detect(&signal, rate).unwrap(),
+        detector.detect(&whole, rate).unwrap(),
+    );
+    eprintln!(
+        "detector original {original:.4} (upstream {:.4}), watermarked {marked:.4} (upstream {:.4})",
+        fixture.detector.original, fixture.detector.watermarked
+    );
+    assert!((original - fixture.detector.original).abs() < 0.02);
+    assert!((marked - fixture.detector.watermarked).abs() < 0.02);
+
+    // Pieces of 0.3 s, as a stream delivers them.
+    let mut stream = watermarker.stream(rate);
+    let mut streamed = Vec::new();
+    for piece in signal.chunks((rate as usize * 3) / 10) {
+        streamed.extend(watermarker.push(&mut stream, piece, false).unwrap());
+    }
+    streamed.extend(watermarker.push(&mut stream, &[], true).unwrap());
+    let score = detector.detect(&streamed, rate).unwrap();
+    let shared = streamed.len().min(whole.len());
+    let diff = streamed[..shared]
+        .iter()
+        .zip(&whole[..shared])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!(
+        "stream: {} of {} samples, score {score:.4}, max |stream − whole| {diff:.2e}",
+        streamed.len(),
+        whole.len()
+    );
+    assert!(streamed.len().abs_diff(whole.len()) <= rate as usize / 100);
+    assert!(
+        (score - marked).abs() < 0.05,
+        "streamed watermark score {score} against {marked} whole"
+    );
 }
