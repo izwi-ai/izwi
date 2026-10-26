@@ -41,7 +41,10 @@ use crate::batch_runtime::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
         RuntimeJobStatus, StageResourceHints,
     },
-    worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
+    worker::{
+        StageCancellationReason, StageCancellationSignal, StageExecutionContext,
+        StageExecutionOutcome, StageExecutor,
+    },
 };
 use crate::entity::RuntimeProjectionAttempt;
 use crate::error::{core_api_error, ApiError, ApiJson};
@@ -1834,6 +1837,21 @@ pub(crate) async fn synthesize_record(
     .map(|(record, _, _)| record)
 }
 
+/// `work`, unless the stage is cancelled first: `work` is then dropped,
+/// which aborts the engine requests it owns.
+async fn unless_cancelled<T>(
+    cancellation: Option<StageCancellationSignal>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, StageCancellationReason> {
+    match cancellation {
+        Some(cancellation) => tokio::select! {
+            output = work => Ok(output),
+            reason = cancellation.cancelled() => Err(reason),
+        },
+        None => Ok(work.await),
+    }
+}
+
 async fn synthesize_record_internal(
     state: &AppState,
     ctx: &RequestContext,
@@ -1903,11 +1921,21 @@ async fn synthesize_record_internal(
     runtime_context.tenant_key = tenant_key;
     generation_request = generation_request.with_runtime_context(runtime_context);
     // No wall clock wraps active generation (TPIPE-6); a dropped request
-    // cancels the engine work.
+    // cancels the engine work. A cancelled stage drops it at once, so the
+    // engine stops mid-render instead of finishing the utterance first.
     let runtime = state.runtime.clone();
-    let output = generate_long_form_tts(&runtime, variant, generation_request)
-        .await
-        .map_err(core_api_error)?;
+    let output = unless_cancelled(
+        attempt.map(StageExecutionContext::cancellation),
+        generate_long_form_tts(&runtime, variant, generation_request),
+    )
+    .await
+    .map_err(|reason| {
+        ApiError::internal(format!(
+            "Stage execution cancelled: {}",
+            reason.as_error_code()
+        ))
+    })?
+    .map_err(core_api_error)?;
     let stop_reason = output.stop_reason;
 
     let encoder = AudioEncoder::new(output.sample_rate, 1);
@@ -2861,6 +2889,40 @@ fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    /// A cancelled stage drops its synthesis at once rather than waiting for
+    /// the utterance, so the engine work it owns stops mid-render.
+    #[tokio::test]
+    async fn cancelling_a_stage_drops_its_synthesis() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        };
+        let cancellation = super::StageCancellationSignal::new();
+        let trigger = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            trigger.cancel(super::StageCancellationReason::UserRequested);
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::unless_cancelled(Some(cancellation), work),
+        )
+        .await
+        .expect("cancellation ends the wait");
+        assert_eq!(outcome, Err(super::StageCancellationReason::UserRequested));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        // Without a stage there is nothing to cancel.
+        assert_eq!(super::unless_cancelled(None, async { 7 }).await, Ok(7));
+    }
+
     #[tokio::test]
     async fn stream_start_uses_first_pcm_rate_once_across_requests() {
         for explicit_rate in [Some(44_100), None] {

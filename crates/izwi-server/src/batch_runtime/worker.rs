@@ -309,7 +309,7 @@ pub enum StageCancellationReason {
 }
 
 impl StageCancellationReason {
-    fn as_error_code(self) -> &'static str {
+    pub(crate) fn as_error_code(self) -> &'static str {
         match self {
             Self::UserRequested => "user_requested",
             Self::ExecutionDeadline => "execution_deadline",
@@ -333,7 +333,7 @@ struct StageCancellationInner {
 }
 
 impl StageCancellationSignal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(StageCancellationInner {
                 cancelled: AtomicBool::new(false),
