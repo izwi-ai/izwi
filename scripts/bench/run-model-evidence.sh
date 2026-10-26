@@ -416,7 +416,7 @@ if ! jq -e \
                 ([.samples[] |
                     (.first_audio_ms | type == "number" and . >= 0) and
                     (.inter_frame_ms | type == "number" and . >= 0) and
-                    (.end_to_end_ms | type == "number" and . >= .first_audio_ms)
+                    (.end_to_end_ms | type == "number") and .end_to_end_ms >= .first_audio_ms
                 ] | all(. == true))
              else
                 .summary.first_transcript_ms.count == (.samples | length) and
@@ -424,7 +424,7 @@ if ! jq -e \
                 ([.samples[] |
                     (.first_transcript_ms | type == "number" and . >= 0) and
                     (.inter_transcript_ms | type == "number" and . >= 0) and
-                    (.end_to_end_ms | type == "number" and . >= .first_transcript_ms)
+                    (.end_to_end_ms | type == "number") and .end_to_end_ms >= .first_transcript_ms
                 ] | all(. == true))
              end)
         ] | all(. == true)) and
