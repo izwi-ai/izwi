@@ -1,6 +1,6 @@
 //! Load admission for the TTS families (P2.1): the residency plan of the ASR
 //! admission framework (`asr_memory`), opened to Qwen3-TTS, Kokoro,
-//! VibeVoice-TTS and Voxtral-TTS. Each plan prices the header census of the
+//! VibeVoice-TTS, Voxtral-TTS and Chatterbox. Each plan prices the header census of the
 //! files its loader reads, in the dtype the loader's own resolver picks, with
 //! Metal's power-of-two rounding of device-written buffers and the uploads
 //! Candle holds until the load fence (see `asr_memory` for the rules). The
@@ -24,6 +24,7 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::chatterbox::config::{S3GEN_WEIGHTS_FILE, T3_WEIGHTS_FILE};
 use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
     KOKORO_MODEL_MEMO_MAX_BYTES,
@@ -46,6 +47,7 @@ pub(super) fn has_plan(variant: ModelVariant) -> bool {
             | ModelFamily::KokoroTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::VoxtralTts
+            | ModelFamily::ChatterboxTts
     )
 }
 
@@ -82,6 +84,7 @@ pub(super) fn residency_plan(
         ModelFamily::KokoroTts => kokoro_plan(model_path, backend),
         ModelFamily::VibeVoiceTts => vibevoice_tts_plan(model_path, device, backend),
         ModelFamily::VoxtralTts => voxtral_tts_plan(model_path, device, backend),
+        ModelFamily::ChatterboxTts => chatterbox_tts_plan(model_path, backend),
         _ => Ok(None),
     }
 }
@@ -292,6 +295,46 @@ fn price_kokoro(files: &[CensusFile], backend: BackendKind) -> Result<AsrResiden
     AsrResidencyPlan::from_ledger(ledger, KOKORO_MODEL_MEMO_MAX_BYTES)
 }
 
+/// Device bytes of the bundled default voice once prepared (`conds.pt`: a
+/// reference mel, prompt tokens and two speaker vectors), well under this.
+const CHATTERBOX_DEFAULT_VOICE_BYTES: u64 = 1024 * 1024;
+
+fn chatterbox_tts_plan(
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let paths = [T3_WEIGHTS_FILE, S3GEN_WEIGHTS_FILE].map(|file| model_path.join(file));
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    price_chatterbox_tts(&files, backend).map(Some)
+}
+
+/// Chatterbox (`chatterbox/model.rs`): T3, S3Gen's flow and HiFT, read from
+/// memory-mapped safetensors at their stored F32 and kept F32 on every
+/// backend. Left out, as the loader never reads them: T3's text head and
+/// the Llama trunk's own token table, and S3Gen's reference encoders
+/// (`tokenizer.*`, `speaker_encoder.*`), since the default voice comes
+/// prepared. HiFT's weight-norm halves are priced whole, a slight
+/// overestimate of the kernels they fold into.
+fn price_chatterbox_tts(files: &[CensusFile], backend: BackendKind) -> Result<AsrResidencyPlan> {
+    const UNREAD: [&str; 4] = [
+        "text_head.",
+        "tfmr.embed_tokens.",
+        "tokenizer.",
+        "speaker_encoder.",
+    ];
+    let mut ledger = Ledger::new(backend);
+    for tensor in files
+        .iter()
+        .flat_map(|file| file.tensors.iter())
+        .filter(|tensor| !UNREAD.iter().any(|prefix| tensor.name.starts_with(prefix)))
+    {
+        ledger.var(tensor, Source::Mapped, &[DType::F32])?;
+    }
+    AsrResidencyPlan::from_ledger(ledger, CHATTERBOX_DEFAULT_VOICE_BYTES)
+}
+
 fn vibevoice_tts_plan(
     model_path: &Path,
     device: &DeviceProfile,
@@ -437,6 +480,41 @@ mod tests {
         price_vibevoice(&census!("vibevoice_1_5b.json"), backend, &load).unwrap()
     }
 
+    /// The published Chatterbox headers (`tests/fixtures/chatterbox`), recast
+    /// as a residency fixture of the two files its loader reads.
+    fn chatterbox_census() -> Vec<CensusFile> {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/chatterbox/tensor_census.json"
+        ))
+        .unwrap();
+        let files = [T3_WEIGHTS_FILE, S3GEN_WEIGHTS_FILE].map(|name| {
+            let mut total_bytes = 0u64;
+            let tensors = doc["files"][name]["tensors"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(tensor, spec)| {
+                    let elements = spec[1]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|dim| dim.as_u64().unwrap())
+                        .product::<u64>();
+                    total_bytes += elements * if spec[0] == "I64" { 8 } else { 4 };
+                    serde_json::json!([tensor, spec[0], spec[1]])
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "path": name,
+                "format": "safetensors",
+                "total_bytes": total_bytes,
+                "tensor_count": tensors.len(),
+                "tensors": tensors,
+            })
+        });
+        fixture(&serde_json::json!({ "files": files }).to_string())
+    }
+
     /// Report 08 table B, resident weights per backend (CPU, Metal as
     /// allocated, CUDA), with the load peak each must stay under:
     /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.01 GiB,
@@ -454,9 +532,12 @@ mod tests {
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
     ///   CUDA (5.04 GiB exact); on Metal its fused LM projections are joined
     ///   at their exact size too (5.41 GiB allocated before, from 5.86).
+    /// - Chatterbox is F32 everywhere: T3 and S3Gen's flow and HiFT, 2.48 GiB
+    ///   of its 3.19 GB of files (the reference encoders wait for cloning).
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
+        let chatterbox = chatterbox_census();
         let qwen06_cv = census!("qwen3_tts_12hz_0_6b_custom_voice.json");
         let qwen06_base = census!("qwen3_tts_12hz_0_6b_base.json");
         let qwen17_cv = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
@@ -483,6 +564,11 @@ mod tests {
             ),
             ("Kokoro-82M", Box::new(kokoro), [0.30, 0.30, 0.30]),
             ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.04, 5.04]),
+            (
+                "Chatterbox-500M",
+                Box::new(|b| price_chatterbox_tts(&chatterbox, b).unwrap()),
+                [2.48, 2.48, 2.48],
+            ),
         ];
         for (label, plan, [cpu, metal, cuda]) in rows {
             let plans = BACKENDS.map(&plan);
