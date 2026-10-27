@@ -80,7 +80,11 @@ Those endpoints only show variants that are enabled for download/use.
 > in the request's language. The download (about 5.5 GB) includes the Mimi
 > codec (CC BY 4.0) and the ECAPA speaker encoder from their own repositories.
 > Izwi estimates about 7 GB of memory on Metal and CUDA; on CPU it runs in F32,
-> and its weights alone take about 10 GB.
+> and its weights alone take about 10 GB. On a 16 GB M1 Pro with Metal one
+> request takes about as long as the speech it generates (0.85 to 1 times),
+> and four at once produce speech about 1.3 times faster than real time
+> together; on that machine's CPU a request takes 8 to 9 times as long as its
+> speech. It has not yet been measured on NVIDIA GPUs.
 
 > `Chatterbox-Multilingual-500M` is the same design trained on 23 languages,
 > with its own speech-token model (`t3_mtl23ls_v2`) and grapheme tokenizer and

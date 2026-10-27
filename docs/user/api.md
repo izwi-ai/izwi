@@ -449,7 +449,9 @@ out of range returns `400`.
   recently sampled codes, which `repetition_penalty` sets. `seed` makes a
   request reproducible.
 - With `stream: true` it streams audio as the Mimi codec decodes it: the first
-  80 ms frame, then windows of 320 ms.
+  80 ms frame, then windows of 320 ms. Streamed and final-only audio are the
+  same samples for the same `seed`, and a request's audio is the same whether
+  it runs alone or beside other requests.
 - One request speaks at most 1,500 frames (120 s). Without `max_tokens`, Izwi
   sets a budget from the text and splits text longer than 280 characters into
   whole sentences of up to 280 characters (about 20 s each). Sentences also end

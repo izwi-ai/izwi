@@ -253,7 +253,7 @@ The load path currently publishes ABI-v2 state as follows:
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Chatterbox** | Retained paged T3 state (two guidance branches per request, decoded in batches across requests) plus bounded acoustic-stage scratch, run one step at a time so other requests interleave | Portable route validated on CPU and Metal; CUDA is compile-checked only until NVIDIA evidence is retained |
 | **Maya1** | Retained paged decoder state (decoded in batches across requests) plus bounded SNAC-window scratch, one window per step so other requests interleave | Portable route validated on Metal for both releases, with exact solo parity under load; CUDA is compile-checked only |
-| **Maya 2 Native** | Retained paged backbone state (decoded in batches across requests) plus bounded depth-decoder and Mimi-window scratch, one window per step so other requests interleave | Portable route; runtime evidence pending |
+| **Maya 2 Native** | Retained paged backbone state (decoded in batches across requests) plus bounded depth-decoder and Mimi-window scratch, one window per step so other requests interleave | Portable route validated on Metal and CPU, with exact solo parity under load; CUDA has not run on a GPU |
 | **Sortformer diarization** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Stateless/catalog-only routes** | No retained mutable state, or no loaded state publication | No cache provider applies |
 
