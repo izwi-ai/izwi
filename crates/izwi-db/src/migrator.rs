@@ -48,6 +48,7 @@ impl Schema {
                 (11, "voice session chat threads"),
                 (12, "transcription translation target and keywords"),
                 (13, "saved voices without a transcript"),
+                (14, "saved voice reference language"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -215,6 +216,9 @@ async fn apply_migration<C: ConnectionTrait>(
             for column in TRANSCRIPTION_TASK_COLUMNS {
                 ensure_column(db, column).await?;
             }
+        }
+        (Schema::App, 14) => {
+            ensure_column(db, &SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN).await?;
         }
         (Schema::App, 13) => {
             if backend == DbBackend::Postgres {
@@ -1187,6 +1191,15 @@ const TRANSCRIPTION_TASK_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 14: the language a saved voice's reference audio is spoken in,
+/// for models that clone across languages (Maya 2 Native); null for voices
+/// saved before, which those models infer from the transcript.
+const SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "saved_voices",
+    column: "reference_language",
+    definition: "TEXT NULL",
+};
+
 /// Migration 13: a saved voice may omit its transcript, as a model that
 /// clones from audio alone (Chatterbox) needs none. PostgreSQL drops the
 /// constraint in place.
@@ -1770,6 +1783,8 @@ pub(crate) fn postgres_schema_sql() -> String {
     }
     // Migration 13.
     push(SAVED_VOICE_TRANSCRIPT_OPTIONAL);
+    // Migration 14.
+    push(&add_column(&SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(

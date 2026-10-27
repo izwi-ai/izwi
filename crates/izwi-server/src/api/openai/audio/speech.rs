@@ -533,6 +533,14 @@ async fn resolve_saved_voice_request(
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
     req.reference_text = saved_voice.reference_text;
+    // The voice's language serves a model that reads one; a request's own
+    // `reference_language` wins.
+    if req.reference_language.is_none()
+        && parse_tts_model_variant(&req.model)
+            .is_ok_and(crate::api::tts_policy::takes_reference_language)
+    {
+        req.reference_language = saved_voice.reference_language;
+    }
     Ok(req)
 }
 

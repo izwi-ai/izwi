@@ -43,6 +43,10 @@ pub struct CreateSavedVoiceRequest {
     pub name: Option<String>,
     #[serde(default)]
     pub reference_text: Option<String>,
+    /// The language the reference is spoken in, one Maya 2 Native knows;
+    /// models that clone across languages use it.
+    #[serde(default)]
+    pub reference_language: Option<String>,
     #[serde(default)]
     pub audio_base64: Option<String>,
     #[serde(default)]
@@ -140,6 +144,26 @@ fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A saved voice's language, stored as the catalog's code: a voice outlives
+/// any one model, so it names a language a cross-lingual cloner knows.
+fn saved_voice_reference_language(raw: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    izwi_core::catalog::maya2_language(raw)
+        .map(|language| Some(language.code.to_string()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Unsupported `reference_language` '{raw}'; use one of: {}.",
+                izwi_core::catalog::MAYA2_LANGUAGES
+                    .iter()
+                    .map(|language| language.code)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
 pub async fn create_saved_voice(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<CreateSavedVoiceRequest>,
@@ -148,6 +172,7 @@ pub async fn create_saved_voice(
     // Optional: a voice for a model that clones from audio alone needs no
     // transcript; a model that conditions on one refuses the voice at use.
     let reference_text = req.reference_text.filter(|text| !text.trim().is_empty());
+    let reference_language = saved_voice_reference_language(req.reference_language.as_deref())?;
     // A designed voice is synthetic; any other is someone's real voice.
     if req.source_route_kind != Some(SavedVoiceSourceRouteKind::VoiceDesign)
         && req.consent != Some(true)
@@ -174,6 +199,7 @@ pub async fn create_saved_voice(
         .create_voice(NewSavedVoice {
             name,
             reference_text,
+            reference_language,
             audio_mime_type,
             audio_filename: req.audio_filename,
             audio_bytes: audio_payload.bytes,
@@ -253,6 +279,20 @@ mod tests {
     use super::*;
 
     /// TPIPE-23: saved voices and synthesis share the 30 s reference limit.
+    #[test]
+    fn saved_voice_languages_are_catalog_codes() {
+        assert_eq!(saved_voice_reference_language(None).unwrap(), None);
+        assert_eq!(saved_voice_reference_language(Some("  ")).unwrap(), None);
+        assert_eq!(
+            saved_voice_reference_language(Some(" HI "))
+                .unwrap()
+                .as_deref(),
+            Some("hi")
+        );
+        let error = saved_voice_reference_language(Some("xx")).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn saved_voices_are_held_to_the_reference_limit_at_upload() {
         assert!(validate_saved_voice_reference(12.0).is_ok());
