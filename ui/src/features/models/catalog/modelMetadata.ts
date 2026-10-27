@@ -255,7 +255,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Maya1",
     fullName: "Maya1 by Maya Research",
     description:
-      "Voice design from a written description, with inline emotion tags such as <laugh>, <sigh> and <whisper> placed in the text. Nine described voices are built in. A 3B model: real time on recent NVIDIA GPUs, slower than real time on Apple Silicon and CPUs.",
+      "Voice design from a written description, with inline emotion tags such as <laugh>, <sigh> and <whisper> placed in the text. Nine described voices are built in. A 3B model: slower than real time on Apple Silicon (about 4.5x the length of its speech on an M1 Pro).",
     category: "tts",
     capabilities: [
       "Text to Speech",
@@ -270,7 +270,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Maya1 GGUF",
     fullName: "Maya1 by Maya Research (GGUF Q8_0)",
     description:
-      "Maya1 with a Q8_0 decoder: the same described voices and inline emotion tags in about half the download and weight memory.",
+      "Maya1 with a Q8_0 decoder: the same described voices and inline emotion tags in about half the download and weight memory, and faster on Apple Silicon (about 3x the length of its speech on an M1 Pro).",
     category: "tts",
     capabilities: [
       "Text to Speech",

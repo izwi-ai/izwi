@@ -407,7 +407,10 @@ out of range returns `400`.
 - Sampling defaults follow the model card: `temperature` 0.4, top-p 0.9,
   top-k 50, repetition penalty 1.1. `seed` makes a request reproducible.
 - With `stream: true` it streams audio in windows as the decoder writes it;
-  streamed and final-only audio are the same samples for the same `seed`.
+  streamed and final-only audio are the same samples for the same `seed`, and
+  so is a request served beside others. It runs slower than real time on
+  Apple Silicon (first audio in about 2 s on an M1 Pro, then windows seconds
+  apart), so buffer before playing.
 - One request speaks at most 2,048 decoder tokens (about 25 s). Without
   `max_tokens`, Izwi sets a budget from the text and splits text longer than
   about 160 characters into sentences of up to about 11 s, each with the same

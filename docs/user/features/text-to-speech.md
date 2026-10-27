@@ -251,6 +251,12 @@ sentences and spoken in full. Every utterance carries Resemble AI's imperceptibl
 operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
 `Chatterbox-Multilingual-500M` does the same in Arabic, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish, named per
 request with `language` (English when unset). Japanese is not supported yet.
+`Maya1-3B` (English, 24 kHz, Apache-2.0) speaks with a built-in voice or one
+described in `instructions`, and performs tags such as `<laugh>` placed in the
+text. On an Apple M1 Pro with Metal it streams first audio in about 2 s and
+runs at a real-time factor of about 4.5 for one request (about 3 with
+`Maya1-3B-GGUF`, which also needs half the memory). A request's audio is the
+same alone, streamed or beside other requests for the same `seed`.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---
