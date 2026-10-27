@@ -72,6 +72,7 @@ use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::maya1::Maya1TtsModel;
+use crate::models::architectures::maya2::Maya2TtsModel;
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
     NemotronOfflinePhysicalStateSpec, NemotronRealtimeBatchInput, NemotronRealtimeBatchRow,
@@ -166,6 +167,7 @@ type VoxtralLoaderFn = fn(
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type ChatterboxTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<ChatterboxTtsModel>;
 type Maya1TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya1TtsModel>;
+type Maya2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya2TtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
@@ -222,6 +224,12 @@ struct Maya1TtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: Maya1TtsLoaderFn,
+}
+
+struct Maya2TtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: Maya2TtsLoaderFn,
 }
 
 struct VibeVoiceTtsLoaderRegistration {
@@ -502,6 +510,14 @@ fn load_maya1_tts_model(
     Maya1TtsModel::load(model_dir, variant, device)
 }
 
+fn load_maya2_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<Maya2TtsModel> {
+    Maya2TtsModel::load(model_dir, variant, device)
+}
+
 fn load_vibevoice_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -656,6 +672,12 @@ const MAYA1_TTS_LOADER_REGISTRY: &[Maya1TtsLoaderRegistration] = &[Maya1TtsLoade
     loader: load_maya1_tts_model,
 }];
 
+const MAYA2_TTS_LOADER_REGISTRY: &[Maya2TtsLoaderRegistration] = &[Maya2TtsLoaderRegistration {
+    name: "maya2_tts",
+    family: ModelFamily::Maya2Tts,
+    loader: load_maya2_tts_model,
+}];
+
 const VIBEVOICE_TTS_LOADER_REGISTRY: &[VibeVoiceTtsLoaderRegistration] =
     &[VibeVoiceTtsLoaderRegistration {
         name: "vibevoice_tts",
@@ -761,6 +783,15 @@ fn resolve_maya1_tts_loader_registration(
 ) -> Option<&'static Maya1TtsLoaderRegistration> {
     let family = variant.family();
     MAYA1_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_maya2_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static Maya2TtsLoaderRegistration> {
+    let family = variant.family();
+    MAYA2_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -4747,6 +4778,27 @@ impl Deref for Maya1TtsModelLease {
     }
 }
 
+/// A loaded Maya2 TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct Maya2TtsModelLease {
+    inner: TrackedModelLease<Maya2TtsModel>,
+}
+
+impl Maya2TtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<Maya2TtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for Maya2TtsModelLease {
+    type Target = Maya2TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl FishS2TtsModelLease {
     #[cfg(test)]
     pub(crate) fn for_test(model: FishS2TtsModel) -> Self {
@@ -6536,6 +6588,7 @@ pub struct ModelRegistry {
     chatterbox_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<ChatterboxTtsModel>>>>>,
     maya1_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Maya1TtsModel>>>>>,
+    maya2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Maya2TtsModel>>>>>,
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
@@ -6715,6 +6768,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::VoxtralTts => "voxtral_tts",
         ModelFamily::ChatterboxTts => "chatterbox_tts",
         ModelFamily::Maya1Tts => "maya1_tts",
+        ModelFamily::Maya2Tts => "maya2_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
         ModelFamily::ParakeetAsr => "parakeet_asr",
@@ -6829,6 +6883,7 @@ impl ModelRegistry {
             voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
             chatterbox_tts_models: Arc::new(RwLock::new(HashMap::new())),
             maya1_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            maya2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
@@ -7155,6 +7210,24 @@ impl ModelRegistry {
                         *variant,
                         "maya1_tts",
                         "maya1_tts",
+                        LoadedModelActualRuntime::default(),
+                        None,
+                        None,
+                        serde_json::to_value(model.diagnostics()).ok(),
+                    ));
+                }
+            }
+        }
+
+        {
+            let guard = self.maya2_tts_models.read().await;
+            for (variant, entry) in guard.iter() {
+                if let Some(model) = entry.ready_model() {
+                    diagnostics.push(loaded_model_diagnostics_entry(
+                        &self.device,
+                        *variant,
+                        "maya2_tts",
+                        "maya2_tts",
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
@@ -7839,6 +7912,64 @@ impl ModelRegistry {
         })
     }
 
+    pub async fn load_maya2_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<Maya2TtsModel>> {
+        let registration = resolve_maya2_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Maya2 TTS model variant: {variant}"))
+        })?;
+
+        let (entry, loading_guard) = {
+            let mut guard = self.maya2_tts_models.write().await;
+            let entry = guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Maya2 TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
+        };
+
+        info!(
+            "Loading Maya2 TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        entry
+            .model
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    DeviceThread::for_device(&device.device)?
+                        .submit(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+        let model = {
+            let guard = self.maya2_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Maya2 TTS model {variant} load was superseded before publication"
+            ))
+        })
+    }
+
     pub async fn load_vibevoice_tts(
         &self,
         variant: ModelVariant,
@@ -8353,6 +8484,52 @@ impl ModelRegistry {
         entry.publish_ready()
     }
 
+    pub async fn get_maya2_tts(&self, variant: ModelVariant) -> Option<Arc<Maya2TtsModel>> {
+        let guard = self.maya2_tts_models.read().await;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub fn try_get_maya2_tts(&self, variant: ModelVariant) -> Option<Arc<Maya2TtsModel>> {
+        let guard = self.maya2_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_maya2_tts_lease(&self, variant: ModelVariant) -> Option<Maya2TtsModelLease> {
+        let guard = self.maya2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Maya2TtsModelLease { inner })
+    }
+
+    pub fn try_get_maya2_tts_lease(&self, variant: ModelVariant) -> Option<Maya2TtsModelLease> {
+        let guard = self.maya2_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Maya2TtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_maya2_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<Maya2TtsModel>> {
+        let guard = self.maya2_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_maya2_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.maya2_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Maya2 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+
     pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.read().await;
         guard.get(&variant).and_then(|entry| entry.ready_model())
@@ -8639,6 +8816,21 @@ impl ModelRegistry {
     pub async fn unload_maya1_tts(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.maya1_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
+        }
+    }
+
+    pub async fn unload_maya2_tts(&self, variant: ModelVariant) {
+        let entry = {
+            let mut guard = self.maya2_tts_models.write().await;
             let entry = guard.remove(&variant);
             if let Some(entry) = &entry {
                 entry.reset_ready();

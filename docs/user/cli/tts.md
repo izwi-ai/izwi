@@ -53,7 +53,8 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
 | `-t, --temperature <TEMP>` | Sampling temperature | model default |
-| `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`) | model default |
+| `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`); for `Maya2-Native-2.5B`, a code (e.g. `hi`) or `auto` to read it from the text's script | model default |
+| `--reference-language <CODE>` | Language the reference audio is spoken in (`Maya2-Native-2.5B` only, which can clone a voice into another language); unset, it is read from the transcript's script | — |
 | `--exaggeration <F>` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight <F>` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
 | `--min-p <F>` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
@@ -173,6 +174,9 @@ izwi tts "Habari za asubuhi, karibu sana." \
 ```
 
 `Chatterbox-500M` returns `400` for any language but English.
+With `--stream`, Chatterbox's first audio arrives after about 2 s on an Apple
+M1 Pro (Metal); the rest follows in windows. It refuses `--speed` and
+`--instructions`.
 
 ### Maya1
 
@@ -194,9 +198,43 @@ The tags are `<angry>`, `<appalled>`, `<chuckle>`, `<cry>`, `<curious>`,
 `<sigh>`, `<sing>`, `<snort>` and `<whisper>`; the server returns `400` for
 any other `<word>` in Maya1's text. Long text is spoken in sentences of up to
 about 11 seconds, each with the same voice description.
-With `--stream`, Chatterbox's first audio arrives after about 2 s on an Apple
-M1 Pro (Metal); the rest follows in windows. It refuses `--speed` and
-`--instructions`.
+
+### Maya 2 Native
+
+`Maya2-Native-2.5B` speaks English and 11 Indic languages with one of 20
+voices (`--speaker Ahana`, the default, or `Vaidehi`, `Anirban`, …; see
+[Voice Presets](/models/voice-presets#maya-2-native)). It reads the language
+from the text's script, or takes a code with `--language`. Devanagari text
+reads as Hindi and Bengali script as Bengali, so name Marathi (`mr`) and
+Assamese (`as`):
+
+```bash
+izwi tts "नमस्ते, आपका ऑर्डर कल पहुँच जाएगा।" \
+  --model Maya2-Native-2.5B \
+  --speaker Vaidehi \
+  --output maya2.wav
+```
+
+It also clones a voice from reference audio and its exact transcript, and the
+clone can speak another of its languages. `--reference-language` names the
+language of the reference; without it, Izwi reads it from the transcript:
+
+```bash
+izwi tts "आपका ऑर्डर कल शाम तक पहुँच जाएगा।" \
+  --model Maya2-Native-2.5B \
+  --reference-audio samples/reference.wav \
+  --reference-text "This is the exact text spoken in the reference sample." \
+  --reference-language en \
+  --output maya2-clone.wav
+```
+
+Tags in square brackets, such as `[laughs]`, `[sighs]` or `[whispers]`, are
+performed on a best-effort basis. Maya Research names `[laughs]`, `[sighs]`,
+`[whispers]`, `[sad]`, `[excited]`, `[curious]`, `[angry]` and `[surprised]`;
+other lowercase `[tags]` are passed to the model too. Numbers, dates, currency
+and similar are spoken as words in the text's language. Text longer than 280
+characters is spoken in whole sentences of up to 280 characters (about 20
+seconds each). It refuses `--speed` and `--instructions`.
 
 ### Saved voice reuse
 

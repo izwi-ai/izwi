@@ -12,6 +12,7 @@ use crate::state::AppState;
 pub(crate) struct SavedVoiceReference {
     pub voice_id: String,
     pub reference_text: Option<String>,
+    pub reference_language: Option<String>,
     pub reference_audio_base64: String,
 }
 
@@ -60,6 +61,7 @@ pub(crate) async fn resolve_saved_voice_reference(
     Ok(SavedVoiceReference {
         voice_id: saved_voice.id,
         reference_text: saved_voice.reference_text,
+        reference_language: saved_voice.reference_language,
         reference_audio_base64: base64::engine::general_purpose::STANDARD.encode(audio.audio_bytes),
     })
 }

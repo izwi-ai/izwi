@@ -33,6 +33,7 @@ pub(crate) enum LoadedAdapterKind {
     VoxtralTts,
     ChatterboxTts,
     Maya1Tts,
+    Maya2Tts,
     KokoroStaticTts,
     Scalar,
 }
@@ -56,6 +57,7 @@ impl LoadedAdapterKind {
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
+            Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -257,6 +259,10 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // its frames arrive; a stream sends them, a final-only request keeps
         // them until it finishes.
         row(F::Maya1Tts, C::Tts, Loaded::Maya1Tts, RetainedAndInvocation).chunked(),
+        // Streams on its TTS route: every request decodes Mimi windows as its
+        // frames arrive; a stream sends them, a final-only request keeps them
+        // until it finishes.
+        row(F::Maya2Tts, C::Tts, Loaded::Maya2Tts, RetainedAndInvocation).chunked(),
         row(
             F::FishS2Tts,
             C::StreamingTts,

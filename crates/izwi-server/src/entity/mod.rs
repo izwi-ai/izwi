@@ -320,6 +320,7 @@ pub mod saved_voices {
         pub allowed_uses_json: String,
         pub permission_provenance: Option<String>,
         pub permission_revoked_at: Option<i64>,
+        pub reference_language: Option<String>,
     }
     empty_relation!();
 }

@@ -158,6 +158,61 @@ describe("viewport-safe creation dialogs", () => {
     });
   });
 
+  it("lets a model that reads the script detect the language", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const maya2 = {
+      variant: "Maya2-Native-2.5B",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        supports_reference_voice: true,
+        reference_transcript_required: true,
+        supports_voice_description: false,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        languages: [
+          { code: "en", name: "English" },
+          { code: "hi", name: "Hindi" },
+        ],
+        language_auto_detect: true,
+        inline_tags: ["[laughs]", "[sighs]"],
+      },
+    } as ModelInfo;
+    const onCreateStream = vi.fn().mockResolvedValue({ id: "record" });
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={maya2.variant}
+        selectedModelInfo={maya2}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={onCreateStream}
+      />,
+    );
+
+    const picker = screen.getByRole("combobox", { name: "Language" });
+    expect(picker).toHaveTextContent("Auto-detect");
+    expect(
+      screen.getByRole("combobox", { name: "Insert an expression tag" }),
+    ).toHaveTextContent("Insert a tag: [laughs], [sighs]…");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
+      target: { value: "नमस्ते, आप कैसे हैं?" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create generation" }));
+    await waitFor(() => expect(onCreateStream).toHaveBeenCalled());
+    expect(onCreateStream.mock.calls[0][0].language).toBeUndefined();
+
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Hindi" }));
+    expect(picker).toHaveTextContent("Hindi");
+  });
+
   it("offers no language to a model that speaks one", () => {
     render(
       <NewTextToSpeechModal

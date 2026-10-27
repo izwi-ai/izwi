@@ -263,6 +263,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "allowed_uses_json",
             "permission_provenance",
             "permission_revoked_at",
+            "reference_language",
         ],
     },
     RequiredSchemaTable {

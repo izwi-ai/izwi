@@ -59,6 +59,7 @@ export function modelCategoryFromVariant(
     normalized.includes("kokoro") ||
     normalized.includes("chatterbox") ||
     normalized.includes("maya1") ||
+    normalized.includes("maya2") ||
     normalized.includes("voicedesign") ||
     normalized.includes("customvoice") ||
     normalized.includes("base")

@@ -505,7 +505,8 @@ fn ensure_speech_audio(
 
 /// Speak numbers, currency, dates, times and units as words when the
 /// request asks for it, or leaves it unset for a family that normalizes by
-/// default (`batch.tts.normalize_text`, TPIPE-26). English text only.
+/// default (`batch.tts.normalize_text`, TPIPE-26). English text only, except
+/// Maya 2 Native, whose own normaliser covers its 12 languages.
 fn normalize_speech_text(
     mut request: GenerationRequest,
     variant: ModelVariant,
@@ -519,6 +520,14 @@ fn normalize_speech_text(
         .speech
         .normalize_text
         .unwrap_or_else(|| family_normalizes_by_default(variant.family()));
+    if enabled && variant.family() == crate::catalog::ModelFamily::Maya2Tts {
+        use crate::models::architectures::maya2::{resolve_language, text::normalise_text};
+        // An unknown language is refused at preparation with its own error.
+        if let Ok(language) = resolve_language(request.language.as_deref(), &request.text) {
+            request.text = normalise_text(&request.text, language);
+        }
+        return request;
+    }
     if enabled
         && is_english(
             request.language.as_deref(),
@@ -972,7 +981,7 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 7] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 8] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
             ModelFamily::VoxtralTts,
@@ -980,6 +989,7 @@ mod tests {
             ModelFamily::VibeVoiceTts,
             ModelFamily::ChatterboxTts,
             ModelFamily::Maya1Tts,
+            ModelFamily::Maya2Tts,
         ];
         let registry = RuntimeAdapterRegistry::built_in();
         let short = "Hello there.";

@@ -5,6 +5,7 @@ use izwi_core::runtime_models::architectures::chatterbox::{
 use izwi_core::runtime_models::architectures::maya1::{
     maya1_auto_max_new_tokens, prompt::validate_inline_tags,
 };
+use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
 };
@@ -197,13 +198,29 @@ pub(crate) fn validate_speech_controls(
     Ok(())
 }
 
+/// Maya 2 Native long-form segments: whole sentences up to about 20 s of
+/// speech, upstream's piece length (its frame prior puts 250 frames at
+/// 280-380 characters across its languages).
+pub(crate) const MAYA2_SEGMENT_MAX_CHARS: usize = 280;
+
 /// Refuse a `language` the model cannot speak before it loads: the English
-/// Chatterbox takes English only, the multilingual one its supported codes.
-/// Other models read `language` as a hint.
+/// Chatterbox takes English only, the multilingual one its supported codes,
+/// Maya 2 Native its 12 codes (or none / `auto`, read from the text's
+/// script). Other models read `language` as a hint.
 pub(crate) fn validate_speech_language(
     variant: ModelVariant,
     language: Option<&str>,
 ) -> Result<(), crate::error::ApiError> {
+    if variant.family() == ModelFamily::Maya2Tts {
+        return maya2_language(language, "")
+            .map(|_| ())
+            .map_err(|error| match error {
+                izwi_core::Error::InvalidInput(message) => {
+                    crate::error::ApiError::bad_request(message)
+                }
+                error => crate::error::core_api_error(error),
+            });
+    }
     let Some(edition) = ChatterboxEdition::of(variant) else {
         return Ok(());
     };
@@ -217,13 +234,13 @@ pub(crate) fn validate_speech_language(
 }
 
 /// Refuse text whose inline `<tag>`s the model does not know (Maya1 would
-/// read an unknown one aloud); text for a model without inline tags is
-/// spoken as written.
+/// read an unknown one aloud); text for any other model is spoken as written
+/// (Maya 2 Native performs its `[tags]` best effort).
 pub(crate) fn validate_speech_inline_tags(
     variant: ModelVariant,
     text: &str,
 ) -> Result<(), crate::error::ApiError> {
-    if variant.speech_inline_tags().is_empty() {
+    if !variant.refuses_unknown_inline_tags() {
         return Ok(());
     }
     match validate_inline_tags(text) {
@@ -233,6 +250,30 @@ pub(crate) fn validate_speech_inline_tags(
         }
         Err(err) => Err(crate::error::core_api_error(err)),
     }
+}
+
+/// Refuse a `reference_language` the request cannot use: only Maya 2 Native
+/// reads one, and it must name one of its languages (or `auto`).
+/// Whether `variant` reads `reference_language`: Maya 2 Native, which
+/// clones a voice into another language.
+pub(crate) fn takes_reference_language(variant: ModelVariant) -> bool {
+    variant.family() == ModelFamily::Maya2Tts
+}
+
+pub(crate) fn validate_speech_reference_language(
+    variant: ModelVariant,
+    reference_language: Option<&str>,
+) -> Result<(), crate::error::ApiError> {
+    let Some(language) = reference_language.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if !takes_reference_language(variant) {
+        return Err(crate::error::ApiError::bad_request(format!(
+            "{variant} does not take `reference_language`; only Maya 2 Native clones across \
+             languages."
+        )));
+    }
+    validate_speech_language(variant, Some(language))
 }
 
 /// Refuse an over-limit speech input with 413 before any model loads.
@@ -277,9 +318,9 @@ pub struct SpeechSamplingRequest {
     /// VibeVoice diffusion steps per frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_steps: Option<usize>,
-    /// Speak numbers, currency, dates, times and units as words (English).
-    /// Unset keeps the model's default: on for Kokoro, off for models that
-    /// read them themselves.
+    /// Speak numbers, currency, dates, times and units as words. Unset keeps
+    /// the model's default: on for Kokoro (English) and Maya 2 Native (in the
+    /// request's language), off for models that read them themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalize_text: Option<bool>,
     /// Min-p sampling threshold, in [0, 1] (Chatterbox).
@@ -384,6 +425,9 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
         ModelFamily::ChatterboxTts => ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
         // The automatic budget is whole 7-token frames, 2,044 at most.
         ModelFamily::Maya1Tts => ModelVariant::MAYA1_MAX_OUTPUT_FRAMES / 7 * 7,
+        // Upstream speaks long text in pieces of about 20 s; each piece's
+        // budget comes from its own frame prior.
+        ModelFamily::Maya2Tts => return text.trim().chars().count() > MAYA2_SEGMENT_MAX_CHARS,
         _ => return false,
     };
     resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)

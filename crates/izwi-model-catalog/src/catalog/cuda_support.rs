@@ -311,6 +311,7 @@ impl ModelVariant {
             | ModelFamily::FishS2Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -373,6 +374,7 @@ impl ModelVariant {
             | ModelFamily::FishS2Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
@@ -498,6 +500,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Maya1 uses dense Candle CUDA tensor kernels for its Llama 3.2-3B decoder (BF16, GQA on izwi's paged KV) and SNAC's convolutional decoder (F32); sampling and the codec noise are drawn on the host; audio decodes in windows while the decoder runs, streamed or not",
             ),
+            ModelFamily::Maya2Tts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Maya 2 Native uses dense Candle CUDA tensor kernels for its Qwen3-1.7B backbone (BF16, GQA on izwi's paged KV), its depth decoder (F16, rows in lockstep, Gumbel draws on the device from host noise) and Mimi's streaming decoder (F32); codebook-0 draws and the stop rule run on the host",
+            ),
             ModelFamily::VibeVoiceTts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "VibeVoice TTS uses dense Candle CUDA tensor kernels for the Qwen decoder, continuous tokenizers, and diffusion head; long-form generation is final-only until chunked decode is proven",
@@ -605,6 +611,10 @@ impl ModelVariant {
             ModelFamily::Maya1Tts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Maya1 ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::Maya2Tts => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Maya 2 Native ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

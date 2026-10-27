@@ -30,6 +30,7 @@ pub struct TtsArgs {
     pub speed: Option<f32>,
     pub temperature: Option<f32>,
     pub language: Option<String>,
+    pub reference_language: Option<String>,
     pub exaggeration: Option<f32>,
     pub cfg_weight: Option<f32>,
     pub min_p: Option<f32>,
@@ -61,6 +62,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         speed,
         temperature,
         language,
+        reference_language,
         exaggeration,
         cfg_weight,
         min_p,
@@ -104,6 +106,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         speed,
         temperature,
         language,
+        reference_language,
         controls: SpeechControls {
             exaggeration,
             cfg_weight,
@@ -297,6 +300,7 @@ struct BuildRequestArgs<'a> {
     speed: Option<f32>,
     temperature: Option<f32>,
     language: Option<String>,
+    reference_language: Option<String>,
     controls: SpeechControls,
     stream: bool,
 }
@@ -336,6 +340,9 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     }
     if let Some(language) = normalize_optional_text(args.language) {
         request_body["language"] = Value::String(language);
+    }
+    if let Some(language) = normalize_optional_text(args.reference_language) {
+        request_body["reference_language"] = Value::String(language);
     }
     let controls = args.controls;
     for (name, value) in [
@@ -513,6 +520,7 @@ mod tests {
                 speed: None,
                 temperature: None,
                 language: None,
+                reference_language: None,
                 controls: SpeechControls::default(),
                 stream: false,
             })
@@ -580,6 +588,7 @@ mod tests {
             speed: None,
             temperature: None,
             language: None,
+            reference_language: None,
             controls: SpeechControls::default(),
             stream: true,
         })
@@ -603,6 +612,7 @@ mod tests {
             speed: None,
             temperature: None,
             language: None,
+            reference_language: None,
             controls: SpeechControls {
                 exaggeration: Some(0.8),
                 cfg_weight: Some(0.0),
@@ -614,6 +624,30 @@ mod tests {
         assert_eq!(body["exaggeration"], json!(0.8f32));
         assert_eq!(body["cfg_weight"], json!(0.0f32));
         assert!(body.get("min_p").is_none());
+    }
+
+    #[test]
+    fn a_saved_voice_carries_a_cross_lingual_reference_language() {
+        let body = build_request_body(BuildRequestArgs {
+            model: "Maya2-Native-2.5B".to_string(),
+            text: "नमस्ते".to_string(),
+            speaker: None,
+            saved_voice_id: Some("voice-1".to_string()),
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            language: Some("hi".to_string()),
+            reference_language: Some(" en ".to_string()),
+            controls: SpeechControls::default(),
+            stream: false,
+        })
+        .expect("request body");
+        assert_eq!(body["language"], "hi");
+        assert_eq!(body["reference_language"], "en");
     }
 
     #[test]
@@ -631,6 +665,7 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             language: None,
+            reference_language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -659,6 +694,7 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             language: None,
+            reference_language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -688,6 +724,7 @@ mod tests {
             speed: None,
             temperature: None,
             language: None,
+            reference_language: None,
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -712,6 +749,7 @@ mod tests {
             speed: Some(1.0),
             temperature: Some(0.7),
             language: None,
+            reference_language: None,
             controls: SpeechControls::default(),
             stream: false,
         })

@@ -24,6 +24,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Chatterbox Multilingual (22 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
 | Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
 | Maya1 GGUF (the same, Q8_0 decoder) | `Maya1-3B-GGUF` |
+| Maya 2 Native (English and 11 Indic languages; 20 voices; reference-voice cloning) | `Maya2-Native-2.5B` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
@@ -62,6 +63,28 @@ Those endpoints only show variants that are enabled for download/use.
 > its decoder quantized to Q8_0 (llama.cpp's conversion, published as
 > `mradermacher/maya1-GGUF`): about 3.6 GB to download and half the weight
 > memory, with the same voices and tags.
+
+> `Maya2-Native-2.5B` is Maya Research's Maya 2 Native (Apache-2.0), a TTS
+> model for Assamese, Bengali, English, Gujarati, Hindi, Kannada, Malayalam,
+> Marathi, Odia, Punjabi, Tamil and Telugu. A Qwen3-1.7B backbone predicts the
+> first codebook of each 80 ms audio frame, a depth decoder fills in the other
+> 31, and Kyutai's Mimi codec turns the frames into 24 kHz audio. It speaks
+> with one of 20 built-in voices (see
+> [Voice Presets](/models/voice-presets#maya-2-native)), or clones a voice from
+> reference audio and its exact transcript with SpeechBrain's ECAPA speaker
+> encoder; the clone can speak any of the 12 languages, not only the
+> reference's. A request names its language in `language` (a code such as
+> `hi`) or leaves it to be read from the text's script. Tags in square
+> brackets (`[laughs]`, `[sighs]`, `[whispers]`, …) are performed on a
+> best-effort basis. Numbers, dates, currency and similar are spoken as words
+> in the request's language. The download (about 5.5 GB) includes the Mimi
+> codec (CC BY 4.0) and the ECAPA speaker encoder from their own repositories.
+> Izwi estimates about 7 GB of memory on Metal and CUDA; on CPU it runs in F32,
+> and its weights alone take about 10 GB. On a 16 GB M1 Pro with Metal one
+> request takes about as long as the speech it generates (0.85 to 1 times),
+> and four at once produce speech about 1.3 times faster than real time
+> together; on that machine's CPU a request takes 8 to 9 times as long as its
+> speech. It has not yet been measured on NVIDIA GPUs.
 
 > `Chatterbox-Multilingual-500M` is the same design trained on 23 languages,
 > with its own speech-token model (`t3_mtl23ls_v2`) and grapheme tokenizer and
@@ -187,6 +210,9 @@ izwi pull Chatterbox-Multilingual-500M
 # Download Maya Research Maya1 (about 6.7 GB, or 3.6 GB as Q8_0 GGUF)
 izwi pull Maya1-3B
 izwi pull Maya1-3B-GGUF
+
+# Download Maya Research Maya 2 Native (about 5.5 GB)
+izwi pull Maya2-Native-2.5B
 ```
 
 ### Via Web UI

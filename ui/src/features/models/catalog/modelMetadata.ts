@@ -79,7 +79,11 @@ export function getModelProviderLabel(variant: string): string {
   ) {
     return "Resemble AI";
   }
-  if (variant.startsWith("Maya1-") || variant.startsWith("maya-research/")) {
+  if (
+    variant.startsWith("Maya1-") ||
+    variant.startsWith("Maya2-") ||
+    variant.startsWith("maya-research/")
+  ) {
     return "Maya Research";
   }
   return "Other";
@@ -282,6 +286,21 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Q8_0",
     ],
     size: "3.62 GB",
+  },
+  "Maya2-Native-2.5B": {
+    shortName: "Maya 2 Native",
+    fullName: "Maya 2 Native by Maya Research",
+    description:
+      "Streaming speech in 11 Indian languages and English (Assamese, Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu) with 20 built-in voices, and voice cloning from a 3-10 second clip and its transcript, across languages. Numbers, currency, dates and phone numbers are read out in the chosen language.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Cloning",
+      "12 Languages",
+      "Streaming",
+      "24 kHz",
+    ],
+    size: "5.49 GB",
   },
   // Text Chat
   "Qwen3.5-0.8B": {

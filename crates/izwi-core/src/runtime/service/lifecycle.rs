@@ -481,6 +481,14 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 Ok(model.available_speakers())
             }
+            crate::catalog::ModelFamily::Maya2Tts => {
+                let model = self
+                    .model_registry
+                    .get_maya2_tts(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                Ok(model.available_speakers())
+            }
             crate::catalog::ModelFamily::VibeVoiceTts => {
                 let model = self
                     .model_registry
@@ -533,6 +541,10 @@ impl RuntimeService {
             }
             crate::catalog::ModelFamily::Maya1Tts => {
                 let model = self.model_registry.get_maya1_tts(variant).await?;
+                serde_json::to_value(model.diagnostics()).ok()
+            }
+            crate::catalog::ModelFamily::Maya2Tts => {
+                let model = self.model_registry.get_maya2_tts(variant).await?;
                 serde_json::to_value(model.diagnostics()).ok()
             }
             _ => None,

@@ -190,6 +190,10 @@ pub struct CreateSpeechHistoryRecordRequest {
     pub reference_audio: Option<String>,
     #[serde(default)]
     pub reference_text: Option<String>,
+    /// The language the reference audio is spoken in, for models that clone
+    /// across languages (Maya 2 Native); absent, the model infers it.
+    #[serde(default)]
+    pub reference_language: Option<String>,
     #[serde(default)]
     pub saved_voice_id: Option<String>,
     #[serde(default)]
@@ -860,7 +864,7 @@ async fn create_record(
             "Idempotency-Key is not supported for streaming text-to-speech requests",
         ));
     }
-    req = resolve_saved_voice_selection(&state, req).await?;
+    req = resolve_saved_voice_selection(&state, variant, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
     if req.stream.unwrap_or(false) && route_kind != SpeechRouteKind::TextToSpeech {
         return Err(ApiError::bad_request(
@@ -1816,7 +1820,7 @@ pub(crate) async fn synthesize_record(
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
     validate_reference_voice_selection(&req)?;
-    req = resolve_saved_voice_selection(state, req).await?;
+    req = resolve_saved_voice_selection(state, variant, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
     synthesize_record_internal(
         state,
@@ -2596,12 +2600,14 @@ fn normalize_create_request(
     req.voice_description = normalize_optional_trimmed(req.voice_description);
     req.reference_audio = normalize_optional_trimmed(req.reference_audio);
     req.reference_text = normalize_optional_trimmed(req.reference_text);
+    req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
     req
 }
 
 async fn resolve_saved_voice_selection(
     state: &AppState,
+    variant: ModelVariant,
     mut req: CreateSpeechHistoryRecordRequest,
 ) -> Result<CreateSpeechHistoryRecordRequest, ApiError> {
     let Some(saved_voice_id) = req.saved_voice_id.as_deref() else {
@@ -2612,6 +2618,12 @@ async fn resolve_saved_voice_selection(
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
     req.reference_text = saved_voice.reference_text;
+    // The voice's language serves a model that reads one; a request's own
+    // `reference_language` wins.
+    if req.reference_language.is_none() && crate::api::tts_policy::takes_reference_language(variant)
+    {
+        req.reference_language = saved_voice.reference_language;
+    }
     Ok(req)
 }
 
@@ -2697,6 +2709,7 @@ fn build_generation_request(
         language: req.language,
         reference_audio: req.reference_audio,
         reference_text: req.reference_text,
+        reference_language: req.reference_language,
         voice_description: req.voice_description,
     }
 }
@@ -2749,6 +2762,10 @@ fn normalize_for_model_capabilities(
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
     crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
+    crate::api::tts_policy::validate_speech_reference_language(
+        variant,
+        req.reference_language.as_deref(),
+    )?;
     crate::api::tts_policy::validate_speech_inline_tags(
         variant,
         req.text.as_deref().unwrap_or_default(),
@@ -3115,6 +3132,7 @@ mod tests {
             voice_description: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             temperature: None,
             speed: None,

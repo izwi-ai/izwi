@@ -1,6 +1,6 @@
 //! Load admission for the TTS families (P2.1): the residency plan of the ASR
 //! admission framework (`asr_memory`), opened to Qwen3-TTS, Kokoro,
-//! VibeVoice-TTS, Voxtral-TTS, Chatterbox and Maya1. Each plan prices the header census of the
+//! VibeVoice-TTS, Voxtral-TTS, Chatterbox, Maya1 and Maya 2 Native. Each plan prices the header census of the
 //! files its loader reads, in the dtype the loader's own resolver picks, with
 //! Metal's power-of-two rounding of device-written buffers and the uploads
 //! Candle holds until the load fence (see `asr_memory` for the rules). The
@@ -42,6 +42,13 @@ use crate::models::architectures::maya1::config::{
 use crate::models::architectures::maya1::{
     maya1_lm_precision, maya1_reloads_in_f32, Maya1LmConfig, MAYA1_GGUF_FILE,
 };
+use crate::models::architectures::maya2::config::{
+    CODEBOOK_SIZE as MAYA2_CODEBOOK_SIZE, DEPTH_LEVELS as MAYA2_DEPTH_LEVELS,
+    MIMI_DIR as MAYA2_MIMI_DIR, WEIGHT_SHARDS as MAYA2_WEIGHT_SHARDS,
+};
+use crate::models::architectures::maya2::{
+    maya2_backbone_precision, maya2_depth_dtype, maya2_reloads_in_f32,
+};
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
 use crate::models::architectures::qwen3::tts::speech_tokenizer::{
     encoder_reads_tensor, read_encoder_acoustic_codebooks,
@@ -51,6 +58,7 @@ use crate::models::architectures::qwen3::tts::{
 };
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_weight_dtype;
 use crate::models::architectures::voxtral::tts::model::{VoxtralTtsDTypePlan, VoxtralTtsModel};
+use crate::models::shared::codecs::mimi::MIMI_WEIGHTS_FILE;
 
 /// Whether `variant` is a TTS family this module prices.
 pub(super) fn has_plan(variant: ModelVariant) -> bool {
@@ -62,6 +70,7 @@ pub(super) fn has_plan(variant: ModelVariant) -> bool {
             | ModelFamily::VoxtralTts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts
     )
 }
 
@@ -101,6 +110,7 @@ pub(super) fn residency_plan(
         ModelFamily::ChatterboxTts => chatterbox_tts_plan(variant, model_path, device, backend),
         ModelFamily::Maya1Tts if variant.is_maya1_gguf() => maya1_gguf_plan(model_path, backend),
         ModelFamily::Maya1Tts => maya1_tts_plan(model_path, device, backend),
+        ModelFamily::Maya2Tts => maya2_tts_plan(model_path, device, backend),
         _ => Ok(None),
     }
 }
@@ -483,6 +493,72 @@ fn price_maya1_tts(
             }
         }
     }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+fn maya2_tts_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let mimi = model_path.join(MAYA2_MIMI_DIR).join(MIMI_WEIGHTS_FILE);
+    let mut paths = MAYA2_WEIGHT_SHARDS
+        .map(|shard| model_path.join(shard))
+        .to_vec();
+    paths.push(mimi);
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    let dtype = maya2_backbone_precision(device).dtype;
+    let plan = price_maya2_tts(&files, backend, dtype, maya2_depth_dtype(device, dtype))?;
+    if maya2_reloads_in_f32(device, dtype) {
+        // A backbone that fails its load-time probe reloads in F32 (never on
+        // Metal, where the load is refused instead).
+        let dense = price_maya2_tts(&files, backend, DType::F32, DType::F32)?;
+        return Ok(Some(plan.with_fallback_peak(&dense)));
+    }
+    Ok(Some(plan))
+}
+
+/// Maya 2 Native (`maya2/runtime.rs`), read through the staged loader: the
+/// backbone and the input side at `dtype` (the token table only gathered,
+/// kept BF16 on the CPU), the depth decoder at `depth_dtype` plus the
+/// prefix table it precomputes, and Mimi (decoder now, encoder on the first
+/// clone) at F32. The text head is an alias of the token table and is never
+/// materialised; ECAPA runs on the host.
+fn price_maya2_tts(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+    depth_dtype: DType,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::staged(backend);
+    for file in files {
+        let mimi = file.path.ends_with(MIMI_WEIGHTS_FILE);
+        for tensor in &file.tensors {
+            if mimi {
+                ledger.var(tensor, Source::Mapped, &[DType::F32])?;
+            } else if tensor.name.starts_with("depth.") {
+                ledger.var(tensor, Source::Mapped, &[depth_dtype])?;
+            } else if tensor.name == "backbone.lm.model.embed_tokens.weight"
+                && backend == BackendKind::Cpu
+            {
+                ledger.var(tensor, Source::Mapped, &[DType::BF16])?;
+            } else {
+                ledger.var(tensor, Source::Mapped, &[dtype])?;
+            }
+        }
+    }
+    // The depth decoder's prefix table, `code_up(code_lo) + level_emb`,
+    // built in F32 and kept at `depth_dtype`.
+    let rows = (MAYA2_DEPTH_LEVELS * MAYA2_CODEBOOK_SIZE) as u64;
+    let table = CensusTensor {
+        name: "depth.prefix_table".into(),
+        dtype: StoredDType::Dense(DType::F32),
+        shape: vec![rows as usize, 1024],
+        stored_bytes: rows * 1024 * 4,
+    };
+    ledger.var(&table, Source::Copied, &[depth_dtype])?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 

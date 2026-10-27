@@ -3693,6 +3693,10 @@ fn tts_state_floor_covers_one_full_request_per_family() {
                 crate::models::architectures::maya1::config::MAX_PROMPT_TOKENS
                     + ModelVariant::MAYA1_MAX_OUTPUT_FRAMES
             }
+            // Upstream's per-seat capacity: prompt plus frames.
+            ModelFamily::Maya2Tts => {
+                crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
+            }
             _ => {
                 assert_eq!(floor(variant), 0, "{variant}");
                 continue;

@@ -16,6 +16,7 @@ use crate::audio::{AudioCodec, AudioEncoder};
 use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, RuntimeDeviceAssignment,
 };
+use crate::catalog::{maya2_voice, MAYA2_DEFAULT_VOICE, MAYA2_VOICES};
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{
     BatchSizePreference, ConcurrencyProfile, EngineConfig, PrefixCachePolicy, ResolvedConcurrency,
@@ -76,6 +77,9 @@ use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::maya1::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
     MAYA1_DEFAULT_VOICE, MAYA1_VOICE_PRESETS,
+};
+use crate::models::architectures::maya2::{
+    resolve_language, Maya2GenerationParams, Maya2SamplingParams, Maya2Voice,
 };
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,

@@ -77,6 +77,10 @@ function changedSpeechControls(
 /** The language a multilingual model is asked for until one is chosen. */
 const DEFAULT_SPEECH_LANGUAGE = "en";
 
+/** The picker's choice for a model that reads the language from the text's
+ * script (Maya 2 Native): the request names none. */
+const AUTO_DETECT_LANGUAGE = "auto";
+
 /** The saved-voice picker's "no saved voice" choice, for a model that also
  * has built-in voices (Radix Select takes no empty value). */
 const BUILT_IN_VOICE = "__built_in__";
@@ -112,7 +116,7 @@ export function NewTextToSpeechModal({
   const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
-  const [language, setLanguage] = useState(DEFAULT_SPEECH_LANGUAGE);
+  const [language, setLanguage] = useState<string | null>(null);
   const [controlValues, setControlValues] = useState<
     Partial<Record<SpeechControlId, number>>
   >({});
@@ -143,21 +147,29 @@ export function NewTextToSpeechModal({
     () => capabilities?.controls ?? [],
     [capabilities],
   );
-  // A model that speaks several named languages (Chatterbox Multilingual)
-  // is told which one; one with a single language needs no picker.
-  const speechLanguages = useMemo(
-    () =>
-      [...(capabilities?.languages ?? [])].sort((a, b) =>
-        a.name.localeCompare(b.name),
-      ),
-    [capabilities],
-  );
+  // A model that speaks several named languages (Chatterbox Multilingual,
+  // Maya 2 Native) is told which one, or left to read it from the text's
+  // script where it can; one with a single language needs no picker.
+  const languageAutoDetect = capabilities?.language_auto_detect ?? false;
+  const speechLanguages = useMemo(() => {
+    const named = [...(capabilities?.languages ?? [])].sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+    return capabilities?.language_auto_detect
+      ? [{ code: AUTO_DETECT_LANGUAGE, name: "Auto-detect" }, ...named]
+      : named;
+  }, [capabilities]);
   const offersLanguage = speechLanguages.length > 1;
-  const resolvedLanguage = speechLanguages.some(
-    (option) => option.code === language,
-  )
-    ? language
-    : (speechLanguages[0]?.code ?? DEFAULT_SPEECH_LANGUAGE);
+  const resolvedLanguage =
+    language !== null &&
+    speechLanguages.some((option) => option.code === language)
+      ? language
+      : !languageAutoDetect &&
+          speechLanguages.some(
+            (option) => option.code === DEFAULT_SPEECH_LANGUAGE,
+          )
+        ? DEFAULT_SPEECH_LANGUAGE
+        : (speechLanguages[0]?.code ?? DEFAULT_SPEECH_LANGUAGE);
   const effectiveVoiceWorkflow: EffectiveVoiceWorkflow =
     supportsReferenceVoices && !supportsBuiltInVoices
       ? "saved_voice"
@@ -185,7 +197,7 @@ export function NewTextToSpeechModal({
   const descriptionReplacesVoice = selectedModel
     ? isMaya1Variant(selectedModel)
     : false;
-  // Inline tags the script may carry (Maya1's <laugh>, <sigh>, ...).
+  // Inline tags the script may carry (Maya1's <laugh>, Maya 2's [laughs], ...).
   const inlineTags = useMemo(
     () => capabilities?.inline_tags ?? [],
     [capabilities],
@@ -235,7 +247,7 @@ export function NewTextToSpeechModal({
     setSpeaker(initialSpeaker || "Vivian");
     setSavedVoiceId(initialSavedVoiceId || "");
     setVoiceDescription("");
-    setLanguage(DEFAULT_SPEECH_LANGUAGE);
+    setLanguage(null);
     setControlValues({});
     setStreamingEnabled(true);
     setIsSubmitting(false);
@@ -409,7 +421,10 @@ export function NewTextToSpeechModal({
           ? resolvedBuiltInSpeaker
           : undefined,
       saved_voice_id: useSavedVoice ? savedVoiceId : undefined,
-      language: offersLanguage ? resolvedLanguage : undefined,
+      language:
+        offersLanguage && resolvedLanguage !== AUTO_DETECT_LANGUAGE
+          ? resolvedLanguage
+          : undefined,
       voice_description:
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
@@ -521,7 +536,9 @@ export function NewTextToSpeechModal({
                     aria-label="Insert an expression tag"
                     className="h-8 w-fit gap-2 text-xs"
                   >
-                    <SelectValue placeholder="Insert a tag: <laugh>, <sigh>, <whisper>…" />
+                    <SelectValue
+                      placeholder={`Insert a tag: ${inlineTags.slice(0, 3).join(", ")}…`}
+                    />
                   </SelectTrigger>
                   <SelectContent>
                     {inlineTags.map((tag) => (

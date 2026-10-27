@@ -64,6 +64,10 @@ pub struct SavedVoiceSummary {
     pub allowed_uses: Vec<String>,
     pub permission_provenance: Option<String>,
     pub permission_revoked_at: Option<u64>,
+    /// The language the reference is spoken in, for models that clone
+    /// across languages (Maya 2 Native); absent, they read it from the
+    /// transcript.
+    pub reference_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +88,10 @@ pub struct SavedVoice {
     pub allowed_uses: Vec<String>,
     pub permission_provenance: Option<String>,
     pub permission_revoked_at: Option<u64>,
+    /// The language the reference is spoken in, for models that clone
+    /// across languages (Maya 2 Native); absent, they read it from the
+    /// transcript.
+    pub reference_language: Option<String>,
 }
 
 impl SavedVoice {
@@ -116,6 +124,7 @@ pub struct StoredSavedVoiceAudio {
 pub struct NewSavedVoice {
     pub name: String,
     pub reference_text: Option<String>,
+    pub reference_language: Option<String>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
@@ -275,6 +284,7 @@ impl SavedVoiceStore {
             .filter(|text| !text.trim().is_empty())
             .map(|text| sanitize_required_text(text, 4_000, "reference_text"))
             .transpose()?;
+        let reference_language = sanitize_optional_text(voice.reference_language.as_deref(), 16);
         let audio_mime_type = sanitize_audio_mime_type(voice.audio_mime_type.as_str());
         let audio_filename = sanitize_optional_text(voice.audio_filename.as_deref(), 260);
         let source_route_kind = voice
@@ -318,6 +328,7 @@ impl SavedVoiceStore {
             allowed_uses_json: Set(DEFAULT_ALLOWED_USES_JSON.to_string()),
             permission_provenance: Set(permission_provenance),
             permission_revoked_at: Set(None),
+            reference_language: Set(reference_language),
         })
         .exec(db)
         .await
@@ -379,7 +390,8 @@ const SAVED_VOICE_COLUMNS: &str = r#"
     consent_status,
     allowed_uses_json,
     permission_provenance,
-    permission_revoked_at
+    permission_revoked_at,
+    reference_language
 "#;
 
 /// ?1 search pattern (or NULL), ?2-?4 cursor (or NULL), ?5 limit.
@@ -398,7 +410,8 @@ const SAVED_VOICE_PAGE_SQL: &str = r#"
         consent_status,
         allowed_uses_json,
         permission_provenance,
-        permission_revoked_at
+        permission_revoked_at,
+        reference_language
     FROM saved_voices
     WHERE (
         ?1 IS NULL
@@ -455,6 +468,7 @@ fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
         allowed_uses: parse_allowed_uses(allowed_uses_raw.as_str()),
         permission_provenance: row.try_get_by_index(12)?,
         permission_revoked_at: row.try_get_by_index::<Option<i64>>(13)?.map(i64_to_u64),
+        reference_language: row.try_get_by_index(14)?,
     })
 }
 
@@ -483,6 +497,7 @@ fn map_saved_voice_summary(row: &QueryResult) -> anyhow::Result<SavedVoiceSummar
         allowed_uses: parse_allowed_uses(allowed_uses_raw.as_str()),
         permission_provenance: row.try_get_by_index(12)?,
         permission_revoked_at: row.try_get_by_index::<Option<i64>>(13)?.map(i64_to_u64),
+        reference_language: row.try_get_by_index(14)?,
     })
 }
 
@@ -595,6 +610,7 @@ mod tests {
         let voice = |name: &str| NewSavedVoice {
             name: name.to_string(),
             reference_text: Some("A calm reference sample".to_string()),
+            reference_language: None,
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: None,
             audio_bytes: vec![1, 2, 3, 4],
@@ -625,6 +641,7 @@ mod tests {
         let voice = |name: &str, transcript: Option<&str>| NewSavedVoice {
             name: name.to_string(),
             reference_text: transcript.map(str::to_string),
+            reference_language: None,
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: None,
             audio_bytes: vec![1, 2, 3, 4],
@@ -668,6 +685,7 @@ mod tests {
             .create_voice(NewSavedVoice {
                 name: "  Demo Voice ".to_string(),
                 reference_text: Some(" A calm reference sample ".to_string()),
+                reference_language: Some("hi".to_string()),
                 audio_mime_type: "audio/wav".to_string(),
                 audio_filename: Some("demo.wav".to_string()),
                 audio_bytes: vec![1, 2, 3, 4],
@@ -678,6 +696,7 @@ mod tests {
             .expect("voice should create");
 
         assert_eq!(created.name, "Demo Voice");
+        assert_eq!(created.reference_language.as_deref(), Some("hi"));
         assert_eq!(
             created.source_route_kind,
             Some(SavedVoiceSourceRouteKind::VoiceCloning)
@@ -709,6 +728,7 @@ mod tests {
         assert!(cursor.is_none());
         assert_eq!(voices.len(), 1);
         assert_eq!(voices[0].name, "Demo Voice");
+        assert_eq!(voices[0].reference_language.as_deref(), Some("hi"));
         assert_eq!(voices[0].permission_scope, "local_owner");
         assert!(voices[0]
             .allowed_uses
@@ -731,6 +751,7 @@ mod tests {
             .expect("voice lookup should succeed")
             .expect("voice should exist");
         assert!(!revoked.allows_local_tts_use());
+        assert_eq!(revoked.reference_language.as_deref(), Some("hi"));
 
         assert!(store
             .delete_voice(created.id.clone())

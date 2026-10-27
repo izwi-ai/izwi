@@ -14,11 +14,22 @@ export interface SpeechModelCapabilities {
   /** Model-specific controls a request may set (Chatterbox). */
   controls?: SpeechControlRange[];
   /** The only languages a request may name, for a model that refuses
-   * others (Chatterbox); absent, `language` is a hint. */
+   * others (Chatterbox, Maya 2 Native); absent, `language` is a hint. */
   languages?: SpeechLanguage[];
-  /** Inline `<tag>`s the text may carry, each a vocal event or delivery
-   * the model performs where it stands (Maya1: `<laugh>`, `<sigh>`, …). */
+  /** Whether `language` may be left out and is then read from the text's
+   * script (Maya 2 Native). */
+  language_auto_detect?: boolean;
+  /** Whether a reference voice may name the language it is spoken in
+   * (`reference_language`), as the model clones a voice into another
+   * language (Maya 2 Native). */
+  cross_lingual_reference?: boolean;
+  /** Inline tags the text may carry, each a vocal event or delivery the
+   * model performs where it stands (Maya1: `<laugh>`, `<sigh>`, …; Maya 2
+   * Native: `[laughs]`, `[sighs]`, …). */
   inline_tags?: string[];
+  /** Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the
+   * list is a suggestion. */
+  inline_tags_strict?: boolean;
 }
 
 export interface SpeechLanguage {

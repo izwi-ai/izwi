@@ -147,14 +147,28 @@ pub struct AdminSpeechModelCapabilities {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<AdminSpeechControlRange>,
     /// The only languages a speech request may name in `language`, for a
-    /// model that refuses others (Chatterbox); absent, `language` is a hint.
+    /// model that refuses others (Chatterbox, Maya 2 Native); absent,
+    /// `language` is a hint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<AdminSpeechLanguage>,
-    /// Inline `<tag>`s the text to speak may carry, each a vocal event or
-    /// delivery the model performs where it stands (Maya1: `<laugh>`,
-    /// `<sigh>`, `<whisper>`, …); a tag not listed is refused.
+    /// Whether `language` may be left out (or `auto`) and is then read from
+    /// the text's script (Maya 2 Native); the picker offers "auto-detect".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub language_auto_detect: bool,
+    /// Whether a reference voice may name the language it is spoken in
+    /// (`reference_language`), as the model clones a voice into another
+    /// language (Maya 2 Native).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cross_lingual_reference: bool,
+    /// Inline tags the text to speak may carry, as written, each a vocal
+    /// event or delivery the model performs where it stands (Maya1:
+    /// `<laugh>`, `<sigh>`, …; Maya 2 Native: `[laughs]`, `[sighs]`, …).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inline_tags: Vec<&'static str>,
+    /// Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the
+    /// list is a suggestion and other tags pass through.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inline_tags_strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -375,7 +389,10 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_auto_long_form: capabilities.supports_auto_long_form,
             controls: Vec::new(),
             languages: Vec::new(),
+            language_auto_detect: false,
+            cross_lingual_reference: false,
             inline_tags: Vec::new(),
+            inline_tags_strict: false,
         }
     }
 }
@@ -397,10 +414,23 @@ impl AdminSpeechModelCapabilities {
 
     fn with_inline_tags(mut self, variant: ModelVariant) -> Self {
         self.inline_tags = variant.speech_inline_tags().to_vec();
+        self.inline_tags_strict = variant.refuses_unknown_inline_tags();
         self
     }
 
     fn with_languages(mut self, variant: ModelVariant) -> Self {
+        self.cross_lingual_reference = crate::api::tts_policy::takes_reference_language(variant);
+        if variant.family() == izwi_core::ModelFamily::Maya2Tts {
+            self.languages = izwi_core::catalog::MAYA2_LANGUAGES
+                .iter()
+                .map(|language| AdminSpeechLanguage {
+                    code: language.code,
+                    name: language.name,
+                })
+                .collect();
+            self.language_auto_detect = true;
+            return self;
+        }
         self.languages = ChatterboxEdition::of(variant)
             .map(ChatterboxEdition::languages)
             .unwrap_or_default()
@@ -1322,6 +1352,33 @@ mod tests {
         assert!(codes.contains(&"sw") && codes.contains(&"en") && codes.contains(&"zh"));
         assert!(!codes.contains(&"ja"));
         assert!(languages(ModelVariant::Kokoro82M).is_null());
+    }
+
+    /// Maya 2 Native lists its 12 languages, detects one from the script,
+    /// takes a reference voice's language and suggests (not enforces) tags.
+    #[test]
+    fn speech_capabilities_describe_maya2_cross_lingual_cloning() {
+        let capabilities = |variant: ModelVariant| {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                .clone()
+        };
+        let maya2 = capabilities(ModelVariant::Maya2Native25B);
+        assert_eq!(maya2["languages"].as_array().expect("languages").len(), 12);
+        assert_eq!(maya2["language_auto_detect"], true);
+        assert_eq!(maya2["cross_lingual_reference"], true);
+        assert!(maya2["inline_tags"]
+            .as_array()
+            .expect("tags")
+            .contains(&serde_json::json!("[laughs]")));
+        assert!(maya2["inline_tags_strict"].is_null());
+        let chatterbox = capabilities(ModelVariant::ChatterboxMultilingual500M);
+        assert!(chatterbox["cross_lingual_reference"].is_null());
+        assert!(chatterbox["language_auto_detect"].is_null());
+        assert_eq!(
+            capabilities(ModelVariant::Maya13B)["inline_tags_strict"],
+            true
+        );
     }
 
     /// P1.0: naming a removed variant (CLI `pull` reads it through this

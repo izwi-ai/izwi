@@ -1498,6 +1498,78 @@ impl ModelLifecycleController {
         Ok(())
     }
 
+    /// Maya 2 Native TTS: the backbone's retained pages, with per-stage
+    /// scratch for the depth decoder and the Mimi windows.
+    pub(super) async fn allocate_maya2_tts_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        if variant.family() != crate::catalog::ModelFamily::Maya2Tts {
+            return Ok(());
+        }
+        if !managed_kv_backend_compiled(backend) {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
+            )));
+        }
+        let model = self
+            .model_registry
+            .get_loading_maya2_tts(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "loaded Maya2 model {variant} is missing from the registry"
+                ))
+            })?;
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let physical_spec = model.physical_state_spec(&stage_graphs)?;
+        let retained = self
+            .core_engine
+            .load_managed_model_state(
+                model_instance_id,
+                &physical_spec.retained,
+                Some(physical_spec.retained_max_tokens),
+                tts_state_minimum_tokens(variant),
+                state_fit_reserve,
+                0,
+            )
+            .await?;
+        self.model_registry
+            .publish_effective_context(variant, retained.logical_token_reach())?;
+        self.model_registry.publish_kv_storage(variant, &retained);
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
+            CapabilityKind::Tts,
+            retained.state_plan_v2(),
+        )?;
+        let retained_uses = contracts
+            .iter()
+            .map(|contract| {
+                Ok((
+                    stage_graph_fingerprint(&contract.stages)?,
+                    RetainedStateUseV2::ExternalPaged,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let publication = self.load_scratch_only_workspace_publication(
+            &contracts,
+            physical_spec.descriptor,
+            Some(retained.into()),
+            retained_uses,
+        )?;
+        state_publications.insert(CapabilityKind::Tts, publication);
+        Ok(())
+    }
+
     /// Kokoro: the stateless static TTS publication.
     pub(super) async fn allocate_kokoro_tts_state(
         &self,

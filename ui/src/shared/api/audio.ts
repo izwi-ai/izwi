@@ -26,6 +26,8 @@ export interface TTSRequest {
   voice_description?: string;
   reference_audio?: string;
   reference_text?: string;
+  /** The language the reference is spoken in (Maya 2 Native). */
+  reference_language?: string;
   saved_voice_id?: string;
   max_tokens?: number;
   format?: "wav" | "pcm" | "raw_f32" | "raw_i16";
@@ -162,6 +164,8 @@ export interface SpeechHistoryRecordCreateRequest {
   voice_description?: string;
   reference_audio?: string;
   reference_text?: string;
+  /** The language the reference is spoken in (Maya 2 Native). */
+  reference_language?: string;
   saved_voice_id?: string;
   temperature?: number;
   speed?: number;
@@ -240,6 +244,8 @@ export interface SavedVoiceSummary {
   name: string;
   reference_text_preview: string;
   reference_text_chars: number;
+  /** The language the reference is spoken in, when it was given. */
+  reference_language?: string | null;
   audio_mime_type: string;
   audio_filename: string | null;
   source_route_kind: SavedVoiceSourceRouteKind | null;
@@ -253,6 +259,8 @@ export interface SavedVoice {
   name: string;
   /** Null for a voice saved without a transcript. */
   reference_text: string | null;
+  /** The language the reference is spoken in, when it was given. */
+  reference_language?: string | null;
   audio_mime_type: string;
   audio_filename: string | null;
   source_route_kind: SavedVoiceSourceRouteKind | null;
@@ -263,6 +271,9 @@ export interface SavedVoiceCreateRequest {
   name: string;
   /** Optional for a model that clones from audio alone. */
   reference_text?: string;
+  /** The language the reference is spoken in, a code a cross-lingual
+   * cloner knows (Maya 2 Native); absent, it is read from the transcript. */
+  reference_language?: string;
   audio_base64: string;
   audio_mime_type?: string;
   audio_filename?: string;

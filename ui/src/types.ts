@@ -80,6 +80,16 @@ export function isMaya1Variant(variant: string): boolean {
   );
 }
 
+export function isMaya2Variant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "maya2-native-2.5b" ||
+    normalized === "maya-research/maya2-native" ||
+    normalized === "maya2-native" ||
+    normalized === "maya2"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -159,6 +169,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isMaya1Variant(variant)) {
     return MAYA1_SPEAKERS;
   }
+  if (isMaya2Variant(variant)) {
+    return MAYA2_SPEAKERS;
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -170,17 +183,18 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "custom-voice",
     label: "Text to Speech",
     description:
-      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1)",
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") ||
       isKokoroVariant(variant) ||
       isVoxtralTtsVariant(variant) ||
       isChatterboxVariant(variant) ||
-      isMaya1Variant(variant),
+      isMaya1Variant(variant) ||
+      isMaya2Variant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, or Maya1 TTS model to generate speech",
+      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, Maya1, or Maya 2 Native TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -190,10 +204,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     modelFilter: (variant) =>
       (variant.includes("Base") && !variant.includes("Tokenizer")) ||
       isVibeVoiceTtsVariant(variant) ||
-      isFishS2TtsVariant(variant),
+      isFishS2TtsVariant(variant) ||
+      isMaya2Variant(variant),
     emptyStateTitle: "No Base Model Loaded",
     emptyStateDescription:
-      "Load a Base, VibeVoice, or Fish S2 model to clone voices from reference audio",
+      "Load a Base, VibeVoice, Fish S2, or Maya 2 Native model to clone voices from reference audio",
   },
   "voice-design": {
     id: "voice-design",
@@ -403,6 +418,132 @@ const MAYA1_SPEAKERS: SpeakerProfile[] = [
     name: "Robot",
     language: "English",
     description: "Robotic AI voice",
+  },
+];
+
+// Maya 2 Native's built-in voices: synthetic personas trained in the
+// languages listed (any of its 12 languages can be asked of any voice; the
+// rest are spoken cross-lingually).
+const MAYA2_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "Ahana",
+    name: "Ahana",
+    language: "11 languages",
+    description: "Young female voice, bright, youthful",
+  },
+  {
+    id: "Vaidehi",
+    name: "Vaidehi",
+    language: "11 languages",
+    description: "Adult female voice, calm, gentle",
+  },
+  {
+    id: "Malini",
+    name: "Malini",
+    language: "11 languages",
+    description: "Mature female voice, steady narrator",
+  },
+  {
+    id: "Charvi",
+    name: "Charvi",
+    language: "11 languages",
+    description: "Young female voice, energetic, upbeat",
+  },
+  {
+    id: "Jahnavi",
+    name: "Jahnavi",
+    language: "10 languages",
+    description: "Adult female voice, warm, friendly",
+  },
+  {
+    id: "Anirban",
+    name: "Anirban",
+    language: "11 languages",
+    description: "Adult male voice, steady narrator",
+  },
+  {
+    id: "Nakul",
+    name: "Nakul",
+    language: "11 languages",
+    description: "Young male voice, bright, youthful",
+  },
+  {
+    id: "Vasant",
+    name: "Vasant",
+    language: "10 languages",
+    description: "Mature male voice, steady narrator",
+  },
+  {
+    id: "Siddhant",
+    name: "Siddhant",
+    language: "11 languages",
+    description: "Adult male voice, clear, professional",
+  },
+  {
+    id: "Satvik",
+    name: "Satvik",
+    language: "11 languages",
+    description: "Young male voice, warm, friendly",
+  },
+  {
+    id: "Abhay",
+    name: "Abhay",
+    language: "English, Hindi",
+    description: "Adult male voice, natural conversational style",
+  },
+  {
+    id: "Nivedita",
+    name: "Nivedita",
+    language: "English, Hindi",
+    description: "Adult female voice, natural conversational style",
+  },
+  {
+    id: "Ishwari",
+    name: "Ishwari",
+    language: "Hindi",
+    description: "Adult female voice, natural conversational style",
+  },
+  {
+    id: "Ritvik",
+    name: "Ritvik",
+    language: "Hindi",
+    description: "Adult male voice, natural conversational style",
+  },
+  {
+    id: "Vrinda",
+    name: "Vrinda",
+    language: "Hindi",
+    description: "Young female voice, natural conversational style",
+  },
+  {
+    id: "Sreekar",
+    name: "Sreekar",
+    language: "English, Hindi, Telugu",
+    description: "Adult male voice, natural conversational style",
+  },
+  {
+    id: "Kayal",
+    name: "Kayal",
+    language: "English, Tamil",
+    description: "Adult female voice, natural conversational style",
+  },
+  {
+    id: "Shaunak",
+    name: "Shaunak",
+    language: "English, Hindi",
+    description: "Young male voice, natural conversational style",
+  },
+  {
+    id: "Akshat",
+    name: "Akshat",
+    language: "English, Hindi",
+    description: "Adult male voice, natural conversational style",
+  },
+  {
+    id: "Tanushree",
+    name: "Tanushree",
+    language: "English, Hindi",
+    description: "Adult female voice, natural conversational style",
   },
 ];
 

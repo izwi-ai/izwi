@@ -142,6 +142,7 @@ async fn render_segment(state: &AppState, claim: &StudioRenderClaim) -> Result<(
         voice_description: None,
         reference_audio: None,
         reference_text: None,
+        reference_language: None,
         saved_voice_id: settings.saved_voice_id,
         temperature: None,
         // A model without speed control rejects a speed: the project may

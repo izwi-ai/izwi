@@ -14,6 +14,9 @@ pub enum ModelFamily {
     ChatterboxTts,
     /// Maya1: a Llama decoder sampling SNAC codes from a voice description.
     Maya1Tts,
+    /// Maya 2 Native: a Qwen3 backbone and depth decoder over Mimi codes,
+    /// 12 languages, built-in and cloned voices.
+    Maya2Tts,
     ParakeetAsr,
     WhisperAsr,
     Qwen3Asr,
@@ -60,6 +63,7 @@ impl ModelFamily {
             | Self::FishS2Tts
             | Self::ChatterboxTts
             | Self::Maya1Tts
+            | Self::Maya2Tts
             | Self::SortformerDiarization
             | Self::Qwen3Chat
             | Self::Qwen3MoeChat
@@ -373,6 +377,7 @@ impl ModelVariant {
             FishAudioS2Pro => ModelFamily::FishS2Tts,
             Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
             Maya13B | Maya13BGguf => ModelFamily::Maya1Tts,
+            Maya2Native25B => ModelFamily::Maya2Tts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -407,7 +412,8 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
             | ModelFamily::ChatterboxTts
-            | ModelFamily::Maya1Tts => ModelTask::Tts,
+            | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts => ModelTask::Tts,
             ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -632,6 +638,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         {
             return Some(VibeVoice15BTts);
         }
+    }
+
+    if normalized.contains("maya2") {
+        return Some(Maya2Native25B);
     }
 
     if normalized.contains("maya1") || normalized.contains("mayaresearch") {
