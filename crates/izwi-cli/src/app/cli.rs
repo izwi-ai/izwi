@@ -359,7 +359,8 @@ pub enum Commands {
 
         /// Model to use. The default speaks with a built-in voice; voice-clone
         /// models (e.g. qwen3-tts-0.6b-base) need --reference-audio and
-        /// --reference-text or --saved-voice-id.
+        /// --reference-text or --saved-voice-id. Chatterbox clones from
+        /// --reference-audio alone.
         #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 
@@ -402,6 +403,24 @@ pub enum Commands {
         /// Temperature for sampling (unset keeps the model's own default)
         #[arg(short, long)]
         temperature: Option<f32>,
+
+        /// Language of the text: a code or name (Chatterbox Multilingual,
+        /// e.g. `fr` or `French`; Qwen3-TTS takes names such as `English`)
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Emotion intensity, 0 to 2 (Chatterbox; its default is 0.5)
+        #[arg(long)]
+        exaggeration: Option<f32>,
+
+        /// Classifier-free guidance weight, 0 to 1; 0 turns guidance off
+        /// (Chatterbox; its default is 0.5)
+        #[arg(long)]
+        cfg_weight: Option<f32>,
+
+        /// Min-p sampling threshold, 0 to 1 (Chatterbox; its default is 0.05)
+        #[arg(long)]
+        min_p: Option<f32>,
 
         /// Stream the audio as it is generated and write it to a WAV file
         /// (reports the time to first audio)

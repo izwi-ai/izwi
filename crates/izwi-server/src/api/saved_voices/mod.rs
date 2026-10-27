@@ -11,7 +11,7 @@ use crate::state::AppState;
 #[derive(Debug, Clone)]
 pub(crate) struct SavedVoiceReference {
     pub voice_id: String,
-    pub reference_text: String,
+    pub reference_text: Option<String>,
     pub reference_audio_base64: String,
 }
 

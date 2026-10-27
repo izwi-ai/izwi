@@ -118,6 +118,65 @@ huggingface-cli download <repo-id> \
 
 ---
 
+## Chatterbox
+
+`Chatterbox-500M` (about 3.2 GB) needs five files from Hugging Face
+(`ResembleAI/chatterbox` at a pinned revision) and one from outside it: the
+PerTh watermarker checkpoint, `perth_net_250000.pth.tar`, from Resemble AI's
+Perth repository on GitHub. Place all six files in the model's directory:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Chatterbox-500M"
+
+huggingface-cli download ResembleAI/chatterbox \
+  t3_cfg.safetensors s3gen.safetensors ve.safetensors tokenizer.json conds.pt \
+  --revision 5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/perth_net_250000.pth.tar" \
+  https://raw.githubusercontent.com/resemble-ai/Perth/ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar
+```
+
+When Izwi downloads the checkpoint itself, it checks the size (37,429,684
+bytes) and SHA-256
+(`a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670`). Check a
+copy you place yourself with `shasum -a 256` (macOS) or `sha256sum` (Linux).
+If the server runs with `IZWI_CHATTERBOX_WATERMARK=false`, the model loads
+without the watermarker and the checkpoint is not needed.
+
+`Chatterbox-Multilingual-500M` (about 3.3 GB) takes its own speech-token model
+and tokenizer from the same repository and revision, with the English S3Gen,
+voice encoder, default voice and the same PerTh checkpoint. Chinese also needs
+the repository's Cangjie table and two files of spacy-pkuseg's word segmenter
+from GitHub: its default model, `spacy_ontonotes.zip` (34,567,143 bytes,
+SHA-256 `b216e7f92de7ae285aeab8feba2faa8ea8216e5995ff6fb3d391cc8356db1bfe`),
+and its merge dictionary, saved as `pkuseg_default.pkl` (4,525,959 bytes,
+SHA-256 `3cf450d95719d51883fa49291302b9032372064d86805b130bb2ea0223196c67`):
+
+```bash
+MODEL_DIR="<izwi-models-path>/Chatterbox-Multilingual-500M"
+
+huggingface-cli download ResembleAI/chatterbox \
+  t3_mtl23ls_v2.safetensors grapheme_mtl_merged_expanded_v1.json \
+  s3gen.safetensors ve.safetensors conds.pt Cangjie5_TC.json \
+  --revision 5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/perth_net_250000.pth.tar" \
+  https://raw.githubusercontent.com/resemble-ai/Perth/ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar
+
+curl -L -o "$MODEL_DIR/spacy_ontonotes.zip" \
+  https://github.com/explosion/spacy-pkuseg/releases/download/v0.0.26/spacy_ontonotes.zip
+
+curl -L -o "$MODEL_DIR/pkuseg_default.pkl" \
+  https://raw.githubusercontent.com/explosion/spacy-pkuseg/16995617f3b8f5cf32e5b6a77d7d800e201b255b/spacy_pkuseg/dicts/default.pkl
+```
+
+Izwi reads the dictionary as the one pickled string it holds and never
+unpickles it.
+
+---
+
 ## Resuming Interrupted Downloads
 
 The Hugging Face CLI automatically resumes interrupted downloads. Just run the same command again.

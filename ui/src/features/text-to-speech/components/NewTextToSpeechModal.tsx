@@ -5,6 +5,8 @@ import {
   api,
   type ModelInfo,
   type SavedVoiceSummary,
+  type SpeechControlId,
+  type SpeechControlRange,
   type SpeechHistoryRecord,
   type SpeechHistoryRecordCreateRequest,
 } from "@/api";
@@ -51,6 +53,34 @@ type EffectiveVoiceWorkflow =
   | "voice_description"
   | "unsupported";
 
+const SPEECH_CONTROL_LABELS: Record<SpeechControlId, string> = {
+  exaggeration: "Exaggeration",
+  cfg_weight: "Guidance",
+  min_p: "Min-p",
+};
+
+/** The controls a request sets: only values moved off the model's default. */
+function changedSpeechControls(
+  controls: SpeechControlRange[],
+  values: Partial<Record<SpeechControlId, number>>,
+): Partial<Record<SpeechControlId, number>> {
+  const changed: Partial<Record<SpeechControlId, number>> = {};
+  for (const range of controls) {
+    const value = values[range.control];
+    if (value !== undefined && Math.abs(value - range.default) > 0.001) {
+      changed[range.control] = value;
+    }
+  }
+  return changed;
+}
+
+/** The language a multilingual model is asked for until one is chosen. */
+const DEFAULT_SPEECH_LANGUAGE = "en";
+
+/** The saved-voice picker's "no saved voice" choice, for a model that also
+ * has built-in voices (Radix Select takes no empty value). */
+const BUILT_IN_VOICE = "__built_in__";
+
 function savedVoiceLabel(voice: SavedVoiceSummary): string {
   const source =
     voice.source_route_kind === "voice_cloning"
@@ -82,6 +112,10 @@ export function NewTextToSpeechModal({
   const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
+  const [language, setLanguage] = useState(DEFAULT_SPEECH_LANGUAGE);
+  const [controlValues, setControlValues] = useState<
+    Partial<Record<SpeechControlId, number>>
+  >({});
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [modelActionPending, setModelActionPending] = useState<
@@ -98,17 +132,45 @@ export function NewTextToSpeechModal({
   const supportsBuiltInVoices = capabilities?.supports_builtin_voices ?? false;
   const supportsReferenceVoices =
     capabilities?.supports_reference_voice ?? false;
+  // Chatterbox clones from audio alone; every other reference model needs
+  // the reference's words, so voices saved without them are left out.
+  const transcriptRequired =
+    capabilities?.reference_transcript_required ?? true;
   const supportsVoiceDescription =
     capabilities?.supports_voice_description ?? false;
   const supportsStreaming = capabilities?.supports_streaming ?? false;
-  const effectiveVoiceWorkflow: EffectiveVoiceWorkflow = supportsReferenceVoices
-    ? "saved_voice"
-    : supportsBuiltInVoices
-      ? "built_in_voice"
-      : supportsVoiceDescription
-        ? "voice_description"
-        : "unsupported";
+  const speechControls = useMemo(
+    () => capabilities?.controls ?? [],
+    [capabilities],
+  );
+  // A model that speaks several named languages (Chatterbox Multilingual)
+  // is told which one; one with a single language needs no picker.
+  const speechLanguages = useMemo(
+    () =>
+      [...(capabilities?.languages ?? [])].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
+    [capabilities],
+  );
+  const offersLanguage = speechLanguages.length > 1;
+  const resolvedLanguage = speechLanguages.some(
+    (option) => option.code === language,
+  )
+    ? language
+    : (speechLanguages[0]?.code ?? DEFAULT_SPEECH_LANGUAGE);
+  const effectiveVoiceWorkflow: EffectiveVoiceWorkflow =
+    supportsReferenceVoices && !supportsBuiltInVoices
+      ? "saved_voice"
+      : supportsBuiltInVoices
+        ? "built_in_voice"
+        : supportsVoiceDescription
+          ? "voice_description"
+          : "unsupported";
   const usesSavedVoiceSelection = effectiveVoiceWorkflow === "saved_voice";
+  // A model with both (Chatterbox) speaks with its built-in voice unless a
+  // saved voice is chosen.
+  const offersSavedVoice = supportsReferenceVoices;
+  const useSavedVoice = offersSavedVoice && Boolean(savedVoiceId);
   const usesBuiltInVoiceSelection =
     effectiveVoiceWorkflow === "built_in_voice";
   const usesVoiceDescription = effectiveVoiceWorkflow === "voice_description";
@@ -145,6 +207,8 @@ export function NewTextToSpeechModal({
     setSpeaker(initialSpeaker || "Vivian");
     setSavedVoiceId(initialSavedVoiceId || "");
     setVoiceDescription("");
+    setLanguage(DEFAULT_SPEECH_LANGUAGE);
+    setControlValues({});
     setStreamingEnabled(true);
     setIsSubmitting(false);
     setModelActionPending(null);
@@ -229,7 +293,7 @@ export function NewTextToSpeechModal({
   }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
 
   useEffect(() => {
-    if (!isOpen || !usesSavedVoiceSelection) {
+    if (!isOpen || !offersSavedVoice) {
       return;
     }
 
@@ -262,7 +326,15 @@ export function NewTextToSpeechModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, usesSavedVoiceSelection]);
+  }, [isOpen, offersSavedVoice]);
+
+  const usableSavedVoices = useMemo(
+    () =>
+      transcriptRequired
+        ? savedVoices.filter((voice) => voice.reference_text_chars > 0)
+        : savedVoices,
+    [savedVoices, transcriptRequired],
+  );
 
   const submitGeneration = useCallback(async () => {
     if (!selectedModel || !selectedModelReady) {
@@ -296,7 +368,7 @@ export function NewTextToSpeechModal({
       return;
     }
 
-    if (usesBuiltInVoiceSelection && !resolvedBuiltInSpeaker) {
+    if (usesBuiltInVoiceSelection && !useSavedVoice && !resolvedBuiltInSpeaker) {
       setError("Select a built-in voice before starting generation.");
       return;
     }
@@ -304,14 +376,19 @@ export function NewTextToSpeechModal({
     const request: SpeechHistoryRecordCreateRequest = {
       model_id: selectedModel,
       text: trimmedText,
-      speaker: usesBuiltInVoiceSelection ? resolvedBuiltInSpeaker : undefined,
-      saved_voice_id: usesSavedVoiceSelection ? savedVoiceId : undefined,
+      speaker:
+        usesBuiltInVoiceSelection && !useSavedVoice
+          ? resolvedBuiltInSpeaker
+          : undefined,
+      saved_voice_id: useSavedVoice ? savedVoiceId : undefined,
+      language: offersLanguage ? resolvedLanguage : undefined,
       voice_description:
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
           : undefined,
       // Only a model with speed control gets one (Kokoro); 1× sends none.
       speed: supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
+      ...changedSpeechControls(speechControls, controlValues),
     };
 
     setIsSubmitting(true);
@@ -338,10 +415,14 @@ export function NewTextToSpeechModal({
     onModelRequired,
     onCreateStream,
     effectiveVoiceWorkflow,
+    offersLanguage,
+    resolvedLanguage,
     resolvedBuiltInSpeaker,
     savedVoiceId,
     selectedModel,
     selectedModelReady,
+    speechControls,
+    controlValues,
     speed,
     streamAvailable,
     streamingEnabled,
@@ -350,6 +431,7 @@ export function NewTextToSpeechModal({
     voiceDescription,
     usesBuiltInVoiceSelection,
     usesSavedVoiceSelection,
+    useSavedVoice,
     usesVoiceDescription,
     showsVoiceDescription,
   ]);
@@ -410,6 +492,30 @@ export function NewTextToSpeechModal({
           }
           side={
             <>
+              {offersLanguage ? (
+                <CreationField label="Language">
+                  <Select
+                    value={resolvedLanguage}
+                    onValueChange={setLanguage}
+                    disabled={isSubmitting}
+                  >
+                    <SelectTrigger
+                      aria-label="Language"
+                      className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
+                    >
+                      <SelectValue placeholder="Select language" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {speechLanguages.map((option) => (
+                        <SelectItem key={option.code} value={option.code}>
+                          {option.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </CreationField>
+              ) : null}
+
               {supportsSpeed ? (
                 <CreationField
                   label="Speed"
@@ -426,6 +532,33 @@ export function NewTextToSpeechModal({
                   />
                 </CreationField>
               ) : null}
+
+              {speechControls.map((range) => {
+                const value = controlValues[range.control] ?? range.default;
+                const label = SPEECH_CONTROL_LABELS[range.control];
+                return (
+                  <CreationField
+                    key={range.control}
+                    label={label}
+                    hint={value.toFixed(2)}
+                  >
+                    <Slider
+                      aria-label={label}
+                      min={range.min}
+                      max={range.max}
+                      step={0.05}
+                      value={[value]}
+                      onValueChange={([next]) =>
+                        setControlValues((current) => ({
+                          ...current,
+                          [range.control]: next ?? range.default,
+                        }))
+                      }
+                      disabled={isSubmitting}
+                    />
+                  </CreationField>
+                );
+              })}
 
               {usesBuiltInVoiceSelection ? (
                 <CreationField label="Built-in voice">
@@ -451,9 +584,13 @@ export function NewTextToSpeechModal({
                 </CreationField>
               ) : null}
 
-              {usesSavedVoiceSelection ? (
+              {offersSavedVoice ? (
                 <CreationField
-                  label="Saved voice"
+                  label={
+                    usesBuiltInVoiceSelection
+                      ? "Saved voice (optional)"
+                      : "Saved voice"
+                  }
                   hint={
                     savedVoicesLoading ? (
                       "Loading saved voices…"
@@ -461,12 +598,20 @@ export function NewTextToSpeechModal({
                       <span className="text-(--danger-text)">
                         {savedVoicesError}
                       </span>
+                    ) : usesBuiltInVoiceSelection ? (
+                      "A saved voice replaces the built-in one."
                     ) : undefined
                   }
                 >
                   <Select
-                    value={savedVoiceId}
-                    onValueChange={setSavedVoiceId}
+                    value={
+                      usesBuiltInVoiceSelection
+                        ? savedVoiceId || BUILT_IN_VOICE
+                        : savedVoiceId
+                    }
+                    onValueChange={(value) =>
+                      setSavedVoiceId(value === BUILT_IN_VOICE ? "" : value)
+                    }
                     disabled={isSubmitting || savedVoicesLoading}
                   >
                     <SelectTrigger
@@ -476,7 +621,12 @@ export function NewTextToSpeechModal({
                       <SelectValue placeholder="Select saved voice" />
                     </SelectTrigger>
                     <SelectContent>
-                      {savedVoices.map((voice) => (
+                      {usesBuiltInVoiceSelection ? (
+                        <SelectItem value={BUILT_IN_VOICE}>
+                          None (built-in voice)
+                        </SelectItem>
+                      ) : null}
+                      {usableSavedVoices.map((voice) => (
                         <SelectItem key={voice.id} value={voice.id}>
                           {savedVoiceLabel(voice)}
                         </SelectItem>
@@ -563,7 +713,8 @@ export function NewTextToSpeechModal({
               <CreationOption
                 title="Stream results"
                 description="Start listening before the full take is ready."
-                checked={streamingEnabled}
+                // A final-only model shows streaming off, not a disabled "on".
+                checked={streamingEnabled && streamAvailable}
                 onCheckedChange={setStreamingEnabled}
                 disabled={isSubmitting || !streamAvailable}
               />

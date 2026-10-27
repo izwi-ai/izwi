@@ -123,6 +123,10 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
             registry.load_fish_s2_tts(variant, model_path).await?;
             InstantiatedPayload::None
         }
+        ModelFamily::ChatterboxTts => {
+            registry.load_chatterbox_tts(variant, model_path).await?;
+            InstantiatedPayload::None
+        }
         ModelFamily::Tokenizer => {
             let tokenizer = match Tokenizer::from_path(model_path) {
                 Ok(tokenizer) => Some(tokenizer),

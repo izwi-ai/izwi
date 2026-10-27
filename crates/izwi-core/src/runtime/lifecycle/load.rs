@@ -266,6 +266,9 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::VoxtralTts => {
             crate::models::architectures::voxtral::tts::VOXTRAL_TTS_STATE_CONTEXT_TOKENS
         }
+        crate::catalog::ModelFamily::ChatterboxTts => {
+            crate::models::architectures::chatterbox::config::STATE_CONTEXT_TOKENS
+        }
         _ => 0,
     };
     tokens as u64
@@ -1156,6 +1159,15 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_chatterbox_tts_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_kokoro_tts_state(
                 variant,
             )
@@ -1231,6 +1243,11 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::VoxtralTts {
                 self.model_registry
                     .publish_voxtral_tts_ready(variant)
+                    .await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::ChatterboxTts {
+                self.model_registry
+                    .publish_chatterbox_tts_ready(variant)
                     .await?;
             }
             self.touch_model_usage(variant).await;

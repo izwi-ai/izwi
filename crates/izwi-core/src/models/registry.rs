@@ -24,6 +24,7 @@ use crate::kernels::numeric_check::{with_precision_reload_gate, PrecisionReloadG
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
+use crate::models::architectures::chatterbox::ChatterboxTtsModel;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
@@ -162,6 +163,7 @@ type VoxtralLoaderFn = fn(
     crate::catalog::PrefixReuseMode,
 ) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
+type ChatterboxTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<ChatterboxTtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
@@ -206,6 +208,12 @@ struct VoxtralTtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: VoxtralTtsLoaderFn,
+}
+
+struct ChatterboxTtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: ChatterboxTtsLoaderFn,
 }
 
 struct VibeVoiceTtsLoaderRegistration {
@@ -470,6 +478,14 @@ fn load_voxtral_tts_model(
     VoxtralTtsModel::load(model_dir, device)
 }
 
+fn load_chatterbox_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<ChatterboxTtsModel> {
+    ChatterboxTtsModel::load(model_dir, variant, device)
+}
+
 fn load_vibevoice_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -611,6 +627,13 @@ const VOXTRAL_TTS_LOADER_REGISTRY: &[VoxtralTtsLoaderRegistration] =
         loader: load_voxtral_tts_model,
     }];
 
+const CHATTERBOX_TTS_LOADER_REGISTRY: &[ChatterboxTtsLoaderRegistration] =
+    &[ChatterboxTtsLoaderRegistration {
+        name: "chatterbox_tts",
+        family: ModelFamily::ChatterboxTts,
+        loader: load_chatterbox_tts_model,
+    }];
+
 const VIBEVOICE_TTS_LOADER_REGISTRY: &[VibeVoiceTtsLoaderRegistration] =
     &[VibeVoiceTtsLoaderRegistration {
         name: "vibevoice_tts",
@@ -698,6 +721,15 @@ fn resolve_voxtral_tts_loader_registration(
 ) -> Option<&'static VoxtralTtsLoaderRegistration> {
     let family = variant.family();
     VOXTRAL_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_chatterbox_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static ChatterboxTtsLoaderRegistration> {
+    let family = variant.family();
+    CHATTERBOX_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -4642,6 +4674,27 @@ impl Deref for VoxtralTtsModelLease {
     }
 }
 
+/// A loaded Chatterbox TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct ChatterboxTtsModelLease {
+    inner: TrackedModelLease<ChatterboxTtsModel>,
+}
+
+impl ChatterboxTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<ChatterboxTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for ChatterboxTtsModelLease {
+    type Target = ChatterboxTtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl FishS2TtsModelLease {
     #[cfg(test)]
     pub(crate) fn for_test(model: FishS2TtsModel) -> Self {
@@ -6428,6 +6481,8 @@ pub struct ModelRegistry {
     voxtral_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralRealtimeModel>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VoxtralTtsModel>>>>>,
+    chatterbox_tts_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<ChatterboxTtsModel>>>>>,
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
@@ -6605,6 +6660,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen3Tts => "qwen3_tts",
         ModelFamily::KokoroTts => "kokoro_tts",
         ModelFamily::VoxtralTts => "voxtral_tts",
+        ModelFamily::ChatterboxTts => "chatterbox_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
         ModelFamily::ParakeetAsr => "parakeet_asr",
@@ -6717,6 +6773,7 @@ impl ModelRegistry {
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            chatterbox_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
@@ -7011,6 +7068,24 @@ impl ModelRegistry {
                         None,
                         None,
                         with_tts_fast_path_counters(*variant, Some(precision)),
+                    ));
+                }
+            }
+        }
+
+        {
+            let guard = self.chatterbox_tts_models.read().await;
+            for (variant, entry) in guard.iter() {
+                if let Some(model) = entry.ready_model() {
+                    diagnostics.push(loaded_model_diagnostics_entry(
+                        &self.device,
+                        *variant,
+                        "chatterbox_tts",
+                        "chatterbox_tts",
+                        LoadedModelActualRuntime::default(),
+                        None,
+                        None,
+                        serde_json::to_value(model.diagnostics()).ok(),
                     ));
                 }
             }
@@ -7572,6 +7647,67 @@ impl ModelRegistry {
         })
     }
 
+    pub async fn load_chatterbox_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<ChatterboxTtsModel>> {
+        let registration =
+            resolve_chatterbox_tts_loader_registration(variant).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Unsupported Chatterbox TTS model variant: {variant}"
+                ))
+            })?;
+
+        let (entry, loading_guard) = {
+            let mut guard = self.chatterbox_tts_models.write().await;
+            let entry = guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Chatterbox TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
+        };
+
+        info!(
+            "Loading Chatterbox TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        entry
+            .model
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    DeviceThread::for_device(&device.device)?
+                        .submit(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+        let model = {
+            let guard = self.chatterbox_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Chatterbox TTS model {variant} load was superseded before publication"
+            ))
+        })
+    }
+
     pub async fn load_vibevoice_tts(
         &self,
         variant: ModelVariant,
@@ -7985,6 +8121,61 @@ impl ModelRegistry {
         entry.publish_ready()
     }
 
+    pub async fn get_chatterbox_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<ChatterboxTtsModel>> {
+        let guard = self.chatterbox_tts_models.read().await;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub fn try_get_chatterbox_tts(&self, variant: ModelVariant) -> Option<Arc<ChatterboxTtsModel>> {
+        let guard = self.chatterbox_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_chatterbox_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ChatterboxTtsModelLease> {
+        let guard = self.chatterbox_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| ChatterboxTtsModelLease { inner })
+    }
+
+    pub fn try_get_chatterbox_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ChatterboxTtsModelLease> {
+        let guard = self.chatterbox_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| ChatterboxTtsModelLease { inner })
+    }
+
+    pub(crate) async fn get_loading_chatterbox_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<ChatterboxTtsModel>> {
+        let guard = self.chatterbox_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub(crate) async fn publish_chatterbox_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.chatterbox_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Chatterbox TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+
     pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
         let guard = self.vibevoice_tts_models.read().await;
         guard.get(&variant).and_then(|entry| entry.ready_model())
@@ -8241,6 +8432,21 @@ impl ModelRegistry {
     pub async fn unload_voxtral_tts(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.voxtral_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
+        }
+    }
+
+    pub async fn unload_chatterbox_tts(&self, variant: ModelVariant) {
+        let entry = {
+            let mut guard = self.chatterbox_tts_models.write().await;
             let entry = guard.remove(&variant);
             if let Some(entry) = &entry {
                 entry.reset_ready();

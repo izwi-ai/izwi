@@ -139,6 +139,15 @@ pub struct SpeechSamplingOptions {
     /// before synthesis; unset keeps the family's default (on for Kokoro).
     #[serde(default)]
     pub normalize_text: Option<bool>,
+    /// Min-p sampling threshold (Chatterbox).
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Emotion intensity (Chatterbox).
+    #[serde(default)]
+    pub exaggeration: Option<f32>,
+    /// Classifier-free guidance weight; 0 turns guidance off (Chatterbox).
+    #[serde(default)]
+    pub cfg_weight: Option<f32>,
 }
 
 impl SpeechSamplingOptions {
@@ -175,6 +184,15 @@ impl SpeechSamplingOptions {
             .is_some_and(|value| !value.is_finite() || value <= 0.0)
         {
             return invalid("cfg_scale must be a finite number > 0".into());
+        }
+        for (name, value, max) in [
+            ("min_p", self.min_p, 1.0),
+            ("exaggeration", self.exaggeration, 2.0),
+            ("cfg_weight", self.cfg_weight, 1.0),
+        ] {
+            if value.is_some_and(|value| !(0.0..=max).contains(&value)) {
+                return invalid(format!("{name} must be between 0 and {max}"));
+            }
         }
         if self
             .diffusion_steps

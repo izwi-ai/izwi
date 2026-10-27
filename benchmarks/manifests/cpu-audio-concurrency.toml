@@ -69,3 +69,17 @@ reference_text_file = "../../data/fox.md"
 
 [benchmarks.matrix]
 concurrent = [1, 2, 4, 8]
+
+# Chatterbox streams windows while T3 runs; each re-runs the S3Gen flow over
+# the reference prompt, so its first audio comes after the first window.
+[[benchmarks]]
+name = "chatterbox-tts-cpu-concurrency"
+command = "tts"
+model = "Chatterbox-500M"
+iterations = 8
+warmup = true
+stream = true
+text = "Continuous audio batching should remain responsive and clear."
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]

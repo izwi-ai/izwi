@@ -4,3 +4,70 @@ Copyright 2026 Izwi AI
 This product includes software developed by Izwi AI
 (https://github.com/izwi-ai/izwi), licensed under the Apache License,
 Version 2.0. See the LICENSE file for the full license text.
+
+Third-party works
+-----------------
+
+The Chatterbox text-to-speech family
+(crates/izwi-core/src/models/architectures/chatterbox) is a Rust port of:
+
+* Chatterbox (https://github.com/resemble-ai/chatterbox)
+  Copyright (c) 2025 Resemble AI. MIT License.
+* PerTh, the watermarker Chatterbox applies to its audio
+  (https://github.com/resemble-ai/Perth)
+  Copyright (c) 2025 Resemble AI. MIT License.
+
+and of the parts of these works that Chatterbox builds on:
+
+* CosyVoice (https://github.com/FunAudioLLM/CosyVoice): the S3Gen flow
+  decoder and the HiFT vocoder. Copyright (c) 2024 Alibaba Inc.
+  Apache License, Version 2.0.
+* WeNet (https://github.com/wenet-e2e/wenet) and ESPnet
+  (https://github.com/espnet/espnet): the Conformer encoder.
+  Copyright (c) 2019 Shigeki Karita; Copyright (c) 2020 Johns Hopkins
+  University (Shinji Watanabe); Copyright (c) 2020-2021 Mobvoi Inc.
+  Apache License, Version 2.0.
+* S3Tokenizer (https://github.com/xingchensong/S3Tokenizer): the speech
+  tokenizer used for voice cloning. Copyright (c) 2024 Tsinghua Univ.
+  (Xingchen Song) and Dinghao Zhou. Apache License, Version 2.0.
+  It is modified from Whisper (https://github.com/openai/whisper),
+  Copyright (c) 2022 OpenAI, MIT License.
+* Matcha-TTS (https://github.com/shivammehta25/Matcha-TTS): the flow
+  decoder's U-Net and transformer blocks. Copyright (c) 2023 Shivam Mehta.
+  MIT License.
+* HiFi-GAN (https://github.com/jik876/hifi-gan): the vocoder's generator.
+  Copyright (c) 2020 Jungil Kong. MIT License.
+* Snake (https://github.com/EdwardDixon/snake): the vocoder's activation.
+  Copyright (c) 2020 Edward Dixon. MIT License.
+* CAM++ from 3D-Speaker (https://github.com/alibaba-damo-academy/3D-Speaker),
+  as modified in FunASR (https://github.com/modelscope/FunASR): the speaker
+  x-vector encoder. Copyright (c) FunASR. MIT License.
+* Real-Time-Voice-Cloning (https://github.com/CorentinJ/Real-Time-Voice-Cloning):
+  the voice encoder. Modified & original work Copyright (c) 2019 Corentin
+  Jemine; original work Copyright (c) 2018 Rayhane Mama. MIT License.
+* spacy-pkuseg (https://github.com/explosion/spacy-pkuseg), a fork of
+  pkuseg-python (https://github.com/lancopku/pkuseg-python): the Chinese word
+  segmenter of the multilingual text frontend. Copyright (c) 2020 ExplosionAI
+  GmbH, 2018-2019 pkuseg authors. MIT License.
+
+The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
+works above are used under these terms:
+
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be included
+  in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

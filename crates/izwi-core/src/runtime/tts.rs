@@ -633,7 +633,7 @@ impl RuntimeService {
         let terminal_deadline = core_request.deadline;
         let budget_frames = core_request.params.max_tokens;
         let mut next_sequence = 0usize;
-        let output = self
+        let mut output = self
             .run_streaming_request(core_request, |stream_chunk| {
                 let tx = chunk_tx.clone();
                 let sequence = next_sequence;
@@ -658,6 +658,15 @@ impl RuntimeService {
             })
             .await?;
 
+        if let Some(samples) = unstreamed_terminal_pcm(&mut output.audio, next_sequence) {
+            let chunk = AudioChunk::new(output.request_id.clone(), next_sequence, samples)
+                .with_sample_rate(output.audio.sample_rate);
+            next_sequence += 1;
+            chunk_tx.send(chunk).await.map_err(|_| {
+                Error::InferenceError("Streaming output channel closed".to_string())
+            })?;
+        }
+
         // Completion statistics are cumulative and arrive after all committed PCM,
         // including when the engine's terminal marker contains no audio.
         let mut terminal =
@@ -678,6 +687,17 @@ impl RuntimeService {
         info!("Streaming generation complete via core engine");
         Ok(())
     }
+}
+
+/// PCM a stream's terminal output holds that the stream never carried: a
+/// final-only family renders its whole utterance there. A family that
+/// streamed `streamed_chunks` may also keep the utterance there (Qwen3-TTS
+/// does), so its terminal PCM is never sent again.
+fn unstreamed_terminal_pcm(
+    audio: &mut crate::engine::AudioOutput,
+    streamed_chunks: usize,
+) -> Option<Vec<f32>> {
+    (streamed_chunks == 0 && !audio.samples.is_empty()).then(|| std::mem::take(&mut audio.samples))
 }
 
 /// Why an engine TTS request ended. The engine's decode accounting counts
@@ -716,6 +736,24 @@ fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_forwards_only_terminal_pcm_that_was_never_streamed() {
+        let mut streamed = crate::engine::AudioOutput::streamed(48_000, 24_000);
+        assert_eq!(unstreamed_terminal_pcm(&mut streamed, 3), None);
+        // Qwen3-TTS streams its chunks and keeps the utterance as well.
+        let mut kept = crate::engine::AudioOutput::new(vec![0.25; 4], 24_000);
+        assert_eq!(unstreamed_terminal_pcm(&mut kept, 2), None);
+
+        let mut final_only = crate::engine::AudioOutput::new(vec![0.25; 4], 24_000);
+        assert_eq!(
+            unstreamed_terminal_pcm(&mut final_only, 0),
+            Some(vec![0.25; 4])
+        );
+        // The duration the terminal statistics report survives the move.
+        assert!(final_only.samples.is_empty());
+        assert!(final_only.duration_secs > 0.0);
+    }
 
     #[test]
     fn fish_s2_public_tts_routes_always_use_retained_execution() {
@@ -934,12 +972,13 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 5] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 6] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
             ModelFamily::VoxtralTts,
             ModelFamily::Lfm25Audio,
             ModelFamily::VibeVoiceTts,
+            ModelFamily::ChatterboxTts,
         ];
         let registry = RuntimeAdapterRegistry::built_in();
         let short = "Hello there.";

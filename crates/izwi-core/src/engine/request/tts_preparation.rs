@@ -277,6 +277,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         for (stage, cost) in stage_costs {
@@ -332,6 +334,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -378,6 +382,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: Some(params),
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -417,6 +423,49 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: Some(artifact),
             voxtral_tts_params: Some(params),
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_chatterbox_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: ChatterboxTtsModelLease,
+        artifact: Arc<ChatterboxPreparedArtifact>,
+        params: ChatterboxGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::ChatterboxTts
+            || artifact.prompt_tokens == 0
+            || artifact.prompt_tokens + params.max_speech_tokens > max_sequence_tokens + 1
+            || params.max_speech_tokens == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Chatterbox request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens);
+        self.params.max_tokens = params.max_speech_tokens;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::ChatterboxTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: Some(artifact),
+            chatterbox_tts_params: Some(params),
             kokoro_tts: None,
         });
         Ok(())
@@ -467,6 +516,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: Some(artifact),
         });
         if let Some((stage, cost)) = prepared_stage_cost {
@@ -572,6 +623,8 @@ impl EngineCoreRequest {
             fish_s2_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -725,6 +778,39 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.voxtral_tts_params))
     }
 
+    pub(crate) fn prepared_chatterbox_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<ChatterboxTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::ChatterboxTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_chatterbox_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<ChatterboxPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.chatterbox_tts.clone()))
+    }
+
+    pub(crate) fn chatterbox_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<ChatterboxGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.chatterbox_tts_params.clone()))
+    }
+
     pub(crate) fn prepared_kokoro_tts_model_lease_for_executor(
         &self,
     ) -> Result<Option<KokoroTtsModelLease>> {
@@ -763,6 +849,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -782,6 +869,7 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
+                | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

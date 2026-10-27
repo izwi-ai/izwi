@@ -505,15 +505,20 @@ impl DeviceProfile {
             return self.metal_bf16_checkpoint_lm_tier();
         }
         DTypeSelection {
-            dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts)
-                || request.model_family == Some(ModelFamily::WhisperAsr)
-            {
+            dtype: if matches!(
+                request.model_family,
+                Some(
+                    ModelFamily::VibeVoiceTts | ModelFamily::WhisperAsr | ModelFamily::ChatterboxTts
+                )
+            ) {
                 DType::F16
             } else {
                 DType::F32
             },
             reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
                 "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
+            } else if request.model_family == Some(ModelFamily::ChatterboxTts) {
+                "Chatterbox Metal policy runs T3 in F16 behind a load-time self-check; S3Gen, HiFT, the reference encoders and PerTh stay F32".into()
             } else if request.model_family == Some(ModelFamily::WhisperAsr) {
                 "Whisper Metal policy runs its F16 checkpoint in F16 on every Apple family, with F32 softmax, LayerNorm statistics and logits (whisper.cpp, mlx-whisper, OpenAI Whisper)".into()
             } else {
@@ -1708,6 +1713,14 @@ mod tests {
             DType::F16
         );
         assert_eq!(
+            with(ModelFamily::ChatterboxTts, MetalDTypeOverride::Auto),
+            DType::F16
+        );
+        assert_eq!(
+            with(ModelFamily::ChatterboxTts, MetalDTypeOverride::F32),
+            DType::F32
+        );
+        assert_eq!(
             metal
                 .metal_default_dtype_selection_with(
                     request(ModelFamily::Voxtral).with_checkpoint_dtype(DType::BF16),
@@ -2021,6 +2034,10 @@ mod tests {
         );
         assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::VibeVoiceAsr, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::ChatterboxTts, None),
             DType::BF16
         );
         assert_eq!(

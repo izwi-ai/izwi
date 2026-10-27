@@ -257,7 +257,10 @@ case "$schema" in
           (.command == "asr" or .command == "tts") and
           .quality_failed == 0 and .telemetry_delta_available == true and
           .samples > 0 and
-          (if .command == "tts" then
+          (if .command == "tts" and .final_only == true then
+             .streaming_latency.first_audio_ms.count == .samples and
+             .streaming_latency.inter_frame_ms == null
+           elif .command == "tts" then
              .streaming_latency.first_audio_ms.count == .samples and
              .streaming_latency.inter_frame_ms.count == .samples
            else

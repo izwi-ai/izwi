@@ -51,6 +51,11 @@ Saved voices can be previewed, deleted, and reused in Text to Speech. The API
 surface is `/v1/voices`, and `izwi tts` can reuse a saved voice with
 `--saved-voice-id`.
 
+A cloned voice can be saved without its transcript. Such an audio-only voice
+works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone; models that need a
+transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) refuse it with a
+`400` asking for one.
+
 ```bash
 izwi tts "Use my saved narration voice." \
   --model Qwen3-TTS-12Hz-0.6B-Base \
@@ -80,7 +85,7 @@ Select **New Voice** from Voice Studio to choose a creation flow:
 
 | Flow | Input | Best for |
 |------|-------|----------|
-| Clone | Reference audio plus reference transcript | Reusing an existing permitted voice |
+| Clone | Reference audio, plus its transcript (optional; Chatterbox does not use one) | Reusing an existing permitted voice |
 | Design | Natural-language voice description | Creating a new synthetic character or style |
 
 See the dedicated guides for details:

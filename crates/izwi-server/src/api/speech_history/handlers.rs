@@ -41,7 +41,10 @@ use crate::batch_runtime::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
         RuntimeJobStatus, StageResourceHints,
     },
-    worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
+    worker::{
+        StageCancellationReason, StageCancellationSignal, StageExecutionContext,
+        StageExecutionOutcome, StageExecutor,
+    },
 };
 use crate::entity::RuntimeProjectionAttempt;
 use crate::error::{core_api_error, ApiError, ApiJson};
@@ -1655,7 +1658,10 @@ async fn hydrate_batch_reference_audio(
     claimed: &ClaimedStage,
     request: &mut CreateSpeechHistoryRecordRequest,
 ) -> anyhow::Result<()> {
-    if request.reference_audio.is_some() || request.reference_text.is_none() {
+    // Enqueueing stores every reference's audio as an input artifact and
+    // drops it from the request; a reference may come without a transcript
+    // (Chatterbox), so the artifact, not the transcript, says there is one.
+    if request.reference_audio.is_some() {
         return Ok(());
     }
 
@@ -1693,7 +1699,11 @@ async fn hydrate_batch_reference_audio(
         return Ok(());
     }
 
-    anyhow::bail!("TTS batch request is missing its reference-audio input artifact")
+    anyhow::ensure!(
+        request.reference_text.is_none() && request.saved_voice_id.is_none(),
+        "TTS batch request is missing its reference-audio input artifact"
+    );
+    Ok(())
 }
 
 async fn publish_speech_audio_runtime_artifact(
@@ -1827,6 +1837,21 @@ pub(crate) async fn synthesize_record(
     .map(|(record, _, _)| record)
 }
 
+/// `work`, unless the stage is cancelled first: `work` is then dropped,
+/// which aborts the engine requests it owns.
+async fn unless_cancelled<T>(
+    cancellation: Option<StageCancellationSignal>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, StageCancellationReason> {
+    match cancellation {
+        Some(cancellation) => tokio::select! {
+            output = work => Ok(output),
+            reason = cancellation.cancelled() => Err(reason),
+        },
+        None => Ok(work.await),
+    }
+}
+
 async fn synthesize_record_internal(
     state: &AppState,
     ctx: &RequestContext,
@@ -1896,11 +1921,21 @@ async fn synthesize_record_internal(
     runtime_context.tenant_key = tenant_key;
     generation_request = generation_request.with_runtime_context(runtime_context);
     // No wall clock wraps active generation (TPIPE-6); a dropped request
-    // cancels the engine work.
+    // cancels the engine work. A cancelled stage drops it at once, so the
+    // engine stops mid-render instead of finishing the utterance first.
     let runtime = state.runtime.clone();
-    let output = generate_long_form_tts(&runtime, variant, generation_request)
-        .await
-        .map_err(core_api_error)?;
+    let output = unless_cancelled(
+        attempt.map(StageExecutionContext::cancellation),
+        generate_long_form_tts(&runtime, variant, generation_request),
+    )
+    .await
+    .map_err(|reason| {
+        ApiError::internal(format!(
+            "Stage execution cancelled: {}",
+            reason.as_error_code()
+        ))
+    })?
+    .map_err(core_api_error)?;
     let stop_reason = output.stop_reason;
 
     let encoder = AudioEncoder::new(output.sample_rate, 1);
@@ -1950,7 +1985,7 @@ async fn synthesize_record_internal(
                 )
                 .await
                 .map_err(|err| ApiError::internal(err.to_string()))?;
-                completion.preexisting_audio_storage_path = Some(storage_key);
+                completion.adopt_published_audio(storage_key);
                 Some(artifact)
             }
             None => None,
@@ -2576,7 +2611,7 @@ async fn resolve_saved_voice_selection(
     let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
-    req.reference_text = Some(saved_voice.reference_text);
+    req.reference_text = saved_voice.reference_text;
     Ok(req)
 }
 
@@ -2593,9 +2628,11 @@ fn validate_reference_voice_selection(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
-    if has_direct_reference_audio != has_direct_reference_text {
+    // Whether the transcript is needed too depends on the model, which the
+    // voice contract checks once the model is known.
+    if has_direct_reference_text && !has_direct_reference_audio {
         return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
+            "`reference_text` was given without `reference_audio`.",
         ));
     }
 
@@ -2703,8 +2740,15 @@ fn normalize_for_model_capabilities(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
+    let has_saved_voice = req
+        .saved_voice_id
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
 
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
+    crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
+    crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(
@@ -2731,9 +2775,19 @@ fn normalize_for_model_capabilities(
                     "Voice cloning requests require a model with reference-voice support.",
                 ));
             }
-            if !has_reference_audio || !has_reference_text {
+            // A saved voice's missing transcript is the voice contract's
+            // to report, below.
+            if capabilities.reference_transcript_required
+                && !has_saved_voice
+                && (!has_reference_audio || !has_reference_text)
+            {
                 return Err(ApiError::bad_request(
                     "Voice cloning requests require `saved_voice_id` or both `reference_audio` and `reference_text`.",
+                ));
+            }
+            if !has_reference_audio {
+                return Err(ApiError::bad_request(
+                    "Voice cloning requests require `saved_voice_id` or `reference_audio`.",
                 ));
             }
         }
@@ -2746,6 +2800,7 @@ fn normalize_for_model_capabilities(
             speaker: has_speaker,
             reference_audio: has_reference_audio,
             reference_text: has_reference_text,
+            saved_voice: has_saved_voice,
             voice_description: has_voice_description,
         },
     )?;
@@ -2835,6 +2890,40 @@ fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    /// A cancelled stage drops its synthesis at once rather than waiting for
+    /// the utterance, so the engine work it owns stops mid-render.
+    #[tokio::test]
+    async fn cancelling_a_stage_drops_its_synthesis() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        };
+        let cancellation = super::StageCancellationSignal::new();
+        let trigger = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            trigger.cancel(super::StageCancellationReason::UserRequested);
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::unless_cancelled(Some(cancellation), work),
+        )
+        .await
+        .expect("cancellation ends the wait");
+        assert_eq!(outcome, Err(super::StageCancellationReason::UserRequested));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        // Without a stage there is nothing to cancel.
+        assert_eq!(super::unless_cancelled(None, async { 7 }).await, Ok(7));
+    }
+
     #[tokio::test]
     async fn stream_start_uses_first_pcm_rate_once_across_requests() {
         for explicit_rate in [Some(44_100), None] {
@@ -3363,16 +3452,43 @@ mod tests {
     }
 
     #[test]
-    fn reference_audio_and_text_must_be_provided_together() {
+    fn reference_text_needs_reference_audio() {
         let err = validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
+            reference_text: Some("words".to_string()),
+            ..base_request()
+        })
+        .expect_err("a transcript alone must fail");
+        assert!(err.message.contains("without `reference_audio`"));
+
+        // Audio alone is the model's call (see the voice-contract tests).
+        validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
             reference_audio: Some("abc".to_string()),
             ..base_request()
         })
-        .expect_err("expected incomplete reference inputs to fail");
+        .expect("audio alone passes the model-independent check");
+    }
 
+    #[test]
+    fn audio_only_cloning_is_for_models_that_take_no_transcript() {
+        let audio_only = || CreateSpeechHistoryRecordRequest {
+            reference_audio: Some("UklGRg==".to_string()),
+            ..base_request()
+        };
+        normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            ModelVariant::Chatterbox500M,
+            audio_only(),
+        )
+        .expect("Chatterbox clones from audio alone");
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            ModelVariant::FishAudioS2Pro,
+            audio_only(),
+        )
+        .expect_err("Fish conditions on the transcript");
         assert!(err
             .message
-            .contains("Provide both `reference_audio` and `reference_text` together."));
+            .contains("require `saved_voice_id` or both `reference_audio` and `reference_text`"));
     }
 
     #[test]

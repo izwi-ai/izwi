@@ -1,7 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ModelInfo } from "@/api";
+import { api, type ModelInfo } from "@/api";
 import { NewDiarizationModal } from "@/features/diarization/components/NewDiarizationModal";
 import { NewTextToSpeechModal } from "@/features/text-to-speech/components/NewTextToSpeechModal";
 import { NewTranscriptionModal } from "@/features/transcription/components/NewTranscriptionModal";
@@ -47,6 +47,138 @@ describe("viewport-safe creation dialogs", () => {
     const submit = screen.getByRole("button", { name: "Create generation" });
     expect(body).not.toContainElement(submit);
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
+  });
+
+  it("offers a final-only model's speech controls with streaming off", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
+    const chatterbox = {
+      variant: "Chatterbox-500M",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        supports_reference_voice: true,
+        reference_transcript_required: false,
+        supports_voice_description: false,
+        supports_streaming: false,
+        supports_speed_control: false,
+        supports_auto_long_form: false,
+        controls: [
+          { control: "exaggeration", min: 0, max: 2, default: 0.5 },
+          { control: "cfg_weight", min: 0, max: 1, default: 0.5 },
+          { control: "min_p", min: 0, max: 1, default: 0.05 },
+        ],
+      },
+    } as ModelInfo;
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={chatterbox.variant}
+        selectedModelInfo={chatterbox}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={vi.fn()}
+      />,
+    );
+
+    for (const [name, value] of [
+      ["Exaggeration", "0.5"],
+      ["Guidance", "0.5"],
+      ["Min-p", "0.05"],
+    ]) {
+      expect(screen.getByRole("slider", { name })).toHaveAttribute(
+        "aria-valuenow",
+        value,
+      );
+    }
+    const stream = screen.getByRole("switch", { name: /Stream results/i });
+    expect(stream).not.toBeChecked();
+    expect(stream).toBeDisabled();
+
+    // The built-in voice speaks unless a saved one is chosen.
+    expect(screen.getByText("Built-in voice")).toBeInTheDocument();
+    expect(await screen.findByText("Saved voice (optional)")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Saved voice" })).toHaveTextContent(
+      "None (built-in voice)",
+    );
+  });
+
+  it("asks a multilingual model which language to speak", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const multilingual = {
+      variant: "Chatterbox-Multilingual-500M",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        supports_reference_voice: true,
+        reference_transcript_required: false,
+        supports_voice_description: false,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: false,
+        languages: [
+          { code: "en", name: "English" },
+          { code: "fr", name: "French" },
+          { code: "sw", name: "Swahili" },
+        ],
+      },
+    } as ModelInfo;
+    const onCreateStream = vi.fn().mockResolvedValue({ id: "record" });
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={multilingual.variant}
+        selectedModelInfo={multilingual}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={onCreateStream}
+      />,
+    );
+
+    const picker = screen.getByRole("combobox", { name: "Language" });
+    expect(picker).toHaveTextContent("English");
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "French" }));
+    expect(picker).toHaveTextContent("French");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
+      target: { value: "Bonjour à tous." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create generation" }));
+    await waitFor(() => expect(onCreateStream).toHaveBeenCalled());
+    expect(onCreateStream.mock.calls[0][0]).toMatchObject({
+      model_id: "Chatterbox-Multilingual-500M",
+      language: "fr",
+    });
+  });
+
+  it("offers no language to a model that speaks one", () => {
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={readyTtsModel.variant}
+        selectedModelInfo={{
+          ...readyTtsModel,
+          speech_capabilities: {
+            ...readyTtsModel.speech_capabilities!,
+            languages: [{ code: "en", name: "English" }],
+          },
+        }}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("combobox", { name: "Language" })).toBeNull();
   });
 
   it("keeps the transcription title, upload action, and final setting reachable", () => {

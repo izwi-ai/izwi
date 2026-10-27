@@ -12,7 +12,7 @@ pub use cuda_support::{
 };
 pub use metadata::{
     ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,
-    SpeechModelCapabilities,
+    SpeechControl, SpeechControlRange, SpeechModelCapabilities,
 };
 pub use prefix_reuse::{
     prefix_reuse_engages, PrefixReuseEvidenceLevel, PrefixReuseMode, PrefixReuseSupport,

@@ -329,11 +329,15 @@ export function CloneVoiceDialog({
           ? "Too long"
           : null;
   const wordCount = countWords(transcript);
+  // Chatterbox clones from the audio alone; every other model conditions on
+  // what the reference says.
+  const transcriptRequired =
+    modelInfo?.speech_capabilities?.reference_transcript_required ?? true;
   const busy = recording !== "idle" || readingClip || saving;
   const canSave =
     Boolean(name.trim() && clip) &&
     !lengthProblem &&
-    wordCount > 0 &&
+    (wordCount > 0 || !transcriptRequired) &&
     consent &&
     !busy;
 
@@ -348,7 +352,7 @@ export function CloneVoiceDialog({
     try {
       const voice = await api.createSavedVoice({
         name: name.trim(),
-        reference_text: transcript.trim(),
+        reference_text: transcript.trim() || undefined,
         audio_base64: await blobToBase64Payload(clip.blob),
         audio_mime_type: "audio/wav",
         audio_filename: wavFilename(clip.name),
@@ -591,9 +595,17 @@ export function CloneVoiceDialog({
             </div>
 
             <CreationField
-              label="What's said in the recording"
+              label={
+                transcriptRequired
+                  ? "What's said in the recording"
+                  : "What's said in the recording (optional)"
+              }
               htmlFor="clone-voice-transcript"
-              hint="Type it exactly as spoken."
+              hint={
+                transcriptRequired
+                  ? "Type it exactly as spoken."
+                  : "This model clones from the audio alone. Add the words to reuse the voice with models that need them."
+              }
             >
               <textarea
                 id="clone-voice-transcript"
@@ -658,13 +670,13 @@ export function CloneVoiceDialog({
                 />
                 <SampleCheck
                   title="Transcript"
-                  detail="Matches what's said"
+                  detail={transcriptRequired ? "Matches what's said" : "Optional for this model"}
                   value={
                     wordCount === 0
                       ? "—"
                       : `${wordCount} ${wordCount === 1 ? "word" : "words"}`
                   }
-                  state={wordCount === 0 ? "empty" : "ok"}
+                  state={wordCount === 0 && transcriptRequired ? "empty" : "ok"}
                 />
               </ul>
             </div>

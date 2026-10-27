@@ -357,18 +357,24 @@ impl EngineCoreRequest {
                 if reference_audio.is_some() || reference_text.is_some() {
                     let reference_audio = reference_audio.ok_or_else(|| {
                         Error::InvalidInput(
-                            "reference_audio and reference_text must both be provided".to_string(),
+                            "reference_text was given without reference_audio".to_string(),
                         )
                     })?;
-                    let reference_text = reference_text.ok_or_else(|| {
-                        Error::InvalidInput(
-                            "reference_audio and reference_text must both be provided".to_string(),
-                        )
-                    })?;
-                    if reference_text.trim().is_empty() {
-                        return Err(Error::InvalidInput(
-                            "reference_text cannot be empty".to_string(),
-                        ));
+                    // A transcript is optional here: a family that uses one
+                    // refuses a reference without it when it prepares it.
+                    if let Some(reference_text) = reference_text {
+                        if reference_text.trim().is_empty() {
+                            return Err(Error::InvalidInput(
+                                "reference_text cannot be empty".to_string(),
+                            ));
+                        }
+                        let reference_chars = reference_text.chars().count();
+                        if reference_chars > limits.reference_text_chars {
+                            return Err(Error::InvalidInput(format!(
+                                "TTS reference_text contains {reference_chars} characters, exceeding the {}-character direct Engine limit",
+                                limits.reference_text_chars
+                            )));
+                        }
                     }
                     validate_base64_audio_retained_size(
                         reference_audio.capacity(),
@@ -379,13 +385,6 @@ impl EngineCoreRequest {
                         limits.reference_source_bytes,
                         "reference audio",
                     )?;
-                    let reference_chars = reference_text.chars().count();
-                    if reference_chars > limits.reference_text_chars {
-                        return Err(Error::InvalidInput(format!(
-                            "TTS reference_text contains {reference_chars} characters, exceeding the {}-character direct Engine limit",
-                            limits.reference_text_chars
-                        )));
-                    }
                 }
                 let already_canonical = self.reference_audio.is_none()
                     && self.reference_text.is_none()

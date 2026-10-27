@@ -41,6 +41,10 @@ const MAX_MANAGED_PREFIX_CURSOR_LOSSES: u8 = 2;
 /// victim, so one request cannot be suspended over and over; once no
 /// replayable victim is left the claim-deadlock breaker decides.
 const MAX_CAPACITY_REPLAYS: u8 = 3;
+/// How long a ready AR decode row waits through codec-only transactions,
+/// besides the four-transaction bound. A Chatterbox acoustic unit (0.3-0.7 s
+/// on Metal) exceeds it on its own, so token decode follows each one.
+const AUDIO_ONLY_TIME_BUDGET: Duration = Duration::from_millis(250);
 
 /// Schedule-time managed prefix probe for one exact session: the cursor its
 /// first prefill span may start at, or `None` for a zero-start prefill.
@@ -478,6 +482,10 @@ struct StarvationDebts {
     /// Committed decode transactions that served only codec or finalization
     /// rows while an AR decode row was ready; bounded the same way.
     audio_only_steps_with_ready_decode: usize,
+    /// How long those transactions ran. A codec unit can be a Fish chunk of
+    /// tens of milliseconds or a Chatterbox acoustic unit of half a second,
+    /// so the AR rows' wait is bounded in time as well as in steps.
+    audio_only_time_with_ready_decode: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1335,7 +1343,8 @@ impl Scheduler {
         // A sustained supply of codec work must still leave a bounded
         // opportunity for AR to refill other streams' audio buffers. Codec and
         // AR rows form separate lanes, so the reserved transaction is AR-only.
-        let reserve_ordinary_decode = debts.audio_only_steps_with_ready_decode >= 4
+        let reserve_ordinary_decode = (debts.audio_only_steps_with_ready_decode >= 4
+            || debts.audio_only_time_with_ready_decode >= AUDIO_ONLY_TIME_BUDGET)
             && self.ordinary_decode_ready(scheduling_now, true, lanes);
         let mut finalize_candidates = self
             .running
@@ -2732,6 +2741,7 @@ impl Scheduler {
     pub(crate) fn record_committed_decode_service(
         &mut self,
         committed: &[(&RequestId, &WorkUnit)],
+        elapsed: Duration,
     ) {
         if committed.is_empty() {
             return;
@@ -2766,8 +2776,10 @@ impl Scheduler {
             });
             if served_token_decode || !scheduler.ordinary_decode_ready(now, true, lanes) {
                 debts.audio_only_steps_with_ready_decode = 0;
+                debts.audio_only_time_with_ready_decode = Duration::ZERO;
             } else if served_codec {
                 debts.audio_only_steps_with_ready_decode += 1;
+                debts.audio_only_time_with_ready_decode += elapsed;
             }
             debts
         });
@@ -5076,10 +5088,10 @@ mod tests {
                     },
                 )
                 .expect("realtime commit");
-            scheduler.record_committed_decode_service(&[(
-                &realtime_rows[0].request_id,
-                &realtime_rows[0].work,
-            )]);
+            scheduler.record_committed_decode_service(
+                &[(&realtime_rows[0].request_id, &realtime_rows[0].work)],
+                Duration::ZERO,
+            );
         }
 
         let reserved = scheduler.schedule();
@@ -5093,7 +5105,7 @@ mod tests {
             }
         ));
         let row = &reserved.decode_requests[0];
-        scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
+        scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)], Duration::ZERO);
         assert_eq!(scheduler.debts.realtime_only_steps_with_ready_decode, 0);
         assert!(scheduler
             .schedule()
@@ -7681,7 +7693,8 @@ mod tests {
             assert!(matches!(row.work, WorkUnit::SequenceAudioDecode { .. }));
             scheduler.release_unexecuted_quantum(&step.decode_requests[1]);
             scheduler.update_after_step(&codec.id, 0, 0, 1.0);
-            scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
+            scheduler
+                .record_committed_decode_service(&[(&row.request_id, &row.work)], Duration::ZERO);
             scheduler
                 .request_sequence_audio_decode(&codec.id, 4)
                 .unwrap();
@@ -7716,6 +7729,51 @@ mod tests {
                 .unwrap();
         }
         assert!(low_served, "aging must prevent priority starvation");
+    }
+
+    #[test]
+    fn a_long_codec_transaction_reserves_the_next_for_ar_decode() {
+        // One Chatterbox acoustic unit can run for half a second: a ready AR
+        // row waits through at most the time budget, not four such units.
+        let (mut scheduler, codec, ar) = two_ready_audio_requests();
+        scheduler.config.max_batch_size = 2;
+        let serve_codec = |scheduler: &mut Scheduler, elapsed| {
+            scheduler
+                .request_sequence_audio_decode(&codec.id, 4)
+                .unwrap();
+            let step = scheduler.schedule();
+            let row = &step.decode_requests[0];
+            assert_eq!(row.request_id, codec.id);
+            assert!(matches!(row.work, WorkUnit::SequenceAudioDecode { .. }));
+            for deferred in &step.decode_requests[1..] {
+                scheduler.release_unexecuted_quantum(deferred);
+            }
+            scheduler.update_after_step(&codec.id, 0, 0, 1.0);
+            scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)], elapsed);
+        };
+
+        serve_codec(&mut scheduler, AUDIO_ONLY_TIME_BUDGET / 2);
+        serve_codec(&mut scheduler, AUDIO_ONLY_TIME_BUDGET / 2);
+        scheduler
+            .request_sequence_audio_decode(&codec.id, 4)
+            .unwrap();
+        let reserved = scheduler.schedule();
+        assert!(reserved
+            .decode_requests
+            .iter()
+            .all(|row| matches!(row.work, WorkUnit::SequenceStep { .. })));
+        let row = reserved
+            .decode_requests
+            .iter()
+            .find(|row| row.request_id == ar.id)
+            .expect("the AR row is served once the budget is spent");
+        scheduler.update_after_step(&ar.id, 0, 1, 1.0);
+        scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)], Duration::ZERO);
+        assert_eq!(scheduler.debts.audio_only_steps_with_ready_decode, 0);
+        assert_eq!(
+            scheduler.debts.audio_only_time_with_ready_decode,
+            Duration::ZERO
+        );
     }
 
     #[test]

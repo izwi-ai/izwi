@@ -7,13 +7,17 @@
 //! - Real-time progress via channels
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest;
+use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
@@ -22,6 +26,10 @@ use tracing::{debug, info, warn};
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
+use crate::models::architectures::chatterbox::chinese::{
+    CANGJIE_FILE, PKUSEG_DICT_FILE, PKUSEG_MODEL_FILE,
+};
+use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
 };
@@ -125,6 +133,44 @@ const VIBEVOICE_QWEN_TOKENIZER_FILES: &[&str] = &[
     "merges.txt",
     "special_tokens_map.json",
 ];
+
+/// The English loader's files at the pinned revision (5bb1f6ee); the repo
+/// also holds the multilingual and legacy checkpoints, which it never reads.
+/// The PerTh watermarker comes from its own repository ([`PERTH_CHECKPOINT`]).
+const CHATTERBOX_FILES: &[&str] = &[
+    "t3_cfg.safetensors",
+    "s3gen.safetensors",
+    "ve.safetensors",
+    "tokenizer.json",
+    "conds.pt",
+    PERTH_CHECKPOINT_FILE,
+];
+
+/// The multilingual edition's files: its T3 and grapheme tokenizer, then
+/// the English S3Gen and voice encoder in place of the pickled `s3gen.pt`
+/// and `ve.pt` upstream's multilingual loader reads (bit-identical tensor
+/// for tensor at this revision; `chatterbox::multilingual_tests` checks),
+/// the default voice, the watermark, and the Chinese frontend's Cangjie
+/// table and pkuseg segmenter ([`PKUSEG_MODEL`], [`PKUSEG_DICT`]).
+const CHATTERBOX_MULTILINGUAL_FILES: &[&str] = &[
+    "t3_mtl23ls_v2.safetensors",
+    "grapheme_mtl_merged_expanded_v1.json",
+    "s3gen.safetensors",
+    "ve.safetensors",
+    "conds.pt",
+    PERTH_CHECKPOINT_FILE,
+    CANGJIE_FILE,
+    PKUSEG_MODEL_FILE,
+    PKUSEG_DICT_FILE,
+];
+
+fn chatterbox_files(variant: ModelVariant) -> &'static [&'static str] {
+    if variant == ModelVariant::ChatterboxMultilingual500M {
+        CHATTERBOX_MULTILINGUAL_FILES
+    } else {
+        CHATTERBOX_FILES
+    }
+}
 
 const FISH_S2_PRO_FILES: &[&str] = &[
     "README.md",
@@ -520,6 +566,80 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
+/// A file served outside the Hub from a fixed URL, checked against its size
+/// and SHA-256 once it lands: Chatterbox's PerTh watermarker and its
+/// multilingual edition's Chinese segmenter ship only on GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedFile {
+    url: &'static str,
+    size: u64,
+    sha256: &'static str,
+}
+
+/// resemble-ai/Perth at ff1c8ac5 (MIT): the implicit watermarker's
+/// checkpoint, a regular Git blob served by commit.
+const PERTH_CHECKPOINT: PinnedFile = PinnedFile {
+    url: "https://raw.githubusercontent.com/resemble-ai/Perth/\
+          ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/\
+          perth_net_250000.pth.tar",
+    size: 37_429_684,
+    sha256: "a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670",
+};
+
+/// spacy-pkuseg's default model, `spacy_ontonotes` (MIT): the release asset
+/// `pkuseg()` downloads, at the SHA-256 pkuseg itself checks.
+const PKUSEG_MODEL: PinnedFile = PinnedFile {
+    url: "https://github.com/explosion/spacy-pkuseg/releases/download/v0.0.26/spacy_ontonotes.zip",
+    size: 34_567_143,
+    sha256: "b216e7f92de7ae285aeab8feba2faa8ea8216e5995ff6fb3d391cc8356db1bfe",
+};
+
+/// spacy-pkuseg's default merge dictionary, `spacy_pkuseg/dicts/default.pkl`,
+/// at the 1.0.2 release commit (the same blob since v0.0.26).
+const PKUSEG_DICT: PinnedFile = PinnedFile {
+    url: "https://raw.githubusercontent.com/explosion/spacy-pkuseg/\
+          16995617f3b8f5cf32e5b6a77d7d800e201b255b/spacy_pkuseg/dicts/default.pkl",
+    size: 4_525_959,
+    sha256: "3cf450d95719d51883fa49291302b9032372064d86805b130bb2ea0223196c67",
+};
+
+/// The pinned source of `variant`'s `local_file`, when it is not on the Hub.
+fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
+    if variant.family() != ModelFamily::ChatterboxTts {
+        return None;
+    }
+    match local_file {
+        PERTH_CHECKPOINT_FILE => Some(PERTH_CHECKPOINT),
+        PKUSEG_MODEL_FILE if variant == ModelVariant::ChatterboxMultilingual500M => {
+            Some(PKUSEG_MODEL)
+        }
+        PKUSEG_DICT_FILE if variant == ModelVariant::ChatterboxMultilingual500M => {
+            Some(PKUSEG_DICT)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `path` holds exactly `pinned`'s bytes; a file that does not is
+/// removed.
+async fn verify_pinned_file(path: &Path, pinned: PinnedFile) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let bytes = tokio::fs::read(path).await?;
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != pinned.sha256 {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(Error::DownloadError(format!(
+            "{} does not match its pinned SHA-256 (got {digest}, expected {}); removed it",
+            path.display(),
+            pinned.sha256
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct FileDownloadPlan {
     source_repo: String,
@@ -528,6 +648,166 @@ struct FileDownloadPlan {
     local_file: String,
     expected_size: u64,
     strict_size_check: bool,
+    /// Served from this URL instead of the Hub.
+    pinned: Option<PinnedFile>,
+}
+
+impl FileDownloadPlan {
+    /// A plan for a pinned file: its own URL and exact size.
+    fn pinned(spec: &ModelFileSpec, pinned: PinnedFile) -> Self {
+        Self {
+            source_repo: spec.source_repo.clone(),
+            source_revision: spec.source_revision.clone(),
+            source_file: spec.source_file.clone(),
+            local_file: spec.local_file.clone(),
+            expected_size: pinned.size,
+            strict_size_check: true,
+            pinned: Some(pinned),
+        }
+    }
+
+    /// The file's `resolve` URL on the Hub at `base`, or its pinned URL.
+    fn url(&self, base: &str) -> String {
+        if let Some(pinned) = self.pinned {
+            return pinned.url.to_string();
+        }
+        format!(
+            "{base}/{}/resolve/{}/{}",
+            self.source_repo, self.source_revision, self.source_file
+        )
+    }
+
+    /// A revision named by commit serves the same bytes forever, as does a
+    /// pinned URL.
+    fn immutable(&self) -> bool {
+        self.pinned.is_some()
+            || (self.source_revision.len() == 40
+                && self
+                    .source_revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
+    }
+
+    /// The size the file must have, when the plan knows it exactly.
+    fn exact_size(&self) -> Option<u64> {
+        (self.strict_size_check && self.expected_size > 0).then_some(self.expected_size)
+    }
+}
+
+/// A connection that delivers nothing for this long is dropped and the
+/// download resumed. There is no limit on a whole transfer: a multi-GB file
+/// on a slow link may take hours.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A file download fails after this many attempts in a row add no bytes.
+const MAX_STALLED_FILE_ATTEMPTS: usize = 4;
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(400);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// What the bytes in a `.part` file are, so an attempt resumes them only
+/// from the same source: the URL names the repository, revision and file;
+/// the ETag, sent back as `If-Range`, catches a file that changed under an
+/// unpinned revision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PartialDownload {
+    url: String,
+    /// The server's strong validator for the bytes.
+    etag: Option<String>,
+    /// The whole file's length, when the server reported it.
+    total: Option<u64>,
+}
+
+/// Where a file transfer reports its bytes.
+#[derive(Default)]
+struct FileProgress<'a> {
+    bar: Option<&'a ProgressBar>,
+    /// The channel, and the model-level progress the file's bytes add to.
+    channel: Option<(
+        &'a broadcast::Sender<DownloadProgress>,
+        &'a DownloadProgress,
+    )>,
+}
+
+/// `dest`'s partial file and the sidecar describing its bytes.
+fn partial_paths(dest: &Path) -> Result<(PathBuf, PathBuf)> {
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::DownloadError(format!("Invalid download destination: {}", dest.display()))
+        })?;
+    Ok((
+        dest.with_file_name(format!(".{name}.part")),
+        dest.with_file_name(format!(".{name}.part.json")),
+    ))
+}
+
+async fn file_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path)
+        .await
+        .map_or(0, |metadata| metadata.len())
+}
+
+/// The partial file's length and the ETag its bytes were served with.
+async fn partial_state(partial_path: &Path, sidecar_path: &Path) -> (u64, Option<String>) {
+    let etag = tokio::fs::read(sidecar_path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PartialDownload>(&bytes).ok())
+        .and_then(|sidecar| sidecar.etag);
+    (file_len(partial_path).await, etag)
+}
+
+/// The byte to resume `url` from, when the partial file holds bytes of the
+/// same source that can be checked: under a commit revision, or with a
+/// validator the server can compare.
+async fn resumable_partial(
+    partial_path: &Path,
+    sidecar_path: &Path,
+    url: &str,
+    immutable: bool,
+    exact_size: Option<u64>,
+) -> Option<(u64, PartialDownload)> {
+    let offset = file_len(partial_path).await;
+    let sidecar: PartialDownload =
+        serde_json::from_slice(&tokio::fs::read(sidecar_path).await.ok()?).ok()?;
+    let fits = sidecar
+        .total
+        .or(exact_size)
+        .is_none_or(|total| offset <= total);
+    (offset > 0 && sidecar.url == url && (immutable || sidecar.etag.is_some()) && fits)
+        .then_some((offset, sidecar))
+}
+
+async fn discard_partial(partial_path: &Path, sidecar_path: &Path) {
+    let _ = tokio::fs::remove_file(partial_path).await;
+    let _ = tokio::fs::remove_file(sidecar_path).await;
+}
+
+/// Move a complete partial file to `dest`.
+async fn publish_partial(partial_path: &Path, sidecar_path: &Path, dest: &Path) -> Result<()> {
+    if let Err(error) = tokio::fs::rename(partial_path, dest).await {
+        discard_partial(partial_path, sidecar_path).await;
+        return Err(Error::from(error));
+    }
+    let _ = tokio::fs::remove_file(sidecar_path).await;
+    Ok(())
+}
+
+/// `Content-Range: bytes <first>-<last>/<total>` as `(Some(first), total)`,
+/// and the unsatisfied form `bytes */<total>` as `(None, total)`; the total
+/// is `None` when the server writes `*`.
+fn parse_content_range(value: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let total = match total.trim() {
+        "*" => None,
+        total => Some(total.parse().ok()?),
+    };
+    let first = match range.trim() {
+        "*" => None,
+        range => Some(range.split_once('-')?.0.trim().parse().ok()?),
+    };
+    Some((first, total))
 }
 
 #[derive(Debug, Clone)]
@@ -745,8 +1025,10 @@ impl ModelDownloader {
         // reqwest's rustls has no built-in crypto provider in this workspace.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut http_client = reqwest::Client::builder()
-            // Large model files can take significant time on slower links.
-            .timeout(std::time::Duration::from_secs(6 * 3600))
+            // No whole-request limit: a stalled connection fails fast and the
+            // file download resumes where it stopped.
+            .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_STALL_TIMEOUT)
             // Avoid macOS SystemConfiguration proxy lookups which can fail in
             // restricted runtime environments (sandboxed agents/CI).
             .no_proxy();
@@ -885,136 +1167,260 @@ impl ModelDownloader {
             .map_err(|error| Error::HfHubError(format!("Response body failed: {}", error_chain(&error))))
     }
 
-    /// Download a file with streaming and progress bar
-    async fn download_file_streaming(
+    /// Download `url` into `dest`, resuming after a dropped connection.
+    /// It fails after [`MAX_STALLED_FILE_ATTEMPTS`] attempts in a row that
+    /// leave no more of the file on disk than any attempt before (for the
+    /// same version of the file); one that does resets the count and the
+    /// backoff, so a slow, flaky link still finishes a large file.
+    /// Fetch one planned file, then hold a pinned file to its SHA-256.
+    async fn fetch_plan(
         &self,
-        repo_id: &str,
-        revision: &str,
-        filename: &str,
+        plan: &FileDownloadPlan,
         dest: &Path,
-        file_pb: Option<ProgressBar>,
-        progress_tx: Option<broadcast::Sender<DownloadProgress>>,
-        progress_template: Option<DownloadProgress>,
+        label: &str,
+        progress: &FileProgress<'_>,
+    ) -> Result<u64> {
+        let bytes = self
+            .fetch_with_retries(
+                &plan.url(HF_BASE_URL),
+                plan.immutable(),
+                plan.exact_size(),
+                dest,
+                label,
+                progress,
+            )
+            .await?;
+        if let Some(pinned) = plan.pinned {
+            verify_pinned_file(dest, pinned).await?;
+        }
+        Ok(bytes)
+    }
+
+    async fn fetch_with_retries(
+        &self,
+        url: &str,
+        immutable: bool,
+        exact_size: Option<u64>,
+        dest: &Path,
+        label: &str,
+        progress: &FileProgress<'_>,
+    ) -> Result<u64> {
+        let (partial_path, sidecar_path) = partial_paths(dest)?;
+        let mut stalled = 0usize;
+        let mut backoff = INITIAL_RETRY_BACKOFF;
+        // The most of this version of the file any attempt has kept.
+        // Measuring progress against it, not the previous attempt, ends the
+        // loop on a server that ignores `Range` and drops the connection at
+        // varying points; a new version (ETag) starts the count again.
+        let (mut kept, mut version) = partial_state(&partial_path, &sidecar_path).await;
+        loop {
+            let error = match self
+                .fetch_resumable(url, immutable, exact_size, dest, progress)
+                .await
+            {
+                Ok(bytes) => match exact_size {
+                    Some(expected) if bytes != expected => {
+                        let _ = tokio::fs::remove_file(dest).await;
+                        Error::DownloadError(format!(
+                            "Downloaded size mismatch for {label}: expected {expected} bytes, got {bytes} bytes"
+                        ))
+                    }
+                    _ => return Ok(bytes),
+                },
+                Err(error) => error,
+            };
+            let (after, after_version) = partial_state(&partial_path, &sidecar_path).await;
+            if after_version != version {
+                version = after_version;
+                kept = 0;
+            }
+            if after > kept {
+                kept = after;
+                stalled = 0;
+                backoff = INITIAL_RETRY_BACKOFF;
+            } else {
+                stalled += 1;
+            }
+            if stalled >= MAX_STALLED_FILE_ATTEMPTS {
+                return Err(Error::DownloadError(format!(
+                    "Failed to download {label} after {stalled} attempts without progress: {error}"
+                )));
+            }
+            warn!("Download of {label} interrupted ({error}); resuming at byte {after} in {backoff:?}");
+            if let Some(bar) = progress.bar {
+                bar.set_message(format!("{label} (resuming)"));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+        }
+    }
+
+    /// One attempt at `url`: continue the `.part` file an earlier attempt
+    /// left when it holds the same source's bytes, else start over. Only a
+    /// complete file is renamed to `dest`, so readiness checks never see a
+    /// partial one; the `.part` file and its sidecar stay for the next
+    /// attempt (or process) to resume.
+    async fn fetch_resumable(
+        &self,
+        url: &str,
+        immutable: bool,
+        exact_size: Option<u64>,
+        dest: &Path,
+        progress: &FileProgress<'_>,
     ) -> Result<u64> {
         self.ensure_online()?;
-        let url = format!(
-            "{}/{}/resolve/{}/{}",
-            HF_BASE_URL, repo_id, revision, filename
-        );
         debug!("Downloading from URL: {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await
-            .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", error_chain(&e))))?;
-
-        if !response.status().is_success() {
-            return Err(Error::HfHubError(format!(
-                "HTTP {} for {}",
-                response.status(),
-                url
-            )));
-        }
-
-        // Get content length for progress bar
-        let total_size = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if let Some(ref pb) = file_pb {
-            pb.set_length(total_size);
-        }
-
-        // Create parent directories
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        let (partial_path, sidecar_path) = partial_paths(dest)?;
+        let resume =
+            resumable_partial(&partial_path, &sidecar_path, url, immutable, exact_size).await;
 
-        // Publish only complete files. A process interruption or stream error
-        // may leave a `.part` file, but never a shard that readiness checks can
-        // mistake for a complete artifact.
-        let file_name = dest
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                Error::DownloadError(format!("Invalid download destination: {}", dest.display()))
-            })?;
-        let partial_dest = dest.with_file_name(format!(".{file_name}.part"));
-        if partial_dest.exists() {
-            tokio::fs::remove_file(&partial_dest).await?;
+        let mut request = self.http_client.get(url).header("User-Agent", USER_AGENT);
+        if let Some((offset, sidecar)) = &resume {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+            // A changed file answers with all of its bytes instead.
+            if let Some(etag) = &sidecar.etag {
+                request = request.header(IF_RANGE, etag.as_str());
+            }
         }
-        let mut file = tokio::fs::File::create(&partial_dest).await?;
-        let mut downloaded = 0u64;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::HfHubError(format!("HTTP request failed: {}", error_chain(&e))))?;
+        let status = response.status();
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        let resumed_at = resume.as_ref().map(|(offset, _)| *offset);
+        let (offset, total) = match (status, resumed_at) {
+            (StatusCode::PARTIAL_CONTENT, Some(offset)) => match content_range {
+                Some((Some(start), total)) if start == offset => (offset, total),
+                _ => {
+                    discard_partial(&partial_path, &sidecar_path).await;
+                    return Err(Error::HfHubError(format!(
+                        "HTTP 206 for {url} does not continue from byte {offset}"
+                    )));
+                }
+            },
+            // The partial file already holds the whole file.
+            (StatusCode::RANGE_NOT_SATISFIABLE, Some(offset))
+                if content_range == Some((None, Some(offset))) =>
+            {
+                publish_partial(&partial_path, &sidecar_path, dest).await?;
+                return Ok(offset);
+            }
+            (status, _) if status == StatusCode::OK => (0, response.content_length()),
+            (status, _) => {
+                if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                    discard_partial(&partial_path, &sidecar_path).await;
+                }
+                return Err(Error::HfHubError(format!("HTTP {status} for {url}")));
+            }
+        };
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .filter(|etag| !etag.starts_with("W/"))
+            .map(str::to_string)
+            .or_else(|| {
+                resume
+                    .filter(|_| offset > 0)
+                    .and_then(|(_, sidecar)| sidecar.etag)
+            });
+        let sidecar = PartialDownload {
+            url: url.to_string(),
+            etag,
+            total,
+        };
+        tokio::fs::write(
+            &sidecar_path,
+            serde_json::to_vec(&sidecar).map_err(|e| Error::DownloadError(e.to_string()))?,
+        )
+        .await?;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&partial_path)
+            .await?;
+        file.set_len(offset).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
+        if offset > 0 {
+            info!("Resuming {} at byte {}", url, offset);
+        }
+
+        let total_size = total.unwrap_or(0);
+        if let Some(bar) = progress.bar {
+            bar.set_length(total_size);
+        }
+        let mut downloaded = offset;
+        self.report_file_progress(progress, downloaded, total_size)
+            .await;
         let mut stream = response.bytes_stream();
         let mut last_progress_emit = Instant::now();
-        let mut last_progress_bytes = 0u64;
-
+        let mut last_progress_bytes = downloaded;
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| Error::HfHubError(format!("Stream error: {}", error_chain(&error))))?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-            downloaded += chunk.len() as u64;
-
-            if let Some(ref pb) = file_pb {
-                pb.set_position(downloaded);
-            }
-
-            // Send real-time progress update
-            if let Some(ref tx) = progress_tx {
-                if let Some(ref template) = progress_template {
-                    let bytes_delta = downloaded.saturating_sub(last_progress_bytes);
-                    let should_emit = bytes_delta >= 256 * 1024
-                        || last_progress_emit.elapsed() >= Duration::from_millis(200)
-                        || (total_size > 0 && downloaded >= total_size);
-
-                    if should_emit {
-                        let progress = DownloadProgress {
-                            current_file_downloaded: downloaded,
-                            current_file_total: total_size.max(downloaded),
-                            // Calculate total downloaded: base bytes from completed files + current file progress
-                            downloaded_bytes: template.downloaded_bytes + downloaded,
-                            ..template.clone()
-                        };
-                        self.set_latest_progress(progress.clone()).await;
-                        let _ = tx.send(progress);
-                        last_progress_emit = Instant::now();
-                        last_progress_bytes = downloaded;
-                    }
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    // Keep what arrived for the next attempt.
+                    let _ = file.sync_data().await;
+                    return Err(Error::HfHubError(format!(
+                        "Stream error: {}",
+                        error_chain(&error)
+                    )));
                 }
+            };
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            if downloaded.saturating_sub(last_progress_bytes) >= 256 * 1024
+                || last_progress_emit.elapsed() >= Duration::from_millis(200)
+                || (total_size > 0 && downloaded >= total_size)
+            {
+                self.report_file_progress(progress, downloaded, total_size)
+                    .await;
+                last_progress_emit = Instant::now();
+                last_progress_bytes = downloaded;
             }
         }
+        // Always end on the file's final byte count, whatever was throttled.
+        self.report_file_progress(progress, downloaded, total_size)
+            .await;
 
-        // Ensure we always emit a final per-file progress event, even if throttled updates
-        // did not include the final chunk.
-        if let Some(ref tx) = progress_tx {
-            if let Some(ref template) = progress_template {
-                let progress = DownloadProgress {
-                    current_file_downloaded: downloaded,
-                    current_file_total: total_size.max(downloaded),
-                    downloaded_bytes: template.downloaded_bytes + downloaded,
-                    ..template.clone()
-                };
-                self.set_latest_progress(progress.clone()).await;
-                let _ = tx.send(progress);
-            }
-        }
-
-        // Sync file to disk
         file.sync_all().await?;
         drop(file);
-        if let Err(error) = tokio::fs::rename(&partial_dest, dest).await {
-            let _ = tokio::fs::remove_file(&partial_dest).await;
-            return Err(Error::from(error));
+        if let Some(total) = total.filter(|total| downloaded != *total) {
+            return Err(Error::HfHubError(format!(
+                "Stream for {url} ended at byte {downloaded} of {total}"
+            )));
         }
-
+        publish_partial(&partial_path, &sidecar_path, dest).await?;
         debug!("Downloaded {} bytes to {:?}", downloaded, dest);
         Ok(downloaded)
+    }
+
+    /// Show `downloaded` of `total` bytes of the current file.
+    async fn report_file_progress(&self, progress: &FileProgress<'_>, downloaded: u64, total: u64) {
+        if let Some(bar) = progress.bar {
+            bar.set_position(downloaded);
+        }
+        if let Some((tx, template)) = progress.channel {
+            let update = DownloadProgress {
+                current_file_downloaded: downloaded,
+                current_file_total: total.max(downloaded),
+                // Bytes of the files already completed, plus this one's.
+                downloaded_bytes: template.downloaded_bytes + downloaded,
+                ..template.clone()
+            };
+            self.set_latest_progress(update.clone()).await;
+            let _ = tx.send(update);
+        }
     }
 
     /// Get the local path for a model variant
@@ -1254,6 +1660,12 @@ impl ModelDownloader {
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
+            // The watermarker is needed only while the watermark is on.
+            ModelFamily::ChatterboxTts => chatterbox_files(variant).iter().all(|file| {
+                (*file == PERTH_CHECKPOINT_FILE
+                    && !crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true))
+                    || path.join(file).exists()
+            }),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -1357,29 +1769,18 @@ impl ModelDownloader {
 
             // Stream download with progress
             match self
-                .download_file_streaming(
-                    &plan.source_repo,
-                    &plan.source_revision,
-                    &plan.source_file,
+                .fetch_plan(
+                    plan,
                     &dest,
-                    Some(file_pb.clone()),
-                    None,
-                    None,
+                    file,
+                    &FileProgress {
+                        bar: Some(&file_pb),
+                        channel: None,
+                    },
                 )
                 .await
             {
                 Ok(bytes_downloaded) => {
-                    if plan.strict_size_check
-                        && plan.expected_size > 0
-                        && bytes_downloaded != plan.expected_size
-                    {
-                        let _ = tokio::fs::remove_file(&dest).await;
-                        file_pb.finish_with_message(format!("{} ✗", file));
-                        return Err(Error::DownloadError(format!(
-                            "Downloaded size mismatch for {file}: expected {} bytes, got {bytes_downloaded} bytes",
-                            plan.expected_size
-                        )));
-                    }
                     debug!(
                         "Downloaded: {}/{} -> {:?} ({} bytes)",
                         plan.source_repo, plan.source_file, dest, bytes_downloaded
@@ -1391,12 +1792,13 @@ impl ModelDownloader {
                 Err(e) => {
                     warn!("Failed to download {}: {}", file, e);
                     file_pb.finish_with_message(format!("{} ✗", file));
-                    if variant.is_qwen38_fp8() {
+                    // A file the repository tree lists is required; only
+                    // files planned without it might be optional.
+                    if variant.is_qwen38_fp8() || plan.exact_size().is_some() {
                         return Err(Error::DownloadError(format!(
-                            "Failed to download required pinned artifact {file}: {e}"
+                            "Failed to download required file {file}: {e}"
                         )));
                     }
-                    // Some files might be optional, continue
                 }
             }
 
@@ -1556,7 +1958,6 @@ impl ModelDownloader {
         let total_files = file_plans.len();
         let total_bytes: u64 = file_plans.iter().map(|plan| plan.expected_size).sum();
         let mut downloaded_bytes: u64 = 0;
-        const MAX_FILE_DOWNLOAD_ATTEMPTS: usize = 4;
 
         for (idx, plan) in file_plans.iter().enumerate() {
             let file = &plan.local_file;
@@ -1628,72 +2029,26 @@ impl ModelDownloader {
                 files_total: total_files,
             };
 
-            let mut last_err: Option<Error> = None;
-            let mut bytes_downloaded_for_file = 0u64;
-            let mut attempt = 1usize;
-
-            while attempt <= MAX_FILE_DOWNLOAD_ATTEMPTS {
-                if attempt > 1 {
-                    info!(
-                        "Retrying {} (attempt {}/{})",
-                        file, attempt, MAX_FILE_DOWNLOAD_ATTEMPTS
-                    );
-                    file_pb.set_message(format!(
-                        "{} (retry {}/{})",
-                        file, attempt, MAX_FILE_DOWNLOAD_ATTEMPTS
-                    ));
+            let bytes_downloaded_for_file = match self
+                .fetch_plan(
+                    plan,
+                    &dest,
+                    file,
+                    &FileProgress {
+                        bar: Some(&file_pb),
+                        channel: Some((&progress_tx, &progress_template)),
+                    },
+                )
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    file_pb.finish_with_message(format!("{} ✗", file));
+                    return Err(Error::DownloadError(format!(
+                        "Failed to download required file {file}: {e}"
+                    )));
                 }
-
-                match self
-                    .download_file_streaming(
-                        &plan.source_repo,
-                        &plan.source_revision,
-                        &plan.source_file,
-                        &dest,
-                        Some(file_pb.clone()),
-                        Some(progress_tx.clone()),
-                        Some(progress_template.clone()),
-                    )
-                    .await
-                {
-                    Ok(bytes_downloaded) => {
-                        if plan.strict_size_check && file_size > 0 && bytes_downloaded != file_size
-                        {
-                            let _ = tokio::fs::remove_file(&dest).await;
-                            last_err = Some(Error::DownloadError(format!(
-                                "Downloaded size mismatch for {}: expected {} bytes, got {} bytes",
-                                file, file_size, bytes_downloaded
-                            )));
-                        } else {
-                            bytes_downloaded_for_file = bytes_downloaded;
-                            last_err = None;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to download {} (attempt {}/{}): {}",
-                            file, attempt, MAX_FILE_DOWNLOAD_ATTEMPTS, e
-                        );
-                        let _ = tokio::fs::remove_file(&dest).await;
-                        last_err = Some(e);
-                    }
-                }
-
-                if attempt < MAX_FILE_DOWNLOAD_ATTEMPTS {
-                    let backoff_ms = 400u64 * (1u64 << (attempt - 1));
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
-                attempt += 1;
-            }
-
-            if let Some(e) = last_err {
-                file_pb.finish_with_message(format!("{} ✗", file));
-                return Err(Error::DownloadError(format!(
-                    "Failed to download required file {} after {} attempts: {}",
-                    file, MAX_FILE_DOWNLOAD_ATTEMPTS, e
-                )));
-            }
+            };
 
             downloaded_bytes += bytes_downloaded_for_file;
 
@@ -1993,6 +2348,10 @@ impl ModelDownloader {
                 files
             }
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
+            ModelFamily::ChatterboxTts => chatterbox_files(variant)
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
@@ -2310,7 +2669,9 @@ impl ModelDownloader {
         let mut repo_tree_planning_available = true;
         for spec in &file_specs {
             let repo_key = (spec.source_repo.clone(), spec.source_revision.clone());
-            if repo_tree_indexes.contains_key(&repo_key) {
+            if repo_tree_indexes.contains_key(&repo_key)
+                || pinned_file(variant, &spec.local_file).is_some()
+            {
                 continue;
             }
             match self
@@ -2336,7 +2697,9 @@ impl ModelDownloader {
             let mut skipped = 0usize;
 
             for spec in &file_specs {
-                if let Some(size) = repo_tree_indexes
+                if let Some(pinned) = pinned_file(variant, &spec.local_file) {
+                    plans.push(FileDownloadPlan::pinned(spec, pinned));
+                } else if let Some(size) = repo_tree_indexes
                     .get(&(spec.source_repo.clone(), spec.source_revision.clone()))
                     .and_then(|index| index.get(&spec.source_file))
                 {
@@ -2347,6 +2710,7 @@ impl ModelDownloader {
                         local_file: spec.local_file.clone(),
                         expected_size: *size,
                         strict_size_check: *size > 0,
+                        pinned: None,
                     });
                 } else {
                     if require_exact_bundle {
@@ -2387,6 +2751,10 @@ impl ModelDownloader {
 
         let mut plans = Vec::with_capacity(file_specs.len());
         for spec in &file_specs {
+            if let Some(pinned) = pinned_file(variant, &spec.local_file) {
+                plans.push(FileDownloadPlan::pinned(spec, pinned));
+                continue;
+            }
             let dest = local_dir.join(&spec.local_file);
             match self
                 .get_actual_file_size(&spec.source_repo, &spec.source_revision, &spec.source_file)
@@ -2399,6 +2767,7 @@ impl ModelDownloader {
                     local_file: spec.local_file.clone(),
                     expected_size: size,
                     strict_size_check: true,
+                    pinned: None,
                 }),
                 Err(e) => {
                     if Self::is_not_found_hf_error(&e) {
@@ -2441,6 +2810,7 @@ impl ModelDownloader {
                         local_file: spec.local_file.clone(),
                         expected_size: fallback_size,
                         strict_size_check: false,
+                        pinned: None,
                     });
                 }
             }
@@ -2459,8 +2829,22 @@ impl ModelDownloader {
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
         // The published files' sizes (unsloth Qwen3.5 GGUF and LiquidAI
-        // LFM2.5-Audio repositories, 2026-10-19).
-        if file == "mmproj-F16.gguf" {
+        // LFM2.5-Audio repositories, 2026-10-19; Chatterbox at 5bb1f6ee).
+        if variant.family() == ModelFamily::ChatterboxTts {
+            match file {
+                "t3_cfg.safetensors" => 2_129_653_744,
+                "t3_mtl23ls_v2.safetensors" => 2_143_989_752,
+                "grapheme_mtl_merged_expanded_v1.json" => 69_989,
+                "s3gen.safetensors" => 1_056_484_620,
+                "ve.safetensors" => 5_695_784,
+                "conds.pt" => 107_374,
+                CANGJIE_FILE => 1_920_163,
+                PERTH_CHECKPOINT_FILE => PERTH_CHECKPOINT.size,
+                PKUSEG_MODEL_FILE => PKUSEG_MODEL.size,
+                PKUSEG_DICT_FILE => PKUSEG_DICT.size,
+                _ => 25_470,
+            }
+        } else if file == "mmproj-F16.gguf" {
             match variant {
                 ModelVariant::Qwen3508BGguf => 204_987_232,
                 ModelVariant::Qwen352BGguf => 668_227_264,
@@ -2703,6 +3087,126 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// The multilingual edition takes its own T3 and grapheme tokenizer and
+    /// shares the English S3Gen, voice encoder, default voice and watermark.
+    #[test]
+    fn chatterbox_multilingual_takes_its_own_t3_and_tokenizer() {
+        let (downloader, _) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::ChatterboxMultilingual500M);
+        for file in [
+            "t3_mtl23ls_v2.safetensors",
+            "grapheme_mtl_merged_expanded_v1.json",
+            "s3gen.safetensors",
+            "ve.safetensors",
+            "conds.pt",
+            PERTH_CHECKPOINT_FILE,
+            CANGJIE_FILE,
+            PKUSEG_MODEL_FILE,
+            PKUSEG_DICT_FILE,
+        ] {
+            assert!(files.contains(&file.to_string()), "{file}");
+        }
+        assert!(!files.contains(&"t3_cfg.safetensors".to_string()));
+        assert!(!files.contains(&"tokenizer.json".to_string()));
+        let total = files
+            .iter()
+            .map(|file| {
+                downloader
+                    .get_single_file_size_estimate(ModelVariant::ChatterboxMultilingual500M, file)
+            })
+            .sum::<u64>();
+        assert_eq!(
+            total,
+            ModelVariant::ChatterboxMultilingual500M.estimated_size()
+        );
+    }
+
+    /// Chatterbox's PerTh checkpoint comes from its GitHub repository by
+    /// commit, at its exact size; every other file of the model stays on the
+    /// Hub.
+    #[test]
+    fn chatterbox_fetches_its_watermarker_from_a_pinned_url() {
+        let (downloader, _) = test_downloader();
+        let variant = ModelVariant::Chatterbox500M;
+        assert!(downloader
+            .get_model_files(variant)
+            .contains(&PERTH_CHECKPOINT_FILE.to_string()));
+        let pinned = pinned_file(variant, PERTH_CHECKPOINT_FILE).expect("pinned");
+        assert_eq!(
+            pinned.url,
+            "https://raw.githubusercontent.com/resemble-ai/Perth/ff1c8ac55a976971245cdd53c18d6131ca00d993/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar"
+        );
+        assert_eq!(pinned_file(variant, "t3_cfg.safetensors"), None);
+        assert_eq!(
+            pinned_file(ModelVariant::Kokoro82M, PERTH_CHECKPOINT_FILE),
+            None
+        );
+
+        let spec = downloader
+            .get_model_file_specs(variant)
+            .into_iter()
+            .find(|spec| spec.local_file == PERTH_CHECKPOINT_FILE)
+            .expect("spec");
+        let plan = FileDownloadPlan::pinned(&spec, pinned);
+        assert_eq!(plan.url(HF_BASE_URL), pinned.url);
+        assert!(plan.immutable());
+        assert_eq!(plan.exact_size(), Some(37_429_684));
+    }
+
+    /// The Chinese frontend's pkuseg model and dictionary come from GitHub
+    /// for the multilingual edition only; its Cangjie table stays on the Hub
+    /// with the checkpoint.
+    #[test]
+    fn chatterbox_multilingual_fetches_its_segmenter_from_pinned_urls() {
+        let variant = ModelVariant::ChatterboxMultilingual500M;
+        let model = pinned_file(variant, PKUSEG_MODEL_FILE).expect("pinned model");
+        assert_eq!(
+            model.url,
+            "https://github.com/explosion/spacy-pkuseg/releases/download/v0.0.26/spacy_ontonotes.zip"
+        );
+        let dict = pinned_file(variant, PKUSEG_DICT_FILE).expect("pinned dictionary");
+        assert_eq!(
+            dict.url,
+            "https://raw.githubusercontent.com/explosion/spacy-pkuseg/16995617f3b8f5cf32e5b6a77d7d800e201b255b/spacy_pkuseg/dicts/default.pkl"
+        );
+        assert_eq!(pinned_file(variant, CANGJIE_FILE), None);
+        assert_eq!(
+            pinned_file(ModelVariant::Chatterbox500M, PKUSEG_MODEL_FILE),
+            None
+        );
+        let (downloader, _) = test_downloader();
+        assert!(!downloader
+            .get_model_files(ModelVariant::Chatterbox500M)
+            .contains(&CANGJIE_FILE.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_file_must_match_its_digest() {
+        let dir = std::env::temp_dir().join(format!("izwi-pinned-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        // SHA-256 of "abc".
+        let pinned = PinnedFile {
+            url: "https://example.invalid/file.bin",
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        verify_pinned_file(&path, pinned)
+            .await
+            .expect("matching bytes");
+        let wrong = PinnedFile {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..pinned
+        };
+        let error = verify_pinned_file(&path, wrong).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its pinned SHA-256"));
+        assert!(!path.exists(), "a mismatched file is removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A download needs the bytes still missing; a fresh `.nemo` also needs
     /// its extracted checkpoint beside it.
     #[test]
@@ -2770,6 +3274,381 @@ mod tests {
             std::env::temp_dir().join(format!("izwi-downloader-test-{}", Uuid::new_v4()));
         let downloader = ModelDownloader::new(temp_dir.clone()).expect("downloader");
         (downloader, temp_dir)
+    }
+
+    /// How the test server answers.
+    struct Behaviour {
+        body: Arc<Vec<u8>>,
+        etag: &'static str,
+        /// Honour `Range` (and `If-Range`), as the Hub and its CDN do.
+        honor_range: bool,
+        /// Body bytes each successive connection sends before it drops;
+        /// connections past the list send everything.
+        drop_after: Vec<usize>,
+    }
+
+    /// Each request's `Range` start and `If-Range` value.
+    type RequestLog = Arc<std::sync::Mutex<Vec<(Option<u64>, Option<String>)>>>;
+
+    /// A local HTTP/1.1 server for one file, one request per connection.
+    async fn flaky_server(behaviour: Behaviour) -> (String, RequestLog) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/repo/resolve/main/model.bin",
+            listener.local_addr().unwrap()
+        );
+        let requests = RequestLog::default();
+        let log = requests.clone();
+        tokio::spawn(async move {
+            for connection in 0.. {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => head.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let header = |name: &str| {
+                    head.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case(name)
+                            .then(|| value.trim().to_string())
+                    })
+                };
+                let range = header("range").and_then(|value| {
+                    value
+                        .strip_prefix("bytes=")?
+                        .strip_suffix('-')?
+                        .parse::<u64>()
+                        .ok()
+                });
+                let if_range = header("if-range");
+                log.lock().unwrap().push((range, if_range.clone()));
+
+                let body = &behaviour.body;
+                let total = body.len() as u64;
+                let current = if_range.as_deref().is_none_or(|tag| tag == behaviour.etag);
+                let (status, content_range, start) = match range {
+                    Some(start) if behaviour.honor_range && current && start >= total => (
+                        "416 Range Not Satisfiable",
+                        Some(format!("bytes */{total}")),
+                        total,
+                    ),
+                    Some(start) if behaviour.honor_range && current => (
+                        "206 Partial Content",
+                        Some(format!("bytes {start}-{}/{total}", total - 1)),
+                        start,
+                    ),
+                    _ => ("200 OK", None, 0),
+                };
+                let content = &body[start as usize..];
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n",
+                    content.len(),
+                    behaviour.etag
+                );
+                if let Some(content_range) = content_range {
+                    response.push_str(&format!("Content-Range: {content_range}\r\n"));
+                }
+                response.push_str("\r\n");
+                let sent = behaviour
+                    .drop_after
+                    .get(connection)
+                    .map_or(content.len(), |limit| (*limit).min(content.len()));
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&content[..sent]).await;
+                let _ = socket.flush().await;
+                // Dropping the socket ends the response, short or not.
+            }
+        });
+        (url, requests)
+    }
+
+    fn test_body() -> Arc<Vec<u8>> {
+        Arc::new((0..1_000_000u32).map(|i| (i * 31 + i / 7) as u8).collect())
+    }
+
+    async fn write_partial(dest: &Path, bytes: &[u8], sidecar: &PartialDownload) {
+        let (partial, sidecar_path) = partial_paths(dest).unwrap();
+        tokio::fs::create_dir_all(dest.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&partial, bytes).await.unwrap();
+        tokio::fs::write(&sidecar_path, serde_json::to_vec(sidecar).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn assert_published(dest: &Path, body: &[u8]) {
+        assert_eq!(tokio::fs::read(dest).await.unwrap(), body);
+        let (partial, sidecar) = partial_paths(dest).unwrap();
+        assert!(!partial.exists() && !sidecar.exists());
+    }
+
+    #[test]
+    fn content_range_headers_parse() {
+        assert_eq!(
+            parse_content_range("bytes 100-999/1000"),
+            Some((Some(100), Some(1000)))
+        );
+        assert_eq!(
+            parse_content_range("bytes */1000"),
+            Some((None, Some(1000)))
+        );
+        assert_eq!(parse_content_range("bytes 0-9/*"), Some((Some(0), None)));
+        assert_eq!(parse_content_range("items 0-9/10"), None);
+    }
+
+    /// Each dropped connection resumes from the bytes already on disk, and
+    /// the attempts that add bytes do not use up the retry budget: six
+    /// attempts here, four allowed without progress.
+    #[tokio::test]
+    async fn a_dropped_download_resumes_where_it_stopped() {
+        let body = test_body();
+        let (url, requests) = flaky_server(Behaviour {
+            body: body.clone(),
+            etag: "\"v1\"",
+            honor_range: true,
+            drop_after: vec![300_000, 0, 200_000, 100_000, 150_000],
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        let dest = temp_dir.join("model.bin");
+
+        let bytes = downloader
+            .fetch_with_retries(
+                &url,
+                false,
+                Some(body.len() as u64),
+                &dest,
+                "model.bin",
+                &FileProgress::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, body.len() as u64);
+        assert_published(&dest, &body).await;
+        let etag = Some("\"v1\"".to_string());
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                (None, None),
+                (Some(300_000), etag.clone()),
+                (Some(300_000), etag.clone()),
+                (Some(500_000), etag.clone()),
+                (Some(600_000), etag.clone()),
+                (Some(750_000), etag),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A server that answers a range with the whole file is read from the
+    /// start again rather than appended to the partial file.
+    #[tokio::test]
+    async fn a_server_that_ignores_range_restarts_the_file() {
+        let body = test_body();
+        let (url, requests) = flaky_server(Behaviour {
+            body: body.clone(),
+            etag: "\"v1\"",
+            honor_range: false,
+            drop_after: vec![300_000],
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        let dest = temp_dir.join("model.bin");
+
+        downloader
+            .fetch_with_retries(
+                &url,
+                true,
+                None,
+                &dest,
+                "model.bin",
+                &FileProgress::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_published(&dest, &body).await;
+        assert_eq!(requests.lock().unwrap()[1].0, Some(300_000));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Under an unpinned revision the file may have changed since the
+    /// partial was written: `If-Range` with the old ETag gets the whole new
+    /// file, never old bytes followed by new ones.
+    #[tokio::test]
+    async fn a_changed_file_is_downloaded_again_not_spliced() {
+        let body = test_body();
+        let (url, requests) = flaky_server(Behaviour {
+            body: body.clone(),
+            etag: "\"v2\"",
+            honor_range: true,
+            drop_after: Vec::new(),
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        let dest = temp_dir.join("model.bin");
+        let sidecar = PartialDownload {
+            url: url.clone(),
+            etag: Some("\"v1\"".into()),
+            total: Some(body.len() as u64),
+        };
+        write_partial(&dest, &[0xAA; 400_000], &sidecar).await;
+
+        downloader
+            .fetch_with_retries(
+                &url,
+                false,
+                None,
+                &dest,
+                "model.bin",
+                &FileProgress::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_published(&dest, &body).await;
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![(Some(400_000), Some("\"v1\"".to_string()))]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A partial file whose bytes cannot be checked (an unpinned revision
+    /// with no validator, or another source) is not resumed.
+    #[tokio::test]
+    async fn an_unverifiable_partial_starts_over() {
+        let body = test_body();
+        let (url, requests) = flaky_server(Behaviour {
+            body: body.clone(),
+            etag: "\"v1\"",
+            honor_range: true,
+            drop_after: Vec::new(),
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        for (index, sidecar) in [
+            PartialDownload {
+                url: url.clone(),
+                etag: None,
+                total: None,
+            },
+            PartialDownload {
+                url: format!("{url}?other"),
+                etag: Some("\"v1\"".into()),
+                total: None,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dest = temp_dir.join(format!("model-{index}.bin"));
+            write_partial(&dest, &[0xAA; 400_000], sidecar).await;
+            downloader
+                .fetch_with_retries(
+                    &url,
+                    false,
+                    None,
+                    &dest,
+                    "model.bin",
+                    &FileProgress::default(),
+                )
+                .await
+                .unwrap();
+            assert_published(&dest, &body).await;
+        }
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(range, if_range)| range.is_none() && if_range.is_none()));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A partial file that already holds every byte (the process stopped
+    /// before renaming it) is published without another transfer.
+    #[tokio::test]
+    async fn a_complete_partial_is_published_without_a_transfer() {
+        let body = test_body();
+        let (url, requests) = flaky_server(Behaviour {
+            body: body.clone(),
+            etag: "\"v1\"",
+            honor_range: true,
+            drop_after: Vec::new(),
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        let dest = temp_dir.join("model.bin");
+        let sidecar = PartialDownload {
+            url: url.clone(),
+            etag: Some("\"v1\"".into()),
+            total: Some(body.len() as u64),
+        };
+        write_partial(&dest, &body, &sidecar).await;
+
+        let bytes = downloader
+            .fetch_with_retries(
+                &url,
+                true,
+                None,
+                &dest,
+                "model.bin",
+                &FileProgress::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, body.len() as u64);
+        assert_published(&dest, &body).await;
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![(Some(body.len() as u64), Some("\"v1\"".to_string()))]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A download fails after four attempts in a row that add no bytes.
+    #[tokio::test]
+    async fn a_download_without_progress_fails_after_four_attempts() {
+        let (url, requests) = flaky_server(Behaviour {
+            body: test_body(),
+            etag: "\"v1\"",
+            honor_range: true,
+            drop_after: vec![0; 8],
+        })
+        .await;
+        let (downloader, temp_dir) = test_downloader();
+        let dest = temp_dir.join("model.bin");
+
+        let error = downloader
+            .fetch_with_retries(
+                &url,
+                true,
+                None,
+                &dest,
+                "model.bin",
+                &FileProgress::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("4 attempts without progress"),
+            "{error}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), MAX_STALLED_FILE_ATTEMPTS);
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]

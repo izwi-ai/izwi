@@ -107,6 +107,18 @@ def family_cases(family, reference):
             ("med", "med", {"voice": "casual_male"}, False),
         ],
         "fish": [("short", "short", clone, False)],
+        # "long" exercises automatic long form, "clone" cloning from reference
+        # audio alone, "med_stream" windowed streaming.
+        "chatterbox": [
+            ("short", "short", {"voice": "default"}, False),
+            ("med", "med", {"voice": "default"}, False),
+            ("med_stream", "med", {"voice": "default"}, True),
+            ("num", "num", {"voice": "default"}, False),
+            ("long", "long", {"voice": "default"}, False),
+            ("clone", "med", {"reference_audio": reference[0]}, False),
+            ("expressive", "short",
+             {"voice": "default", "exaggeration": 0.9, "cfg_weight": 0.3}, False),
+        ],
     }
     if family not in table:
         raise SystemExit(f"unknown family {family}; known: {', '.join(sorted(table))}")

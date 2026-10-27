@@ -15,7 +15,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/bench/run-tts-matrix.sh --backend <cpu|metal|cuda> --models <Model:family,...> [options]
 
-Families: kokoro, lfm, qwen_cv, qwen_base, qwen_greedy, vibevoice, voxtral, fish
+Families: kokoro, lfm, qwen_cv, qwen_base, qwen_greedy, vibevoice, voxtral, fish, chatterbox
 (see scripts/bench/score-tts-matrix.py for each family's cases).
 
 Options:

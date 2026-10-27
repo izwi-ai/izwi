@@ -4,10 +4,33 @@ export interface SpeechModelCapabilities {
   supports_builtin_voices: boolean;
   built_in_voice_count: number | null;
   supports_reference_voice: boolean;
+  /** Whether a reference voice needs its transcript (every reference model
+   * but Chatterbox, which clones from the audio alone). */
+  reference_transcript_required?: boolean;
   supports_voice_description: boolean;
   supports_streaming: boolean;
   supports_speed_control: boolean;
   supports_auto_long_form: boolean;
+  /** Model-specific controls a request may set (Chatterbox). */
+  controls?: SpeechControlRange[];
+  /** The only languages a request may name, for a model that refuses
+   * others (Chatterbox); absent, `language` is a hint. */
+  languages?: SpeechLanguage[];
+}
+
+export interface SpeechLanguage {
+  code: string;
+  name: string;
+}
+
+export type SpeechControlId = "exaggeration" | "cfg_weight" | "min_p";
+
+export interface SpeechControlRange {
+  control: SpeechControlId;
+  min: number;
+  max: number;
+  /** The model's own value when the request leaves the control unset. */
+  default: number;
 }
 
 export type ChatReasoningEffort = "xhigh" | "medium" | "low";

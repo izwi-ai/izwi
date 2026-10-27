@@ -180,7 +180,10 @@ pub async fn speech(
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
     validate_speech_voice_contract(&req, variant)?;
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
+    crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
+    crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
     let streaming = resolve_streaming_mode(&req)?;
+    crate::api::tts_policy::validate_speech_streaming(variant, streaming)?;
     let resolved_format = parse_response_format(
         req.response_format.as_deref().unwrap_or("wav"),
         req.allow_format_fallback.unwrap_or(false),
@@ -518,7 +521,7 @@ async fn resolve_saved_voice_request(
     let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
     req.saved_voice_id = Some(saved_voice.voice_id);
     req.reference_audio = Some(saved_voice.reference_audio_base64);
-    req.reference_text = Some(saved_voice.reference_text);
+    req.reference_text = saved_voice.reference_text;
     Ok(req)
 }
 
@@ -539,6 +542,7 @@ fn validate_speech_voice_contract(
             speaker,
             reference_audio: present(req.reference_audio.as_deref()),
             reference_text: present(req.reference_text.as_deref()),
+            saved_voice: present(req.saved_voice_id.as_deref()),
             voice_description: present(req.instructions.as_deref()),
         },
     )
@@ -557,6 +561,12 @@ async fn stream_speech(
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
     let mut gen_request = build_generation_request(&req, correlation_id, true, variant);
+    // Long text streams as long-form segments, as a final-only request splits.
+    crate::api::tts_long_form::defer_automatic_budget_to_long_form(
+        &mut gen_request,
+        variant,
+        req.max_output_tokens.or(req.max_tokens),
+    );
     let planned_segment_count = if variant == ModelVariant::FishAudioS2Pro {
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &req.input,
@@ -566,7 +576,8 @@ async fn stream_speech(
         .segments
         .len()
     } else {
-        1
+        crate::api::tts_long_form::expand_generation_requests_for_long_form(&gen_request, variant)
+            .len()
     };
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
@@ -655,9 +666,14 @@ async fn stream_speech(
                 )
                 .await
             } else {
-                generation_engine
-                    .generate_streaming(gen_request, chunk_tx)
-                    .await
+                crate::api::tts_long_form::generate_long_form_stream(
+                    &generation_engine,
+                    variant,
+                    gen_request,
+                    chunk_tx,
+                    fallback_sample_rate,
+                )
+                .await
             }
         });
 

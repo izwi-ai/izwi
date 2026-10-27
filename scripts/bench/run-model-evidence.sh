@@ -407,16 +407,28 @@ if ! jq -e \
             .command == "asr" or .command == "tts"
         ] | all(. == true)) and
         ([.reports[].report |
-            .config.stream == true and
+            # A final-only TTS model (no streaming) is benchmarked without
+            # streaming: its first audio is its end to end time and it has
+            # no inter-frame gaps. Only final-only reports may skip streaming.
+            ((.config.stream == true and .config.final_only != true) or
+             (.command == "tts" and .config.final_only == true and .config.stream == false)) and
             (.samples | length) == .config.iterations and
             ([.samples[].quality_gates[] | .status != "fail"] | all(. == true)) and
-            (if .command == "tts" then
+            (if .command == "tts" and .config.final_only == true then
+                .summary.first_audio_ms.count == (.samples | length) and
+                .summary.inter_frame_ms == null and
+                ([.samples[] |
+                    (.first_audio_ms | type == "number" and . >= 0) and
+                    .end_to_end_ms == .first_audio_ms and
+                    .inter_frame_ms == null
+                ] | all(. == true))
+             elif .command == "tts" then
                 .summary.first_audio_ms.count == (.samples | length) and
                 .summary.inter_frame_ms.count == (.samples | length) and
                 ([.samples[] |
                     (.first_audio_ms | type == "number" and . >= 0) and
                     (.inter_frame_ms | type == "number" and . >= 0) and
-                    (.end_to_end_ms | type == "number" and . >= .first_audio_ms)
+                    (.end_to_end_ms | type == "number") and .end_to_end_ms >= .first_audio_ms
                 ] | all(. == true))
              else
                 .summary.first_transcript_ms.count == (.samples | length) and
@@ -424,7 +436,7 @@ if ! jq -e \
                 ([.samples[] |
                     (.first_transcript_ms | type == "number" and . >= 0) and
                     (.inter_transcript_ms | type == "number" and . >= 0) and
-                    (.end_to_end_ms | type == "number" and . >= .first_transcript_ms)
+                    (.end_to_end_ms | type == "number") and .end_to_end_ms >= .first_transcript_ms
                 ] | all(. == true))
              end)
         ] | all(. == true)) and
@@ -556,6 +568,7 @@ jq -n \
                 concurrent: .report.config.concurrent,
                 samples: (.report.samples | length),
                 quality_failed: .report.summary.quality_gates.failed,
+                final_only: (.report.config.final_only == true),
                 streaming_latency: {
                     first_audio_ms: .report.summary.first_audio_ms,
                     inter_frame_ms: .report.summary.inter_frame_ms,

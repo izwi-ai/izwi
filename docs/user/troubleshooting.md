@@ -417,10 +417,10 @@ Ensure required models are loaded:
 
 | Feature | Required Model Type |
 |---------|---------------------|
-| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, or `FishAudio-S2-Pro` |
+| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, or `Chatterbox-500M` / `Chatterbox-Multilingual-500M` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, or `LFM2.5-Audio-*` |
 | Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, or `LFM2.5-1.2B-*` |
-| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, or `FishAudio-S2-Pro` |
+| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, or `Chatterbox-500M` / `Chatterbox-Multilingual-500M` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` |
 
 ---

@@ -215,6 +215,7 @@ impl ModelFamily {
             | Self::VoxtralTts
             | Self::VibeVoiceTts
             | Self::FishS2Tts
+            | Self::ChatterboxTts
             | Self::ParakeetAsr
             | Self::WhisperAsr
             | Self::Qwen3Asr

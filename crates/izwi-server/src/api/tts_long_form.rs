@@ -408,6 +408,109 @@ pub async fn generate_long_form_tts(
     })
 }
 
+/// Stream a request into `output` as its long-form segments, one after
+/// another, so streamed text is split as it is for a final-only request
+/// instead of being cut at one request's budget. Text one request can carry
+/// streams as is.
+pub(crate) async fn generate_long_form_stream(
+    runtime: &Arc<RuntimeService>,
+    variant: ModelVariant,
+    mut request: GenerationRequest,
+    output: tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
+    fallback_sample_rate: u32,
+) -> Result<(), izwi_core::Error> {
+    request.model_variant.get_or_insert(variant);
+    let mut segments = expand_generation_requests_for_long_form(&request, variant);
+    if segments.len() == 1 {
+        return runtime.generate_streaming(segments.remove(0), output).await;
+    }
+    let runtime = runtime.clone();
+    stream_segments(
+        segments,
+        &request.id,
+        fallback_sample_rate,
+        output,
+        move |segment, sender| {
+            let runtime = runtime.clone();
+            async move { runtime.generate_streaming(segment, sender).await }
+        },
+    )
+    .await
+}
+
+/// Forward each segment's chunks as one utterance's: renumbered under
+/// `request_id`, a later segment opening with the long-form pause and fading
+/// in, and only the last segment's final chunk final, carrying the whole
+/// request's totals and combined stop reason (an earlier segment's totals go
+/// out as a delta).
+async fn stream_segments<F, Fut>(
+    segments: Vec<GenerationRequest>,
+    request_id: &str,
+    fallback_sample_rate: u32,
+    output: tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
+    generate: F,
+) -> Result<(), izwi_core::Error>
+where
+    F: Fn(GenerationRequest, tokio::sync::mpsc::Sender<izwi_core::AudioChunk>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), izwi_core::Error>> + Send + 'static,
+{
+    let count = segments.len();
+    let mut sequence = 0;
+    let (mut tokens, mut time_ms) = (0usize, 0f32);
+    let mut stop_reasons = Vec::with_capacity(count);
+    for (index, segment) in segments.into_iter().enumerate() {
+        let last = index + 1 == count;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let task = tokio::spawn(generate(segment, sender));
+        let _abort = AbortSpeechTask(task.abort_handle());
+        let mut pause_pending = index > 0;
+        // Deltas this segment has sent so far.
+        let (mut sent_tokens, mut sent_ms) = (0usize, 0f32);
+        while let Some(mut chunk) = receiver.recv().await {
+            if pause_pending && !chunk.samples.is_empty() {
+                pause_pending = false;
+                let rate = chunk.sample_rate_or(fallback_sample_rate).max(1);
+                chunk.samples = pause_then_segment(&chunk.samples, rate);
+            }
+            match (chunk.is_final, chunk.stats.as_mut()) {
+                (false, Some(stats)) => {
+                    sent_tokens += stats.tokens_generated;
+                    sent_ms += stats.generation_time_ms;
+                }
+                (true, Some(stats)) => {
+                    stop_reasons.push(stats.stop_reason);
+                    let (segment_tokens, segment_ms) =
+                        (stats.tokens_generated, stats.generation_time_ms);
+                    if last {
+                        stats.tokens_generated += tokens;
+                        stats.generation_time_ms += time_ms;
+                        stats.stop_reason = TtsStopReason::combine(stop_reasons.drain(..));
+                    } else {
+                        stats.tokens_generated = segment_tokens.saturating_sub(sent_tokens);
+                        stats.generation_time_ms = (segment_ms - sent_ms).max(0.0);
+                        stats.stop_reason = None;
+                    }
+                    tokens += segment_tokens;
+                    time_ms += segment_ms;
+                }
+                (true, None) => stop_reasons.push(None),
+                (false, None) => {}
+            }
+            chunk.is_final &= last;
+            chunk.request_id = request_id.to_string();
+            chunk.sequence = sequence;
+            sequence += 1;
+            output.send(chunk).await.map_err(|_| {
+                izwi_core::Error::InferenceError("Speech consumer disconnected".into())
+            })?;
+        }
+        task.await.map_err(|error| {
+            izwi_core::Error::InferenceError(format!("Speech segment task failed: {error}"))
+        })??;
+    }
+    Ok(())
+}
+
 /// Long-form segments in flight at once: the rows the engine batches TTS at
 /// (`RuntimeService::tts_row_width`), so segments synthesize side by side
 /// instead of one after another (SPK-F12). More would only queue.
@@ -760,6 +863,69 @@ impl Drop for AbortSpeechTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Streamed segments reach the consumer as one utterance: numbered in
+    /// order under the request's id, the second opening with the pause, only
+    /// the last chunk final, and the totals and stop reason of both.
+    #[tokio::test]
+    async fn streamed_segments_join_into_one_utterance() {
+        use izwi_core::{AudioChunk, ChunkStats};
+        let stats = |tokens, ms, stop_reason| ChunkStats {
+            generation_time_ms: ms,
+            tokens_generated: tokens,
+            rtf: 0.0,
+            stop_reason,
+        };
+        let segments = vec![
+            GenerationRequest::new("first"),
+            GenerationRequest::new("second"),
+        ];
+        let (output, mut received) = tokio::sync::mpsc::channel(16);
+        stream_segments(segments, "request", 100, output, move |segment, sender| {
+            let first = segment.text == "first";
+            async move {
+                let mut interim = AudioChunk::new(segment.id.clone(), 0, vec![1.0; 4]);
+                interim.stats = Some(stats(3, 30.0, None));
+                sender.send(interim).await.unwrap();
+                let mut last = AudioChunk::final_chunk(segment.id.clone(), 1, vec![1.0; 2]);
+                last.stats = Some(if first {
+                    stats(5, 50.0, Some(TtsStopReason::OutputBudget))
+                } else {
+                    stats(4, 40.0, Some(TtsStopReason::EndOfSpeech))
+                });
+                sender.send(last).await.unwrap();
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = received.recv().await {
+            chunks.push(chunk);
+        }
+        assert_eq!(
+            chunks.iter().map(|c| c.sequence).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert!(chunks.iter().all(|c| c.request_id == "request"));
+        assert_eq!(
+            chunks.iter().map(|c| c.is_final).collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        // The first segment's rest goes out as a delta: 5 − 3 tokens.
+        let delta = chunks[1].stats.as_ref().unwrap();
+        assert_eq!((delta.tokens_generated, delta.stop_reason), (2, None));
+        let pause = segment_pause_samples(100);
+        assert_eq!(chunks[2].samples.len(), pause + 4);
+        assert!(chunks[2].samples[..pause]
+            .iter()
+            .all(|&sample| sample == 0.0));
+        let total = chunks[3].stats.as_ref().unwrap();
+        assert_eq!(total.tokens_generated, 9);
+        assert_eq!(total.generation_time_ms, 90.0);
+        assert_eq!(total.stop_reason, Some(TtsStopReason::OutputBudget));
+    }
 
     /// SPK-F12: segments run `concurrency` at a time, and their outputs come
     /// back in segment order however long each takes.
@@ -1126,6 +1292,40 @@ mod tests {
             "Sentence one. Sentence two.",
         );
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// Chatterbox speaks at most 1,000 speech tokens (40 s) per request, so
+    /// text whose automatic budget reaches that splits between sentences
+    /// and each segment gets its own budget below the cap.
+    #[test]
+    fn chatterbox_splits_text_one_request_cannot_finish() {
+        let variant = ModelVariant::Chatterbox500M;
+        let sentence = "The committee reviewed every proposal in detail before the vote. ";
+        let short = sentence.repeat(3);
+        assert!(!crate::api::tts_policy::tts_text_exceeds_one_request(
+            variant, &short
+        ));
+        let request = GenerationRequest::new(short).with_model_variant(variant);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&request, variant).len(),
+            1
+        );
+
+        let long = sentence.repeat(20);
+        assert!(crate::api::tts_policy::tts_text_exceeds_one_request(
+            variant, &long
+        ));
+        let request = GenerationRequest::new(long).with_model_variant(variant);
+        let planned = expand_generation_requests_for_long_form(&request, variant);
+        assert!(planned.len() > 1);
+        for chunk in &planned {
+            assert!(chunk.text.starts_with("The committee") && chunk.text.ends_with("vote."));
+            let budget = chunk.config.options.max_tokens;
+            assert!(
+                budget > 0 && budget < ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
+                "segment budget {budget}"
+            );
+        }
     }
 
     #[test]

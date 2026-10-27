@@ -177,6 +177,21 @@ jq --arg audio_sha256 "$audio_sha256" \
 $validator --certificate "$tmp_dir/audio-certificate.json" --backend cuda \
   --expected-git-sha "$git_sha" --require-audio-streaming-evidence >/dev/null
 
+# A final-only TTS model (no streaming) has first audio but no inter-frame
+# gaps; a streaming TTS case without inter-frame latency still fails.
+jq '.cases |= map(.command = "tts" | .final_only = true |
+  .streaming_latency = {first_audio_ms: {count: 1}, inter_frame_ms: null})' \
+  "$tmp_dir/audio-certificate.json" >"$tmp_dir/final-only-certificate.json"
+$validator --certificate "$tmp_dir/final-only-certificate.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-audio-streaming-evidence >/dev/null
+jq '.cases |= map(.final_only = false)' "$tmp_dir/final-only-certificate.json" \
+  >"$tmp_dir/unstreamed-certificate.json"
+if $validator --certificate "$tmp_dir/unstreamed-certificate.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-audio-streaming-evidence >/dev/null 2>&1; then
+  echo 'validator accepted streaming TTS evidence without inter-frame latency' >&2
+  exit 1
+fi
+
 jq '.models[0].memory.growth_bytes = 1' "$tmp_dir/audio-runtime.json" \
   >"$tmp_dir/audio-runtime-mutated.json"
 jq --arg audio "$tmp_dir/audio-runtime-mutated.json" \

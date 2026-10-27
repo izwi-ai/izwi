@@ -168,6 +168,9 @@ export interface SpeechHistoryRecordCreateRequest {
   max_tokens?: number;
   max_output_tokens?: number;
   top_k?: number;
+  exaggeration?: number;
+  cfg_weight?: number;
+  min_p?: number;
 }
 
 type SpeechHistoryRecordStreamEvent =
@@ -248,7 +251,8 @@ export interface SavedVoice {
   created_at: number;
   updated_at: number;
   name: string;
-  reference_text: string;
+  /** Null for a voice saved without a transcript. */
+  reference_text: string | null;
   audio_mime_type: string;
   audio_filename: string | null;
   source_route_kind: SavedVoiceSourceRouteKind | null;
@@ -257,7 +261,8 @@ export interface SavedVoice {
 
 export interface SavedVoiceCreateRequest {
   name: string;
-  reference_text: string;
+  /** Optional for a model that clones from audio alone. */
+  reference_text?: string;
   audio_base64: string;
   audio_mime_type?: string;
   audio_filename?: string;
@@ -1639,6 +1644,9 @@ export class AudioApiClient {
       max_tokens: request.max_tokens,
       max_output_tokens: request.max_output_tokens,
       top_k: request.top_k,
+      exaggeration: request.exaggeration,
+      cfg_weight: request.cfg_weight,
+      min_p: request.min_p,
       stream,
     };
   }

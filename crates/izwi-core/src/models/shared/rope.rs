@@ -17,6 +17,20 @@ pub enum RopeScaling {
     Default,
     /// YaRN, as transformers' `_compute_yarn_parameters` computes it.
     Yarn(YarnRopeScaling),
+    /// Llama 3.1's wavelength-banded scaling, as transformers'
+    /// `_compute_llama3_parameters` computes it.
+    Llama3(Llama3RopeScaling),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Llama3RopeScaling {
+    /// Interpolation factor for pairs whose wavelength exceeds the
+    /// pretraining context divided by `low_freq_factor`.
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    /// Context length the base model was pretrained at.
+    pub original_max_position_embeddings: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +118,31 @@ impl RopeScaling {
                 yarn.validate()?;
                 Ok(Self::Yarn(yarn))
             }
+            "llama3" => {
+                let number = |key: &str| {
+                    object.get(key).and_then(Value::as_f64).ok_or_else(|| {
+                        Error::ModelLoadError(format!("Llama3 RoPE scaling is missing its {key}"))
+                    })
+                };
+                let original = object
+                    .get("original_max_position_embeddings")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "Llama3 RoPE scaling is missing its original_max_position_embeddings (a positive integer)"
+                                .into(),
+                        )
+                    })?;
+                let llama3 = Llama3RopeScaling {
+                    factor: number("factor")?,
+                    low_freq_factor: number("low_freq_factor")?,
+                    high_freq_factor: number("high_freq_factor")?,
+                    original_max_position_embeddings: original,
+                };
+                llama3.validate()?;
+                Ok(Self::Llama3(llama3))
+            }
             other => Err(Error::ModelLoadError(format!(
                 "RoPE scaling type {other:?} is not implemented"
             ))),
@@ -114,6 +153,42 @@ impl RopeScaling {
         match self {
             Self::Default => "default",
             Self::Yarn(_) => "yarn",
+            Self::Llama3(_) => "llama3",
+        }
+    }
+}
+
+impl Llama3RopeScaling {
+    fn validate(&self) -> Result<()> {
+        let finite_positive = |value: f64| value.is_finite() && value > 0.0;
+        if !finite_positive(self.factor)
+            || !finite_positive(self.low_freq_factor)
+            || !finite_positive(self.high_freq_factor)
+            || self.high_freq_factor <= self.low_freq_factor
+            || self.original_max_position_embeddings == 0
+        {
+            return Err(Error::ModelLoadError(format!(
+                "Llama3 RoPE scaling needs a positive factor, low < high frequency factors and a positive original context, got {self:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pairs with a wavelength under `original / high_freq_factor` keep their
+    /// frequency, those over `original / low_freq_factor` are divided by
+    /// `factor`, and the band between is interpolated by the inverse
+    /// wavelength.
+    fn scale(&self, inv_freq: f64) -> f64 {
+        let original = self.original_max_position_embeddings as f64;
+        let wavelength = 2.0 * std::f64::consts::PI / inv_freq;
+        if wavelength < original / self.high_freq_factor {
+            inv_freq
+        } else if wavelength > original / self.low_freq_factor {
+            inv_freq / self.factor
+        } else {
+            let smooth = (original / wavelength - self.low_freq_factor)
+                / (self.high_freq_factor - self.low_freq_factor);
+            (1.0 - smooth) * inv_freq / self.factor + smooth * inv_freq
         }
     }
 }
@@ -196,11 +271,20 @@ pub fn rope_frequencies(
     let base = (0..pairs)
         .map(|pair| theta.powf(-((2 * pair) as f64) / rotary_dim as f64))
         .collect::<Vec<_>>();
-    let RopeScaling::Yarn(yarn) = scaling else {
-        return Ok(RopeFrequencies {
-            inv_freq: base,
-            attention_scale: 1.0,
-        });
+    let yarn = match scaling {
+        RopeScaling::Default => {
+            return Ok(RopeFrequencies {
+                inv_freq: base,
+                attention_scale: 1.0,
+            })
+        }
+        RopeScaling::Llama3(llama3) => {
+            return Ok(RopeFrequencies {
+                inv_freq: base.into_iter().map(|inv| llama3.scale(inv)).collect(),
+                attention_scale: 1.0,
+            })
+        }
+        RopeScaling::Yarn(yarn) => yarn,
     };
 
     let mut low = yarn.correction_dim(yarn.beta_fast, rotary_dim, theta);
@@ -317,6 +401,70 @@ mod tests {
         for pair in 46..64 {
             assert_close(freqs.inv_freq[pair], default.inv_freq[pair] / 4.0);
         }
+    }
+
+    /// Chatterbox's T3 (Llama-520M): head_dim 64, theta 5e5, Llama3 factor 8
+    /// over an 8192-token pretraining context. Expected values are
+    /// transformers 5.2's `_compute_llama3_parameters`, which runs in F32.
+    #[test]
+    fn llama3_matches_the_reference_equations_for_chatterbox_t3() {
+        let scaling = RopeScaling::from_config_value(
+            Some(&json!({
+                "factor": 8.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "llama3"
+            })),
+            131_072,
+        )
+        .unwrap();
+        assert_eq!(scaling.name(), "llama3");
+        let freqs = rope_frequencies(64, 500_000.0, &scaling).unwrap();
+        let default = rope_frequencies(64, 500_000.0, &RopeScaling::Default).unwrap();
+        assert_eq!(freqs.attention_scale, 1.0);
+        for (pair, expected) in [
+            (0, 1.0),
+            (5, 0.128_687_381_744_384_77),
+            (10, 0.016_560_440_883_040_428),
+            (15, 0.001_371_893_682_517_111_3),
+            (16, 0.000_524_846_022_017_300_1),
+            (17, 0.000_178_507_791_133_597_5),
+            (18, 7.784_655_463_183_299e-5),
+            (25, 4.411_534_519_022_098e-6),
+            (31, 3.767_322_596_104_35e-7),
+        ] {
+            let actual = freqs.inv_freq[pair];
+            assert!(
+                (actual - expected).abs() <= 1e-6 * expected,
+                "pair {pair}: {actual} != {expected}"
+            );
+        }
+        // Wavelengths under 2048 keep their frequency; over 8192 divide by 8.
+        for pair in 0..15 {
+            assert_eq!(freqs.inv_freq[pair], default.inv_freq[pair]);
+        }
+        for pair in 18..32 {
+            assert_close(freqs.inv_freq[pair], default.inv_freq[pair] / 8.0);
+        }
+    }
+
+    #[test]
+    fn llama3_rejects_incomplete_or_inverted_bands() {
+        let error = |value: Value| {
+            RopeScaling::from_config_value(Some(&value), 4096)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error(json!({"rope_type": "llama3", "factor": 8.0})).contains("missing"));
+        assert!(error(json!({
+            "rope_type": "llama3",
+            "factor": 8.0,
+            "low_freq_factor": 4.0,
+            "high_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192
+        }))
+        .contains("low < high"));
     }
 
     #[test]

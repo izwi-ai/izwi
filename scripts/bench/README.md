@@ -131,7 +131,9 @@ Audio concurrency evidence uses the `cpu-audio-concurrency.toml`,
 Each manifest covers every benchmarkable ASR and TTS family at c1/c2/c4/c8
 through the SSE endpoints. The CLI records first-audio and inter-audio-chunk
 latency for TTS, plus first-transcript and inter-transcript-delta latency for
-ASR. Require the complete matrix with the fail-closed gate:
+ASR. A final-only TTS model (one whose capabilities say it does not stream)
+runs unstreamed: the report marks its cases `final_only`, each sample's first
+audio is its end-to-end time, and no inter-chunk latency is recorded. Require the complete matrix with the fail-closed gate:
 
 ```bash
 scripts/bench/run-model-evidence.sh --backend metal \
