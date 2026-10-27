@@ -16,11 +16,10 @@
 //! Both files' metadata must agree with the release's `config.json`, which
 //! the GGUF variant downloads beside them.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
@@ -418,106 +417,6 @@ fn host_tensor(gguf: &GgufLoader, name: &str) -> Result<Tensor> {
     .map_err(Error::from)
 }
 
-/// One language-model tensor joined into a projection: its GGUF name and, for
-/// Q and K, the heads whose rows llama.cpp reordered for interleaved RoPE.
-pub(super) struct QuantizedPart<'a> {
-    pub(super) name: &'a str,
-    pub(super) rope_heads: Option<usize>,
-}
-
-/// The parts' rows joined, in order, into one quantized projection on
-/// `device`, with Q and K rows put back in half-split RoPE order.
-pub(super) fn joined_qmatmul(
-    gguf: &GgufLoader,
-    parts: &[QuantizedPart<'_>],
-    device: &Device,
-) -> Result<QMatMul> {
-    QMatMul::from_qtensor(joined_qtensor(gguf, parts, device)?).map_err(Error::from)
-}
-
-/// [`joined_qmatmul`]'s tensor. Each part is read on the host and the joined
-/// rows uploaded once.
-pub(super) fn joined_qtensor(
-    gguf: &GgufLoader,
-    parts: &[QuantizedPart<'_>],
-    device: &Device,
-) -> Result<QTensor> {
-    let mut joined = Vec::new();
-    let mut rows = 0;
-    let mut layout: Option<(GgmlDType, usize)> = None;
-    for part in parts {
-        let tensor = gguf.load_qtensor(part.name, &Device::Cpu)?;
-        let (part_rows, columns) = tensor.shape().dims2()?;
-        match layout {
-            None => layout = Some((tensor.dtype(), columns)),
-            Some(expected) if expected == (tensor.dtype(), columns) => {}
-            Some((dtype, width)) => {
-                return Err(Error::ModelLoadError(format!(
-                    "Granite Speech 5.0 GGUF tensor {} is {:?} x {columns}, unlike the {dtype:?} x {width} it joins",
-                    part.name,
-                    tensor.dtype()
-                )))
-            }
-        }
-        let data = tensor.data()?;
-        let order = match part.rope_heads {
-            Some(heads) => half_split_row_order(part_rows, heads).ok_or_else(|| {
-                Error::ModelLoadError(format!(
-                    "Granite Speech 5.0 GGUF tensor {} has {part_rows} rows, which do not split into {heads} heads of even width",
-                    part.name
-                ))
-            })?,
-            None => (0..part_rows).collect(),
-        };
-        append_rows(&mut joined, &data, part_rows, &order)?;
-        rows += part_rows;
-    }
-    let (dtype, columns) = layout.ok_or_else(|| {
-        Error::ModelLoadError("Granite Speech 5.0 GGUF projection has no parts".into())
-    })?;
-    let storage = QStorage::from_data(Cow::Owned(joined), device, dtype)?;
-    QTensor::new(storage, (rows, columns)).map_err(Error::from)
-}
-
-/// The GGUF row that holds each half-split row, head by head. llama.cpp's
-/// conversion stores row `i` of a head's first half at `2i` and row `i` of
-/// its second half at `2i + 1`.
-fn half_split_row_order(rows: usize, heads: usize) -> Option<Vec<usize>> {
-    if heads == 0 || !rows.is_multiple_of(heads) {
-        return None;
-    }
-    let head_rows = rows / heads;
-    if !head_rows.is_multiple_of(2) {
-        return None;
-    }
-    let half = head_rows / 2;
-    Some(
-        (0..heads)
-            .flat_map(|head| {
-                (0..2).flat_map(move |second| {
-                    (0..half).map(move |index| head * head_rows + 2 * index + second)
-                })
-            })
-            .collect(),
-    )
-}
-
-/// Appends `data`'s rows (`rows` of equal byte length) in `order`.
-fn append_rows(out: &mut Vec<u8>, data: &[u8], rows: usize, order: &[usize]) -> Result<()> {
-    if rows == 0 || !data.len().is_multiple_of(rows) {
-        return Err(Error::ModelLoadError(format!(
-            "a GGUF tensor of {} bytes does not hold {rows} equal rows",
-            data.len()
-        )));
-    }
-    let row_bytes = data.len() / rows;
-    out.reserve(data.len());
-    for &row in order {
-        out.extend_from_slice(&data[row * row_bytes..(row + 1) * row_bytes]);
-    }
-    Ok(())
-}
-
 /// Opens a GGUF file for reading on the host.
 pub(super) fn open_gguf(path: &Path) -> Result<GgufLoader> {
     GgufLoader::from_path_with_backend(path, BackendKind::Cpu)
@@ -526,35 +425,6 @@ pub(super) fn open_gguf(path: &Path) -> Result<GgufLoader> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn half_split_order_undoes_llamas_interleave() {
-        // llama.cpp's `permute` on one head of 6 rows: [a0 a1 a2 | b0 b1 b2]
-        // becomes [a0 b0 a1 b1 a2 b2].
-        let interleaved = ["a0", "b0", "a1", "b1", "a2", "b2"];
-        let order = half_split_row_order(6, 1).unwrap();
-        let restored = order
-            .iter()
-            .map(|row| interleaved[*row])
-            .collect::<Vec<_>>();
-        assert_eq!(restored, ["a0", "a1", "a2", "b0", "b1", "b2"]);
-        // Heads stay in place.
-        assert_eq!(
-            half_split_row_order(8, 2).unwrap(),
-            [0, 2, 1, 3, 4, 6, 5, 7]
-        );
-        assert!(half_split_row_order(6, 4).is_none());
-        assert!(half_split_row_order(6, 2).is_none());
-    }
-
-    #[test]
-    fn joined_rows_follow_the_order() {
-        let data = [0u8, 0, 1, 1, 2, 2, 3, 3];
-        let mut out = Vec::new();
-        append_rows(&mut out, &data, 4, &[2, 0, 3, 1]).unwrap();
-        assert_eq!(out, [2, 2, 0, 0, 3, 3, 1, 1]);
-        assert!(append_rows(&mut out, &data[..7], 4, &[0]).is_err());
-    }
 
     #[test]
     fn every_mmproj_tensor_maps_to_a_model_tensor() {

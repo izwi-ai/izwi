@@ -62,7 +62,7 @@ const CHATTERBOX_TTS_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Chatterbox500M,
     ModelVariant::ChatterboxMultilingual500M,
 ];
-const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B];
+const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B, ModelVariant::Maya13BGguf];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];

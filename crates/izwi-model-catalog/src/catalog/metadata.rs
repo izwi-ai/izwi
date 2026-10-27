@@ -317,6 +317,16 @@ pub enum ModelVariant {
         alias = "Maya1 3B"
     )]
     Maya13B,
+    /// Maya1 with its decoder quantized to Q8_0 by llama.cpp's conversion
+    /// (`mradermacher/maya1-GGUF`); config, tokenizer and SNAC as Maya1's
+    #[serde(
+        rename = "Maya1-3B-GGUF",
+        alias = "mradermacher/maya1-GGUF",
+        alias = "maya1-gguf",
+        alias = "Maya1 GGUF",
+        alias = "Maya1-GGUF"
+    )]
+    Maya13BGguf,
 }
 
 impl ModelVariant {
@@ -369,6 +379,10 @@ impl ModelVariant {
     pub const MAYA1_FRAME_RATE_HZ: f32 = 24_000.0 * 7.0 / 2_048.0;
     /// Named voice descriptions.
     pub const MAYA1_BUILT_IN_VOICE_COUNT: usize = 9;
+    /// mradermacher/maya1-GGUF, whose `maya1.Q8_0.gguf` converts Maya1's
+    /// unchanged weights.
+    pub const MAYA1_GGUF_ARTIFACT_REVISION: &'static str =
+        "595e0193e6ca6d4a2e5a7ea18e3bf8ada39aae53";
     /// The `.nemo` revisions izwi's Sortformer loader was verified against
     /// (sha256 `8abd3283…2ef8` and `867c53f5…e96d`); a re-published archive
     /// changes graph config and weights together (NDZ-5).
@@ -425,6 +439,7 @@ impl ModelVariant {
                 Some(Self::CHATTERBOX_ARTIFACT_REVISION)
             }
             Self::Maya13B => Some(Self::MAYA1_ARTIFACT_REVISION),
+            Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -495,6 +510,7 @@ impl ModelVariant {
             Self::FishAudioS2Pro => "fishaudio/s2-pro",
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => "ResembleAI/chatterbox",
             Self::Maya13B => "maya-research/maya1",
+            Self::Maya13BGguf => "mradermacher/maya1-GGUF",
         }
     }
 
@@ -550,6 +566,7 @@ impl ModelVariant {
             Self::Chatterbox500M => "Chatterbox",
             Self::ChatterboxMultilingual500M => "Chatterbox Multilingual",
             Self::Maya13B => "Maya1",
+            Self::Maya13BGguf => "Maya1 GGUF",
         }
     }
 
@@ -605,6 +622,7 @@ impl ModelVariant {
             Self::Chatterbox500M => "Chatterbox-500M",
             Self::ChatterboxMultilingual500M => "Chatterbox-Multilingual-500M",
             Self::Maya13B => "Maya1-3B",
+            Self::Maya13BGguf => "Maya1-3B-GGUF",
         }
     }
 
@@ -666,6 +684,9 @@ impl ModelVariant {
             // (6,624,761,513 B), and SNAC 24 kHz's pinned checkpoint
             // (79,488,254 B).
             Self::Maya13B => 6_704_249_767,
+            // The Q8_0 GGUF (3,516,496,480 B), Maya1's config and tokenizer
+            // (22,854,118 B) and SNAC.
+            Self::Maya13BGguf => 3_618_838_852,
         }
     }
 
@@ -739,6 +760,9 @@ impl ModelVariant {
             // CPU, priced by its residency plan), ~0.25 GB of KV per
             // 2,300-position request and SNAC.
             Self::Maya13B => 9.0,
+            // 3.5 GB of Q8_0 weights, ~0.5 GB of F32 KV per 2,300-position
+            // request and SNAC.
+            Self::Maya13BGguf => 5.0,
         }
     }
 
@@ -863,7 +887,8 @@ impl ModelVariant {
             | Self::GraniteSpeech502BGguf
             | Self::Qwen3827BFp8
             | Self::Qwen36Moe35BA3BFp8
-            | Self::Maya13B => Some("Apache-2.0"),
+            | Self::Maya13B
+            | Self::Maya13BGguf => Some("Apache-2.0"),
             _ => None,
         }
     }
@@ -994,7 +1019,7 @@ impl ModelVariant {
             },
             // Built-in voices are named descriptions; a request's own
             // description replaces the voice's.
-            Self::Maya13B => SpeechModelCapabilities {
+            Self::Maya13B | Self::Maya13BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::MAYA1_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
@@ -1146,6 +1171,7 @@ impl ModelVariant {
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
                 | Self::GraniteSpeech502BGguf
+                | Self::Maya13BGguf
                 | Self::Qwen314BGguf
                 | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
@@ -1173,6 +1199,7 @@ impl ModelVariant {
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
                 | Self::GraniteSpeech502BGguf
+                | Self::Maya13BGguf
         )
     }
 
@@ -1199,6 +1226,11 @@ impl ModelVariant {
     /// model and F16 `mmproj`).
     pub fn is_granite_speech5_gguf(&self) -> bool {
         matches!(self, Self::GraniteSpeech502BGguf)
+    }
+
+    /// Whether this is Maya1's GGUF release (a Q8_0 decoder).
+    pub fn is_maya1_gguf(&self) -> bool {
+        matches!(self, Self::Maya13BGguf)
     }
 
     /// Whether this is a Qwen3.5 chat GGUF variant.
@@ -1275,7 +1307,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => true,
-            Self::Maya13B => true,
+            Self::Maya13B | Self::Maya13BGguf => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1332,6 +1364,7 @@ impl ModelVariant {
             Self::Chatterbox500M,
             Self::ChatterboxMultilingual500M,
             Self::Maya13B,
+            Self::Maya13BGguf,
         ]
     }
 }

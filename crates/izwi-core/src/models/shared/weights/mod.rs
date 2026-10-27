@@ -1,6 +1,7 @@
 //! Shared model weight loading helpers.
 
 pub mod gguf;
+pub(crate) mod gguf_projection;
 pub mod layout;
 pub mod mlx;
 pub(crate) mod nemo;

@@ -24,10 +24,10 @@ use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
+use crate::models::shared::weights::gguf_projection::{joined_qmatmul, QuantizedPart};
 use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::config::GraniteSpeech5TextConfig;
-use super::gguf::{joined_qmatmul, QuantizedPart};
 use super::precision::{self, LmExecutionPlan};
 
 /// Attention geometry, checked before any head-dimension division.

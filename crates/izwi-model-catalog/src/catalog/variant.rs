@@ -372,7 +372,7 @@ impl ModelVariant {
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             FishAudioS2Pro => ModelFamily::FishS2Tts,
             Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
-            Maya13B => ModelFamily::Maya1Tts,
+            Maya13B | Maya13BGguf => ModelFamily::Maya1Tts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -635,6 +635,9 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     }
 
     if normalized.contains("maya1") || normalized.contains("mayaresearch") {
+        if normalized.contains("gguf") || normalized.contains("q80") {
+            return Some(Maya13BGguf);
+        }
         return Some(Maya13B);
     }
 

@@ -570,6 +570,13 @@ impl ModelVariant {
             );
         }
 
+        if self.is_maya1_gguf() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Maya1's GGUF release keeps its decoder's projections, token table and head in Q8_0 for Candle's quantized matmuls, with F32 activations and KV; SNAC stays dense F32",
+            );
+        }
+
         match self.family() {
             ModelFamily::Tokenizer => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

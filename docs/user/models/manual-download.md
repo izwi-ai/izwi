@@ -267,3 +267,22 @@ curl -L -o "$MODEL_DIR/snac_24khz.pth" \
 When Izwi downloads the decoder itself, it checks the size (79,488,254 bytes)
 and SHA-256
 (`4b8164cc6606bfa627f1a784734c1e539891518f1191ed9194fe1e3b9b4bff40`).
+
+`Maya1-3B-GGUF` (about 3.6 GB) takes the Q8_0 decoder from
+`mradermacher/maya1-GGUF`, the config and tokenizer from `maya-research/maya1`,
+and the same SNAC decoder:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Maya1-3B-GGUF"
+
+huggingface-cli download mradermacher/maya1-GGUF maya1.Q8_0.gguf \
+  --revision 595e0193e6ca6d4a2e5a7ea18e3bf8ada39aae53 \
+  --local-dir "$MODEL_DIR"
+
+huggingface-cli download maya-research/maya1 config.json tokenizer.json \
+  --revision b1b9b38ca9decbfcfd6c98ea93dd502bfd0f9572 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/snac_24khz.pth" \
+  https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec/pytorch_model.bin
+```

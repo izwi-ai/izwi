@@ -11,13 +11,14 @@
 //! Components a loader never reads are left out: the Qwen3-TTS
 //! speech-tokenizer encoder and ECAPA speaker encoder outside voice-clone
 //! checkpoints.
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use candle_core::pickle::read_pth_tensor_info;
 use candle_core::DType;
 
 use super::asr_memory::{
-    by_name, census_of, price_vibevoice, AsrResidencyPlan, Ledger, Source, VibeVoiceLoad,
+    by_name, census_of, price_vibevoice, tensor, AsrResidencyPlan, Ledger, Source, VibeVoiceLoad,
 };
 use super::{CensusFile, CensusTensor, ModelResourcePlan, StoredDType};
 use crate::backends::{BackendKind, DeviceProfile};
@@ -35,8 +36,12 @@ use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
     KOKORO_MODEL_MEMO_MAX_BYTES,
 };
-use crate::models::architectures::maya1::config::{SNAC_WEIGHTS_FILE, WEIGHT_SHARDS};
-use crate::models::architectures::maya1::{maya1_lm_precision, maya1_reloads_in_f32};
+use crate::models::architectures::maya1::config::{
+    HEAD_FIRST_TOKEN, HEAD_ROWS, SNAC_WEIGHTS_FILE, WEIGHT_SHARDS,
+};
+use crate::models::architectures::maya1::{
+    maya1_lm_precision, maya1_reloads_in_f32, Maya1LmConfig, MAYA1_GGUF_FILE,
+};
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
 use crate::models::architectures::qwen3::tts::speech_tokenizer::{
     encoder_reads_tensor, read_encoder_acoustic_codebooks,
@@ -94,6 +99,7 @@ pub(super) fn residency_plan(
         ModelFamily::VibeVoiceTts => vibevoice_tts_plan(model_path, device, backend),
         ModelFamily::VoxtralTts => voxtral_tts_plan(model_path, device, backend),
         ModelFamily::ChatterboxTts => chatterbox_tts_plan(variant, model_path, device, backend),
+        ModelFamily::Maya1Tts if variant.is_maya1_gguf() => maya1_gguf_plan(model_path, backend),
         ModelFamily::Maya1Tts => maya1_tts_plan(model_path, device, backend),
         _ => Ok(None),
     }
@@ -480,6 +486,70 @@ fn price_maya1_tts(
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
+fn maya1_gguf_plan(model_path: &Path, backend: BackendKind) -> Result<Option<AsrResidencyPlan>> {
+    let snac = model_path.join(SNAC_WEIGHTS_FILE);
+    let Some(files) = census_of(&[model_path.join(MAYA1_GGUF_FILE)])? else {
+        return Ok(None);
+    };
+    if !snac.is_file() {
+        return Ok(None);
+    }
+    let layers = Maya1LmConfig::load(model_path)?.num_hidden_layers;
+    price_maya1_gguf(&files, &snac_decoder_census(&snac)?, backend, layers).map(Some)
+}
+
+/// Maya1's GGUF release (`maya1/gguf.rs`): the Q8_0 projections read on
+/// the host, joined (q/k/v and gate/up) and uploaded once; the token table
+/// loaded quantized and the head's rows sliced from it on the host; the
+/// norms in F32 (`rope_freqs` is only read on the host); SNAC as for
+/// Maya1.
+fn price_maya1_gguf(
+    gguf: &[CensusFile],
+    snac: &CensusFile,
+    backend: BackendKind,
+    layers: usize,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::staged(backend);
+    let tensors = by_name(gguf);
+    let table = tensor(&tensors, "token_embd.weight")?;
+    ledger.gguf_stored(table)?;
+    let head = u64::from(HEAD_FIRST_TOKEN);
+    ledger.gguf_host_rows(table, head..head + HEAD_ROWS as u64)?;
+    let mut priced = BTreeSet::from([
+        "token_embd.weight".to_string(),
+        "rope_freqs.weight".to_string(),
+    ]);
+    for layer in 0..layers {
+        for parts in [
+            &["attn_q", "attn_k", "attn_v"][..],
+            &["attn_output"],
+            &["ffn_gate", "ffn_up"],
+            &["ffn_down"],
+        ] {
+            let names = parts
+                .iter()
+                .map(|part| format!("blk.{layer}.{part}.weight"))
+                .collect::<Vec<_>>();
+            let joined = names
+                .iter()
+                .map(|name| tensor(&tensors, name))
+                .collect::<Result<Vec<_>>>()?;
+            ledger.gguf_host_joined(&joined)?;
+            priced.extend(names);
+        }
+    }
+    for (name, tensor) in &tensors {
+        if !priced.contains(*name) {
+            // The norms.
+            ledger.var(tensor, Source::Copied, &[DType::F32])?;
+        }
+    }
+    for tensor in &snac.tensors {
+        ledger.var(tensor, Source::Copied, &[DType::F32])?;
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
 fn vibevoice_tts_plan(
     model_path: &Path,
     device: &DeviceProfile,
@@ -750,6 +820,132 @@ mod tests {
                     estimate.load_peak_bytes >= estimate.resident_bytes,
                     "{label}"
                 );
+            }
+        }
+    }
+
+    /// Maya1's census from its pinned geometry: the BF16 shards (as one
+    /// file, the index's 6,601,857,024 bytes), or the Q8_0 GGUF (llama.cpp's
+    /// names, F32 norms and `rope_freqs`).
+    fn maya1_census(cfg: &Maya1LmConfig, gguf: bool) -> Vec<CensusFile> {
+        let (tensors, total_bytes) = if gguf {
+            let (hidden, q, kv, mlp) = (
+                cfg.hidden_size,
+                cfg.q_out(),
+                cfg.kv_out(),
+                cfg.intermediate_size,
+            );
+            let mut tensors = vec![
+                serde_json::json!(["token_embd.weight", "Q8_0", [cfg.vocab_size, hidden]]),
+                serde_json::json!(["output_norm.weight", "F32", [hidden]]),
+                serde_json::json!(["rope_freqs.weight", "F32", [cfg.head_dim / 2]]),
+            ];
+            for layer in 0..cfg.num_hidden_layers {
+                for (name, dtype, shape) in [
+                    ("attn_norm", "F32", vec![hidden]),
+                    ("ffn_norm", "F32", vec![hidden]),
+                    ("attn_q", "Q8_0", vec![q, hidden]),
+                    ("attn_k", "Q8_0", vec![kv, hidden]),
+                    ("attn_v", "Q8_0", vec![kv, hidden]),
+                    ("attn_output", "Q8_0", vec![hidden, q]),
+                    ("ffn_gate", "Q8_0", vec![mlp, hidden]),
+                    ("ffn_up", "Q8_0", vec![mlp, hidden]),
+                    ("ffn_down", "Q8_0", vec![hidden, mlp]),
+                ] {
+                    tensors.push(serde_json::json!([
+                        format!("blk.{layer}.{name}.weight"),
+                        dtype,
+                        shape
+                    ]));
+                }
+            }
+            let bytes = tensors
+                .iter()
+                .map(|tensor| {
+                    let elements = tensor[2]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|dim| dim.as_u64().unwrap())
+                        .product::<u64>();
+                    if tensor[1] == "Q8_0" {
+                        elements / 32 * 34
+                    } else {
+                        elements * 4
+                    }
+                })
+                .sum::<u64>();
+            (tensors, bytes)
+        } else {
+            let tensors = crate::models::architectures::maya1::published_tensors(cfg)
+                .into_iter()
+                .map(|(name, shape)| serde_json::json!([name, "BF16", shape]))
+                .collect::<Vec<_>>();
+            (tensors, 6_601_857_024)
+        };
+        fixture(
+            &serde_json::json!({ "files": [{
+                "path": if gguf { MAYA1_GGUF_FILE } else { WEIGHT_SHARDS[0] },
+                "format": if gguf { "gguf" } else { "safetensors" },
+                "total_bytes": total_bytes,
+                "tensor_count": tensors.len(),
+                "tensors": tensors,
+            }] })
+            .to_string(),
+        )
+    }
+
+    /// Maya1's releases priced at their stored widths, SNAC aside: the
+    /// shards' 3.30 B parameters in F32 on CPU and F16 / BF16 on Metal and
+    /// CUDA (12.30 / 6.15 / 6.15 GiB); the GGUF's projections and table
+    /// in Q8_0 on every backend, with the head's 28,680 rows sliced from the
+    /// table as a second Q8_0 tensor and F32 norms (3.35 GiB; CUDA pads each
+    /// quantized tensor's rows).
+    #[test]
+    fn maya1_plans_price_each_release_at_its_stored_width() {
+        let cfg = Maya1LmConfig::pinned();
+        let shards = maya1_census(&cfg, false);
+        let gguf = maya1_census(&cfg, true);
+        let no_snac = CensusFile {
+            path: PathBuf::from(SNAC_WEIGHTS_FILE),
+            tensors: Vec::new(),
+        };
+        let q8 = stored(&gguf, |tensor| {
+            tensor.dtype == StoredDType::Ggml(candle_core::quantized::GgmlDType::Q8_0)
+        });
+        let table = stored(&gguf, |tensor| tensor.name == "token_embd.weight");
+        let head = table / cfg.vocab_size as u64 * HEAD_ROWS as u64;
+        let norms = stored(&gguf, |tensor| tensor.name.ends_with("norm.weight"));
+        for (backend, dtype, dense_gib) in [
+            (BackendKind::Cpu, DType::F32, 12.30),
+            (BackendKind::Metal, DType::F16, 6.15),
+            (BackendKind::Cuda, DType::BF16, 6.15),
+        ] {
+            let dense = price_maya1_tts(&shards, backend, dtype)
+                .unwrap()
+                .estimate()
+                .unwrap();
+            assert_gib(
+                &format!("Maya1 {backend:?}"),
+                dense.resident_bytes,
+                dense_gib,
+            );
+            let quantized = price_maya1_gguf(&gguf, &no_snac, backend, cfg.num_hidden_layers)
+                .unwrap()
+                .estimate()
+                .unwrap();
+            let expected = q8 + head + norms;
+            if backend == BackendKind::Cpu {
+                assert_eq!(quantized.resident_bytes, expected);
+            }
+            assert_gib(
+                &format!("Maya1 GGUF {backend:?}"),
+                quantized.resident_bytes,
+                gib(expected),
+            );
+            assert_gib("Maya1 GGUF", expected, 3.35);
+            for estimate in [dense, quantized] {
+                assert!(estimate.load_peak_bytes >= estimate.resident_bytes);
             }
         }
     }
