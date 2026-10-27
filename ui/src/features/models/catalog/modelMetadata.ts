@@ -13,6 +13,7 @@ export const PROVIDER_ORDER = [
   "hexgrad",
   "Fish Audio",
   "Resemble AI",
+  "Maya Research",
   "Other",
 ] as const;
 
@@ -77,6 +78,9 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("ResembleAI/chatterbox")
   ) {
     return "Resemble AI";
+  }
+  if (variant.startsWith("Maya1-") || variant.startsWith("maya-research/")) {
+    return "Maya Research";
   }
   return "Other";
 }
@@ -246,6 +250,21 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "24 kHz",
     ],
     size: "3.28 GB",
+  },
+  "Maya1-3B": {
+    shortName: "Maya1",
+    fullName: "Maya1 by Maya Research",
+    description:
+      "Voice design from a written description, with inline emotion tags such as <laugh>, <sigh> and <whisper> placed in the text. Nine described voices are built in. A 3B model: real time on recent NVIDIA GPUs, slower than real time on Apple Silicon and CPUs.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Design",
+      "Emotion Tags",
+      "Streaming",
+      "24 kHz",
+    ],
+    size: "6.70 GB",
   },
   // Text Chat
   "Qwen3.5-0.8B": {
