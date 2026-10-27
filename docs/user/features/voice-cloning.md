@@ -200,7 +200,7 @@ saved voice routes and exact fields.
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
-| `Chatterbox-Multilingual-500M` | ~3.2 GB | 21 languages (set `language`); clones from audio alone |
+| `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
 
 Larger models produce more accurate voice clones.
 

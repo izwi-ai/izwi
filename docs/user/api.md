@@ -395,10 +395,10 @@ out of range returns `400`.
   `IZWI_CHATTERBOX_WATERMARK=false` before the model loads to turn it off.
 
 `Chatterbox-Multilingual-500M` takes the same fields and speaks the `language`
-the request names: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish (codes `ar`, `da`, `nl`, `en`, `fi`, `fr`,
-`de`, `el`, `he`, `hi`, `it`, `ko`, `ms`, `no`, `pl`, `pt`, `ru`, `es`, `sw`,
-`sv`, `tr`). Without `language`, or with `Auto`, it speaks English. Chinese and
-Japanese return `400` until Izwi has their text processing.
+the request names: Arabic, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish (codes `ar`, `zh`, `da`, `nl`, `en`, `fi`,
+`fr`, `de`, `el`, `he`, `hi`, `it`, `ko`, `ms`, `no`, `pl`, `pt`, `ru`, `es`,
+`sw`, `sv`, `tr`). Without `language`, or with `Auto`, it speaks English.
+Japanese returns `400` until Izwi has its text processing.
 
 Non-stream response:
 

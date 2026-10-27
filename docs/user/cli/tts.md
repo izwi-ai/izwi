@@ -234,7 +234,7 @@ Izwi saves the streamed audio, then plays it.
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
-| `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 21 languages chosen with `--language`; watermarked, 24 kHz output, MIT |
+| `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 22 languages chosen with `--language`; watermarked, 24 kHz output, MIT |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 
 ---

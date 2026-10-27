@@ -232,7 +232,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice | Medium |
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
-| `Chatterbox-Multilingual-500M` | ~3.2 GB | 21 languages, reference voice, emotion control | Slow |
+| `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
 
 For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` or `Chatterbox-Multilingual-500M`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603` or `LFM2.5-Audio-1.5B-GGUF`.  
@@ -249,9 +249,8 @@ set `IZWI_METAL_DTYPE=f32` to keep it in F32), so streamed audio can pause
 between windows. Long text is split between
 sentences and spoken in full. Every utterance carries Resemble AI's imperceptible PerTh watermark;
 operators can turn it off with `IZWI_CHATTERBOX_WATERMARK=false`.
-`Chatterbox-Multilingual-500M` does the same in Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish, named per
-request with `language` (English when unset). Chinese and Japanese are not
-supported yet.
+`Chatterbox-Multilingual-500M` does the same in Arabic, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish, named per
+request with `language` (English when unset). Japanese is not supported yet.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---

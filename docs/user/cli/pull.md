@@ -74,7 +74,7 @@ Common models:
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | TTS (voice design) | ~4.2 GB |
 | `Voxtral-4B-TTS-2603` | TTS (20 preset voices, CC BY-NC 4.0) | ~8.1 GB |
 | `Chatterbox-500M` | TTS (English, cloning from audio alone, watermarked) | ~3.2 GB |
-| `Chatterbox-Multilingual-500M` | TTS (21 languages, cloning from audio alone, watermarked) | ~3.2 GB |
+| `Chatterbox-Multilingual-500M` | TTS (22 languages, cloning from audio alone, watermarked) | ~3.3 GB |
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~2.5 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | ASR (NVIDIA multilingual `.nemo`) | ~2.37 GB |
