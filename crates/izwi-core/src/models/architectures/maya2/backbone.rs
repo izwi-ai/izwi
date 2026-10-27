@@ -49,6 +49,38 @@ pub struct Maya2Backbone {
     max_positions: usize,
 }
 
+/// The most decode rows one forward takes, and the span up to which a
+/// projection keeps each row's sums apart (a longer span is one request's
+/// prefill, whose shape is its own).
+pub(crate) const MAX_DECODE_GROUP: usize = 32;
+
+/// `x` `[rows, in]` · `weight`ᵀ, each row rounded the same however many
+/// requests share the call, so a request sounds the same under load as
+/// alone. Candle picks a matmul's kernel and tiles from its row count
+/// (`gemv` for one row, GEMM tiles by size; the CPU's matmul as well), and
+/// each rounds a row's sums differently. On the CPU and Metal each row of a
+/// decode-sized call takes the single-row kernel a lone request gets; on
+/// CUDA the call is padded to [`MAX_DECODE_GROUP`] rows, one shape for every
+/// batch.
+pub(super) fn rows_apart_matmul(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let rows = x.dim(0)?;
+    let weight = weight.t()?;
+    if rows > MAX_DECODE_GROUP {
+        return Ok(x.matmul(&weight)?);
+    }
+    if x.device().is_cuda() {
+        let padded = x.pad_with_zeros(0, 0, MAX_DECODE_GROUP - rows)?;
+        return Ok(padded.matmul(&weight)?.narrow(0, 0, rows)?);
+    }
+    if rows == 1 {
+        return Ok(x.matmul(&weight)?);
+    }
+    let products = (0..rows)
+        .map(|row| Ok(x.narrow(0, row, 1)?.matmul(&weight)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Tensor::cat(&products, 0)?)
+}
+
 /// One row of a forward: `embeds` `[positions, hidden]` appended to `cache`.
 pub struct Maya2BackboneRow<'a> {
     pub embeds: Tensor,
@@ -101,6 +133,27 @@ impl Maya2Backbone {
 
     pub fn max_positions(&self) -> usize {
         self.max_positions
+    }
+
+    /// Requests' rows as the engine batches them, each row's last hidden
+    /// state in row order: the bits each row gets alone. A prefill row runs
+    /// by itself (its span alone sets its matmul shapes); single-position
+    /// decode rows share forwards in groups of at most [`MAX_DECODE_GROUP`],
+    /// whose projections keep rows apart ([`rows_apart_matmul`]).
+    pub fn forward_batch(&self, rows: &mut [Maya2BackboneRow<'_>]) -> Result<Tensor> {
+        let decode = rows
+            .iter()
+            .all(|row| row.embeds.dim(0).is_ok_and(|n| n == 1));
+        let group = if decode { MAX_DECODE_GROUP } else { 1 };
+        let mut hidden = rows
+            .chunks_mut(group)
+            .map(|chunk| self.forward(chunk))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(if hidden.len() == 1 {
+            hidden.pop().expect("one group")
+        } else {
+            Tensor::cat(&hidden, 0)?
+        })
     }
 
     /// Run `rows` through the decoder; each row's last hidden state after
@@ -300,7 +353,7 @@ impl Layer {
         let tokens = x.dim(0)?;
         let (q_out, kv_out, head_dim) = (cfg.q_out(), cfg.kv_out(), cfg.head_dim);
         let eps = cfg.rms_norm_eps as f32;
-        let qkv = self.input_norm.forward(x)?.matmul(&self.qkv.t()?)?;
+        let qkv = rows_apart_matmul(&self.input_norm.forward(x)?, &self.qkv)?;
         let q = qkv
             .narrow(1, 0, q_out)?
             .reshape((tokens, cfg.num_attention_heads, head_dim))?;
@@ -337,14 +390,12 @@ impl Layer {
         } else {
             Tensor::cat(&outputs, 0)?
         };
-        let attn = attn.reshape((tokens, q_out))?.matmul(&self.o_proj.t()?)?;
+        let attn = rows_apart_matmul(&attn.reshape((tokens, q_out))?, &self.o_proj)?;
         let x = x.add(&attn)?;
-        let gate_up = self.post_norm.forward(&x)?.matmul(&self.gate_up.t()?)?;
+        let gate_up = rows_apart_matmul(&self.post_norm.forward(&x)?, &self.gate_up)?;
         let gate = gate_up.narrow(1, 0, cfg.intermediate_size)?;
         let up = gate_up.narrow(1, cfg.intermediate_size, cfg.intermediate_size)?;
-        let mlp = candle_nn::ops::silu(&gate)?
-            .mul(&up)?
-            .matmul(&self.down.t()?)?;
+        let mlp = rows_apart_matmul(&candle_nn::ops::silu(&gate)?.mul(&up)?, &self.down)?;
         Ok(x.add(&mlp)?)
     }
 }
@@ -360,4 +411,170 @@ fn rotate_half_split(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let first = x1.broadcast_mul(&cos)?.sub(&x2.broadcast_mul(&sin)?)?;
     let second = x1.broadcast_mul(&sin)?.add(&x2.broadcast_mul(&cos)?)?;
     Ok(Tensor::cat(&[first, second], D::Minus1)?.contiguous()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_nn::VarMap;
+
+    use super::*;
+    use crate::models::shared::noise::mix;
+
+    /// Maya 2's layout at the paged-attention kernels' head width, still
+    /// toy-sized: GQA 2/1, two layers.
+    fn tiny_config() -> Maya2BackboneConfig {
+        Maya2BackboneConfig {
+            hidden_size: 256,
+            intermediate_size: 512,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            vocab_size: 64,
+        }
+    }
+
+    fn tiny_backbone(device: &Device, dtype: DType) -> Maya2Backbone {
+        let varmap = VarMap::new();
+        let load = || {
+            Maya2Backbone::load(
+                tiny_config(),
+                VarBuilder::from_varmap(&varmap, dtype, device),
+                64,
+            )
+            .unwrap()
+        };
+        load();
+        let mut seed = 5u64;
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            let shape = var.shape().clone();
+            let values = (0..shape.elem_count())
+                .map(|_| {
+                    seed = mix(seed.wrapping_add(1));
+                    let unit = (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                    if name.ends_with("norm.weight") {
+                        1.0 + unit * 0.2
+                    } else {
+                        unit * 0.2
+                    }
+                })
+                .collect::<Vec<_>>();
+            let value = Tensor::from_vec(values, shape, device).unwrap();
+            var.set(&value.to_dtype(dtype).unwrap()).unwrap();
+        }
+        load()
+    }
+
+    fn embeds(positions: usize, salt: u64, device: &Device, dtype: DType) -> Tensor {
+        let values = (0..positions * 256)
+            .map(|i| ((mix(i as u64 ^ salt) >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (positions, 256), device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// How far row `row`'s hidden states move beside other requests, as the
+    /// engine batches them (its pages after or before theirs in the arena):
+    /// its prefill beside another prefill, and its decode step beside two
+    /// other decode rows, each against the row alone.
+    fn batch_variance(device: &Device, dtype: DType, row: usize) -> f32 {
+        let backbone = tiny_backbone(device, dtype);
+        let cfg = tiny_config();
+        // Caches in one arena, as the engine allocates them, so batched rows
+        // share each attention call.
+        let caches = |rows: usize| {
+            crate::models::shared::attention::physical::test_physical_caches_with_dtype_on(
+                device,
+                dtype,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                64,
+                rows,
+            )
+        };
+        let prompts = [(7, 1u64), (12, 2), (3, 3)];
+        let step = |row: u64| embeds(1, 100 + row, device, dtype);
+        // Row 0 alone.
+        let mut alone = caches(1).pop().unwrap();
+        let alone_prefill = backbone
+            .forward_batch(&mut [Maya2BackboneRow {
+                embeds: embeds(prompts[row].0, prompts[row].1, device, dtype),
+                cache: &mut alone,
+            }])
+            .unwrap();
+        let alone_decode = backbone
+            .forward_batch(&mut [Maya2BackboneRow {
+                embeds: step(row as u64),
+                cache: &mut alone,
+            }])
+            .unwrap();
+        // Row 0 among others.
+        let mut caches = caches(3);
+        let mut rows = caches
+            .iter_mut()
+            .zip(prompts)
+            .map(|(cache, (positions, salt))| Maya2BackboneRow {
+                embeds: embeds(positions, salt, device, dtype),
+                cache,
+            })
+            .collect::<Vec<_>>();
+        let batched_prefill = backbone.forward_batch(&mut rows).unwrap();
+        drop(rows);
+        let mut rows = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(row, cache)| Maya2BackboneRow {
+                embeds: step(row as u64),
+                cache,
+            })
+            .collect::<Vec<_>>();
+        let batched_decode = backbone.forward_batch(&mut rows).unwrap();
+        let diff = |a: &Tensor, b: &Tensor| {
+            values(a)
+                .iter()
+                .zip(values(&b.narrow(0, row, 1).unwrap()))
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        diff(&alone_prefill, &batched_prefill).max(diff(&alone_decode, &batched_decode))
+    }
+
+    #[test]
+    fn a_rows_hidden_states_do_not_depend_on_its_batch() {
+        for row in 0..3 {
+            let diff = batch_variance(&Device::Cpu, DType::F32, row);
+            assert_eq!(diff, 0.0, "row {row} moves by {diff} beside other rows");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_rows_hidden_states_do_not_depend_on_its_batch_on_metal() {
+        use crate::backends::{BackendPreference, DeviceSelector};
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "a_rows_hidden_states_do_not_depend_on_its_batch_on_metal",
+        );
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+        if !matches!(profile.device, Device::Metal(_)) {
+            return;
+        }
+        for row in 0..3 {
+            let diff = batch_variance(&profile.device, DType::F16, row);
+            assert_eq!(diff, 0.0, "row {row} moves by {diff} beside other rows");
+        }
+    }
 }

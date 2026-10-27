@@ -16,6 +16,7 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
+use super::backbone::rows_apart_matmul;
 use super::config::{CB0_CLASSES, CODEBOOKS, CODEBOOK_SIZE};
 use super::prompt::{Maya2Prompt, PromptItem};
 use crate::error::{Error, Result};
@@ -208,9 +209,10 @@ impl Maya2Inputs {
     /// Codebook-0 logits `[rows, 2049]` (F32) of backbone states `[rows,
     /// hidden]`.
     pub fn cb0_logits(&self, hidden: &Tensor) -> Result<Tensor> {
-        Ok(hidden
-            .to_dtype(self.dtype)?
-            .matmul(&self.cb0_head.t()?)?
-            .to_dtype(DType::F32)?)
+        // Rows apart, so a request's logits do not move with its batch.
+        Ok(
+            rows_apart_matmul(&hidden.to_dtype(self.dtype)?, &self.cb0_head)?
+                .to_dtype(DType::F32)?,
+        )
     }
 }

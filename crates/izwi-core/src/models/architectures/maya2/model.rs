@@ -388,3 +388,116 @@ impl Maya2Runtime {
         )
     }
 }
+
+/// The release checkpoint through the engine's own quanta: a request's codes
+/// alone against the same request beside another, their caches in one
+/// arena as the engine allocates them.
+#[cfg(all(test, feature = "metal"))]
+mod real_weight_tests {
+    use super::*;
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use crate::models::architectures::maya2::retained::{Maya2Phase, Maya2StepRow};
+    use crate::models::architectures::maya2::runtime::{Maya2GenerationParams, Maya2Voice};
+    use crate::models::architectures::maya2::sampling::Maya2SamplingParams;
+    use crate::models::shared::attention::physical::test_physical_caches_with_dtype_on;
+
+    /// Each request's codes, its prompt prefilled in spans of at most
+    /// `chunk` positions (all at once when `None`).
+    fn run(
+        model: &Maya2TtsModel,
+        requests: &[(&'static str, u64)],
+        chunk: Option<usize>,
+    ) -> Vec<Vec<u32>> {
+        let text =
+            "The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun.";
+        let cfg = model.runtime().backbone().config().clone();
+        let mut caches = test_physical_caches_with_dtype_on(
+            model.runtime().device(),
+            model.runtime().backbone().dtype(),
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            STATE_CONTEXT_TOKENS,
+            requests.len(),
+        );
+        let mut states = requests
+            .iter()
+            .map(|&(voice, seed)| {
+                let artifact = model
+                    .prepare_retained_artifact(Maya2Voice::Named(voice), "en", text, None)
+                    .unwrap();
+                let params = Maya2GenerationParams {
+                    sampling: Maya2SamplingParams::default(),
+                    max_frames: None,
+                    seed,
+                };
+                model.new_retained_state(artifact, params).unwrap()
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let spans = states
+                .iter()
+                .map(|s| s.prompt_tokens() - s.prefill_cursor())
+                .map(|left| chunk.map_or(left, |chunk| left.min(chunk)))
+                .filter(|&span| span > 0)
+                .collect::<Vec<_>>();
+            if spans.is_empty() {
+                break;
+            }
+            let mut rows = states
+                .iter_mut()
+                .zip(caches.iter_mut())
+                .filter(|(state, _)| state.prefill_cursor() < state.prompt_tokens())
+                .map(|(state, cache)| Maya2StepRow { state, cache })
+                .collect::<Vec<_>>();
+            model.retained_prefill_batch(&mut rows, &spans).unwrap();
+        }
+        loop {
+            let mut rows = states
+                .iter_mut()
+                .zip(caches.iter_mut())
+                .filter(|(state, _)| state.phase() == Maya2Phase::Decode && !state.stopped())
+                .map(|(state, cache)| Maya2StepRow { state, cache })
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                break;
+            }
+            model.retained_decode_batch(&mut rows).unwrap();
+        }
+        states.iter().map(|s| s.codes().to_vec()).collect()
+    }
+
+    #[test]
+    #[ignore = "needs the Maya2 release (IZWI_MAYA2_MODEL_DIR) and Metal"]
+    fn a_requests_codes_do_not_depend_on_its_batch_on_metal() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "a_requests_codes_do_not_depend_on_its_batch_on_metal",
+        );
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+        if !matches!(profile.device, candle_core::Device::Metal(_)) {
+            return;
+        }
+        let dir = std::path::PathBuf::from(std::env::var("IZWI_MAYA2_MODEL_DIR").unwrap());
+        let model = Maya2TtsModel::load(&dir, ModelVariant::Maya2Native25B, profile).unwrap();
+        let alone = run(&model, &[("Ahana", 20)], None).remove(0);
+        let compare = |label: &str, other: &[u32]| {
+            let frame = alone
+                .chunks(32)
+                .zip(other.chunks(32))
+                .position(|(a, b)| a != b);
+            eprintln!(
+                "{label}: {} frames alone, {} here, first differing frame {frame:?}",
+                alone.len() / 32,
+                other.len() / 32
+            );
+            frame.is_none() && alone.len() == other.len()
+        };
+        // Second in the arena, so its KV blocks sit after another request's.
+        let second = run(&model, &[("Anirban", 21), ("Ahana", 20)], None).remove(1);
+        // Its prompt prefilled in chunks, as the scheduler may split it.
+        let chunked = run(&model, &[("Ahana", 20)], Some(8)).remove(0);
+        let second_ok = compare("second in the arena", &second);
+        let chunked_ok = compare("prefilled in chunks of 8", &chunked);
+        assert!(second_ok && chunked_ok);
+    }
+}

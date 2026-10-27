@@ -123,8 +123,19 @@ pub struct Maya2Depth {
 }
 
 fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    // One 2-D matmul over every row: `broadcast_matmul` would copy the
-    // broadcast weight on each call, about 50× slower on Metal.
+    // Each request's rows on their own: a matmul's kernel and tiles follow
+    // its row count, so rows folded with another request's would round
+    // differently from the same rows alone, and a request would sound
+    // different under load.
+    let batch = x.dim(0)?;
+    if batch > 1 {
+        let rows = (0..batch)
+            .map(|row| linear(&x.narrow(0, row, 1)?, weight))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Tensor::cat(&rows, 0)?);
+    }
+    // One 2-D matmul over the request's rows: `broadcast_matmul` would copy
+    // the broadcast weight on each call, about 50× slower on Metal.
     let mut dims = x.dims().to_vec();
     let inner = dims.pop().unwrap_or(0);
     let rows = dims.iter().product::<usize>();
@@ -342,7 +353,8 @@ impl Maya2Depth {
                         // Only the final position is read after the last
                         // layer, and it sees every key.
                         x = x.narrow(1, tokens - 1, 1)?;
-                        attention(&q.narrow(2, tokens - 1, 1)?, &k, &v, false)?
+                        let last = q.narrow(2, tokens - 1, 1)?.contiguous()?;
+                        attention(&last, &k, &v, false)?
                     } else {
                         attention(&q, &k, &v, true)?
                     }
@@ -626,6 +638,106 @@ mod tests {
         assert!(both[0]
             .iter()
             .all(|&code| (code as usize) < TINY.codebook_size));
+    }
+
+    /// Every level's logits for row `row`, alone and beside two other rows.
+    fn logits_alone_and_batched(
+        depth: &Maya2Depth,
+        device: &Device,
+        row: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let width = depth.geometry.backbone_width;
+        let h = random(3, width, 7)
+            .to_device(device)
+            .unwrap()
+            .to_dtype(depth.dtype)
+            .unwrap();
+        let cb0 = Tensor::new(&[3u32, 17, 9], device).unwrap();
+        let cross = Tensor::stack(&vec![depth.cross_constants(None).unwrap(); 3], 0).unwrap();
+        let run = |start: usize, rows: usize, pick: usize| {
+            let mut logits = Vec::new();
+            depth
+                .run_levels(
+                    &h.narrow(0, start, rows).unwrap(),
+                    &cb0.narrow(0, start, rows).unwrap(),
+                    &cross.narrow(0, start, rows).unwrap(),
+                    |_, row_logits| {
+                        logits.extend(
+                            row_logits
+                                .narrow(0, pick, 1)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()?,
+                        );
+                        Ok(row_logits.argmax(D::Minus1)?.to_dtype(DType::U32)?)
+                    },
+                )
+                .unwrap();
+            logits
+        };
+        (run(row, 1, 0), run(0, 3, row))
+    }
+
+    /// A row's logits are the same bits beside other rows as alone, so a
+    /// request sounds the same under load: a matmul's kernel follows its
+    /// row count, and rows folded together round differently.
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+    }
+
+    #[test]
+    fn a_rows_logits_do_not_depend_on_its_batch() {
+        let depth = tiny_depth();
+        for row in 0..3 {
+            let (alone, batched) = logits_alone_and_batched(&depth, &Device::Cpu, row);
+            let diff = max_diff(&alone, &batched);
+            assert_eq!(diff, 0.0, "row {row} moves by {diff} beside other rows");
+        }
+    }
+
+    /// The same on Metal in F16 at the release width, where kernels switch
+    /// with the row count.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_rows_logits_do_not_depend_on_its_batch_on_metal() {
+        use crate::backends::{BackendPreference, DeviceSelector};
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "a_rows_logits_do_not_depend_on_its_batch_on_metal",
+        );
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+        if !matches!(profile.device, Device::Metal(_)) {
+            return;
+        }
+        let geometry = DepthGeometry {
+            codebook_size: 64,
+            ..DepthGeometry::RELEASE
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F16, &profile.device);
+        let depth = Maya2Depth::load(vb, geometry).unwrap();
+        for var in varmap.data().lock().unwrap().values() {
+            let noise = Tensor::randn(0f32, 0.05, var.shape(), &profile.device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            var.set(&noise).unwrap();
+        }
+        for row in 0..3 {
+            let (alone, batched) = logits_alone_and_batched(&depth, &profile.device, row);
+            let diff = max_diff(&alone, &batched);
+            let first_level = alone
+                .chunks(geometry.codebook_size)
+                .zip(batched.chunks(geometry.codebook_size))
+                .position(|(a, b)| a != b)
+                .map(|index| index + 1);
+            assert_eq!(
+                diff, 0.0,
+                "row {row} moves by {diff} beside other rows, first at level {first_level:?}"
+            );
+        }
     }
 
     #[test]

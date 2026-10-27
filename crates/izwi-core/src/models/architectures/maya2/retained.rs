@@ -411,7 +411,7 @@ pub(crate) fn maya2_prefill_batch(
             cache: &mut *row.cache,
         });
     }
-    let hidden = networks.backbone.forward(&mut forward)?;
+    let hidden = networks.backbone.forward_batch(&mut forward)?;
     drop(forward);
     for (index, (row, step)) in rows.iter_mut().zip(&steps).enumerate() {
         row.state.prefill_cursor += step.consumed_tokens;
@@ -560,7 +560,7 @@ pub(crate) fn maya2_decode_batch(
                 });
                 cursor += 1;
             }
-            let next = networks.backbone.forward(&mut forward)?;
+            let next = networks.backbone.forward_batch(&mut forward)?;
             drop(forward);
             for (position, &index) in feed_rows.iter().enumerate() {
                 let state = &mut *rows[index].state;
