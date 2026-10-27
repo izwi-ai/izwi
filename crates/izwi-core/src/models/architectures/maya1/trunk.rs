@@ -29,9 +29,49 @@ pub(crate) enum Projection {
     Quantized(QMatMul),
 }
 
+/// The most decode rows one forward takes, and the span up to which a
+/// projection keeps each row's sums independent of the rows beside it (a
+/// longer span is one request's prefill, whose shape is its own).
+pub(crate) const MAX_DECODE_GROUP: usize = 32;
+
 impl Projection {
-    /// `x` [tokens, in] → [tokens, out].
+    /// `x` [tokens, in] → [tokens, out], each row rounded the same however
+    /// many requests share the call, so a request sounds the same under
+    /// load as alone. Candle picks a matmul's kernel and tiles from its row
+    /// count (`gemv` and the quantized `mv` kernel for one row, GEMM tiles by
+    /// size), and each rounds a row's sums differently. On the CPU and Metal
+    /// every row of a decode-sized call runs through the single-row kernels a
+    /// lone request gets: the fastest there at the few rows those devices
+    /// batch (Metal's dense GEMM costs a third more than `gemv` for one row,
+    /// its Q8_0 GEMM 1.8x the `mv` kernel). The CPU's quantized matmul is
+    /// already row by row. On CUDA the call is padded to [`MAX_DECODE_GROUP`]
+    /// rows, one shape for every batch.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let rows = x.dim(0)?;
+        if rows > MAX_DECODE_GROUP || (x.device().is_cpu() && matches!(self, Self::Quantized(_))) {
+            return self.matmul(x);
+        }
+        if x.device().is_cuda() {
+            let padded = x.pad_with_zeros(0, 0, MAX_DECODE_GROUP - rows)?;
+            return Ok(self.matmul(&padded)?.narrow(0, 0, rows)?);
+        }
+        match self {
+            Self::Quantized(weight) => {
+                // A [rows, 1, in] input takes Candle's `mv` kernel row by row.
+                let columns = x.dim(1)?;
+                let products = weight.forward(&x.reshape((rows, 1, columns))?)?;
+                Ok(products.reshape((rows, ()))?)
+            }
+            Self::Dense(_) => {
+                let products = (0..rows)
+                    .map(|row| self.matmul(&x.narrow(0, row, 1)?))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Tensor::cat(&products, 0)?)
+            }
+        }
+    }
+
+    fn matmul(&self, x: &Tensor) -> Result<Tensor> {
         Ok(match self {
             Self::Dense(weight) => x.matmul(&weight.t()?)?,
             Self::Quantized(weight) => weight.forward(x)?,
@@ -165,6 +205,21 @@ impl Maya1Trunk {
 
     pub fn max_positions(&self) -> usize {
         self.max_positions
+    }
+
+    /// Requests' rows as the engine batches them, each row's head logits in
+    /// row order: the bits each row gets alone. A prefill row runs by itself
+    /// (its span alone sets its matmul shapes); single-token decode rows
+    /// share forwards in groups of at most [`MAX_DECODE_GROUP`], whose
+    /// projections keep rows apart ([`Projection::forward`]).
+    pub(crate) fn forward_batch(&self, rows: &mut [Maya1ForwardRow<'_>]) -> Result<Vec<Vec<f32>>> {
+        let decode = rows.iter().all(|row| row.tokens.len() == 1);
+        let group = if decode { MAX_DECODE_GROUP } else { 1 };
+        let mut logits = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks_mut(group) {
+            logits.extend(self.forward(chunk)?.to_vec2::<f32>()?);
+        }
+        Ok(logits)
     }
 
     /// Run `rows` through the decoder and return each row's head logits at
@@ -584,6 +639,103 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Maya1's layout at the real head width (the paged-attention kernels'
+    /// 128), still toy-sized: GQA 2/1, two layers.
+    pub(crate) fn head_128_config() -> Maya1LmConfig {
+        Maya1LmConfig {
+            hidden_size: 256,
+            intermediate_size: 512,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            ..tiny_config()
+        }
+    }
+
+    fn logits(trunk: &Maya1Trunk, rows: &mut [Maya1ForwardRow<'_>]) -> Vec<Vec<f32>> {
+        trunk.forward_batch(rows).unwrap()
+    }
+
+    /// How far a row's logits move when other requests' rows share its
+    /// forward, as the engine batches them (decode rows together, prefill
+    /// rows together): a decode row beside one and two others, and a prefill
+    /// beside another, each against the same row run alone. Zero means a
+    /// request sounds the same under load as alone.
+    pub(crate) fn batch_variance(trunk: &Maya1Trunk, device: &Device, dtype: DType) -> f32 {
+        let cfg = trunk.config().clone();
+        let cache = || {
+            PhysicalPagedKvCache::scratch_for_probe(
+                device,
+                dtype,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                64,
+            )
+            .unwrap()
+        };
+        let a = [
+            128_259u32, 128_000, 40, 7_000, 52_011, 128_009, 128_260, 128_261, 128_257,
+        ];
+        let b = [128_259u32, 128_000, 99, 1_234, 128_257];
+        let codes = [[128_266u32], [132_400], [136_500]];
+        // Three requests, each prefilled alone.
+        let prefilled = || {
+            let mut caches = [cache(), cache(), cache()];
+            for (tokens, cache) in [&a[..], &b[..], &a[1..]].into_iter().zip(&mut caches) {
+                logits(trunk, &mut [Maya1ForwardRow { tokens, cache }]);
+            }
+            caches
+        };
+
+        let [mut alone, _, _] = prefilled();
+        let decode_alone = logits(
+            trunk,
+            &mut [Maya1ForwardRow {
+                tokens: &codes[0],
+                cache: &mut alone,
+            }],
+        )
+        .remove(0);
+        let mut variance = 0f32;
+        for width in [2, 3] {
+            let mut caches = prefilled();
+            let mut rows = caches
+                .iter_mut()
+                .zip(&codes)
+                .take(width)
+                .map(|(cache, tokens)| Maya1ForwardRow { tokens, cache })
+                .collect::<Vec<_>>();
+            let batched = logits(trunk, &mut rows);
+            variance = variance.max(max_diff(&batched[0], &decode_alone));
+        }
+
+        let mut alone = cache();
+        let prefill_alone = logits(
+            trunk,
+            &mut [Maya1ForwardRow {
+                tokens: &b,
+                cache: &mut alone,
+            }],
+        )
+        .remove(0);
+        let (mut first, mut second) = (cache(), cache());
+        let batched = logits(
+            trunk,
+            &mut [
+                Maya1ForwardRow {
+                    tokens: &a,
+                    cache: &mut first,
+                },
+                Maya1ForwardRow {
+                    tokens: &b,
+                    cache: &mut second,
+                },
+            ],
+        );
+        variance.max(max_diff(&batched[1], &prefill_alone))
+    }
+
     pub(crate) fn max_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)
@@ -672,5 +824,143 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(cache_a.context_len(), full_a.len());
+    }
+
+    #[test]
+    fn cpu_rows_are_batch_invariant() {
+        let cfg = tiny_config();
+        let vb = VarBuilder::from_tensors(tiny_weights(&cfg), DType::F32, &Device::Cpu);
+        let trunk = Maya1Trunk::load(cfg, vb, 64).unwrap();
+        assert_eq!(batch_variance(&trunk, &Device::Cpu, DType::F32), 0.0);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_f16_rows_are_batch_invariant() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_f16_rows_are_batch_invariant")
+        else {
+            return;
+        };
+        let cfg = head_128_config();
+        let vb = VarBuilder::from_tensors(tiny_weights(&cfg), DType::F16, &device);
+        let trunk = Maya1Trunk::load(cfg, vb, 64).unwrap();
+        assert_eq!(batch_variance(&trunk, &device, DType::F16), 0.0);
+    }
+
+    /// Decode-step cost of Maya1's four projections at their real shapes on
+    /// Metal, per row count: dense F16 as Candle runs it (gemv for one row),
+    /// padded to 2 and to 16 rows, and Q8_0 through the GEMM against
+    /// single-row `mv` products. `cargo test ... projection_cost -- --ignored
+    /// --nocapture`.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "a timing table, not a check"]
+    fn metal_projection_cost() {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_projection_cost")
+        else {
+            return;
+        };
+        let shapes = [(3072, 5120), (3072, 3072), (3072, 16384), (8192, 3072)];
+        let mut rng = SplitMix64::new(3);
+        let weights = shapes
+            .iter()
+            .map(|&(input, output)| random(&mut rng, &[output, input], 0.02))
+            .collect::<Vec<_>>();
+        let dense = weights
+            .iter()
+            .map(|w| w.to_dtype(DType::F16).unwrap().to_device(&device).unwrap())
+            .collect::<Vec<_>>();
+        let quantized = weights
+            .iter()
+            .map(|w| {
+                let q = QTensor::quantize(w, GgmlDType::Q8_0).unwrap();
+                let q = candle_core::quantized::QTensor::new(
+                    candle_core::quantized::QStorage::from_data(
+                        std::borrow::Cow::Owned(q.data().unwrap().to_vec()),
+                        &device,
+                        GgmlDType::Q8_0,
+                    )
+                    .unwrap(),
+                    q.shape().clone(),
+                )
+                .unwrap();
+                QMatMul::from_qtensor(q).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let time = |run: &dyn Fn() -> Tensor| {
+            for _ in 0..3 {
+                run().to_vec2::<f32>().unwrap();
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                run().to_vec2::<f32>().unwrap();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 20.0
+        };
+        eprintln!("rows | F16 as is | F16 pad 2 | F16 pad 16 | Q8_0 GEMM | Q8_0 mv rows   (ms, 4 projections)");
+        for rows in [1usize, 2, 4, 8, 16, 32] {
+            let inputs = |dtype: DType, pad: usize| {
+                shapes
+                    .iter()
+                    .map(|&(input, _)| {
+                        random(&mut SplitMix64::new(5), &[rows.max(pad), input], 1.0)
+                            .to_dtype(dtype)
+                            .unwrap()
+                            .to_device(&device)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let f16 = |pad: usize| {
+                let xs = inputs(DType::F16, pad);
+                time(&|| {
+                    let out = dense
+                        .iter()
+                        .zip(&xs)
+                        .map(|(w, x)| {
+                            x.matmul(&w.t().unwrap())
+                                .unwrap()
+                                .narrow(0, 0, 1)
+                                .unwrap()
+                                .to_dtype(DType::F32)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    Tensor::cat(&out, 1).unwrap()
+                })
+            };
+            let q8 = |single_rows: bool| {
+                let xs = inputs(DType::F32, 0);
+                time(&|| {
+                    let out = quantized
+                        .iter()
+                        .zip(&xs)
+                        .map(|(w, x)| {
+                            let product = if single_rows {
+                                w.forward(&x.reshape((rows, 1, ())).unwrap())
+                                    .unwrap()
+                                    .reshape((rows, ()))
+                                    .unwrap()
+                            } else {
+                                w.forward(x).unwrap()
+                            };
+                            product.narrow(0, 0, 1).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    Tensor::cat(&out, 1).unwrap()
+                })
+            };
+            eprintln!(
+                "{rows:4} | {:9.2} | {:9.2} | {:10.2} | {:9.2} | {:12.2}",
+                f16(0),
+                f16(2),
+                f16(16),
+                q8(false),
+                q8(true)
+            );
+        }
     }
 }

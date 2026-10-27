@@ -211,7 +211,7 @@ mod tests {
 
     use super::*;
     use crate::models::architectures::maya1::trunk::tests::{
-        dense_reference, max_diff, tiny_config, tiny_weights,
+        batch_variance, dense_reference, head_128_config, max_diff, tiny_config, tiny_weights,
     };
     use crate::models::architectures::maya1::trunk::Maya1ForwardRow;
     use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -426,5 +426,36 @@ mod tests {
             .to_string();
         assert!(error.contains("rope_freqs"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Q8_0 projections give a row the same logits alone or beside other
+    /// requests' rows.
+    fn quantized_batch_variance(device: &Device, tag: &str) -> f32 {
+        let cfg = head_128_config();
+        let dir =
+            std::env::temp_dir().join(format!("izwi-maya1-gguf-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MAYA1_GGUF_FILE);
+        write_tiny_gguf(&cfg, &path);
+        let trunk = load_gguf_trunk(&path, cfg, device, 64).unwrap();
+        let variance = batch_variance(&trunk, device, DType::F32);
+        std::fs::remove_dir_all(&dir).ok();
+        variance
+    }
+
+    #[test]
+    fn cpu_quantized_rows_are_batch_invariant() {
+        assert_eq!(quantized_batch_variance(&Device::Cpu, "cpu-batch"), 0.0);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_quantized_rows_are_batch_invariant() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_quantized_rows_are_batch_invariant")
+        else {
+            return;
+        };
+        assert_eq!(quantized_batch_variance(&device, "metal-batch"), 0.0);
     }
 }
