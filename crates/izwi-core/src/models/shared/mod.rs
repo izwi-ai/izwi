@@ -10,6 +10,7 @@ pub(crate) mod detokenize;
 pub mod grammar;
 pub mod memory;
 pub mod moe;
+pub mod noise;
 pub mod rope;
 pub mod sampling;
 pub mod speculative_sampling;
