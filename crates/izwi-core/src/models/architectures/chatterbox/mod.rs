@@ -9,6 +9,7 @@
 //! 24 kHz mono. A voice is the bundled default (`conds.pt`) or one prepared
 //! from reference audio alone; no transcript is involved.
 
+pub mod chinese;
 pub mod conds;
 pub mod config;
 pub mod hift;

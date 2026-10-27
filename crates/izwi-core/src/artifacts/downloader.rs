@@ -26,6 +26,9 @@ use tracing::{debug, info, warn};
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
+use crate::models::architectures::chatterbox::chinese::{
+    CANGJIE_FILE, PKUSEG_DICT_FILE, PKUSEG_MODEL_FILE,
+};
 use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
@@ -147,7 +150,8 @@ const CHATTERBOX_FILES: &[&str] = &[
 /// the English S3Gen and voice encoder in place of the pickled `s3gen.pt`
 /// and `ve.pt` upstream's multilingual loader reads (bit-identical tensor
 /// for tensor at this revision; `chatterbox::multilingual_tests` checks),
-/// the default voice and the watermark.
+/// the default voice, the watermark, and the Chinese frontend's Cangjie
+/// table and pkuseg segmenter ([`PKUSEG_MODEL`], [`PKUSEG_DICT`]).
 const CHATTERBOX_MULTILINGUAL_FILES: &[&str] = &[
     "t3_mtl23ls_v2.safetensors",
     "grapheme_mtl_merged_expanded_v1.json",
@@ -155,6 +159,9 @@ const CHATTERBOX_MULTILINGUAL_FILES: &[&str] = &[
     "ve.safetensors",
     "conds.pt",
     PERTH_CHECKPOINT_FILE,
+    CANGJIE_FILE,
+    PKUSEG_MODEL_FILE,
+    PKUSEG_DICT_FILE,
 ];
 
 fn chatterbox_files(variant: ModelVariant) -> &'static [&'static str] {
@@ -560,8 +567,8 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 }
 
 /// A file served outside the Hub from a fixed URL, checked against its size
-/// and SHA-256 once it lands: Chatterbox's PerTh watermarker ships only in
-/// its GitHub repository.
+/// and SHA-256 once it lands: Chatterbox's PerTh watermarker and its
+/// multilingual edition's Chinese segmenter ship only on GitHub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PinnedFile {
     url: &'static str,
@@ -579,10 +586,38 @@ const PERTH_CHECKPOINT: PinnedFile = PinnedFile {
     sha256: "a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670",
 };
 
+/// spacy-pkuseg's default model, `spacy_ontonotes` (MIT): the release asset
+/// `pkuseg()` downloads, at the SHA-256 pkuseg itself checks.
+const PKUSEG_MODEL: PinnedFile = PinnedFile {
+    url: "https://github.com/explosion/spacy-pkuseg/releases/download/v0.0.26/spacy_ontonotes.zip",
+    size: 34_567_143,
+    sha256: "b216e7f92de7ae285aeab8feba2faa8ea8216e5995ff6fb3d391cc8356db1bfe",
+};
+
+/// spacy-pkuseg's default merge dictionary, `spacy_pkuseg/dicts/default.pkl`,
+/// at the 1.0.2 release commit (the same blob since v0.0.26).
+const PKUSEG_DICT: PinnedFile = PinnedFile {
+    url: "https://raw.githubusercontent.com/explosion/spacy-pkuseg/\
+          16995617f3b8f5cf32e5b6a77d7d800e201b255b/spacy_pkuseg/dicts/default.pkl",
+    size: 4_525_959,
+    sha256: "3cf450d95719d51883fa49291302b9032372064d86805b130bb2ea0223196c67",
+};
+
 /// The pinned source of `variant`'s `local_file`, when it is not on the Hub.
 fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
-    (variant.family() == ModelFamily::ChatterboxTts && local_file == PERTH_CHECKPOINT_FILE)
-        .then_some(PERTH_CHECKPOINT)
+    if variant.family() != ModelFamily::ChatterboxTts {
+        return None;
+    }
+    match local_file {
+        PERTH_CHECKPOINT_FILE => Some(PERTH_CHECKPOINT),
+        PKUSEG_MODEL_FILE if variant == ModelVariant::ChatterboxMultilingual500M => {
+            Some(PKUSEG_MODEL)
+        }
+        PKUSEG_DICT_FILE if variant == ModelVariant::ChatterboxMultilingual500M => {
+            Some(PKUSEG_DICT)
+        }
+        _ => None,
+    }
 }
 
 /// Whether `path` holds exactly `pinned`'s bytes; a file that does not is
@@ -2803,7 +2838,10 @@ impl ModelDownloader {
                 "s3gen.safetensors" => 1_056_484_620,
                 "ve.safetensors" => 5_695_784,
                 "conds.pt" => 107_374,
+                CANGJIE_FILE => 1_920_163,
                 PERTH_CHECKPOINT_FILE => PERTH_CHECKPOINT.size,
+                PKUSEG_MODEL_FILE => PKUSEG_MODEL.size,
+                PKUSEG_DICT_FILE => PKUSEG_DICT.size,
                 _ => 25_470,
             }
         } else if file == "mmproj-F16.gguf" {
@@ -3062,6 +3100,9 @@ mod tests {
             "ve.safetensors",
             "conds.pt",
             PERTH_CHECKPOINT_FILE,
+            CANGJIE_FILE,
+            PKUSEG_MODEL_FILE,
+            PKUSEG_DICT_FILE,
         ] {
             assert!(files.contains(&file.to_string()), "{file}");
         }
@@ -3110,6 +3151,33 @@ mod tests {
         assert_eq!(plan.url(HF_BASE_URL), pinned.url);
         assert!(plan.immutable());
         assert_eq!(plan.exact_size(), Some(37_429_684));
+    }
+
+    /// The Chinese frontend's pkuseg model and dictionary come from GitHub
+    /// for the multilingual edition only; its Cangjie table stays on the Hub
+    /// with the checkpoint.
+    #[test]
+    fn chatterbox_multilingual_fetches_its_segmenter_from_pinned_urls() {
+        let variant = ModelVariant::ChatterboxMultilingual500M;
+        let model = pinned_file(variant, PKUSEG_MODEL_FILE).expect("pinned model");
+        assert_eq!(
+            model.url,
+            "https://github.com/explosion/spacy-pkuseg/releases/download/v0.0.26/spacy_ontonotes.zip"
+        );
+        let dict = pinned_file(variant, PKUSEG_DICT_FILE).expect("pinned dictionary");
+        assert_eq!(
+            dict.url,
+            "https://raw.githubusercontent.com/explosion/spacy-pkuseg/16995617f3b8f5cf32e5b6a77d7d800e201b255b/spacy_pkuseg/dicts/default.pkl"
+        );
+        assert_eq!(pinned_file(variant, CANGJIE_FILE), None);
+        assert_eq!(
+            pinned_file(ModelVariant::Chatterbox500M, PKUSEG_MODEL_FILE),
+            None
+        );
+        let (downloader, _) = test_downloader();
+        assert!(!downloader
+            .get_model_files(ModelVariant::Chatterbox500M)
+            .contains(&CANGJIE_FILE.to_string()));
     }
 
     #[tokio::test]

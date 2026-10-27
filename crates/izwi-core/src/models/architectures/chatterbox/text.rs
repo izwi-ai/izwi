@@ -155,6 +155,22 @@ pub fn normalize_multilingual(text: &str, language: &str) -> Result<String> {
     Ok(format!("[{language}]{text}"))
 }
 
+/// Python's `str.isspace`: Unicode whitespace plus the ASCII information
+/// separators.
+pub(super) fn is_python_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Python's `str.strip()`.
+pub(super) fn python_strip(text: &str) -> &str {
+    text.trim_matches(is_python_space)
+}
+
+/// Python's `str.split()`.
+pub(super) fn python_split(text: &str) -> impl Iterator<Item = &str> {
+    text.split(is_python_space).filter(|word| !word.is_empty())
+}
+
 /// Upstream's `korean_normalize`: each Hangul syllable as its jamo, then
 /// trimmed. After NFKD the syllables are already decomposed the same way.
 fn korean_jamo(text: &str) -> String {
@@ -186,13 +202,7 @@ fn normalize_punctuation_ending(text: &str, enders: &[char]) -> String {
     } else {
         text.to_string()
     };
-    // Python's `str.split()` separators: Unicode whitespace plus the ASCII
-    // information separators.
-    let mut text = text
-        .split(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut text = python_split(&text).collect::<Vec<_>>().join(" ");
     for (old, new) in PUNCTUATION_REPLACEMENTS {
         text = text.replace(old, new);
     }

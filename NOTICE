@@ -45,6 +45,10 @@ and of the parts of these works that Chatterbox builds on:
 * Real-Time-Voice-Cloning (https://github.com/CorentinJ/Real-Time-Voice-Cloning):
   the voice encoder. Modified & original work Copyright (c) 2019 Corentin
   Jemine; original work Copyright (c) 2018 Rayhane Mama. MIT License.
+* spacy-pkuseg (https://github.com/explosion/spacy-pkuseg), a fork of
+  pkuseg-python (https://github.com/lancopku/pkuseg-python): the Chinese word
+  segmenter of the multilingual text frontend. Copyright (c) 2020 ExplosionAI
+  GmbH, 2018-2019 pkuseg authors. MIT License.
 
 The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
 works above are used under these terms:

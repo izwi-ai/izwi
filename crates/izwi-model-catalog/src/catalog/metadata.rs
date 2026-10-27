@@ -635,8 +635,9 @@ impl ModelVariant {
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
             Self::Chatterbox500M => 3_229_396_676, // five pinned HF files (3,191,966,992 B) + PerTh checkpoint (37,429,684 B)
             // Its T3 and tokenizer (2,144,059,741 B), the English S3Gen,
-            // voice encoder and default voice (1,062,287,778 B) and PerTh.
-            Self::ChatterboxMultilingual500M => 3_243_777_203,
+            // voice encoder and default voice (1,062,287,778 B), PerTh, and
+            // the Chinese Cangjie table and pkuseg segmenter (41,013,265 B).
+            Self::ChatterboxMultilingual500M => 3_284_790_468,
         }
     }
 
