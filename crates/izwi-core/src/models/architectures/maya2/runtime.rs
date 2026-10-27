@@ -451,3 +451,129 @@ pub(crate) fn cap_reason(budget: &Maya2PieceBudget, max_frames: Option<usize>) -
         Maya2StopReason::Cap
     }
 }
+
+/// The release checkpoint on Metal: a short utterance end to end, with each
+/// step of a frame timed (backbone, cb0, depth, input embedding) so a slow
+/// stage shows in `--nocapture` output.
+#[cfg(all(test, feature = "metal"))]
+mod real_weight_tests {
+    use super::*;
+    use crate::backends::{BackendPreference, DeviceSelector};
+
+    fn model_dir() -> PathBuf {
+        PathBuf::from(
+            std::env::var("IZWI_MAYA2_MODEL_DIR").expect("IZWI_MAYA2_MODEL_DIR names the release"),
+        )
+    }
+
+    fn ms(started: Instant) -> f32 {
+        started.elapsed().as_secs_f32() * 1000.0
+    }
+
+    #[test]
+    #[ignore = "needs the Maya2 release (IZWI_MAYA2_MODEL_DIR) and Metal"]
+    fn frames_on_metal_are_timed_step_by_step() {
+        let _lease =
+            crate::backends::metal_test_device_or_skip("frames_on_metal_are_timed_step_by_step");
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+        if !matches!(profile.device, Device::Metal(_)) {
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let device = profile.device;
+        let runtime = Maya2Runtime::load(&model_dir(), &device, DType::F16, DType::F16).unwrap();
+        let voice = Maya2Voice::Named("Ahana");
+        let text = "Hello there, this is a quick test of the new voice.";
+        let prompt = runtime.prompt(&voice, "en", text).unwrap();
+        let (embeds, cross) = runtime.conditioning(&voice, &prompt).unwrap();
+        let cross = cross.unsqueeze(0).unwrap();
+        let mut cache = runtime.scratch_cache(STATE_CONTEXT_TOKENS).unwrap();
+        let sync = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        let started = Instant::now();
+        let mut hidden = runtime
+            .backbone
+            .forward(&mut [Maya2BackboneRow {
+                embeds,
+                cache: &mut cache,
+            }])
+            .unwrap();
+        sync(&hidden);
+        eprintln!(
+            "prefill {} positions: {:.1} ms",
+            prompt.items.len(),
+            ms(started)
+        );
+        let mut rng = SplitMix64::for_stream(7, Maya2Stream::Depth);
+        let mut totals = [0f32; 5];
+        let frames = 12;
+        for frame_index in 0..frames {
+            let t = Instant::now();
+            let logits = runtime
+                .inputs
+                .cb0_logits(&hidden)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let code = logits[0]
+                .iter()
+                .enumerate()
+                .take(CODEBOOK_SIZE)
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            let cb0_ms = ms(t);
+            let t = Instant::now();
+            let gumbel =
+                depth_gumbel(&mut [&mut rng], DEPTH_LEVELS, CODEBOOK_SIZE, &device).unwrap();
+            let cb0 = Tensor::new(&[code], &device).unwrap();
+            sync(&gumbel);
+            let gumbel_ms = ms(t);
+            let t = Instant::now();
+            let frame = runtime
+                .depth
+                .generate_frame(&hidden, &cb0, &cross, &gumbel, 0.7, 64)
+                .unwrap();
+            let codes = frame.to_vec2::<u32>().unwrap();
+            let depth_ms = ms(t);
+            let t = Instant::now();
+            let embeds = runtime.inputs.audio_frames(&frame).unwrap();
+            sync(&embeds);
+            let embed_ms = ms(t);
+            let t = Instant::now();
+            hidden = runtime
+                .backbone
+                .forward(&mut [Maya2BackboneRow {
+                    embeds,
+                    cache: &mut cache,
+                }])
+                .unwrap();
+            sync(&hidden);
+            let backbone_ms = ms(t);
+            for (total, value) in
+                totals
+                    .iter_mut()
+                    .zip([cb0_ms, gumbel_ms, depth_ms, embed_ms, backbone_ms])
+            {
+                *total += value;
+            }
+            assert_eq!(codes[0].len(), CODEBOOKS);
+            eprintln!(
+                "frame {frame_index}: cb0 {cb0_ms:.1} gumbel {gumbel_ms:.1} depth {depth_ms:.1} \
+                 embed {embed_ms:.1} backbone {backbone_ms:.1} ms"
+            );
+        }
+        let per = totals.map(|total| total / frames as f32);
+        eprintln!(
+            "mean per frame: cb0 {:.1} gumbel {:.1} depth {:.1} embed {:.1} backbone {:.1} ms \
+             (80 ms of audio per frame)",
+            per[0], per[1], per[2], per[3], per[4]
+        );
+    }
+}

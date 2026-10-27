@@ -24,6 +24,7 @@ use candle_nn::{LayerNorm, VarBuilder};
 use super::config::{CODEBOOKS, CODEBOOK_SIZE, DEPTH_LEVELS};
 use super::sampling::sample_depth_level;
 use crate::error::{Error, Result};
+use crate::models::shared::attention::flash::try_fused_self_attention;
 
 const LAYERS: usize = 4;
 const GROUPS: usize = 11;
@@ -122,7 +123,14 @@ pub struct Maya2Depth {
 }
 
 fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    Ok(x.broadcast_matmul(&weight.t()?)?)
+    // One 2-D matmul over every row: `broadcast_matmul` would copy the
+    // broadcast weight on each call, about 50× slower on Metal.
+    let mut dims = x.dims().to_vec();
+    let inner = dims.pop().unwrap_or(0);
+    let rows = dims.iter().product::<usize>();
+    let out = x.reshape((rows, inner))?.matmul(&weight.t()?)?;
+    dims.push(weight.dim(0)?);
+    Ok(out.reshape(dims)?)
 }
 
 impl Maya2Depth {
@@ -403,9 +411,13 @@ impl Maya2Depth {
     }
 }
 
-/// Scaled dot-product attention over `[B, H, T, d]`, in F32; `causal`
-/// masks keys after each query (query and key lengths equal).
+/// Scaled dot-product attention over `[B, H, T, d]`: the fused kernel on a
+/// GPU, otherwise in F32; `causal` masks keys after each query (query and
+/// key lengths equal).
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+    if let Some(out) = try_fused_self_attention(q, k, v, None, q.dim(D::Minus1)?, causal)? {
+        return Ok(out);
+    }
     let dtype = q.dtype();
     let scale = 1.0 / (q.dim(D::Minus1)? as f64).sqrt();
     let q = q.to_dtype(DType::F32)?;
@@ -622,5 +634,137 @@ mod tests {
         assert!(GROUP_OF_LEVEL[9..17].iter().all(|&g| g == 8));
         assert!(GROUP_OF_LEVEL[17..25].iter().all(|&g| g == 9));
         assert!(GROUP_OF_LEVEL[25..32].iter().all(|&g| g == 10));
+    }
+}
+
+/// Each op of a depth level timed on Metal at the release shapes, so a slow
+/// kernel path shows in `--nocapture` output.
+#[cfg(all(test, feature = "metal"))]
+mod metal_timing {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::backends::{BackendPreference, DeviceSelector};
+
+    fn time(label: &str, iterations: usize, device: &Device, mut op: impl FnMut() -> Tensor) {
+        let warm = op();
+        warm.to_dtype(DType::F32)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let started = Instant::now();
+        let mut last = None;
+        for _ in 0..iterations {
+            last = Some(op());
+        }
+        last.unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        device.synchronize().unwrap();
+        let per = started.elapsed().as_secs_f64() * 1e6 / iterations as f64;
+        eprintln!("{label:<40} {per:>9.1} µs");
+    }
+
+    #[test]
+    #[ignore = "timing on Metal"]
+    fn depth_ops_on_metal_are_timed() {
+        let _lease = crate::backends::metal_test_device_or_skip("depth_ops_on_metal_are_timed");
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+        if !matches!(profile.device, Device::Metal(_)) {
+            return;
+        }
+        let device = profile.device;
+        let f16 = |shape: &[usize]| {
+            Tensor::randn(0f32, 0.02, shape, &device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+        };
+        let n = 200;
+        let w_qkv = f16(&[3072, 1024]);
+        let w_head = f16(&[2048, 1024]);
+        for tokens in [1usize, 9] {
+            let x = f16(&[1, tokens, 1024]);
+            time(
+                &format!("linear qkv x[1,{tokens},1024]"),
+                n,
+                &device,
+                || linear(&x, &w_qkv).unwrap(),
+            );
+            let x2 = x.reshape((tokens, 1024)).unwrap();
+            time(
+                &format!("matmul 2-D x[{tokens},1024]·wᵀ"),
+                n,
+                &device,
+                || x2.matmul(&w_qkv.t().unwrap()).unwrap(),
+            );
+        }
+        let ln = candle_nn::LayerNorm::new(f16(&[1024]), f16(&[1024]), LAYER_NORM_EPS);
+        let x = f16(&[1, 9, 1024]);
+        time("layer_norm [1,9,1024]", n, &device, || {
+            ln.forward(&x).unwrap()
+        });
+        let q = f16(&[1, 16, 9, 64]);
+        time("attention causal [1,16,9,64]", n, &device, || {
+            attention(&q, &q, &q, true).unwrap()
+        });
+        time("attention [1,16,1,64]x9", n, &device, || {
+            attention(&q.narrow(2, 8, 1).unwrap(), &q, &q, false).unwrap()
+        });
+        let last = f16(&[1, 1024]);
+        time(
+            "head logits [1,1024]·[2048]ᵀ → F32",
+            n,
+            &device,
+            || {
+                linear(&last, &w_head)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+            },
+        );
+        let logits = Tensor::randn(0f32, 1.0, (1, 2048), &device).unwrap();
+        let gumbel = Tensor::randn(0f32, 1.0, (1, 2048), &device).unwrap();
+        time("sample_depth_level [1,2048]", n, &device, || {
+            sample_depth_level(&logits, 0.7, 64, &gumbel).unwrap()
+        });
+        time("sort_last_dim [2,1024]", n, &device, || {
+            logits
+                .reshape((2, 1024))
+                .unwrap()
+                .sort_last_dim(false)
+                .unwrap()
+                .0
+        });
+        let table = f16(&[CODEBOOKS * CODEBOOK_SIZE, 1024]);
+        let code = Tensor::new(&[5u32], &device).unwrap();
+        time("prefix embedding gather", n, &device, || {
+            let offset = Tensor::new(2048u32, &device).unwrap();
+            table
+                .index_select(&code.broadcast_add(&offset).unwrap(), 0)
+                .unwrap()
+        });
+        time("gelu_erf [1,9,3072]", n, &device, || {
+            f16(&[1, 9, 3072]).gelu_erf().unwrap()
+        });
+        let a = f16(&[1, 9, 1024]);
+        time("add [1,9,1024]", n, &device, || (&a + &a).unwrap());
+        time("qkv split contiguous", n, &device, || {
+            f16(&[1, 9, 3, 16, 64])
+                .narrow(2, 0, 1)
+                .unwrap()
+                .squeeze(2)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        });
     }
 }
