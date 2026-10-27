@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod frames;
+pub mod gguf;
 mod model;
 pub mod noise;
 mod physical;
@@ -39,6 +40,7 @@ pub use config::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1LmConfig, Maya1VoicePreset, MAYA1_DEFAULTS,
     MAYA1_DEFAULT_VOICE, MAYA1_INLINE_TAGS, MAYA1_VOICE_PRESETS, SAMPLE_RATE,
 };
+pub use gguf::MAYA1_GGUF_FILE;
 pub use model::{maya1_lm_precision, Maya1TtsDiagnostics, Maya1TtsModel};
 pub(crate) use model::{maya1_reloads_in_f32, Maya1AudioProgress};
 pub(crate) use physical::MAYA1_DOMAIN;
@@ -155,6 +157,29 @@ impl Maya1Runtime {
         let tokenizer = Maya1Tokenizer::load(&model_dir.join(config::TOKENIZER_FILE))?;
         let vb = weights::mmap_lm(model_dir, dtype, device)?;
         let trunk = Maya1Trunk::load(cfg, vb, STATE_CONTEXT_TOKENS)?;
+        Self::assemble(model_dir, tokenizer, trunk, device)
+    }
+
+    /// Load the GGUF release from `model_dir`: the decoder's weights in
+    /// Q8_0 as stored, run in F32, and SNAC in F32.
+    pub fn load_gguf(model_dir: &Path, device: &Device) -> Result<Self> {
+        let cfg = Maya1LmConfig::load(model_dir)?;
+        let tokenizer = Maya1Tokenizer::load(&model_dir.join(config::TOKENIZER_FILE))?;
+        let trunk = gguf::load_gguf_trunk(
+            &model_dir.join(MAYA1_GGUF_FILE),
+            cfg,
+            device,
+            STATE_CONTEXT_TOKENS,
+        )?;
+        Self::assemble(model_dir, tokenizer, trunk, device)
+    }
+
+    fn assemble(
+        model_dir: &Path,
+        tokenizer: Maya1Tokenizer,
+        trunk: Maya1Trunk,
+        device: &Device,
+    ) -> Result<Self> {
         let snac = SnacDecoder::load(&model_dir.join(config::SNAC_WEIGHTS_FILE), device)?;
         Ok(Self {
             model_dir: model_dir.to_path_buf(),

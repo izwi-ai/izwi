@@ -73,6 +73,7 @@ export function isMaya1Variant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
     normalized === "maya1-3b" ||
+    normalized === "maya1-3b-gguf" ||
     normalized === "maya-research/maya1" ||
     normalized === "maya1" ||
     normalized === "maya-1"

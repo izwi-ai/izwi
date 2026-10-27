@@ -73,7 +73,16 @@ impl Maya1TtsModel {
         // 13.2 GB of weights, past what most Macs give the GPU, so a decoder
         // failing its F16 probe is refused there instead of reloaded.
         let selection = maya1_lm_precision(&device);
-        let runtime = if maya1_reloads_in_f32(&device, selection.dtype) {
+        let runtime = if variant.is_maya1_gguf() {
+            // Q8_0 weights with F32 activations everywhere: nothing narrower
+            // than F32 to probe.
+            let runtime = Maya1Runtime::load_gguf(model_dir, &device.device)?;
+            tracing::info!(
+                "Maya1 decoder on {:?}: Q8_0 weights, F32 activations",
+                device.kind
+            );
+            runtime
+        } else if maya1_reloads_in_f32(&device, selection.dtype) {
             let (runtime, precision) = load_with_precision_fallback(
                 "Maya1 decoder",
                 &selection,
@@ -143,7 +152,11 @@ impl Maya1TtsModel {
             model_family: "maya1_tts",
             variant: self.variant.to_string(),
             sample_rate: SAMPLE_RATE,
-            dtype: format!("{:?}", self.runtime.lm_dtype()),
+            dtype: if self.variant.is_maya1_gguf() {
+                "Q8_0 weights, F32 activations".to_string()
+            } else {
+                format!("{:?}", self.runtime.lm_dtype())
+            },
             context_tokens: self.context_tokens(),
             max_new_tokens: config::MAX_NEW_TOKENS,
         }

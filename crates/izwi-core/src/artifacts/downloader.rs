@@ -34,6 +34,7 @@ use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
 };
 use crate::models::architectures::maya1::config::SNAC_WEIGHTS_FILE;
+use crate::models::architectures::maya1::MAYA1_GGUF_FILE;
 use crate::models::architectures::nemotron::asr::nemotron_native_artifacts_complete;
 use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_complete;
 use crate::models::shared::weights::nemo::ensure_free_disk;
@@ -185,6 +186,28 @@ const MAYA1_FILES: &[&str] = &[
     "tokenizer.json",
     SNAC_WEIGHTS_FILE,
 ];
+
+/// Maya1's GGUF release: the Q8_0 decoder from `mradermacher/maya1-GGUF`,
+/// the config and tokenizer from Maya1's own repository at its pin (the
+/// GGUF repo ships neither as files), and SNAC.
+const MAYA1_GGUF_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    MAYA1_GGUF_FILE,
+    SNAC_WEIGHTS_FILE,
+];
+
+/// The exact size of `maya1.Q8_0.gguf` at the pinned revision (LFS sha256
+/// `529b6f9a…`).
+const MAYA1_GGUF_BYTES: u64 = 3_516_496_480;
+
+fn maya1_files(variant: ModelVariant) -> &'static [&'static str] {
+    if variant.is_maya1_gguf() {
+        MAYA1_GGUF_FILES
+    } else {
+        MAYA1_FILES
+    }
+}
 
 const FISH_S2_PRO_FILES: &[&str] = &[
     "README.md",
@@ -1694,7 +1717,9 @@ impl ModelDownloader {
                     && !crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true))
                     || path.join(file).exists()
             }),
-            ModelFamily::Maya1Tts => MAYA1_FILES.iter().all(|file| path.join(file).exists()),
+            ModelFamily::Maya1Tts => maya1_files(variant)
+                .iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -2384,7 +2409,10 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
-            ModelFamily::Maya1Tts => MAYA1_FILES.iter().map(|file| (*file).to_string()).collect(),
+            ModelFamily::Maya1Tts => maya1_files(variant)
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -2468,6 +2496,34 @@ impl ModelDownloader {
                             "main".to_string()
                         },
                         source_repo,
+                        source_file: file.clone(),
+                        local_file: file,
+                    }
+                })
+                .collect();
+        }
+
+        if variant.is_maya1_gguf() {
+            // The config and tokenizer come from Maya1's own release at its
+            // pin; SNAC's pinned source overrides its spec.
+            let companion = ModelVariant::Maya13B;
+            let companion_revision = companion.artifact_revision().unwrap_or("main");
+            return self
+                .get_model_files(variant)
+                .into_iter()
+                .map(|file| {
+                    let (source_repo, source_revision) =
+                        if file == MAYA1_GGUF_FILE || file == SNAC_WEIGHTS_FILE {
+                            (default_repo.clone(), default_revision.clone())
+                        } else {
+                            (
+                                companion.repo_id().to_string(),
+                                companion_revision.to_string(),
+                            )
+                        };
+                    ModelFileSpec {
+                        source_repo,
+                        source_revision,
                         source_file: file.clone(),
                         local_file: file,
                     }
@@ -2881,6 +2937,7 @@ impl ModelDownloader {
                 "model-00002-of-00002.safetensors" => 1_610_725_592,
                 "tokenizer.json" => 22_853_258,
                 "model.safetensors.index.json" => 20_955,
+                MAYA1_GGUF_FILE => MAYA1_GGUF_BYTES,
                 SNAC_WEIGHTS_FILE => SNAC_24KHZ_CHECKPOINT.size,
                 _ => 860,
             }
@@ -4029,6 +4086,52 @@ mod tests {
             ),
             GRANITE_SPEECH_5_MODEL_BYTES
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// Maya1's GGUF release takes the Q8_0 decoder from the GGUF repo, the
+    /// config and tokenizer from Maya1's repo, each pinned, and SNAC from
+    /// its pinned checkpoint.
+    #[test]
+    fn maya1_gguf_specs_pin_both_repos_and_snac() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Maya13BGguf;
+        let specs = downloader.get_model_file_specs(variant);
+        assert_eq!(specs.len(), MAYA1_GGUF_FILES.len());
+        for spec in &specs {
+            let (repo, revision) = if spec.local_file == MAYA1_GGUF_FILE {
+                (
+                    "mradermacher/maya1-GGUF",
+                    ModelVariant::MAYA1_GGUF_ARTIFACT_REVISION,
+                )
+            } else if spec.local_file == SNAC_WEIGHTS_FILE {
+                assert_eq!(
+                    pinned_file(variant, &spec.local_file),
+                    Some(SNAC_24KHZ_CHECKPOINT)
+                );
+                continue;
+            } else {
+                ("maya-research/maya1", ModelVariant::MAYA1_ARTIFACT_REVISION)
+            };
+            assert_eq!(spec.source_repo, repo, "{}", spec.local_file);
+            assert_eq!(spec.source_revision, revision, "{}", spec.local_file);
+            assert_eq!(spec.source_file, spec.local_file);
+        }
+        assert!(!specs
+            .iter()
+            .any(|spec| spec.local_file.ends_with(".safetensors")));
+        assert_eq!(
+            downloader.get_single_file_size_estimate(variant, MAYA1_GGUF_FILE),
+            MAYA1_GGUF_BYTES
+        );
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        for file in &MAYA1_GGUF_FILES[..MAYA1_GGUF_FILES.len() - 1] {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial Maya1 asset");
+        }
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(model_dir.join(SNAC_WEIGHTS_FILE), [0u8]).expect("SNAC");
+        assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

@@ -419,7 +419,7 @@ fn rotate_half_split(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use candle_core::{DType, Device, Tensor, D};
@@ -431,7 +431,7 @@ mod tests {
 
     /// Maya1's layout at toy width: GQA 4/2, head 16, two layers; the
     /// vocabulary must still reach the audio codes.
-    fn tiny_config() -> Maya1LmConfig {
+    pub(crate) fn tiny_config() -> Maya1LmConfig {
         Maya1LmConfig {
             hidden_size: 64,
             intermediate_size: 96,
@@ -461,7 +461,7 @@ mod tests {
         Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
     }
 
-    fn tiny_weights(cfg: &Maya1LmConfig) -> HashMap<String, Tensor> {
+    pub(crate) fn tiny_weights(cfg: &Maya1LmConfig) -> HashMap<String, Tensor> {
         let mut rng = SplitMix64::new(11);
         let h = cfg.hidden_size;
         let mut weights = HashMap::new();
@@ -505,7 +505,7 @@ mod tests {
 
     /// A plain Llama forward over the whole sequence (explicit causal
     /// attention, K/V heads repeated): head-row logits at every position.
-    fn dense_reference(
+    pub(crate) fn dense_reference(
         cfg: &Maya1LmConfig,
         w: &HashMap<String, Tensor>,
         tokens: &[u32],
@@ -584,7 +584,7 @@ mod tests {
             .unwrap()
     }
 
-    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    pub(crate) fn max_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)
             .map(|(x, y)| {

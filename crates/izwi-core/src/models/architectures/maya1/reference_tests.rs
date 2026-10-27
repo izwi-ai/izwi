@@ -3,12 +3,13 @@
 //! `tests/fixtures/maya1`).
 //!
 //! The sampler test runs everywhere. The others need the checkpoint
-//! (`IZWI_MAYA1_MODEL_DIR`, with `snac_24khz.pth` beside it) and are
-//! ignored by default:
+//! (`IZWI_MAYA1_MODEL_DIR`, with `snac_24khz.pth` beside it), and the GGUF
+//! ones the GGUF release too (`IZWI_MAYA1_GGUF_DIR`), and are ignored by
+//! default:
 //!
 //! ```text
-//! IZWI_MAYA1_MODEL_DIR=… cargo test -p izwi-core --features metal --lib \
-//!     maya1::reference_tests -- --ignored --test-threads=1
+//! IZWI_MAYA1_MODEL_DIR=… IZWI_MAYA1_GGUF_DIR=… cargo test -p izwi-core \
+//!     --features metal --lib maya1::reference_tests -- --ignored --test-threads=1
 //! ```
 
 use std::collections::BTreeMap;
@@ -32,6 +33,14 @@ fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(
         std::env::var("IZWI_MAYA1_MODEL_DIR")
             .expect("set IZWI_MAYA1_MODEL_DIR to a Maya1-3B download (with snac_24khz.pth)"),
+    )
+}
+
+/// The GGUF release's directory for the ignored GGUF tests.
+fn gguf_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("IZWI_MAYA1_GGUF_DIR")
+            .expect("set IZWI_MAYA1_GGUF_DIR to a Maya1-3B-GGUF download"),
     )
 }
 
@@ -327,5 +336,162 @@ fn full_decoder_tracks_upstream_bf16_on_metal() {
         assert!(shared >= 6, "step {step}: {shared}/8 of the top-8 shared");
         let error = sample_error(&format!("step {step}"), row, &[HEAD_ROWS], &record.sample);
         assert!(error < 0.1, "step {step} head error {error}");
+    }
+}
+
+/// Every projection the GGUF loader builds is the shards' within Q8_0's
+/// error, its Q and K rows back in half-split order, and the head's rows
+/// are the table's from the stop token on.
+#[test]
+#[ignore = "needs both Maya1 releases (IZWI_MAYA1_MODEL_DIR, IZWI_MAYA1_GGUF_DIR)"]
+fn gguf_projections_match_the_shards() {
+    use candle_core::safetensors::MmapedSafetensors;
+    use candle_core::Tensor;
+
+    use super::config::{HEAD_FIRST_TOKEN, WEIGHT_SHARDS};
+    use crate::backends::BackendKind;
+    use crate::models::shared::weights::gguf::GgufLoader;
+    use crate::models::shared::weights::gguf_projection::{
+        joined_qtensor, row_slice_qtensor, QuantizedPart,
+    };
+
+    let cfg = Maya1LmConfig::pinned();
+    let paths = WEIGHT_SHARDS
+        .iter()
+        .map(|shard| model_dir().join(shard))
+        .collect::<Vec<_>>();
+    // The shards are not written while the test maps them.
+    let shards = unsafe { MmapedSafetensors::multi(&paths) }.unwrap();
+    let gguf = GgufLoader::from_path_with_backend(
+        &gguf_dir().join(super::MAYA1_GGUF_FILE),
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let cpu = Device::Cpu;
+    let dense = |names: &[String]| -> Tensor {
+        let parts = names
+            .iter()
+            .map(|name| {
+                shards
+                    .load(name, &cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        Tensor::cat(&parts, 0).unwrap()
+    };
+    // Relative RMS error; Q8_0 keeps it near 0.5%.
+    let relative = |ours: &Tensor, theirs: &Tensor| -> f32 {
+        let diff = (ours - theirs).unwrap().sqr().unwrap().mean_all().unwrap();
+        let scale = theirs.sqr().unwrap().mean_all().unwrap();
+        (diff.to_scalar::<f32>().unwrap() / scale.to_scalar::<f32>().unwrap()).sqrt()
+    };
+    for layer in [0, cfg.num_hidden_layers / 2, cfg.num_hidden_layers - 1] {
+        let hf = |name: &str| format!("model.layers.{layer}.{name}.weight");
+        let blk = |name: &str| format!("blk.{layer}.{name}.weight");
+        let (q, k, v) = (blk("attn_q"), blk("attn_k"), blk("attn_v"));
+        let ours = joined_qtensor(
+            &gguf,
+            &[
+                QuantizedPart {
+                    name: &q,
+                    rope_heads: Some(cfg.num_attention_heads),
+                },
+                QuantizedPart {
+                    name: &k,
+                    rope_heads: Some(cfg.num_key_value_heads),
+                },
+                QuantizedPart {
+                    name: &v,
+                    rope_heads: None,
+                },
+            ],
+            &cpu,
+        )
+        .unwrap()
+        .dequantize(&cpu)
+        .unwrap();
+        let theirs = dense(&[
+            hf("self_attn.q_proj"),
+            hf("self_attn.k_proj"),
+            hf("self_attn.v_proj"),
+        ]);
+        let error = relative(&ours, &theirs);
+        assert!(error < 0.02, "layer {layer} qkv: {error}");
+        let (gate, up) = (blk("ffn_gate"), blk("ffn_up"));
+        let ours = joined_qtensor(
+            &gguf,
+            &[
+                QuantizedPart {
+                    name: &gate,
+                    rope_heads: None,
+                },
+                QuantizedPart {
+                    name: &up,
+                    rope_heads: None,
+                },
+            ],
+            &cpu,
+        )
+        .unwrap()
+        .dequantize(&cpu)
+        .unwrap();
+        let theirs = dense(&[hf("mlp.gate_proj"), hf("mlp.up_proj")]);
+        let error = relative(&ours, &theirs);
+        assert!(error < 0.02, "layer {layer} gate/up: {error}");
+    }
+    let head = HEAD_FIRST_TOKEN as usize;
+    let ours = row_slice_qtensor(&gguf, "token_embd.weight", head..head + HEAD_ROWS, &cpu)
+        .unwrap()
+        .dequantize(&cpu)
+        .unwrap();
+    let theirs = shards
+        .load("model.embed_tokens.weight", &cpu)
+        .unwrap()
+        .narrow(0, head, HEAD_ROWS)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+    let error = relative(&ours, &theirs);
+    assert!(error < 0.02, "head rows: {error}");
+}
+
+/// The GGUF release's whole decoder (Q8_0 weights, F32 activations) on the
+/// best local device against transformers in BF16: quantization may swap
+/// near-tied codes, so the likeliest code is upstream's top three and most
+/// of the top eight are shared.
+#[test]
+#[ignore = "needs the GGUF release (IZWI_MAYA1_GGUF_DIR)"]
+fn gguf_decoder_tracks_upstream_bf16() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    #[cfg(feature = "metal")]
+    let _lease = crate::backends::metal_test_device_or_skip("gguf_decoder_tracks_upstream_bf16");
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Auto).unwrap();
+    let fixture: LmFixture = fixture("lm.json");
+    let runtime = Maya1Runtime::load_gguf(&gguf_dir(), &profile.device).unwrap();
+    assert_eq!(runtime.lm_dtype(), DType::F32);
+    let logits = forced_head_logits(&runtime, &fixture);
+    for (step, record) in &fixture.full_bf16 {
+        let row = &logits[&step.parse::<usize>().unwrap()];
+        let ours = top8(row);
+        assert!(
+            record.top[..3]
+                .iter()
+                .any(|(theirs, _)| *theirs == ours[0].0),
+            "step {step}: likeliest code {} is not upstream's top three",
+            ours[0].0
+        );
+        let shared = ours
+            .iter()
+            .filter(|(row, _)| record.top.iter().any(|(theirs, _)| theirs == row))
+            .count();
+        assert!(shared >= 5, "step {step}: {shared}/8 of the top-8 shared");
+        let error = sample_error(&format!("step {step}"), row, &[HEAD_ROWS], &record.sample);
+        eprintln!(
+            "step {step}: top-1 {} shared {shared}/8 error {error:.4}",
+            ours[0].0
+        );
+        assert!(error < 0.25, "step {step} head error {error}");
     }
 }

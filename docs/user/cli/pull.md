@@ -76,6 +76,7 @@ Common models:
 | `Chatterbox-500M` | TTS (English, cloning from audio alone, watermarked) | ~3.2 GB |
 | `Chatterbox-Multilingual-500M` | TTS (22 languages, cloning from audio alone, watermarked) | ~3.3 GB |
 | `Maya1-3B` | TTS (voice design from a description, emotion tags) | ~6.7 GB |
+| `Maya1-3B-GGUF` | TTS (Maya1 with a Q8_0 decoder) | ~3.6 GB |
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~2.5 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | ASR (NVIDIA multilingual `.nemo`) | ~2.37 GB |

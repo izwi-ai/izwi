@@ -59,6 +59,7 @@
 //!   priced from the archive's payload size (`price_nemo_first_load`).
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use candle_core::quantized::GgmlDType;
@@ -902,7 +903,7 @@ impl Ledger {
 
     /// A GGUF tensor kept quantized (`QTensor` / `QMatMul`), read through a
     /// host buffer.
-    fn gguf_stored(&mut self, tensor: &CensusTensor) -> Result<()> {
+    pub(super) fn gguf_stored(&mut self, tensor: &CensusTensor) -> Result<()> {
         let stored = tensor.stored_bytes;
         self.apply(if self.backend == BackendKind::Cuda {
             let resident = sum(&[stored, cuda_qtensor_padding(tensor)?])?;
@@ -997,7 +998,7 @@ impl Ledger {
     /// uploaded once as one `QTensor` (`granite_speech5/asr/gguf.rs`). Each
     /// part is read whole (the GGUF bytes and Candle's copy of them) while
     /// the join grows; the join is alive with the upload.
-    fn gguf_host_joined(&mut self, parts: &[&CensusTensor]) -> Result<()> {
+    pub(super) fn gguf_host_joined(&mut self, parts: &[&CensusTensor]) -> Result<()> {
         let first = parts.first().ok_or_else(overflow)?;
         let stored = sum(&parts
             .iter()
@@ -1012,6 +1013,42 @@ impl Ledger {
         let uploading = sum(&[stored, stored])?;
         self.apply(if self.backend == BackendKind::Cuda {
             let resident = sum(&[stored, cuda_qtensor_padding(first)?])?;
+            Step {
+                logical: stored,
+                resident,
+                high: resident,
+                host: reading.max(stored),
+                ..Step::default()
+            }
+        } else {
+            Step {
+                logical: stored,
+                resident: stored,
+                high: reading.max(uploading),
+                ..Step::default()
+            }
+        })
+    }
+
+    /// Rows `rows` of a quantized GGUF tensor read on the host and uploaded as
+    /// their own `QTensor` (`gguf_projection::row_slice_qtensor`): the whole
+    /// tensor is read (the GGUF bytes and Candle's copy of them) while the
+    /// rows are copied out, and the copy is alive with the upload.
+    pub(super) fn gguf_host_rows(&mut self, tensor: &CensusTensor, rows: Range<u64>) -> Result<()> {
+        let total = dim(tensor, 0)?;
+        if rows.start >= rows.end || rows.end > total {
+            return Err(Error::ModelLoadError(format!(
+                "Checkpoint tensor `{}` has {total} rows; rows {rows:?} are out of range",
+                tensor.name
+            )));
+        }
+        let stored = (tensor.stored_bytes / total)
+            .checked_mul(rows.end - rows.start)
+            .ok_or_else(overflow)?;
+        let reading = sum(&[tensor.stored_bytes, tensor.stored_bytes, stored])?;
+        let uploading = sum(&[stored, stored])?;
+        self.apply(if self.backend == BackendKind::Cuda {
+            let resident = sum(&[stored, cuda_qtensor_padding(tensor)?])?;
             Step {
                 logical: stored,
                 resident,
@@ -1392,7 +1429,10 @@ pub(super) fn by_name(files: &[CensusFile]) -> BTreeMap<&str, &CensusTensor> {
         .collect()
 }
 
-fn tensor<'a>(tensors: &BTreeMap<&str, &'a CensusTensor>, name: &str) -> Result<&'a CensusTensor> {
+pub(super) fn tensor<'a>(
+    tensors: &BTreeMap<&str, &'a CensusTensor>,
+    name: &str,
+) -> Result<&'a CensusTensor> {
     tensors
         .get(name)
         .copied()

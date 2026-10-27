@@ -266,6 +266,23 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "6.70 GB",
   },
+  "Maya1-3B-GGUF": {
+    shortName: "Maya1 GGUF",
+    fullName: "Maya1 by Maya Research (GGUF Q8_0)",
+    description:
+      "Maya1 with a Q8_0 decoder: the same described voices and inline emotion tags in about half the download and weight memory.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Design",
+      "Emotion Tags",
+      "Streaming",
+      "24 kHz",
+      "GGUF",
+      "Q8_0",
+    ],
+    size: "3.62 GB",
+  },
   // Text Chat
   "Qwen3.5-0.8B": {
     shortName: "Qwen3.5 0.8B",

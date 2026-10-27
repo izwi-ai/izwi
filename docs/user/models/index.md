@@ -23,6 +23,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
 | Chatterbox Multilingual (22 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
 | Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
+| Maya1 GGUF (the same, Q8_0 decoder) | `Maya1-3B-GGUF` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
@@ -55,7 +56,10 @@ Those endpoints only show variants that are enabled for download/use.
 > (`<laugh>`, `<sigh>`, `<whisper>`, …) make it laugh, sigh or whisper there.
 > At 3B parameters it is real time on recent NVIDIA GPUs and slower than real
 > time on Apple Silicon and CPUs. The download (about 6.7 GB) includes the SNAC
-> 24 kHz decoder from its own repository.
+> 24 kHz decoder from its own repository. `Maya1-3B-GGUF` is the same model with
+> its decoder quantized to Q8_0 (llama.cpp's conversion, published as
+> `mradermacher/maya1-GGUF`): about 3.6 GB to download and half the weight
+> memory, with the same voices and tags.
 
 > `Chatterbox-Multilingual-500M` is the same design trained on 23 languages,
 > with its own speech-token model (`t3_mtl23ls_v2`) and grapheme tokenizer and
@@ -178,8 +182,9 @@ izwi pull VibeVoice-ASR
 izwi pull Chatterbox-500M
 izwi pull Chatterbox-Multilingual-500M
 
-# Download Maya Research Maya1 (about 6.7 GB)
+# Download Maya Research Maya1 (about 6.7 GB, or 3.6 GB as Q8_0 GGUF)
 izwi pull Maya1-3B
+izwi pull Maya1-3B-GGUF
 ```
 
 ### Via Web UI
