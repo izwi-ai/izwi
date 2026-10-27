@@ -1,0 +1,1041 @@
+[
+ {
+  "lang": "en",
+  "input": "I have 25 apples",
+  "output": "I have twenty five apples",
+  "source": "maya3/tests/test_text.py:21"
+ },
+ {
+  "lang": "hi",
+  "input": "मेरे पास 25 रुपये हैं",
+  "output": "मेरे पास पच्चीस रुपये हैं",
+  "source": "maya3/tests/test_text.py:22"
+ },
+ {
+  "lang": "te",
+  "input": "నా దగ్గర 25 రూపాయలు ఉన్నాయి",
+  "output": "నా దగ్గర ఇరవై ఐదు రూపాయలు ఉన్నాయి",
+  "source": "maya3/tests/test_text.py:23"
+ },
+ {
+  "lang": "en",
+  "input": "Your OTP is 482913.",
+  "output": "Your OTP is four, eight, two, nine, one, three.",
+  "source": "maya3/tests/test_text.py:24"
+ },
+ {
+  "lang": "hi",
+  "input": "आपका ओटीपी 4821 है",
+  "output": "आपका ओटीपी चार, आठ, दो, एक है",
+  "source": "maya3/tests/test_text.py:25"
+ },
+ {
+  "lang": "en",
+  "input": "Visit https://www.example.com/abc today",
+  "output": "Visit W W W dot example dot com slash abc today",
+  "source": "maya3/tests/test_text.py:26"
+ },
+ {
+  "lang": "en",
+  "input": "Email a.b@gmail.com",
+  "output": "Email A dot B at gmail dot com",
+  "source": "maya3/tests/test_text.py:27"
+ },
+ {
+  "lang": "en",
+  "input": "Ha [laughs] I have 3 cats",
+  "output": "Ha [laughs] I have three cats",
+  "source": "maya3/tests/test_text.py:28"
+ },
+ {
+  "lang": "hi",
+  "input": "मेरे पास 25 रुपये हैं [laughs] और 3 किताबें",
+  "output": "मेरे पास पच्चीस रुपये हैं [laughs] और तीन किताबें",
+  "source": "maya3/tests/test_text.py:29"
+ },
+ {
+  "lang": "ta",
+  "input": "  spaced   [sighs]  out 12%  ",
+  "output": "spaced [sighs] out பன்னிரண்டு சதவீதம்",
+  "source": "maya3/tests/test_text.py:30"
+ },
+ {
+  "lang": "bn",
+  "input": "২৫ টাকা",
+  "output": "পঁচিশ টাকা",
+  "source": "maya3/tests/test_text.py:31"
+ },
+ {
+  "lang": "en",
+  "input": "RAHUL KUMAR paid",
+  "output": "Rahul Kumar paid",
+  "source": "maya3/tests/test_text.py:38"
+ },
+ {
+  "lang": "en",
+  "input": "HDFC NEFT KYC done",
+  "output": "HDFC NEFT KYC done",
+  "source": "maya3/tests/test_text.py:39"
+ },
+ {
+  "lang": "en",
+  "input": "[laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:46"
+ },
+ {
+  "lang": "fr",
+  "input": "x 1",
+  "output": "x 1",
+  "source": "maya3/tests/test_text.py:55"
+ },
+ {
+  "lang": "mr",
+  "input": "कृपया लक्षात घ्या की तुमची मुदत ठेव 15-08-25 ला परिपक्व होत आहे",
+  "output": "कृपया लक्षात घ्या की तुमची मुदत ठेव पंधरा ऑगस्ट दोन हजार पंचवीस ला परिपक्व होत आहे",
+  "source": "maya3/tests/test_text.py:111"
+ },
+ {
+  "lang": "bn",
+  "input": "শেষ তারিখ 15-08-25 নির্ধারণ",
+  "output": "শেষ তারিখ পনেরো আগস্ট দুই হাজার পঁচিশ নির্ধারণ",
+  "source": "maya3/tests/test_text.py:112"
+ },
+ {
+  "lang": "bn",
+  "input": "ট্রানজ্যাকশন 9/9/99 তারিখে",
+  "output": "ট্রানজ্যাকশন নয় সেপ্টেম্বর উনিশশো নিরানব্বই তারিখে",
+  "source": "maya3/tests/test_text.py:113"
+ },
+ {
+  "lang": "or",
+  "input": "12-05-24 ତାରିଖରେ",
+  "output": "ବାର ମଇ ଦୁଇ ହଜାର ଚବିଶି ତାରିଖରେ",
+  "source": "maya3/tests/test_text.py:114"
+ },
+ {
+  "lang": "en",
+  "input": "starting from 05/11/24.",
+  "output": "starting from five November two thousand twenty four.",
+  "source": "maya3/tests/test_text.py:115"
+ },
+ {
+  "lang": "ml",
+  "input": "കാലാവധി 15-08-25 ന്",
+  "output": "കാലാവധി പതിനഞ്ച് ഓഗസ്റ്റ് രണ്ടായിരത്തി ഇരുപത്തിയഞ്ചിന്",
+  "source": "maya3/tests/test_text.py:116"
+ },
+ {
+  "lang": "kn",
+  "input": "ಕಾರ್ಡ್‌ನ ಅಂತಿಮ ದಿನಾಂಕ 11/26 ಮತ್ತು CVV 456 ನಮೂದಿಸಿ.",
+  "output": "ಕಾರ್ಡ್‌ನ ಅಂತಿಮ ದಿನಾಂಕ ನವೆಂಬರ್ ಎರಡು ಸಾವಿರದ ಇಪ್ಪತ್ತಾರು ಮತ್ತು CVV ನಾಲ್ಕು, ಐದು, ಆರು ನಮೂದಿಸಿ.",
+  "source": "maya3/tests/test_text.py:118"
+ },
+ {
+  "lang": "te",
+  "input": "కార్డు గడువు తేదీ 08/25 మరియు CVV 456",
+  "output": "కార్డు గడువు తేదీ ఆగస్టు రెండు వేల ఇరవై ఐదు మరియు CVV నాలుగు, ఐదు, ఆరు",
+  "source": "maya3/tests/test_text.py:119"
+ },
+ {
+  "lang": "mr",
+  "input": "एक्सपायरी डेट 12/25 टाका.",
+  "output": "एक्सपायरी डेट डिसेंबर दोन हजार पंचवीस टाका.",
+  "source": "maya3/tests/test_text.py:120"
+ },
+ {
+  "lang": "pa",
+  "input": "ਵਿੱਤੀ ਸਾਲ 2023-24 ਲਈ",
+  "output": "ਵਿੱਤੀ ਸਾਲ ਦੋ ਹਜ਼ਾਰ ਤੇਈ ਚੌਵੀ ਲਈ",
+  "source": "maya3/tests/test_text.py:122"
+ },
+ {
+  "lang": "hi",
+  "input": "वित्त वर्ष 2023-24",
+  "output": "वित्त वर्ष दो हजार तेईस चौबीस",
+  "source": "maya3/tests/test_text.py:123"
+ },
+ {
+  "lang": "mr",
+  "input": "तुमच्या 4111 2233 4455 6677 या कार्डवरून",
+  "output": "तुमच्या चार, एक, एक, एक, दोन, दोन, तीन, तीन, चार, चार, पाच, पाच, सहा, सहा, सात, सात या कार्डवरून",
+  "source": "maya3/tests/test_text.py:125"
+ },
+ {
+  "lang": "kn",
+  "input": "ಒಟಿಪಿಯನ್ನು 98765 43210 ಗೆ ಕಳುಹಿಸುತ್ತಿದ್ದೇನೆ",
+  "output": "ಒಟಿಪಿಯನ್ನು ಒಂಬತ್ತು, ಎಂಟು, ಏಳು, ಆರು, ಐದು, ನಾಲ್ಕು, ಮೂರು, ಎರಡು, ಒಂದು, ಸೊನ್ನೆಗೆ ಕಳುಹಿಸುತ್ತಿದ್ದೇನೆ",
+  "source": "maya3/tests/test_text.py:126"
+ },
+ {
+  "lang": "en",
+  "input": "call 98765 43210",
+  "output": "call nine, eight, seven, six, five, four, three, two, one, zero",
+  "source": "maya3/tests/test_text.py:127"
+ },
+ {
+  "lang": "hi",
+  "input": "कृपया अपना यूपीआई पिन 4532 दर्ज करें",
+  "output": "कृपया अपना यूपीआई पिन चार, पाँच, तीन, दो दर्ज करें",
+  "source": "maya3/tests/test_text.py:129"
+ },
+ {
+  "lang": "ta",
+  "input": "சென்னை 600018 என்ற முகவரியில்",
+  "output": "சென்னை ஆறு, பூஜ்ஜியம், பூஜ்ஜியம், பூஜ்ஜியம், ஒன்று, எட்டு என்ற முகவரியில்",
+  "source": "maya3/tests/test_text.py:131"
+ },
+ {
+  "lang": "en",
+  "input": "Bengaluru 560038.",
+  "output": "Bengaluru five, six, zero, zero, three, eight.",
+  "source": "maya3/tests/test_text.py:132"
+ },
+ {
+  "lang": "mr",
+  "input": "नागपूर 440010 येथे",
+  "output": "नागपूर चार, चार, शून्य, शून्य, एक, शून्य येथे",
+  "source": "maya3/tests/test_text.py:133"
+ },
+ {
+  "lang": "as",
+  "input": "যোৰহাট 785001 ত",
+  "output": "যোৰহাট সাত, আঠ, পাঁচ, শূন্য, শূন্য, এক ত",
+  "source": "maya3/tests/test_text.py:134"
+ },
+ {
+  "lang": "kn",
+  "input": "ಪುಣೆಯ 411001 ಅಂಚೆ ಕಚೇರಿಯಲ್ಲಿ",
+  "output": "ಪುಣೆಯ ನಾಲ್ಕು, ಒಂದು, ಒಂದು, ಸೊನ್ನೆ, ಸೊನ್ನೆ, ಒಂದು ಅಂಚೆ ಕಚೇರಿಯಲ್ಲಿ",
+  "source": "maya3/tests/test_text.py:135"
+ },
+ {
+  "lang": "hi",
+  "input": "ऐप को v4.5.2 पर अपडेट करें",
+  "output": "ऐप को वी चार दशमलव पाँच दशमलव दो पर अपडेट करें",
+  "source": "maya3/tests/test_text.py:137"
+ },
+ {
+  "lang": "ta",
+  "input": "கடந்த ஆகஸ்ட் 15, 2025 அன்று",
+  "output": "கடந்த ஆகஸ்ட் பதினைந்தாம் தேதி இரண்டாயிரத்து இருபத்தைந்து அன்று",
+  "source": "maya3/tests/test_text.py:139"
+ },
+ {
+  "lang": "en",
+  "input": "₹1,25,000.50 has been credited",
+  "output": "one lakh twenty five thousand rupees fifty paise has been credited",
+  "source": "maya3/tests/test_text.py:141"
+ },
+ {
+  "lang": "bn",
+  "input": "পরিমাণ হল ₹95.41, যা",
+  "output": "পরিমাণ হল পঁচানব্বই টাকা একচল্লিশ পয়সা, যা",
+  "source": "maya3/tests/test_text.py:142"
+ },
+ {
+  "lang": "gu",
+  "input": "મોત્તા (₹5,400.50) નેગેટિવ",
+  "output": "મોત્તા, પાંચ હજાર ચારસો રૂપિયા પચાસ પૈસા, નેગેટિવ",
+  "source": "maya3/tests/test_text.py:143"
+ },
+ {
+  "lang": "kn",
+  "input": "ಮೊತ್ತ ₹4,500.50 ಮರುಪಾವತಿ",
+  "output": "ಮೊತ್ತ ನಾಲ್ಕು ಸಾವಿರದ ಐನೂರು ರೂಪಾಯಿ ಐವತ್ತು ಪೈಸೆ ಮರುಪಾವತಿ",
+  "source": "maya3/tests/test_text.py:144"
+ },
+ {
+  "lang": "ml",
+  "input": "ബിൽ ₹95.41 ആണ്",
+  "output": "ബിൽ തൊണ്ണൂറ്റിയഞ്ച് രൂപ നാൽപ്പത്തിയൊന്ന് പൈസ ആണ്",
+  "source": "maya3/tests/test_text.py:145"
+ },
+ {
+  "lang": "mr",
+  "input": "बिल ₹95.41 आहे",
+  "output": "बिल पंच्याण्णव रुपये एक्केचाळीस पैसे आहे",
+  "source": "maya3/tests/test_text.py:146"
+ },
+ {
+  "lang": "pa",
+  "input": "ਬਿੱਲ ₹95.41 ਹੈ",
+  "output": "ਬਿੱਲ ਪਚਾਨਵੇਂ ਰੁਪਏ ਇਕਤਾਲੀ ਪੈਸੇ ਹੈ",
+  "source": "maya3/tests/test_text.py:147"
+ },
+ {
+  "lang": "ta",
+  "input": "தொகை ₹15,430.50 ஆகும்",
+  "output": "தொகை பதினைந்தாயிரத்து நானூற்று முப்பது ரூபாய் ஐம்பது பைசா ஆகும்",
+  "source": "maya3/tests/test_text.py:148"
+ },
+ {
+  "lang": "hi",
+  "input": "नौ, आठ, सात, [curious] छह, पाँच",
+  "output": "नौ, आठ, सात. [curious] छह, पाँच",
+  "source": "maya3/tests/test_text.py:185"
+ },
+ {
+  "lang": "pa",
+  "input": "kyc_update@safebank-india.com ਤੇ ਭੇਜੋ",
+  "output": "ਕੇ ਵਾਈ ਸੀ ਅੰਡਰਸਕੋਰ update ਐਟ ਦ ਰੇਟ safebank ਡੈਸ਼ india ਡਾਟ com ਤੇ ਭੇਜੋ",
+  "source": "maya3/tests/test_text.py:193"
+ },
+ {
+  "lang": "as",
+  "input": "4 8 9 30 45 71",
+  "output": "চাৰি আঠ ন ত্ৰিশ পঞ্চল্লিশ একসত্তৰ",
+  "source": "maya3/tests/test_text.py:207"
+ },
+ {
+  "lang": "as",
+  "input": "₹1,250.50",
+  "output": "এক হাজাৰ দুশ পঞ্চাশ টকা পঞ্চাশ পইচা",
+  "source": "maya3/tests/test_text.py:208"
+ },
+ {
+  "lang": "as",
+  "input": "2,50,00,000",
+  "output": "দুই কোটি পঞ্চাশ লাখ",
+  "source": "maya3/tests/test_text.py:209"
+ },
+ {
+  "lang": "as",
+  "input": "1st 4th 9th",
+  "output": "প্ৰথম চতুৰ্থ নৱম",
+  "source": "maya3/tests/test_text.py:210"
+ },
+ {
+  "lang": "as",
+  "input": "3.14",
+  "output": "তিনি দশমিক এক চাৰি",
+  "source": "maya3/tests/test_text.py:211"
+ },
+ {
+  "lang": "as",
+  "input": "12/03/2024",
+  "output": "বাৰ মাৰ্চ দুই হাজাৰ চৌবিশ",
+  "source": "maya3/tests/test_text.py:212"
+ },
+ {
+  "lang": "as",
+  "input": "পুৱা 10:30 বজাত বিনিময়",
+  "output": "পুৱা দহ বাজি ত্ৰিশ মিনিটত বিনিময়",
+  "source": "maya3/tests/test_text.py:213"
+ },
+ {
+  "lang": "as",
+  "input": "ৰাতি 8:00 বজাৰ ভিতৰত",
+  "output": "ৰাতি আঠ বজাৰ ভিতৰত",
+  "source": "maya3/tests/test_text.py:214"
+ },
+ {
+  "lang": "as",
+  "input": "12:30 PM ত",
+  "output": "দুপৰীয়া বাৰ বাজি ত্ৰিশ মিনিটত",
+  "source": "maya3/tests/test_text.py:215"
+ },
+ {
+  "lang": "as",
+  "input": "₹50 ৰ এটা কেচবেক",
+  "output": "পঞ্চাশ টকাৰ এটা কেচবেক",
+  "source": "maya3/tests/test_text.py:216"
+ },
+ {
+  "lang": "as",
+  "input": "2.5% লৈকে",
+  "output": "দুই দশমিক পাঁচ শতাংশলৈকে",
+  "source": "maya3/tests/test_text.py:217"
+ },
+ {
+  "lang": "as",
+  "input": "45°C",
+  "output": "পঞ্চল্লিশ ডিগ্ৰী চেলছিয়াছ",
+  "source": "maya3/tests/test_text.py:218"
+ },
+ {
+  "lang": "as",
+  "input": "3/4",
+  "output": "তিনি চতুৰ্থাংশ",
+  "source": "maya3/tests/test_text.py:219"
+ },
+ {
+  "lang": "as",
+  "input": "আমি আজি 2023 টা অভিযোগৰ",
+  "output": "আমি আজি দুই হাজাৰ তেইশ টা অভিযোগৰ",
+  "source": "maya3/tests/test_text.py:220"
+ },
+ {
+  "lang": "as",
+  "input": "support@hdfcbank.com লৈ",
+  "output": "support এট দ্য ৰেট এইচ ডি এফ সি bank ডট com লৈ",
+  "source": "maya3/tests/test_text.py:221"
+ },
+ {
+  "lang": "as",
+  "input": "ID TRN987654",
+  "output": "ID টি, আৰ, এন, ন, আঠ, সাত, ছয়, পাঁচ, চাৰি",
+  "source": "maya3/tests/test_text.py:222"
+ },
+ {
+  "lang": "bn",
+  "input": "30",
+  "output": "ত্রিশ",
+  "source": "maya3/tests/test_text.py:250"
+ },
+ {
+  "lang": "bn",
+  "input": "40 km/h বেগে",
+  "output": "চল্লিশ কে এম প্রতি ঘণ্টা বেগে",
+  "source": "maya3/tests/test_text.py:254"
+ },
+ {
+  "lang": "as",
+  "input": "850 km/h আৰু",
+  "output": "আঠশ পঞ্চাশ কে এম প্ৰতি ঘণ্টা আৰু",
+  "source": "maya3/tests/test_text.py:255"
+ },
+ {
+  "lang": "mr",
+  "input": "45 km/h च्या",
+  "output": "पंचेचाळीस के एम प्रति तासच्या",
+  "source": "maya3/tests/test_text.py:256"
+ },
+ {
+  "lang": "gu",
+  "input": "120 km/h ની",
+  "output": "એકસો વીસ કે એમ પ્રતિ કલાકની",
+  "source": "maya3/tests/test_text.py:257"
+ },
+ {
+  "lang": "kn",
+  "input": "100 MB/s ಗಿಂತ",
+  "output": "ನೂರು ಎಂ ಬಿ ಪರ್ ಸೆಕೆಂಡ್ ಗಿಂತ",
+  "source": "maya3/tests/test_text.py:258"
+ },
+ {
+  "lang": "ta",
+  "input": "30 km/h வேகத்தில்",
+  "output": "முப்பது கே எம் பெர் ஹவர் வேகத்தில்",
+  "source": "maya3/tests/test_text.py:259"
+ },
+ {
+  "lang": "en",
+  "input": "speed 40 km/h",
+  "output": "speed forty kilometers per hour",
+  "source": "maya3/tests/test_text.py:260"
+ },
+ {
+  "lang": "en",
+  "input": "100 MB/s",
+  "output": "one hundred M B per second",
+  "source": "maya3/tests/test_text.py:261"
+ },
+ {
+  "lang": "mr",
+  "input": "तुमची पावती e-receipt.hdfcbank.com वर",
+  "output": "तुमची पावती ई डॅश receipt डॉट एच डी एफ सी bank डॉट com वर",
+  "source": "maya3/tests/test_text.py:269"
+ },
+ {
+  "lang": "pa",
+  "input": "netbanking.nationalbank.in ਤੋਂ",
+  "output": "netbanking ਡਾਟ nationalbank ਡਾਟ in ਤੋਂ",
+  "source": "maya3/tests/test_text.py:270"
+ },
+ {
+  "lang": "en",
+  "input": "Book on irctc.co.in.",
+  "output": "Book on I R C T C dot co dot in.",
+  "source": "maya3/tests/test_text.py:272"
+ },
+ {
+  "lang": "en",
+  "input": "pay rahul.deshmukh@okaxis now",
+  "output": "pay rahul dot deshmukh at okaxis now",
+  "source": "maya3/tests/test_text.py:274"
+ },
+ {
+  "lang": "as",
+  "input": "report-fraud@sbi.co.in ত",
+  "output": "report ডেশ্ব fraud এট দ্য ৰেট এছ বি আই ডট co ডট in ত",
+  "source": "maya3/tests/test_text.py:276"
+ },
+ {
+  "lang": "hi",
+  "input": "www.onlinesbi.sbi देखें",
+  "output": "डब्ल्यू डब्ल्यू डब्ल्यू डॉट online एस बी आई डॉट एस बी आई देखें",
+  "source": "maya3/tests/test_text.py:277"
+ },
+ {
+  "lang": "en",
+  "input": "kyc.axisbank.com",
+  "output": "K Y C dot axisbank dot com",
+  "source": "maya3/tests/test_text.py:278"
+ },
+ {
+  "lang": "en",
+  "input": "support@paytm.com",
+  "output": "support at paytm dot com",
+  "source": "maya3/tests/test_text.py:279"
+ },
+ {
+  "lang": "en",
+  "input": "sbi and kyc",
+  "output": "sbi and kyc",
+  "source": "maya3/tests/test_text.py:286"
+ },
+ {
+  "lang": "en",
+  "input": "Contact the public office",
+  "output": "Contact the public office",
+  "source": "maya3/tests/test_text.py:287"
+ },
+ {
+  "lang": "as",
+  "input": "3.5%-4% सुत",
+  "output": "তিনি দশমিক পাঁচৰ পৰা চাৰি শতাংশ सुत",
+  "source": "maya3/tests/test_text.py:292"
+ },
+ {
+  "lang": "en",
+  "input": "rate 3.5%-4%",
+  "output": "rate three point five to four percent",
+  "source": "maya3/tests/test_text.py:293"
+ },
+ {
+  "lang": "pa",
+  "input": "₹500/kg ਲੱਗੇਗਾ",
+  "output": "ਪੰਜ ਸੌ ਰੁਪਏ ਪ੍ਰਤੀ ਕੇ ਜੀ ਲੱਗੇਗਾ",
+  "source": "maya3/tests/test_text.py:295"
+ },
+ {
+  "lang": "or",
+  "input": "₹500/kg ଅତିରିକ୍ତ",
+  "output": "ପାଞ୍ଚ ଶହ ଟଙ୍କା ପ୍ରତି କେ ଜି ଅତିରିକ୍ତ",
+  "source": "maya3/tests/test_text.py:296"
+ },
+ {
+  "lang": "en",
+  "input": "₹500/kg extra",
+  "output": "five hundred rupees per kg extra",
+  "source": "maya3/tests/test_text.py:297"
+ },
+ {
+  "lang": "mr",
+  "input": "8.5% p.a. सुद",
+  "output": "आठ पूर्णांक पाच टक्के पी ए सुद",
+  "source": "maya3/tests/test_text.py:299"
+ },
+ {
+  "lang": "en",
+  "input": "7% p.a. interest",
+  "output": "seven percent per annum interest",
+  "source": "maya3/tests/test_text.py:300"
+ },
+ {
+  "lang": "en",
+  "input": "[laughs] 2 [sighs] [whispers] 3 [laughs]",
+  "output": "[laughs] two [sighs] [whispers] three [laughs]",
+  "source": "maya3/tests/test_text.py:45"
+ },
+ {
+  "lang": "en",
+  "input": "mail a-b@x.com",
+  "output": "dash",
+  "source": "maya3/tests/test_text.py:194",
+  "check": "contains"
+ },
+ {
+  "lang": "hi",
+  "input": "25",
+  "output": "पच्चीस",
+  "source": "maya3/tests/test_text.py:81"
+ },
+ {
+  "lang": "en",
+  "input": "Your OTP is 482913 [laughs]",
+  "output": "Your OTP is four, eight, two, nine, one, three [laughs]",
+  "source": "maya3/text/__init__.py:4"
+ },
+ {
+  "lang": "en",
+  "input": "15-08-25",
+  "output": "fifteen August two thousand twenty five",
+  "source": "maya3/text/README.md:26"
+ },
+ {
+  "lang": "en",
+  "input": "expiry 11/26",
+  "output": "November two thousand twenty six",
+  "source": "maya3/text/README.md:27",
+  "check": "contains"
+ },
+ {
+  "lang": "en",
+  "input": "2023-24",
+  "output": "two thousand twenty three twenty four",
+  "source": "maya3/text/README.md:28"
+ },
+ {
+  "lang": "en",
+  "input": "v4.5.2",
+  "output": "four point five point two",
+  "source": "maya3/text/README.md:32",
+  "check": "contains"
+ },
+ {
+  "lang": "en",
+  "input": "₹95.41",
+  "output": "ninety five rupees forty one paise",
+  "source": "maya3/text/README.md:34"
+ },
+ {
+  "lang": "bn",
+  "input": "40 km/h",
+  "output": "কে এম প্রতি ঘণ্টা",
+  "source": "maya3/text/README.md:49",
+  "check": "contains"
+ },
+ {
+  "lang": "as",
+  "input": "sbi.co.in",
+  "output": "এছ বি আই",
+  "source": "maya3/text/README.md:51",
+  "check": "contains"
+ },
+ {
+  "lang": "as",
+  "input": "hdfcbank.com",
+  "output": "এইচ ডি এফ সি bank",
+  "source": "maya3/text/README.md:51",
+  "check": "contains"
+ },
+ {
+  "lang": "en",
+  "input": "3.5%-4%",
+  "output": "three point five to four percent",
+  "source": "maya3/text/README.md:52"
+ },
+ {
+  "lang": "en",
+  "input": "8.5% p.a.",
+  "output": "per annum",
+  "source": "maya3/text/README.md:54",
+  "check": "contains"
+ },
+ {
+  "lang": "te",
+  "input": "10 గంటలకు",
+  "output": "పది గంటలకు",
+  "source": "maya3/text/tn/normalize.py:273"
+ },
+ {
+  "lang": "hi",
+  "input": "5 million",
+  "output": "पाँच million",
+  "source": "maya3/text/tn/normalize.py:516"
+ },
+ {
+  "lang": "en",
+  "input": "Dr. Rao",
+  "output": "doctor Rao",
+  "source": "maya3/text/tn/normalize.py:714"
+ },
+ {
+  "lang": "en",
+  "input": "approx.",
+  "output": "approximately.",
+  "source": "maya3/text/tn/normalize.py:715",
+  "check": "contains"
+ },
+ {
+  "lang": "en",
+  "input": "14:30",
+  "output": "fourteen thirty",
+  "source": "maya3/text/tn/normalize.py:890"
+ },
+ {
+  "lang": "en",
+  "input": "₹500-700",
+  "output": "five hundred to seven hundred rupees",
+  "source": "maya3/text/tn/normalize.py:1087"
+ },
+ {
+  "lang": "en",
+  "input": "50-50",
+  "output": "fifty fifty",
+  "source": "maya3/text/tn/normalize.py:1508"
+ },
+ {
+  "lang": "hi",
+  "input": "3-2 से जीते",
+  "output": "तीन दो",
+  "source": "maya3/text/tn/normalize.py:1515",
+  "check": "contains"
+ },
+ {
+  "lang": "hi",
+  "input": "1422 गांधी मार्ग",
+  "output": "चौदह सौ बाईस",
+  "source": "maya3/text/tn/normalize.py:1781",
+  "check": "contains"
+ },
+ {
+  "lang": "te",
+  "input": "అడ్రస్: Door",
+  "output": "అడ్రస్, Door",
+  "source": "maya3/text/tn/normalize.py:1813"
+ },
+ {
+  "lang": "en",
+  "input": "No. 12",
+  "output": "number twelve",
+  "source": "maya3/text/tn/normalize.py:2083"
+ },
+ {
+  "lang": "en",
+  "input": "6.45 pm",
+  "output": "six forty five p m",
+  "source": "maya3/text/tn/normalize.py:2087"
+ },
+ {
+  "lang": "en",
+  "input": "Your OTP is 482913.",
+  "output": "",
+  "source": "maya3/tests/test_text.py:155",
+  "check": "same_as_normaliser"
+ },
+ {
+  "lang": "hi",
+  "input": "मेरे पास 25 रुपये हैं",
+  "output": "",
+  "source": "maya3/tests/test_text.py:156",
+  "check": "same_as_normaliser"
+ },
+ {
+  "lang": "hi",
+  "input": "घर नंबर 8-2-45, सेक्टर 17",
+  "output": "",
+  "source": "maya3/tests/test_text.py:164",
+  "check": "same_as_normaliser",
+  "dash": true,
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "hi",
+  "input": "100000 रुपये",
+  "output": "एक लाख रुपये",
+  "source": "maya3/tests/test_text.py:165",
+  "check": "exact",
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "hi",
+  "input": "₹100000 का",
+  "output": "एक लाख रुपये का",
+  "source": "maya3/tests/test_text.py:166",
+  "check": "exact",
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "en",
+  "input": "customer id CUST-567890",
+  "output": "",
+  "source": "maya3/tests/test_text.py:167",
+  "check": "same_as_normaliser",
+  "dash": true,
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "hi",
+  "input": "राशि 150000 ÷ 12 है",
+  "output": "",
+  "source": "maya3/tests/test_text.py:168",
+  "check": "same_as_normaliser",
+  "dash": true,
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "hi",
+  "input": "दिनांक 05/11 को",
+  "output": "",
+  "source": "maya3/tests/test_text.py:169",
+  "check": "same_as_normaliser",
+  "dash": true,
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "mr",
+  "input": "www.airindia.in/v2.1 देखें",
+  "output": "",
+  "source": "maya3/tests/test_text.py:170",
+  "check": "same_as_normaliser",
+  "dash": true,
+  "absent": [
+   "February",
+   "फ़रवरी",
+   "फरवरी"
+  ]
+ },
+ {
+  "lang": "as",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "bn",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "en",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "gu",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "hi",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "kn",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "ml",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "mr",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "or",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "pa",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "ta",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "te",
+  "input": "Pay ₹1,250 on 12/03/2024 at 10:30, call 9820451120 [laughs]",
+  "output": "[laughs]",
+  "source": "maya3/tests/test_text.py:60",
+  "check": "no_digits_ends_with"
+ },
+ {
+  "lang": "as",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "bn",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "en",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "gu",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "hi",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "kn",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "ml",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "mr",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "or",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "pa",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "ta",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "te",
+  "input": "15-08-25, 4111 2233 4455 6677, 560038, ₹95.41, v4.5.2, 2023-24, expiry 08/27",
+  "output": "",
+  "source": "maya3/tests/test_text.py:199",
+  "check": "no_digits",
+  "absent": [
+   "minus",
+   "/"
+  ]
+ },
+ {
+  "lang": "as",
+  "input": "Pay ₹1,23,456.75 on 12/03/2024 at 5:00 PM, 1st, 3rd, 33%, 1/2, x², 5 > 3, a_b@x-y.co.in, #45, A&B, 38°C, RS 42, 9:15 AM, 14:30, 1990 চনত, 99, 31, 38 [laughs]",
+  "output": "",
+  "source": "maya3/tests/test_text.py:234",
+  "check": "no_digits",
+  "absent": [
+   "র",
+   "চার",
+   "আট",
+   "তিন ",
+   "নয়",
+   "সকাল",
+   "দুপুর",
+   "সন্ধ্যা",
+   "অ্যাট",
+   "এর ",
+   "টা বেজে"
+  ]
+ }
+]

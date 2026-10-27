@@ -25,6 +25,7 @@ pub mod inputs;
 pub mod prompt;
 pub mod runtime;
 pub mod sampling;
+pub mod text;
 mod weights;
 
 pub use config::{MAYA2_DEFAULTS, SAMPLE_RATE};
