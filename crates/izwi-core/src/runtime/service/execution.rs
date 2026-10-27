@@ -439,7 +439,24 @@ impl RuntimeService {
     /// acquired cannot create a scheduler session; once that lock is acquired,
     /// Engine admission contains no further await point and returns its exact
     /// session atomically.
-    pub(super) async fn await_engine_admission_for_job<T, F>(&self, job: &JobLease, admission: F) -> Result<T>
+    ///
+    /// Boxed: the admission future holds the request at several of its
+    /// steps (≈ 42 KB in debug builds), and inline it is repeated in every
+    /// future that awaits it, up the chat and speech paths, until a debug
+    /// build overflows a 2 MiB thread stack.
+    pub(super) fn await_engine_admission_for_job<'a, T, F>(
+        &'a self,
+        job: &'a JobLease,
+        admission: F,
+    ) -> futures::future::BoxFuture<'a, Result<T>>
+    where
+        F: Future<Output = Result<T>> + Send + 'a,
+        T: Send + 'a,
+    {
+        Box::pin(Self::bound_engine_admission(job, admission))
+    }
+
+    async fn bound_engine_admission<T, F>(job: &JobLease, admission: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {

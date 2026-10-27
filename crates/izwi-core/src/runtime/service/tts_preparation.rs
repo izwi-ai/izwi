@@ -1812,7 +1812,22 @@ impl RuntimeService {
 
     /// Every admitted execution mode must install the same model-bound artifacts
     /// before binding or engine admission. Keep the family pipeline in one place.
-    pub(super) async fn prepare_request_for_binding(
+    ///
+    /// Boxed: the pipeline awaits every family's preparation in turn, so its
+    /// future holds the largest of them plus a request at each step (≈ 22 KB
+    /// in debug builds). Inline, that size is repeated in every future that
+    /// awaits it, up the chat and speech paths, until a debug build overflows
+    /// a 2 MiB thread stack.
+    pub(super) fn prepare_request_for_binding<'a>(
+        &'a self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&'a ModelResidencyLease>,
+    ) -> futures::future::BoxFuture<'a, Result<(EngineCoreRequest, JobLease)>> {
+        Box::pin(self.prepare_request_for_binding_inline(request, job, residency_lease))
+    }
+
+    async fn prepare_request_for_binding_inline(
         &self,
         mut request: EngineCoreRequest,
         job: JobLease,
