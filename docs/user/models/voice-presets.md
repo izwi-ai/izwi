@@ -1,6 +1,6 @@
 ---
 title: "Voice Presets"
-description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, Chatterbox, and Maya1."
+description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, Chatterbox, Maya1, and Maya 2 Native."
 sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
@@ -24,6 +24,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | FishAudio-S2-Pro | Reference voice or saved voice only |
 | Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
 | Maya1-3B | Nine described voices, or a description of your own in `instructions` |
+| Maya2-Native-2.5B | 20 named voices, or a reference or saved voice (transcript needed) |
 | Qwen3 Base | Reference voice or saved voice only |
 | Qwen3 VoiceDesign | Prompt instructions, then optional saved voice reuse |
 
@@ -165,3 +166,50 @@ pitch, timbre, pacing, emotion and intensity, and for realistic voices a
 domain and role) and end with a full stop: the model reads a short or
 unfinished description aloud more often. Izwi adds the final full stop when
 it is missing.
+
+## Maya 2 Native
+
+`Maya2-Native-2.5B` has 20 named voices. Any voice can speak any of the
+model's 12 languages: the last column lists the languages with at least an
+hour of that voice's training audio, and the voice speaks the others
+cross-lingually. No built-in voice has Assamese training audio. Voice names
+are not case-sensitive, and a request without one uses `Ahana`. OpenAI's
+voice names map to voices trained on ten or more languages (`alloy` and `sage`
+to `Vaidehi`, `ash` to `Siddhant`, `ballad` and `onyx` to `Vasant`, `cedar`
+and `fable` to `Anirban`, `coral` to `Jahnavi`, `echo` to `Nakul`, `marin` to
+`Malini`, `nova` to `Ahana`, `shimmer` to `Charvi`, `verse` to `Satvik`).
+
+| Voice | Description | Trained languages |
+|-------|-------------|-------------------|
+| `Ahana` (default) | Young female voice, bright, youthful | All but Assamese |
+| `Vaidehi` | Adult female voice, calm, gentle | All but Assamese |
+| `Malini` | Mature female voice, steady narrator | All but Assamese |
+| `Charvi` | Young female voice, energetic, upbeat | All but Assamese |
+| `Jahnavi` | Adult female voice, warm, friendly | All but Assamese and Punjabi |
+| `Anirban` | Adult male voice, steady narrator | All but Assamese |
+| `Nakul` | Young male voice, bright, youthful | All but Assamese |
+| `Vasant` | Mature male voice, steady narrator | All but Assamese and Punjabi |
+| `Siddhant` | Adult male voice, clear, professional | All but Assamese |
+| `Satvik` | Young male voice, warm, friendly | All but Assamese |
+| `Abhay` | Adult male voice, natural conversational style | English, Hindi |
+| `Nivedita` | Adult female voice, natural conversational style | English, Hindi |
+| `Ishwari` | Adult female voice, natural conversational style | Hindi |
+| `Ritvik` | Adult male voice, natural conversational style | Hindi |
+| `Vrinda` | Young female voice, natural conversational style | Hindi |
+| `Sreekar` | Adult male voice, natural conversational style | English, Hindi, Telugu |
+| `Kayal` | Adult female voice, natural conversational style | English, Tamil |
+| `Shaunak` | Young male voice, natural conversational style | English, Hindi |
+| `Akshat` | Adult male voice, natural conversational style | English, Hindi |
+| `Tanushree` | Adult female voice, natural conversational style | English, Hindi |
+
+Example:
+
+```bash
+izwi tts "வணக்கம், எப்படி இருக்கிறீர்கள்?" \
+  --model Maya2-Native-2.5B \
+  --speaker Kayal \
+  --output maya2-kayal.wav
+```
+
+To speak in a voice of your own instead, clone one from reference audio and
+its transcript (see [Voice Cloning](/features/voice-cloning)).

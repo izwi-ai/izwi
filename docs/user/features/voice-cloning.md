@@ -48,7 +48,10 @@ Voice cloning now lives inside the unified **Voices** workspace.
    - Single speaker
 
 The reference transcript is marked optional: Chatterbox clones from the audio
-alone, while Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro need it.
+alone, while Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro and Maya 2 Native
+need it. With Maya 2 Native, the dialog also asks for the language of the
+recording, or detects it from the transcript; the voice can then speak any of
+the model's languages.
 
 ### Step 2: Generate Speech
 
@@ -65,7 +68,7 @@ alone, while Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro need it.
 
 ## Using the CLI
 
-Use `izwi tts` with a Base, VibeVoice or `FishAudio-S2-Pro` TTS model and provide both the
+Use `izwi tts` with a Base, VibeVoice, `FishAudio-S2-Pro` or `Maya2-Native-2.5B` TTS model and provide both the
 reference audio and its transcript:
 
 ```bash
@@ -99,6 +102,23 @@ izwi tts "This sentence will use the cloned voice." \
   --output cloned-chatterbox.wav
 ```
 
+`Maya2-Native-2.5B` clones from reference audio and its exact transcript, and
+the cloned voice can speak any of the model's 12 languages, not only the
+reference's. Name the language of the reference with `--reference-language`
+(a code such as `en`), or leave it to be read from the transcript's script.
+The reference must last 0.5 to 30 seconds; Maya Research recommends 3 to 10.
+Here an English reference speaks Hindi, which Izwi reads from the text's
+Devanagari script (`--language hi` says the same):
+
+```bash
+izwi tts "आपका ऑर्डर कल शाम तक पहुँच जाएगा।" \
+  --model Maya2-Native-2.5B \
+  --reference-audio samples/reference.wav \
+  --reference-text "This is the exact text spoken in the reference sample." \
+  --reference-language en \
+  --output cloned-hindi.wav
+```
+
 Saved voices created in Voice Studio or through `/v1/voices` can be reused from
 the CLI:
 
@@ -130,6 +150,7 @@ POST /v1/audio/speech
 | `input` | String | Text to synthesize |
 | `reference_audio` | String | Base64-encoded reference audio |
 | `reference_text` | String | Transcript of reference audio (optional and ignored for Chatterbox) |
+| `reference_language` | String | Language the reference audio is spoken in, one of Maya 2 Native's 12 codes (`Maya2-Native-2.5B` only; read from the transcript when unset) |
 | `saved_voice_id` | String | Optional saved voice reference to reuse instead of resending audio |
 
 ### Example (curl)
@@ -148,7 +169,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 
 Saved voices can also be managed through `/v1/voices` and reused from
 `/v1/audio/speech`. See the [API Reference](/api#saved-voices) for the
-saved voice routes and exact fields.
+saved voice routes and exact fields. A voice saved with a `reference_language`
+passes it to `Maya2-Native-2.5B` requests that use it, unless the request sets
+its own.
 
 ---
 
@@ -201,6 +224,7 @@ saved voice routes and exact fields.
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
+| `Maya2-Native-2.5B` | ~5.5 GB | English and 11 Indic languages; needs a transcript; clones across languages |
 
 Larger models produce more accurate voice clones.
 

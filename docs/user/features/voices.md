@@ -53,8 +53,10 @@ surface is `/v1/voices`, and `izwi tts` can reuse a saved voice with
 
 A cloned voice can be saved without its transcript. Such an audio-only voice
 works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone; models that need a
-transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) refuse it with a
-`400` asking for one.
+transcript (Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro and Maya 2 Native)
+refuse it with a `400` asking for one. A saved voice can also store the
+language of its recording (`reference_language`); Maya 2 Native reads it when
+the voice speaks any of its 12 languages.
 
 ```bash
 izwi tts "Use my saved narration voice." \

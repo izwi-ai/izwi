@@ -59,6 +59,31 @@ Version 2.0) and includes a Rust port of the decoder of:
   tokens decode through. Copyright (c) 2023, Descript; Copyright (c) 2024,
   Hubert Siuzdak. MIT License.
 
+The Maya 2 Native text-to-speech family
+(crates/izwi-core/src/models/architectures/maya2) runs Maya Research's
+Maya 2 Native (https://huggingface.co/maya-research/maya2-native, Apache
+License, Version 2.0) and includes Rust ports of:
+
+* Maya 2 Native's inference code (https://github.com/MayaResearch/maya2-native):
+  the prompt layout, samplers, stop rule, loop guards and text normaliser.
+  Copyright (c) 2026 Maya Research. Apache License, Version 2.0.
+  Its normaliser's Assamese number words are AI4Bharat's indic-numtowords
+  data (https://github.com/AI4Bharat/indic-numtowords, MIT License) and its
+  Assamese month names come from the Unicode CLDR (Unicode License v3), both
+  as Maya Research vendors them.
+* SpeechBrain's ECAPA-TDNN speaker encoder and filterbank front end
+  (https://github.com/speechbrain/speechbrain), whose
+  spkrec-ecapa-voxceleb weights clone voices. Copyright (c) SpeechBrain
+  contributors. Apache License, Version 2.0.
+
+The shared Mimi codec (crates/izwi-core/src/models/shared/codecs/mimi) is a
+Rust port of Hugging Face transformers' MimiModel
+(https://github.com/huggingface/transformers, Copyright (c) Kyutai and The
+HuggingFace Inc. team, Apache License, Version 2.0). It runs Kyutai's Mimi
+weights (https://huggingface.co/kyutai/mimi), which Kyutai licenses under
+Creative Commons Attribution 4.0 (CC BY 4.0,
+https://creativecommons.org/licenses/by/4.0/); izwi downloads them unmodified.
+
 The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
 works above are used under these terms:
 

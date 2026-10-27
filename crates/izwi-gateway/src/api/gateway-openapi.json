@@ -2100,7 +2100,7 @@
             ]
           },
           "normalize_text": {
-            "description": "Speak numbers, currency, dates, times and units as words (English).\nUnset keeps the model's default: on for Kokoro, off for models that\nread them themselves.",
+            "description": "Speak numbers, currency, dates, times and units as words. Unset keeps\nthe model's default: on for Kokoro (English) and Maya 2 Native (in the\nrequest's language), off for models that read them themselves.",
             "type": [
               "boolean",
               "null"

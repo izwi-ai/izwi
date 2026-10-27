@@ -78,7 +78,8 @@ izwi tts "Your text here" --output output.wav
 | `--reference-text-file` | File containing the reference transcript | — |
 | `--instructions`, `--voice-description` | Voice-design direction prompt; for `Maya1-3B`, the voice to speak with | — |
 | `--temperature`, `-t` | Sampling temperature | Model default |
-| `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; a hint for Qwen3-TTS) | Model default |
+| `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; `Maya2-Native-2.5B`: a code such as `hi`, or `auto`; a hint for Qwen3-TTS) | Model default |
+| `--reference-language` | Language of the reference audio (`Maya2-Native-2.5B` only; read from the transcript when unset) | — |
 | `--exaggeration` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
 | `--min-p` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
@@ -170,7 +171,8 @@ izwi tts "This line uses a designed voice." \
 
 With Chatterbox selected, the dialog shows sliders for exaggeration, CFG weight
 and min-p. With Chatterbox Multilingual it also asks which language the text is
-in.
+in. With Maya 2 Native it asks the same, with **Auto-detect** (the default) to
+read the language from the text's script, and offers its inline tags.
 
 ### Features
 
@@ -234,8 +236,8 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` or `Chatterbox-Multilingual-500M`.  
-For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603` or `LFM2.5-Audio-1.5B-GGUF`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
+For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF` or `Maya2-Native-2.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its

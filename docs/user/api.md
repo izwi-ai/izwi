@@ -357,7 +357,7 @@ Request fields:
 | `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
 | `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
 | `speed` | Optional model-dependent speed control. |
-| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `GET /v1/admin/models` lists a Chatterbox model's languages in `speech_capabilities.languages`. |
+| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox or Maya 2 Native model's languages in `speech_capabilities.languages`. |
 | `temperature`, `top_k` | Optional sampling controls. |
 | `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
@@ -366,6 +366,7 @@ Request fields:
 | `instructions` | Voice-design prompt for voice-design models; for `Maya1-3B`, the description of the voice to speak with, replacing `voice`. |
 | `reference_audio` | Base64 audio for voice cloning. |
 | `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
+| `reference_language` | `Maya2-Native-2.5B` only. The language the reference audio is spoken in, one of its 12 codes; unset, it is read from the transcript's script. Any other model returns `400` if it is set. The speech history create routes accept it too. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
 | `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
@@ -412,6 +413,44 @@ out of range returns `400`.
   `max_tokens`, Izwi sets a budget from the text and splits text longer than
   about 160 characters into sentences of up to about 11 s, each with the same
   description.
+
+`Maya2-Native-2.5B` specifics:
+
+- It speaks Assamese, Bengali, English, Gujarati, Hindi, Kannada, Malayalam,
+  Marathi, Odia, Punjabi, Tamil and Telugu (codes `as`, `bn`, `en`, `gu`,
+  `hi`, `kn`, `ml`, `mr`, `or`, `pa`, `ta`, `te`). Without `language`, or with
+  `auto`, it reads the language from the text's main script: Latin letters as
+  English, Devanagari as Hindi and Bengali script as Bengali, so name `mr` or
+  `as` for Marathi or Assamese text. `GET /v1/admin/models` marks this with
+  `speech_capabilities.language_auto_detect`, and cloning across languages
+  with `speech_capabilities.cross_lingual_reference`.
+- Its voice is one of 20 built-in voices that `voice` names (`Ahana`, the
+  default, `Vaidehi`, `Anirban`, …; OpenAI's names map to one of them, see
+  [Voice Presets](/models/voice-presets#maya-2-native)), or a clone of
+  `reference_audio` (or a saved voice) with its exact `reference_text`, which
+  is required. The reference must last 0.5 to 30 s. A clone can speak any of
+  the 12 languages: `reference_language` names the language of the reference
+  and `language` the language of the output. A saved voice's
+  `reference_language` applies unless the request sets its own.
+  `instructions` and `speed` each return `400`.
+- Tags in `input` are lowercase words in square brackets, such as `[laughs]`,
+  `[sighs]` or `[whispers]`. The model performs them on a best-effort basis.
+  `speech_capabilities.inline_tags` of `GET /v1/admin/models` lists the eight
+  that Maya Research names; any other lowercase `[tag]` is passed to the model
+  rather than refused.
+- Numbers, currency, dates, times, phone numbers, URLs and e-mail addresses are
+  spoken as words in the request's language by default. Set
+  `normalize_text: false` to send the text as written.
+- Sampling defaults follow Maya Research's release: `temperature` 0.9 (0.1 to
+  1.5), top-k 64, top-p 1.0, and a presence penalty of 0.8 (0 to 5) on
+  recently sampled codes, which `repetition_penalty` sets. `seed` makes a
+  request reproducible.
+- With `stream: true` it streams audio as the Mimi codec decodes it: the first
+  80 ms frame, then windows of 320 ms.
+- One request speaks at most 1,500 frames (120 s). Without `max_tokens`, Izwi
+  sets a budget from the text and splits text longer than 280 characters into
+  whole sentences of up to 280 characters (about 20 s each). Sentences also end
+  at a danda (`।` or `॥`), and a tag is never sent as a segment on its own.
 
 `Chatterbox-Multilingual-500M` takes the same fields and speaks the `language`
 the request names: Arabic, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish (codes `ar`, `zh`, `da`, `nl`, `en`, `fi`,
@@ -834,7 +873,12 @@ Reusable voice clone references:
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
 
-A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice and Fish Audio S2 Pro) return `400` for it, asking for a voice saved with one.
+A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro and Maya 2 Native) return `400` for it, asking for a voice saved with one.
+
+`POST /v1/voices` also takes an optional `reference_language`: the language the
+reference is spoken in, one of Maya 2 Native's 12 codes (any other value
+returns `400`). A `Maya2-Native-2.5B` request that uses the voice inherits it
+unless the request sets its own `reference_language`.
 
 Saved voice records include a local permission baseline:
 `permission_scope`, `consent_status`, `allowed_uses`,

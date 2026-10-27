@@ -286,3 +286,41 @@ huggingface-cli download maya-research/maya1 config.json tokenizer.json \
 curl -L -o "$MODEL_DIR/snac_24khz.pth" \
   https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec/pytorch_model.bin
 ```
+
+---
+
+## Maya 2 Native
+
+`Maya2-Native-2.5B` (about 5.5 GB) needs seven files from Hugging Face
+(`maya-research/maya2-native` at a pinned revision), the Mimi codec's config
+and weights from `kyutai/mimi`, saved in `mimi/`, and SpeechBrain's ECAPA
+speaker encoder from `speechbrain/spkrec-ecapa-voxceleb`, saved in `ecapa/`:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Maya2-Native-2.5B"
+
+huggingface-cli download maya-research/maya2-native \
+  maya3_config.json model.safetensors.index.json \
+  model-00001-of-00002.safetensors model-00002-of-00002.safetensors \
+  backbone/config.json backbone/tokenizer.json voices/voices.json \
+  --revision 1403b841a6af0f920781319e851d4d6bdeb596c6 \
+  --local-dir "$MODEL_DIR"
+
+curl -L --create-dirs -o "$MODEL_DIR/mimi/config.json" \
+  https://huggingface.co/kyutai/mimi/resolve/89091b3e466eb6a9d11e537bf26b144f194978f7/config.json
+
+curl -L --create-dirs -o "$MODEL_DIR/mimi/model.safetensors" \
+  https://huggingface.co/kyutai/mimi/resolve/89091b3e466eb6a9d11e537bf26b144f194978f7/model.safetensors
+
+curl -L --create-dirs -o "$MODEL_DIR/ecapa/embedding_model.ckpt" \
+  https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/resolve/0f99f2d0ebe89ac095bcc5903c4dd8f72b367286/embedding_model.ckpt
+```
+
+When Izwi downloads the last three files itself, it checks each one's size and
+SHA-256:
+
+| File | Size (bytes) | SHA-256 |
+|------|--------------|---------|
+| `mimi/config.json` | 1,117 | `aca6f44b04f7bc2e7466b71597d2d51e463ed1cf3cd7025d8848595580546c36` |
+| `mimi/model.safetensors` | 384,649,828 | `bac7e85083dcded655d24eaadde7e6eea34c0da1b35fa2d284e641bd2b942a5e` |
+| `ecapa/embedding_model.ckpt` | 83,316,686 | `0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2` |

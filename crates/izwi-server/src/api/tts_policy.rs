@@ -318,9 +318,9 @@ pub struct SpeechSamplingRequest {
     /// VibeVoice diffusion steps per frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_steps: Option<usize>,
-    /// Speak numbers, currency, dates, times and units as words (English).
-    /// Unset keeps the model's default: on for Kokoro, off for models that
-    /// read them themselves.
+    /// Speak numbers, currency, dates, times and units as words. Unset keeps
+    /// the model's default: on for Kokoro (English) and Maya 2 Native (in the
+    /// request's language), off for models that read them themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalize_text: Option<bool>,
     /// Min-p sampling threshold, in [0, 1] (Chatterbox).
