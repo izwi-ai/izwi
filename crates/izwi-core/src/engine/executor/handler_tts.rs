@@ -3934,6 +3934,13 @@ impl NativeExecutor {
         if ordered_requests.first().is_some_and(|request| {
             request
                 .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Maya1Tts)
+        }) {
+            return self.maya1_tts_batch_with_managed(&ordered_requests, scheduled, managed_caches);
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
                 .is_some_and(|variant| variant.family() == ModelFamily::VibeVoiceTts)
         }) {
             return self.vibevoice_tts_decode_batch_with_managed(

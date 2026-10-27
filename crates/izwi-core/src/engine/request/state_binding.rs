@@ -487,6 +487,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Maya1Tts(_)) {
+            let prepared = ready.maya1_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Maya1 request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.maya1_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Maya1 request {} is missing its sealed generation parameters",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::Maya1Tts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt.len())
+                || self.params.max_tokens != params.max_new_tokens
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Maya1 request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
             let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -566,6 +589,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Maya1Tts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::Maya1Tts
+                    && ready.maya1_tts.is_some()
+                    && ready.maya1_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::KokoroTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::KokoroTts
                     && ready.kokoro_tts.is_some() =>
@@ -637,6 +667,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())

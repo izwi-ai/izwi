@@ -249,6 +249,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::VibeVoiceTts
         | ModelFamily::FishS2Tts
         | ModelFamily::ChatterboxTts
+        | ModelFamily::Maya1Tts
         | ModelFamily::SortformerDiarization
         | ModelFamily::Qwen3Chat
         | ModelFamily::Qwen3MoeChat

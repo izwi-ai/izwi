@@ -33,6 +33,7 @@ use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
 use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
 };
+use crate::models::architectures::maya1::config::SNAC_WEIGHTS_FILE;
 use crate::models::architectures::nemotron::asr::nemotron_native_artifacts_complete;
 use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_complete;
 use crate::models::shared::weights::nemo::ensure_free_disk;
@@ -171,6 +172,19 @@ fn chatterbox_files(variant: ModelVariant) -> &'static [&'static str] {
         CHATTERBOX_FILES
     }
 }
+
+/// Maya1's files at the pinned revision (b1b9b38c): both BF16 shards, their
+/// index, the config (checked against the port's geometry) and the
+/// tokenizer; then SNAC 24 kHz's checkpoint from its own repository
+/// ([`SNAC_24KHZ_CHECKPOINT`]).
+const MAYA1_FILES: &[&str] = &[
+    "config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "tokenizer.json",
+    SNAC_WEIGHTS_FILE,
+];
 
 const FISH_S2_PRO_FILES: &[&str] = &[
     "README.md",
@@ -603,8 +617,22 @@ const PKUSEG_DICT: PinnedFile = PinnedFile {
     sha256: "3cf450d95719d51883fa49291302b9032372064d86805b130bb2ea0223196c67",
 };
 
-/// The pinned source of `variant`'s `local_file`, when it is not on the Hub.
+/// hubertsiuzdak/snac_24khz at d73ad176 (MIT): the decoder Maya1's codes
+/// go through, its `pytorch_model.bin` (a torch zip) kept under its own name
+/// beside Maya1's files.
+const SNAC_24KHZ_CHECKPOINT: PinnedFile = PinnedFile {
+    url: "https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/\
+          d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec/pytorch_model.bin",
+    size: 79_488_254,
+    sha256: "4b8164cc6606bfa627f1a784734c1e539891518f1191ed9194fe1e3b9b4bff40",
+};
+
+/// The pinned source of `variant`'s `local_file`, when it is not in the
+/// variant's own repository.
 fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
+    if variant.family() == ModelFamily::Maya1Tts && local_file == SNAC_WEIGHTS_FILE {
+        return Some(SNAC_24KHZ_CHECKPOINT);
+    }
     if variant.family() != ModelFamily::ChatterboxTts {
         return None;
     }
@@ -1666,6 +1694,7 @@ impl ModelDownloader {
                     && !crate::env::flag_or("IZWI_CHATTERBOX_WATERMARK", true))
                     || path.join(file).exists()
             }),
+            ModelFamily::Maya1Tts => MAYA1_FILES.iter().all(|file| path.join(file).exists()),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -2355,6 +2384,7 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
+            ModelFamily::Maya1Tts => MAYA1_FILES.iter().map(|file| (*file).to_string()).collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -2843,6 +2873,16 @@ impl ModelDownloader {
                 PKUSEG_MODEL_FILE => PKUSEG_MODEL.size,
                 PKUSEG_DICT_FILE => PKUSEG_DICT.size,
                 _ => 25_470,
+            }
+        } else if variant.family() == ModelFamily::Maya1Tts {
+            // Maya1 at b1b9b38c.
+            match file {
+                "model-00001-of-00002.safetensors" => 4_991_160_848,
+                "model-00002-of-00002.safetensors" => 1_610_725_592,
+                "tokenizer.json" => 22_853_258,
+                "model.safetensors.index.json" => 20_955,
+                SNAC_WEIGHTS_FILE => SNAC_24KHZ_CHECKPOINT.size,
+                _ => 860,
             }
         } else if file == "mmproj-F16.gguf" {
             match variant {

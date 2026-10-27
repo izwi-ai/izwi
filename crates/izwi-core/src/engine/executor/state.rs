@@ -6,6 +6,7 @@ use crate::models::architectures::chatterbox::retained::ChatterboxRetainedState;
 use crate::models::architectures::fish_s2::FishS2RetainedState;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
+use crate::models::architectures::maya1::retained::Maya1RetainedState;
 use crate::models::architectures::parakeet::asr::{
     ParakeetPreparedEncoderArtifact, ParakeetRetainedDecodeState,
 };
@@ -19,8 +20,9 @@ use crate::models::architectures::voxtral::realtime::{
 use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
     AsrModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease, Lfm25AudioModelLease,
-    NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint,
-    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
+    Maya1TtsModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState,
+    NativeChatReplayCheckpoint, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
+    VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -178,6 +180,16 @@ pub(super) struct ActiveChatterboxTtsDecode {
     /// A streamed request's next chunk sequence and samples sent so far.
     pub(super) stream_sequence: usize,
     pub(super) streamed_samples: usize,
+}
+
+pub(super) struct ActiveMaya1TtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Maya1TtsModelLease,
+    pub(super) state: Maya1RetainedState,
+    /// A streamed request's next chunk sequence.
+    pub(super) stream_sequence: usize,
+    /// A final-only request's settled samples, handed over at finalize.
+    pub(super) rendered: Vec<f32>,
 }
 
 pub(super) struct ActiveVoxtralRealtime {

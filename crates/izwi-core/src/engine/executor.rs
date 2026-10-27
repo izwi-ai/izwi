@@ -21,6 +21,7 @@ mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
 mod handler_chatterbox;
+mod handler_maya1;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
 #[path = "executor/long_form.rs"]
@@ -103,8 +104,8 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishS2TtsDecode,
-    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
-    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
+    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveMaya1TtsDecode, ActiveParakeetAsrDecode,
+    ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
     PendingVoxtralRealtimeQuantum, PreparedVoxtralRealtimeQuantum,
 };
 
@@ -2640,6 +2641,7 @@ pub struct NativeExecutor {
     fish_s2_pending: Arc<FishStateCoordinator>,
     voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
     chatterbox_tts_decode_states: ExecutorStateStore<ActiveChatterboxTtsDecode>,
+    maya1_tts_decode_states: ExecutorStateStore<ActiveMaya1TtsDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
     long_form_asr: Arc<long_form::LongFormAsrRuns>,
@@ -2726,6 +2728,7 @@ impl NativeExecutor {
             fish_s2_pending,
             voxtral_tts_decode_states: Mutex::new(HashMap::new()),
             chatterbox_tts_decode_states: Mutex::new(HashMap::new()),
+            maya1_tts_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
             long_form_asr,
@@ -2900,6 +2903,9 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                 .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_chatterbox_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some())
+                || request
+                    .prepared_maya1_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some()) =>
         {
             (true, true)
@@ -3079,6 +3085,9 @@ impl ModelExecutor for NativeExecutor {
                     || request
                         .prepared_chatterbox_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
+                    || request
+                        .prepared_maya1_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(matches!(
                     variant.family(),
@@ -3087,6 +3096,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::VibeVoiceTts
                         | crate::catalog::ModelFamily::FishS2Tts
                         | crate::catalog::ModelFamily::ChatterboxTts
+                        | crate::catalog::ModelFamily::Maya1Tts
                 ))
             }
             super::types::TaskType::SpeechToSpeech => self
@@ -3124,6 +3134,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::VibeVoiceTts
                             | crate::catalog::ModelFamily::FishS2Tts
                             | crate::catalog::ModelFamily::ChatterboxTts
+                            | crate::catalog::ModelFamily::Maya1Tts
                     )
                 }
                 super::types::TaskType::SpeechToSpeech => false,
@@ -3175,6 +3186,13 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_chatterbox_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_maya1_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -3650,6 +3668,23 @@ impl ModelExecutor for NativeExecutor {
                     ..
                 } if execution.requests.iter().all(|request| {
                     request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Maya1Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_maya1_tts_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Lfm25Audio
                     })
                 }) =>
@@ -3777,6 +3812,10 @@ impl ModelExecutor for NativeExecutor {
         let mut chatterbox_tts = self.chatterbox_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Chatterbox decode state mutex poisoned".to_string())
         })?;
+        let mut maya1_tts = self
+            .maya1_tts_decode_states
+            .lock()
+            .map_err(|_| Error::InferenceError("Maya1 decode state mutex poisoned".to_string()))?;
         if self.voxtral_realtime.abort_matching(|_| true).is_err() {
             return Err(Error::InferenceError(
                 "failed to abort pending Voxtral realtime state during shutdown".to_string(),
@@ -3802,6 +3841,7 @@ impl ModelExecutor for NativeExecutor {
         fish_s2_tts.clear();
         voxtral_tts.clear();
         chatterbox_tts.clear();
+        maya1_tts.clear();
         voxtral.clear();
         tts.clear();
         drop((
@@ -3814,6 +3854,7 @@ impl ModelExecutor for NativeExecutor {
             fish_s2_tts,
             voxtral_tts,
             chatterbox_tts,
+            maya1_tts,
             voxtral,
             tts,
         ));
@@ -3853,6 +3894,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut fish_s2_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
+            Ok(mut maya1_tts),
             Ok(mut voxtral),
             Ok(mut tts),
         ) = (
@@ -3865,6 +3907,7 @@ impl ModelExecutor for NativeExecutor {
             self.fish_s2_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
+            self.maya1_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
@@ -3881,6 +3924,7 @@ impl ModelExecutor for NativeExecutor {
         let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
         let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
         let chatterbox_tts = cleanup_request_states_locked(&mut chatterbox_tts, request_id);
+        let maya1_tts = cleanup_request_states_locked(&mut maya1_tts, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
         cleanup_report(
@@ -3892,6 +3936,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(fish_s2_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
+                .combine(maya1_tts)
                 .combine(voxtral)
                 .combine(tts),
         )
@@ -3927,6 +3972,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut fish_s2_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
+            Ok(mut maya1_tts),
             Ok(mut voxtral),
             Ok(mut tts),
         ) = (
@@ -3939,6 +3985,7 @@ impl ModelExecutor for NativeExecutor {
             self.fish_s2_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
+            self.maya1_tts_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
@@ -3959,6 +4006,7 @@ impl ModelExecutor for NativeExecutor {
         let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
         let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
         let chatterbox_tts = cleanup_session_state_locked(&mut chatterbox_tts, session);
+        let maya1_tts = cleanup_session_state_locked(&mut maya1_tts, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
         cleanup_report(
@@ -3970,6 +4018,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(fish_s2_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
+                .combine(maya1_tts)
                 .combine(voxtral)
                 .combine(tts),
         )
@@ -3988,10 +4037,11 @@ impl ModelExecutor for NativeExecutor {
         {
             return CacheReleaseReport::unconfirmed();
         }
-        let (Ok(mut states), Ok(mut voxtral_tts), Ok(mut chatterbox_tts)) = (
+        let (Ok(mut states), Ok(mut voxtral_tts), Ok(mut chatterbox_tts), Ok(mut maya1_tts)) = (
             self.voxtral_realtime.states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
+            self.maya1_tts_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
@@ -4004,6 +4054,11 @@ impl ModelExecutor for NativeExecutor {
                 ))
                 .combine(cleanup_model_states_locked(
                     &mut chatterbox_tts,
+                    variant,
+                    |active| active.variant,
+                ))
+                .combine(cleanup_model_states_locked(
+                    &mut maya1_tts,
                     variant,
                     |active| active.variant,
                 )),
@@ -6817,6 +6872,24 @@ mod tests {
         });
         let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
         request.model_variant = Some(ModelVariant::Chatterbox500M);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
+    }
+
+    #[test]
+    fn maya1_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Maya13B);
 
         let profile = executor.execution_profile(&request).unwrap();
 
