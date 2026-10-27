@@ -77,7 +77,7 @@ Different features require different models:
 | Diarization | `diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization` (+ optional ASR and aligner models) |
 | Forced Alignment | `Qwen3-ForcedAligner-0.6B` |
 | Voice Cloning | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-1.7B-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` or `Chatterbox-Multilingual-500M` |
-| Voice Design | Qwen3 TTS VoiceDesign model (`Qwen3-TTS-12Hz-1.7B-VoiceDesign*`) |
+| Voice Design | Qwen3 TTS VoiceDesign model (`Qwen3-TTS-12Hz-1.7B-VoiceDesign*`) or `Maya1-3B` |
 
 ---
 

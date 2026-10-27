@@ -76,7 +76,7 @@ izwi tts "Your text here" --output output.wav
 | `--reference-audio` | Reference audio file for cloning | — |
 | `--reference-text` | Transcript for the reference audio (needs `--reference-audio`; optional for Chatterbox) | — |
 | `--reference-text-file` | File containing the reference transcript | — |
-| `--instructions` | Voice-design direction prompt | — |
+| `--instructions`, `--voice-description` | Voice-design direction prompt; for `Maya1-3B`, the voice to speak with | — |
 | `--temperature`, `-t` | Sampling temperature | Model default |
 | `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; a hint for Qwen3-TTS) | Model default |
 | `--exaggeration` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |

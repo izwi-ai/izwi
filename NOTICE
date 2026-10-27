@@ -50,6 +50,15 @@ and of the parts of these works that Chatterbox builds on:
   segmenter of the multilingual text frontend. Copyright (c) 2020 ExplosionAI
   GmbH, 2018-2019 pkuseg authors. MIT License.
 
+The Maya1 text-to-speech family
+(crates/izwi-core/src/models/architectures/maya1) runs Maya Research's
+Maya1 (https://huggingface.co/maya-research/maya1, Apache License,
+Version 2.0) and includes a Rust port of the decoder of:
+
+* SNAC (https://github.com/hubertsiuzdak/snac), the audio codec Maya1's
+  tokens decode through. Copyright (c) 2023, Descript; Copyright (c) 2024,
+  Hubert Siuzdak. MIT License.
+
 The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
 works above are used under these terms:
 
