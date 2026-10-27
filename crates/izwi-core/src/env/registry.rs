@@ -1082,6 +1082,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Scheduler token budget per step; 0 or invalid ignored, leaving the backend's automatic budget.",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA2_MODEL_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Maya 2 Native model directory (with its mimi/ and ecapa/ companions) for the ignored real-weight tests.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MEDIA_LOCAL_ROOT",
         Path,
         "unset (local file media disabled)",

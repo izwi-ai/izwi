@@ -512,6 +512,7 @@ impl DeviceProfile {
                         | ModelFamily::WhisperAsr
                         | ModelFamily::ChatterboxTts
                         | ModelFamily::Maya1Tts
+                        | ModelFamily::Maya2Tts
                 )
             ) {
                 DType::F16
@@ -524,6 +525,8 @@ impl DeviceProfile {
                 "Chatterbox Metal policy runs T3 in F16 behind a load-time self-check; S3Gen, HiFT, the reference encoders and PerTh stay F32".into()
             } else if request.model_family == Some(ModelFamily::Maya1Tts) {
                 "Maya1 Metal policy runs its BF16 decoder in F16 (Metal paged attention has no BF16) behind a load-time range probe; SNAC stays F32".into()
+            } else if request.model_family == Some(ModelFamily::Maya2Tts) {
+                "Maya 2 Native Metal policy runs its BF16 backbone in F16 (Metal paged attention has no BF16) behind a load-time range probe; the depth decoder runs in F16 and Mimi in F32".into()
             } else if request.model_family == Some(ModelFamily::WhisperAsr) {
                 "Whisper Metal policy runs its F16 checkpoint in F16 on every Apple family, with F32 softmax, LayerNorm statistics and logits (whisper.cpp, mlx-whisper, OpenAI Whisper)".into()
             } else {
@@ -1730,6 +1733,10 @@ mod tests {
             DType::F16
         );
         assert_eq!(
+            with(ModelFamily::Maya2Tts, MetalDTypeOverride::Auto),
+            DType::F16
+        );
+        assert_eq!(
             metal
                 .metal_default_dtype_selection_with(
                     request(ModelFamily::Voxtral).with_checkpoint_dtype(DType::BF16),
@@ -2051,6 +2058,10 @@ mod tests {
         );
         assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::Maya1Tts, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::Maya2Tts, None),
             DType::BF16
         );
         assert_eq!(

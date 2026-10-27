@@ -327,6 +327,18 @@ pub enum ModelVariant {
         alias = "Maya1-GGUF"
     )]
     Maya13BGguf,
+    /// Maya Research's Maya 2 Native (Qwen3-1.7B backbone + depth decoder
+    /// over Kyutai Mimi; 12 Indic and English languages, 20 voices, cloning)
+    #[serde(
+        rename = "Maya2-Native-2.5B",
+        alias = "maya-research/maya2-native",
+        alias = "maya2-native",
+        alias = "Maya2-Native",
+        alias = "maya2",
+        alias = "Maya2",
+        alias = "Maya 2 Native"
+    )]
+    Maya2Native25B,
 }
 
 impl ModelVariant {
@@ -379,6 +391,14 @@ impl ModelVariant {
     pub const MAYA1_FRAME_RATE_HZ: f32 = 24_000.0 * 7.0 / 2_048.0;
     /// Named voice descriptions.
     pub const MAYA1_BUILT_IN_VOICE_COUNT: usize = 9;
+    /// Maya 2 Native's release 1.0 (2026-10-25) as of its card rewrite.
+    pub const MAYA2_ARTIFACT_REVISION: &'static str = "1403b841a6af0f920781319e851d4d6bdeb596c6";
+    /// Upstream's absolute per-piece ceiling: 1,500 frames (120 s).
+    pub const MAYA2_MAX_OUTPUT_FRAMES: usize = 1_500;
+    /// Mimi frames per second.
+    pub const MAYA2_FRAME_RATE_HZ: f32 = 12.5;
+    /// The release's named voices.
+    pub const MAYA2_BUILT_IN_VOICE_COUNT: usize = 20;
     /// mradermacher/maya1-GGUF, whose `maya1.Q8_0.gguf` converts Maya1's
     /// unchanged weights.
     pub const MAYA1_GGUF_ARTIFACT_REVISION: &'static str =
@@ -440,6 +460,7 @@ impl ModelVariant {
             }
             Self::Maya13B => Some(Self::MAYA1_ARTIFACT_REVISION),
             Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
+            Self::Maya2Native25B => Some(Self::MAYA2_ARTIFACT_REVISION),
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -511,6 +532,7 @@ impl ModelVariant {
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => "ResembleAI/chatterbox",
             Self::Maya13B => "maya-research/maya1",
             Self::Maya13BGguf => "mradermacher/maya1-GGUF",
+            Self::Maya2Native25B => "maya-research/maya2-native",
         }
     }
 
@@ -567,6 +589,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M => "Chatterbox Multilingual",
             Self::Maya13B => "Maya1",
             Self::Maya13BGguf => "Maya1 GGUF",
+            Self::Maya2Native25B => "Maya 2 Native",
         }
     }
 
@@ -623,6 +646,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M => "Chatterbox-Multilingual-500M",
             Self::Maya13B => "Maya1-3B",
             Self::Maya13BGguf => "Maya1-3B-GGUF",
+            Self::Maya2Native25B => "Maya2-Native-2.5B",
         }
     }
 
@@ -687,6 +711,11 @@ impl ModelVariant {
             // The Q8_0 GGUF (3,516,496,480 B), Maya1's config and tokenizer
             // (22,854,118 B) and SNAC.
             Self::Maya13BGguf => 3_618_838_852,
+            // Both BF16 shards, their index, the release config, backbone
+            // config and tokenizer and the voice list at the pin
+            // (5,021,048,540 B), Mimi's config and weights (384,650,945 B)
+            // and ECAPA's embedding model (83,316,686 B).
+            Self::Maya2Native25B => 5_489_016_171,
         }
     }
 
@@ -763,6 +792,10 @@ impl ModelVariant {
             // 3.5 GB of Q8_0 weights, ~0.5 GB of F32 KV per 2,300-position
             // request and SNAC.
             Self::Maya13BGguf => 5.0,
+            // 5.0 GB of weights at F16/BF16 (10 GB in F32 on the CPU, priced
+            // by its residency plan), Mimi in F32, ~0.22 GB of KV per
+            // 2,048-position request.
+            Self::Maya2Native25B => 7.0,
         }
     }
 
@@ -867,6 +900,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::FishS2Tts
                 | crate::catalog::ModelFamily::ChatterboxTts
                 | crate::catalog::ModelFamily::Maya1Tts
+                | crate::catalog::ModelFamily::Maya2Tts
         )
     }
 
@@ -888,7 +922,8 @@ impl ModelVariant {
             | Self::Qwen3827BFp8
             | Self::Qwen36Moe35BA3BFp8
             | Self::Maya13B
-            | Self::Maya13BGguf => Some("Apache-2.0"),
+            | Self::Maya13BGguf
+            | Self::Maya2Native25B => Some("Apache-2.0"),
             _ => None,
         }
     }
@@ -905,6 +940,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::VoxtralTts
                 | crate::catalog::ModelFamily::ChatterboxTts
                 | crate::catalog::ModelFamily::Maya1Tts
+                | crate::catalog::ModelFamily::Maya2Tts
         )
     }
 
@@ -1019,6 +1055,18 @@ impl ModelVariant {
             },
             // Built-in voices are named descriptions; a request's own
             // description replaces the voice's.
+            // Named voices, or a clone of a reference clip with its exact
+            // transcript (the reference's language may differ).
+            Self::Maya2Native25B => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::MAYA2_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: true,
+                reference_transcript_required: true,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
+            },
             Self::Maya13B | Self::Maya13BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::MAYA1_BUILT_IN_VOICE_COUNT),
@@ -1089,6 +1137,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_MAX_OUTPUT_FRAMES),
             _ => None,
         }
     }
@@ -1102,6 +1151,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_FRAME_RATE_HZ),
             _ => None,
         }
     }
@@ -1117,6 +1167,7 @@ impl ModelVariant {
             | crate::catalog::ModelFamily::VibeVoiceTts
             | crate::catalog::ModelFamily::ChatterboxTts
             | crate::catalog::ModelFamily::Maya1Tts
+            | crate::catalog::ModelFamily::Maya2Tts
             | crate::catalog::ModelFamily::Lfm25Audio => Some(24_000),
             _ => None,
         }
@@ -1308,6 +1359,7 @@ impl ModelVariant {
             Self::FishAudioS2Pro => true,
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => true,
             Self::Maya13B | Self::Maya13BGguf => true,
+            Self::Maya2Native25B => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1365,6 +1417,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M,
             Self::Maya13B,
             Self::Maya13BGguf,
+            Self::Maya2Native25B,
         ]
     }
 }
@@ -1481,13 +1534,24 @@ impl ModelVariant {
         }
     }
 
-    /// The inline `<tag>`s a speech request's text may carry (Maya1); text
-    /// for any other model has none, and a tag this list lacks is refused.
+    /// The inline tags a speech request's text may carry, as they are
+    /// written: Maya1's `<tag>`s (a tag this list lacks is refused, see
+    /// [`Self::refuses_unknown_inline_tags`]) and the `[tag]`s Maya 2 Native
+    /// performs best effort (any lowercase `[tag]` passes through; these are
+    /// the ones it names). Text for any other model has none.
     pub fn speech_inline_tags(&self) -> &'static [&'static str] {
         match self.family() {
             crate::catalog::ModelFamily::Maya1Tts => MAYA1_INLINE_TAGS,
+            crate::catalog::ModelFamily::Maya2Tts => crate::catalog::MAYA2_SUGGESTED_TAGS,
             _ => &[],
         }
+    }
+
+    /// Whether a speech request naming an inline tag outside
+    /// [`Self::speech_inline_tags`] is refused (Maya1, whose tokenizer would
+    /// read an unknown tag aloud).
+    pub fn refuses_unknown_inline_tags(&self) -> bool {
+        self.family() == crate::catalog::ModelFamily::Maya1Tts
     }
 }
 

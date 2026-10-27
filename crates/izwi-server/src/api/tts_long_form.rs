@@ -16,6 +16,7 @@ const QWEN_SEGMENT_MAX_CHARS: usize = 300;
 /// inside the 1-14 s clips it was trained on; its automatic budget reaches
 /// the per-request cap near 160 characters.
 const MAYA1_SEGMENT_MAX_CHARS: usize = 160;
+use crate::api::tts_policy::MAYA2_SEGMENT_MAX_CHARS;
 
 /// Silence between two long-form segments: a sentence pause, not the raw
 /// back-to-back concatenation that ran sentences together (TPIPE-5).
@@ -92,29 +93,52 @@ fn segment_max_chars(variant: ModelVariant) -> usize {
     configured_chunk_max_chars().unwrap_or(match variant.family() {
         izwi_core::ModelFamily::Qwen3Tts => QWEN_SEGMENT_MAX_CHARS,
         izwi_core::ModelFamily::Maya1Tts => MAYA1_SEGMENT_MAX_CHARS,
+        izwi_core::ModelFamily::Maya2Tts => MAYA2_SEGMENT_MAX_CHARS,
         _ => DEFAULT_CHUNK_MAX_CHARS,
     })
 }
 
 /// Whether text under an automatic budget splits into long-form segments:
-/// when one request cannot speak it, or (Qwen3-TTS, Maya1) when it is
-/// longer than one segment.
+/// when one request cannot speak it, or (Qwen3-TTS, Maya1, Maya 2 Native)
+/// when it is longer than one segment.
 fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
     crate::api::tts_policy::tts_text_exceeds_one_request(variant, text)
         || (matches!(
             variant.family(),
-            izwi_core::ModelFamily::Qwen3Tts | izwi_core::ModelFamily::Maya1Tts
+            izwi_core::ModelFamily::Qwen3Tts
+                | izwi_core::ModelFamily::Maya1Tts
+                | izwi_core::ModelFamily::Maya2Tts
         ) && text.trim().chars().count() > segment_max_chars(variant))
 }
 
-/// Merge a segment that holds only inline tags (`<laugh>` on a line of its
-/// own, or after a sentence's full stop) into its neighbour, so the model
-/// performs it beside the words it belongs to rather than in a request of
-/// its own.
-fn attach_lone_tags(chunks: Vec<String>) -> Vec<String> {
+/// The inline tags of `chunk` in `variant`'s syntax: Maya1's `<tag>`s,
+/// Maya 2 Native's lowercase `[tag]`s.
+fn inline_tags(variant: ModelVariant, chunk: &str) -> Vec<&str> {
+    if variant.family() == izwi_core::ModelFamily::Maya2Tts {
+        let mut tags = Vec::new();
+        let mut rest = chunk;
+        while let Some(open) = rest.find('[') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find(']') else { break };
+            let name = &after[..close];
+            if !name.is_empty() && name.chars().all(|ch| ch.is_ascii_lowercase() || ch == ' ') {
+                tags.push(&rest[open..open + close + 2]);
+            }
+            rest = &after[close + 1..];
+        }
+        return tags;
+    }
+    izwi_core::runtime_models::architectures::maya1::prompt::inline_tags(chunk).collect()
+}
+
+/// Merge a segment that holds only inline tags (`<laugh>` or `[laughs]` on a
+/// line of its own, or after a sentence's full stop) into its neighbour, so
+/// the model performs it beside the words it belongs to rather than in a
+/// request of its own.
+fn attach_lone_tags(variant: ModelVariant, chunks: Vec<String>) -> Vec<String> {
     let lone = |chunk: &str| {
         let mut rest = chunk.to_string();
-        for tag in izwi_core::runtime_models::architectures::maya1::prompt::inline_tags(chunk) {
+        for tag in inline_tags(variant, chunk) {
             rest = rest.replacen(tag, "", 1);
         }
         rest.trim().is_empty()
@@ -294,8 +318,11 @@ pub fn split_tts_text_for_long_form(
 
     if chunks.is_empty() {
         vec![trimmed.to_string()]
-    } else if variant.family() == izwi_core::ModelFamily::Maya1Tts {
-        attach_lone_tags(chunks)
+    } else if matches!(
+        variant.family(),
+        izwi_core::ModelFamily::Maya1Tts | izwi_core::ModelFamily::Maya2Tts
+    ) {
+        attach_lone_tags(variant, chunks)
     } else {
         chunks
     }
@@ -1360,12 +1387,15 @@ mod tests {
             assert!(budget > 0 && budget % 7 == 0, "segment budget {budget}");
         }
 
-        let chunks = attach_lone_tags(vec![
-            "<sigh>".to_string(),
-            "Well, that went badly.".to_string(),
-            "<laugh>".to_string(),
-            "Never again.".to_string(),
-        ]);
+        let chunks = attach_lone_tags(
+            variant,
+            vec![
+                "<sigh>".to_string(),
+                "Well, that went badly.".to_string(),
+                "<laugh>".to_string(),
+                "Never again.".to_string(),
+            ],
+        );
         assert_eq!(
             chunks,
             vec![
@@ -1373,7 +1403,49 @@ mod tests {
                 "Never again.".to_string()
             ]
         );
-        assert_eq!(attach_lone_tags(vec!["<gasp>".to_string()]), vec!["<gasp>"]);
+        assert_eq!(
+            attach_lone_tags(variant, vec!["<gasp>".to_string()]),
+            vec!["<gasp>"]
+        );
+    }
+
+    /// Maya 2 Native speaks long text in pieces of about 20 s (280
+    /// characters): Hindi paragraphs split at dandas, and a lone `[laughs]`
+    /// stays with its sentence.
+    #[test]
+    fn maya2_splits_at_dandas_and_keeps_square_tags_with_words() {
+        let variant = ModelVariant::Maya2Native25B;
+        let sentence = "आपका ऑर्डर कल शाम तक पहुँच जाएगा और डिलीवरी एजेंट आपको फोन करेगा। ";
+        let long = GenerationRequest::new(sentence.repeat(8)).with_model_variant(variant);
+        let planned = expand_generation_requests_for_long_form(&long, variant);
+        assert!(planned.len() >= 2, "{}", planned.len());
+        for chunk in &planned {
+            assert!(chunk.text.chars().count() <= 280, "{}", chunk.text);
+            assert!(chunk.text.trim_end().ends_with('।'), "{}", chunk.text);
+        }
+        let short = GenerationRequest::new(sentence).with_model_variant(variant);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&short, variant).len(),
+            1
+        );
+
+        let chunks = attach_lone_tags(
+            variant,
+            vec![
+                "That went badly.".to_string(),
+                "[laughs]".to_string(),
+                "Never again.".to_string(),
+            ],
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "That went badly. [laughs]".to_string(),
+                "Never again.".to_string()
+            ]
+        );
+        // Brackets that are not lowercase tags are text.
+        assert_eq!(inline_tags(variant, "[Note] a [b c] [x1]"), vec!["[b c]"]);
     }
 
     /// Chatterbox speaks at most 1,000 speech tokens (40 s) per request, so

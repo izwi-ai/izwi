@@ -127,6 +127,7 @@ pub(crate) struct TtsRuntimeRequest {
     language: Option<String>,
     reference_audio: Option<String>,
     reference_text: Option<String>,
+    reference_language: Option<String>,
     voice_description: Option<String>,
 }
 
@@ -164,6 +165,7 @@ impl TtsRuntimeRequest {
             language: request.language,
             reference_audio: request.reference_audio,
             reference_text: request.reference_text,
+            reference_language: request.reference_language,
             voice_description: request.voice_description,
         })
     }
@@ -174,6 +176,7 @@ impl TtsRuntimeRequest {
         request.language = self.language;
         request.reference_audio = self.reference_audio;
         request.reference_text = self.reference_text;
+        request.reference_language = self.reference_language;
         request.voice_description = self.voice_description;
         request.params = params;
         request

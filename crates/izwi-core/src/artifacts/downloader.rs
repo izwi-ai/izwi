@@ -187,6 +187,27 @@ const MAYA1_FILES: &[&str] = &[
     SNAC_WEIGHTS_FILE,
 ];
 
+/// Maya 2 Native's files at the pinned revision (1403b841): both BF16
+/// shards, their index, the release config, the backbone's config and
+/// tokenizer and the voice list; then Mimi's config and weights and ECAPA's
+/// embedding model, each from its own pinned repository
+/// ([`MIMI_CONFIG`], [`MIMI_WEIGHTS`], [`ECAPA_EMBEDDING_MODEL`]).
+const MAYA2_FILES: &[&str] = &[
+    "maya3_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "backbone/config.json",
+    "backbone/tokenizer.json",
+    "voices/voices.json",
+    MAYA2_MIMI_CONFIG_FILE,
+    MAYA2_MIMI_WEIGHTS_FILE,
+    MAYA2_ECAPA_FILE,
+];
+const MAYA2_MIMI_CONFIG_FILE: &str = "mimi/config.json";
+const MAYA2_MIMI_WEIGHTS_FILE: &str = "mimi/model.safetensors";
+const MAYA2_ECAPA_FILE: &str = "ecapa/embedding_model.ckpt";
+
 /// Maya1's GGUF release: the Q8_0 decoder from `mradermacher/maya1-GGUF`,
 /// the config and tokenizer from Maya1's own repository at its pin (the
 /// GGUF repo ships neither as files), and SNAC.
@@ -650,11 +671,44 @@ const SNAC_24KHZ_CHECKPOINT: PinnedFile = PinnedFile {
     sha256: "4b8164cc6606bfa627f1a784734c1e539891518f1191ed9194fe1e3b9b4bff40",
 };
 
+/// kyutai/mimi at 89091b3e (CC-BY-4.0): the codec Maya 2 Native's codes
+/// decode through (transformers `MimiModel` layout), its config and weights
+/// kept in `mimi/` beside the model.
+const MIMI_CONFIG: PinnedFile = PinnedFile {
+    url: "https://huggingface.co/kyutai/mimi/resolve/\
+          89091b3e466eb6a9d11e537bf26b144f194978f7/config.json",
+    size: 1_117,
+    sha256: "aca6f44b04f7bc2e7466b71597d2d51e463ed1cf3cd7025d8848595580546c36",
+};
+const MIMI_WEIGHTS: PinnedFile = PinnedFile {
+    url: "https://huggingface.co/kyutai/mimi/resolve/\
+          89091b3e466eb6a9d11e537bf26b144f194978f7/model.safetensors",
+    size: 384_649_828,
+    sha256: "bac7e85083dcded655d24eaadde7e6eea34c0da1b35fa2d284e641bd2b942a5e",
+};
+/// speechbrain/spkrec-ecapa-voxceleb at 0f99f2d0 (Apache-2.0): the speaker
+/// encoder Maya 2 Native clones voices with, its `embedding_model.ckpt` (a
+/// torch zip) kept in `ecapa/`.
+const ECAPA_EMBEDDING_MODEL: PinnedFile = PinnedFile {
+    url: "https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/resolve/\
+          0f99f2d0ebe89ac095bcc5903c4dd8f72b367286/embedding_model.ckpt",
+    size: 83_316_686,
+    sha256: "0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2",
+};
+
 /// The pinned source of `variant`'s `local_file`, when it is not in the
 /// variant's own repository.
 fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
     if variant.family() == ModelFamily::Maya1Tts && local_file == SNAC_WEIGHTS_FILE {
         return Some(SNAC_24KHZ_CHECKPOINT);
+    }
+    if variant.family() == ModelFamily::Maya2Tts {
+        return match local_file {
+            MAYA2_MIMI_CONFIG_FILE => Some(MIMI_CONFIG),
+            MAYA2_MIMI_WEIGHTS_FILE => Some(MIMI_WEIGHTS),
+            MAYA2_ECAPA_FILE => Some(ECAPA_EMBEDDING_MODEL),
+            _ => None,
+        };
     }
     if variant.family() != ModelFamily::ChatterboxTts {
         return None;
@@ -1720,6 +1774,7 @@ impl ModelDownloader {
             ModelFamily::Maya1Tts => maya1_files(variant)
                 .iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::Maya2Tts => MAYA2_FILES.iter().all(|file| path.join(file).exists()),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -2413,6 +2468,7 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
+            ModelFamily::Maya2Tts => MAYA2_FILES.iter().map(|file| (*file).to_string()).collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -2940,6 +2996,19 @@ impl ModelDownloader {
                 MAYA1_GGUF_FILE => MAYA1_GGUF_BYTES,
                 SNAC_WEIGHTS_FILE => SNAC_24KHZ_CHECKPOINT.size,
                 _ => 860,
+            }
+        } else if variant.family() == ModelFamily::Maya2Tts {
+            // Maya 2 Native at 1403b841.
+            match file {
+                "model-00001-of-00002.safetensors" => 5_000_017_272,
+                "model-00002-of-00002.safetensors" => 4_862_496,
+                "backbone/tokenizer.json" => 16_103_051,
+                "model.safetensors.index.json" => 56_957,
+                "voices/voices.json" => 6_013,
+                MAYA2_MIMI_CONFIG_FILE => MIMI_CONFIG.size,
+                MAYA2_MIMI_WEIGHTS_FILE => MIMI_WEIGHTS.size,
+                MAYA2_ECAPA_FILE => ECAPA_EMBEDDING_MODEL.size,
+                _ => 1_418,
             }
         } else if file == "mmproj-F16.gguf" {
             match variant {

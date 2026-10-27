@@ -899,6 +899,7 @@ impl ModelLifecycleController {
                     | ModelFamily::FishS2Tts
                     | ModelFamily::ChatterboxTts
                     | ModelFamily::Maya1Tts
+                    | ModelFamily::Maya2Tts
             );
         if backend == BackendKind::Cuda || !fits_state {
             return Ok(0);

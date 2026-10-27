@@ -190,6 +190,10 @@ pub struct CreateSpeechHistoryRecordRequest {
     pub reference_audio: Option<String>,
     #[serde(default)]
     pub reference_text: Option<String>,
+    /// The language the reference audio is spoken in, for models that clone
+    /// across languages (Maya 2 Native); absent, the model infers it.
+    #[serde(default)]
+    pub reference_language: Option<String>,
     #[serde(default)]
     pub saved_voice_id: Option<String>,
     #[serde(default)]
@@ -2596,6 +2600,7 @@ fn normalize_create_request(
     req.voice_description = normalize_optional_trimmed(req.voice_description);
     req.reference_audio = normalize_optional_trimmed(req.reference_audio);
     req.reference_text = normalize_optional_trimmed(req.reference_text);
+    req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
     req
 }
@@ -2697,6 +2702,7 @@ fn build_generation_request(
         language: req.language,
         reference_audio: req.reference_audio,
         reference_text: req.reference_text,
+        reference_language: req.reference_language,
         voice_description: req.voice_description,
     }
 }
@@ -2749,6 +2755,10 @@ fn normalize_for_model_capabilities(
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
     crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
+    crate::api::tts_policy::validate_speech_reference_language(
+        variant,
+        req.reference_language.as_deref(),
+    )?;
     crate::api::tts_policy::validate_speech_inline_tags(
         variant,
         req.text.as_deref().unwrap_or_default(),
@@ -3115,6 +3125,7 @@ mod tests {
             voice_description: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             temperature: None,
             speed: None,

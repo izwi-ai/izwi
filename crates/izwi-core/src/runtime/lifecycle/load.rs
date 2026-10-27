@@ -272,6 +272,9 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::Maya1Tts => {
             crate::models::architectures::maya1::config::STATE_CONTEXT_TOKENS
         }
+        crate::catalog::ModelFamily::Maya2Tts => {
+            crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
+        }
         _ => 0,
     };
     tokens as u64
@@ -1180,6 +1183,15 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_maya2_tts_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_kokoro_tts_state(
                 variant,
             )
@@ -1264,6 +1276,9 @@ impl ModelLifecycleController {
             }
             if variant.family() == crate::catalog::ModelFamily::Maya1Tts {
                 self.model_registry.publish_maya1_tts_ready(variant).await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::Maya2Tts {
+                self.model_registry.publish_maya2_tts_ready(variant).await?;
             }
             self.touch_model_usage(variant).await;
             info!(

@@ -549,15 +549,27 @@
             },
             "type": "array"
           },
+          "cross_lingual_reference": {
+            "description": "Whether a reference voice may name the language it is spoken in\n(`reference_language`), as the model clones a voice into another\nlanguage (Maya 2 Native).",
+            "type": "boolean"
+          },
           "inline_tags": {
-            "description": "Inline `<tag>`s the text to speak may carry, each a vocal event or\ndelivery the model performs where it stands (Maya1: `<laugh>`,\n`<sigh>`, `<whisper>`, …); a tag not listed is refused.",
+            "description": "Inline tags the text to speak may carry, as written, each a vocal\nevent or delivery the model performs where it stands (Maya1:\n`<laugh>`, `<sigh>`, …; Maya 2 Native: `[laughs]`, `[sighs]`, …).",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
+          "inline_tags_strict": {
+            "description": "Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the\nlist is a suggestion and other tags pass through.",
+            "type": "boolean"
+          },
+          "language_auto_detect": {
+            "description": "Whether `language` may be left out (or `auto`) and is then read from\nthe text's script (Maya 2 Native); the picker offers \"auto-detect\".",
+            "type": "boolean"
+          },
           "languages": {
-            "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox); absent, `language` is a hint.",
+            "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox, Maya 2 Native); absent,\n`language` is a hint.",
             "items": {
               "$ref": "#/components/schemas/AdminSpeechLanguage"
             },
@@ -1966,6 +1978,13 @@
                 "type": "string"
               },
               "reference_audio": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reference_language": {
+                "description": "The language the reference audio is spoken in (Maya 2 Native, which\nclones across languages); absent, read from the transcript's script.",
                 "type": [
                   "string",
                   "null"

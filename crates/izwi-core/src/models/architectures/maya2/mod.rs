@@ -22,7 +22,10 @@ pub mod depth;
 pub mod ecapa;
 pub mod guards;
 pub mod inputs;
+mod model;
+mod physical;
 pub mod prompt;
+pub(crate) mod retained;
 pub mod runtime;
 pub mod sampling;
 pub mod text;
@@ -30,6 +33,10 @@ mod weights;
 
 pub use config::{MAYA2_DEFAULTS, SAMPLE_RATE};
 pub use guards::Maya2StopReason;
+pub(crate) use model::maya2_reloads_in_f32;
+pub(crate) use model::Maya2AudioProgress;
+pub use model::{maya2_backbone_precision, maya2_depth_dtype, Maya2TtsDiagnostics, Maya2TtsModel};
+pub(crate) use physical::MAYA2_DOMAIN;
 pub use prompt::{detect_language, resolve_language, Maya2Prompt, Maya2Reference};
 pub use runtime::{
     Maya2ClonedVoice, Maya2GenerationOutput, Maya2GenerationParams, Maya2Runtime, Maya2Voice,

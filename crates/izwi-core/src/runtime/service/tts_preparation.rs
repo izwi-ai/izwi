@@ -186,6 +186,98 @@ pub(super) fn maya1_voice_description(
         })
 }
 
+/// Maya2 generation for a request: unset fields keep upstream's sampler
+/// (codebook-0 temperature 0.9, top-k 64, no nucleus, presence penalty 0.8);
+/// `repetition_penalty` is that presence penalty; `max_tokens` below the
+/// 1,500-frame ceiling caps the frames (the server sends the ceiling when the
+/// caller sets none, which leaves the per-piece budget to the frame prior);
+/// the seed defaults to one derived from the request id.
+pub(super) fn maya2_tts_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+) -> Result<Maya2GenerationParams> {
+    let speech = &params.speech;
+    let defaults = Maya2SamplingParams::default();
+    let generation = Maya2GenerationParams {
+        sampling: Maya2SamplingParams {
+            temperature: speech.temperature.unwrap_or(defaults.temperature),
+            top_k: speech.top_k.unwrap_or(defaults.top_k),
+            top_p: speech.top_p.unwrap_or(defaults.top_p),
+            presence_penalty: speech
+                .repetition_penalty
+                .unwrap_or(defaults.presence_penalty),
+        },
+        max_frames: (params.max_tokens != 0
+            && params.max_tokens < ModelVariant::MAYA2_MAX_OUTPUT_FRAMES)
+            .then_some(params.max_tokens),
+        seed: speech
+            .seed
+            .filter(|seed| *seed != 0)
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+    };
+    generation.validate()?;
+    Ok(generation)
+}
+
+/// Who speaks a Maya2 request, before any audio is decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Maya2VoiceChoice {
+    /// A built-in voice (its exact name).
+    Named(&'static str),
+    /// A clone of base64 reference audio with its transcript and language.
+    Clone {
+        audio: String,
+        transcript: String,
+        language: &'static str,
+    },
+}
+
+/// The voice a Maya2 request names: a reference clip (which needs its
+/// transcript; its language is the request's `reference_language`, else the
+/// transcript's dominant script), else a built-in voice or an OpenAI name
+/// aliased to one, else the default voice.
+pub(super) fn maya2_voice_choice(
+    reference_audio: Option<&str>,
+    reference_text: Option<&str>,
+    reference_language: Option<&str>,
+    speaker: Option<&str>,
+) -> Result<Maya2VoiceChoice> {
+    if let Some(audio) = reference_audio.filter(|audio| !audio.trim().is_empty()) {
+        let transcript = reference_text
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "Maya 2 Native clones a voice from reference audio and its exact \
+                     transcript (reference_text)"
+                        .into(),
+                )
+            })?;
+        let language = resolve_language(reference_language, transcript)?;
+        return Ok(Maya2VoiceChoice::Clone {
+            audio: audio.to_string(),
+            transcript: transcript.to_string(),
+            language,
+        });
+    }
+    let name = speaker
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MAYA2_DEFAULT_VOICE);
+    maya2_voice(name)
+        .map(|voice| Maya2VoiceChoice::Named(voice.name))
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Maya 2 Native has no voice '{name}'; use one of {} or clone one from reference audio",
+                MAYA2_VOICES
+                    .iter()
+                    .map(|voice| voice.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
 pub(super) fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
     let mut bytes = 0usize;
     add_chat_messages_allocations(&mut bytes, messages, messages.len())?;
@@ -1316,6 +1408,187 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    pub(super) async fn prepare_maya2_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Maya2Tts)
+            || request
+                .prepared_maya2_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Maya2 variant");
+        let model = self
+            .model_registry
+            .get_maya2_tts_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("Maya2 model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Maya2 preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Maya2 model {variant} has no effective context"))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Maya2 request is missing text".into()))?
+            .trim()
+            .to_string();
+        let language = resolve_language(request.language.as_deref(), &text)?;
+        // A reference clip (with its transcript) wins; else a built-in voice.
+        let voice = maya2_voice_choice(
+            request.tts_reference_audio_for_execution(),
+            request.tts_reference_text_for_execution(),
+            request.reference_language.as_deref(),
+            request.tts_speaker_for_execution(),
+        )?;
+        let params = maya2_tts_request_params(&request.params, &request.id)?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Maya2 retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        // A clone encodes its reference with Mimi and ECAPA here (once per
+        // distinct clip: the model caches prepared voices).
+        let workspace = match voice {
+            Maya2VoiceChoice::Named(_) => 64 * 1024 * 1024,
+            Maya2VoiceChoice::Clone { .. } => 768 * 1024 * 1024,
+        };
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        workspace,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.maya2".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                workspace,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let max_frames = params.max_frames;
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Maya2 preparation must remain scalar".into(),
+                    ));
+                }
+                let voice = match voice {
+                    Maya2VoiceChoice::Named(name) => Maya2Voice::Named(name),
+                    Maya2VoiceChoice::Clone {
+                        audio,
+                        transcript,
+                        language,
+                    } => {
+                        let (samples, rate) = decode_reference_audio_base64(&audio)?;
+                        let samples = crate::audio::resample_mono_high_quality(
+                            &samples,
+                            rate,
+                            crate::models::architectures::maya2::SAMPLE_RATE,
+                        )?;
+                        Maya2Voice::Cloned(model_for_preparation.prepare_clone(
+                            &samples,
+                            &transcript,
+                            language,
+                        )?)
+                    }
+                };
+                let artifact = model_for_preparation
+                    .prepare_retained_artifact(voice, language, &text, max_frames)?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: 0,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Maya2 preparation returned no outcome".into()))?
+        {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_maya2_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_lfm25_audio_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1568,6 +1841,9 @@ impl RuntimeService {
             .prepare_maya1_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
+            .prepare_maya2_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease)
             .await?;
         Ok((request, job))
@@ -1618,5 +1894,71 @@ mod maya1_tests {
         assert_eq!(explicit.seed, 42);
         params.speech.temperature = Some(0.0);
         assert!(maya1_tts_request_params(&params, "request-1", "Hi.").is_err());
+    }
+}
+
+#[cfg(test)]
+mod maya2_tests {
+    use super::*;
+
+    #[test]
+    fn maya2_voice_is_a_clone_else_a_named_voice() {
+        assert_eq!(
+            maya2_voice_choice(None, None, None, Some("ahana")).unwrap(),
+            Maya2VoiceChoice::Named("Ahana")
+        );
+        // OpenAI names map to fixed voices; none at all is the default.
+        assert_eq!(
+            maya2_voice_choice(None, None, None, Some("alloy")).unwrap(),
+            Maya2VoiceChoice::Named("Vaidehi")
+        );
+        assert_eq!(
+            maya2_voice_choice(None, None, None, None).unwrap(),
+            Maya2VoiceChoice::Named(MAYA2_DEFAULT_VOICE)
+        );
+        assert!(maya2_voice_choice(None, None, None, Some("nobody")).is_err());
+        // A reference needs its transcript; its language comes from the
+        // request or the transcript's script.
+        assert!(maya2_voice_choice(Some("UklGRg=="), None, None, None).is_err());
+        let clone =
+            maya2_voice_choice(Some("UklGRg=="), Some(" नमस्ते "), None, Some("ahana")).unwrap();
+        assert_eq!(
+            clone,
+            Maya2VoiceChoice::Clone {
+                audio: "UklGRg==".into(),
+                transcript: "नमस्ते".into(),
+                language: "hi",
+            }
+        );
+        let marathi =
+            maya2_voice_choice(Some("UklGRg=="), Some("नमस्कार"), Some("mr"), None).unwrap();
+        assert!(matches!(
+            marathi,
+            Maya2VoiceChoice::Clone { language: "mr", .. }
+        ));
+        assert!(maya2_voice_choice(Some("UklGRg=="), Some("hi"), Some("fr"), None).is_err());
+    }
+
+    #[test]
+    fn maya2_params_keep_upstream_defaults() {
+        let mut params = GenerationParams {
+            max_tokens: ModelVariant::MAYA2_MAX_OUTPUT_FRAMES,
+            ..GenerationParams::default()
+        };
+        let auto = maya2_tts_request_params(&params, "request-1").unwrap();
+        assert_eq!(auto.sampling, Maya2SamplingParams::default());
+        assert_eq!(auto.max_frames, None, "the ceiling is no caller limit");
+        assert!(auto.seed > 0);
+        params.max_tokens = 300;
+        params.speech.temperature = Some(0.7);
+        params.speech.repetition_penalty = Some(0.0);
+        params.speech.seed = Some(42);
+        let explicit = maya2_tts_request_params(&params, "request-1").unwrap();
+        assert_eq!(explicit.max_frames, Some(300));
+        assert_eq!(explicit.sampling.temperature, 0.7);
+        assert_eq!(explicit.sampling.presence_penalty, 0.0);
+        assert_eq!(explicit.seed, 42);
+        params.speech.temperature = Some(0.0);
+        assert!(maya2_tts_request_params(&params, "request-1").is_err());
     }
 }

@@ -2755,6 +2755,7 @@ impl SegmentSynthesis {
             language: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             voice_description: None,
         };
         let (chunk_tx, chunks) = tokio::sync::mpsc::channel(32);

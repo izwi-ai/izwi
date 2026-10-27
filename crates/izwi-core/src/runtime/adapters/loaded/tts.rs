@@ -1,5 +1,5 @@
 //! TTS execution adapters: Qwen3-TTS, static Kokoro, Voxtral, Chatterbox, Maya1,
-//! Fish S2, VibeVoice and LFM2.5-Audio.
+//! Maya 2 Native, Fish S2, VibeVoice and LFM2.5-Audio.
 
 use super::*;
 
@@ -736,6 +736,174 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         // SNAC's activations over a window of up to 22 frames (45,056
         // samples), the widest 12 MB a tensor.
         acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        for stage in [
+            &mut preparation,
+            &mut prefill,
+            &mut decode,
+            &mut finalize,
+            &mut acoustic,
+        ] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode, finalize, acoustic]),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Maya2TtsExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) max_batch_size: usize,
+}
+
+impl Maya2TtsExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        MAYA2_TTS_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        // One graph serves both: every request's audio quanta run Mimi over
+        // its newest frames while the backbone runs; a stream sends each one.
+        if streaming.model_native && self.metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming TTS contract",
+                self.metadata.model_variant
+            )));
+        }
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:maya2-state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.prepare.maya2",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        // Tokenizing the prompt on the host; a new clone reference also runs
+        // Mimi's encoder (in bounded windows) and ECAPA over up to 30 s.
+        preparation.max_workspace_bytes = 768 * 1024 * 1024;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.prefill.maya2.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = 16_384_u64.saturating_mul(self.max_batch_size as u64);
+        prefill.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.max_batch_size as u64);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "tts.decode.maya2.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.max_batch_size as u64);
+        // Hands over the audio (a stream's end-of-stream marker).
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            "tts.finalize.maya2.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        // One Mimi window per quantum, so other requests' quanta run between
+        // them.
+        let mut acoustic = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            "tts.audio.maya2.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        acoustic.selector = StageWorkSelector::SequenceAudioDecode;
+        acoustic.progress = StageProgressKind::Iterative;
+        acoustic.shape_policy = StageShapePolicy::Exact;
+        acoustic.max_batch_size = 1;
+        acoustic.concurrency = ConcurrencyClass::Exclusive;
+        acoustic.max_work_units = 1;
+        // Mimi's activations over a window of a few 80 ms frames (1,920
+        // samples each at up to 1,024 channels) and its per-stream state.
+        acoustic.max_workspace_bytes = 64 * 1024 * 1024;
         for stage in [
             &mut preparation,
             &mut prefill,

@@ -34,6 +34,8 @@ use crate::models::architectures::lfm25_audio::{
 };
 use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
 use crate::models::architectures::maya1::Maya1GenerationParams;
+use crate::models::architectures::maya2::retained::Maya2PreparedArtifact;
+use crate::models::architectures::maya2::Maya2GenerationParams;
 use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
@@ -48,8 +50,9 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease,
-    KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, NativeAsrModel, NativeChatModel,
-    NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+    KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease,
+    NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease,
+    VibeVoiceTtsModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -427,6 +430,7 @@ enum PreparedIncrementalModel {
     VoxtralTts(VoxtralTtsModelLease),
     ChatterboxTts(ChatterboxTtsModelLease),
     Maya1Tts(Maya1TtsModelLease),
+    Maya2Tts(Maya2TtsModelLease),
     KokoroTts(KokoroTtsModelLease),
 }
 
@@ -442,6 +446,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
+            Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
@@ -463,6 +468,8 @@ pub(super) struct IncrementalModelExecutionReady {
     chatterbox_tts_params: Option<ChatterboxGenerationParams>,
     maya1_tts: Option<Arc<Maya1PreparedArtifact>>,
     maya1_tts_params: Option<Maya1GenerationParams>,
+    maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
+    maya2_tts_params: Option<Maya2GenerationParams>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 
@@ -1033,6 +1040,9 @@ pub struct EngineCoreRequest {
     /// Reference text for voice cloning. Processing may move this buffer into
     /// [`Self::task`] and clear this field.
     pub reference_text: Option<String>,
+    /// The language the reference audio is spoken in, for families that clone
+    /// across languages (Maya 2 Native); absent, the family infers it.
+    pub reference_language: Option<String>,
     /// Voice description for voice design
     pub voice_description: Option<String>,
     /// Optional system prompt (e.g. speech-to-speech system instruction).

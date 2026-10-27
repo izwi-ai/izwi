@@ -38,6 +38,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -89,6 +91,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
             kokoro_tts: None,
         });
         for (stage_id, cost) in prepared_costs {
@@ -755,6 +759,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
+                | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -774,6 +779,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
+                | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -795,6 +801,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
+                | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

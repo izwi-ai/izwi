@@ -76,6 +76,11 @@ pub struct SpeechRequest {
     /// Optional reference transcript for cloning.
     #[serde(default)]
     pub reference_text: Option<String>,
+    /// izwi extension: the language the reference audio is spoken in, for
+    /// models that clone across languages (Maya 2 Native); absent, the model
+    /// infers it from the transcript.
+    #[serde(default)]
+    pub reference_language: Option<String>,
     /// Optional saved voice identifier resolved server-side.
     #[serde(default)]
     pub saved_voice_id: Option<String>,
@@ -182,6 +187,10 @@ pub async fn speech(
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
     crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
+    crate::api::tts_policy::validate_speech_reference_language(
+        variant,
+        req.reference_language.as_deref(),
+    )?;
     crate::api::tts_policy::validate_speech_inline_tags(variant, &req.input)?;
     let streaming = resolve_streaming_mode(&req)?;
     crate::api::tts_policy::validate_speech_streaming(variant, streaming)?;
@@ -490,6 +499,7 @@ fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
     req.instructions = normalize_optional_trimmed(req.instructions);
     req.reference_audio = normalize_optional_trimmed(req.reference_audio);
     req.reference_text = normalize_optional_trimmed(req.reference_text);
+    req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
     req.stream_format = normalize_optional_trimmed(req.stream_format);
     req
@@ -971,6 +981,7 @@ fn build_generation_request(
         language: req.language.clone(),
         reference_audio: req.reference_audio.clone(),
         reference_text: req.reference_text.clone(),
+        reference_language: req.reference_language.clone(),
         voice_description: req.instructions.clone(),
     }
 }
@@ -1204,6 +1215,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1240,6 +1252,7 @@ mod tests {
             instructions: None,
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1276,6 +1289,7 @@ mod tests {
             instructions: None,
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1311,6 +1325,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1347,6 +1362,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1375,6 +1391,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1407,6 +1424,7 @@ mod tests {
             instructions: instructions.map(str::to_string),
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1488,6 +1506,7 @@ mod tests {
             instructions: None,
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1516,6 +1535,7 @@ mod tests {
             instructions: None,
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("reference words".to_string()),
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };
@@ -1577,6 +1597,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             saved_voice_id: None,
             sampling: Default::default(),
         };

@@ -2211,6 +2211,9 @@ pub struct SpeechRequest {
     pub instructions: Option<String>,
     pub reference_audio: Option<String>,
     pub reference_text: Option<String>,
+    /// The language the reference audio is spoken in (Maya 2 Native, which
+    /// clones across languages); absent, read from the transcript's script.
+    pub reference_language: Option<String>,
     pub saved_voice_id: Option<String>,
     /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
     /// `exaggeration`, `min_p`, ...); a control the model does not take is

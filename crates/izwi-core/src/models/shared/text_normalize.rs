@@ -12,8 +12,10 @@
 use crate::catalog::ModelFamily;
 
 /// Whether `family` normalizes speech text when the request does not say.
+/// Maya 2 Native was evaluated and is served upstream with its own
+/// multilingual normaliser on.
 pub(crate) fn family_normalizes_by_default(family: ModelFamily) -> bool {
-    matches!(family, ModelFamily::KokoroTts)
+    matches!(family, ModelFamily::KokoroTts | ModelFamily::Maya2Tts)
 }
 
 /// Whether text in `language` (or, without one, for `speaker`) is English:
@@ -547,8 +549,9 @@ mod tests {
     }
 
     #[test]
-    fn only_kokoro_opts_in_by_default_and_only_for_english() {
+    fn kokoro_and_maya2_opt_in_by_default() {
         assert!(family_normalizes_by_default(ModelFamily::KokoroTts));
+        assert!(family_normalizes_by_default(ModelFamily::Maya2Tts));
         for family in [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,

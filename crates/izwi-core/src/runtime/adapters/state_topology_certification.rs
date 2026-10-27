@@ -104,6 +104,9 @@ fn certified_topology(
         // Maya1 retains its decoder pages; the SNAC window stage leases
         // scratch only.
         (Maya1Tts, Tts) => RetainedPagedAndInvocationScratch,
+        // Maya 2 Native retains its backbone pages; the depth decoder and the
+        // Mimi window stage lease scratch only.
+        (Maya2Tts, Tts) => RetainedPagedAndInvocationScratch,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.

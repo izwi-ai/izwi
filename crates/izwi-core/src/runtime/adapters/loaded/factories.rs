@@ -249,6 +249,34 @@ impl LoadedExecutionAdapterFactory for Maya1PhysicalTtsAdapterFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct Maya2PhysicalTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for Maya2PhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::Maya2Tts.factory_id()
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Maya2Tts, metadata, backend_kind)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(Maya2TtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct KokoroStaticTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
@@ -578,6 +606,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(VoxtralPhysicalTtsAdapterFactory),
         Arc::new(ChatterboxPhysicalTtsAdapterFactory),
         Arc::new(Maya1PhysicalTtsAdapterFactory),
+        Arc::new(Maya2PhysicalTtsAdapterFactory),
         Arc::new(KokoroStaticTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]

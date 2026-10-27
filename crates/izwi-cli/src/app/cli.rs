@@ -408,9 +408,17 @@ pub enum Commands {
         temperature: Option<f32>,
 
         /// Language of the text: a code or name (Chatterbox Multilingual,
-        /// e.g. `fr` or `French`; Qwen3-TTS takes names such as `English`)
+        /// e.g. `fr` or `French`; Qwen3-TTS takes names such as `English`;
+        /// Maya 2 Native a code such as `hi`, or `auto` to read it from the
+        /// text's script)
         #[arg(long)]
         language: Option<String>,
+
+        /// Language the reference audio is spoken in, a code such as `en`
+        /// (Maya 2 Native, which can clone a voice into another language;
+        /// unset, it reads it from the transcript's script)
+        #[arg(long, value_name = "CODE")]
+        reference_language: Option<String>,
 
         /// Emotion intensity, 0 to 2 (Chatterbox; its default is 0.5)
         #[arg(long)]

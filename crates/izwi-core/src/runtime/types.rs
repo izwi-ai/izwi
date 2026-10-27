@@ -277,6 +277,11 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub reference_text: Option<String>,
 
+    /// Language the reference audio is spoken in (Maya 2 Native clones
+    /// across languages); absent, the model infers it.
+    #[serde(default)]
+    pub reference_language: Option<String>,
+
     /// Voice description for voice design models
     #[serde(default)]
     pub voice_description: Option<String>,
@@ -298,6 +303,7 @@ impl GenerationRequest {
             language: None,
             reference_audio: None,
             reference_text: None,
+            reference_language: None,
             voice_description: None,
         }
     }
