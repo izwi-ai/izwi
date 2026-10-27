@@ -190,6 +190,54 @@ describe("CloneVoiceDialog", () => {
     );
   });
 
+  it("asks a cross-lingual model which language the recording is in", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    renderDialog({
+      model: "Maya2-Native-2.5B",
+      modelInfo: {
+        variant: "Maya2-Native-2.5B",
+        status: "ready",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          built_in_voice_count: 20,
+          supports_reference_voice: true,
+          reference_transcript_required: true,
+          supports_voice_description: false,
+          supports_streaming: true,
+          supports_speed_control: false,
+          supports_auto_long_form: true,
+          languages: [
+            { code: "hi", name: "Hindi" },
+            { code: "en", name: "English" },
+          ],
+          language_auto_detect: true,
+          cross_lingual_reference: true,
+        },
+      } as React.ComponentProps<typeof CloneVoiceDialog>["modelInfo"],
+    });
+    await uploadClip("sam-reference.wav");
+    fillForm();
+
+    const picker = screen.getByRole("combobox", { name: "Language of the recording" });
+    expect(picker).toHaveTextContent("Detect from the transcript");
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "English" }));
+    fireEvent.click(saveButton());
+
+    expect(await screen.findByRole("dialog", { name: "Voice saved" })).toBeInTheDocument();
+    expect(mocks.createSavedVoice).toHaveBeenCalledWith(
+      expect.objectContaining({ reference_language: "en" }),
+    );
+  });
+
+  it("asks no recording language of a model that clones within one", async () => {
+    renderDialog();
+    await uploadClip("sam-reference.wav");
+    expect(
+      screen.queryByRole("combobox", { name: "Language of the recording" }),
+    ).toBeNull();
+  });
+
   it.each([
     [2.4, "Too short", "0:02"],
     [31.2, "Too long", "0:32"],

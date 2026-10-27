@@ -18,6 +18,13 @@ import {
   type SegmentOption,
 } from "@/components/history/HistoryToolbar";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
 import { blobToBase64Payload } from "@/utils/audioBase64";
@@ -38,6 +45,10 @@ import {
 } from "./NewVoiceParts";
 
 type ClipSource = "upload" | "record";
+
+/** The recording-language choice that leaves the language to be read from
+ * the transcript's script. */
+const DETECT_REFERENCE_LANGUAGE = "detect";
 
 interface Clip extends ReferenceClip {
   name: string;
@@ -140,6 +151,9 @@ export function CloneVoiceDialog({
   );
   const [elapsedSecs, setElapsedSecs] = useState(0);
   const [transcript, setTranscript] = useState("");
+  const [referenceLanguage, setReferenceLanguage] = useState(
+    DETECT_REFERENCE_LANGUAGE,
+  );
   const [consent, setConsent] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -195,6 +209,7 @@ export function CloneVoiceDialog({
     setRecording("idle");
     setElapsedSecs(0);
     setTranscript("");
+    setReferenceLanguage(DETECT_REFERENCE_LANGUAGE);
     setConsent(false);
     setDragging(false);
     setSaving(false);
@@ -333,6 +348,14 @@ export function CloneVoiceDialog({
   // what the reference says.
   const transcriptRequired =
     modelInfo?.speech_capabilities?.reference_transcript_required ?? true;
+  // A model that clones a voice into other languages (Maya 2 Native) is
+  // told which one the recording is in, or reads it from the transcript.
+  const recordingLanguages = modelInfo?.speech_capabilities
+    ?.cross_lingual_reference
+    ? [...(modelInfo.speech_capabilities.languages ?? [])].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      )
+    : [];
   const busy = recording !== "idle" || readingClip || saving;
   const canSave =
     Boolean(name.trim() && clip) &&
@@ -353,6 +376,11 @@ export function CloneVoiceDialog({
       const voice = await api.createSavedVoice({
         name: name.trim(),
         reference_text: transcript.trim() || undefined,
+        reference_language:
+          recordingLanguages.length > 0 &&
+          referenceLanguage !== DETECT_REFERENCE_LANGUAGE
+            ? referenceLanguage
+            : undefined,
         audio_base64: await blobToBase64Payload(clip.blob),
         audio_mime_type: "audio/wav",
         audio_filename: wavFilename(clip.name),
@@ -617,6 +645,36 @@ export function CloneVoiceDialog({
                 className={TEXTAREA_CLASS}
               />
             </CreationField>
+
+            {recordingLanguages.length > 0 ? (
+              <CreationField
+                label="Language of the recording"
+                hint="The voice can then speak any of the model's languages."
+              >
+                <Select
+                  value={referenceLanguage}
+                  onValueChange={setReferenceLanguage}
+                  disabled={saving}
+                >
+                  <SelectTrigger
+                    aria-label="Language of the recording"
+                    className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={DETECT_REFERENCE_LANGUAGE}>
+                      Detect from the transcript
+                    </SelectItem>
+                    {recordingLanguages.map((option) => (
+                      <SelectItem key={option.code} value={option.code}>
+                        {option.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </CreationField>
+            ) : null}
 
             <label
               htmlFor="clone-voice-consent"
