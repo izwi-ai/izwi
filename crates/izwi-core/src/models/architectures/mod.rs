@@ -14,6 +14,7 @@ pub mod kokoro;
 pub mod lfm2;
 pub mod lfm25_audio;
 pub mod maya1;
+pub mod maya2;
 pub mod nemotron;
 pub mod parakeet;
 pub mod qwen3;

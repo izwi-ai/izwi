@@ -1,6 +1,7 @@
 //! Model identities, families, metadata and backend support levels.
 
 mod cuda_support;
+mod maya2;
 mod metadata;
 mod prefix_reuse;
 mod variant;
@@ -9,6 +10,10 @@ pub use cuda_support::{
     CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind,
     CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
     CudaSupportLevel,
+};
+pub use maya2::{
+    maya2_language, maya2_voice, Maya2Language, Maya2Voice, MAYA2_DEFAULT_VOICE,
+    MAYA2_LANGUAGES, MAYA2_OPENAI_VOICE_ALIASES, MAYA2_SUGGESTED_TAGS, MAYA2_VOICES,
 };
 pub use metadata::{
     ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,
