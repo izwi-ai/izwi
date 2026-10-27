@@ -1,13 +1,16 @@
 //! Chatterbox's text frontends: upstream's `punc_norm`, then the BPE
 //! tokenizer with spaces spelled `[SPACE]` (`tts.py`, `mtl_tts.py`,
 //! `models/tokenizers/tokenizer.py`). The multilingual one also lowercases,
-//! applies NFKD, decomposes Korean syllables and prefixes a `[lang]` tag.
+//! applies NFKD, decomposes Korean syllables, spells Chinese in Cangjie
+//! codes ([`super::chinese`]) and prefixes a `[lang]` tag.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokenizers::normalizers::NFKD;
 use tokenizers::{NormalizedString, Normalizer, Tokenizer};
 
+use super::chinese::ChineseFrontend;
 use crate::error::{Error, Result};
 
 const SPACE_TOKEN: &str = "[SPACE]";
@@ -62,12 +65,11 @@ pub const MULTILINGUAL_LANGUAGES: [(&str, &str); 23] = [
     ("zh", "Chinese"),
 ];
 
-/// Languages whose upstream frontend needs a word segmenter and Cangjie
-/// table (zh, spacy-pkuseg) or a kanji reader (ja, pykakasi) izwi has not
-/// ported; every other language matches upstream's default install, Hebrew
-/// and Russian without the optional diacritics and stress models upstream
-/// also skips when they are absent.
-const UNPORTED_LANGUAGES: [&str; 2] = ["ja", "zh"];
+/// Languages whose upstream frontend needs a kanji reader (ja, pykakasi)
+/// izwi has not ported; every other language matches upstream's default
+/// install, Hebrew and Russian without the optional diacritics and stress
+/// models upstream also skips when they are absent.
+const UNPORTED_LANGUAGES: [&str; 1] = ["ja"];
 
 /// The multilingual language tag for a request's `language`: a code ("fr")
 /// or English name ("French") in any case. Absent or "auto" is English.
@@ -140,19 +142,56 @@ pub fn normalize_punctuation(text: &str) -> String {
     normalize_punctuation_ending(text, &SENTENCE_ENDERS)
 }
 
-/// The multilingual text upstream tokenizes: `punc_norm` (CJK enders
-/// accepted), lowercase, NFKD, Korean syllables as jamo, then the `[lang]`
-/// tag (`mtl_tts.py`, `MTLTokenizer.encode`).
-pub fn normalize_multilingual(text: &str, language: &str) -> Result<String> {
-    let text = normalize_punctuation_ending(text, &MULTILINGUAL_SENTENCE_ENDERS).to_lowercase();
-    let mut normalized = NormalizedString::from(text);
-    NFKD.normalize(&mut normalized)
-        .map_err(|error| Error::InvalidInput(format!("Chatterbox text normalization: {error}")))?;
-    let mut text = normalized.get().to_string();
-    if language == "ko" {
-        text = korean_jamo(&text);
+/// The multilingual frontend: the language steps of `MTLTokenizer.encode`,
+/// with the Chinese reader loaded from the model directory on first use.
+pub struct MultilingualFrontend {
+    dir: PathBuf,
+    chinese: Mutex<Option<Arc<ChineseFrontend>>>,
+}
+
+impl MultilingualFrontend {
+    /// A frontend reading its data files from `dir` when a language needs
+    /// them.
+    pub fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            chinese: Mutex::new(None),
+        }
     }
-    Ok(format!("[{language}]{text}"))
+
+    /// The multilingual text upstream tokenizes: `punc_norm` (CJK enders
+    /// accepted), lowercase, NFKD, the language's own step (Korean
+    /// syllables as jamo, Chinese in Cangjie codes), then the `[lang]` tag
+    /// (`mtl_tts.py`, `MTLTokenizer.encode`).
+    pub fn normalize(&self, text: &str, language: &str) -> Result<String> {
+        let text = normalize_punctuation_ending(text, &MULTILINGUAL_SENTENCE_ENDERS).to_lowercase();
+        let mut normalized = NormalizedString::from(text);
+        NFKD.normalize(&mut normalized).map_err(|error| {
+            Error::InvalidInput(format!("Chatterbox text normalization: {error}"))
+        })?;
+        let text = normalized.get();
+        let text = match language {
+            "ko" => korean_jamo(text),
+            "zh" => self.chinese()?.convert(text),
+            _ => text.to_string(),
+        };
+        Ok(format!("[{language}]{text}"))
+    }
+
+    /// The Chinese reader, loaded once; a failed load is retried by the
+    /// next Chinese request.
+    fn chinese(&self) -> Result<Arc<ChineseFrontend>> {
+        let mut chinese = self
+            .chinese
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(frontend) = chinese.as_ref() {
+            return Ok(frontend.clone());
+        }
+        let frontend = Arc::new(ChineseFrontend::load(&self.dir)?);
+        *chinese = Some(frontend.clone());
+        Ok(frontend)
+    }
 }
 
 /// Python's `str.isspace`: Unicode whitespace plus the ASCII information
@@ -218,8 +257,9 @@ pub struct ChatterboxTextTokenizer {
     tokenizer: Tokenizer,
     start_text_token: u32,
     stop_text_token: u32,
-    /// The multilingual frontend: language tags, lowercase, NFKD.
-    multilingual: bool,
+    /// The multilingual frontend: language tags, lowercase, NFKD and the
+    /// per-language steps.
+    multilingual: Option<MultilingualFrontend>,
 }
 
 impl ChatterboxTextTokenizer {
@@ -228,7 +268,8 @@ impl ChatterboxTextTokenizer {
     }
 
     /// The multilingual checkpoint's grapheme tokenizer, which must carry a
-    /// tag for every language.
+    /// tag for every language; the per-language data files are read from
+    /// its directory.
     pub fn load_multilingual(
         path: &Path,
         start_text_token: u32,
@@ -243,6 +284,8 @@ impl ChatterboxTextTokenizer {
         stop_text_token: u32,
         multilingual: bool,
     ) -> Result<Self> {
+        let multilingual =
+            multilingual.then(|| MultilingualFrontend::new(path.parent().unwrap_or(Path::new(""))));
         let tokenizer = Tokenizer::from_file(path).map_err(|error| {
             Error::ModelLoadError(format!(
                 "Failed to load Chatterbox tokenizer {}: {error}",
@@ -262,7 +305,7 @@ impl ChatterboxTextTokenizer {
                 "Chatterbox tokenizer has no [SPACE] token".into(),
             ));
         }
-        if multilingual {
+        if multilingual.is_some() {
             for (code, _) in MULTILINGUAL_LANGUAGES {
                 if tokenizer.token_to_id(&format!("[{code}]")).is_none() {
                     return Err(Error::ModelLoadError(format!(
@@ -280,7 +323,7 @@ impl ChatterboxTextTokenizer {
     }
 
     pub fn multilingual(&self) -> bool {
-        self.multilingual
+        self.multilingual.is_some()
     }
 
     /// Token ids of already-normalised text, without start/stop tokens.
@@ -301,10 +344,9 @@ impl ChatterboxTextTokenizer {
     /// [`Self::text_sequence`] in `language`, a code from
     /// [`multilingual_language`]; the English tokenizer ignores it.
     pub fn text_sequence_for(&self, text: &str, language: &str) -> Result<Vec<u32>> {
-        let normalized = if self.multilingual {
-            normalize_multilingual(text, language)?
-        } else {
-            normalize_punctuation(text)
+        let normalized = match &self.multilingual {
+            Some(frontend) => frontend.normalize(text, language)?,
+            None => normalize_punctuation(text),
         };
         let mut ids = Vec::with_capacity(normalized.len() + 2);
         ids.push(self.start_text_token);
@@ -344,23 +386,23 @@ mod tests {
     /// (é → e + U+0301), Hangul as jamo, then the tag.
     #[test]
     fn multilingual_text_follows_upstream() {
+        let frontend = MultilingualFrontend::new(Path::new("/nonexistent"));
         assert_eq!(
-            normalize_multilingual("Ça va très bien", "fr").unwrap(),
+            frontend.normalize("Ça va très bien", "fr").unwrap(),
             "[fr]c\u{327}a va tre\u{300}s bien."
         );
         assert_eq!(
-            normalize_multilingual("ΟΔΟΣ ΚΑΛΗ", "el").unwrap(),
+            frontend.normalize("ΟΔΟΣ ΚΑΛΗ", "el").unwrap(),
             "[el]οδο\u{3c2} καλη."
-        );
-        assert_eq!(
-            normalize_multilingual("你好。", "zh").unwrap(),
-            "[zh]你好。"
         );
         // 한 = ᄒ + ᅡ + ᆫ; NFKD and the jamo step agree.
         assert_eq!(
-            normalize_multilingual("한국", "ko").unwrap(),
+            frontend.normalize("한국", "ko").unwrap(),
             "[ko]\u{1112}\u{1161}\u{11ab}\u{1100}\u{116e}\u{11a8}."
         );
+        // Chinese needs its data files, which this directory lacks.
+        let missing = frontend.normalize("你好。", "zh").unwrap_err().to_string();
+        assert!(missing.contains("download the model again"), "{missing}");
         assert_eq!(korean_jamo(" 한 "), "\u{1112}\u{1161}\u{11ab}");
     }
 
@@ -375,8 +417,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("Japanese"), "{refused}");
-        assert!(multilingual_language(Some("zh")).is_err());
-        assert_eq!(supported_multilingual_languages().len(), 21);
+        assert_eq!(multilingual_language(Some("Chinese")).unwrap(), "zh");
+        assert_eq!(supported_multilingual_languages().len(), 22);
         assert!(english_language(Some("English")).is_ok());
         assert!(english_language(None).is_ok());
         assert!(english_language(Some("fr")).is_err());
@@ -415,6 +457,41 @@ mod tests {
                 assert_eq!(ids[1], tag, "{code}: {sentence}");
                 assert!(!ids.contains(&unknown), "{code}: {sentence} → {ids:?}");
             }
+        }
+    }
+
+    /// Chinese gives the token ids upstream's own tokenizer does
+    /// (`chinese_reference.json`): pkuseg's segmentation and merge
+    /// dictionary, Cangjie indices, table entries that are not Lo (〇), and
+    /// full-width text NFKD folds.
+    #[test]
+    #[ignore = "needs the multilingual tokenizer and Chinese frontend files in IZWI_CHATTERBOX_MULTILINGUAL_DIR"]
+    fn chinese_matches_upstream_token_ids() {
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("IZWI_CHATTERBOX_MULTILINGUAL_DIR")
+                .expect("IZWI_CHATTERBOX_MULTILINGUAL_DIR"),
+        );
+        let tokenizer = ChatterboxTextTokenizer::load_multilingual(
+            &dir.join("grapheme_mtl_merged_expanded_v1.json"),
+            255,
+            0,
+        )
+        .unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/chatterbox/chinese_reference.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let text = case["text"].as_str().unwrap();
+            let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
+            let ids = tokenizer.text_sequence_for(text, "zh").unwrap();
+            assert_eq!((ids[0], ids[ids.len() - 1]), (255, 0), "{text}");
+            assert_eq!(
+                ids[1..ids.len() - 1],
+                expected[..],
+                "{text}: upstream segments it as {}",
+                case["words"]
+            );
         }
     }
 }

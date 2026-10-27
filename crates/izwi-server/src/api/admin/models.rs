@@ -1289,9 +1289,9 @@ mod tests {
             .iter()
             .map(|language| language["code"].as_str().expect("code"))
             .collect::<Vec<_>>();
-        assert_eq!(codes.len(), 21);
-        assert!(codes.contains(&"sw") && codes.contains(&"en"));
-        assert!(!codes.contains(&"zh") && !codes.contains(&"ja"));
+        assert_eq!(codes.len(), 22);
+        assert!(codes.contains(&"sw") && codes.contains(&"en") && codes.contains(&"zh"));
+        assert!(!codes.contains(&"ja"));
         assert!(languages(ModelVariant::Kokoro82M).is_null());
     }
 

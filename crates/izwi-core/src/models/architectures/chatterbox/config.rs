@@ -24,7 +24,7 @@ pub const MULTILINGUAL_TOKENIZER_FILE: &str = "grapheme_mtl_merged_expanded_v1.j
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatterboxEdition {
     English,
-    /// 23 languages (21 with izwi's frontend), tagged per request.
+    /// 23 languages (22 with izwi's frontend), tagged per request.
     Multilingual,
 }
 
