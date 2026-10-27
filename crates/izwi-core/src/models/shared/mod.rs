@@ -5,6 +5,7 @@
 
 pub mod attention;
 pub mod chat;
+pub mod codecs;
 pub mod config;
 pub(crate) mod detokenize;
 pub mod grammar;
