@@ -1,8 +1,9 @@
 //! Sentence segmentation shared by long-form TTS and Studio (P3.1, TPIPE-5).
 //!
 //! A sentence ends at `!`, `?`, a full stop or an ellipsis followed by
-//! whitespace (and, for an ellipsis, a capitalized next word), a CJK
-//! terminator, or a line break. Trailing closing quotes and brackets stay with
+//! whitespace (and, for an ellipsis, a capitalized next word), an Indic
+//! danda (`।`, `॥`) followed by whitespace, a CJK terminator, or a line
+//! break. Trailing closing quotes and brackets stay with
 //! their sentence. A full stop does not end a sentence inside a number
 //! ("3.14"), after a title or a fixed abbreviation ("Dr.", "e.g.", "No."),
 //! after an initial ("J. Smith"), or after an abbreviation such as "etc."
@@ -51,6 +52,12 @@ fn is_cjk_terminator(ch: char) -> bool {
     )
 }
 
+/// The danda and double danda that end sentences in Devanagari, Bengali,
+/// Gurmukhi and Odia text (Hindi, Marathi, Bengali, Assamese, Punjabi, Odia).
+fn is_danda(ch: char) -> bool {
+    matches!(ch, '\u{0964}' | '\u{0965}')
+}
+
 /// Byte ranges of the sentences of `text`, trimmed, in order.
 pub(crate) fn sentence_spans(text: &str) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -63,6 +70,16 @@ pub(crate) fn sentence_spans(text: &str) -> Vec<Range<usize>> {
         let boundary = match ch {
             '\n' => Some(index + 1),
             _ if is_cjk_terminator(ch) => Some(absorb_closing(&chars, index + 1)),
+            _ if is_danda(ch) => {
+                let mut run_end = index + 1;
+                while run_end < chars.len() && is_danda(chars[run_end].1) {
+                    run_end += 1;
+                }
+                let after = absorb_closing(&chars, run_end);
+                let ends = after >= chars.len() || chars[after].1.is_whitespace();
+                index = run_end - 1;
+                ends.then_some(after)
+            }
             '!' | '?' | '.' | '\u{2026}' => {
                 // The run of terminators ("?!", "...", "…") and the closing
                 // quotes and brackets after it belong to this sentence.
@@ -293,6 +310,23 @@ fn split_words(unit: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hindi, Bengali and Punjabi sentences end at a danda followed by a
+    /// space; a danda run and a closing quote stay with their sentence.
+    #[test]
+    fn dandas_end_indic_sentences() {
+        let text = "नमस्ते। आप कैसे हैं? \"ठीक हूँ॥\" আমি ভালো আছি। ਧੰਨਵਾਦ";
+        let sentences = sentence_spans(text)
+            .into_iter()
+            .map(|span| &text[span])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sentences,
+            ["नमस्ते।", "आप कैसे हैं?", "\"ठीक हूँ॥\"", "আমি ভালো আছি।", "ਧੰਨਵਾਦ"]
+        );
+        // No space after the danda: not a boundary.
+        assert_eq!(sentence_spans("एक।दो").len(), 1);
+    }
 
     fn sentences(text: &str) -> Vec<&str> {
         sentence_spans(text)
