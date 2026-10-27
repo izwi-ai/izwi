@@ -93,8 +93,12 @@ pub const MAX_DESCRIPTION_CHARS: usize = 1_000;
 
 /// A request's generation budget when it sets none, sized from its text
 /// alone (the server sets it before any tokenizer is at hand): about twice
-/// the tokens unhurried speech of its characters takes, a second and a half
-/// per inline tag, in whole frames within [`MAX_NEW_TOKENS`].
+/// the tokens unhurried speech of its characters takes, three seconds of
+/// lead-in and pauses, and six seconds per inline tag, in whole frames within
+/// [`MAX_NEW_TOKENS`]. Measured on Metal (22 one-sentence requests and a
+/// tagged line at three seeds, uncapped), every utterance ended by itself
+/// within three quarters of this budget; a laugh ran up to five seconds and
+/// a described voice took 1.6 s to start.
 pub fn maya1_auto_max_new_tokens(text: &str) -> usize {
     let tags = crate::models::architectures::maya1::prompt::inline_tags(text).count();
     let tag_chars = crate::models::architectures::maya1::prompt::inline_tags(text)
@@ -110,12 +114,13 @@ pub fn maya1_auto_max_new_tokens(text: &str) -> usize {
     frames * TOKENS_PER_FRAME
 }
 
-/// One second of audio.
-const AUTO_BUDGET_BASE_TOKENS: usize = 84;
+/// Three seconds of audio.
+const AUTO_BUDGET_BASE_TOKENS: usize = 252;
 /// Speech runs near 14 characters a second (5.9 tokens a character);
 /// twice that leaves room for slow and expressive delivery.
 const AUTO_BUDGET_TOKENS_PER_CHAR: usize = 12;
-const AUTO_BUDGET_TOKENS_PER_TAG: usize = 126;
+/// Six seconds: a tag such as `<laugh>` can run for five.
+const AUTO_BUDGET_TOKENS_PER_TAG: usize = 504;
 
 /// A built-in voice: a name and the description it stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

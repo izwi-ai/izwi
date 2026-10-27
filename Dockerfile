@@ -98,8 +98,12 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 WORKDIR /app
 
-# git: the FlashAttention build fetches CUTLASS.
-RUN apt-get update \
+# git: the FlashAttention build fetches CUTLASS. Nothing here comes from
+# NVIDIA's apt repository (the image already has the CUDA toolkit), so its
+# source goes first: a mirror NVIDIA is still syncing fails `apt-get update`
+# with a size mismatch.
+RUN rm -f /etc/apt/sources.list.d/cuda* \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -192,8 +196,10 @@ LABEL org.opencontainers.image.title="Izwi Audio (CUDA)" \
       org.opencontainers.image.documentation="https://github.com/izwi-ai/izwi/blob/main/docs/user/installation/docker.md"
 
 # Ubuntu 24.04 images ship an `ubuntu` user with uid 1000; izwi takes it over
-# so existing volumes (owned by 1000) keep working.
-RUN apt-get update \
+# so existing volumes (owned by 1000) keep working. NVIDIA's apt source goes
+# first, as in the builder: nothing here comes from it.
+RUN rm -f /etc/apt/sources.list.d/cuda* \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         espeak-ng \

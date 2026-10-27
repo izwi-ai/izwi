@@ -55,8 +55,10 @@ Those endpoints only show variants that are enabled for download/use.
 > pacing." Nine described voices are built in (see
 > [Voice Presets](/models/voice-presets#maya1)). Twenty tags placed in the text
 > (`<laugh>`, `<sigh>`, `<whisper>`, …) make it laugh, sigh or whisper there.
-> At 3B parameters it is real time on recent NVIDIA GPUs and slower than real
-> time on Apple Silicon and CPUs. The download (about 6.7 GB) includes the SNAC
+> At 3B parameters it is slower than real time on Apple Silicon: on a 16 GB
+> M1 Pro with Metal one request takes about 4.5 times as long as the speech it
+> generates (3 times with `Maya1-3B-GGUF`). It has not yet been measured on
+> NVIDIA GPUs. The download (about 6.7 GB) includes the SNAC
 > 24 kHz decoder from its own repository. `Maya1-3B-GGUF` is the same model with
 > its decoder quantized to Q8_0 (llama.cpp's conversion, published as
 > `mradermacher/maya1-GGUF`): about 3.6 GB to download and half the weight

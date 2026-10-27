@@ -6,8 +6,9 @@
 //! checkpointed with the cache at the start of each quantum, so a failed or
 //! cancelled quantum rolls back to exactly where it began. Prefill may arrive
 //! in chunks; each decode step samples one token from the pending logits and
-//! runs it through the decoder (the stop token needs no forward). Rows from
-//! many requests batch into one decoder call. Audio is decoded in windows
+//! runs it through the decoder (the stop token needs no forward). Decode rows
+//! from many requests share decoder calls, each row getting the logits it
+//! would alone ([`Maya1Trunk::forward_batch`]). Audio is decoded in windows
 //! between quanta ([`super::stream`]); a failed window discards the request.
 
 use std::sync::Arc;
@@ -322,7 +323,7 @@ pub(crate) fn maya1_prefill_batch(
             }
         })
         .collect::<Vec<_>>();
-    let logits = trunk.forward(&mut forward)?.to_vec2::<f32>()?;
+    let logits = trunk.forward_batch(&mut forward)?;
     drop(forward);
     for ((row, step), logits) in rows.iter_mut().zip(&steps).zip(logits) {
         row.state.prefill_cursor += step.consumed_tokens;
@@ -401,7 +402,7 @@ pub(crate) fn maya1_decode_batch(
             });
             cursor += 1;
         }
-        let logits = trunk.forward(&mut forward)?.to_vec2::<f32>()?;
+        let logits = trunk.forward_batch(&mut forward)?;
         drop(forward);
         for (&index, logits) in continuing.iter().zip(logits) {
             rows[index].state.pending = Some(logits);
