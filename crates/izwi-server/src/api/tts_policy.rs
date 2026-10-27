@@ -571,16 +571,12 @@ mod tests {
             assert!(validate_speech_language(english, language).is_ok());
             assert!(validate_speech_language(multilingual, language).is_ok());
         }
-        for language in [Some("fr"), Some("Swahili"), Some("ko")] {
+        for language in [Some("fr"), Some("Swahili"), Some("ko"), Some("zh")] {
             assert!(validate_speech_language(multilingual, language).is_ok());
             let error = validate_speech_language(english, language).unwrap_err();
             assert!(error.message.contains("English only"), "{}", error.message);
         }
-        for (language, expected) in [
-            ("zh", "text frontend"),
-            ("ja", "text frontend"),
-            ("klingon", "does not speak"),
-        ] {
+        for (language, expected) in [("ja", "text frontend"), ("klingon", "does not speak")] {
             let error = validate_speech_language(multilingual, Some(language)).unwrap_err();
             assert!(error.message.contains(expected), "{}", error.message);
         }
