@@ -90,6 +90,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts. It targets compute capability 8.0 (Ampere) and newer unless built with another `CUDA_COMPUTE_CAP`.
 - On macOS 15+, the recommended GPU path is Metal, not CUDA. macOS 12-14 are CPU-only.
 - `Chatterbox-500M` and `Chatterbox-Multilingual-500M` build for CUDA but are compile-checked only: they have not yet run on an NVIDIA GPU. Their T3 speech-token models run in BF16 on CUDA devices with BF16, F16 on Metal and F32 on CPU, behind a load-time self-check that falls back to F32; their other networks run in F32. `Chatterbox-500M` is verified end to end on CPU and Metal, and `Chatterbox-Multilingual-500M` on Metal.
+- `Maya1-3B` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. Its decoder runs in BF16 on CUDA devices with BF16 and F32 on CPU, each behind a load-time range probe that falls back to F32, and in F16 on Metal, where a failed probe refuses the load (F32 would need 13.2 GB of weights); SNAC runs in F32 everywhere.
 
 ### Qwen3.8 CUDA weight residency
 
@@ -250,6 +251,7 @@ The load path currently publishes ABI-v2 state as follows:
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Chatterbox** | Retained paged T3 state (two guidance branches per request, decoded in batches across requests) plus bounded acoustic-stage scratch, run one step at a time so other requests interleave | Portable route validated on CPU and Metal; CUDA is compile-checked only until NVIDIA evidence is retained |
+| **Maya1** | Retained paged decoder state (decoded in batches across requests) plus bounded SNAC-window scratch, one window per step so other requests interleave | Portable route compiled and unit-tested; runtime evidence pending |
 | **Sortformer diarization** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Stateless/catalog-only routes** | No retained mutable state, or no loaded state publication | No cache provider applies |
 

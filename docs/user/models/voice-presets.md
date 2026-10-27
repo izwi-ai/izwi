@@ -1,6 +1,6 @@
 ---
 title: "Voice Presets"
-description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, and Chatterbox."
+description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, Chatterbox, and Maya1."
 sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
@@ -23,6 +23,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | VibeVoice-1.5B | Reference voice or saved voice only; no built-in presets |
 | FishAudio-S2-Pro | Reference voice or saved voice only |
 | Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
+| Maya1-3B | Nine described voices, or a description of your own in `instructions` |
 | Qwen3 Base | Reference voice or saved voice only |
 | Qwen3 VoiceDesign | Prompt instructions, then optional saved voice reuse |
 
@@ -134,3 +135,33 @@ izwi tts "Hello from Bella." \
 - [Voices](/features/voices)
 - [Text-to-Speech](/features/text-to-speech)
 - [Models](/models)
+
+## Maya1
+
+`Maya1-3B` has no recorded voices: each built-in voice is a description in
+the style the model was trained on, and the model invents a voice to match
+it. A request's own description (`instructions`, or `--voice-description` in
+the CLI) replaces the voice. The same description and seed give the same
+audio for the same text; across different texts, the voice is similar rather
+than identical. OpenAI's voice names map to the nearest preset (`alloy` and
+`nova` to `ava`, `ash` and `echo` to `leo`, `ballad` and `fable` to `james`,
+`coral` and `shimmer` to `zoe`, `onyx` and `cedar` to `omar`, `sage` to
+`nora`, `verse` to `arjun`, `marin` to `priya`).
+
+| Voice | Description |
+|-------|-------------|
+| `ava` (default) | Realistic female voice in the 30s age with a american accent. Normal pitch, warm timbre, conversational pacing, neutral tone delivery at med intensity, podcast domain, podcast_host role, neutral delivery. |
+| `leo` | Realistic male voice in the 30s age with a american accent, otherwise as `ava`. |
+| `nora` | Realistic female voice in the 30s age with a british accent. Normal pitch, smooth timbre, conversational pacing, corporate domain, explainer_video_voice role, formal delivery. |
+| `james` | Realistic male voice in the 40s age with a british accent. Low pitch, deep timbre, slow pacing, entertainment domain, storyteller role. |
+| `priya` | Realistic female voice in the 30s age with a indian accent. Normal pitch, smooth timbre, conversational pacing, support domain, customer_support_agent role. |
+| `arjun` | Realistic male voice in the 20s age with a indian accent. Normal pitch, warm timbre, energetic tone, education domain, elearning_instructor role, casual delivery. |
+| `zoe` | Realistic female voice in the 20s age with a american accent. High pitch, smooth timbre, brisk pacing, energetic tone, social_content domain, youtube_vlogger role. |
+| `omar` | Realistic male voice in the 30s age with a middle_eastern accent. Low pitch, deep timbre, corporate domain, event_host role, formal delivery. |
+| `robot` | Creative, ai_machine_voice character. Male voice in their 20s with a american accent. Normal pitch, robotic timbre, conversational pacing. |
+
+Descriptions work best when they follow this template (age, gender, accent,
+pitch, timbre, pacing, emotion and intensity, and for realistic voices a
+domain and role) and end with a full stop: the model reads a short or
+unfinished description aloud more often. Izwi adds the final full stop when
+it is missing.

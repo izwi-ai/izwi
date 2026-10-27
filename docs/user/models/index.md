@@ -22,6 +22,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
 | Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
 | Chatterbox Multilingual (22 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
+| Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 
@@ -44,6 +45,17 @@ Those endpoints only show variants that are enabled for download/use.
 > utterance carries Resemble AI's imperceptible PerTh watermark (the catalog
 > labels it **Watermarked**), whose checkpoint is downloaded from GitHub rather
 > than Hugging Face (see [Manual Downloads](/models/manual-download#chatterbox)).
+
+> `Maya1-3B` is Maya Research's English voice-design model (Apache-2.0): a
+> Llama 3.2-3B decoder that writes SNAC audio codes, 24 kHz output. Its voice
+> comes from a written description (`instructions`), such as "Realistic female
+> voice in the 30s age with a british accent. Low pitch, warm timbre, slow
+> pacing." Nine described voices are built in (see
+> [Voice Presets](/models/voice-presets#maya1)). Twenty tags placed in the text
+> (`<laugh>`, `<sigh>`, `<whisper>`, …) make it laugh, sigh or whisper there.
+> At 3B parameters it is real time on recent NVIDIA GPUs and slower than real
+> time on Apple Silicon and CPUs. The download (about 6.7 GB) includes the SNAC
+> 24 kHz decoder from its own repository.
 
 > `Chatterbox-Multilingual-500M` is the same design trained on 23 languages,
 > with its own speech-token model (`t3_mtl23ls_v2`) and grapheme tokenizer and
@@ -165,6 +177,9 @@ izwi pull VibeVoice-ASR
 # Download Resemble AI Chatterbox (about 3.2 GB each)
 izwi pull Chatterbox-500M
 izwi pull Chatterbox-Multilingual-500M
+
+# Download Maya Research Maya1 (about 6.7 GB)
+izwi pull Maya1-3B
 ```
 
 ### Via Web UI

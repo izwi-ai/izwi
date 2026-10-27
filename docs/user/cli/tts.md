@@ -48,7 +48,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `--reference-audio <PATH>` | Reference audio file for voice cloning | — |
 | `--reference-text <TEXT>` | Transcript for the reference audio; needs `--reference-audio` (optional for Chatterbox) | — |
 | `--reference-text-file <PATH>` | File containing the reference transcript | — |
-| `--instructions <TEXT>` | Voice direction prompt for voice-design models | — |
+| `--instructions <TEXT>`, `--voice-description <TEXT>` | Voice direction for voice-design models; for `Maya1-3B`, the description of the voice to speak with (replaces `--speaker`) | — |
 | `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
@@ -173,6 +173,27 @@ izwi tts "Habari za asubuhi, karibu sana." \
 ```
 
 `Chatterbox-500M` returns `400` for any language but English.
+
+### Maya1
+
+`Maya1-3B` speaks with one of nine described voices (`--speaker ava`, the
+default, or `leo`, `nora`, `james`, …), or with a voice you describe. Tags in
+the text, such as `<laugh>`, `<sigh>` or `<whisper>`, are performed where they
+stand:
+
+```bash
+izwi tts "I really did not expect that. <laugh> Let's do it again!" \
+  --model Maya1-3B \
+  --voice-description "Realistic female voice in the 40s age with a british accent. Low pitch, warm timbre, slow pacing, excited tone delivery at med intensity." \
+  --output maya1.wav
+```
+
+The tags are `<angry>`, `<appalled>`, `<chuckle>`, `<cry>`, `<curious>`,
+`<disappointed>`, `<excited>`, `<exhale>`, `<gasp>`, `<giggle>`, `<gulp>`,
+`<laugh>`, `<laugh_harder>`, `<mischievous>`, `<sarcastic>`, `<scream>`,
+`<sigh>`, `<sing>`, `<snort>` and `<whisper>`; the server returns `400` for
+any other `<word>` in Maya1's text. Long text is spoken in sentences of up to
+about 11 seconds, each with the same voice description.
 With `--stream`, Chatterbox's first audio arrives after about 2 s on an Apple
 M1 Pro (Metal); the rest follows in windows. It refuses `--speed` and
 `--instructions`.

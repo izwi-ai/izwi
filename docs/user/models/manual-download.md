@@ -242,3 +242,28 @@ Large models can be 10+ GB. Ensure you have enough free space.
 
 - [Models Overview](/models)
 - [Troubleshooting](/troubleshooting)
+
+---
+
+## Maya1
+
+`Maya1-3B` (about 6.7 GB) needs five files from Hugging Face
+(`maya-research/maya1` at a pinned revision) and the SNAC 24 kHz decoder from
+`hubertsiuzdak/snac_24khz`, saved as `snac_24khz.pth` beside them:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Maya1-3B"
+
+huggingface-cli download maya-research/maya1 \
+  config.json model.safetensors.index.json tokenizer.json \
+  model-00001-of-00002.safetensors model-00002-of-00002.safetensors \
+  --revision b1b9b38ca9decbfcfd6c98ea93dd502bfd0f9572 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/snac_24khz.pth" \
+  https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec/pytorch_model.bin
+```
+
+When Izwi downloads the decoder itself, it checks the size (79,488,254 bytes)
+and SHA-256
+(`4b8164cc6606bfa627f1a784734c1e539891518f1191ed9194fe1e3b9b4bff40`).
