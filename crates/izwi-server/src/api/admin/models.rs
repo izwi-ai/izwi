@@ -150,6 +150,11 @@ pub struct AdminSpeechModelCapabilities {
     /// model that refuses others (Chatterbox); absent, `language` is a hint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<AdminSpeechLanguage>,
+    /// Inline `<tag>`s the text to speak may carry, each a vocal event or
+    /// delivery the model performs where it stands (Maya1: `<laugh>`,
+    /// `<sigh>`, `<whisper>`, …); a tag not listed is refused.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inline_tags: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -292,6 +297,7 @@ impl AdminModelInfo {
                 AdminSpeechModelCapabilities::from(capabilities)
                     .with_controls(variant)
                     .with_languages(variant)
+                    .with_inline_tags(variant)
             }),
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
@@ -369,6 +375,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_auto_long_form: capabilities.supports_auto_long_form,
             controls: Vec::new(),
             languages: Vec::new(),
+            inline_tags: Vec::new(),
         }
     }
 }
@@ -385,6 +392,11 @@ impl AdminSpeechModelCapabilities {
                 default: range.default,
             })
             .collect();
+        self
+    }
+
+    fn with_inline_tags(mut self, variant: ModelVariant) -> Self {
+        self.inline_tags = variant.speech_inline_tags().to_vec();
         self
     }
 
@@ -1270,6 +1282,23 @@ mod tests {
 
     /// Chatterbox lists the languages it accepts so a client can offer
     /// them; a model that takes `language` as a hint lists none.
+    /// Maya1 lists the inline tags its text may carry; other models list
+    /// none.
+    #[test]
+    fn speech_capabilities_list_maya1_inline_tags() {
+        let tags = |variant: ModelVariant| {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                ["inline_tags"]
+                .clone()
+        };
+        let maya1 = tags(ModelVariant::Maya13B);
+        let maya1 = maya1.as_array().expect("tags");
+        assert_eq!(maya1.len(), 20);
+        assert!(maya1.contains(&serde_json::json!("<laugh>")));
+        assert_eq!(tags(ModelVariant::Kokoro82M), serde_json::Value::Null);
+    }
+
     #[test]
     fn speech_capabilities_list_chatterbox_languages() {
         let languages = |variant: ModelVariant| {

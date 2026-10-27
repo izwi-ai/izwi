@@ -62,6 +62,7 @@ const CHATTERBOX_TTS_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Chatterbox500M,
     ModelVariant::ChatterboxMultilingual500M,
 ];
+const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B, ModelVariant::Maya13BGguf];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
@@ -136,6 +137,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::ChatterboxTts,
         module_path: "crate::models::architectures::chatterbox",
         variants: CHATTERBOX_TTS_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Maya1Tts,
+        module_path: "crate::models::architectures::maya1",
+        variants: MAYA1_TTS_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::ParakeetAsr,

@@ -2749,6 +2749,10 @@ fn normalize_for_model_capabilities(
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
     crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
+    crate::api::tts_policy::validate_speech_inline_tags(
+        variant,
+        req.text.as_deref().unwrap_or_default(),
+    )?;
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(

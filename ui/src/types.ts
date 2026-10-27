@@ -69,6 +69,17 @@ export function isChatterboxVariant(variant: string): boolean {
   );
 }
 
+export function isMaya1Variant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "maya1-3b" ||
+    normalized === "maya1-3b-gguf" ||
+    normalized === "maya-research/maya1" ||
+    normalized === "maya1" ||
+    normalized === "maya-1"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -145,6 +156,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isChatterboxVariant(variant)) {
     return CHATTERBOX_SPEAKERS;
   }
+  if (isMaya1Variant(variant)) {
+    return MAYA1_SPEAKERS;
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -156,16 +170,17 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "custom-voice",
     label: "Text to Speech",
     description:
-      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox)",
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") ||
       isKokoroVariant(variant) ||
       isVoxtralTtsVariant(variant) ||
-      isChatterboxVariant(variant),
+      isChatterboxVariant(variant) ||
+      isMaya1Variant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, Voxtral, or Chatterbox TTS model to generate speech",
+      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, or Maya1 TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -185,7 +200,8 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     label: "Voice Design",
     description: "Create unique voices from text descriptions",
     icon: "Wand2",
-    modelFilter: (variant) => variant.includes("VoiceDesign"),
+    modelFilter: (variant) =>
+      variant.includes("VoiceDesign") || isMaya1Variant(variant),
     emptyStateTitle: "No Voice Design Model Loaded",
     emptyStateDescription:
       "Load the VoiceDesign model to create voices from descriptions",
@@ -328,6 +344,65 @@ const CHATTERBOX_SPEAKERS: SpeakerProfile[] = [
     name: "Default",
     language: "English",
     description: "Chatterbox's bundled voice",
+  },
+];
+
+// Maya1's built-in voices are named descriptions (the server holds the
+// text); a voice description of the user's own replaces them.
+const MAYA1_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "ava",
+    name: "Ava",
+    language: "English",
+    description: "Warm American woman in her 30s, podcast host",
+  },
+  {
+    id: "leo",
+    name: "Leo",
+    language: "English",
+    description: "Warm American man in his 30s, podcast host",
+  },
+  {
+    id: "nora",
+    name: "Nora",
+    language: "English",
+    description: "Smooth British woman in her 30s, formal explainer",
+  },
+  {
+    id: "james",
+    name: "James",
+    language: "English",
+    description: "Deep, slow British man in his 40s, storyteller",
+  },
+  {
+    id: "priya",
+    name: "Priya",
+    language: "English",
+    description: "Smooth Indian-accented woman in her 30s, support agent",
+  },
+  {
+    id: "arjun",
+    name: "Arjun",
+    language: "English",
+    description: "Energetic Indian-accented man in his 20s, instructor",
+  },
+  {
+    id: "zoe",
+    name: "Zoe",
+    language: "English",
+    description: "Bright, brisk American woman in her 20s, vlogger",
+  },
+  {
+    id: "omar",
+    name: "Omar",
+    language: "English",
+    description: "Deep Middle Eastern-accented man in his 30s, event host",
+  },
+  {
+    id: "robot",
+    name: "Robot",
+    language: "English",
+    description: "Robotic AI voice",
   },
 ];
 

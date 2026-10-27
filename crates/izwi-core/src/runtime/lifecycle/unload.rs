@@ -116,6 +116,10 @@ impl ModelLifecycleController {
                 self.model_registry.unload_chatterbox_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::Maya1Tts => {
+                self.model_registry.unload_maya1_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::Tokenizer => {
                 let mut tokenizer_guard = self.tokenizer.write().await;
                 *tokenizer_guard = None;

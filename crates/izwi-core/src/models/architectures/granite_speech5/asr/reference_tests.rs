@@ -465,7 +465,8 @@ fn relative_l2(actual: &Tensor, expected: &Tensor) -> f32 {
 #[test]
 #[ignore = "needs both Granite Speech 5.0 checkpoints"]
 fn granite_speech5_gguf_tensors_match_the_safetensors_release() {
-    use super::gguf::{joined_qtensor, mmproj_var_builder, open_gguf, QuantizedPart};
+    use super::gguf::{mmproj_var_builder, open_gguf};
+    use crate::models::shared::weights::gguf_projection::{joined_qtensor, QuantizedPart};
     use candle_core::safetensors::MmapedSafetensors;
     let safetensors_dir = model_dir(ModelVariant::GraniteSpeech502B);
     let gguf_dir = model_dir(ModelVariant::GraniteSpeech502BGguf);

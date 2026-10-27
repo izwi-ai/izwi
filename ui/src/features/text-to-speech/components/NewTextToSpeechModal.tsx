@@ -28,7 +28,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { getSpeakerProfilesForVariant } from "@/types";
+import { getSpeakerProfilesForVariant, isMaya1Variant } from "@/types";
 
 interface NewTextToSpeechModalProps {
   isOpen: boolean;
@@ -180,6 +180,34 @@ export function NewTextToSpeechModal({
   const showsVoiceDescription =
     supportsVoiceDescription &&
     (usesVoiceDescription || usesBuiltInVoiceSelection);
+  // Maya1's built-in voices are themselves descriptions: one of the user's
+  // own replaces the voice rather than styling it.
+  const descriptionReplacesVoice = selectedModel
+    ? isMaya1Variant(selectedModel)
+    : false;
+  // Inline tags the script may carry (Maya1's <laugh>, <sigh>, ...).
+  const inlineTags = useMemo(
+    () => capabilities?.inline_tags ?? [],
+    [capabilities],
+  );
+  const scriptRef = useRef<HTMLTextAreaElement>(null);
+  const insertInlineTag = useCallback(
+    (tag: string) => {
+      const field = scriptRef.current;
+      const start = field?.selectionStart ?? text.length;
+      const end = field?.selectionEnd ?? text.length;
+      const before = text.slice(0, start);
+      const after = text.slice(end).replace(/^\s+/, "");
+      const lead = before && !/\s$/.test(before) ? " " : "";
+      const inserted = `${before}${lead}${tag} `;
+      setText(`${inserted}${after}`);
+      requestAnimationFrame(() => {
+        field?.focus();
+        field?.setSelectionRange(inserted.length, inserted.length);
+      });
+    },
+    [text],
+  );
   const streamAvailable = supportsStreaming;
 
   const speakerOptions = useMemo(
@@ -473,6 +501,7 @@ export function NewTextToSpeechModal({
           main={
             <>
               <textarea
+                ref={scriptRef}
                 aria-label="Script"
                 value={text}
                 onChange={(event) => setText(event.target.value)}
@@ -482,6 +511,27 @@ export function NewTextToSpeechModal({
                 placeholder="Write or paste the text to speak…"
                 className="min-h-68 w-full flex-1 resize-y rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
               />
+              {inlineTags.length > 0 ? (
+                <Select
+                  value=""
+                  onValueChange={insertInlineTag}
+                  disabled={isSubmitting}
+                >
+                  <SelectTrigger
+                    aria-label="Insert an expression tag"
+                    className="h-8 w-fit gap-2 text-xs"
+                  >
+                    <SelectValue placeholder="Insert a tag: <laugh>, <sigh>, <whisper>…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {inlineTags.map((tag) => (
+                      <SelectItem key={tag} value={tag}>
+                        {tag}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : null}
               {isSubmitting ? (
                 <div className="inline-flex items-center gap-2 text-xs text-(--text-muted)">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -641,22 +691,40 @@ export function NewTextToSpeechModal({
                   label={
                     usesVoiceDescription
                       ? "Voice direction"
-                      : "Style direction (optional)"
+                      : descriptionReplacesVoice
+                        ? "Your own voice (optional)"
+                        : "Style direction (optional)"
                   }
                   htmlFor="tts-voice-description"
                 >
-                  <Input
-                    id="tts-voice-description"
-                    value={voiceDescription}
-                    onChange={(event) => setVoiceDescription(event.target.value)}
-                    disabled={isSubmitting}
-                    required={usesVoiceDescription}
-                    placeholder={
-                      usesVoiceDescription
-                        ? "Describe the voice, e.g. a calm, warm narrator"
-                        : "e.g. speak slowly and warmly"
-                    }
-                  />
+                  {descriptionReplacesVoice ? (
+                    <textarea
+                      id="tts-voice-description"
+                      value={voiceDescription}
+                      onChange={(event) =>
+                        setVoiceDescription(event.target.value)
+                      }
+                      disabled={isSubmitting}
+                      rows={4}
+                      placeholder="Describe a voice to use instead, e.g. Realistic female voice in the 40s age with a british accent. Low pitch, warm timbre, slow pacing."
+                      className="w-full resize-y rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 py-2 text-[13px] leading-5 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
+                    />
+                  ) : (
+                    <Input
+                      id="tts-voice-description"
+                      value={voiceDescription}
+                      onChange={(event) =>
+                        setVoiceDescription(event.target.value)
+                      }
+                      disabled={isSubmitting}
+                      required={usesVoiceDescription}
+                      placeholder={
+                        usesVoiceDescription
+                          ? "Describe the voice, e.g. a calm, warm narrator"
+                          : "e.g. speak slowly and warmly"
+                      }
+                    />
+                  )}
                 </CreationField>
               ) : null}
 

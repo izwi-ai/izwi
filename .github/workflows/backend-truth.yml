@@ -264,9 +264,13 @@ jobs:
 
       # The workspace .cargo/config.toml sets a python3 rustc-wrapper; the
       # NVIDIA base image ships no python interpreter, so install one or
-      # every cargo invocation in this container dies at startup.
+      # every cargo invocation in this container dies at startup. Nothing
+      # here comes from NVIDIA's apt repository (the image already has the
+      # CUDA toolkit), so its source goes first: a mirror NVIDIA is still
+      # syncing fails `apt-get update` with a size mismatch.
       - name: Install container build dependencies
         run: |
+          rm -f /etc/apt/sources.list.d/cuda*
           apt-get update
           apt-get install -y \
             build-essential \

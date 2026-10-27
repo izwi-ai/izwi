@@ -13,6 +13,7 @@ export const PROVIDER_ORDER = [
   "hexgrad",
   "Fish Audio",
   "Resemble AI",
+  "Maya Research",
   "Other",
 ] as const;
 
@@ -77,6 +78,9 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("ResembleAI/chatterbox")
   ) {
     return "Resemble AI";
+  }
+  if (variant.startsWith("Maya1-") || variant.startsWith("maya-research/")) {
+    return "Maya Research";
   }
   return "Other";
 }
@@ -246,6 +250,38 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "24 kHz",
     ],
     size: "3.28 GB",
+  },
+  "Maya1-3B": {
+    shortName: "Maya1",
+    fullName: "Maya1 by Maya Research",
+    description:
+      "Voice design from a written description, with inline emotion tags such as <laugh>, <sigh> and <whisper> placed in the text. Nine described voices are built in. A 3B model: slower than real time on Apple Silicon (about 4.5x the length of its speech on an M1 Pro).",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Design",
+      "Emotion Tags",
+      "Streaming",
+      "24 kHz",
+    ],
+    size: "6.70 GB",
+  },
+  "Maya1-3B-GGUF": {
+    shortName: "Maya1 GGUF",
+    fullName: "Maya1 by Maya Research (GGUF Q8_0)",
+    description:
+      "Maya1 with a Q8_0 decoder: the same described voices and inline emotion tags in about half the download and weight memory, and faster on Apple Silicon (about 3x the length of its speech on an M1 Pro).",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Design",
+      "Emotion Tags",
+      "Streaming",
+      "24 kHz",
+      "GGUF",
+      "Q8_0",
+    ],
+    size: "3.62 GB",
   },
   // Text Chat
   "Qwen3.5-0.8B": {

@@ -363,7 +363,7 @@ Request fields:
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
 | `min_p` | Chatterbox only. Min-p sampling threshold, 0 to 1 (default `0.05`). |
 | `max_tokens`, `max_output_tokens` | Optional output token budget aliases. |
-| `instructions` | Voice-design prompt for voice-design models. |
+| `instructions` | Voice-design prompt for voice-design models; for `Maya1-3B`, the description of the voice to speak with, replacing `voice`. |
 | `reference_audio` | Base64 audio for voice cloning. |
 | `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
@@ -393,6 +393,28 @@ out of range returns `400`.
   spoken in full. An explicit `max_tokens` is used as given, without splitting.
 - Every utterance carries Resemble AI's imperceptible PerTh watermark. Set
   `IZWI_CHATTERBOX_WATERMARK=false` before the model loads to turn it off.
+
+`Maya1-3B` specifics:
+
+- Its voice comes from a description: `instructions`, else the built-in voice
+  `voice` names (`ava`, the default, `leo`, `nora`, `james`, `priya`, `arjun`,
+  `zoe`, `omar`, `robot`; OpenAI's names map to the nearest of these). A
+  reference voice returns `400`.
+- Tags in `input` (`<laugh>`, `<sigh>`, `<whisper>` and 17 more, listed in
+  `speech_capabilities.inline_tags` of `GET /v1/admin/models`) are performed
+  where they stand; any other `<word>` returns `400`, as the model would read
+  it aloud.
+- Sampling defaults follow the model card: `temperature` 0.4, top-p 0.9,
+  top-k 50, repetition penalty 1.1. `seed` makes a request reproducible.
+- With `stream: true` it streams audio in windows as the decoder writes it;
+  streamed and final-only audio are the same samples for the same `seed`, and
+  so is a request served beside others. It runs slower than real time on
+  Apple Silicon (first audio in about 2 s on an M1 Pro, then windows seconds
+  apart), so buffer before playing.
+- One request speaks at most 2,048 decoder tokens (about 25 s). Without
+  `max_tokens`, Izwi sets a budget from the text and splits text longer than
+  about 160 characters into sentences of up to about 11 s, each with the same
+  description.
 
 `Chatterbox-Multilingual-500M` takes the same fields and speaks the `language`
 the request names: Arabic, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Italian, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish and Turkish (codes `ar`, `zh`, `da`, `nl`, `en`, `fi`,

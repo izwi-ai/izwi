@@ -122,6 +122,70 @@ pub(super) fn chatterbox_tts_request_params(
     Ok(generation)
 }
 
+/// Maya1 generation for a request: unset fields keep the card's sampling
+/// (temperature 0.4, top-p 0.9, top-k 50, repetition penalty 1.1, at least
+/// 28 tokens); the budget is the request's, else one sized to `text`, within
+/// the card's 2,048 tokens; the seed defaults to one derived from the
+/// request id.
+pub(super) fn maya1_tts_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+    text: &str,
+) -> Result<Maya1GenerationParams> {
+    let speech = &params.speech;
+    let defaults = Maya1SamplingParams::default();
+    let generation = Maya1GenerationParams {
+        sampling: Maya1SamplingParams {
+            temperature: speech.temperature.unwrap_or(defaults.temperature),
+            top_p: speech.top_p.unwrap_or(defaults.top_p),
+            top_k: speech.top_k.unwrap_or(defaults.top_k),
+            repetition_penalty: speech
+                .repetition_penalty
+                .unwrap_or(defaults.repetition_penalty),
+            min_new_tokens: defaults.min_new_tokens,
+        },
+        max_new_tokens: if params.max_tokens == 0 {
+            maya1_auto_max_new_tokens(text)
+        } else {
+            params.max_tokens.min(ModelVariant::MAYA1_MAX_OUTPUT_FRAMES)
+        },
+        seed: speech
+            .seed
+            .filter(|seed| *seed != 0)
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+    };
+    generation.validate()?;
+    Ok(generation)
+}
+
+/// The description a Maya1 request speaks with: its own, else the one its
+/// built-in voice (an OpenAI name aliased to one) stands for, else the
+/// default voice's.
+pub(super) fn maya1_voice_description(
+    description: Option<&str>,
+    speaker: Option<&str>,
+) -> Result<String> {
+    if let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(description.to_string());
+    }
+    let name = speaker
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MAYA1_DEFAULT_VOICE);
+    maya1_voice_preset(name)
+        .map(|preset| preset.description.to_string())
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Maya1 has no voice '{name}'; use one of {} or describe the voice",
+                MAYA1_VOICE_PRESETS
+                    .iter()
+                    .map(|preset| preset.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
 pub(super) fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
     let mut bytes = 0usize;
     add_chat_messages_allocations(&mut bytes, messages, messages.len())?;
@@ -1101,6 +1165,157 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    pub(super) async fn prepare_maya1_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Maya1Tts)
+            || request
+                .prepared_maya1_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Maya1 variant");
+        let model = self
+            .model_registry
+            .get_maya1_tts_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("Maya1 model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Maya1 preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Maya1 model {variant} has no effective context"))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Maya1 request is missing text".into()))?
+            .trim()
+            .to_string();
+        // A request's own description wins; else its built-in voice's.
+        let description = maya1_voice_description(
+            request.voice_description.as_deref(),
+            request.tts_speaker_for_execution(),
+        )?;
+        let params = maya1_tts_request_params(&request.params, &request.id, &text)?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Maya1 retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        64 * 1024 * 1024,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.maya1".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                64 * 1024 * 1024,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Maya1 preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact =
+                    model_for_preparation.prepare_retained_artifact(&description, &text)?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: 0,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Maya1 preparation returned no outcome".into()))?
+        {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_maya1_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_lfm25_audio_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1350,8 +1565,58 @@ impl RuntimeService {
             .prepare_chatterbox_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
+            .prepare_maya1_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease)
             .await?;
         Ok((request, job))
+    }
+}
+
+#[cfg(test)]
+mod maya1_tests {
+    use super::*;
+
+    #[test]
+    fn maya1_voice_is_the_description_else_a_preset() {
+        let own = maya1_voice_description(Some("  A calm narrator.  "), Some("leo")).unwrap();
+        assert_eq!(own, "A calm narrator.");
+        let leo = maya1_voice_description(None, Some("leo")).unwrap();
+        assert!(leo.starts_with("Realistic male voice"), "{leo}");
+        let alloy = maya1_voice_description(Some(" "), Some("alloy")).unwrap();
+        assert_eq!(
+            alloy,
+            maya1_voice_description(None, Some(MAYA1_DEFAULT_VOICE)).unwrap()
+        );
+        assert!(maya1_voice_description(None, None).is_ok());
+        assert!(maya1_voice_description(None, Some("nobody")).is_err());
+    }
+
+    #[test]
+    fn maya1_params_keep_the_card_defaults_and_size_the_budget() {
+        let mut params = GenerationParams {
+            max_tokens: 0,
+            ..GenerationParams::default()
+        };
+        let auto = maya1_tts_request_params(&params, "request-1", "Hello there.").unwrap();
+        assert_eq!(auto.sampling, Maya1SamplingParams::default());
+        assert_eq!(
+            auto.max_new_tokens,
+            maya1_auto_max_new_tokens("Hello there.")
+        );
+        assert!(auto.seed > 0);
+        params.max_tokens = 99_999;
+        params.speech.temperature = Some(0.7);
+        params.speech.seed = Some(42);
+        let explicit = maya1_tts_request_params(&params, "request-1", "Hi.").unwrap();
+        assert_eq!(
+            explicit.max_new_tokens,
+            ModelVariant::MAYA1_MAX_OUTPUT_FRAMES
+        );
+        assert_eq!(explicit.sampling.temperature, 0.7);
+        assert_eq!(explicit.seed, 42);
+        params.speech.temperature = Some(0.0);
+        assert!(maya1_tts_request_params(&params, "request-1", "Hi.").is_err());
     }
 }

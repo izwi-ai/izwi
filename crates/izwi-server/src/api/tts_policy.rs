@@ -2,6 +2,9 @@ use izwi_core::catalog::ModelFamily;
 use izwi_core::runtime_models::architectures::chatterbox::{
     chatterbox_auto_max_speech_tokens, ChatterboxEdition,
 };
+use izwi_core::runtime_models::architectures::maya1::{
+    maya1_auto_max_new_tokens, prompt::validate_inline_tags,
+};
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
 };
@@ -213,6 +216,25 @@ pub(crate) fn validate_speech_language(
     }
 }
 
+/// Refuse text whose inline `<tag>`s the model does not know (Maya1 would
+/// read an unknown one aloud); text for a model without inline tags is
+/// spoken as written.
+pub(crate) fn validate_speech_inline_tags(
+    variant: ModelVariant,
+    text: &str,
+) -> Result<(), crate::error::ApiError> {
+    if variant.speech_inline_tags().is_empty() {
+        return Ok(());
+    }
+    match validate_inline_tags(text) {
+        Ok(()) => Ok(()),
+        Err(izwi_core::Error::InvalidInput(message)) => {
+            Err(crate::error::ApiError::bad_request(message))
+        }
+        Err(err) => Err(crate::error::core_api_error(err)),
+    }
+}
+
 /// Refuse an over-limit speech input with 413 before any model loads.
 pub(crate) fn check_tts_input_length(text: &str) -> Result<(), crate::error::ApiError> {
     let limit = tts_max_text_bytes();
@@ -334,6 +356,9 @@ pub(crate) fn resolve_tts_output_frames(
         Some(0) | None if variant.family() == ModelFamily::ChatterboxTts => {
             Some(chatterbox_auto_max_speech_tokens(text).min(model_max_frames))
         }
+        Some(0) | None if variant.family() == ModelFamily::Maya1Tts => {
+            Some(maya1_auto_max_new_tokens(text).min(model_max_frames))
+        }
         Some(0) | None if variant.family() == ModelFamily::Qwen3Tts => {
             Some(qwen_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
@@ -357,6 +382,8 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
         ModelFamily::Qwen3Tts => qwen3_tts_auto_max_output_frames(),
         ModelFamily::VibeVoiceTts => vibevoice_tts_auto_max_output_frames(),
         ModelFamily::ChatterboxTts => ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
+        // The automatic budget is whole 7-token frames, 2,044 at most.
+        ModelFamily::Maya1Tts => ModelVariant::MAYA1_MAX_OUTPUT_FRAMES / 7 * 7,
         _ => return false,
     };
     resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)
@@ -619,6 +646,56 @@ mod tests {
             resolve_tts_output_frames(variant, "hi", Some(usize::MAX)),
             Some(ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES)
         );
+    }
+
+    #[test]
+    fn maya1_budget_is_text_sized_in_whole_frames_and_capped() {
+        let variant = ModelVariant::Maya13B;
+        let short = resolve_tts_output_frames(variant, "Hello there.", None).unwrap();
+        assert!(short < 400 && short.is_multiple_of(7), "{short}");
+        let tagged =
+            resolve_tts_output_frames(variant, "Hello there. <laugh_harder>", None).unwrap();
+        assert!(tagged > short + 100, "{tagged} vs {short}");
+        let long = resolve_tts_output_frames(variant, &"word ".repeat(1_000), None).unwrap();
+        assert_eq!(long, 2_044);
+        assert!(tts_text_exceeds_one_request(
+            variant,
+            &"word ".repeat(1_000)
+        ));
+        assert!(!tts_text_exceeds_one_request(variant, "Hello there."));
+        assert_eq!(
+            resolve_tts_output_frames(variant, "hi", Some(usize::MAX)),
+            Some(ModelVariant::MAYA1_MAX_OUTPUT_FRAMES)
+        );
+    }
+
+    /// Maya1 refuses a tag it does not know (it would read it aloud); any
+    /// other model speaks angle brackets as written.
+    #[test]
+    fn inline_tags_are_checked_only_for_models_that_have_them() {
+        let maya1 = ModelVariant::Maya13B;
+        assert!(validate_speech_inline_tags(maya1, "Ha! <laugh> fine. <sigh>").is_ok());
+        let error = validate_speech_inline_tags(maya1, "Well <happy> then").unwrap_err();
+        assert!(format!("{error:?}").contains("<happy>"), "{error:?}");
+        assert!(validate_speech_inline_tags(ModelVariant::Kokoro82M, "a <happy> b").is_ok());
+    }
+
+    /// Maya1's voices are named descriptions: a name, a description, or
+    /// both are accepted; a reference is not.
+    #[test]
+    fn maya1_takes_voice_names_and_descriptions_not_references() {
+        let maya1 = ModelVariant::Maya13B;
+        let request = |speaker, voice_description, reference_audio| SpeechVoiceRequest {
+            speaker,
+            voice_description,
+            reference_audio,
+            ..SpeechVoiceRequest::default()
+        };
+        assert!(validate_speech_voice(maya1, request(false, false, false)).is_ok());
+        assert!(validate_speech_voice(maya1, request(true, false, false)).is_ok());
+        assert!(validate_speech_voice(maya1, request(false, true, false)).is_ok());
+        assert!(validate_speech_voice(maya1, request(true, true, false)).is_ok());
+        assert!(validate_speech_voice(maya1, request(false, false, true)).is_err());
     }
 
     #[test]

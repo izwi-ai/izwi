@@ -898,6 +898,7 @@ impl ModelLifecycleController {
                     | ModelFamily::VoxtralTts
                     | ModelFamily::FishS2Tts
                     | ModelFamily::ChatterboxTts
+                    | ModelFamily::Maya1Tts
             );
         if backend == BackendKind::Cuda || !fits_state {
             return Ok(0);

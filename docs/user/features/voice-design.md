@@ -119,6 +119,18 @@ izwi tts "Hello, this is my designed voice." \
   --output designed.wav
 ```
 
+`Maya1-3B` designs voices the same way, and also performs tags placed in the
+text (`<laugh>`, `<sigh>`, `<whisper>`, …). It follows descriptions written in
+its own template best, ending with a full stop (see
+[Voice Presets](/models/voice-presets#maya1)):
+
+```bash
+izwi tts "Welcome back. <chuckle> You won't believe what happened." \
+  --model Maya1-3B \
+  --voice-description "Realistic male voice in the 30s age with a american accent. Normal pitch, warm timbre, conversational pacing, energetic tone delivery at med intensity, podcast domain, podcast_host role, casual delivery." \
+  --output maya1-host.wav
+```
+
 You can iterate quickly by changing only the prompt:
 
 ```bash
@@ -173,6 +185,7 @@ family and `/v1/audio/speech` streaming details.
 | Model | Size | Quality |
 |-------|------|---------|
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~4.2 GB | Better |
+| `Maya1-3B` | ~6.7 GB | Expressive; inline emotion tags; English |
 
 Larger models better interpret complex descriptions.
 

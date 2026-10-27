@@ -133,6 +133,9 @@ fn certified_topology(
         // own group and arena); the acoustic stage, whole or windowed,
         // leases scratch only.
         (ChatterboxTts, Tts) => RetainedPagedPagedAndInvocationScratch,
+        // Maya1 retains its decoder pages; the SNAC window stage leases
+        // scratch only.
+        (Maya1Tts, Tts) => RetainedPagedAndInvocationScratch,
 
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.

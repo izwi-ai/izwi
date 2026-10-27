@@ -16,6 +16,9 @@ export interface SpeechModelCapabilities {
   /** The only languages a request may name, for a model that refuses
    * others (Chatterbox); absent, `language` is a hint. */
   languages?: SpeechLanguage[];
+  /** Inline `<tag>`s the text may carry, each a vocal event or delivery
+   * the model performs where it stands (Maya1: `<laugh>`, `<sigh>`, …). */
+  inline_tags?: string[];
 }
 
 export interface SpeechLanguage {
