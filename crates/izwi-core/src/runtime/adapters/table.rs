@@ -32,6 +32,7 @@ pub(crate) enum LoadedAdapterKind {
     FishS2Tts,
     VoxtralTts,
     ChatterboxTts,
+    Maya1Tts,
     KokoroStaticTts,
     Scalar,
 }
@@ -54,6 +55,7 @@ impl LoadedAdapterKind {
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
+            Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -251,6 +253,10 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
+        // Streams on its TTS route: every request decodes SNAC windows as
+        // its frames arrive; a stream sends them, a final-only request keeps
+        // them until it finishes.
+        row(F::Maya1Tts, C::Tts, Loaded::Maya1Tts, RetainedAndInvocation).chunked(),
         row(
             F::FishS2Tts,
             C::StreamingTts,

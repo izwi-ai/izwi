@@ -73,6 +73,10 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparedPromptArtifact,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
+use crate::models::architectures::maya1::{
+    maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
+    MAYA1_DEFAULT_VOICE, MAYA1_VOICE_PRESETS,
+};
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };

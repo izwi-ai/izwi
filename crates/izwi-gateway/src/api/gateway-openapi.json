@@ -549,6 +549,13 @@
             },
             "type": "array"
           },
+          "inline_tags": {
+            "description": "Inline `<tag>`s the text to speak may carry, each a vocal event or\ndelivery the model performs where it stands (Maya1: `<laugh>`,\n`<sigh>`, `<whisper>`, …); a tag not listed is refused.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "languages": {
             "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox); absent, `language` is a hint.",
             "items": {

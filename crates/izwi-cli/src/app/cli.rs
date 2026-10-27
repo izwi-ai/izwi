@@ -364,7 +364,8 @@ pub enum Commands {
         #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 
-        /// Speaker voice or VibeVoice speaker label
+        /// Speaker voice or VibeVoice speaker label (Maya1: a described voice
+        /// such as ava or james)
         #[arg(short, long)]
         speaker: Option<String>,
 
@@ -384,8 +385,10 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         reference_text_file: Option<PathBuf>,
 
-        /// Voice direction prompt for supported models
-        #[arg(long)]
+        /// Voice direction for supported models: Qwen3 VoiceDesign's voice,
+        /// CustomVoice's style, or the voice Maya1 speaks with (replacing
+        /// its built-in one)
+        #[arg(long, visible_alias = "voice-description")]
         instructions: Option<String>,
 
         /// Output file path
@@ -720,7 +723,8 @@ pub enum BenchCommands {
         )]
         text: String,
 
-        /// Speaker voice or VibeVoice speaker label
+        /// Speaker voice or VibeVoice speaker label (Maya1: a described voice
+        /// such as ava or james)
         #[arg(short, long)]
         speaker: Option<String>,
 

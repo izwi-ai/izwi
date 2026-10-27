@@ -32,6 +32,8 @@ use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
     tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
 };
+use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
+use crate::models::architectures::maya1::Maya1GenerationParams;
 use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
@@ -46,7 +48,7 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease,
-    KokoroTtsModelLease, Lfm25AudioModelLease, NativeAsrModel, NativeChatModel,
+    KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, NativeAsrModel, NativeChatModel,
     NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
@@ -424,6 +426,7 @@ enum PreparedIncrementalModel {
     FishS2Tts(FishS2TtsModelLease),
     VoxtralTts(VoxtralTtsModelLease),
     ChatterboxTts(ChatterboxTtsModelLease),
+    Maya1Tts(Maya1TtsModelLease),
     KokoroTts(KokoroTtsModelLease),
 }
 
@@ -438,6 +441,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
+            Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
@@ -457,6 +461,8 @@ pub(super) struct IncrementalModelExecutionReady {
     voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
     chatterbox_tts: Option<Arc<ChatterboxPreparedArtifact>>,
     chatterbox_tts_params: Option<ChatterboxGenerationParams>,
+    maya1_tts: Option<Arc<Maya1PreparedArtifact>>,
+    maya1_tts_params: Option<Maya1GenerationParams>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

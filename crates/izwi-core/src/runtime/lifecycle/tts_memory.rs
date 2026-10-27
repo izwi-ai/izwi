@@ -1,6 +1,6 @@
 //! Load admission for the TTS families (P2.1): the residency plan of the ASR
 //! admission framework (`asr_memory`), opened to Qwen3-TTS, Kokoro,
-//! VibeVoice-TTS, Voxtral-TTS and Chatterbox. Each plan prices the header census of the
+//! VibeVoice-TTS, Voxtral-TTS, Chatterbox and Maya1. Each plan prices the header census of the
 //! files its loader reads, in the dtype the loader's own resolver picks, with
 //! Metal's power-of-two rounding of device-written buffers and the uploads
 //! Candle holds until the load fence (see `asr_memory` for the rules). The
@@ -35,6 +35,8 @@ use crate::models::architectures::kokoro::{
     CHECKPOINT_FILE as KOKORO_CHECKPOINT_FILE, CHECKPOINT_SUBMODULE_KEYS as KOKORO_CHECKPOINT_KEYS,
     KOKORO_MODEL_MEMO_MAX_BYTES,
 };
+use crate::models::architectures::maya1::config::{SNAC_WEIGHTS_FILE, WEIGHT_SHARDS};
+use crate::models::architectures::maya1::{maya1_lm_precision, maya1_reloads_in_f32};
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
 use crate::models::architectures::qwen3::tts::speech_tokenizer::{
     encoder_reads_tensor, read_encoder_acoustic_codebooks,
@@ -54,6 +56,7 @@ pub(super) fn has_plan(variant: ModelVariant) -> bool {
             | ModelFamily::VibeVoiceTts
             | ModelFamily::VoxtralTts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::Maya1Tts
     )
 }
 
@@ -91,6 +94,7 @@ pub(super) fn residency_plan(
         ModelFamily::VibeVoiceTts => vibevoice_tts_plan(model_path, device, backend),
         ModelFamily::VoxtralTts => voxtral_tts_plan(model_path, device, backend),
         ModelFamily::ChatterboxTts => chatterbox_tts_plan(variant, model_path, device, backend),
+        ModelFamily::Maya1Tts => maya1_tts_plan(model_path, device, backend),
         _ => Ok(None),
     }
 }
@@ -400,6 +404,80 @@ fn price_chatterbox_tts(
     }
     let voices = 1 + CHATTERBOX_REFERENCE_VOICE_CACHE as u64;
     AsrResidencyPlan::from_ledger(ledger, voices * CHATTERBOX_VOICE_BYTES)
+}
+
+fn maya1_tts_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let snac = model_path.join(SNAC_WEIGHTS_FILE);
+    let Some(mut files) = census_of(&WEIGHT_SHARDS.map(|shard| model_path.join(shard)))? else {
+        return Ok(None);
+    };
+    if !snac.is_file() {
+        return Ok(None);
+    }
+    files.push(snac_decoder_census(&snac)?);
+    let dtype = maya1_lm_precision(device).dtype;
+    let plan = price_maya1_tts(&files, backend, dtype)?;
+    if maya1_reloads_in_f32(device, dtype) {
+        // A decoder that fails its load-time probe reloads in F32 (never on
+        // Metal, where the load is refused instead).
+        let dense = price_maya1_tts(&files, backend, DType::F32)?;
+        return Ok(Some(plan.with_fallback_peak(&dense)));
+    }
+    Ok(Some(plan))
+}
+
+/// SNAC's decoder and codebooks in its checkpoint (the loader never reads
+/// the encoder).
+fn snac_decoder_census(checkpoint: &Path) -> Result<CensusFile> {
+    let infos = read_pth_tensor_info(checkpoint, false, None).map_err(|error| {
+        Error::ModelLoadError(format!(
+            "Cannot read the SNAC checkpoint {}: {error}",
+            checkpoint.display()
+        ))
+    })?;
+    let tensors = infos
+        .into_iter()
+        .filter(|info| info.name.starts_with("decoder.") || info.name.starts_with("quantizer."))
+        .map(|info| {
+            let elements = u64::try_from(info.layout.shape().elem_count()).unwrap_or(u64::MAX);
+            CensusTensor {
+                name: format!("snac.{}", info.name),
+                dtype: StoredDType::Dense(info.dtype),
+                shape: info.layout.shape().dims().to_vec(),
+                stored_bytes: elements.saturating_mul(info.dtype.size_in_bytes() as u64),
+            }
+        })
+        .collect();
+    Ok(CensusFile {
+        path: checkpoint.to_path_buf(),
+        tensors,
+    })
+}
+
+/// Maya1 (`maya1/model.rs`), read through the staged loader: the decoder at
+/// `dtype` (its q/k/v and gate/up stacked into tensors of the same total
+/// size, its head a view of the tied token table) and SNAC's decoder and
+/// codebooks at F32 through a host buffer.
+fn price_maya1_tts(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::staged(backend);
+    for file in files {
+        for tensor in &file.tensors {
+            if tensor.name.starts_with("snac.") {
+                ledger.var(tensor, Source::Copied, &[DType::F32])?;
+            } else {
+                ledger.var(tensor, Source::Mapped, &[dtype])?;
+            }
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
 fn vibevoice_tts_plan(

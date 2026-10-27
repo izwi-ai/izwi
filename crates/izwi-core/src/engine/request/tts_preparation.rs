@@ -279,6 +279,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: None,
         });
         for (stage, cost) in stage_costs {
@@ -336,6 +338,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -384,6 +388,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -425,6 +431,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: Some(params),
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -466,6 +474,51 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: Some(artifact),
             chatterbox_tts_params: Some(params),
+            maya1_tts: None,
+            maya1_tts_params: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_maya1_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Maya1TtsModelLease,
+        artifact: Arc<Maya1PreparedArtifact>,
+        params: Maya1GenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::Maya1Tts
+            || artifact.prompt.is_empty()
+            || artifact.prompt.len() + params.max_new_tokens > max_sequence_tokens + 1
+            || params.max_new_tokens == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Maya1 request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt.len());
+        self.params.max_tokens = params.max_new_tokens;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Maya1Tts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: Some(artifact),
+            maya1_tts_params: Some(params),
             kokoro_tts: None,
         });
         Ok(())
@@ -518,6 +571,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: Some(artifact),
         });
         if let Some((stage, cost)) = prepared_stage_cost {
@@ -625,6 +680,8 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             chatterbox_tts: None,
             chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -811,6 +868,39 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.chatterbox_tts_params.clone()))
     }
 
+    pub(crate) fn prepared_maya1_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Maya1TtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Maya1Tts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_maya1_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Maya1PreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.maya1_tts.clone()))
+    }
+
+    pub(crate) fn maya1_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<Maya1GenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.maya1_tts_params))
+    }
+
     pub(crate) fn prepared_kokoro_tts_model_lease_for_executor(
         &self,
     ) -> Result<Option<KokoroTtsModelLease>> {
@@ -850,6 +940,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -870,6 +961,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishS2Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

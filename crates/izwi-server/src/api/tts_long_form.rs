@@ -12,6 +12,10 @@ const CHUNK_MAX_CHARS_MAX: usize = 4000;
 /// generates sentence by sentence. Text longer than this splits even when
 /// one request could hold it.
 const QWEN_SEGMENT_MAX_CHARS: usize = 300;
+/// Maya1 long-form segments: whole sentences up to about 11 s of speech,
+/// inside the 1-14 s clips it was trained on; its automatic budget reaches
+/// the per-request cap near 160 characters.
+const MAYA1_SEGMENT_MAX_CHARS: usize = 160;
 
 /// Silence between two long-form segments: a sentence pause, not the raw
 /// back-to-back concatenation that ran sentences together (TPIPE-5).
@@ -85,22 +89,60 @@ fn configured_chunk_max_chars() -> Option<usize> {
 /// The most characters one long-form segment of `variant` packs: the
 /// configured cap, else Qwen3-TTS's segment size or the default.
 fn segment_max_chars(variant: ModelVariant) -> usize {
-    configured_chunk_max_chars().unwrap_or(
-        if variant.family() == izwi_core::ModelFamily::Qwen3Tts {
-            QWEN_SEGMENT_MAX_CHARS
-        } else {
-            DEFAULT_CHUNK_MAX_CHARS
-        },
-    )
+    configured_chunk_max_chars().unwrap_or(match variant.family() {
+        izwi_core::ModelFamily::Qwen3Tts => QWEN_SEGMENT_MAX_CHARS,
+        izwi_core::ModelFamily::Maya1Tts => MAYA1_SEGMENT_MAX_CHARS,
+        _ => DEFAULT_CHUNK_MAX_CHARS,
+    })
 }
 
 /// Whether text under an automatic budget splits into long-form segments:
-/// when one request cannot speak it, or (Qwen3-TTS) when it is longer than
-/// one segment.
+/// when one request cannot speak it, or (Qwen3-TTS, Maya1) when it is
+/// longer than one segment.
 fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
     crate::api::tts_policy::tts_text_exceeds_one_request(variant, text)
-        || (variant.family() == izwi_core::ModelFamily::Qwen3Tts
-            && text.trim().chars().count() > segment_max_chars(variant))
+        || (matches!(
+            variant.family(),
+            izwi_core::ModelFamily::Qwen3Tts | izwi_core::ModelFamily::Maya1Tts
+        ) && text.trim().chars().count() > segment_max_chars(variant))
+}
+
+/// Merge a segment that holds only inline tags (`<laugh>` on a line of its
+/// own, or after a sentence's full stop) into its neighbour, so the model
+/// performs it beside the words it belongs to rather than in a request of
+/// its own.
+fn attach_lone_tags(chunks: Vec<String>) -> Vec<String> {
+    let lone = |chunk: &str| {
+        let mut rest = chunk.to_string();
+        for tag in izwi_core::runtime_models::architectures::maya1::prompt::inline_tags(chunk) {
+            rest = rest.replacen(tag, "", 1);
+        }
+        rest.trim().is_empty()
+    };
+    let mut merged: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut leading = String::new();
+    for chunk in chunks {
+        if lone(&chunk) {
+            match merged.last_mut() {
+                Some(previous) => {
+                    previous.push(' ');
+                    previous.push_str(chunk.trim());
+                }
+                None => {
+                    leading.push_str(chunk.trim());
+                    leading.push(' ');
+                }
+            }
+        } else if leading.is_empty() {
+            merged.push(chunk);
+        } else {
+            merged.push(format!("{}{}", std::mem::take(&mut leading), chunk.trim()));
+        }
+    }
+    if !leading.is_empty() {
+        merged.push(leading.trim().to_string());
+    }
+    merged
 }
 
 /// A stable, versioned partition of the original UTF-8 input. Audio limits are
@@ -252,6 +294,8 @@ pub fn split_tts_text_for_long_form(
 
     if chunks.is_empty() {
         vec![trimmed.to_string()]
+    } else if variant.family() == izwi_core::ModelFamily::Maya1Tts {
+        attach_lone_tags(chunks)
     } else {
         chunks
     }
@@ -1292,6 +1336,44 @@ mod tests {
             "Sentence one. Sentence two.",
         );
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// Maya1 segments are whole sentences of about 11 s at most (it was
+    /// trained on 1-14 s clips), each with its own budget, and a tag that
+    /// would stand alone joins the sentence before it.
+    #[test]
+    fn maya1_splits_into_short_sentences_and_keeps_tags_with_words() {
+        let variant = ModelVariant::Maya13B;
+        let sentence = "The committee reviewed every proposal in detail before the vote. ";
+        let short = GenerationRequest::new(sentence.to_string()).with_model_variant(variant);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&short, variant).len(),
+            1
+        );
+
+        let long = GenerationRequest::new(sentence.repeat(6)).with_model_variant(variant);
+        let planned = expand_generation_requests_for_long_form(&long, variant);
+        assert!(planned.len() >= 3, "{}", planned.len());
+        for chunk in &planned {
+            assert!(chunk.text.chars().count() <= 160, "{}", chunk.text);
+            let budget = chunk.config.options.max_tokens;
+            assert!(budget > 0 && budget % 7 == 0, "segment budget {budget}");
+        }
+
+        let chunks = attach_lone_tags(vec![
+            "<sigh>".to_string(),
+            "Well, that went badly.".to_string(),
+            "<laugh>".to_string(),
+            "Never again.".to_string(),
+        ]);
+        assert_eq!(
+            chunks,
+            vec![
+                "<sigh> Well, that went badly. <laugh>".to_string(),
+                "Never again.".to_string()
+            ]
+        );
+        assert_eq!(attach_lone_tags(vec!["<gasp>".to_string()]), vec!["<gasp>"]);
     }
 
     /// Chatterbox speaks at most 1,000 speech tokens (40 s) per request, so

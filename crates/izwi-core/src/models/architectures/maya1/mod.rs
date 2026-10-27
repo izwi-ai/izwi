@@ -13,8 +13,11 @@
 
 pub mod config;
 pub mod frames;
+mod model;
 pub mod noise;
+mod physical;
 pub mod prompt;
+pub(crate) mod retained;
 pub mod sampling;
 pub mod snac;
 pub mod stream;
@@ -36,6 +39,9 @@ pub use config::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1LmConfig, Maya1VoicePreset, MAYA1_DEFAULTS,
     MAYA1_DEFAULT_VOICE, MAYA1_INLINE_TAGS, MAYA1_VOICE_PRESETS, SAMPLE_RATE,
 };
+pub use model::{maya1_lm_precision, Maya1TtsDiagnostics, Maya1TtsModel};
+pub(crate) use model::{maya1_reloads_in_f32, Maya1AudioProgress};
+pub(crate) use physical::MAYA1_DOMAIN;
 pub use sampling::Maya1SamplingParams;
 pub use weights::published_tensors;
 

@@ -113,6 +113,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
             | (ModelFamily::ChatterboxTts, CapabilityKind::Tts)
+            | (ModelFamily::Maya1Tts, CapabilityKind::Tts)
             | (ModelFamily::GraniteSpeechAsr, CapabilityKind::Asr)
     );
     if !route_validated {

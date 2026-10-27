@@ -3688,6 +3688,11 @@ fn tts_state_floor_covers_one_full_request_per_family() {
                     + 2
                     + ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES
             }
+            // The longest prompt and the card's token budget.
+            ModelFamily::Maya1Tts => {
+                crate::models::architectures::maya1::config::MAX_PROMPT_TOKENS
+                    + ModelVariant::MAYA1_MAX_OUTPUT_FRAMES
+            }
             _ => {
                 assert_eq!(floor(variant), 0, "{variant}");
                 continue;

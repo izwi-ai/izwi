@@ -310,6 +310,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::Maya1Tts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -371,6 +372,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::Maya1Tts
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
@@ -492,6 +494,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Chatterbox uses dense Candle CUDA tensor kernels for the T3 Llama decoder (both guidance branches on izwi's paged KV), the S3Gen Conformer encoder and flow-matching U-Net, and the HiFT vocoder; the vocoder's harmonic source and the request noise are synthesised on the host; a stream renders windows while T3 runs, each re-running the S3Gen flow over the reference prompt",
             ),
+            ModelFamily::Maya1Tts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Maya1 uses dense Candle CUDA tensor kernels for its Llama 3.2-3B decoder (BF16, GQA on izwi's paged KV) and SNAC's convolutional decoder (F32); sampling and the codec noise are drawn on the host; audio decodes in windows while the decoder runs, streamed or not",
+            ),
             ModelFamily::VibeVoiceTts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "VibeVoice TTS uses dense Candle CUDA tensor kernels for the Qwen decoder, continuous tokenizers, and diffusion head; long-form generation is final-only until chunked decode is proven",
@@ -588,6 +594,10 @@ impl ModelVariant {
             ModelFamily::ChatterboxTts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Chatterbox ships dense F32 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::Maya1Tts => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Maya1 ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

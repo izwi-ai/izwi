@@ -182,6 +182,7 @@ pub async fn speech(
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
     crate::api::tts_policy::validate_speech_language(variant, req.language.as_deref())?;
+    crate::api::tts_policy::validate_speech_inline_tags(variant, &req.input)?;
     let streaming = resolve_streaming_mode(&req)?;
     crate::api::tts_policy::validate_speech_streaming(variant, streaming)?;
     let resolved_format = parse_response_format(
