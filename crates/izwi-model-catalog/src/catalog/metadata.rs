@@ -1360,6 +1360,32 @@ const CHATTERBOX_SPEECH_CONTROLS: &[SpeechControlRange] = &[
     },
 ];
 
+/// Maya1's inline tags, each a single token of its tokenizer
+/// (156,940..=156,959, in this order): the text may place them where the
+/// voice should laugh, sigh, whisper and so on.
+pub const MAYA1_INLINE_TAGS: &[&str] = &[
+    "<angry>",
+    "<appalled>",
+    "<chuckle>",
+    "<cry>",
+    "<curious>",
+    "<disappointed>",
+    "<excited>",
+    "<exhale>",
+    "<gasp>",
+    "<giggle>",
+    "<gulp>",
+    "<laugh>",
+    "<laugh_harder>",
+    "<mischievous>",
+    "<sarcastic>",
+    "<scream>",
+    "<sigh>",
+    "<sing>",
+    "<snort>",
+    "<whisper>",
+];
+
 impl ModelVariant {
     /// The model-specific controls a speech request may set; a control not
     /// listed is refused rather than ignored.
