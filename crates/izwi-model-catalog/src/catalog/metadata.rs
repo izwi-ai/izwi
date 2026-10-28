@@ -421,6 +421,16 @@ impl ModelVariant {
     pub const MAYA1_BUILT_IN_VOICE_COUNT: usize = 9;
     /// Maya 2 Native's release 1.0 (2026-10-25) as of its card rewrite.
     pub const MAYA2_ARTIFACT_REVISION: &'static str = "1403b841a6af0f920781319e851d4d6bdeb596c6";
+    /// LiquidAI/LFM2.5-1.2B-Instruct-GGUF; its Q4_K_M file is byte-identical
+    /// to the one downloaded from `main` since 2026-03.
+    pub const LFM25_12B_INSTRUCT_GGUF_ARTIFACT_REVISION: &'static str =
+        "8ed288026e23958ad9dfa92d53ed773a8eee7125";
+    /// LiquidAI/LFM2.5-1.2B-Thinking-GGUF (Q4_K_M).
+    pub const LFM25_12B_THINKING_GGUF_ARTIFACT_REVISION: &'static str =
+        "9584426effbfa44b677e925793a12188a36b44ce";
+    /// LiquidAI/LFM2.5-Audio-1.5B-GGUF (the four Q4_0 files).
+    pub const LFM25_AUDIO_15B_GGUF_ARTIFACT_REVISION: &'static str =
+        "7d525f883a077e20afb782f2ff618edcae0e39e4";
     /// LiquidAI/LFM3-1.7B-GGUF (QAD-Q4_0 and Q8_0 files).
     pub const LFM3_17B_GGUF_ARTIFACT_REVISION: &'static str =
         "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf";
@@ -504,6 +514,9 @@ impl ModelVariant {
             Self::Maya13B => Some(Self::MAYA1_ARTIFACT_REVISION),
             Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
             Self::Maya2Native25B => Some(Self::MAYA2_ARTIFACT_REVISION),
+            Self::Lfm2512BInstructGguf => Some(Self::LFM25_12B_INSTRUCT_GGUF_ARTIFACT_REVISION),
+            Self::Lfm2512BThinkingGguf => Some(Self::LFM25_12B_THINKING_GGUF_ARTIFACT_REVISION),
+            Self::Lfm25Audio15BGguf => Some(Self::LFM25_AUDIO_15B_GGUF_ARTIFACT_REVISION),
             Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => Some(Self::LFM3_17B_GGUF_ARTIFACT_REVISION),
             Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => {
                 Some(Self::LFM3_AUDIO_2B_GGUF_ARTIFACT_REVISION)
@@ -998,7 +1011,10 @@ impl ModelVariant {
             | Self::Maya13B
             | Self::Maya13BGguf
             | Self::Maya2Native25B => Some("Apache-2.0"),
-            Self::Lfm317BGguf
+            Self::Lfm2512BInstructGguf
+            | Self::Lfm2512BThinkingGguf
+            | Self::Lfm25Audio15BGguf
+            | Self::Lfm317BGguf
             | Self::Lfm317BQ8Gguf
             | Self::Lfm3Audio2BGguf
             | Self::Lfm3Audio2BQ8Gguf => Some("LFM Open License v1.0"),
@@ -2390,5 +2406,28 @@ mod tests {
             None
         );
         assert_eq!(ModelVariant::Qwen359BGguf.speech_capabilities(), None);
+    }
+
+    #[test]
+    fn every_liquid_gguf_is_pinned_and_carries_the_lfm_licence() {
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.repo_id().starts_with("LiquidAI/"))
+        {
+            assert!(
+                variant.artifact_revision().is_some(),
+                "{variant} downloads from an unpinned main"
+            );
+            assert_eq!(
+                variant.license_label(),
+                Some("LFM Open License v1.0"),
+                "{variant}"
+            );
+        }
+        assert_eq!(
+            ModelVariant::Lfm25Audio15BGguf.artifact_revision(),
+            Some(ModelVariant::LFM25_AUDIO_15B_GGUF_ARTIFACT_REVISION)
+        );
     }
 }

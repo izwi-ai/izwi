@@ -4539,6 +4539,11 @@ mod tests {
                 .find(|spec| spec.local_file.ends_with(".gguf"))
                 .expect("gguf spec");
             assert_eq!(gguf.source_repo, variant.repo_id());
+            assert_eq!(
+                Some(gguf.source_revision.as_str()),
+                variant.artifact_revision(),
+                "{variant}: the GGUF comes from its pinned revision"
+            );
             assert!(specs
                 .iter()
                 .filter(|spec| !spec.local_file.ends_with(".gguf"))
