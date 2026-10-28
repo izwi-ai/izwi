@@ -239,6 +239,14 @@ pub(crate) fn asr_prompt(language: Option<&str>) -> Result<Vec<PromptPart>> {
         .assistant(""))
 }
 
+/// `Perform live ASR.` (English only): a system turn and an open assistant
+/// turn, which the stream's audio and text then fill.
+pub(crate) fn live_asr_prompt() -> Vec<PromptPart> {
+    PromptBuilder::new()
+        .turn("system", "Perform live ASR.")
+        .assistant("")
+}
+
 /// `Perform TTS in <locale> using a <gender> voice.`, prefilled with
 /// `<|audio_start|>`.
 pub(crate) fn tts_prompt(text: &str, voice: Lfm3AudioVoice) -> Vec<PromptPart> {
@@ -272,6 +280,15 @@ mod tests {
         assert_eq!(
             tts_locale(Lfm3AudioVoice::DEFAULT_LOCALE_TAG).unwrap(),
             Lfm3AudioVoice::DEFAULT.locale
+        );
+    }
+
+    #[test]
+    fn live_asr_prompt_has_no_user_turn() {
+        assert_eq!(
+            text(&live_asr_prompt()),
+            "<|startoftext|><|im_start|>system\nPerform live ASR.<|im_end|>\n\
+             <|im_start|>assistant\n"
         );
     }
 

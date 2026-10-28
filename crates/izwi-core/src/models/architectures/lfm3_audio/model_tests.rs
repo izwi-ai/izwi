@@ -734,6 +734,123 @@ fn tts_rows_are_batch_invariant(profile: DeviceProfile) {
     }
 }
 
+/// A language-model state that a live transcription may restart: each new
+/// context starts from fresh pages and ring.
+struct RestartableLmState<'a> {
+    model: &'a Lfm3AudioModel,
+    inner: RetainedLmState,
+    contexts: usize,
+}
+
+impl Lfm3AudioLmState for RestartableLmState<'_> {
+    fn reset(&mut self) -> Result<()> {
+        self.inner = fresh_state(self.model);
+        self.contexts += 1;
+        Ok(())
+    }
+
+    fn capacity_tokens(&self) -> usize {
+        self.inner.capacity_tokens()
+    }
+
+    fn forward(
+        &mut self,
+        lm: &QuantizedLfm2Backbone,
+        embeds: &Tensor,
+        position: usize,
+    ) -> Result<Tensor> {
+        self.inner.forward(lm, embeds, position)
+    }
+}
+
+/// LiveASR fed 100 ms pieces writes the speech it hears as it hears it: a
+/// 29.7 s clip in one context, and the same clip then the fox sentence
+/// (34 s) across two, losing no word where the second one starts.
+fn live_asr_transcribes_while_streaming(profile: DeviceProfile) {
+    let dir = models_dir().join(FOLDER);
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let backend = format!("{:?}", profile.kind);
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    let to_16k = |(samples, rate): (Vec<f32>, u32)| {
+        crate::audio::resample_mono_high_quality(&samples, rate, INPUT_SAMPLE_RATE).unwrap()
+    };
+    let speech = to_16k(read_wav("test.wav"));
+    let fox = to_16k(read_wav("fox.wav"));
+    let reference = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/test.md"),
+    )
+    .unwrap();
+    let long = [speech.as_slice(), &[0.0; 16_000], &fox].concat();
+    for (name, audio, reference, contexts) in [
+        ("29.7 s", &speech, reference.clone(), 1),
+        ("34 s", &long, format!("{reference} {SENTENCE}"), 2),
+    ] {
+        let mut state = RestartableLmState {
+            model: &model,
+            inner: fresh_state(&model),
+            contexts: 0,
+        };
+        let mut live = model.start_live_asr();
+        let mut text = String::new();
+        let mut slowest = 0f64;
+        let started = Instant::now();
+        let pieces = audio.chunks(1_600).collect::<Vec<_>>();
+        for (index, piece) in pieces.iter().enumerate() {
+            let push = Instant::now();
+            let is_final = index + 1 == pieces.len();
+            text.push_str(
+                &model
+                    .push_live_asr(&mut live, piece, is_final, &mut state)
+                    .unwrap(),
+            );
+            slowest = slowest.max(push.elapsed().as_secs_f64());
+        }
+        assert!(live.finished());
+        let seconds = audio.len() as f64 / 16_000.0;
+        let heard = words(&text);
+        let recall = words(&reference)
+            .iter()
+            .filter(|word| heard.contains(word))
+            .count() as f64
+            / words(&reference).len() as f64;
+        eprintln!(
+            "{backend}: LiveASR {name} -> recall {recall:.2}, {} contexts, RTF {:.2}, \
+             slowest push {:.0} ms: {text:?}",
+            state.contexts,
+            started.elapsed().as_secs_f64() / seconds,
+            slowest * 1000.0
+        );
+        assert_eq!(state.contexts, contexts, "{backend}: {name} contexts");
+        assert!(recall >= 0.9, "{backend}: {name} recall {recall:.2}");
+        assert!(
+            heard.contains(&"impossible".to_string()),
+            "{backend}: {name} kept the last word before the new context"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_live_asr_on_cpu() {
+    live_asr_transcribes_while_streaming(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_live_asr_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm3_audio_live_asr_on_metal");
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        return;
+    }
+    live_asr_transcribes_while_streaming(profile);
+}
+
 /// Voice-chat replies (text and speech interleaved) joining a running batch
 /// at different steps each reply exactly as they reply alone, past the 256
 /// tokens where CPU attention starts slicing a row's context.

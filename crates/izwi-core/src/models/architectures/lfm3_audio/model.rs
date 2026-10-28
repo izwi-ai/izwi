@@ -43,7 +43,7 @@ use super::depth::{FrameHistory, Lfm3DepthDecoder};
 use super::encoder::Lfm3AudioEncoder;
 use super::preprocessor::Lfm3AudioMel;
 use super::prompts::{
-    asr_prompt, tts_prompt, Lfm3AudioVoice, PromptBuilder, PromptPart,
+    asr_prompt, live_asr_prompt, tts_prompt, Lfm3AudioVoice, PromptBuilder, PromptPart,
     LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT,
 };
 use super::sampling::{apply_repetition_penalty, sample};
@@ -1032,6 +1032,9 @@ pub(crate) fn lfm3_audio_asr_max_tokens(seconds: f32) -> usize {
     };
     ((seconds * 12.0).ceil() as usize + 32).clamp(64, 512)
 }
+
+#[path = "live_asr.rs"]
+mod live_asr;
 
 #[cfg(test)]
 #[path = "model_tests.rs"]
