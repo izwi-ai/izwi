@@ -518,8 +518,21 @@ impl Lfm3AudioModel {
         should_stop: &mut dyn FnMut() -> bool,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Lfm3AudioOutput> {
-        let prompt = asr_prompt(language)?;
         let audio = self.encode_audio(samples, sample_rate)?;
+        self.transcribe_encoded(audio, language, max_tokens, state, should_stop, on_text)
+    }
+
+    /// [`Self::transcribe_clip`] over encoder embeddings already computed.
+    pub(crate) fn transcribe_encoded(
+        &self,
+        audio: Tensor,
+        language: Option<&str>,
+        max_tokens: usize,
+        state: &mut dyn Lfm3AudioLmState,
+        should_stop: &mut dyn FnMut() -> bool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Lfm3AudioOutput> {
+        let prompt = asr_prompt(language)?;
         self.generate(
             Lfm3AudioRequest {
                 prompt,
@@ -536,6 +549,46 @@ impl Lfm3AudioModel {
             on_text,
             &mut |_| {},
         )
+    }
+
+    /// The transcript of a spoken turn whose encoder embeddings `audio` the
+    /// reply will reuse: one pass over them when the turn fits one ASR
+    /// window, else the chunked long form over `samples`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transcribe_turn(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        audio: &Tensor,
+        state: &mut dyn Lfm3AudioLmState,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<String> {
+        let config = AsrLongFormConfig::default();
+        if plan_audio_chunks(samples, sample_rate, &config, None).len() > 1 {
+            let (text, _) = self.transcribe(
+                samples,
+                sample_rate,
+                None,
+                None,
+                state,
+                should_stop,
+                &mut |_| {},
+            )?;
+            return Ok(text);
+        }
+        let seconds = samples.len() as f32 / sample_rate.max(1) as f32;
+        let output = self.transcribe_encoded(
+            audio.clone(),
+            None,
+            lfm3_audio_asr_max_tokens(seconds),
+            state,
+            should_stop,
+            &mut |_| {},
+        )?;
+        if output.stop_reason == "cancelled" {
+            return Err(Error::Cancelled("LFM3-Audio transcription cancelled".into()));
+        }
+        Ok(output.text.trim().to_string())
     }
 
     /// Speak `text` in `voice`: at most `max_frames` frames of 80 ms.
@@ -580,8 +633,7 @@ impl Lfm3AudioModel {
     pub(crate) fn respond(
         &self,
         history: &[ChatMessage],
-        samples: &[f32],
-        sample_rate: u32,
+        audio: Tensor,
         system_prompt: Option<&str>,
         max_slots: usize,
         text_sampling: Lfm3TextSampling,
@@ -592,7 +644,6 @@ impl Lfm3AudioModel {
         on_text: &mut dyn FnMut(&str),
         on_audio: &mut dyn FnMut(&[f32]),
     ) -> Result<Lfm3AudioOutput> {
-        let audio = self.encode_audio(samples, sample_rate)?;
         let system = match system_prompt.map(str::trim).filter(|text| !text.is_empty()) {
             Some(extra) => format!("{LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT}\n\n{extra}"),
             None => LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT.to_string(),

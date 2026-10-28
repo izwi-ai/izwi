@@ -224,12 +224,9 @@ impl NativeExecutor {
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let max_slots = request.params.max_tokens.max(1);
-        let text_sampling = Lfm3TextSampling {
-            temperature: request.params.temperature.max(0.0),
-            top_k: request.params.top_k,
-            top_p: request.params.top_p.clamp(0.0, 1.0),
-            ..Lfm3TextSampling::default()
-        };
+        // Liquid's `generation_config.json` decodes the reply's text
+        // greedily; no voice route sets text sampling of its own.
+        let text_sampling = Lfm3TextSampling::default();
         let sampling = audio_sampling(request);
         let seed = request
             .params
@@ -243,20 +240,20 @@ impl NativeExecutor {
         let mut leases =
             super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
 
+        // The turn is encoded once, for its transcript and for the reply.
+        let audio = Self::run_blocking(|| model.encode_audio(&samples, sample_rate))?;
         let transcription = Self::run_blocking(|| {
             with_lm_state(&mut leases, |state| {
-                model.transcribe(
+                model.transcribe_turn(
                     &samples,
                     sample_rate,
-                    None,
-                    None,
+                    &audio,
                     state,
                     &mut || request.is_cancelled(),
-                    &mut |_| {},
                 )
             })
         });
-        let (input_transcription, _) = match leases.fence_on_error(transcription) {
+        let input_transcription = match leases.fence_on_error(transcription) {
             Err(Error::Cancelled(_)) => return Ok(Self::lfm3_audio_cancelled(request)),
             transcription => transcription?,
         };
@@ -311,8 +308,7 @@ impl NativeExecutor {
             with_lm_state(&mut leases, |state| {
                 model.respond(
                     history,
-                    &samples,
-                    sample_rate,
+                    audio,
                     system_prompt,
                     max_slots,
                     text_sampling,

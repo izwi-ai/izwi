@@ -5,6 +5,8 @@
 //! `IZWI_LFM3_AUDIO_MODELS_DIR` names the models directory and is otherwise
 //! reported as not run.
 //!
+//! `IZWI_LFM3_AUDIO_BACKEND=metal` runs it on Metal instead of the CPU.
+//!
 //! Run: `IZWI_LFM3_AUDIO_MODELS_DIR=~/Library/Application\ Support/izwi/models cargo test -p izwi-core --features metal --release --lib lfm3_audio_tests -- --nocapture`
 
 use std::io::Write;
@@ -29,6 +31,17 @@ fn words(text: &str) -> Vec<String> {
         })
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+/// This process's resident memory, from `ps`.
+fn resident_bytes() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map_or(0, |kib| kib * 1024)
 }
 
 fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
@@ -58,15 +71,37 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         );
         return;
     };
+    // Tests default to the CPU backend; `IZWI_LFM3_AUDIO_BACKEND=metal`
+    // (or `cuda`) runs the same routes on a device.
+    let backend = std::env::var("IZWI_LFM3_AUDIO_BACKEND")
+        .ok()
+        .and_then(|name| crate::backends::BackendPreference::parse(&name))
+        .unwrap_or(crate::backends::BackendPreference::Cpu);
+    #[cfg(feature = "metal")]
+    let _metal_lease = (backend == crate::backends::BackendPreference::Metal).then(|| {
+        crate::backends::metal_test_device_or_skip(
+            "lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set",
+        )
+    });
     let runtime = RuntimeService::new(EngineConfig {
         models_dir: models_dir.into(),
+        backend,
         ..Default::default()
     })
     .expect("runtime");
+    eprintln!("backend {:?}", runtime.backend_context().backend_kind);
     let variant = ModelVariant::Lfm3Audio2BGguf;
     let started = Instant::now();
     runtime.load_model(variant).await.expect("load LFM3-Audio");
-    eprintln!("loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let snapshot = runtime.coordinator_snapshot();
+    eprintln!(
+        "loaded in {:.2}s; reserved {:.2} GiB (unified {:.2} GiB, host {:.2} GiB), process RSS {:.2} GiB",
+        started.elapsed().as_secs_f64(),
+        snapshot.reserved_memory_bytes as f64 / f64::from(1u32 << 30),
+        snapshot.reserved_unified_memory_bytes as f64 / f64::from(1u32 << 30),
+        snapshot.reserved_host_memory_bytes as f64 / f64::from(1u32 << 30),
+        resident_bytes() as f64 / f64::from(1u32 << 30),
+    );
     let model_id = variant.to_string();
     let fox =
         std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav"))
