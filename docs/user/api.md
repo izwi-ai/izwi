@@ -321,8 +321,9 @@ Tool behavior:
   `<parameter=…>`): tools are listed in the system turn inside `<tools>`, one
   JSON object per line, `tool` messages become native tool turns wrapped in
   `<tool_response>`, and calls are returned as `tool_calls`. Its context is
-  32,768 tokens by default; the server's `IZWI_LFM3_CONTEXT_TOKENS` raises it
-  up to the checkpoint's 262,144.
+  32,768 tokens by default on CPU and Metal and the checkpoint's 262,144 on
+  CUDA (capped by the memory the arena fits); the server's
+  `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend.
 
 Multimodal content parts:
 

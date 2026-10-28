@@ -315,15 +315,16 @@ impl LfmChatDialect {
         }
     }
 
-    /// The backbone configuration with the dialect's served context.
-    fn parse_config(self, loader: &GgufLoader) -> Result<Lfm2BackboneConfig> {
+    /// The backbone configuration with the dialect's served context on
+    /// `backend`.
+    fn parse_config(self, loader: &GgufLoader, backend: BackendKind) -> Result<Lfm2BackboneConfig> {
         let mut config = match self {
             Self::Lfm2 => parse_lfm2_backbone_config(loader)?,
             Self::Lfm3 => parse_lfm3_backbone_config(loader)?,
         };
         config.context_length = match self {
             Self::Lfm2 => lfm25_chat_context_limit(config.context_length),
-            Self::Lfm3 => lfm3_chat_context_limit(config.context_length),
+            Self::Lfm3 => lfm3_chat_context_limit(config.context_length, backend),
         };
         Ok(config)
     }
@@ -519,7 +520,7 @@ impl Lfm2ChatModel {
         let tokenizer = ChatTokenizer::load(model_dir)?;
         let loader =
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
-        let config = dialect.parse_config(&loader)?;
+        let config = dialect.parse_config(&loader, BackendKind::from(device.kind))?;
         let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         if tokenizer.vocab_size == 0 || tokenizer.vocab_size > text_model.vocab_size() {
             return Err(Error::ModelLoadError(
@@ -1511,9 +1512,11 @@ pub(crate) struct Lfm2ChatLoadLayout {
 pub(crate) fn lfm2_chat_load_layout(
     model_dir: &Path,
     variant: ModelVariant,
+    backend: BackendKind,
 ) -> Result<Lfm2ChatLoadLayout> {
     let gguf = model_dir.join(lfm2_chat_gguf_name(variant)?);
-    let config = LfmChatDialect::of(variant).parse_config(&GgufLoader::from_path(&gguf)?)?;
+    let config =
+        LfmChatDialect::of(variant).parse_config(&GgufLoader::from_path(&gguf)?, backend)?;
     Ok(Lfm2ChatLoadLayout {
         rope_table: super::backbone::rope_table_geometry(&config)?,
         rope_table_sets: 1 + usize::from(
@@ -1550,18 +1553,24 @@ fn lfm25_chat_context_limit(checkpoint_context: usize) -> usize {
     checkpoint_context.min(LFM25_CHAT_CONTEXT_TOKENS)
 }
 
-/// LFM3's default served context. The checkpoint is trained to 262,144
-/// tokens, and its KV is cheap (six global layers, 12 KiB per token in F16),
-/// but the context sizes the RoPE tables and every backend's reservation at
-/// load: the default keeps LFM2.5's footprint on 16 GB machines, and
-/// `IZWI_LFM3_CONTEXT_TOKENS` raises it.
+/// LFM3's default served context on CPU and Metal. The checkpoint is
+/// trained to 262,144 tokens, and its KV is cheap (six global layers, 12 KiB
+/// per token in F16), but the context sizes the RoPE tables and the
+/// reservation at load: the default keeps LFM2.5's footprint on 16 GB
+/// machines. CUDA serves the checkpoint's context, since its one-context
+/// arena is fitted to device memory at load and caps the reach there.
+/// `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend.
 const LFM3_CHAT_CONTEXT_TOKENS: usize = 32_768;
 
-fn lfm3_chat_context_limit(checkpoint_context: usize) -> usize {
+fn lfm3_chat_context_limit(checkpoint_context: usize, backend: BackendKind) -> usize {
+    let default = match backend {
+        BackendKind::Cuda => checkpoint_context,
+        BackendKind::Cpu | BackendKind::Metal => LFM3_CHAT_CONTEXT_TOKENS,
+    };
     let requested = crate::env::value("IZWI_LFM3_CONTEXT_TOKENS")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|tokens| *tokens > 0)
-        .unwrap_or(LFM3_CHAT_CONTEXT_TOKENS);
+        .unwrap_or(default);
     checkpoint_context.min(requested)
 }
 
@@ -1656,6 +1665,20 @@ mod tests {
     fn lfm25_chat_context_is_capped_at_the_model_card_length() {
         assert_eq!(super::lfm25_chat_context_limit(128_000), 32_768);
         assert_eq!(super::lfm25_chat_context_limit(32), 32);
+    }
+
+    /// CUDA serves LFM3's whole trained context (its arena is fitted to
+    /// memory at load); CPU and Metal keep the 32K default.
+    #[test]
+    fn lfm3_chat_context_defaults_per_backend() {
+        if crate::env::value("IZWI_LFM3_CONTEXT_TOKENS").is_some() {
+            return;
+        }
+        use super::BackendKind::{Cpu, Cuda, Metal};
+        assert_eq!(super::lfm3_chat_context_limit(262_144, Cuda), 262_144);
+        assert_eq!(super::lfm3_chat_context_limit(262_144, Metal), 32_768);
+        assert_eq!(super::lfm3_chat_context_limit(262_144, Cpu), 32_768);
+        assert_eq!(super::lfm3_chat_context_limit(4_096, Cpu), 4_096);
     }
 
     #[test]

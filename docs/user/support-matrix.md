@@ -282,7 +282,7 @@ native CUDA ceilings are:
 | Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
 | Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
 | LFM2.5 chat | 32,768 tokens (Izwi cap; the checkpoint advertises 128,000) | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
-| LFM3 chat | 32,768 tokens by default; `IZWI_LFM3_CONTEXT_TOKENS` raises it to the checkpoint's 262,144 | [Pinned LFM3-1.7B config](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/config.json) |
+| LFM3 chat | 32,768 tokens by default on CPU and Metal; the checkpoint's 262,144 on CUDA, capped by the memory its arena fits at load; `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend | [Pinned LFM3-1.7B config](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/config.json) |
 
 Optional YaRN extensions are not included: the local adapters do not implement
 their scaling parameters. Qwen3.8 fits its effective context to remaining

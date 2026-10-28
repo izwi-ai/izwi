@@ -2979,9 +2979,9 @@ pub(super) fn lfm2_chat_resource_plan(
     model_path: &Path,
     backend: BackendKind,
 ) -> Result<Option<ModelResourcePlan>> {
-    let Ok(layout) =
-        crate::models::architectures::lfm2::chat::lfm2_chat_load_layout(model_path, variant)
-    else {
+    let Ok(layout) = crate::models::architectures::lfm2::chat::lfm2_chat_load_layout(
+        model_path, variant, backend,
+    ) else {
         return Ok(None);
     };
     let Some(files) = census_of(std::slice::from_ref(&layout.gguf))? else {
