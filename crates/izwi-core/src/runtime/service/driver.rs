@@ -520,7 +520,7 @@ impl Drop for PendingRequestGuard {
 }
 
 impl RuntimeService {
-    pub(super) async fn ensure_step_driver_started(&self) {
+    pub(in crate::runtime) async fn ensure_step_driver_started(&self) {
         let mut guard = self.step_driver_task.lock().await;
         let restart_needed = match guard.as_ref() {
             Some(handle) if !handle.is_finished() => false,

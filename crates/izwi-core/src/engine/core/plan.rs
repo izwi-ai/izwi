@@ -84,9 +84,20 @@ impl EngineCore {
         };
 
         let (prefill_stage, decode_stage) = match profile.mode {
-            ExecutionMode::Sequence | ExecutionMode::Realtime => (
+            ExecutionMode::Sequence => (
                 Some(binding.stage_for_work(&prefill_work)?),
                 Some(binding.stage_for_work(&decode_work)?),
+            ),
+            // A realtime session's operations open with their preparation
+            // and continue with decode steps.
+            ExecutionMode::Realtime => (
+                Some(
+                    binding
+                        .stage_for_selector(super::super::StageWorkSelector::RealtimePreparation)?,
+                ),
+                Some(binding.stage_for_selector(
+                    super::super::StageWorkSelector::RealtimeDecodeContinuation,
+                )?),
             ),
             ExecutionMode::Atomic | ExecutionMode::Artifact => {
                 (Some(binding.stage_for_work(&atomic_work)?), None)

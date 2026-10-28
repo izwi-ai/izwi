@@ -22,6 +22,9 @@ impl RuntimeService {
                 "Voxtral realtime ASR does not support an initial text prompt".into(),
             ));
         }
+        // The session's operations run on the engine's step driver, which
+        // may not have started if this stream is the process's first work.
+        self.ensure_step_driver_started().await;
         let request_id = uuid::Uuid::new_v4().to_string();
         let initial_spec = self.coordinator_job_for_input(
             request_id.clone(),

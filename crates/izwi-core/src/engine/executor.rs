@@ -1431,8 +1431,11 @@ impl ModelSessionResult {
         }
     }
 
+    /// Add stream outputs this quantum staged after any already attached:
+    /// a realtime handler attaches its rows' own, and finalization then adds
+    /// what the request's staging buffer still holds.
     fn with_staged_stream_outputs(mut self, outputs: Vec<StreamingOutput>) -> Self {
-        self.staged_stream_outputs = outputs;
+        self.staged_stream_outputs.extend(outputs);
         self
     }
 
@@ -3082,6 +3085,38 @@ impl ModelExecutor for NativeExecutor {
             profile.compute_dtype,
             profile.kv_dtype
         ));
+
+        if request.is_realtime_asr_session() {
+            // An Engine realtime session runs its loaded adapter's realtime
+            // stages: preparation batched statically across sessions, prompt
+            // spans alone, and decode continuously, on retained pages.
+            let loaded =
+                self.config.model_registry.as_ref().is_some_and(|registry| {
+                    match variant.family() {
+                        crate::catalog::ModelFamily::Voxtral => {
+                            registry.try_get_voxtral_lease(variant).is_some()
+                        }
+                        crate::catalog::ModelFamily::Lfm3Audio => {
+                            registry.try_get_lfm25_audio_lease(variant).is_some()
+                        }
+                        _ => false,
+                    }
+                });
+            if !loaded {
+                return Some(profile);
+            }
+            profile.mode = ExecutionMode::Realtime;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = true;
+            profile.prefill_batch = NativeBatchMode::Static;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
+            profile.cache_mode = CacheMode::ExternalPaged;
+            profile.cancellation = CancellationGranularity::RealtimeChunk;
+            profile.resolved_from_loaded_model = true;
+            return Some(profile);
+        }
 
         let loaded_incremental = match request.task_type {
             super::types::TaskType::Chat => request
@@ -7267,6 +7302,35 @@ mod tests {
             request.reference_audio = Some("reference".to_string());
             assert!(!executor.execution_capabilities(&request).native_batch);
         }
+    }
+
+    #[test]
+    fn finalization_keeps_stream_outputs_a_realtime_handler_attached() {
+        let staged = |sequence| StreamingOutput {
+            request_id: "live".to_string(),
+            sequence,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some(format!("piece {sequence}")),
+            stats: None,
+            asr_progress: None,
+            logprobs: Vec::new(),
+        };
+        // The handler attaches its rows' outputs; finalization then adds
+        // what the staging buffer still holds, here nothing and then one.
+        let result = ModelSessionResult::sequence(ExecutorOutput::error("live".into(), "unused"))
+            .with_staged_stream_outputs(vec![staged(0), staged(1)])
+            .with_staged_stream_outputs(Vec::new())
+            .with_staged_stream_outputs(vec![staged(2)]);
+        assert_eq!(
+            result
+                .staged_stream_outputs
+                .iter()
+                .map(|output| output.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
     }
 
     #[test]

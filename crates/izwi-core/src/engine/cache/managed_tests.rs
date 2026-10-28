@@ -4527,12 +4527,10 @@ fn realtime_selected_tensor_state_commits_without_implicit_paged_advance() {
         .prepare(&runtime, 5243, &session, &work, None)
         .unwrap()
         .unwrap();
-    assert!(
-        reservation
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens })
-    );
+    // A fresh session's view spans one page, though preparation writes none.
+    assert!(reservation.domains.iter().all(|domain| {
+        domain.execution_start_tokens == 0 && domain.target_committed_tokens == 1
+    }));
     let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
     arena
         .stage_replace(
@@ -5413,11 +5411,11 @@ fn realtime_subphase_reservations_are_exact_and_stage_scoped() {
             .unwrap()
             .expect("unchanged-prefix reservation");
         assert!(reservation.allow_unchanged_prefix);
-        assert!(
-            reservation.domains.iter().all(|domain| {
-                domain.target_committed_tokens == domain.execution_start_tokens
-            })
-        );
+        // Nothing is committed yet, so the view spans one page; the quantum
+        // still commits an unchanged prefix.
+        assert!(reservation.domains.iter().all(|domain| {
+            domain.execution_start_tokens == 0 && domain.target_committed_tokens == 1
+        }));
         let receipt = reservation
             .completed_write_receipt_for_prefix(
                 &[],

@@ -872,6 +872,23 @@ impl ExecutionAdapterBinding {
         Ok(stage)
     }
 
+    /// The one stage that `selector` exactly names.
+    pub fn stage_for_selector(&self, selector: StageWorkSelector) -> Result<&StageDescriptor> {
+        let mut stages = self
+            .stages
+            .iter()
+            .filter(|stage| stage.selector == selector);
+        match (stages.next(), stages.next()) {
+            (Some(stage), None) => Ok(stage),
+            (None, _) => Err(Error::InvalidInput(format!(
+                "execution adapter has no {selector:?} stage"
+            ))),
+            (Some(_), Some(_)) => Err(Error::InvalidInput(format!(
+                "execution adapter has several {selector:?} stages"
+            ))),
+        }
+    }
+
     pub fn key_for_stage(&self, stage_id: StageId) -> Result<AdapterBindingKey> {
         if !self.stages.iter().any(|stage| stage.id == stage_id) {
             return Err(Error::InvalidInput(
