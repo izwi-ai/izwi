@@ -344,6 +344,16 @@ pub(super) fn kokoro_synthesis_resources(
 /// 24 kHz).
 pub(super) const KOKORO_JOIN_PAUSE_SAMPLES: u64 = 960;
 
+/// What an LFM3-Audio row's preparation builds its prompt from.
+enum Lfm3AudioRowSource {
+    Speech(crate::models::architectures::lfm3_audio::model::Lfm3AudioRequest),
+    Reply {
+        samples: Vec<f32>,
+        sample_rate: u32,
+        settings: crate::engine::Lfm3AudioReplySettings,
+    },
+}
+
 impl RuntimeService {
     pub(super) async fn prepare_kokoro_tts_for_binding(
         &self,
@@ -1592,16 +1602,23 @@ impl RuntimeService {
     /// Prepare an LFM3-Audio speech request as a retained row: resolve its
     /// voice, locale, frame cap, sampling and seed, and embed its prompt
     /// once, so its row prefills from the artifact.
-    pub(super) async fn prepare_lfm3_audio_tts_for_binding(
+    /// Seal an LFM3-Audio speech request or voice-chat turn as a retained
+    /// row: preparation builds its prompt embeddings (encoding a turn's
+    /// speech first).
+    pub(super) async fn prepare_lfm3_audio_row_for_binding(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<&ModelResidencyLease>,
     ) -> Result<(EngineCoreRequest, JobLease)> {
-        if request.task_type != TaskType::TTS
-            || request
-                .model_variant
-                .is_none_or(|variant| variant.family() != ModelFamily::Lfm3Audio)
+        let workload = match request.task_type {
+            TaskType::TTS => Lfm3AudioWorkload::Tts,
+            TaskType::SpeechToSpeech => Lfm3AudioWorkload::Conversation,
+            _ => return Ok((request, job)),
+        };
+        if request
+            .model_variant
+            .is_none_or(|variant| variant.family() != ModelFamily::Lfm3Audio)
             || request
                 .prepared_lfm3_audio_artifact_for_executor()?
                 .is_some()
@@ -1625,21 +1642,49 @@ impl RuntimeService {
         let contract = loaded_contract_for_residency(
             residency,
             loaded_bundle.as_deref(),
-            CapabilityKind::Tts,
+            CapabilityKind::for_engine_task(request.task_type),
             false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let context_limit = model.lfm3_audio()?.row_context(Lfm3AudioWorkload::Tts);
-        let speech = request.lfm3_audio_tts_request()?;
+        let context_limit = model.lfm3_audio()?.row_context(workload);
+        let (source, request) = match workload {
+            Lfm3AudioWorkload::Tts => {
+                let speech = request.lfm3_audio_tts_request()?;
+                (Lfm3AudioRowSource::Speech(speech), request)
+            }
+            _ => {
+                let reply = request.lfm3_audio_reply_settings();
+                let (samples, sample_rate, request) = self
+                    .coordinator
+                    .run_host_blocking_stage(&job, move || {
+                        let (samples, sample_rate) =
+                            crate::engine::decode_request_audio_with_rate(&request)?;
+                        Ok((samples, sample_rate, request))
+                    })
+                    .await?;
+                (
+                    Lfm3AudioRowSource::Reply {
+                        samples,
+                        sample_rate,
+                        settings: reply,
+                    },
+                    request,
+                )
+            }
+        };
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("LFM3-Audio retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
-        // Tokenizing the prompt and gathering its embeddings.
-        let workspace = 64 * 1024 * 1024;
+        // Tokenizing the prompt and gathering its embeddings; a turn's mel
+        // features and encoder too.
+        let workspace = match workload {
+            Lfm3AudioWorkload::Tts => 64 * 1024 * 1024,
+            _ => 512 * 1024 * 1024,
+        };
         let preparation_job = self
             .coordinator
             .admit_observed_from_preparation(
@@ -1661,7 +1706,11 @@ impl RuntimeService {
             .await
             .map_err(|failure| failure.error)?;
         let work = WorkUnit::PreSequencePreparation {
-            kind: "tts.prepare.lfm3_audio".into(),
+            kind: match workload {
+                Lfm3AudioWorkload::Tts => "tts.prepare.lfm3_audio",
+                _ => "s2s.prepare.lfm3_audio",
+            }
+            .into(),
         };
         let cost = crate::engine::WorkCost::with_workspace(
             context_limit as u64,
@@ -1693,7 +1742,24 @@ impl RuntimeService {
                         "LFM3-Audio preparation must remain scalar".into(),
                     ));
                 }
-                let artifact = model_for_preparation.lfm3_audio()?.prepare_row(speech)?;
+                let lfm3 = model_for_preparation.lfm3_audio()?;
+                let artifact = match source {
+                    Lfm3AudioRowSource::Speech(speech) => lfm3.prepare_row(speech)?,
+                    Lfm3AudioRowSource::Reply {
+                        samples,
+                        sample_rate,
+                        settings,
+                    } => lfm3.prepare_reply_row(
+                        &samples,
+                        sample_rate,
+                        &settings.history,
+                        settings.system_prompt.as_deref(),
+                        settings.max_slots,
+                        settings.text_sampling,
+                        settings.audio_sampling,
+                        settings.seed,
+                    )?,
+                };
                 Ok(vec![Ok(PreparationArtifact {
                     retained: JobResourceObservation {
                         host_bytes: retained_request_bytes,
@@ -2001,7 +2067,7 @@ impl RuntimeService {
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
-            .prepare_lfm3_audio_tts_for_binding(request, job, residency_lease)
+            .prepare_lfm3_audio_row_for_binding(request, job, residency_lease)
             .await?;
         Ok((request, job))
     }

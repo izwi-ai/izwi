@@ -418,6 +418,104 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
     assert!(!reply.text.trim().is_empty());
     assert!(reply.samples.len() > 24_000 / 2, "the reply speaks");
 
+    // Voice chat as rows: a seeded turn replies the same streamed and
+    // final-only, and alone and beside other turns.
+    let turn = |seed: u64| {
+        let mut params = GenerationParams {
+            max_tokens: 300,
+            ..Default::default()
+        };
+        params.speech.seed = Some(seed);
+        params
+    };
+    let alone = runtime
+        .speech_to_speech_generate_bytes_with_variant(
+            variant,
+            &fox,
+            Vec::new(),
+            turn(31),
+            None,
+            None,
+        )
+        .await
+        .expect("seeded reply");
+    let streamed = runtime
+        .speech_to_speech_generate_streaming_bytes_with_variant(
+            variant,
+            &fox,
+            Vec::new(),
+            turn(31),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("streamed reply");
+    assert_eq!(streamed.text, alone.text);
+    assert!(streamed.samples == alone.samples, "streamed speech differs");
+    let turns = [
+        (fox.clone(), 31),
+        (fox.clone(), 32),
+        (inputs[1].clone(), 33),
+    ];
+    let mut solo = Vec::new();
+    for (audio, seed) in &turns {
+        solo.push(
+            runtime
+                .speech_to_speech_generate_bytes_with_variant(
+                    variant,
+                    audio,
+                    Vec::new(),
+                    turn(*seed),
+                    None,
+                    None,
+                )
+                .await
+                .expect("reply alone"),
+        );
+    }
+    let before = crate::engine::metrics::engine_batch_metrics_snapshot();
+    let started = Instant::now();
+    let together = futures::future::join_all(turns.iter().map(|(audio, seed)| {
+        runtime.speech_to_speech_generate_bytes_with_variant(
+            variant,
+            audio,
+            Vec::new(),
+            turn(*seed),
+            None,
+            None,
+        )
+    }))
+    .await;
+    let after = crate::engine::metrics::engine_batch_metrics_snapshot();
+    let batches = after.model_tensor_batches_total - before.model_tensor_batches_total;
+    let rows = after.model_tensor_batch_rows_total - before.model_tensor_batch_rows_total;
+    eprintln!(
+        "S2S x{}: {batches} tensor calls over {rows} rows (mean width {:.2}) in {:.2}s",
+        turns.len(),
+        rows as f64 / batches.max(1) as f64,
+        started.elapsed().as_secs_f64()
+    );
+    for (index, (solo, together)) in solo.iter().zip(together).enumerate() {
+        let together = together.expect("reply concurrently");
+        eprintln!(
+            "S2S turn {index}: heard {:?}, replied {:?}",
+            together.input_transcription, together.text
+        );
+        assert_eq!(solo.text, together.text, "turn {index} text differs");
+        assert!(
+            solo.samples == together.samples,
+            "turn {index} speech differs: {} vs {} samples, first difference at {:?}",
+            solo.samples.len(),
+            together.samples.len(),
+            solo.samples
+                .iter()
+                .zip(&together.samples)
+                .position(|(a, b)| a != b)
+        );
+        assert_eq!(solo.input_transcription, together.input_transcription);
+    }
+
     // Diarization with LFM3-Audio as its ASR, which transcribes on the
     // long-form graph's invocation workspace.
     let started = Instant::now();

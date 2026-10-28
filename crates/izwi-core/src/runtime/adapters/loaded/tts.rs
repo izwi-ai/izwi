@@ -926,13 +926,14 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
     }
 }
 
-/// LFM3-Audio speech as retained continuous rows: a scalar preparation
-/// (the prompt's embeddings), a static prefill of each row's prompt, and a
+/// LFM3-Audio speech and voice-chat replies as retained continuous rows: a
+/// scalar preparation (the prompt's embeddings, with a spoken turn's
+/// encoder embeddings), a static prefill of each row's prompt, and a
 /// continuous decode that steps every row one slot with the language model
 /// batched across rows. The codec decodes inside the decode quantum, so the
 /// graph has no separate audio stage.
 #[derive(Debug)]
-pub(super) struct Lfm3AudioTtsExecutionAdapter {
+pub(super) struct Lfm3AudioSpeechExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,
     pub(super) model_instance_id: ModelInstanceId,
     pub(super) adapter_instance_id: AdapterInstanceId,
@@ -941,7 +942,7 @@ pub(super) struct Lfm3AudioTtsExecutionAdapter {
     pub(super) max_batch_size: usize,
 }
 
-impl Lfm3AudioTtsExecutionAdapter {
+impl Lfm3AudioSpeechExecutionAdapter {
     pub(super) fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
@@ -962,7 +963,7 @@ impl Lfm3AudioTtsExecutionAdapter {
     }
 }
 
-impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
+impl LoadedExecutionAdapter for Lfm3AudioSpeechExecutionAdapter {
     fn metadata(&self) -> AdapterMetadata {
         self.metadata
     }
@@ -970,7 +971,10 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
         self.adapter_instance_id
     }
     fn adapter_abi_revision(&self) -> AdapterAbiRevision {
-        LFM3_AUDIO_TTS_ADAPTER_ABI
+        match self.metadata.capability {
+            CapabilityKind::Tts => LFM3_AUDIO_TTS_ADAPTER_ABI,
+            _ => LFM3_AUDIO_CHAT_ADAPTER_ABI,
+        }
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
@@ -980,6 +984,12 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
                 self.metadata.model_variant
             )));
         }
+        // A voice-chat reply's prompt holds its history and the spoken turn,
+        // which preparation encodes.
+        let (task, prompt_tokens, preparation_bytes) = match self.metadata.capability {
+            CapabilityKind::Tts => ("tts", 4_096_u64, 64 * 1024 * 1024),
+            _ => ("s2s", 16_384, 512 * 1024 * 1024),
+        };
         let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
@@ -988,7 +998,7 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
         profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
-            "{}:tts:{}:lfm3-audio-state-v2",
+            "{}:{task}:{}:lfm3-audio-state-v2",
             self.metadata.model_variant,
             self.backend_kind.as_str()
         ));
@@ -1005,7 +1015,7 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
 
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
-            "tts.prepare.lfm3_audio",
+            format!("{task}.prepare.lfm3_audio"),
             &profile,
             NativeBatchMode::None,
         );
@@ -1015,12 +1025,13 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = 16_384;
-        // Tokenizing the prompt and gathering its embeddings.
-        preparation.max_workspace_bytes = 64 * 1024 * 1024;
+        // Tokenizing the prompt, encoding a spoken turn and gathering the
+        // prompt's embeddings.
+        preparation.max_workspace_bytes = preparation_bytes;
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
-            "tts.prefill.lfm3_audio.tensor_static",
+            format!("{task}.prefill.lfm3_audio.tensor_static"),
             &profile,
             NativeBatchMode::Static,
         );
@@ -1028,13 +1039,13 @@ impl LoadedExecutionAdapter for Lfm3AudioTtsExecutionAdapter {
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
-        prefill.max_work_units = 4_096_u64.saturating_mul(rows);
+        prefill.max_work_units = prompt_tokens.saturating_mul(rows);
         // Each row's prompt prefills alone: one span's activations.
         prefill.max_workspace_bytes = (256_u64 * 1024 * 1024).saturating_mul(rows);
 
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
-            "tts.decode.lfm3_audio.tensor_continuous",
+            format!("{task}.decode.lfm3_audio.tensor_continuous"),
             &profile,
             NativeBatchMode::Continuous,
         );

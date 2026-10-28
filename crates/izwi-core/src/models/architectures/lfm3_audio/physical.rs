@@ -1,16 +1,15 @@
-//! LFM3-Audio's invocation state: the language model's paged attention and
-//! ShortConv ring, owned by each atomic request. The MaskGIT depth decoder
-//! is stateless and the encoder and codec streams are bounded host state,
-//! so no other domain exists. The domain ids are LFM2.5-Audio's, so the
-//! engine's audio-chat leases serve both families.
+//! LFM3-Audio's state: the language model's paged attention and ShortConv
+//! ring. Rows of every capability keep them in one managed arena between
+//! quanta; long-form transcription leases them for one atomic invocation.
+//! The MaskGIT depth decoder is stateless and the encoder and codec streams
+//! are bounded host state, so no other domain exists. The domain ids are
+//! LFM2.5-Audio's, so the engine's audio-chat leases serve both families.
 //!
-//! Each workload leases only the context it can use (a 30 s ASR chunk, one
-//! TTS segment, a conversation), and paged KV is F16 on Metal and CUDA, so
-//! the four capabilities of one loaded model reserve a few hundred MiB per
-//! row instead of four full 32K-token contexts.
+//! Each workload holds only the context it can use (a 30 s ASR chunk, one
+//! TTS segment, a conversation), and paged KV is F16 on Metal and CUDA.
 
 use crate::backends::BackendKind;
-use crate::engine::{NativeBatchMode, StageDescriptor, StageWorkSelector};
+use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
@@ -25,7 +24,7 @@ use crate::models::architectures::lfm2::physical::{
     Lfm2StateIds, Lfm2StateLayout,
 };
 use crate::models::architectures::lfm25_audio::physical::{
-    Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+    Lfm25AudioRetainedStateSpec, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
     LFM25_MAIN_SHORTCONV_STATE_DOMAIN, LFM25_MAIN_STATE_GROUP,
 };
 
@@ -161,21 +160,22 @@ fn scratch_domain(id: u32, bytes: u64) -> InvocationWorkspaceDomain {
     }
 }
 
-/// Speech or transcription as retained rows: the language model's paged
-/// attention and ShortConv ring stay in the managed arena between quanta,
-/// sized for one `workload` segment per row. The depth decoder and codec
-/// keep no state between quanta, so each row stage leases its activations as
-/// per-row scratch. Transcription's long-form graph (one atomic stage) also
-/// leases the language model's main invocation workspace.
+/// Rows of `workload` (speech, transcription or voice-chat replies): the
+/// language model's paged attention and ShortConv ring stay in the managed
+/// arena between quanta, at most one `workload` context per row. The depth
+/// decoder and codec keep no state between quanta, so each row stage leases
+/// its activations as per-row scratch. Transcription's long-form graph (one
+/// atomic stage) also leases the language model's main invocation
+/// workspace.
 pub(crate) fn lfm3_audio_retained_state_spec(
     lm_config: &Lfm2BackboneConfig,
     workload: Lfm3AudioWorkload,
     kv_dtype: StateDType,
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<Lfm25AudioRetainedStateSpec> {
-    if stage_graphs.is_empty() || workload == Lfm3AudioWorkload::Conversation {
+    if stage_graphs.is_empty() {
         return Err(Error::ModelLoadError(
-            "LFM3-Audio retained state serves speech or transcription graphs".into(),
+            "LFM3-Audio retained state has no execution graph".into(),
         ));
     }
     let retained = crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(
@@ -260,73 +260,5 @@ pub(crate) fn lfm3_audio_retained_state_spec(
         retained_max_tokens: context,
         main_invocation,
         depthformer_invocation: None,
-    })
-}
-
-/// The invocation workspace of one scalar LFM3-Audio request of `workload`.
-pub(crate) fn lfm3_audio_physical_state_spec(
-    lm_config: &Lfm2BackboneConfig,
-    workload: Lfm3AudioWorkload,
-    kv_dtype: StateDType,
-    stage_graphs: &[&[StageDescriptor]],
-) -> Result<Lfm25AudioPhysicalStateSpec> {
-    if stage_graphs.is_empty() {
-        return Err(Error::ModelLoadError(
-            "LFM3-Audio physical state has no execution graph".into(),
-        ));
-    }
-    for stages in stage_graphs {
-        if stages.len() != 1 {
-            return Err(Error::ModelLoadError(
-                "LFM3-Audio invocation state requires one scalar execution stage".into(),
-            ));
-        }
-        for stage in *stages {
-            stage.validate()?;
-            if !stage.runs_independent_invocations() || stage.batch_mode != NativeBatchMode::None {
-                return Err(Error::ModelLoadError(
-                    "LFM3-Audio invocation state requires scalar atomic execution stages".into(),
-                ));
-            }
-        }
-    }
-    let invocation = main_invocation_contract(lm_config, kv_dtype)?;
-    let context = workload.context_tokens().min(lm_config.context_length);
-    let max_domain_id = invocation
-        .domains
-        .iter()
-        .map(|domain| domain.id().get())
-        .max()
-        .ok_or_else(|| Error::ModelLoadError("LFM3-Audio state contract is empty".into()))?;
-    let mut profiles = Vec::with_capacity(stage_graphs.len());
-    for stages in stage_graphs {
-        let stage = &stages[0];
-        let mut domains = invocation_state_domains(&invocation, context, kv_dtype)?;
-        if stage.max_workspace_bytes > 0 {
-            domains.push(scratch_domain(max_domain_id + 1, stage.max_workspace_bytes));
-        }
-        profiles.push(InvocationWorkspaceProfile {
-            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
-            stages: vec![InvocationStageWorkspace {
-                stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
-                domains,
-            }],
-        });
-    }
-    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
-    profiles.dedup();
-    let descriptor = CapabilityStateDescriptorV2 {
-        abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
-        invocation: InvocationWorkspaceSet::Bounded { profiles },
-    };
-    for stages in stage_graphs {
-        descriptor.validate_against_stages(stages)?;
-    }
-    Ok(Lfm25AudioPhysicalStateSpec {
-        descriptor,
-        invocation,
     })
 }

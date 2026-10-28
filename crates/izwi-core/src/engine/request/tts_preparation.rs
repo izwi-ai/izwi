@@ -618,6 +618,28 @@ impl EngineCoreRequest {
         }
     }
 
+    /// The LFM3-Audio voice-chat reply this turn asks for: at most its
+    /// `max_tokens` slots, the reply's text greedy (Liquid's
+    /// `generation_config.json`; no voice route sets text sampling of its
+    /// own), its speech sampled as [`Self::lfm3_audio_sampling`] with its seed
+    /// (else one derived from its id).
+    pub(crate) fn lfm3_audio_reply_settings(&self) -> super::Lfm3AudioReplySettings {
+        super::Lfm3AudioReplySettings {
+            history: self.speech_messages_for_execution().to_vec(),
+            system_prompt: self
+                .speech_system_prompt_for_execution()
+                .map(str::to_string),
+            max_slots: self.params.max_tokens.max(1),
+            text_sampling: Default::default(),
+            audio_sampling: self.lfm3_audio_sampling(),
+            seed: self
+                .params
+                .speech
+                .seed
+                .unwrap_or_else(|| Self::chat_request_seed(&self.id)),
+        }
+    }
+
     /// The LFM3-Audio speech this TTS request asks for: its text in its voice
     /// (`female` or `male`) and locale, at most its frame cap (from the text
     /// when unset), with its sampling and seed (else one derived from its id).
@@ -666,7 +688,7 @@ impl EngineCoreRequest {
         let routed = self.model_variant == Some(model_variant)
             && model_variant.family() == ModelFamily::Lfm3Audio;
         let shaped = match (self.task_type, artifact.as_ref()) {
-            (TaskType::TTS, Some(_)) => true,
+            (TaskType::TTS | TaskType::SpeechToSpeech, Some(_)) => true,
             (TaskType::ASR, Some(_)) => !self.uses_asr_long_form_atomic(),
             (TaskType::ASR, None) => self.uses_asr_long_form_atomic(),
             _ => false,

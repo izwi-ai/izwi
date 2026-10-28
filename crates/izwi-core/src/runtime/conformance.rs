@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            63
+            67
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            17
+            13
         );
 
         assert_eq!(
@@ -544,6 +544,16 @@ mod tests {
             (ModelVariant::Lfm3Audio2BGguf, CapabilityKind::Tts),
             (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::Asr),
             (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::Tts),
+            (ModelVariant::Lfm3Audio2BGguf, CapabilityKind::AudioChat),
+            (
+                ModelVariant::Lfm3Audio2BGguf,
+                CapabilityKind::SpeechToSpeech,
+            ),
+            (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::AudioChat),
+            (
+                ModelVariant::Lfm3Audio2BQ8Gguf,
+                CapabilityKind::SpeechToSpeech,
+            ),
         ] {
             let case = manifest_case(&manifest, variant, capability);
             assert_eq!(case.retained_state, Managed, "{variant} {capability:?}");

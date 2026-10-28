@@ -297,7 +297,7 @@ impl RuntimeService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
+    pub(crate) async fn asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
         &self,
         variant: ModelVariant,
         audio_bytes: &[u8],

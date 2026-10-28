@@ -36,6 +36,7 @@ pub(crate) enum LoadedAdapterKind {
     Maya2Tts,
     Lfm3AudioTts,
     Lfm3AudioAsr,
+    Lfm3AudioChat,
     KokoroStaticTts,
     Scalar,
 }
@@ -62,6 +63,7 @@ impl LoadedAdapterKind {
             Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
             Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
             Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
+            Self::Lfm3AudioChat => "builtin.lfm3_audio_chat.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -362,12 +364,11 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // Audio chat.
         row(F::Lfm25Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm25Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
-        // LFM3-Audio speech and transcription run as retained rows that
-        // batch: the language model's pages and ring stay in the managed
-        // arena between quanta. Speech streams as the codec decodes it; a
-        // clip of at most 30 s transcribes as a row, longer audio in clips
-        // of at most 30 s, one atomic dispatch each. Voice chat runs as one
-        // atomic invocation on leased pages and ring.
+        // LFM3-Audio speech, transcription and voice-chat replies run as
+        // retained rows that batch: the language model's pages and ring stay
+        // in the managed arena between quanta. Speech streams as the codec
+        // decodes it; a clip of at most 30 s transcribes as a row, longer
+        // audio in clips of at most 30 s, one atomic dispatch each.
         row(
             F::Lfm3Audio,
             C::Tts,
@@ -383,8 +384,20 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         )
         .chunked()
         .sequence(),
-        row(F::Lfm3Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
-        row(F::Lfm3Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
+        row(
+            F::Lfm3Audio,
+            C::AudioChat,
+            Loaded::Lfm3AudioChat,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::Lfm3Audio,
+            C::SpeechToSpeech,
+            Loaded::Lfm3AudioChat,
+            RetainedAndInvocation,
+        )
+        .chunked(),
         // Chat.
         chat(F::Qwen3Chat).only(QWEN3_RESUMABLE_CHAT).resumable(),
         chat(F::Qwen3Chat).only(QWEN3_ATOMIC_CHAT),

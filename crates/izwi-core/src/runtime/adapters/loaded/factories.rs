@@ -294,7 +294,35 @@ impl LoadedExecutionAdapterFactory for Lfm3AudioPhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(Lfm3AudioTtsExecutionAdapter::new(
+        Ok(Arc::new(Lfm3AudioSpeechExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Lfm3AudioPhysicalChatAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for Lfm3AudioPhysicalChatAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::Lfm3AudioChat.factory_id()
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Lfm3AudioChat, metadata, backend_kind)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(Lfm3AudioSpeechExecutionAdapter::new(
             context.execution_group_id,
             context.model_instance_id,
             metadata,
@@ -665,6 +693,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(Maya2PhysicalTtsAdapterFactory),
         Arc::new(Lfm3AudioPhysicalTtsAdapterFactory),
         Arc::new(Lfm3AudioPhysicalAsrAdapterFactory),
+        Arc::new(Lfm3AudioPhysicalChatAdapterFactory),
         Arc::new(KokoroStaticTtsAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]

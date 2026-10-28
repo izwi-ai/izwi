@@ -171,14 +171,12 @@ fn certified_topology(
         (Lfm25Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, Tts) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
-        // LFM3-Audio speech retains the language model's pages and ring
-        // between quanta and leases scratch per stage; the other
-        // capabilities run one scalar invocation on leased pages and ring.
-        (Lfm3Audio, Tts) => RetainedPagedRingAndInvocationScratch,
+        // LFM3-Audio speech and voice-chat replies retain the language
+        // model's pages and ring between quanta and lease scratch per stage.
+        (Lfm3Audio, Tts | AudioChat | SpeechToSpeech) => RetainedPagedRingAndInvocationScratch,
         // Transcription retains the same pages and ring; its long form leases
         // the language model's pages and ring for one atomic invocation.
         (Lfm3Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
-        (Lfm3Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
 
         (SortformerDiarization, Diarization) => InvocationTensor,
         (Qwen3ForcedAligner, ForcedAlignment) => Stateless,

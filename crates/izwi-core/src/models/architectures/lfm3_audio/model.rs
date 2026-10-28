@@ -302,6 +302,44 @@ pub(crate) fn tts_request(
     })
 }
 
+/// The reply to a spoken turn (encoder embeddings `audio`) after
+/// `history`'s text turns: interleaved text and speech (`Respond with
+/// interleaved text and audio.`, the reply prefilled with `<|mixed_start|>`),
+/// at most `max_slots` slots.
+pub(crate) fn reply_request(
+    history: &[ChatMessage],
+    audio: Tensor,
+    system_prompt: Option<&str>,
+    max_slots: usize,
+    text_sampling: Lfm3TextSampling,
+    audio_sampling: Lfm3AudioSampling,
+    seed: u64,
+) -> Lfm3AudioRequest {
+    let system = match system_prompt.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(extra) => format!("{LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT}\n\n{extra}"),
+        None => LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT.to_string(),
+    };
+    let mut prompt = PromptBuilder::new().turn("system", &system);
+    for message in history {
+        let role = match message.role {
+            ChatRole::System => continue,
+            ChatRole::User | ChatRole::Tool => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        prompt = prompt.turn(role, &message.content);
+    }
+    Lfm3AudioRequest {
+        prompt: prompt.audio_turn("user", "").assistant("<|mixed_start|>"),
+        audio: Some(audio),
+        mode: Lfm3AudioMode::Interleaved,
+        text_only: false,
+        max_slots: max_slots.max(1),
+        text_sampling,
+        audio_sampling,
+        seed,
+    }
+}
+
 fn check_prompt_fits(prompt_tokens: usize, context: usize) -> Result<()> {
     if prompt_tokens >= context {
         return Err(Error::InvalidInput(format!(
@@ -445,6 +483,32 @@ impl Lfm3AudioModel {
         let budget = max_tokens.unwrap_or_else(|| lfm3_audio_asr_max_tokens(seconds));
         let audio = self.encode_audio(samples, sample_rate)?;
         self.prepare_row(asr_request(audio, language, budget)?)
+    }
+
+    /// The reply row of a spoken turn at any rate (see [`reply_request`]):
+    /// its prompt with the turn's encoder embeddings.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_reply_row(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        history: &[ChatMessage],
+        system_prompt: Option<&str>,
+        max_slots: usize,
+        text_sampling: Lfm3TextSampling,
+        audio_sampling: Lfm3AudioSampling,
+        seed: u64,
+    ) -> Result<std::sync::Arc<super::retained::Lfm3AudioPreparedArtifact>> {
+        let audio = self.encode_audio(samples, sample_rate)?;
+        self.prepare_row(reply_request(
+            history,
+            audio,
+            system_prompt,
+            max_slots,
+            text_sampling,
+            audio_sampling,
+            seed,
+        ))
     }
 
     pub fn max_context_tokens(&self) -> usize {
@@ -827,48 +891,6 @@ impl Lfm3AudioModel {
         )
     }
 
-    /// The transcript of a spoken turn whose encoder embeddings `audio` the
-    /// reply will reuse: one pass over them when the turn fits one ASR
-    /// window, else the chunked long form over `samples`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn transcribe_turn(
-        &self,
-        samples: &[f32],
-        sample_rate: u32,
-        audio: &Tensor,
-        state: &mut dyn Lfm3AudioLmState,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<String> {
-        let config = AsrLongFormConfig::default();
-        if plan_audio_chunks(samples, sample_rate, &config, None).len() > 1 {
-            let (text, _) = self.transcribe(
-                samples,
-                sample_rate,
-                None,
-                None,
-                state,
-                should_stop,
-                &mut |_| {},
-            )?;
-            return Ok(text);
-        }
-        let seconds = samples.len() as f32 / sample_rate.max(1) as f32;
-        let output = self.transcribe_encoded(
-            audio.clone(),
-            None,
-            lfm3_audio_asr_max_tokens(seconds),
-            state,
-            should_stop,
-            &mut |_| {},
-        )?;
-        if output.stop_reason == "cancelled" {
-            return Err(Error::Cancelled(
-                "LFM3-Audio transcription cancelled".into(),
-            ));
-        }
-        Ok(output.text.trim().to_string())
-    }
-
     /// Speak `text` in `voice`: at most `max_frames` frames of 80 ms.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn synthesize(
@@ -887,56 +909,6 @@ impl Lfm3AudioModel {
             state,
             should_stop,
             &mut |_| {},
-            on_audio,
-        )
-    }
-
-    /// Answer a spoken turn, after `history`'s text turns, with interleaved
-    /// text and speech (`Respond with interleaved text and audio.`, the
-    /// reply prefilled with `<|mixed_start|>`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn respond(
-        &self,
-        history: &[ChatMessage],
-        audio: Tensor,
-        system_prompt: Option<&str>,
-        max_slots: usize,
-        text_sampling: Lfm3TextSampling,
-        audio_sampling: Lfm3AudioSampling,
-        seed: u64,
-        state: &mut dyn Lfm3AudioLmState,
-        should_stop: &mut dyn FnMut() -> bool,
-        on_text: &mut dyn FnMut(&str),
-        on_audio: &mut dyn FnMut(&[f32]),
-    ) -> Result<Lfm3AudioOutput> {
-        let system = match system_prompt.map(str::trim).filter(|text| !text.is_empty()) {
-            Some(extra) => format!("{LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT}\n\n{extra}"),
-            None => LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT.to_string(),
-        };
-        let mut prompt = PromptBuilder::new().turn("system", &system);
-        for message in history {
-            let role = match message.role {
-                ChatRole::System => continue,
-                ChatRole::User | ChatRole::Tool => "user",
-                ChatRole::Assistant => "assistant",
-            };
-            prompt = prompt.turn(role, &message.content);
-        }
-        let prompt = prompt.audio_turn("user", "").assistant("<|mixed_start|>");
-        self.generate(
-            Lfm3AudioRequest {
-                prompt,
-                audio: Some(audio),
-                mode: Lfm3AudioMode::Interleaved,
-                text_only: false,
-                max_slots: max_slots.max(1),
-                text_sampling,
-                audio_sampling,
-                seed,
-            },
-            state,
-            should_stop,
-            on_text,
             on_audio,
         )
     }

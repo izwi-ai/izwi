@@ -992,10 +992,11 @@ impl ModelLifecycleController {
         Ok(())
     }
 
-    /// LFM3-Audio: speech and transcription run as retained rows on one
-    /// managed arena (the language model's paged attention and ShortConv
-    /// ring, kept between quanta); long-form transcription and voice chat
-    /// each lease one scalar invocation workspace and run atomically.
+    /// LFM3-Audio: speech, transcription and voice-chat replies run as
+    /// retained rows on one managed arena (the language model's paged
+    /// attention and ShortConv ring, kept between quanta), fitted up to a
+    /// conversation's context; long-form transcription leases one scalar
+    /// invocation workspace and runs atomically.
     pub(super) async fn allocate_lfm3_audio_state(
         &self,
         variant: ModelVariant,
@@ -1005,6 +1006,7 @@ impl ModelLifecycleController {
         bundle_draft: &LoadedModelBundleDraft,
         state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<()> {
+        use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
         if variant.family() != crate::catalog::ModelFamily::Lfm3Audio {
             return Ok(());
         }
@@ -1022,130 +1024,91 @@ impl ModelLifecycleController {
                     "loaded LFM3-Audio model {variant} is missing from the registry"
                 ))
             })?;
-        let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;
-        let stage_graphs = contracts
-            .iter()
-            .map(|contract| contract.stages.as_ref())
-            .collect::<Vec<_>>();
-        let tts_spec = model.lfm3_audio_retained_state_spec(
-            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts,
-            &stage_graphs,
-        )?;
-        let retained = self
-            .core_engine
-            .load_managed_model_state(
-                model_instance_id,
-                &tts_spec.retained,
-                Some(tts_spec.retained_max_tokens),
-                tts_state_minimum_tokens(variant),
-                state_fit_reserve,
-                0,
-            )
-            .await?;
-        self.model_registry.publish_kv_storage(variant, &retained);
-        crate::runtime::rollout::validate_managed_state_plan_eligibility(
-            variant,
-            CapabilityKind::Tts,
-            retained.state_plan_v2(),
-        )?;
-        let retained_uses = contracts
-            .iter()
-            .map(|contract| {
-                Ok((
-                    stage_graph_fingerprint(&contract.stages)?,
-                    RetainedStateUseV2::ExternalPaged,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        let publication = self.load_scratch_only_workspace_publication(
-            &contracts,
-            tts_spec.descriptor,
-            Some(retained.into()),
-            retained_uses,
-        )?;
-        state_publications.insert(CapabilityKind::Tts, publication);
-
-        // Transcription rows share the speech arena (the same contract
-        // returns the bound runtime); its long form leases the main
-        // invocation workspace.
-        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
-        let stage_graphs = contracts
-            .iter()
-            .map(|contract| contract.stages.as_ref())
-            .collect::<Vec<_>>();
-        let asr_spec = model.lfm3_audio_retained_state_spec(
-            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Asr,
-            &stage_graphs,
-        )?;
-        let retained = self
-            .core_engine
-            .load_managed_model_state(
-                model_instance_id,
-                &asr_spec.retained,
-                Some(tts_spec.retained_max_tokens),
-                0,
-                state_fit_reserve,
-                0,
-            )
-            .await?;
-        crate::runtime::rollout::validate_managed_state_plan_eligibility(
-            variant,
-            CapabilityKind::Asr,
-            retained.state_plan_v2(),
-        )?;
-        let retained_uses = contracts
-            .iter()
-            .map(|contract| {
-                let retained_use = match contract.execution_profile.mode {
-                    crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
-                    crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
-                    _ => {
-                        return Err(Error::ModelLoadError(
-                            "LFM3-Audio ASR graph has an incompatible retained-state profile"
-                                .into(),
-                        ))
-                    }
-                };
-                Ok((stage_graph_fingerprint(&contract.stages)?, retained_use))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        let main_invocation = asr_spec.main_invocation.as_ref().ok_or_else(|| {
-            Error::ModelLoadError("LFM3-Audio ASR is missing its long-form workspace".into())
-        })?;
-        let publication = self
-            .load_invocation_workspace_publication_with_remaining_groups(
-                model_instance_id,
-                &contracts,
-                asr_spec.descriptor,
-                main_invocation,
-                Some(retained.into()),
-                retained_uses,
-                LaterStateGroups::sharing(3),
-            )
-            .await?;
-        state_publications.insert(CapabilityKind::Asr, publication);
-
-        let capabilities = [CapabilityKind::AudioChat, CapabilityKind::SpeechToSpeech];
-        for (index, capability) in capabilities.into_iter().enumerate() {
-            use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
+        let capabilities = [
+            (CapabilityKind::Tts, Lfm3AudioWorkload::Tts),
+            (CapabilityKind::Asr, Lfm3AudioWorkload::Asr),
+            (CapabilityKind::AudioChat, Lfm3AudioWorkload::Conversation),
+            (
+                CapabilityKind::SpeechToSpeech,
+                Lfm3AudioWorkload::Conversation,
+            ),
+        ];
+        let mut plans = Vec::with_capacity(capabilities.len());
+        for (capability, workload) in capabilities {
             let contracts = bundle_draft.execution_contracts(capability)?;
             let stage_graphs = contracts
                 .iter()
                 .map(|contract| contract.stages.as_ref())
                 .collect::<Vec<_>>();
-            let workload = Lfm3AudioWorkload::Conversation;
-            let physical_spec = model.lfm3_audio_physical_state_spec(workload, &stage_graphs)?;
-            let publication = self
-                .load_invocation_workspace_publication_with_remaining_groups(
+            let spec = model.lfm3_audio_retained_state_spec(workload, &stage_graphs)?;
+            plans.push((capability, contracts, spec));
+        }
+        // Every capability binds the same arena (one contract returns the
+        // bound runtime), sized for the longest row: a conversation turn.
+        let logical_context = plans
+            .iter()
+            .map(|(_, _, spec)| spec.retained_max_tokens)
+            .max();
+        let mut kv_published = false;
+        for (capability, contracts, spec) in plans {
+            let retained = self
+                .core_engine
+                .load_managed_model_state(
                     model_instance_id,
-                    &contracts,
-                    physical_spec.descriptor,
-                    &physical_spec.invocation,
-                    None,
-                    HashMap::new(),
-                    LaterStateGroups::sharing((capabilities.len() - index) as u64),
+                    &spec.retained,
+                    logical_context,
+                    tts_state_minimum_tokens(variant),
+                    state_fit_reserve,
+                    0,
                 )
                 .await?;
+            if !kv_published {
+                self.model_registry.publish_kv_storage(variant, &retained);
+                kv_published = true;
+            }
+            crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                variant,
+                capability,
+                retained.state_plan_v2(),
+            )?;
+            let retained_uses = contracts
+                .iter()
+                .map(|contract| {
+                    let retained_use = match contract.execution_profile.mode {
+                        crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
+                        crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
+                        _ => {
+                            return Err(Error::ModelLoadError(
+                                "LFM3-Audio graph has an incompatible retained-state profile"
+                                    .into(),
+                            ))
+                        }
+                    };
+                    Ok((stage_graph_fingerprint(&contract.stages)?, retained_use))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            // Long-form transcription is the one graph that leases the
+            // language model's state for an atomic invocation.
+            let publication = match spec.main_invocation.as_ref() {
+                Some(main_invocation) => {
+                    self.load_invocation_workspace_publication_with_remaining_groups(
+                        model_instance_id,
+                        &contracts,
+                        spec.descriptor,
+                        main_invocation,
+                        Some(retained.into()),
+                        retained_uses,
+                        LaterStateGroups::sharing(1),
+                    )
+                    .await?
+                }
+                None => self.load_scratch_only_workspace_publication(
+                    &contracts,
+                    spec.descriptor,
+                    Some(retained.into()),
+                    retained_uses,
+                )?,
+            };
             state_publications.insert(capability, publication);
         }
         Ok(())

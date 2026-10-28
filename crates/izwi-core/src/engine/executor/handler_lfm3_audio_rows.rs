@@ -3,7 +3,8 @@
 //! one batched forward, over each row's retained paged KV and ShortConv ring.
 //! A speech row streams its audio as the codec decodes it (a final-only
 //! request gets it when its row finishes); a transcription row returns its
-//! text so far and streams each quantum's new text.
+//! text so far and streams each quantum's new text; a voice-chat row streams
+//! its reply's text and speech in the order they decode.
 
 use std::sync::Arc;
 
@@ -341,8 +342,8 @@ impl NativeExecutor {
             let mut lease = row.lease.take().expect("armed LFM3-Audio lease");
             let active = lease.require_state_mut()?;
             let finished = active.state.finished();
-            let (audio, text) = match active.input_audio {
-                Some((sample_rate, input_samples)) => {
+            let (audio, text) = match (request.task_type, active.input_audio) {
+                (TaskType::ASR, Some((sample_rate, input_samples))) => {
                     let delta = active.state.take_text();
                     if let Some(tx) = Self::stream_sender(request) {
                         if !delta.is_empty() {
@@ -376,7 +377,15 @@ impl NativeExecutor {
                     };
                     (audio, Some(text))
                 }
-                None => (
+                (TaskType::ASR, None) => {
+                    return Err(Error::InferenceError(
+                        "LFM3-Audio transcription row lost its audio".into(),
+                    ))
+                }
+                (TaskType::SpeechToSpeech, _) => {
+                    self.lfm3_audio_reply_output(request, active, is_prefill)?
+                }
+                _ => (
                     self.lfm3_audio_speech_output(request, active, is_prefill)?,
                     None,
                 ),
@@ -460,6 +469,64 @@ impl NativeExecutor {
                 }
             }
         })
+    }
+}
+
+impl NativeExecutor {
+    /// A voice-chat row's reply for this quantum: its text and speech
+    /// streamed as they decode, or kept until a final-only turn finishes.
+    /// The finished quantum returns the whole reply's text.
+    fn lfm3_audio_reply_output(
+        &self,
+        request: &EngineCoreRequest,
+        active: &mut ActiveLfm3AudioDecode,
+        is_prefill: bool,
+    ) -> Result<(AudioOutput, Option<String>)> {
+        if is_prefill {
+            return Ok((AudioOutput::new(Vec::new(), SAMPLE_RATE), None));
+        }
+        let finished = active.state.finished();
+        let delta = active.state.take_text();
+        let samples = active.state.take_samples();
+        let audio = match Self::stream_sender(request) {
+            Some(tx) => {
+                if !delta.is_empty() {
+                    Self::stream_text_with_policy(
+                        &tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active.stream_sequence,
+                        delta,
+                    )?;
+                }
+                stream_committed_tts_audio(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active.stream_sequence,
+                    &mut active.streamed_samples,
+                    samples,
+                    SAMPLE_RATE,
+                    finished,
+                )?
+            }
+            None => {
+                active.rendered.extend(samples);
+                if finished {
+                    AudioOutput::new(std::mem::take(&mut active.rendered), SAMPLE_RATE)
+                } else {
+                    AudioOutput::new(Vec::new(), SAMPLE_RATE)
+                }
+            }
+        };
+        let text = finished.then(|| {
+            active
+                .state
+                .output()
+                .map(|output| output.text.trim().to_string())
+                .unwrap_or_default()
+        });
+        Ok((audio, text))
     }
 }
 

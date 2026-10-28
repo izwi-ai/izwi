@@ -661,7 +661,7 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
-            (PreparedIncrementalModel::Lfm3Audio(_), TaskType::TTS)
+            (PreparedIncrementalModel::Lfm3Audio(_), TaskType::TTS | TaskType::SpeechToSpeech)
                 if ready.model_variant.family() == ModelFamily::Lfm3Audio
                     && ready.lfm3_audio.is_some() =>
             {

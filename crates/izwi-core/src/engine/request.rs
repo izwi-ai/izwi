@@ -487,6 +487,18 @@ pub(crate) fn clamp_tts_speed(speed: f32) -> f32 {
     speed.clamp(TTS_SPEED_RANGE.0, TTS_SPEED_RANGE.1)
 }
 
+/// What an LFM3-Audio voice-chat reply is prepared from: the text turns
+/// before the spoken one, its instructions, its slot budget and sampling.
+#[derive(Debug, Clone)]
+pub(crate) struct Lfm3AudioReplySettings {
+    pub(crate) history: Vec<crate::models::shared::chat::ChatMessage>,
+    pub(crate) system_prompt: Option<String>,
+    pub(crate) max_slots: usize,
+    pub(crate) text_sampling: crate::models::architectures::lfm3_audio::config::Lfm3TextSampling,
+    pub(crate) audio_sampling: crate::models::architectures::lfm3_audio::config::Lfm3AudioSampling,
+    pub(crate) seed: u64,
+}
+
 /// A Kokoro request prepared for synthesis. The voice pack conditions at
 /// most 510 phonemes, so longer text is split by the chunk planner into
 /// pieces that each fit (one piece for most requests); the pieces are

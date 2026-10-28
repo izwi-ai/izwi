@@ -21,7 +21,6 @@ mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
 mod handler_chatterbox;
-mod handler_lfm3_audio;
 mod handler_lfm3_audio_rows;
 mod handler_maya1;
 mod handler_maya2;
@@ -303,7 +302,9 @@ impl NativeBatchRoute {
             (TaskType::Chat, _, NativeBatchMode::Mixed) => Ok(Self::ChatMixedStep {
                 stage_id: execution.batch.lane.stage_id,
             }),
-            (TaskType::ASR | TaskType::TTS, stage, mode) if mode != NativeBatchMode::Mixed => {
+            (TaskType::ASR | TaskType::TTS | TaskType::SpeechToSpeech, stage, mode)
+                if mode != NativeBatchMode::Mixed =>
+            {
                 Ok(Self::Audio {
                     task,
                     stage,
@@ -2947,7 +2948,11 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                 lfm25_audio,
             )
         }
-        TaskType::SpeechToSpeech => (false, false),
+        TaskType::SpeechToSpeech => request
+            .prepared_lfm3_audio_model_lease_for_executor()
+            .ok()
+            .flatten()
+            .map_or((false, false), |_| (true, true)),
     };
     let Some(binding) = request.execution_adapter_binding() else {
         return NativeBatchSupport::NONE;
@@ -3157,12 +3162,19 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::Lfm3Audio
                 ))
             }
-            super::types::TaskType::SpeechToSpeech => self
-                .config
-                .model_registry
-                .as_ref()
-                .and_then(|registry| registry.try_get_audio_chat(variant))
-                .map(|_| false),
+            // LFM3-Audio voice-chat replies run as retained rows.
+            super::types::TaskType::SpeechToSpeech => request
+                .prepared_lfm3_audio_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map(|_| true)
+                .or_else(|| {
+                    self.config
+                        .model_registry
+                        .as_ref()
+                        .and_then(|registry| registry.try_get_audio_chat(variant))
+                        .map(|_| false)
+                }),
         };
         let native_batch_support = loaded_native_batch_support(request);
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
@@ -3278,7 +3290,11 @@ impl ModelExecutor for NativeExecutor {
                         .flatten()
                         .map(|_| true)
                 }),
-            super::types::TaskType::SpeechToSpeech => None,
+            super::types::TaskType::SpeechToSpeech => request
+                .prepared_lfm3_audio_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map(|_| true),
         };
 
         if implementation_incremental {
@@ -3608,10 +3624,47 @@ impl ModelExecutor for NativeExecutor {
                     }) && request.uses_asr_retained_sequence()
                 }) =>
                 {
-                    self.execute_static_lfm3_audio_prefill_requests_with_rows(
+                    self.execute_lfm3_audio_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
+                        NativeBatchMode::Static,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::SpeechToSpeech,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Lfm3Audio
+                    })
+                }) =>
+                {
+                    self.execute_lfm3_audio_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                        NativeBatchMode::Static,
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::SpeechToSpeech,
+                    stage: NativeAudioStage::SequenceDecode,
+                    mode: NativeBatchMode::Continuous,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Lfm3Audio
+                    })
+                }) =>
+                {
+                    self.execute_lfm3_audio_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                        NativeBatchMode::Continuous,
                     )
                 }
                 NativeBatchRoute::Audio {
@@ -3804,10 +3857,11 @@ impl ModelExecutor for NativeExecutor {
                     })
                 }) =>
                 {
-                    self.execute_static_lfm3_audio_prefill_requests_with_rows(
+                    self.execute_lfm3_audio_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
+                        NativeBatchMode::Static,
                     )
                 }
                 NativeBatchRoute::Audio {

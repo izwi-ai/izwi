@@ -625,25 +625,26 @@ fn row_caches(model: &Lfm3AudioModel, rows: usize, capacity: usize) -> Vec<Physi
     )
 }
 
-/// Each seeded speech row's frames and samples. Row `i` prefills and joins
-/// the batch at decode step `joins[i]`; alone, every row runs by itself.
-fn tts_rows(
+/// Each seeded row's frames, samples and text: one row per request that
+/// `request(i)` builds. Row `i` prefills and joins the batch at decode step
+/// `joins[i]`; alone, every row runs by itself.
+fn run_rows(
     model: &Lfm3AudioModel,
-    rows: &[(&str, Lfm3AudioVoice, u64)],
+    rows: usize,
+    request: impl Fn(usize) -> Lfm3AudioRequest,
     joins: &[usize],
     together: bool,
-) -> Vec<(Vec<[u32; CODEBOOKS]>, Vec<f32>)> {
+) -> Vec<(Vec<[u32; CODEBOOKS]>, Vec<f32>, String)> {
     use super::super::retained::{Lfm3AudioRetainedState, Lfm3AudioStepRow};
     let capacity = 512;
-    let mut caches = row_caches(model, rows.len(), capacity);
-    let mut states = rows
-        .iter()
-        .map(|&(text, voice, seed)| {
-            let request = tts_request(text, voice, 60, Lfm3AudioSampling::default(), seed).unwrap();
-            Lfm3AudioRetainedState::new(model, model.prepare_row(request).unwrap(), capacity)
+    let mut caches = row_caches(model, rows, capacity);
+    let mut states = (0..rows)
+        .map(|row| {
+            Lfm3AudioRetainedState::new(model, model.prepare_row(request(row)).unwrap(), capacity)
                 .unwrap()
         })
         .collect::<Vec<_>>();
+    let rows = vec![(); rows];
     let mut samples = vec![Vec::new(); rows.len()];
     let schedules: Vec<Vec<usize>> = if together {
         vec![(0..rows.len()).collect()]
@@ -689,7 +690,10 @@ fn tts_rows(
     states
         .iter()
         .zip(samples)
-        .map(|(state, samples)| (state.output().unwrap().frames.clone(), samples))
+        .map(|(state, samples)| {
+            let output = state.output().unwrap();
+            (output.frames.clone(), samples, output.text.clone())
+        })
         .collect()
 }
 
@@ -712,8 +716,12 @@ fn tts_rows_are_batch_invariant(profile: DeviceProfile) {
         ("A late row joins mid-sentence.", female, 14),
     ];
     let joins = [0, 0, 5, 11];
-    let alone = tts_rows(&model, &rows, &joins, false);
-    let together = tts_rows(&model, &rows, &joins, true);
+    let request = |row: usize| {
+        let (text, voice, seed) = rows[row];
+        tts_request(text, voice, 60, Lfm3AudioSampling::default(), seed).unwrap()
+    };
+    let alone = run_rows(&model, rows.len(), request, &joins, false);
+    let together = run_rows(&model, rows.len(), request, &joins, true);
     for (index, (alone, together)) in alone.iter().zip(&together).enumerate() {
         eprintln!(
             "{backend}: row {index}: {} frames, {} samples alone",
@@ -724,6 +732,70 @@ fn tts_rows_are_batch_invariant(profile: DeviceProfile) {
         assert_eq!(alone.0, together.0, "{backend}: row {index} frames");
         assert!(alone.1 == together.1, "{backend}: row {index} samples");
     }
+}
+
+/// Voice-chat replies (text and speech interleaved) joining a running batch
+/// at different steps each reply exactly as they reply alone, past the 256
+/// tokens where CPU attention starts slicing a row's context.
+fn reply_rows_are_batch_invariant(profile: DeviceProfile) {
+    let dir = models_dir().join(FOLDER);
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let backend = format!("{:?}", profile.kind);
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    let (fox, rate) = read_wav("fox.wav");
+    let padded = [vec![0.0; rate as usize], fox.clone()].concat();
+    let turns = [(&fox, 31), (&fox, 32), (&padded, 33), (&fox, 34)];
+    let joins = [0, 0, 5, 11];
+    let request = |row: usize| {
+        let (audio, seed) = turns[row];
+        reply_request(
+            &[],
+            model.encode_audio(audio, rate).unwrap(),
+            None,
+            220,
+            Lfm3TextSampling::default(),
+            Lfm3AudioSampling::default(),
+            seed,
+        )
+    };
+    let alone = run_rows(&model, turns.len(), request, &joins, false);
+    let together = run_rows(&model, turns.len(), request, &joins, true);
+    for (index, (alone, together)) in alone.iter().zip(&together).enumerate() {
+        eprintln!(
+            "{backend}: reply {index}: {} frames, {} samples, {:?} alone",
+            alone.0.len(),
+            alone.1.len(),
+            alone.2
+        );
+        assert!(!alone.0.is_empty(), "{backend}: reply {index} spoke");
+        assert_eq!(alone.2, together.2, "{backend}: reply {index} text");
+        assert_eq!(alone.0, together.0, "{backend}: reply {index} frames");
+        assert!(alone.1 == together.1, "{backend}: reply {index} samples");
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_reply_rows_are_batch_invariant_on_cpu() {
+    reply_rows_are_batch_invariant(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_reply_rows_are_batch_invariant_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "lfm3_audio_reply_rows_are_batch_invariant_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        return;
+    }
+    reply_rows_are_batch_invariant(profile);
 }
 
 #[test]
