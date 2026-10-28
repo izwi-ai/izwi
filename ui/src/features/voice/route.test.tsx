@@ -322,7 +322,6 @@ describe("VoicePage compact model", () => {
           type: "input_stream_start",
           mode: "unified",
           s2s_model_id: "LFM3-Audio-2B-GGUF",
-          speaker: "female",
         }),
       ),
     );

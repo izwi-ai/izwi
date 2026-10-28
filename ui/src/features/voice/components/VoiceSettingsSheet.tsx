@@ -22,6 +22,7 @@ import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import {
   VOICE_ENGINES,
   compactVoiceModels,
+  voiceEngineChoosesItsOwnVoice,
   voiceEngineModels,
   voiceEngineSpeakerVariant,
   voiceEngineTotalBytes,
@@ -210,7 +211,9 @@ function MainView({
         </h3>
         {speakers.length === 0 ? (
           <p className="text-sm text-(--text-muted)">
-            This engine has no built-in voices.
+            {voiceEngineChoosesItsOwnVoice(preferences.engine, compactModel)
+              ? "LFM3 Audio picks its own voice in conversation."
+              : "This engine has no built-in voices."}
           </p>
         ) : (
           <div role="radiogroup" aria-labelledby={voiceGroupId} className="flex flex-col gap-0.5">

@@ -123,10 +123,23 @@ export function voiceEngineSpeakerVariant(
   return engine === "compact" ? compactModel : MODULAR_STACK_VARIANTS.tts;
 }
 
+/** Whether the engine's model picks its own voice in conversation: LFM3
+ * Audio's interleaved replies take no voice, so its Female and Male voices
+ * apply to text to speech only. */
+export function voiceEngineChoosesItsOwnVoice(
+  engine: VoiceEngineId,
+  compactModel: string = COMPACT_VOICE_MODEL,
+): boolean {
+  return engine === "compact" && isLfm3AudioVariant(compactModel);
+}
+
 export function voiceEngineSpeakers(
   engine: VoiceEngineId,
   compactModel: string = COMPACT_VOICE_MODEL,
 ): SpeakerProfile[] {
+  if (voiceEngineChoosesItsOwnVoice(engine, compactModel)) {
+    return [];
+  }
   return getSpeakerProfilesForVariant(
     voiceEngineSpeakerVariant(engine, compactModel),
   );
