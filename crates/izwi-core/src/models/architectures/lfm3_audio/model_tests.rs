@@ -734,39 +734,15 @@ fn tts_rows_are_batch_invariant(profile: DeviceProfile) {
     }
 }
 
-/// A language-model state that a live transcription may restart: each new
-/// context starts from fresh pages and ring.
-struct RestartableLmState<'a> {
-    model: &'a Lfm3AudioModel,
-    inner: RetainedLmState,
-    contexts: usize,
-}
-
-impl Lfm3AudioLmState for RestartableLmState<'_> {
-    fn reset(&mut self) -> Result<()> {
-        self.inner = fresh_state(self.model);
-        self.contexts += 1;
-        Ok(())
-    }
-
-    fn capacity_tokens(&self) -> usize {
-        self.inner.capacity_tokens()
-    }
-
-    fn forward(
-        &mut self,
-        lm: &QuantizedLfm2Backbone,
-        embeds: &Tensor,
-        position: usize,
-    ) -> Result<Tensor> {
-        self.inner.forward(lm, embeds, position)
-    }
-}
-
-/// LiveASR fed 100 ms pieces writes the speech it hears as it hears it: a
-/// 29.7 s clip in one context, and the same clip then the fox sentence
-/// (34 s) across two, losing no word where the second one starts.
+/// LiveASR fed 100 ms pieces writes the speech it hears as it hears it, in
+/// segments of at most 29 s as the runtime runs them: each new segment hears
+/// the previous one's last 2.88 s again and the transcript drops the words
+/// that repeat. A 29.7 s clip and the same clip then the fox sentence (34 s)
+/// both lose no word where the second segment starts.
 fn live_asr_transcribes_while_streaming(profile: DeviceProfile) {
+    use super::live_asr::{
+        Lfm3LiveTranscript, LFM3_LIVE_ASR_OVERLAP_SECONDS, LFM3_LIVE_ASR_SEGMENT_SECONDS,
+    };
     let dir = models_dir().join(FOLDER);
     if !dir.exists() {
         eprintln!("skipping: {} is missing", dir.display());
@@ -784,50 +760,75 @@ fn live_asr_transcribes_while_streaming(profile: DeviceProfile) {
     )
     .unwrap();
     let long = [speech.as_slice(), &[0.0; 16_000], &fox].concat();
-    for (name, audio, reference, contexts) in [
-        ("29.7 s", &speech, reference.clone(), 1),
-        ("34 s", &long, format!("{reference} {SENTENCE}"), 2),
+    let segment = (LFM3_LIVE_ASR_SEGMENT_SECONDS * 16_000.0) as usize;
+    let overlap = (LFM3_LIVE_ASR_OVERLAP_SECONDS * 16_000.0) as usize;
+    for (name, audio, reference) in [
+        ("29.7 s", &speech, reference.clone()),
+        ("34 s", &long, format!("{reference} {SENTENCE}")),
     ] {
-        let mut state = RestartableLmState {
-            model: &model,
-            inner: fresh_state(&model),
-            contexts: 0,
-        };
+        let mut transcript = Lfm3LiveTranscript::default();
         let mut live = model.start_live_asr();
+        let mut state = fresh_state(&model);
         let mut text = String::new();
-        let mut slowest = 0f64;
+        let (mut heard, mut segments, mut slowest) = (0, 1, 0f64);
         let started = Instant::now();
         let pieces = audio.chunks(1_600).collect::<Vec<_>>();
         for (index, piece) in pieces.iter().enumerate() {
             let push = Instant::now();
+            if heard + piece.len() > segment {
+                let tail = model
+                    .push_live_asr(&mut live, &[], true, &mut state)
+                    .unwrap();
+                text.push_str(&transcript.push(&tail));
+                live = model.start_live_asr();
+                state = fresh_state(&model);
+                segments += 1;
+                text.push_str(&transcript.start_segment());
+                let offset = index * 1_600;
+                let again = &audio[offset - overlap..offset];
+                let repeat = model
+                    .push_live_asr(&mut live, again, false, &mut state)
+                    .unwrap();
+                text.push_str(&transcript.push(&repeat));
+                heard = again.len();
+            }
             let is_final = index + 1 == pieces.len();
-            text.push_str(
-                &model
-                    .push_live_asr(&mut live, piece, is_final, &mut state)
-                    .unwrap(),
-            );
+            let written = model
+                .push_live_asr(&mut live, piece, is_final, &mut state)
+                .unwrap();
+            text.push_str(&transcript.push(&written));
+            heard += piece.len();
             slowest = slowest.max(push.elapsed().as_secs_f64());
         }
+        text.push_str(&transcript.flush());
         assert!(live.finished());
         let seconds = audio.len() as f64 / 16_000.0;
-        let heard = words(&text);
+        let words_heard = words(&text);
         let recall = words(&reference)
             .iter()
-            .filter(|word| heard.contains(word))
+            .filter(|word| words_heard.contains(word))
             .count() as f64
             / words(&reference).len() as f64;
         eprintln!(
-            "{backend}: LiveASR {name} -> recall {recall:.2}, {} contexts, RTF {:.2}, \
-             slowest push {:.0} ms: {text:?}",
-            state.contexts,
+            "{backend}: LiveASR {name} -> recall {recall:.2}, WER {:.2}, {segments} segments, \
+             RTF {:.2}, slowest push {:.0} ms: {text:?}",
+            wer(&reference, &text),
             started.elapsed().as_secs_f64() / seconds,
             slowest * 1000.0
         );
-        assert_eq!(state.contexts, contexts, "{backend}: {name} contexts");
+        assert_eq!(segments, 2, "{backend}: {name} segments");
         assert!(recall >= 0.9, "{backend}: {name} recall {recall:.2}");
         assert!(
-            heard.contains(&"impossible".to_string()),
-            "{backend}: {name} kept the last word before the new context"
+            words_heard.contains(&"impossible".to_string()),
+            "{backend}: {name} kept the last word before the new segment"
+        );
+        assert_eq!(
+            words_heard
+                .iter()
+                .filter(|word| *word == "amplifying")
+                .count(),
+            1,
+            "{backend}: {name} repeated the overlap"
         );
     }
 }

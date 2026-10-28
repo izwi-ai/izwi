@@ -4,24 +4,30 @@
 //!
 //! The stream's mel features reach the encoder in chunks of 96 frames
 //! (0.96 s, `interleaved_n_audio` encoder tokens). Each chunk's embeddings
-//! feed the language model after what is pending, the prompt of a new
-//! context or the previous block's closing `<|text_end|>`, and the model
-//! writes the chunk's text greedily until `<|text_end|>`: at most 48 tokens,
-//! 96 for the last chunk. Before the last chunk it may not start speech, an
-//! interleaved block or the end of the turn.
+//! feed the language model after what is pending, the prompt of the context
+//! or the previous block's closing `<|text_end|>`, and the model writes the
+//! chunk's text greedily until `<|text_end|>`: at most 48 tokens, 96 for the
+//! last chunk. Before the last chunk it may not start speech, an interleaved
+//! block or the end of the turn.
 //!
-//! A context hears at most 30 s of audio; the next chunk then starts a new
-//! one with the prompt, while the encoder keeps following the stream. The
-//! model writes a word a chunk or so after it hears it, and a fresh context
-//! writes little for its first chunk, so a new context first hears the last
-//! three chunks again: it writes the words the old one had not, and the
-//! words it repeats from the transcript's end are dropped.
+//! One [`Lfm3LiveAsr`] is one segment: one text context of at most 30 s of
+//! audio. A longer stream runs as segments of [`LFM3_LIVE_ASR_SEGMENT_SECONDS`];
+//! each new one first hears the previous one's last
+//! [`LFM3_LIVE_ASR_OVERLAP_SECONDS`] again, since the model writes a word a
+//! chunk or so after it hears it, and [`Lfm3LiveTranscript`] drops the words
+//! that overlap repeats.
 
 use std::collections::VecDeque;
 
 use super::*;
 use crate::models::architectures::lfm3_audio::encoder::Lfm3AudioEncoderStream;
 use crate::models::architectures::lfm3_audio::preprocessor::{Lfm3AudioMelStream, N_MELS};
+
+/// Seconds of audio one segment hears, its re-heard overlap included: under
+/// a context's 30 s with room for the last partial chunk.
+pub(crate) const LFM3_LIVE_ASR_SEGMENT_SECONDS: f32 = 29.0;
+/// Seconds of the previous segment's end a new segment hears again.
+pub(crate) const LFM3_LIVE_ASR_OVERLAP_SECONDS: f32 = 2.88;
 
 /// Mel frames per chunk: `interleaved_n_audio` encoder tokens.
 const CHUNK_FRAMES: usize = INTERLEAVED_AUDIO * ENCODER_STRIDE;
@@ -31,10 +37,8 @@ const CHUNK_TEXT_TOKENS: usize = 48;
 const FINAL_TEXT_TOKENS: usize = 96;
 /// Encoder tokens one text context hears: 30 s.
 const CONTEXT_AUDIO_TOKENS: usize = 375;
-/// Transcript words a new context's repeat is matched against.
+/// Transcript words a new segment's repeat is matched against.
 const RECENT_WORDS: usize = 16;
-/// Chunks a new context hears again before its first new one.
-const REHEARD_CHUNKS: usize = 3;
 /// Ids that may never be written: the input and output speech placeholders.
 const PLACEHOLDERS: [u32; 2] = [AUDIO_PLACEHOLDER, AUDIO_OUT_PLACEHOLDER];
 /// Ids masked until the last chunk: speech, an interleaved block, the end of
@@ -44,39 +48,346 @@ const SUPPRESSED_UNTIL_FINAL: [u32; 5] = [AUDIO_START, MIXED_START, IM_END, MIXE
 /// Ids that end the last chunk besides `<|text_end|>`.
 const FINAL_STOPS: [u32; 3] = [IM_END, END_OF_TEXT, IM_START];
 
-/// One live transcription: the mel and encoder streams, the mel frames short
-/// of a chunk, and where the language model's context stands.
+/// The block being written: its token budget, the tokens written, and
+/// whether it is the segment's last.
+#[derive(Debug, Clone, Copy)]
+struct LiveBlock {
+    budget: usize,
+    written: usize,
+    is_final: bool,
+}
+
+/// One segment of a live transcription: the mel and encoder streams, the
+/// chunks heard but not yet fed, and where the language model's context and
+/// the block being written stand. Tensors are immutable, so a clone is an
+/// exact checkpoint of everything but the language model's state.
+#[derive(Clone)]
 pub(crate) struct Lfm3LiveAsr {
     mel: Lfm3AudioMelStream,
     encoder: Lfm3AudioEncoderStream,
     /// Mel frames not yet a whole chunk, one row per mel band.
     frames: Vec<Vec<f32>>,
-    /// Fed before the next chunk's audio: the prompt of a new context, or
-    /// the previous block's `<|text_end|>`.
+    /// Chunks heard and not yet fed: their embeddings (none for a last
+    /// chunk that completes no token) and whether each is the last.
+    queued: VecDeque<(Option<Tensor>, bool)>,
+    /// Fed before the next chunk's audio: the previous block's
+    /// `<|text_end|>`; the context's prompt before the first chunk.
     pending: Option<Tensor>,
     /// Positions the language-model context holds.
     position: usize,
     /// Encoder tokens the context has heard.
     context_audio_tokens: usize,
-    /// The latest chunks' embeddings, which a new context hears again.
-    recent_audio: VecDeque<Tensor>,
-    /// The transcript's last words, lowercased without punctuation.
-    recent: VecDeque<String>,
-    /// The transcript so far, if any, does not end in whitespace: a new
-    /// context's first words need a space before them.
-    open_word: bool,
-    separate: bool,
+    block: Option<LiveBlock>,
     decoder: IncrementalDecoder,
+    /// Text written and not yet taken.
+    text: String,
     finished: bool,
 }
 
 impl Lfm3LiveAsr {
+    /// Whether the segment has heard its last chunk and written its text.
     pub(crate) fn finished(&self) -> bool {
         self.finished
     }
 
-    /// Append `piece` to the transcript: after a space when it opens a new
-    /// context's text, and into the recent words.
+    /// Text written since the last call.
+    pub(crate) fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+}
+
+impl Lfm3AudioModel {
+    pub(crate) fn start_live_asr(&self) -> Lfm3LiveAsr {
+        Lfm3LiveAsr {
+            mel: Lfm3AudioMelStream::default(),
+            encoder: Lfm3AudioEncoderStream::default(),
+            frames: vec![Vec::new(); N_MELS],
+            queued: VecDeque::new(),
+            pending: None,
+            position: 0,
+            context_audio_tokens: 0,
+            block: None,
+            decoder: IncrementalDecoder::new(true),
+            text: String::new(),
+            finished: false,
+        }
+    }
+
+    /// Hear 16 kHz mono `samples`, the segment's last with `is_final`:
+    /// encode every whole chunk they complete (and, at the end, the rest)
+    /// and queue it.
+    pub(crate) fn hear_live_asr(
+        &self,
+        live: &mut Lfm3LiveAsr,
+        samples: &[f32],
+        is_final: bool,
+    ) -> Result<()> {
+        if live.finished || live.queued.back().is_some_and(|(_, last)| *last) {
+            return Err(Error::InvalidInput(
+                "LFM3-Audio live transcription has heard its last audio".into(),
+            ));
+        }
+        let (features, count) = self.mel.stream(&mut live.mel, samples, is_final)?;
+        for (mel, row) in live.frames.iter_mut().enumerate() {
+            row.extend_from_slice(&features[mel * count..][..count]);
+        }
+        while live.frames[0].len() >= CHUNK_FRAMES {
+            let chunk = take_frames(&mut live.frames, CHUNK_FRAMES);
+            let audio = self
+                .encoder
+                .stream(&mut live.encoder, &chunk, CHUNK_FRAMES, false)?;
+            live.queued.push_back((audio, false));
+        }
+        if is_final {
+            let frames = live.frames[0].len();
+            let chunk = take_frames(&mut live.frames, frames);
+            let audio = self
+                .encoder
+                .stream(&mut live.encoder, &chunk, frames, true)?;
+            if live.encoder.tokens() == 0 {
+                // A segment that heard no speech token writes nothing.
+                live.finished = true;
+            } else {
+                live.queued.push_back((audio, true));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the next queued chunk's block: what to feed (the pending
+    /// embedding and the chunk's audio) at which position, or `None` when no
+    /// chunk is queued.
+    pub(crate) fn open_live_asr_block(
+        &self,
+        live: &mut Lfm3LiveAsr,
+    ) -> Result<Option<(Tensor, usize)>> {
+        if live.block.is_some() {
+            return Err(Error::InvalidInput(
+                "LFM3-Audio live block opened before the last one closed".into(),
+            ));
+        }
+        let Some((audio, is_final)) = live.queued.pop_front() else {
+            return Ok(None);
+        };
+        let audio_tokens = audio.as_ref().map_or(Ok(0), |audio| audio.dim(1))?;
+        if live.context_audio_tokens + audio_tokens > CONTEXT_AUDIO_TOKENS {
+            return Err(Error::InvalidInput(
+                "an LFM3-Audio live segment hears at most 30 s; start a new one".into(),
+            ));
+        }
+        let pending = match live.pending.take() {
+            Some(pending) => pending,
+            None => self.live_asr_prompt()?,
+        };
+        let input = match audio {
+            Some(audio) => Tensor::cat(&[pending, audio], 1)?,
+            None => pending,
+        };
+        let position = live.position;
+        live.position += input.dim(1)?;
+        live.context_audio_tokens += audio_tokens;
+        live.block = Some(LiveBlock {
+            budget: if is_final {
+                FINAL_TEXT_TOKENS
+            } else {
+                CHUNK_TEXT_TOKENS
+            },
+            written: 0,
+            is_final,
+        });
+        Ok(Some((input, position)))
+    }
+
+    /// The open block's next token, after a feed whose last hidden state is
+    /// `last` (`[1, 2048]`): the token's embedding to feed at which
+    /// position, or `None` once the block has closed.
+    pub(crate) fn step_live_asr(
+        &self,
+        live: &mut Lfm3LiveAsr,
+        last: &Tensor,
+    ) -> Result<Option<(Tensor, usize)>> {
+        let block = live.block.ok_or_else(|| {
+            Error::InvalidInput("LFM3-Audio live step without an open block".into())
+        })?;
+        let token = if block.written < block.budget {
+            let mut scores = self
+                .lm
+                .project_hidden(last)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?;
+            for id in PLACEHOLDERS {
+                scores[id as usize] = f32::NEG_INFINITY;
+            }
+            if !block.is_final {
+                for id in SUPPRESSED_UNTIL_FINAL {
+                    scores[id as usize] = f32::NEG_INFINITY;
+                }
+            }
+            Some(greedy(&scores))
+                .filter(|&token| token != TEXT_END)
+                .filter(|token| !(block.is_final && FINAL_STOPS.contains(token)))
+        } else {
+            None
+        };
+        let Some(token) = token else {
+            // The block closes before the next chunk, whether the model
+            // wrote `<|text_end|>` or ran out of tokens.
+            live.block = None;
+            if block.is_final {
+                let tail = self
+                    .tokenizer
+                    .finish_incremental_decode(&mut live.decoder)?;
+                live.text.push_str(&tail);
+                live.finished = true;
+            } else {
+                live.pending = Some(self.embed_live_asr_token(TEXT_END)?);
+            }
+            return Ok(None);
+        };
+        let text = self
+            .tokenizer
+            .decode_incrementally(&mut live.decoder, token)?;
+        live.text.push_str(&text);
+        live.block = Some(LiveBlock {
+            written: block.written + 1,
+            ..block
+        });
+        let position = live.position;
+        live.position += 1;
+        Ok(Some((self.embed_live_asr_token(token)?, position)))
+    }
+
+    /// Hear `samples` (the segment's last with `is_final`) and write their
+    /// text on `state`, which holds this segment's context.
+    pub(crate) fn push_live_asr(
+        &self,
+        live: &mut Lfm3LiveAsr,
+        samples: &[f32],
+        is_final: bool,
+        state: &mut dyn Lfm3AudioLmState,
+    ) -> Result<String> {
+        self.hear_live_asr(live, samples, is_final)?;
+        while let Some((input, position)) = self.open_live_asr_block(live)? {
+            if position == 0 {
+                state.reset()?;
+            }
+            let span = input.dim(1)?;
+            let hidden = state.forward(&self.lm, &input, position)?;
+            let mut last = hidden.narrow(1, span - 1, 1)?.squeeze(1)?;
+            while let Some((embed, position)) = self.step_live_asr(live, &last)? {
+                last = state.forward(&self.lm, &embed, position)?.squeeze(1)?;
+            }
+        }
+        Ok(live.take_text())
+    }
+
+    fn live_asr_prompt(&self) -> Result<Tensor> {
+        let (prompt, _) = self.prompt_embeds(&Lfm3AudioRequest {
+            prompt: live_asr_prompt(),
+            audio: None,
+            mode: Lfm3AudioMode::Text,
+            text_only: true,
+            max_slots: FINAL_TEXT_TOKENS,
+            text_sampling: Lfm3TextSampling::default(),
+            audio_sampling: Lfm3AudioSampling::default(),
+            seed: 0,
+        })?;
+        Ok(prompt)
+    }
+
+    fn embed_live_asr_token(&self, token: u32) -> Result<Tensor> {
+        self.lm
+            .embed_tokens(&Tensor::from_vec(vec![token], (1, 1), &self.device.device)?)
+    }
+}
+
+/// A live transcript across segments. A new segment first hears the
+/// previous one's end again, and catches up on it a chunk or two later: its
+/// text is held until it moves past the words the transcript ends with (or
+/// plainly does not repeat them), and only the words after the repeat are
+/// kept. A new segment's text is spaced from the last one's.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lfm3LiveTranscript {
+    /// The transcript's last words, lowercased without punctuation.
+    recent: VecDeque<String>,
+    /// The transcript so far, if any, does not end in whitespace.
+    open_word: bool,
+    separate: bool,
+    /// The new segment's text while it may still repeat the transcript.
+    held: Option<String>,
+}
+
+/// How a new segment's words line up with the transcript's last ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlap {
+    /// Its first `n` words repeat the transcript up to its end.
+    Through(usize),
+    /// Its words repeat a stretch of the transcript that has not yet
+    /// reached the end.
+    Within,
+    None,
+}
+
+impl Lfm3LiveTranscript {
+    /// A new segment starts, hearing the previous one's end again: what an
+    /// earlier one still held is settled first.
+    pub(crate) fn start_segment(&mut self) -> String {
+        let settled = self.release(true);
+        self.separate = true;
+        self.held = Some(String::new());
+        settled
+    }
+
+    /// A segment's text: what the transcript gains by it.
+    pub(crate) fn push(&mut self, piece: &str) -> String {
+        match self.held.as_mut() {
+            Some(held) => {
+                held.push_str(piece);
+                self.release(false)
+            }
+            None => self.emit(piece),
+        }
+    }
+
+    /// The stream or the segment ends: settle the text still held.
+    pub(crate) fn flush(&mut self) -> String {
+        self.release(true)
+    }
+
+    /// Emit the held text past its repeat once that can be told: the
+    /// complete words after a repeat that reaches the transcript's end, all
+    /// of them when they repeat nothing, none while they may still be
+    /// catching up. `settle` decides with what is held.
+    fn release(&mut self, settle: bool) -> String {
+        let Some(held) = self.held.as_ref() else {
+            return String::new();
+        };
+        let starts = word_starts(held);
+        let complete = if settle || held.ends_with(char::is_whitespace) {
+            starts.len()
+        } else {
+            starts.len().saturating_sub(1)
+        };
+        let keys = held
+            .split_whitespace()
+            .take(complete)
+            .map(normalize)
+            .collect::<Vec<_>>();
+        let from = match overlap(&self.recent, &keys) {
+            Overlap::Through(count) if count < complete => Some(starts[count]),
+            Overlap::Through(_) | Overlap::Within if settle => None,
+            Overlap::None if settle || complete >= 3 => Some(0),
+            _ => return String::new(),
+        };
+        let held = self.held.take().unwrap_or_default();
+        match from {
+            Some(from) => self.emit(&held[from..]),
+            None => String::new(),
+        }
+    }
+
     fn emit(&mut self, piece: &str) -> String {
         if piece.is_empty() {
             return String::new();
@@ -105,226 +416,6 @@ impl Lfm3LiveAsr {
     }
 }
 
-impl Lfm3AudioModel {
-    pub(crate) fn start_live_asr(&self) -> Lfm3LiveAsr {
-        Lfm3LiveAsr {
-            mel: Lfm3AudioMelStream::default(),
-            encoder: Lfm3AudioEncoderStream::default(),
-            frames: vec![Vec::new(); N_MELS],
-            pending: None,
-            position: 0,
-            context_audio_tokens: 0,
-            recent_audio: VecDeque::new(),
-            recent: VecDeque::new(),
-            open_word: false,
-            separate: false,
-            decoder: IncrementalDecoder::new(true),
-            finished: false,
-        }
-    }
-
-    /// Feed 16 kHz mono `samples` and return the text of every chunk they
-    /// complete. `is_final` flushes the stream and closes the transcript.
-    pub(crate) fn push_live_asr(
-        &self,
-        live: &mut Lfm3LiveAsr,
-        samples: &[f32],
-        is_final: bool,
-        state: &mut dyn Lfm3AudioLmState,
-    ) -> Result<String> {
-        if live.finished {
-            return Err(Error::InvalidInput(
-                "LFM3-Audio live transcription is finished".into(),
-            ));
-        }
-        let (features, count) = self.mel.stream(&mut live.mel, samples, is_final)?;
-        for (mel, row) in live.frames.iter_mut().enumerate() {
-            row.extend_from_slice(&features[mel * count..][..count]);
-        }
-        let mut text = String::new();
-        while live.frames[0].len() >= CHUNK_FRAMES {
-            let chunk = take_frames(&mut live.frames, CHUNK_FRAMES);
-            text.push_str(&self.live_asr_chunk(live, &chunk, CHUNK_FRAMES, false, state)?);
-        }
-        if is_final {
-            let frames = live.frames[0].len();
-            let chunk = take_frames(&mut live.frames, frames);
-            text.push_str(&self.live_asr_chunk(live, &chunk, frames, true, state)?);
-            let tail = self
-                .tokenizer
-                .finish_incremental_decode(&mut live.decoder)?;
-            text.push_str(&live.emit(&tail));
-            live.finished = true;
-        }
-        Ok(text)
-    }
-
-    /// One chunk: its audio heard after what is pending, then its text. A
-    /// chunk that would take the context past 30 s, or past its room, opens
-    /// a new one, which first hears the last chunks again.
-    fn live_asr_chunk(
-        &self,
-        live: &mut Lfm3LiveAsr,
-        features: &[f32],
-        frames: usize,
-        is_final: bool,
-        state: &mut dyn Lfm3AudioLmState,
-    ) -> Result<String> {
-        let audio = self
-            .encoder
-            .stream(&mut live.encoder, features, frames, is_final)?;
-        let audio_tokens = audio.as_ref().map_or(Ok(0), |audio| audio.dim(1))?;
-        let budget = if is_final {
-            FINAL_TEXT_TOKENS
-        } else {
-            CHUNK_TEXT_TOKENS
-        };
-        let room = state.capacity_tokens().min(self.lm_config.context_length);
-        let mut text = String::new();
-        if live.pending.is_none()
-            || live.context_audio_tokens + audio_tokens > CONTEXT_AUDIO_TOKENS
-            || live.position + 1 + audio_tokens + budget >= room
-        {
-            let reheard = if live.pending.is_some() {
-                std::mem::take(&mut live.recent_audio)
-            } else {
-                VecDeque::new()
-            };
-            let tail = self
-                .tokenizer
-                .finish_incremental_decode(&mut live.decoder)?;
-            text.push_str(&live.emit(&tail));
-            live.decoder = IncrementalDecoder::new(true);
-            self.open_live_asr_context(live, state)?;
-            live.separate = true;
-            if !reheard.is_empty() {
-                let mut decoder = IncrementalDecoder::new(true);
-                let mut heard = String::new();
-                for chunk in &reheard {
-                    heard.push_str(&self.live_asr_block(
-                        live,
-                        Some(chunk.clone()),
-                        CHUNK_TEXT_TOKENS,
-                        false,
-                        &mut decoder,
-                        state,
-                    )?);
-                }
-                heard.push_str(&self.tokenizer.finish_incremental_decode(&mut decoder)?);
-                text.push_str(&live.emit(&after_overlap(&live.recent, &heard)));
-            }
-            live.recent_audio = reheard;
-        }
-        let mut decoder = std::mem::replace(&mut live.decoder, IncrementalDecoder::new(true));
-        let written =
-            self.live_asr_block(live, audio.clone(), budget, is_final, &mut decoder, state);
-        live.decoder = decoder;
-        text.push_str(&live.emit(&written?));
-        if let Some(audio) = audio {
-            live.recent_audio.push_back(audio);
-            while live.recent_audio.len() > REHEARD_CHUNKS {
-                live.recent_audio.pop_front();
-            }
-        }
-        Ok(text)
-    }
-
-    /// Start a new text context: empty state and the prompt pending.
-    fn open_live_asr_context(
-        &self,
-        live: &mut Lfm3LiveAsr,
-        state: &mut dyn Lfm3AudioLmState,
-    ) -> Result<()> {
-        state.reset()?;
-        let (prompt, _) = self.prompt_embeds(&Lfm3AudioRequest {
-            prompt: live_asr_prompt(),
-            audio: None,
-            mode: Lfm3AudioMode::Text,
-            text_only: true,
-            max_slots: FINAL_TEXT_TOKENS,
-            text_sampling: Lfm3TextSampling::default(),
-            audio_sampling: Lfm3AudioSampling::default(),
-            seed: 0,
-        })?;
-        live.pending = Some(prompt);
-        live.position = 0;
-        live.context_audio_tokens = 0;
-        Ok(())
-    }
-
-    /// Feed what is pending and `audio`, then write text greedily until
-    /// `<|text_end|>` (or a final stop), at most `budget` tokens.
-    fn live_asr_block(
-        &self,
-        live: &mut Lfm3LiveAsr,
-        audio: Option<Tensor>,
-        budget: usize,
-        is_final: bool,
-        decoder: &mut IncrementalDecoder,
-        state: &mut dyn Lfm3AudioLmState,
-    ) -> Result<String> {
-        let audio_tokens = audio.as_ref().map_or(Ok(0), |audio| audio.dim(1))?;
-        let pending = live.pending.take().ok_or_else(|| {
-            Error::InferenceError("LFM3-Audio live transcription lost its context".into())
-        })?;
-        let input = match audio {
-            Some(audio) => Tensor::cat(&[pending, audio], 1)?,
-            None => pending,
-        };
-        let span = input.dim(1)?;
-        let room = state.capacity_tokens().min(self.lm_config.context_length);
-        if live.position + span + budget >= room {
-            return Err(Error::InvalidInput(
-                "LFM3-Audio live transcription chunk does not fit its context".into(),
-            ));
-        }
-        let hidden = state.forward(&self.lm, &input, live.position)?;
-        live.position += span;
-        live.context_audio_tokens += audio_tokens;
-        let mut last = hidden.narrow(1, span - 1, 1)?.squeeze(1)?;
-        let mut text = String::new();
-        for _ in 0..budget {
-            let mut scores = self
-                .lm
-                .project_hidden(&last)?
-                .squeeze(0)?
-                .to_dtype(DType::F32)?
-                .to_device(&Device::Cpu)?
-                .to_vec1::<f32>()?;
-            for id in PLACEHOLDERS {
-                scores[id as usize] = f32::NEG_INFINITY;
-            }
-            if !is_final {
-                for id in SUPPRESSED_UNTIL_FINAL {
-                    scores[id as usize] = f32::NEG_INFINITY;
-                }
-            }
-            let token = greedy(&scores);
-            if token == TEXT_END || (is_final && FINAL_STOPS.contains(&token)) {
-                break;
-            }
-            text.push_str(&self.tokenizer.decode_incrementally(decoder, token)?);
-            let embed = self.lm.embed_tokens(&Tensor::from_vec(
-                vec![token],
-                (1, 1),
-                &self.device.device,
-            )?)?;
-            last = state.forward(&self.lm, &embed, live.position)?.squeeze(1)?;
-            live.position += 1;
-        }
-        // The block closes before the next chunk, whether the model wrote
-        // `<|text_end|>` or ran out of tokens.
-        if !is_final {
-            live.pending = Some(self.lm.embed_tokens(&Tensor::from_vec(
-                vec![TEXT_END],
-                (1, 1),
-                &self.device.device,
-            )?)?);
-        }
-        Ok(text)
-    }
-}
-
 /// A word lowercased without its punctuation.
 fn normalize(word: &str) -> String {
     word.chars()
@@ -333,30 +424,47 @@ fn normalize(word: &str) -> String {
         .collect()
 }
 
-/// `heard` after the longest run of its words that repeats the end of
-/// `recent`: from its first word, or (two words at least) from its second or
-/// third, the first ones being a word the chunk edge cut.
-fn after_overlap(recent: &VecDeque<String>, heard: &str) -> String {
-    let words = heard.split_whitespace().collect::<Vec<_>>();
-    let keys = words.iter().map(|word| normalize(word)).collect::<Vec<_>>();
-    let repeats = |skip: usize, count: usize| {
-        skip + count <= keys.len()
-            && count <= recent.len()
-            && recent
-                .iter()
-                .skip(recent.len() - count)
-                .eq(keys[skip..skip + count].iter())
-    };
-    let repeated = (1..=keys.len().min(recent.len()))
-        .rev()
-        .find_map(|count| {
-            (0..=2)
-                .filter(|&skip| skip == 0 || count >= 2)
-                .find(|&skip| repeats(skip, count))
-                .map(|skip| skip + count)
-        })
-        .unwrap_or(0);
-    words[repeated..].join(" ")
+/// The byte offset of each whitespace-separated word of `text`.
+fn word_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut previous_space = true;
+    for (offset, ch) in text.char_indices() {
+        let space = ch.is_whitespace();
+        if previous_space && !space {
+            starts.push(offset);
+        }
+        previous_space = space;
+    }
+    starts
+}
+
+/// How `keys`, a new segment's words, line up with `recent`: a repeat from
+/// the first word, or (two words at least) from the second or third, the
+/// first ones being a word the chunk edge cut.
+fn overlap(recent: &VecDeque<String>, keys: &[String]) -> Overlap {
+    let recent = recent.iter().map(String::as_str).collect::<Vec<_>>();
+    for count in (1..=keys.len().min(recent.len())).rev() {
+        for skip in (0..=2).filter(|&skip| skip == 0 || count >= 2) {
+            if skip + count <= keys.len()
+                && recent[recent.len() - count..]
+                    .iter()
+                    .copied()
+                    .eq(keys[skip..skip + count].iter().map(String::as_str))
+            {
+                return Overlap::Through(skip + count);
+            }
+        }
+    }
+    for skip in (0..=2).filter(|&skip| skip < keys.len()) {
+        let tail = &keys[skip..];
+        if recent
+            .windows(tail.len())
+            .any(|window| window.iter().copied().eq(tail.iter().map(String::as_str)))
+        {
+            return Overlap::Within;
+        }
+    }
+    Overlap::None
 }
 
 /// The first `count` frames of every mel row, `[N_MELS, count]` mel-major.
@@ -383,56 +491,65 @@ fn greedy(scores: &[f32]) -> u32 {
 mod tests {
     use super::*;
 
-    fn recent(text: &str) -> VecDeque<String> {
-        text.split_whitespace().map(normalize).collect()
-    }
-
-    #[test]
-    fn a_new_contexts_repeat_of_the_transcript_end_is_dropped() {
-        let tail = recent("it's about amplifying it to solve the");
-        assert_eq!(
-            after_overlap(&tail, "it to solve the impossible."),
-            "impossible."
-        );
-        assert_eq!(after_overlap(&tail, "The impossible."), "impossible.");
-        assert_eq!(after_overlap(&tail, "impossible."), "impossible.");
-        assert_eq!(after_overlap(&tail, "solve the"), "");
-        assert_eq!(
-            after_overlap(&tail, "fying it to solve the impossible."),
-            "impossible."
-        );
-        assert_eq!(
-            after_overlap(&VecDeque::new(), "Hello there."),
-            "Hello there."
-        );
-    }
-
-    #[test]
-    fn pieces_join_into_words_and_a_new_context_is_spaced() {
-        let mut live = Lfm3LiveAsr {
-            mel: Lfm3AudioMelStream::default(),
-            encoder: Lfm3AudioEncoderStream::default(),
-            frames: Vec::new(),
-            pending: None,
-            position: 0,
-            context_audio_tokens: 0,
-            recent_audio: VecDeque::new(),
-            recent: VecDeque::new(),
-            open_word: false,
-            separate: false,
-            decoder: IncrementalDecoder::new(true),
-            finished: false,
-        };
-        let mut transcript = String::new();
-        for piece in ["We're no", " longer amplif", "ying it"] {
-            transcript.push_str(&live.emit(piece));
+    fn stitch(old: &[&str], new: &[&str]) -> String {
+        let mut transcript = Lfm3LiveTranscript::default();
+        let mut text = String::new();
+        for piece in old {
+            text.push_str(&transcript.push(piece));
         }
-        live.separate = true;
-        transcript.push_str(&live.emit("The fox."));
-        assert_eq!(transcript, "We're no longer amplifying it The fox.");
+        text.push_str(&transcript.start_segment());
+        for piece in new {
+            text.push_str(&transcript.push(piece));
+        }
+        text.push_str(&transcript.flush());
+        text
+    }
+
+    #[test]
+    fn a_new_segments_repeat_of_the_transcript_end_is_dropped() {
+        let old = ["it's about amplif", "ying it to solve the impossible."];
+        let expected = "it's about amplifying it to solve the impossible. The fox.";
+        // Caught up within the overlap, after it, or cut mid-word.
+        for new in [
+            &["it to solve the impossible.", " The fox."][..],
+            &[
+                "",
+                " It's about",
+                " amplifying it to",
+                " solve the impossible.",
+                " The fox.",
+            ],
+            &["fying it to solve the", " impossible. The fox."],
+            &["The impossible. The fox."],
+        ] {
+            assert_eq!(stitch(&old, new), expected, "{new:?}");
+        }
+        // Nothing new by the end, and nothing repeated.
         assert_eq!(
-            live.recent.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["we're", "no", "longer", "amplifying", "it", "the", "fox"]
+            stitch(&old, &[" to solve the"]),
+            "it's about amplifying it to solve the impossible."
+        );
+        assert_eq!(
+            stitch(&old, &["Hello there, friend."]),
+            "it's about amplifying it to solve the impossible. Hello there, friend."
+        );
+    }
+
+    #[test]
+    fn pieces_join_into_words_and_a_new_segment_is_spaced() {
+        let mut transcript = Lfm3LiveTranscript::default();
+        let mut text = String::new();
+        for piece in ["We're no", " longer amplif", "ying it to solve the"] {
+            text.push_str(&transcript.push(piece));
+        }
+        text.push_str(&transcript.start_segment());
+        text.push_str(&transcript.push("to solve the imposs"));
+        text.push_str(&transcript.push("ible."));
+        text.push_str(&transcript.push(" The fox."));
+        text.push_str(&transcript.flush());
+        assert_eq!(
+            text,
+            "We're no longer amplifying it to solve the impossible. The fox."
         );
     }
 }
