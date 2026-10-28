@@ -160,15 +160,15 @@ export function NewTextToSpeechModal({
       : named;
   }, [capabilities]);
   const offersLanguage = speechLanguages.length > 1;
+  const defaultLanguage =
+    capabilities?.default_language ?? DEFAULT_SPEECH_LANGUAGE;
   const resolvedLanguage =
     language !== null &&
     speechLanguages.some((option) => option.code === language)
       ? language
       : !languageAutoDetect &&
-          speechLanguages.some(
-            (option) => option.code === DEFAULT_SPEECH_LANGUAGE,
-          )
-        ? DEFAULT_SPEECH_LANGUAGE
+          speechLanguages.some((option) => option.code === defaultLanguage)
+        ? defaultLanguage
         : (speechLanguages[0]?.code ?? DEFAULT_SPEECH_LANGUAGE);
   const effectiveVoiceWorkflow: EffectiveVoiceWorkflow =
     supportsReferenceVoices && !supportsBuiltInVoices

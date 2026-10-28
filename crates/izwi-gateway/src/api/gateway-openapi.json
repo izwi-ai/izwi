@@ -553,6 +553,13 @@
             "description": "Whether a reference voice may name the language it is spoken in\n(`reference_language`), as the model clones a voice into another\nlanguage (Maya 2 Native).",
             "type": "boolean"
           },
+          "default_language": {
+            "description": "The `languages` entry a request without `language` speaks (LFM3\nAudio: `en-US`); absent, pickers default to English.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "inline_tags": {
             "description": "Inline tags the text to speak may carry, as written, each a vocal\nevent or delivery the model performs where it stands (Maya1:\n`<laugh>`, `<sigh>`, …; Maya 2 Native: `[laughs]`, `[sighs]`, …).",
             "items": {

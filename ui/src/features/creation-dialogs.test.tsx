@@ -213,7 +213,7 @@ describe("viewport-safe creation dialogs", () => {
     expect(picker).toHaveTextContent("Hindi");
   });
 
-  it("gives LFM3 Audio its two voices and the server's locales", async () => {
+  it("gives LFM3 Audio its two voices, the server's locales and its default", async () => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
     const lfm3Audio = {
       variant: "LFM3-Audio-2B-GGUF",
@@ -226,7 +226,9 @@ describe("viewport-safe creation dialogs", () => {
         supports_streaming: true,
         supports_speed_control: false,
         supports_auto_long_form: true,
-        // The server's order, default first.
+        // The server names the default; it is not the first by name here,
+        // so the picker must follow `default_language`, not the sort.
+        default_language: "en-GB",
         languages: [
           { code: "en-US", name: "American English" },
           { code: "en-GB", name: "British English" },
@@ -257,7 +259,7 @@ describe("viewport-safe creation dialogs", () => {
     expect(screen.queryByRole("combobox", { name: "Saved voice" })).toBeNull();
     expect(screen.queryByRole("slider", { name: "Speed" })).toBeNull();
     const picker = screen.getByRole("combobox", { name: "Language" });
-    expect(picker).toHaveTextContent("American English");
+    expect(picker).toHaveTextContent("British English");
 
     const script = screen.getByRole("textbox", { name: "Script" });
     fireEvent.change(script, { target: { value: "Hello there." } });
@@ -266,7 +268,7 @@ describe("viewport-safe creation dialogs", () => {
     expect(onCreateStream.mock.calls[0][0]).toMatchObject({
       model_id: "LFM3-Audio-2B-GGUF",
       speaker: "female",
-      language: "en-US",
+      language: "en-GB",
     });
   });
 

@@ -71,6 +71,8 @@ impl Lfm3AudioVoice {
         female: true,
         locale: "American English",
     };
+    /// The [`LFM3_AUDIO_TTS_LOCALES`] tag of [`Self::DEFAULT`]'s locale.
+    pub const DEFAULT_LOCALE_TAG: &'static str = "en-US";
 
     /// Resolve a voice name and an optional language. The voice is `Female`
     /// or `Male` (any case), or an LFM2.5-style `US Female` / `UK Male` that
@@ -263,6 +265,14 @@ mod tests {
                 PromptPart::Audio => "[AUDIO]",
             })
             .collect()
+    }
+
+    #[test]
+    fn the_default_locale_tag_names_the_default_locale() {
+        assert_eq!(
+            tts_locale(Lfm3AudioVoice::DEFAULT_LOCALE_TAG).unwrap(),
+            Lfm3AudioVoice::DEFAULT.locale
+        );
     }
 
     #[test]
