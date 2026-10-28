@@ -688,3 +688,252 @@ async fn lfm3_audio_live_asr_streams_on_engine_sessions_if_env_set() {
     assert_eq!(long_together, long_text);
     assert_eq!(fox_together, fox_text);
 }
+
+fn audio_data_url(bytes: &[u8], mime: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+fn audio_chat(clips: &[String]) -> crate::models::shared::chat::ChatRequestConfig {
+    use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatRequestConfig};
+    ChatRequestConfig {
+        media_inputs: clips
+            .iter()
+            .map(|source| ChatMediaInput {
+                kind: ChatMediaKind::Audio,
+                source: source.clone(),
+            })
+            .collect(),
+        ..ChatRequestConfig::default()
+    }
+}
+
+fn user(content: String) -> Vec<crate::models::shared::chat::ChatMessage> {
+    vec![crate::models::shared::chat::ChatMessage {
+        role: crate::models::shared::chat::ChatRole::User,
+        content,
+    }]
+}
+
+/// LFM3-Audio's greedy answer to a chat question about its clips.
+async fn ask_about_audio(
+    runtime: &RuntimeService,
+    question: String,
+    config: crate::models::shared::chat::ChatRequestConfig,
+    max_tokens: usize,
+) -> crate::runtime::types::ChatGeneration {
+    let backend = runtime.backend_context().backend_kind;
+    let started = Instant::now();
+    let reply = runtime
+        .chat_generate_with_runtime_context(
+            ModelVariant::Lfm3Audio2BGguf,
+            user(question.clone()),
+            GenerationParams {
+                max_tokens,
+                ..greedy_chat()
+            },
+            config,
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .expect("chat about audio");
+    eprintln!(
+        "{backend:?}: {question:?} -> {:?} ({:?}, {} prompt + {} tokens) in {:.2}s",
+        reply.text,
+        reply.finish_reason,
+        reply.prompt_tokens,
+        reply.tokens_generated,
+        started.elapsed().as_secs_f64()
+    );
+    reply
+}
+
+fn greedy_chat() -> GenerationParams {
+    GenerationParams {
+        temperature: 0.0,
+        max_tokens: 96,
+        ..GenerationParams::default()
+    }
+}
+
+/// Chat completions through LFM3-Audio: questions about WAV and MP3 clips,
+/// two clips in one turn, streamed and cut-off replies, answered in text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lfm3_audio_answers_chat_about_audio_if_env_set() {
+    use crate::models::shared::chat::ChatTruncation;
+    use izwi_model_catalog::CHAT_AUDIO_PLACEHOLDER as AUDIO;
+    let Some(models_dir) = std::env::var_os("IZWI_LFM3_AUDIO_MODELS_DIR") else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "IZWI_LFM3_AUDIO_MODELS_DIR unset; not run"
+        );
+        return;
+    };
+    let backend = std::env::var("IZWI_LFM3_AUDIO_BACKEND")
+        .ok()
+        .and_then(|name| crate::backends::BackendPreference::parse(&name))
+        .unwrap_or(crate::backends::BackendPreference::Cpu);
+    #[cfg(feature = "metal")]
+    let _metal_lease = (backend == crate::backends::BackendPreference::Metal).then(|| {
+        crate::backends::metal_test_device_or_skip("lfm3_audio_answers_chat_about_audio_if_env_set")
+    });
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.into(),
+        backend,
+        ..Default::default()
+    })
+    .expect("runtime");
+    let backend = runtime.backend_context().backend_kind;
+    let variant = ModelVariant::Lfm3Audio2BGguf;
+    runtime.load_model(variant).await.expect("load LFM3-Audio");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let fox = std::fs::read(data.join("fox.wav")).expect("fixture");
+    let speech = std::fs::read(data.join("test.wav")).expect("fixture");
+    let greedy = greedy_chat;
+    let ask = |question: &str, clips: &[String]| {
+        ask_about_audio(&runtime, question.to_string(), audio_chat(clips), 96)
+    };
+
+    // A WAV question, answered in text from what the clip says.
+    let fox_url = audio_data_url(&fox, "audio/wav");
+    let question = format!("{AUDIO}Which animal does the speaker mention? Answer in one word.");
+    let reply = ask(&question, std::slice::from_ref(&fox_url)).await;
+    assert!(
+        reply.text.to_lowercase().contains("fox"),
+        "{:?}",
+        reply.text
+    );
+    assert_eq!(reply.finish_reason, Some(izwi_model_catalog::chat::FinishReason::StopToken));
+    assert!(reply.tokens_generated > 0 && reply.tokens_generated < 96);
+    assert!(reply.prompt_tokens > 20);
+
+    // An MP3 clip (the first 20 s of a longer recording) is heard as its
+    // transcription is.
+    let mp3 = std::fs::read(data.join("ceo.mp3")).expect("fixture");
+    let mp3 = &mp3[..mp3.len().min(200_000)];
+    let heard = runtime
+        .asr_transcribe_bytes(mp3, Some(&variant.to_string()), Some("en"))
+        .await
+        .expect("transcribe the MP3")
+        .text;
+    // The model may think first (its template has no switch for it); the
+    // answer follows `</think>`.
+    let reply = ask_about_audio(
+        &runtime,
+        format!("{AUDIO}Repeat exactly what the speaker says."),
+        audio_chat(&[audio_data_url(mp3, "audio/mpeg")]),
+        512,
+    )
+    .await;
+    assert_eq!(
+        reply.finish_reason,
+        Some(izwi_model_catalog::chat::FinishReason::StopToken)
+    );
+    let answer = reply.text.rsplit("</think>").next().unwrap_or_default();
+    let repeated = recall(&heard, answer);
+    eprintln!("{backend:?}: MP3 heard {heard:?}; repeated recall {repeated:.2}");
+    assert!(repeated >= 0.6, "MP3 recall {repeated:.2}");
+
+    // Two clips in one turn, each heard in its place.
+    let speech_url = audio_data_url(&speech, "audio/wav");
+    let which_mentions_a_fox = format!(
+        "First recording: {AUDIO}\nSecond recording: {AUDIO}\n\
+         Which recording mentions a fox, the first or the second? Answer in one word."
+    );
+    let reply = ask(
+        &which_mentions_a_fox,
+        &[speech_url.clone(), fox_url.clone()],
+    )
+    .await;
+    assert!(
+        reply.text.to_lowercase().contains("second"),
+        "{:?}",
+        reply.text
+    );
+    let reply = ask(
+        &which_mentions_a_fox,
+        &[fox_url.clone(), speech_url.clone()],
+    )
+    .await;
+    assert!(
+        reply.text.to_lowercase().contains("first"),
+        "{:?}",
+        reply.text
+    );
+
+    // Streamed, the deltas make up the reply (the runtime checks they match
+    // its final text exactly).
+    let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = streamed.clone();
+    let reply = runtime
+        .chat_generate_streaming_tokens_with_runtime_context(
+            variant,
+            user(format!("{AUDIO}What does the speaker say?")),
+            greedy(),
+            audio_chat(std::slice::from_ref(&fox_url)),
+            None,
+            RuntimeRequestContext::default(),
+            move |delta, _| sink.lock().unwrap().push_str(&delta),
+        )
+        .await
+        .expect("stream a reply about audio");
+    eprintln!("{backend:?}: streamed -> {:?}", reply.text);
+    assert_eq!(*streamed.lock().unwrap(), reply.text);
+    assert!(recall(SENTENCE, &reply.text) >= 0.8, "{:?}", reply.text);
+
+    // A reply cut off at its budget says so; a budget the context cannot
+    // hold is an error unless the request opted into truncation.
+    let reply = runtime
+        .chat_generate_with_runtime_context(
+            variant,
+            user(format!("{AUDIO}Describe this recording in detail.")),
+            GenerationParams {
+                max_tokens: 3,
+                ..greedy()
+            },
+            audio_chat(std::slice::from_ref(&fox_url)),
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .expect("a cut-off reply");
+    assert_eq!(reply.finish_reason, Some(izwi_model_catalog::chat::FinishReason::MaxTokens));
+    assert_eq!(reply.tokens_generated, 3);
+    let mut strict = audio_chat(std::slice::from_ref(&fox_url));
+    strict.truncation = ChatTruncation::Disabled;
+    let error = runtime
+        .chat_generate_with_runtime_context(
+            variant,
+            user(format!("{AUDIO}Describe this recording.")),
+            GenerationParams {
+                max_tokens: 10_000_000,
+                ..greedy()
+            },
+            strict,
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::ContextLengthExceeded(_)),
+        "{error}"
+    );
+
+    // A clip the messages do not place is refused before it runs.
+    assert!(runtime
+        .chat_generate_with_runtime_context(
+            variant,
+            user("What does the speaker say?".to_string()),
+            greedy(),
+            audio_chat(std::slice::from_ref(&fox_url)),
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .is_err());
+}

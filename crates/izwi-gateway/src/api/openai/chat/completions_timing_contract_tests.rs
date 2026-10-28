@@ -194,6 +194,8 @@ fn logprob_requests_validate_openai_bounds() {
         reasoning_format: None,
         truncation: None,
         skip_special_tokens: None,
+        modalities: None,
+        audio: None,
     };
     assert!(validate_chat_request_compatibility(&req(Some(true), Some(20)), profile()).is_ok());
     assert!(validate_chat_request_compatibility(&req(Some(true), None), profile()).is_ok());
@@ -240,6 +242,8 @@ fn response_format_types_are_validated() {
         reasoning_format: None,
         truncation: None,
         skip_special_tokens: None,
+        modalities: None,
+        audio: None,
     };
     assert!(validate_chat_request_compatibility(&req("json_object"), profile()).is_ok());
     assert!(

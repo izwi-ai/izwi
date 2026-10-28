@@ -2173,6 +2173,18 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
                 "{model}"
             );
         }
+        // LFM3-Audio answers chat completions on a local server only: a
+        // chat worker refuses it at boot.
+        for model in ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"] {
+            assert!(WorkerProcessConfig::from_env(&env_config::snapshot([
+                (WORKER_TASK_ENV, "chat"),
+                ("IZWI_WORKER_MODEL", model),
+                ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+                ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+                ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+            ]))
+            .is_err());
+        }
     }
 
     #[test]

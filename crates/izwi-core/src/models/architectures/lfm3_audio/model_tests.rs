@@ -18,7 +18,9 @@ use crate::models::architectures::lfm2::physical::Lfm2StateLayout;
 use crate::models::shared::attention::physical::test_physical_caches_for_model_layers_on;
 use std::time::Instant;
 
-use super::super::prompts::{asr_prompt, tts_prompt, Lfm3AudioVoice};
+use super::super::prompts::{
+    asr_prompt, tts_prompt, voice_reply_messages, Lfm3AudioReplyOutput, Lfm3AudioVoice,
+};
 
 const FOLDER: &str = "LFM3-Audio-2B-GGUF";
 const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
@@ -152,7 +154,7 @@ fn transcribe(model: &Lfm3AudioModel, samples: &[f32], sample_rate: u32) -> (Str
         model,
         Lfm3AudioRequest {
             prompt: asr_prompt(Some("en")).unwrap(),
-            audio: Some(audio),
+            clips: vec![audio],
             mode: Lfm3AudioMode::Text,
             text_only: true,
             max_slots: 256,
@@ -172,7 +174,7 @@ fn speak(model: &Lfm3AudioModel, voice: &str, seed: u64) -> (Lfm3AudioOutput, f6
         model,
         Lfm3AudioRequest {
             prompt: tts_prompt(SENTENCE, voice),
-            audio: None,
+            clips: Vec::new(),
             mode: Lfm3AudioMode::Audio,
             text_only: false,
             max_slots: 400,
@@ -305,7 +307,7 @@ fn time_components(profile: DeviceProfile) {
     let voice = Lfm3AudioVoice::resolve(Some("female"), Some("en-US")).unwrap();
     let request = Lfm3AudioRequest {
         prompt: tts_prompt(SENTENCE, voice),
-        audio: None,
+        clips: Vec::new(),
         mode: Lfm3AudioMode::Audio,
         text_only: false,
         max_slots: 1,
@@ -872,14 +874,17 @@ fn reply_rows_are_batch_invariant(profile: DeviceProfile) {
     let request = |row: usize| {
         let (audio, seed) = turns[row];
         reply_request(
+            &voice_reply_messages(&[], None),
+            vec![model.encode_audio(audio, rate).unwrap()],
             &[],
-            model.encode_audio(audio, rate).unwrap(),
-            None,
+            Lfm3AudioReplyOutput::Interleaved,
+            false,
             220,
             Lfm3TextSampling::default(),
             Lfm3AudioSampling::default(),
             seed,
         )
+        .unwrap()
     };
     let alone = run_rows(&model, turns.len(), request, &joins, false);
     let together = run_rows(&model, turns.len(), request, &joins, true);

@@ -32,7 +32,8 @@ use crate::ids::new_prefixed_id;
 use crate::state::{AppState, StoredFunctionCall, StoredResponseInputItem, StoredResponseRecord};
 use izwi_core::chat_reasoning::{reasoning_opened_in_prompt, PromptOpener};
 use izwi_core::{
-    parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
+    parse_chat_request_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole,
+    ModelVariant,
 };
 
 use super::dto::{
@@ -57,6 +58,40 @@ fn response_stream_failure_payload(response_id: &str, message: impl Into<String>
 fn response_stream_interruption_payload(response_id: &str, saw_terminal: bool) -> Option<String> {
     (!saw_terminal)
         .then(|| response_stream_failure_payload(response_id, RESPONSE_STREAM_INTERRUPTED_ERROR))
+}
+
+/// LFM3-Audio answers through its own reply rows, which take the sampling
+/// controls, tools and `preserve_thinking` but not these; each is refused,
+/// never dropped.
+fn validate_lfm3_audio_response_controls(req: &ResponsesCreateRequest) -> Result<(), ApiError> {
+    let kwargs = req.chat_template_kwargs.as_ref();
+    let unsupported: [(&'static str, bool); 4] = [
+        (
+            "presence_penalty",
+            req.presence_penalty.is_some_and(|penalty| penalty != 0.0),
+        ),
+        (
+            "skip_special_tokens",
+            req.skip_special_tokens == Some(false),
+        ),
+        (
+            "enable_thinking",
+            req.enable_thinking.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.enable_thinking.is_some()),
+        ),
+        (
+            "reasoning_effort",
+            req.reasoning_effort.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.reasoning_effort.is_some()),
+        ),
+    ];
+    match unsupported.iter().find(|(_, requested)| *requested) {
+        Some((param, _)) => Err(ApiError::invalid_param(
+            param,
+            format!("`{param}` is not supported for LFM3-Audio"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Responses declares a function tool flat (`{"type": "function", "name",
@@ -86,8 +121,11 @@ pub async fn create_response(
     Extension(ctx): Extension<RequestContext>,
     ApiJson(req): ApiJson<ResponsesCreateRequest>,
 ) -> Result<Response<Body>, ApiError> {
-    let model_variant = parse_chat_model_variant(Some(&req.model))
+    let model_variant = parse_chat_request_model_variant(Some(&req.model))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if model_variant.family() == izwi_core::ModelFamily::Lfm3Audio {
+        validate_lfm3_audio_response_controls(&req)?;
+    }
 
     let tools = req.tools.as_deref().map(|tools| {
         tools
@@ -1021,6 +1059,14 @@ fn build_input_messages(
                 "Response input item content cannot be empty",
             ));
         }
+        if parsed_role != ResponseInboundRole::User
+            && item
+                .media_inputs
+                .iter()
+                .any(|input| input.kind == izwi_core::ChatMediaKind::Audio)
+        {
+            return Err(ApiError::bad_request("Only user messages can carry audio"));
+        }
         media_inputs.extend(item.media_inputs.clone());
         previous_was_assistant_message = parsed_role == ResponseInboundRole::Assistant;
 
@@ -1028,7 +1074,7 @@ fn build_input_messages(
             ResponseInboundRole::System => {
                 if !item.media_inputs.is_empty() {
                     return Err(ApiError::bad_request(
-                        "System response input items cannot contain images or videos",
+                        "System response input items cannot contain images, videos or audio",
                     ));
                 }
                 ChatMessage {
@@ -1349,6 +1395,43 @@ mod tests {
         assert_eq!(stored[0].role, "system");
         assert_eq!(stored[1].role, "user");
         assert!(media_inputs.is_empty());
+    }
+
+    /// LFM3-Audio hears `input_audio` parts in user items, each where the
+    /// item places it; other roles cannot carry audio.
+    #[test]
+    fn audio_input_items_reach_lfm3_audio_in_place() {
+        let input: ResponseInput = serde_json::from_value(json!([{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is said? "},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+            ]
+        }]))
+        .unwrap();
+        let (messages, _, media_inputs) =
+            build_input_messages(ModelVariant::Lfm3Audio2BGguf, None, Some(input), &[]).unwrap();
+        assert_eq!(
+            messages[0].content,
+            format!("What is said? {}", izwi_core::CHAT_AUDIO_PLACEHOLDER)
+        );
+        assert_eq!(media_inputs.len(), 1);
+        assert_eq!(media_inputs[0].source, "data:audio/wav;base64,UklGRg==");
+
+        let assistant: ResponseInput = serde_json::from_value(json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": [
+                {"type": "input_audio", "input_audio": {"data": "UklGRg=="}}
+            ]}
+        ]))
+        .unwrap();
+        let error = build_input_messages(ModelVariant::Lfm3Audio2BGguf, None, Some(assistant), &[])
+            .unwrap_err();
+        assert!(
+            error.message.contains("Only user messages"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

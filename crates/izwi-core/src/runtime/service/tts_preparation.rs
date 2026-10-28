@@ -348,8 +348,7 @@ pub(super) const KOKORO_JOIN_PAUSE_SAMPLES: u64 = 960;
 enum Lfm3AudioRowSource {
     Speech(crate::models::architectures::lfm3_audio::model::Lfm3AudioRequest),
     Reply {
-        samples: Vec<f32>,
-        sample_rate: u32,
+        clips: Vec<(Vec<f32>, u32)>,
         settings: crate::engine::Lfm3AudioReplySettings,
     },
 }
@@ -1657,18 +1656,16 @@ impl RuntimeService {
             }
             _ => {
                 let reply = request.lfm3_audio_reply_settings();
-                let (samples, sample_rate, request) = self
+                let (clips, request) = self
                     .coordinator
                     .run_host_blocking_stage(&job, move || {
-                        let (samples, sample_rate) =
-                            crate::engine::decode_request_audio_with_rate(&request)?;
-                        Ok((samples, sample_rate, request))
+                        let clips = request.lfm3_audio_reply_clips()?;
+                        Ok((clips, request))
                     })
                     .await?;
                 (
                     Lfm3AudioRowSource::Reply {
-                        samples,
-                        sample_rate,
+                        clips,
                         settings: reply,
                     },
                     request,
@@ -1745,15 +1742,12 @@ impl RuntimeService {
                 let lfm3 = model_for_preparation.lfm3_audio()?;
                 let artifact = match source {
                     Lfm3AudioRowSource::Speech(speech) => lfm3.prepare_row(speech)?,
-                    Lfm3AudioRowSource::Reply {
-                        samples,
-                        sample_rate,
-                        settings,
-                    } => lfm3.prepare_reply_row(
-                        &samples,
-                        sample_rate,
-                        &settings.history,
-                        settings.system_prompt.as_deref(),
+                    Lfm3AudioRowSource::Reply { clips, settings } => lfm3.prepare_reply_row(
+                        &clips,
+                        &settings.messages,
+                        &settings.tools,
+                        settings.output,
+                        settings.preserve_thinking,
                         settings.max_slots,
                         settings.text_sampling,
                         settings.audio_sampling,

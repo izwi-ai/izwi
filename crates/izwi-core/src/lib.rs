@@ -149,8 +149,8 @@ pub use artifacts::{
     ModelResidencyState, ModelWeights,
 };
 pub use catalog::{
-    normalize_stored_model_id, parse_chat_model_variant, parse_model_variant,
-    parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
+    normalize_stored_model_id, parse_chat_model_variant, parse_chat_request_model_variant,
+    parse_model_variant, parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
     resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
     validate_diarization_speaker_limits, ChatModelCapabilities, CudaEvidenceLevel,
@@ -161,7 +161,8 @@ pub use catalog::{
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
-    ChatTemplateKwargs, ChatTruncation,
+    ChatTemplateKwargs, ChatTruncation, CHAT_AUDIO_PLACEHOLDER, CHAT_MAX_AUDIO_CLIPS,
+    CHAT_MAX_AUDIO_CLIP_SECONDS,
 };
 
 /// How `<think>` reasoning splits from a chat answer, shared with the gateway.

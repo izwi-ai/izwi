@@ -909,7 +909,9 @@
       },
       "ChatCompletionMessage": {
         "properties": {
-          "content": {},
+          "content": {
+            "description": "Text, or content parts: `text`, images for Qwen3.5, `input_audio`\nclips for LFM3-Audio."
+          },
           "role": {
             "type": "string"
           },
@@ -928,6 +930,9 @@
       },
       "ChatCompletionRequest": {
         "properties": {
+          "audio": {
+            "description": "Spoken replies are not offered here (the voice realtime API speaks);\nany value is a `400`."
+          },
           "chat_template_kwargs": {
             "oneOf": [
               {
@@ -963,6 +968,16 @@
               "$ref": "#/components/schemas/ChatCompletionMessage"
             },
             "type": "array"
+          },
+          "modalities": {
+            "description": "Replies are text: only `[\"text\"]` is accepted.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "model": {
             "type": "string"

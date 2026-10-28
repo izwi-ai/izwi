@@ -141,6 +141,15 @@ pub fn resolve_chat_sampling(
             repetition_penalty: 1.1,
             presence_penalty: 0.0,
         }
+    } else if variant.family() == ModelFamily::Lfm3Audio {
+        // LFM3-Audio-2B's `generation_config.json` decodes text greedily.
+        ResolvedChatSampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+        }
     } else {
         ResolvedChatSampling::ENGINE_DEFAULT
     };
@@ -290,6 +299,18 @@ mod tests {
                 variant,
                 Some(false)
             ));
+        }
+    }
+
+    #[test]
+    fn lfm3_audio_chat_decodes_text_greedily_unless_asked_otherwise() {
+        for variant in [ModelVariant::Lfm3Audio2BGguf, ModelVariant::Lfm3Audio2BQ8Gguf] {
+            assert_eq!(
+                resolve_chat_sampling(variant, None, ChatSamplingRequest::default()),
+                sampling(0.0, 1.0, 0, 1.0, 0.0)
+            );
+            assert!(variant.serves_chat_requests() && !variant.is_chat());
+            assert!(!chat_supports_json_object(variant));
         }
     }
 

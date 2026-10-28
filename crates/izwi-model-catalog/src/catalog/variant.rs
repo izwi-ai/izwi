@@ -498,6 +498,20 @@ pub fn parse_chat_model_variant(
     }
 }
 
+/// The model a chat route request names: a text chat model, or LFM3-Audio
+/// (see [`ModelVariant::serves_chat_requests`]).
+pub fn parse_chat_request_model_variant(
+    input: Option<&str>,
+) -> Result<ModelVariant, ParseModelVariantError> {
+    let id = input.unwrap_or("Qwen3.5-4B");
+    let variant = parse_model_variant(id)?;
+    if variant.serves_chat_requests() {
+        Ok(variant)
+    } else {
+        Err(ParseModelVariantError::new(id))
+    }
+}
+
 /// Resolve the LLM variant that summarizes a diarization transcript. Any
 /// chat-capable catalog model is accepted: the summary prompt is
 /// model-agnostic. Defaults to Qwen3.5-4B. Legacy records may still

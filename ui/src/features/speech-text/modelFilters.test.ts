@@ -4,7 +4,9 @@ import type { ModelInfo } from "@/api";
 import {
   installedGraniteSpeech5Model,
   isDiarizationPipelineAsrModel,
+  isDiarizationPipelineLlmModel,
   isSpeakerAttributedAsrModel,
+  isTranscriptionSummaryModel,
   resolveDiarizationStackRole,
 } from "@/features/speech-text/modelFilters";
 
@@ -196,6 +198,22 @@ describe("isDiarizationPipelineAsrModel", () => {
     });
     expect(isSpeakerAttributedAsrModel(plus)).toBe(true);
     expect(isDiarizationPipelineAsrModel(plus)).toBe(true);
+  });
+
+  it("runs summaries on text chat models, not on an audio chat model", () => {
+    const textChat = withCapabilities("Qwen3.5-4B", {
+      openai_chat_completions: true,
+      voice_realtime_text_model: true,
+    });
+    // LFM3-Audio serves chat completions, but only as an audio chat model.
+    const audioChat = withCapabilities("LFM3-Audio-2B-GGUF", {
+      openai_chat_completions: true,
+      voice_realtime_unified: true,
+    });
+    expect(isTranscriptionSummaryModel(textChat)).toBe(true);
+    expect(isDiarizationPipelineLlmModel(textChat)).toBe(true);
+    expect(isTranscriptionSummaryModel(audioChat)).toBe(false);
+    expect(isDiarizationPipelineLlmModel(audioChat)).toBe(false);
   });
 
   it("finds an installed Granite Speech 5.0 for the speaker-attribution hint", () => {

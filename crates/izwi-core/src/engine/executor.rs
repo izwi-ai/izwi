@@ -46,6 +46,11 @@ pub(crate) fn decode_request_audio_with_rate(
     audio::decode_request_audio_with_rate(request)
 }
 
+/// A chat audio clip (`data:audio/...;base64,` or bare base64), decoded.
+pub(crate) fn decode_audio_source_with_rate(source: &str) -> Result<(Vec<f32>, u32)> {
+    audio::decode_audio_base64_with_rate(source)
+}
+
 pub(crate) use audio::{AsrRouteCapabilities, PlannedAsrChunks};
 
 /// Route plan for a request's audio; see [`NativeExecutor::asr_route_plan`].

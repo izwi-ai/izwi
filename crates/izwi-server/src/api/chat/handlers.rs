@@ -19,7 +19,7 @@ use crate::app::chat::{
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamCompletion, ChatStreamEvent,
 };
 use crate::app::chat_content::{
-    flatten_thread_content, validate_media_inputs_for_variant, variant_accepts_image_input,
+    flatten_thread_content, validate_media_inputs_for_variant, variant_accepts_media,
     FlattenedMultimodalContent,
 };
 use crate::chat_store::{
@@ -30,8 +30,8 @@ use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::chat_reasoning::reasoning_opened_in_prompt;
 use izwi_core::{
-    ChatFinishReason, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole,
-    ChatTemplateKwargs, ChatTruncation,
+    ChatFinishReason, ChatGeneration, ChatMediaInput, ChatMediaKind, ChatMessage,
+    ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation, CHAT_MAX_AUDIO_CLIPS,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -570,14 +570,14 @@ async fn run_thread_turn(
         .map_err(map_store_error)?;
     let turn = resolve_turn(&state, &thread_id, existing_messages, target).await?;
 
-    // A thread that once used an image model can continue on a text-only
-    // one: earlier turns are sent as their text, while a new attachment on
-    // this message is still rejected below.
+    // A thread that once used an image or audio model can continue on one
+    // that does not hear that media: earlier turns are sent as their text,
+    // while a new attachment on this message is still rejected below.
     let (runtime_messages, media_inputs) = build_runtime_messages(
         &turn.history,
         &turn.content,
         effective_system_prompt.as_deref(),
-        variant_accepts_image_input(model_variant),
+        |kind| variant_accepts_media(model_variant, kind),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -933,15 +933,20 @@ fn chat_finish_reason(generation: &ChatGeneration) -> Option<String> {
     Some(reason.to_string())
 }
 
-/// Placeholder for a past image turn when the target model reads text only
-/// and the turn has no text of its own.
+/// Placeholders for a past media turn when the target model does not hear
+/// its media and the turn has no text of its own.
 const OMITTED_IMAGE_TEXT: &str = "[Image attachment]";
+const OMITTED_AUDIO_TEXT: &str = "[Audio attachment]";
 
+/// The thread's conversation for the model, with the media it hears
+/// (`accepts`): a past turn keeps its media only when the model hears every
+/// kind in it, and audio only for the newest [`CHAT_MAX_AUDIO_CLIPS`] clips
+/// beside the new message's.
 fn build_runtime_messages(
     existing: &[ChatThreadMessage],
     new_user_content: &FlattenedMultimodalContent,
     system_prompt: Option<&str>,
-    include_history_media: bool,
+    accepts: impl Fn(ChatMediaKind) -> bool,
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut messages = Vec::new();
     let mut media_inputs = Vec::new();
@@ -956,6 +961,7 @@ fn build_runtime_messages(
         });
     }
 
+    let mut history = Vec::with_capacity(existing.len());
     for message in existing {
         let role = parse_stored_role(&message.role)?;
         let flattened = flatten_thread_content(&message.content, message.content_parts.as_deref())
@@ -972,13 +978,41 @@ fn build_runtime_messages(
             // model answer, so neither becomes an assistant prompt turn.
             continue;
         }
-        let content = if include_history_media || !flattened.has_media() {
+        history.push((role, flattened));
+    }
+
+    let mut clips_left =
+        CHAT_MAX_AUDIO_CLIPS.saturating_sub(audio_clips(&new_user_content.media_inputs));
+    let mut heard = vec![false; history.len()];
+    for (index, (_, flattened)) in history.iter().enumerate().rev() {
+        if !flattened
+            .media_inputs
+            .iter()
+            .all(|input| accepts(input.kind))
+        {
+            continue;
+        }
+        let clips = audio_clips(&flattened.media_inputs);
+        if clips > clips_left {
+            clips_left = 0;
+            continue;
+        }
+        clips_left -= clips;
+        heard[index] = true;
+    }
+
+    for ((role, flattened), heard) in history.into_iter().zip(heard) {
+        let content = if heard {
             media_inputs.extend(flattened.media_inputs);
             flattened.runtime_text
         } else if flattened.display_text.trim().is_empty() {
-            // runtime_text carries one vision placeholder per image, which
+            // runtime_text carries a placeholder per image or clip, which
             // must not reach the prompt without its media input.
-            OMITTED_IMAGE_TEXT.to_string()
+            if audio_clips(&flattened.media_inputs) > 0 {
+                OMITTED_AUDIO_TEXT.to_string()
+            } else {
+                OMITTED_IMAGE_TEXT.to_string()
+            }
         } else {
             flattened.display_text
         };
@@ -993,6 +1027,13 @@ fn build_runtime_messages(
     );
 
     Ok((messages, media_inputs))
+}
+
+fn audio_clips(media_inputs: &[ChatMediaInput]) -> usize {
+    media_inputs
+        .iter()
+        .filter(|input| input.kind == ChatMediaKind::Audio)
+        .count()
 }
 
 /// A reply stopped before its reasoning closed: `<think>` with no `</think>`.
@@ -1192,7 +1233,7 @@ mod tests {
                 media_inputs: Vec::new(),
             },
             None,
-            true,
+            |_| true,
         )
         .unwrap();
         assert_eq!(messages.len(), 3);
@@ -1223,7 +1264,7 @@ mod tests {
                 media_inputs: Vec::new(),
             },
             Some("Be concise."),
-            true,
+            |_| true,
         )
         .expect("runtime messages");
 
@@ -1282,7 +1323,7 @@ mod tests {
                 }],
             },
             None,
-            true,
+            |_| true,
         )
         .expect("runtime messages");
 
@@ -1323,7 +1364,7 @@ mod tests {
             ],
             &next,
             None,
-            false,
+            |_| false,
         )
         .expect("runtime messages");
 
@@ -1341,11 +1382,85 @@ mod tests {
             ],
             &next,
             None,
-            true,
+            |_| true,
         )
         .expect("runtime messages");
         assert_eq!(media_inputs.len(), 1);
         assert!(messages[0].content.contains("<|image_pad|>"));
+    }
+
+    fn audio_part() -> serde_json::Value {
+        json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}})
+    }
+
+    fn audio_turn(content: &str) -> ChatThreadMessage {
+        ChatThreadMessage {
+            content_parts: Some(vec![json!({"type": "text", "text": content}), audio_part()]),
+            ..image_turn(content)
+        }
+    }
+
+    #[test]
+    fn audio_models_hear_the_newest_clips_and_others_read_their_text() {
+        let hears_audio = |kind| kind == ChatMediaKind::Audio;
+        let next = FlattenedMultimodalContent {
+            display_text: "And this one?".to_string(),
+            runtime_text: format!("{}And this one?", izwi_core::CHAT_AUDIO_PLACEHOLDER),
+            media_inputs: vec![ChatMediaInput {
+                kind: ChatMediaKind::Audio,
+                source: "data:audio/wav;base64,UklGRg==".to_string(),
+            }],
+        };
+        let history = (0..9)
+            .flat_map(|turn| [audio_turn(&format!("clip {turn}")), reply("Heard.")])
+            .collect::<Vec<_>>();
+        let (messages, media_inputs) =
+            build_runtime_messages(&history, &next, None, hears_audio).expect("runtime messages");
+        // The newest seven past clips and the new one; the two oldest turns
+        // keep their text.
+        assert_eq!(media_inputs.len(), CHAT_MAX_AUDIO_CLIPS);
+        assert_eq!(messages[0].content, "clip 0");
+        assert_eq!(messages[2].content, "clip 1");
+        assert!(messages[4]
+            .content
+            .contains(izwi_core::CHAT_AUDIO_PLACEHOLDER));
+        let placed = messages
+            .iter()
+            .map(|message| {
+                message
+                    .content
+                    .matches(izwi_core::CHAT_AUDIO_PLACEHOLDER)
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(placed, media_inputs.len());
+
+        // A model that does not hear audio reads a clip-only turn as a
+        // placeholder, and an audio model reads a past image turn's text.
+        let clip_only = ChatThreadMessage {
+            content: String::new(),
+            content_parts: Some(vec![audio_part()]),
+            ..image_turn("")
+        };
+        let text_next = FlattenedMultimodalContent {
+            display_text: "Thanks".to_string(),
+            runtime_text: "Thanks".to_string(),
+            media_inputs: Vec::new(),
+        };
+        let (messages, media_inputs) =
+            build_runtime_messages(&[clip_only, reply("Heard.")], &text_next, None, |_| false)
+                .expect("runtime messages");
+        assert!(media_inputs.is_empty());
+        assert_eq!(messages[0].content, OMITTED_AUDIO_TEXT);
+        let (messages, media_inputs) = build_runtime_messages(
+            &[image_turn("What is in this chart?"), reply("Sales.")],
+            &text_next,
+            None,
+            hears_audio,
+        )
+        .expect("runtime messages");
+        assert!(media_inputs.is_empty());
+        assert_eq!(messages[0].content, "What is in this chart?");
     }
 
     #[test]
@@ -1364,7 +1479,7 @@ mod tests {
             media_inputs: Vec::new(),
         };
         let (messages, media_inputs) =
-            build_runtime_messages(&[image_only, reply("A photo.")], &next, None, false)
+            build_runtime_messages(&[image_only, reply("A photo.")], &next, None, |_| false)
                 .expect("runtime messages");
         assert!(media_inputs.is_empty());
         assert_eq!(messages[0].content, OMITTED_IMAGE_TEXT);
@@ -1418,7 +1533,7 @@ mod tests {
                 media_inputs: Vec::new(),
             },
             Some("Be brief."),
-            true,
+            |_| true,
         )
         .unwrap();
         assert_eq!(messages.len(), 2);

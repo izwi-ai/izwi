@@ -4,6 +4,7 @@ use crate::api::openai::convert::{InboundContent, InboundContentPart};
 use crate::app::chat::ChatStreamEvent;
 use crate::error::ErrorScope;
 use axum::http::StatusCode;
+use izwi_model_catalog::CHAT_AUDIO_PLACEHOLDER;
 use serde_json::json;
 
 #[test]
@@ -399,6 +400,8 @@ fn validates_rejects_non_zero_frequency_penalty() {
         reasoning_format: None,
         truncation: None,
         skip_special_tokens: None,
+        modalities: None,
+        audio: None,
     };
 
     let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -443,6 +446,8 @@ fn strict_profile_accepts_stop_sequences() {
         reasoning_format: None,
         truncation: None,
         skip_special_tokens: None,
+        modalities: None,
+        audio: None,
     };
 
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -511,6 +516,8 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
         reasoning_format: None,
         truncation: None,
         skip_special_tokens: None,
+        modalities: None,
+        audio: None,
     };
 
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
@@ -555,4 +562,125 @@ fn lfm3_tool_results_name_deferred_tools_as_the_template_does() {
             .is_err()
     );
     assert!(to_core_messages_with_media(ModelVariant::Qwen359BGguf, messages, &tools).is_err());
+}
+
+fn lfm3_audio_request(
+    mut body: serde_json::Value,
+) -> Result<(ChatExecutionRequest, AnswerFormat), ApiError> {
+    body["model"] = json!("LFM3-Audio-2B-GGUF");
+    let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+    let ctx = RequestContext::new("audio".into(), izwi_hooks::Principal::local_anonymous());
+    validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)?;
+    prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
+}
+
+fn clip(format: &str) -> serde_json::Value {
+    json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": format}})
+}
+
+/// LFM3-Audio hears `input_audio` parts and `data:` audio URLs, each where
+/// its user turn places it, and answers in text.
+#[test]
+fn lfm3_audio_chat_hears_audio_parts_in_place() {
+    let (request, _) = lfm3_audio_request(json!({"messages": [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "What is said in "},
+            clip("mp3"),
+            {"type": "text", "text": " and "},
+            {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,UklGRg=="}},
+            {"type": "text", "text": "?"}
+        ]}
+    ], "preserve_thinking": true}))
+    .expect("audio chat");
+    assert_eq!(
+        request.messages[1].content,
+        format!("What is said in {CHAT_AUDIO_PLACEHOLDER} and {CHAT_AUDIO_PLACEHOLDER}?")
+    );
+    let sources = request
+        .chat_config
+        .media_inputs
+        .iter()
+        .map(|input| (input.kind, input.source.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sources,
+        [
+            (ChatMediaKind::Audio, "data:audio/mpeg;base64,UklGRg=="),
+            (ChatMediaKind::Audio, "data:audio/wav;base64,UklGRg=="),
+        ]
+    );
+    assert_eq!(request.chat_config.preserve_thinking, Some(true));
+}
+
+#[test]
+fn audio_chat_refuses_what_it_cannot_hear_or_answer() {
+    let user =
+        |content: serde_json::Value| json!({"messages": [{"role": "user", "content": content}]});
+    let refusals = [
+        (
+            user(json!([{"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}])),
+            "does not fetch audio",
+        ),
+        (
+            json!({"messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [clip("wav")]}
+            ]}),
+            "Only user messages can carry audio",
+        ),
+        (
+            user(json!([{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}])),
+            "reads audio clips",
+        ),
+        (user(json!(vec![clip("wav"); 9])), "at most 8 audio clips"),
+        (
+            user(json!([{"type": "input_audio", "input_audio": {}}])),
+            "base64 `data`",
+        ),
+    ];
+    for (body, expected) in refusals {
+        let error = lfm3_audio_request(body).expect_err(expected);
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+
+    // Spoken replies and controls the reply rows do not take are refused by
+    // name.
+    let hello = || user(json!("Hello"));
+    for (param, value) in [
+        ("modalities", json!(["text", "audio"])),
+        ("audio", json!({"voice": "alloy", "format": "wav"})),
+        ("stop", json!(["\n"])),
+        ("logprobs", json!(true)),
+        ("presence_penalty", json!(0.5)),
+        ("enable_thinking", json!(false)),
+    ] {
+        let mut body = hello();
+        body[param] = value;
+        let error = lfm3_audio_request(body).expect_err(param);
+        assert_eq!(
+            error.detail.and_then(|detail| detail.param),
+            Some(param),
+            "{}",
+            error.message
+        );
+    }
+    let mut body = hello();
+    body["chat_template_kwargs"] = json!({"reasoning_effort": "low"});
+    assert!(lfm3_audio_request(body).is_err());
+
+    // Other models refuse audio.
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "Qwen3.5-4B",
+        "messages": [{"role": "user", "content": [clip("wav")]}]
+    }))
+    .unwrap();
+    let ctx = RequestContext::new("audio".into(), izwi_hooks::Principal::local_anonymous());
+    let error = prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
+        .expect_err("text models do not hear audio");
+    assert!(
+        error.message.contains("needs LFM3-Audio"),
+        "{}",
+        error.message
+    );
 }

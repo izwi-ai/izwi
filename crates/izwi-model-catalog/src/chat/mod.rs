@@ -13,7 +13,8 @@ pub use generation::{
 };
 pub use messages::{
     fold_system_messages, ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole,
-    ChatTemplateKwargs, ChatTruncation,
+    ChatTemplateKwargs, ChatTruncation, CHAT_AUDIO_PLACEHOLDER, CHAT_MAX_AUDIO_CLIPS,
+    CHAT_MAX_AUDIO_CLIP_SECONDS,
 };
 pub use sampling::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,

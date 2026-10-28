@@ -43,11 +43,11 @@ use super::depth::{FrameHistory, Lfm3DepthDecoder};
 use super::encoder::Lfm3AudioEncoder;
 use super::preprocessor::Lfm3AudioMel;
 use super::prompts::{
-    asr_prompt, live_asr_prompt, tts_prompt, Lfm3AudioVoice, PromptBuilder, PromptPart,
-    LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT,
+    asr_prompt, audio_slots, live_asr_prompt, reply_prompt, tts_prompt, Lfm3AudioReplyOutput,
+    Lfm3AudioVoice, PromptPart,
 };
 use super::sampling::{apply_repetition_penalty, sample};
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::chat::ChatMessage;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, TranscriptAssembler};
 
 /// The served context, the length on Liquid's model card (the GGUF says
@@ -82,8 +82,9 @@ pub(crate) enum Lfm3AudioMode {
 /// One generation's inputs.
 pub(crate) struct Lfm3AudioRequest {
     pub(crate) prompt: Vec<PromptPart>,
-    /// Encoder embeddings `[1, tokens, 2048]` for the prompt's speech clip.
-    pub(crate) audio: Option<Tensor>,
+    /// Encoder embeddings `[1, tokens, 2048]` of the prompt's speech clips,
+    /// one per [`PromptPart::Audio`], in order.
+    pub(crate) clips: Vec<Tensor>,
     pub(crate) mode: Lfm3AudioMode,
     /// Keep the reply in text: forbid `<|audio_start|>` and
     /// `<|mixed_start|>`.
@@ -268,7 +269,7 @@ pub(crate) fn asr_request(
 ) -> Result<Lfm3AudioRequest> {
     Ok(Lfm3AudioRequest {
         prompt: asr_prompt(language)?,
-        audio: Some(audio),
+        clips: vec![audio],
         mode: Lfm3AudioMode::Text,
         text_only: true,
         max_slots: max_tokens.max(1),
@@ -291,7 +292,7 @@ pub(crate) fn tts_request(
     }
     Ok(Lfm3AudioRequest {
         prompt: tts_prompt(text, voice),
-        audio: None,
+        clips: Vec::new(),
         mode: Lfm3AudioMode::Audio,
         text_only: false,
         // The end-of-audio frame and the closing `<|im_end|>`.
@@ -302,42 +303,45 @@ pub(crate) fn tts_request(
     })
 }
 
-/// The reply to a spoken turn (encoder embeddings `audio`) after
-/// `history`'s text turns: interleaved text and speech (`Respond with
-/// interleaved text and audio.`, the reply prefilled with `<|mixed_start|>`),
-/// at most `max_slots` slots.
+/// A reply to `messages` (see [`reply_prompt`]): text, or interleaved text
+/// and speech, the encoder embeddings `clips` filling the prompt's speech
+/// slots in order, at most `max_slots` slots. A reply that may call tools
+/// starts in text and moves to speech at `<|mixed_start|>`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reply_request(
-    history: &[ChatMessage],
-    audio: Tensor,
-    system_prompt: Option<&str>,
+    messages: &[ChatMessage],
+    clips: Vec<Tensor>,
+    tools: &[serde_json::Value],
+    output: Lfm3AudioReplyOutput,
+    preserve_thinking: bool,
     max_slots: usize,
     text_sampling: Lfm3TextSampling,
     audio_sampling: Lfm3AudioSampling,
     seed: u64,
-) -> Lfm3AudioRequest {
-    let system = match system_prompt.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(extra) => format!("{LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT}\n\n{extra}"),
-        None => LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT.to_string(),
-    };
-    let mut prompt = PromptBuilder::new().turn("system", &system);
-    for message in history {
-        let role = match message.role {
-            ChatRole::System => continue,
-            ChatRole::User | ChatRole::Tool => "user",
-            ChatRole::Assistant => "assistant",
-        };
-        prompt = prompt.turn(role, &message.content);
+) -> Result<Lfm3AudioRequest> {
+    let prompt = reply_prompt(messages, tools, output, preserve_thinking);
+    let slots = audio_slots(&prompt);
+    if slots != clips.len() {
+        return Err(Error::InvalidInput(format!(
+            "LFM3-Audio reply has {slots} audio placeholders for {} audio clips",
+            clips.len()
+        )));
     }
-    Lfm3AudioRequest {
-        prompt: prompt.audio_turn("user", "").assistant("<|mixed_start|>"),
-        audio: Some(audio),
-        mode: Lfm3AudioMode::Interleaved,
-        text_only: false,
+    let (mode, text_only) = match output {
+        Lfm3AudioReplyOutput::Text => (Lfm3AudioMode::Text, true),
+        Lfm3AudioReplyOutput::Interleaved if !tools.is_empty() => (Lfm3AudioMode::Text, false),
+        Lfm3AudioReplyOutput::Interleaved => (Lfm3AudioMode::Interleaved, false),
+    };
+    Ok(Lfm3AudioRequest {
+        prompt,
+        clips,
+        mode,
+        text_only,
         max_slots: max_slots.max(1),
         text_sampling,
         audio_sampling,
         seed,
-    }
+    })
 }
 
 fn check_prompt_fits(prompt_tokens: usize, context: usize) -> Result<()> {
@@ -485,30 +489,36 @@ impl Lfm3AudioModel {
         self.prepare_row(asr_request(audio, language, budget)?)
     }
 
-    /// The reply row of a spoken turn at any rate (see [`reply_request`]):
-    /// its prompt with the turn's encoder embeddings.
+    /// The reply row of a conversation (see [`reply_request`]): its prompt
+    /// with each audio clip's encoder embeddings, the clips at any rate.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_reply_row(
         &self,
-        samples: &[f32],
-        sample_rate: u32,
-        history: &[ChatMessage],
-        system_prompt: Option<&str>,
+        clips: &[(Vec<f32>, u32)],
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        output: Lfm3AudioReplyOutput,
+        preserve_thinking: bool,
         max_slots: usize,
         text_sampling: Lfm3TextSampling,
         audio_sampling: Lfm3AudioSampling,
         seed: u64,
     ) -> Result<std::sync::Arc<super::retained::Lfm3AudioPreparedArtifact>> {
-        let audio = self.encode_audio(samples, sample_rate)?;
+        let clips = clips
+            .iter()
+            .map(|(samples, sample_rate)| self.encode_audio(samples, *sample_rate))
+            .collect::<Result<Vec<_>>>()?;
         self.prepare_row(reply_request(
-            history,
-            audio,
-            system_prompt,
+            messages,
+            clips,
+            tools,
+            output,
+            preserve_thinking,
             max_slots,
             text_sampling,
             audio_sampling,
             seed,
-        ))
+        )?)
     }
 
     pub fn max_context_tokens(&self) -> usize {
@@ -533,7 +543,7 @@ impl Lfm3AudioModel {
     fn prompt_embeds(&self, request: &Lfm3AudioRequest) -> Result<(Tensor, usize)> {
         let device = &self.device.device;
         let mut pieces = Vec::new();
-        let mut clips = request.audio.iter();
+        let mut clips = request.clips.iter();
         for part in &request.prompt {
             match part {
                 PromptPart::Text(text) => {
@@ -552,6 +562,11 @@ impl Lfm3AudioModel {
                     pieces.push(clip.to_dtype(DType::F32)?);
                 }
             }
+        }
+        if clips.next().is_some() {
+            return Err(Error::InvalidInput(
+                "LFM3-Audio prompt has more audio clips than speech slots".into(),
+            ));
         }
         let embeds = Tensor::cat(&pieces, 1)?;
         let tokens = embeds.dim(1)?;

@@ -904,24 +904,32 @@ fn chat_rows_that_spend_their_budget_report_max_tokens() {
     use super::super::types::FinishReason;
     let stop = Some(FinishReason::StopToken);
     assert_eq!(
-        chat_budget_finish_reason(stop, TaskType::Chat, 128, 128),
+        chat_budget_finish_reason(stop, true, 128, 128),
         Some(FinishReason::MaxTokens)
     );
-    assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 128, 127), stop);
+    assert_eq!(chat_budget_finish_reason(stop, true, 128, 127), stop);
     // Only chat budgets count tokens; other tasks and terminal kinds keep
     // their reason.
-    assert_eq!(chat_budget_finish_reason(stop, TaskType::TTS, 8, 8), stop);
+    assert_eq!(chat_budget_finish_reason(stop, false, 8, 8), stop);
     for reason in [
         Some(FinishReason::Aborted),
         Some(FinishReason::Error),
         None,
     ] {
         assert_eq!(
-            chat_budget_finish_reason(reason, TaskType::Chat, 8, 8),
+            chat_budget_finish_reason(reason, true, 8, 8),
             reason
         );
     }
-    assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 0, 0), stop);
+    assert_eq!(chat_budget_finish_reason(stop, true, 0, 0), stop);
+
+    // An LFM3-Audio reply answers chat on a chat turn only.
+    let mut request = EngineCoreRequest::lfm3_audio_chat(Vec::new());
+    assert!(request.answers_chat());
+    request.speech_reply = crate::engine::SpeechReplyTurn::Voice;
+    assert!(!request.answers_chat());
+    assert!(EngineCoreRequest::chat(Vec::new()).answers_chat());
+    assert!(!EngineCoreRequest::tts("hi").answers_chat());
 }
 
 #[test]

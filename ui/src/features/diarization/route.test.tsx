@@ -98,7 +98,7 @@ const baseModels: ModelInfo[] = [
   },
   {
     variant: "Qwen3.5-4B",
-    route_capabilities: caps({ openai_chat_completions: true }),
+    route_capabilities: caps({ openai_chat_completions: true, voice_realtime_text_model: true }),
     status: "ready" as const,
     local_path: "/models/llm",
     size_bytes: null,

@@ -73,6 +73,13 @@ pub struct ChatCompletionRequest {
     /// in the reply text. Absent or `true` skips them.
     #[serde(default)]
     pub skip_special_tokens: Option<bool>,
+    /// OpenAI's output modalities. Chat answers in text, so anything else is
+    /// refused rather than ignored.
+    #[serde(default)]
+    pub modalities: Option<Vec<String>>,
+    /// OpenAI's audio output settings, refused for the same reason.
+    #[serde(default)]
+    pub audio: Option<serde_json::Value>,
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;

@@ -32,7 +32,8 @@ use crate::error::ApiError;
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmittedTenantWork};
 use crate::ids::new_prefixed_id;
 use izwi_model_catalog::{
-    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
+    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMediaKind, ChatMessage,
+    ChatRole, ModelFamily, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -97,11 +98,19 @@ fn to_core_messages_with_media(
             }
         }
 
+        if role != InboundMessageRole::User
+            && flattened
+                .media_inputs
+                .iter()
+                .any(|input| input.kind == ChatMediaKind::Audio)
+        {
+            return Err(ApiError::bad_request("Only user messages can carry audio"));
+        }
         match role {
             InboundMessageRole::System => {
                 if flattened.has_media() {
                     return Err(ApiError::bad_request(
-                        "System messages cannot contain images or videos",
+                        "System messages cannot contain images, videos or audio",
                     ));
                 }
                 if content.trim().is_empty() {
@@ -208,6 +217,22 @@ pub fn validate_chat_request_compatibility(
         return Err(ApiError::invalid_param(
             "n",
             "This server currently supports only `n=1` for chat completions",
+        ));
+    }
+    if req
+        .modalities
+        .as_deref()
+        .is_some_and(|modalities| modalities.iter().any(|modality| modality != "text"))
+    {
+        return Err(ApiError::invalid_param(
+            "modalities",
+            "Chat completions answer in text only; for spoken replies use the realtime voice API",
+        ));
+    }
+    if req.audio.is_some() {
+        return Err(ApiError::invalid_param(
+            "audio",
+            "Chat completions answer in text only; for spoken replies use the realtime voice API",
         ));
     }
 
@@ -394,6 +419,9 @@ pub fn prepare_execution_request(
     profile: OpenAiCompatibilityProfile,
 ) -> Result<(ChatExecutionRequest, AnswerFormat), ApiError> {
     let variant = parse_chat_model(&req.model)?;
+    if variant.family() == ModelFamily::Lfm3Audio {
+        validate_lfm3_audio_chat_controls(req)?;
+    }
     let stop_sequences = chat_stop_sequences(req.stop.as_ref())?;
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
@@ -453,6 +481,47 @@ pub fn prepare_execution_request(
         tool_calls: tool_policy.format,
     };
     Ok((execution, format))
+}
+
+/// LFM3-Audio answers chat through its own reply rows, which take the
+/// sampling controls, tools and `preserve_thinking` but not these; each is
+/// refused, never dropped. Its template has no thinking switch: the model
+/// may think, and `reasoning_format: "parsed"` splits it out.
+fn validate_lfm3_audio_chat_controls(req: &ChatCompletionRequest) -> Result<(), ApiError> {
+    let kwargs = req.chat_template_kwargs.as_ref();
+    let unsupported: [(&'static str, bool); 7] = [
+        (
+            "stop",
+            req.stop.as_ref().is_some_and(|stop| !stop.is_null()),
+        ),
+        ("logprobs", req.logprobs.unwrap_or(false)),
+        ("top_logprobs", req.top_logprobs.is_some()),
+        (
+            "presence_penalty",
+            req.presence_penalty.is_some_and(|penalty| penalty != 0.0),
+        ),
+        (
+            "skip_special_tokens",
+            req.skip_special_tokens == Some(false),
+        ),
+        (
+            "enable_thinking",
+            req.enable_thinking.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.enable_thinking.is_some()),
+        ),
+        (
+            "reasoning_effort",
+            req.reasoning_effort.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.reasoning_effort.is_some()),
+        ),
+    ];
+    match unsupported.iter().find(|(_, requested)| *requested) {
+        Some((param, _)) => Err(ApiError::invalid_param(
+            param,
+            format!("`{param}` is not supported for LFM3-Audio chat"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether the request asked for `reasoning_format: "parsed"`.

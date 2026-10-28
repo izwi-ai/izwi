@@ -468,8 +468,10 @@ impl AdminModelRouteCapabilities {
             .is_some_and(|capabilities| capabilities.supports_voice_description);
 
         Self {
-            openai_chat_completions: variant.is_chat(),
-            openai_responses: variant.is_chat(),
+            // LFM3-Audio answers chat with audio clips in text; the text chat
+            // models are the ones `voice_realtime_text_model` marks.
+            openai_chat_completions: variant.serves_chat_requests(),
+            openai_responses: variant.serves_chat_requests(),
             openai_audio_speech: supports_tts,
             openai_audio_transcriptions: variant.is_asr()
                 || variant.is_voxtral()

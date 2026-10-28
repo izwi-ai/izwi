@@ -176,7 +176,7 @@ pub use request::{
     EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
     RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
-pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings};
+pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings, SpeechReplyTurn};
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
     PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
@@ -2577,14 +2577,14 @@ impl Engine {
                     let worker = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let mut request = request;
-                        let (samples, sample_rate) =
-                            executor::decode_request_audio_with_rate(&request)?;
+                        let clips = request.lfm3_audio_reply_clips()?;
                         let reply = request.lfm3_audio_reply_settings();
                         let artifact = model.lfm3_audio()?.prepare_reply_row(
-                            &samples,
-                            sample_rate,
-                            &reply.history,
-                            reply.system_prompt.as_deref(),
+                            &clips,
+                            &reply.messages,
+                            &reply.tools,
+                            reply.output,
+                            reply.preserve_thinking,
                             reply.max_slots,
                             reply.text_sampling,
                             reply.audio_sampling,

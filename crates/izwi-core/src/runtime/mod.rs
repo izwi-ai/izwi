@@ -10,7 +10,7 @@ mod asr_no_speech;
 pub(crate) mod audio_io;
 mod broker;
 mod capabilities;
-mod chat;
+pub(crate) mod chat;
 mod chat_request;
 mod conformance;
 mod coordinator;
@@ -19,6 +19,7 @@ pub(crate) mod fish_capacity;
 mod forced_alignment;
 mod health;
 mod kokoro;
+mod lfm3_audio_chat;
 #[cfg(test)]
 mod lfm3_audio_tests;
 mod lifecycle;

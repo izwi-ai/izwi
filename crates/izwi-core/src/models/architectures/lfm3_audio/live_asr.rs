@@ -300,7 +300,7 @@ impl Lfm3AudioModel {
     fn live_asr_prompt(&self) -> Result<Tensor> {
         let (prompt, _) = self.prompt_embeds(&Lfm3AudioRequest {
             prompt: live_asr_prompt(),
-            audio: None,
+            clips: Vec::new(),
             mode: Lfm3AudioMode::Text,
             text_only: true,
             max_slots: FINAL_TEXT_TOKENS,
