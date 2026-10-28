@@ -992,6 +992,66 @@ impl ModelLifecycleController {
         Ok(())
     }
 
+    /// LFM3-Audio: one scalar invocation workspace (the language model's
+    /// paged attention and ShortConv ring) per capability; every request
+    /// runs atomically.
+    pub(super) async fn allocate_lfm3_audio_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        if variant.family() != crate::catalog::ModelFamily::Lfm3Audio {
+            return Ok(());
+        }
+        if !managed_kv_backend_compiled(backend) {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {variant} requires physical LFM3-Audio invocation state, but the {backend:?} build has no direct paged-attention runtime"
+            )));
+        }
+        let model = self
+            .model_registry
+            .get_loading_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "loaded LFM3-Audio model {variant} is missing from the registry"
+                ))
+            })?;
+        let capabilities = [
+            CapabilityKind::Asr,
+            CapabilityKind::Tts,
+            CapabilityKind::AudioChat,
+            CapabilityKind::SpeechToSpeech,
+        ];
+        for (index, capability) in capabilities.into_iter().enumerate() {
+            let contracts = bundle_draft.execution_contracts(capability)?;
+            let stage_graphs = contracts
+                .iter()
+                .map(|contract| contract.stages.as_ref())
+                .collect::<Vec<_>>();
+            let physical_spec = model.physical_state_spec(
+                crate::models::architectures::lfm25_audio::physical::Lfm25AudioStateMode::MainOnly,
+                &stage_graphs,
+            )?;
+            let publication = self
+                .load_invocation_workspace_publication_with_remaining_groups(
+                    model_instance_id,
+                    &contracts,
+                    physical_spec.descriptor,
+                    &physical_spec.invocation,
+                    None,
+                    HashMap::new(),
+                    LaterStateGroups::sharing((capabilities.len() - index) as u64),
+                )
+                .await?;
+            state_publications.insert(capability, publication);
+        }
+        Ok(())
+    }
+
     /// Qwen3-TTS: retained talker state and the code-predictor workspace.
     pub(super) async fn allocate_qwen_tts_state(
         &self,

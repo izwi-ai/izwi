@@ -49,6 +49,14 @@ impl NativeExecutor {
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
+        if variant.family() == crate::catalog::ModelFamily::Lfm3Audio {
+            return self.lfm3_audio_chat_request(
+                request,
+                scheduled,
+                Self::audio_chat_messages(request),
+                request.speech_system_prompt_for_execution(),
+            );
+        }
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let generation_config = Self::audio_chat_generation_config(request);

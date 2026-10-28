@@ -92,6 +92,17 @@ pub enum ModelVariant {
     /// LFM3 1.7B from Liquid AI (GGUF Q8_0)
     #[serde(rename = "LFM3-1.7B-Q8_0-GGUF", alias = "LFM3-1.7B-Q8_0.gguf")]
     Lfm317BQ8Gguf,
+    /// LFM3 Audio 2B from Liquid AI (GGUF Q4_K_M language model and Q8_0
+    /// encoder, depth decoder and codec)
+    #[serde(
+        rename = "LFM3-Audio-2B-GGUF",
+        alias = "LiquidAI/LFM3-Audio-2B-GGUF",
+        alias = "LFM3-Audio-2B-Q4_K_M.gguf"
+    )]
+    Lfm3Audio2BGguf,
+    /// LFM3 Audio 2B from Liquid AI (GGUF Q8_0 language model)
+    #[serde(rename = "LFM3-Audio-2B-Q8_0-GGUF", alias = "LFM3-Audio-2B-Q8_0.gguf")]
+    Lfm3Audio2BQ8Gguf,
     /// Kokoro-82M TTS model from hexgrad
     #[serde(rename = "Kokoro-82M")]
     Kokoro82M,
@@ -372,6 +383,13 @@ impl ModelVariant {
     /// have no G2P yet and are hidden and refused.
     pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 41;
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
+    /// LFM3-Audio speaks with a female or a male voice.
+    pub const LFM3_AUDIO_BUILT_IN_VOICE_COUNT: usize = 2;
+    /// LFM3-Audio frames per second: one frame is 1,920 samples at 24 kHz.
+    pub const LFM3_AUDIO_FRAME_RATE_HZ: f32 = 12.5;
+    /// Frames one LFM3-Audio TTS request speaks at most (about 164 s);
+    /// longer text is split into sentences first.
+    pub const LFM3_AUDIO_MAX_OUTPUT_FRAMES: usize = 2048;
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
     pub const VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES: usize = 2048;
@@ -410,6 +428,14 @@ impl ModelVariant {
     /// repo does not ship.
     pub const LFM3_17B_COMPANION_REVISION: &'static str =
         "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd";
+    /// LiquidAI/LFM3-Audio-2B-GGUF (Q4_K_M and Q8_0 language models, Q8_0
+    /// mmproj).
+    pub const LFM3_AUDIO_2B_GGUF_ARTIFACT_REVISION: &'static str =
+        "fcfae9027c00a6f3f872c48a841cfeb77e2b5a1c";
+    /// LiquidAI/LFM3-Audio-2B: the tokenizer, chat template and configs the
+    /// GGUF repo does not ship.
+    pub const LFM3_AUDIO_2B_COMPANION_REVISION: &'static str =
+        "9d49701c372d6011d900f6abb40c6b296fb706dd";
     /// Upstream's absolute per-piece ceiling: 1,500 frames (120 s).
     pub const MAYA2_MAX_OUTPUT_FRAMES: usize = 1_500;
     /// Mimi frames per second.
@@ -479,6 +505,9 @@ impl ModelVariant {
             Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
             Self::Maya2Native25B => Some(Self::MAYA2_ARTIFACT_REVISION),
             Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => Some(Self::LFM3_17B_GGUF_ARTIFACT_REVISION),
+            Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => {
+                Some(Self::LFM3_AUDIO_2B_GGUF_ARTIFACT_REVISION)
+            }
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -518,6 +547,7 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
             Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => "LiquidAI/LFM3-1.7B-GGUF",
+            Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => "LiquidAI/LFM3-Audio-2B-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
             Self::ParakeetTdt06BV3 => "nvidia/parakeet-tdt-0.6b-v3",
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
@@ -575,6 +605,8 @@ impl ModelVariant {
             Self::Lfm25Audio15BGguf => "LFM2.5 Audio 1.5B GGUF",
             Self::Lfm317BGguf => "LFM3 1.7B GGUF",
             Self::Lfm317BQ8Gguf => "LFM3 1.7B Q8_0 GGUF",
+            Self::Lfm3Audio2BGguf => "LFM3 Audio 2B GGUF",
+            Self::Lfm3Audio2BQ8Gguf => "LFM3 Audio 2B Q8_0 GGUF",
             Self::Kokoro82M => "Kokoro 82M",
             Self::ParakeetTdt06BV3 => "Parakeet TDT 0.6B v3",
             Self::WhisperLargeV3Turbo => "Whisper Large v3 Turbo",
@@ -634,6 +666,8 @@ impl ModelVariant {
             Self::Lfm25Audio15BGguf => "LFM2.5-Audio-1.5B-GGUF",
             Self::Lfm317BGguf => "LFM3-1.7B-GGUF",
             Self::Lfm317BQ8Gguf => "LFM3-1.7B-Q8_0-GGUF",
+            Self::Lfm3Audio2BGguf => "LFM3-Audio-2B-GGUF",
+            Self::Lfm3Audio2BQ8Gguf => "LFM3-Audio-2B-Q8_0-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
             Self::ParakeetTdt06BV3 => "Parakeet-TDT-0.6B-v3",
             Self::WhisperLargeV3Turbo => "Whisper-Large-v3-Turbo",
@@ -695,6 +729,11 @@ impl ModelVariant {
             Self::Lfm317BGguf => 1_067_539_863,
             // Q8_0 GGUF 1,846,238,496 B + companion files 17,924,183 B
             Self::Lfm317BQ8Gguf => 1_864_162_679,
+            // Q4_K_M GGUF 1,099,626,016 B + mmproj Q8_0 337,862,080 B +
+            // companion files 17,925,353 B (HF tree @ pins)
+            Self::Lfm3Audio2BGguf => 1_455_413_449,
+            // Q8_0 GGUF 1,846,236,704 B + the same mmproj and companions
+            Self::Lfm3Audio2BQ8Gguf => 2_202_024_137,
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
             Self::ParakeetTdt06BV3 => 2_509_332_480,    // .nemo 2,509,332,480 B (HF tree, Oct 2026)
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
@@ -765,6 +804,8 @@ impl ModelVariant {
             Self::Lfm25Audio15BGguf => 5.0,
             Self::Lfm317BGguf => 2.0,
             Self::Lfm317BQ8Gguf => 3.0,
+            Self::Lfm3Audio2BGguf => 3.0,
+            Self::Lfm3Audio2BQ8Gguf => 4.0,
             Self::Kokoro82M => 2.0,
             Self::ParakeetTdt06BV3 => 12.0,
             Self::WhisperLargeV3Turbo => 4.0,
@@ -917,7 +958,10 @@ impl ModelVariant {
 
     /// Whether this is an audio-chat model.
     pub fn is_audio_chat(&self) -> bool {
-        matches!(self.family(), crate::catalog::ModelFamily::Lfm25Audio)
+        matches!(
+            self.family(),
+            crate::catalog::ModelFamily::Lfm25Audio | crate::catalog::ModelFamily::Lfm3Audio
+        )
     }
 
     pub fn is_tts(&self) -> bool {
@@ -954,7 +998,10 @@ impl ModelVariant {
             | Self::Maya13B
             | Self::Maya13BGguf
             | Self::Maya2Native25B => Some("Apache-2.0"),
-            Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => Some("LFM Open License v1.0"),
+            Self::Lfm317BGguf
+            | Self::Lfm317BQ8Gguf
+            | Self::Lfm3Audio2BGguf
+            | Self::Lfm3Audio2BQ8Gguf => Some("LFM Open License v1.0"),
             _ => None,
         }
     }
@@ -967,6 +1014,7 @@ impl ModelVariant {
         matches!(
             self.family(),
             crate::catalog::ModelFamily::Lfm25Audio
+                | crate::catalog::ModelFamily::Lfm3Audio
                 | crate::catalog::ModelFamily::VibeVoiceTts
                 | crate::catalog::ModelFamily::VoxtralTts
                 | crate::catalog::ModelFamily::ChatterboxTts
@@ -1043,6 +1091,16 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+            },
+            Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::LFM3_AUDIO_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                reference_transcript_required: false,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
             },
             Self::Voxtral4BTts2603 => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1172,6 +1230,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::Lfm3Audio => Some(Self::LFM3_AUDIO_MAX_OUTPUT_FRAMES),
             _ => None,
         }
     }
@@ -1186,6 +1245,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::Lfm3Audio => Some(Self::LFM3_AUDIO_FRAME_RATE_HZ),
             _ => None,
         }
     }
@@ -1202,7 +1262,8 @@ impl ModelVariant {
             | crate::catalog::ModelFamily::ChatterboxTts
             | crate::catalog::ModelFamily::Maya1Tts
             | crate::catalog::ModelFamily::Maya2Tts
-            | crate::catalog::ModelFamily::Lfm25Audio => Some(24_000),
+            | crate::catalog::ModelFamily::Lfm25Audio
+            | crate::catalog::ModelFamily::Lfm3Audio => Some(24_000),
             _ => None,
         }
     }
@@ -1253,6 +1314,8 @@ impl ModelVariant {
                 | Self::Lfm25Audio15BGguf
                 | Self::Lfm317BGguf
                 | Self::Lfm317BQ8Gguf
+                | Self::Lfm3Audio2BGguf
+                | Self::Lfm3Audio2BQ8Gguf
                 | Self::Qwen306B4Bit
                 | Self::Qwen317B4Bit
                 | Self::Qwen3Asr06BGguf
@@ -1285,6 +1348,8 @@ impl ModelVariant {
                 | Self::Lfm25Audio15BGguf
                 | Self::Lfm317BGguf
                 | Self::Lfm317BQ8Gguf
+                | Self::Lfm3Audio2BGguf
+                | Self::Lfm3Audio2BQ8Gguf
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
                 | Self::GraniteSpeech502BGguf
@@ -1355,6 +1420,11 @@ impl ModelVariant {
         matches!(self, Self::Lfm317BGguf | Self::Lfm317BQ8Gguf)
     }
 
+    /// Whether this is an LFM3-Audio GGUF variant.
+    pub fn is_lfm3_audio_gguf(&self) -> bool {
+        matches!(self, Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf)
+    }
+
     /// Whether this is an LFM2.5 Audio GGUF bundle variant.
     pub fn is_lfm25_audio_gguf(&self) -> bool {
         matches!(self, Self::Lfm25Audio15BGguf)
@@ -1388,6 +1458,8 @@ impl ModelVariant {
             | Self::Lfm25Audio15BGguf
             | Self::Lfm317BGguf
             | Self::Lfm317BQ8Gguf
+            | Self::Lfm3Audio2BGguf
+            | Self::Lfm3Audio2BQ8Gguf
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => true,
@@ -1429,6 +1501,8 @@ impl ModelVariant {
             Self::Lfm25Audio15BGguf,
             Self::Lfm317BGguf,
             Self::Lfm317BQ8Gguf,
+            Self::Lfm3Audio2BGguf,
+            Self::Lfm3Audio2BQ8Gguf,
             Self::Kokoro82M,
             Self::ParakeetTdt06BV3,
             Self::WhisperLargeV3Turbo,

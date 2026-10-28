@@ -206,7 +206,7 @@ impl ModelFamily {
             Self::Lfm2Chat | Self::Lfm3Chat => excluded(
                 "hybrid state domains keep per-request KV; reuse is not proven for this family",
             ),
-            Self::Lfm25Audio => not_enabled(
+            Self::Lfm25Audio | Self::Lfm3Audio => not_enabled(
                 PrefixReuseEvidenceLevel::NotRun,
                 "audio-chat reuse evidence not collected",
             ),

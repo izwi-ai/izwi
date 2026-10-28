@@ -420,6 +420,13 @@ impl AdminSpeechModelCapabilities {
 
     fn with_languages(mut self, variant: ModelVariant) -> Self {
         self.cross_lingual_reference = crate::api::tts_policy::takes_reference_language(variant);
+        if variant.family() == izwi_core::ModelFamily::Lfm3Audio {
+            self.languages = izwi_core::runtime_models::architectures::lfm3_audio::LFM3_AUDIO_TTS_LOCALES
+                .iter()
+                .map(|(code, name)| AdminSpeechLanguage { code, name })
+                .collect();
+            return self;
+        }
         if variant.family() == izwi_core::ModelFamily::Maya2Tts {
             self.languages = izwi_core::catalog::MAYA2_LANGUAGES
                 .iter()

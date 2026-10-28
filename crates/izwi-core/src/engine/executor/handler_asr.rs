@@ -238,10 +238,11 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
-        // Voxtral and LFM2.5 Audio have their own executors; the forced
-        // aligner and the remaining families do not transcribe.
+        // Voxtral and the LFM audio models have their own executors; the
+        // forced aligner and the remaining families do not transcribe.
         ModelFamily::Voxtral
         | ModelFamily::Lfm25Audio
+        | ModelFamily::Lfm3Audio
         | ModelFamily::Qwen3ForcedAligner
         | ModelFamily::Qwen3Tts
         | ModelFamily::KokoroTts

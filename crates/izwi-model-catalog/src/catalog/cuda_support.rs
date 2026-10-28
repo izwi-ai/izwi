@@ -323,6 +323,7 @@ impl ModelVariant {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Lfm25Audio
+            | ModelFamily::Lfm3Audio
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::Voxtral
             | ModelFamily::Tokenizer => CudaOperatorCapability::source_reviewed(
@@ -384,6 +385,7 @@ impl ModelVariant {
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
+            | ModelFamily::Lfm3Audio
             | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
             // The forced aligner runs one cacheless forward per request.
             ModelFamily::KokoroTts
@@ -521,6 +523,10 @@ impl ModelVariant {
             ModelFamily::GraniteSpeech5Asr => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Granite Speech 5.0 ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and YaRN Granite decoder once the native loader is selected; its RoPE tables are built on the host",
+            ),
+            ModelFamily::Lfm3Audio => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "LFM3-Audio uses Candle CUDA tensor kernels for the quantized LFM3 language model (paged KV with sliding-window layers), the speech encoder, the MaskGIT depth decoder and the LiquidCodec decoder; the mel features, sampling and the inverse FFT run on the host",
             ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts

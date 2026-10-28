@@ -913,7 +913,8 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Maya1Tts
                     | izwi_core::catalog::ModelFamily::Maya2Tts
-                    | izwi_core::catalog::ModelFamily::Lfm25Audio => variant,
+                    | izwi_core::catalog::ModelFamily::Lfm25Audio
+                    | izwi_core::catalog::ModelFamily::Lfm3Audio => variant,
                     other => bail!(
                         "realtime text_to_speech workers support only TTS synthesis families; {model} is {other:?}"
                     ),

@@ -4,10 +4,12 @@
 use super::*;
 
 impl RuntimeService {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn asr_transcribe_audio_chat<F>(
         &self,
         variant: ModelVariant,
         audio_input: AsrAudioInput<'_>,
+        language: Option<&str>,
         max_tokens: Option<usize>,
         streaming_required: bool,
         on_delta: F,
@@ -62,6 +64,10 @@ impl RuntimeService {
                 Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
             })?;
         let observation_job = job.clone();
+        let language = language
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+            .map(str::to_string);
         self.coordinator
             .run_loaded_blocking_stage_with_invocation_workspace(
                 &job,
@@ -96,6 +102,7 @@ impl RuntimeService {
                         .transcribe_with_callback_and_max_tokens_from_invocation_workspace(
                             &samples,
                             sample_rate,
+                            language.as_deref(),
                             max_tokens,
                             leases,
                             &mut delta_sink,
@@ -266,6 +273,7 @@ impl RuntimeService {
                 .asr_transcribe_audio_chat(
                     variant,
                     AsrAudioInput::Base64(audio_base64),
+                    language,
                     max_tokens,
                     false,
                     |_delta| {},
@@ -369,6 +377,7 @@ impl RuntimeService {
                 .asr_transcribe_audio_chat(
                     variant,
                     AsrAudioInput::Base64(audio_base64),
+                    language,
                     max_tokens,
                     true,
                     on_delta,
@@ -460,6 +469,7 @@ impl RuntimeService {
                 .asr_transcribe_audio_chat(
                     variant,
                     AsrAudioInput::Bytes(audio_bytes),
+                    language,
                     max_tokens,
                     false,
                     |_delta| {},
@@ -617,6 +627,7 @@ impl RuntimeService {
                 .asr_transcribe_audio_chat(
                     variant,
                     AsrAudioInput::Bytes(audio_bytes),
+                    language,
                     max_tokens,
                     broker_streaming_required,
                     on_delta,

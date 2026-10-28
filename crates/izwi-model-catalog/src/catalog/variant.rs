@@ -37,6 +37,9 @@ pub enum ModelFamily {
     /// LFM3 text chat: the tri-hybrid trunk on the LFM2 backbone, with its
     /// own chat template and tool-call format.
     Lfm3Chat,
+    /// LFM3-Audio: an LFM3 language model with a speech encoder, a MaskGIT
+    /// depth decoder and the LiquidCodec decoder.
+    Lfm3Audio,
     Gemma3Chat,
     Qwen3ForcedAligner,
     Voxtral,
@@ -57,6 +60,7 @@ impl ModelFamily {
             | Self::GraniteSpeechAsr
             | Self::GraniteSpeech5Asr
             | Self::Lfm25Audio
+            | Self::Lfm3Audio
             | Self::Voxtral => true,
             Self::ParakeetAsr | Self::NemotronAsr => false,
             Self::Qwen3Tts
@@ -403,6 +407,7 @@ impl ModelVariant {
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Lfm317BGguf | Lfm317BQ8Gguf => ModelFamily::Lfm3Chat,
+            Lfm3Audio2BGguf | Lfm3Audio2BQ8Gguf => ModelFamily::Lfm3Audio,
             Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B => ModelFamily::Qwen3ForcedAligner,
             VoxtralMini4BRealtime2602 => ModelFamily::Voxtral,
@@ -437,7 +442,7 @@ impl ModelVariant {
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
             ModelFamily::Voxtral => ModelTask::Asr,
-            ModelFamily::Lfm25Audio => ModelTask::AudioChat,
+            ModelFamily::Lfm25Audio | ModelFamily::Lfm3Audio => ModelTask::AudioChat,
             ModelFamily::Tokenizer => ModelTask::Tokenizer,
         }
     }
@@ -832,6 +837,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(lfm3_variant);
     }
 
+    if let Some(lfm3_audio_variant) = resolve_lfm3_audio_variant(normalized) {
+        return Some(lfm3_audio_variant);
+    }
+
     if let Some(lfm25_audio_variant) = resolve_lfm25_audio_variant(normalized) {
         return Some(lfm25_audio_variant);
     }
@@ -1005,6 +1014,24 @@ fn resolve_lfm3_chat_variant(normalized: &str) -> Option<ModelVariant> {
     }
 
     Some(Lfm317BGguf)
+}
+
+fn resolve_lfm3_audio_variant(normalized: &str) -> Option<ModelVariant> {
+    use ModelVariant::*;
+
+    if !normalized.contains("audio") || !normalized.contains("lfm3") {
+        return None;
+    }
+
+    if !normalized.contains("2b") {
+        return None;
+    }
+
+    if normalized.contains("q80") || normalized.contains("q8") {
+        return Some(Lfm3Audio2BQ8Gguf);
+    }
+
+    Some(Lfm3Audio2BGguf)
 }
 
 fn resolve_lfm25_audio_variant(normalized: &str) -> Option<ModelVariant> {

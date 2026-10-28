@@ -449,6 +449,18 @@ pub fn validate_asr_task(
                 keywords: task.keywords.clone(),
             })
         }
+        // An unknown language fails before the model loads; `auto` and none
+        // let the model pick.
+        ModelFamily::Lfm3Audio => match language
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+        {
+            Some(language) => {
+                crate::models::architectures::lfm3_audio::prompts::asr_language(language)
+                    .map(|_| ())
+            }
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }

@@ -162,6 +162,43 @@ impl GgufLoader {
         }
     }
 
+    /// A view of this file whose tensors answer to other names: `rename`
+    /// maps each stored name to the one callers ask for, or `None` to hide
+    /// it. Data is still read from this file. A loader written for one
+    /// naming scheme can then read a sub-model of a bundle (LFM3-Audio's
+    /// encoder and codec trunks inside its `mmproj` GGUF).
+    pub(crate) fn renamed(&self, rename: impl Fn(&str) -> Option<String>) -> Self {
+        use candle_core::quantized::gguf_file::TensorInfo;
+        let tensor_infos = self
+            .content
+            .tensor_infos
+            .iter()
+            .filter_map(|(name, info)| {
+                rename(name).map(|renamed| {
+                    (
+                        renamed,
+                        TensorInfo {
+                            ggml_dtype: info.ggml_dtype,
+                            shape: info.shape.clone(),
+                            offset: info.offset,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        Self {
+            path: self.path.clone(),
+            tensor_count: tensor_infos.len(),
+            content: GgufContent {
+                magic: self.content.magic,
+                metadata: self.content.metadata.clone(),
+                tensor_infos,
+                tensor_data_offset: self.content.tensor_data_offset,
+            },
+            metadata: self.metadata.clone(),
+        }
+    }
+
     /// Check if a tensor exists in the GGUF file.
     pub fn has_tensor(&self, name: &str) -> bool {
         self.content.tensor_infos.contains_key(name)

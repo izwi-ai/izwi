@@ -35,6 +35,7 @@ impl ModelLifecycleController {
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
+            | ModelFamily::Lfm3Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::VoxtralTts
@@ -48,6 +49,7 @@ impl ModelLifecycleController {
                     ModelFamily::Qwen3Tts
                         | ModelFamily::KokoroTts
                         | ModelFamily::Lfm25Audio
+                        | ModelFamily::Lfm3Audio
                         | ModelFamily::VoxtralTts
                         | ModelFamily::VibeVoiceTts
                         | ModelFamily::FishS2Tts

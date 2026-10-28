@@ -95,6 +95,31 @@ fn lfm2_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     }
 }
 
+/// An LFM3-Audio variant's language model and mmproj GGUFs.
+fn lfm3_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 2]> {
+    match variant {
+        ModelVariant::Lfm3Audio2BGguf => Some([
+            "LFM3-Audio-2B-Q4_K_M.gguf",
+            "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+        ]),
+        ModelVariant::Lfm3Audio2BQ8Gguf => Some([
+            "LFM3-Audio-2B-Q8_0.gguf",
+            "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+        ]),
+        _ => None,
+    }
+}
+
+/// Files the LFM3 GGUF repos do not ship, from the safetensors repo.
+const LFM3_COMPANION_FILES: [&str; 6] = [
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
 fn lfm25_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 4]> {
     match variant {
         ModelVariant::Lfm25Audio15BGguf => Some([
@@ -1736,6 +1761,11 @@ impl ModelDownloader {
                 .expect("checked by is_lfm25_audio_gguf")
                 .into_iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::Lfm3Audio => lfm3_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm3_audio_gguf")
+                .into_iter()
+                .chain(LFM3_COMPANION_FILES)
+                .all(|file| path.join(file).exists()),
             ModelFamily::Qwen3ForcedAligner => {
                 path.join("config.json").exists()
                     && path.join("vocab.json").exists()
@@ -2412,6 +2442,12 @@ impl ModelDownloader {
                 .into_iter()
                 .map(|file| file.to_string())
                 .collect(),
+            ModelFamily::Lfm3Audio => lfm3_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm3_audio_gguf")
+                .into_iter()
+                .chain(LFM3_COMPANION_FILES)
+                .map(|file| file.to_string())
+                .collect(),
             ModelFamily::Qwen3ForcedAligner => {
                 let mut files = vec![
                     "config.json".to_string(),
@@ -2618,7 +2654,10 @@ impl ModelDownloader {
                 .collect();
         }
 
-        if variant.is_lfm2_chat_gguf() || variant.is_lfm3_chat_gguf() {
+        if variant.is_lfm2_chat_gguf()
+            || variant.is_lfm3_chat_gguf()
+            || variant.is_lfm3_audio_gguf()
+        {
             // The GGUF repos ship no tokenizer, so the companion files come
             // from the safetensors repos at a pinned revision: upstream
             // replaced their chat template on 2026-08-05, and an unpinned
@@ -2635,6 +2674,10 @@ impl ModelDownloader {
                 ModelVariant::Lfm317BGguf | ModelVariant::Lfm317BQ8Gguf => (
                     "LiquidAI/LFM3-1.7B",
                     ModelVariant::LFM3_17B_COMPANION_REVISION,
+                ),
+                ModelVariant::Lfm3Audio2BGguf | ModelVariant::Lfm3Audio2BQ8Gguf => (
+                    "LiquidAI/LFM3-Audio-2B",
+                    ModelVariant::LFM3_AUDIO_2B_COMPANION_REVISION,
                 ),
                 _ => (variant.repo_id(), "main"),
             };
@@ -3058,6 +3101,12 @@ impl ModelDownloader {
                 1_049_615_680
             } else if file.contains("LFM3-1.7B-Q8_0") {
                 1_846_238_496
+            } else if file.contains("mmproj-LFM3-Audio-2B-Q8_0") {
+                337_862_080
+            } else if file.contains("LFM3-Audio-2B-Q4_K_M") {
+                1_099_626_016
+            } else if file.contains("LFM3-Audio-2B-Q8_0") {
+                1_846_236_704
             } else if lower.contains("qwen3_asr_0.6b") {
                 1_012_824_608
             } else if lower.contains("qwen3_asr_1.7b") {

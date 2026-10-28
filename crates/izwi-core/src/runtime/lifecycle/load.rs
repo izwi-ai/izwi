@@ -1131,6 +1131,14 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_lfm3_audio_state(
+                variant,
+                model_instance_id,
+                backend,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_qwen_tts_state(
                 variant,
                 model_instance_id,

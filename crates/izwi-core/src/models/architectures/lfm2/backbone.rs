@@ -638,7 +638,9 @@ pub struct QuantizedLfm2Backbone {
     cfg: Lfm2BackboneConfig,
     /// `None` for a backbone that only runs on supplied embeddings.
     token_embeddings: Option<Arc<candle_core::quantized::QTensor>>,
-    output_head: ProjectionHead,
+    /// `None` for a trunk that only produces hidden states (LFM3-Audio's
+    /// encoder and codec decoder run their own heads).
+    output_head: Option<ProjectionHead>,
     layers: Vec<LayerWeights>,
     norm: LfmRmsNorm,
     vocab_size: usize,
@@ -1333,6 +1335,10 @@ impl ShortConvLayer {
 
             if let Some(out) = out {
                 out
+            } else if self.l_cache != 3 {
+                // LFM3's width-7 filters: Candle runs a grouped `Conv1d` as
+                // one convolution per channel, a dispatch each on a GPU.
+                depthwise_causal_conv(&bx, conv_weight)?
             } else {
                 let conv = Conv1d::new(
                     conv_weight
@@ -1571,7 +1577,7 @@ impl ProjectionHead {
 
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
-        Self::load_inner(loader, cfg, device, true)
+        Self::load_inner(loader, cfg, device, BackboneParts::Full)
     }
 
     /// A backbone that only ever runs on supplied embeddings, such as the
@@ -1582,14 +1588,25 @@ impl QuantizedLfm2Backbone {
         cfg: Lfm2BackboneConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::load_inner(loader, cfg, device, false)
+        Self::load_inner(loader, cfg, device, BackboneParts::ForEmbeds)
+    }
+
+    /// The layers and final norm alone, run on supplied embeddings and
+    /// returning hidden states: neither a token table nor an output head
+    /// (LFM3-Audio's encoder and LiquidCodec decoder).
+    pub fn load_trunk(
+        loader: &GgufLoader,
+        cfg: Lfm2BackboneConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(loader, cfg, device, BackboneParts::Trunk)
     }
 
     fn load_inner(
         loader: &GgufLoader,
         cfg: Lfm2BackboneConfig,
         device: &Device,
-        with_token_embeddings: bool,
+        parts: BackboneParts,
     ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (context_length, head_dim) = rope_table_geometry(&cfg)?;
@@ -1625,7 +1642,9 @@ impl QuantizedLfm2Backbone {
         // (`QTensor::embedding`, all backends), which a tied LM head shares:
         // no dequantized copy (512 MiB F32 for LFM2.5's 65,536 x 2,048
         // vocabulary) and no second quantized read for the head.
-        let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
+        let (token_embeddings, vocab_size, hidden_size) = if parts == BackboneParts::Trunk {
+            (None, 0, cfg.embedding_length)
+        } else if parts == BackboneParts::Full {
             let token_embedding_q = load_weight_any(loader, device, &embedding_names)?;
             let (vocab_size, hidden_size) = token_embedding_q.tensor.shape().dims2()?;
             (Some(token_embedding_q), vocab_size, hidden_size)
@@ -1664,7 +1683,9 @@ impl QuantizedLfm2Backbone {
             )?,
             cfg.attention_layer_norm_rms_epsilon,
         )?;
-        let output_head = ProjectionHead::load(loader, device, token_embeddings.as_ref())?;
+        let output_head = (parts != BackboneParts::Trunk)
+            .then(|| ProjectionHead::load(loader, device, token_embeddings.as_ref()))
+            .transpose()?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
@@ -1920,14 +1941,20 @@ impl QuantizedLfm2Backbone {
             .map_err(Error::from)
     }
 
+    fn head(&self) -> Result<&ProjectionHead> {
+        self.output_head.as_ref().ok_or_else(|| {
+            Error::InferenceError("LFM2 trunk was loaded without an output head".into())
+        })
+    }
+
     pub fn project_hidden(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        self.output_head.forward(hidden_states)
+        self.head()?.forward(hidden_states)
     }
 
     pub fn project_last_hidden(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
         let last_hidden = hidden_states.i((.., seq_len - 1, ..))?;
-        self.output_head.forward(&last_hidden)
+        self.head()?.forward(&last_hidden)
     }
 
     pub(crate) fn forward_tokens_physical(
@@ -2265,7 +2292,7 @@ impl QuantizedLfm2Backbone {
             let normalized = self.norm.forward(&hidden_states)?.squeeze(0)?;
             let sample_tokens =
                 Tensor::from_vec(sample_tokens, sample_rows.len(), normalized.device())?;
-            self.output_head
+            self.head()?
                 .forward(&normalized.index_select(&sample_tokens, 0)?)
                 .map(Some)
         })();
@@ -2684,6 +2711,32 @@ impl QuantizedLfm2Backbone {
     }
 }
 
+/// A causal depthwise convolution of `x` `[batch, channels, time]` with
+/// `weight` `[channels, width]`: `out[t] = sum_k weight[k] * x[t + k - (width
+/// - 1)]`, zero before the start, as one shifted multiply-add per tap.
+fn depthwise_causal_conv(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let (batch, channels, time) = x.dims3()?;
+    let width = weight.dim(1)?;
+    let padded = Tensor::cat(
+        &[
+            &Tensor::zeros((batch, channels, width - 1), x.dtype(), x.device())?,
+            x,
+        ],
+        2,
+    )?;
+    let mut out = None::<Tensor>;
+    for tap in 0..width {
+        let term = padded
+            .narrow(2, tap, time)?
+            .broadcast_mul(&weight.narrow(1, tap, 1)?.unsqueeze(0)?)?;
+        out = Some(match out {
+            Some(sum) => (sum + term)?,
+            None => term,
+        });
+    }
+    Ok(out.expect("a filter has at least one tap").contiguous()?)
+}
+
 /// Per-layer input tails of [`QuantizedLfm2Backbone::forward_embeds_stream`]:
 /// the positions consumed and, before each layer, the rows its operator can
 /// still reach. Tensors are immutable, so a clone is an exact checkpoint.
@@ -2697,6 +2750,17 @@ impl Lfm2StatelessStream {
     pub(crate) fn positions(&self) -> usize {
         self.positions
     }
+}
+
+/// What [`QuantizedLfm2Backbone::load_inner`] reads besides the layers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackboneParts {
+    /// Token table, layers and output head.
+    Full,
+    /// Layers and output head; the token table is never read.
+    ForEmbeds,
+    /// Layers and final norm only.
+    Trunk,
 }
 
 /// Attention masking for [`QuantizedLfm2Backbone::forward_embeds_stateless`].
@@ -3717,6 +3781,39 @@ pub(crate) mod tests {
     #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
     fn unfused_shortconv_ring_falls_back_on_cuda() {
         assert_unfused_ring_matches_cpu(&Device::new_cuda(0).expect("CUDA device required"));
+    }
+
+    #[test]
+    fn depthwise_causal_conv_matches_a_grouped_conv1d() {
+        let device = Device::Cpu;
+        let (channels, width, time) = (5, 7, 11);
+        let x = Tensor::randn(0f32, 1.0, (2, channels, time), &device).unwrap();
+        let weight = Tensor::randn(0f32, 1.0, (channels, width), &device).unwrap();
+        let conv = candle_nn::Conv1d::new(
+            weight.reshape((channels, 1, width)).unwrap(),
+            None,
+            candle_nn::Conv1dConfig {
+                padding: width - 1,
+                groups: channels,
+                ..Default::default()
+            },
+        );
+        let expected = candle_nn::Module::forward(&conv, &x)
+            .unwrap()
+            .narrow(2, 0, time)
+            .unwrap();
+        let actual = super::depthwise_causal_conv(&x, &weight).unwrap();
+        let worst = (expected - actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(worst < 1e-5, "worst difference {worst}");
     }
 
     /// The host ring loop sums the same taps in the same order as the op

@@ -71,6 +71,12 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         },
     },
     DispatchRoute {
+        name: "lfm3_audio_tts",
+        task: TaskType::TTS,
+        variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::Lfm3Audio),
+        handler: NativeExecutor::lfm3_audio_tts_request,
+    },
+    DispatchRoute {
         name: "tts",
         task: TaskType::TTS,
         variant_matcher: None,

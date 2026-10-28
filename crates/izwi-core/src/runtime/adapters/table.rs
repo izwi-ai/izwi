@@ -358,6 +358,16 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // Audio chat.
         row(F::Lfm25Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm25Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
+        // LFM3-Audio runs every request as one atomic invocation on leased
+        // pages and ring. Speech streams from the engine as frames decode;
+        // ASR runs on the direct audio-chat route, long audio chunked
+        // inside the invocation.
+        row(F::Lfm3Audio, C::Tts, Loaded::Scalar, Invocation).chunked(),
+        row(F::Lfm3Audio, C::Asr, Loaded::Scalar, Invocation)
+            .chunked()
+            .target(Target::DirectModel),
+        row(F::Lfm3Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
+        row(F::Lfm3Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
         // Chat.
         chat(F::Qwen3Chat).only(QWEN3_RESUMABLE_CHAT).resumable(),
         chat(F::Qwen3Chat).only(QWEN3_ATOMIC_CHAT),

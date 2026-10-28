@@ -21,6 +21,7 @@ mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
 mod handler_chatterbox;
+mod handler_lfm3_audio;
 mod handler_maya1;
 mod handler_maya2;
 #[path = "executor/handler_tts.rs"]

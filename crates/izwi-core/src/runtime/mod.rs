@@ -19,6 +19,8 @@ pub(crate) mod fish_capacity;
 mod forced_alignment;
 mod health;
 mod kokoro;
+#[cfg(test)]
+mod lfm3_audio_tests;
 mod lifecycle;
 mod pipeline;
 mod request;

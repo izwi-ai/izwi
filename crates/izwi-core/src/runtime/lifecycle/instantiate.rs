@@ -97,7 +97,7 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
             registry.load_voxtral(variant, model_path).await?;
             InstantiatedPayload::None
         }
-        ModelFamily::Lfm25Audio => {
+        ModelFamily::Lfm25Audio | ModelFamily::Lfm3Audio => {
             registry.load_audio_chat(variant, model_path).await?;
             InstantiatedPayload::None
         }

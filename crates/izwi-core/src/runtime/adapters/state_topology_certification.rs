@@ -168,6 +168,9 @@ fn certified_topology(
         (Lfm25Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, Tts) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
+        // LFM3-Audio runs every capability as one scalar invocation on the
+        // language model's pages and ShortConv ring.
+        (Lfm3Audio, Asr | Tts | AudioChat | SpeechToSpeech) => InvocationPagedRing,
 
         (SortformerDiarization, Diarization) => InvocationTensor,
         (Qwen3ForcedAligner, ForcedAlignment) => Stateless,
