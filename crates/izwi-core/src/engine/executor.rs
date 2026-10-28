@@ -3024,13 +3024,20 @@ impl ModelExecutor for NativeExecutor {
         // LFM loaders and retained-state contracts currently use F32 regardless
         // of the global device preference. Report the representation actually
         // consumed by these executors, including the cache namespace.
-        if matches!(
-            variant.family(),
-            crate::catalog::ModelFamily::Lfm25Audio | crate::catalog::ModelFamily::Lfm3Audio
-        ) {
-            // The audio models keep F32 activations and F32 invocation KV.
+        if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+            // LFM2.5-Audio keeps F32 activations and F32 invocation KV.
             profile.compute_dtype = "f32".into();
             profile.kv_dtype = "f32".into();
+        } else if variant.family() == crate::catalog::ModelFamily::Lfm3Audio {
+            // F32 activations; invocation KV as `lfm3_audio_kv_dtype` stores
+            // it (F16 on Metal and CUDA, F32 on CPU).
+            use crate::models::architectures::lfm3_audio::physical::lfm3_audio_kv_dtype;
+            profile.compute_dtype = "f32".into();
+            profile.kv_dtype = match lfm3_audio_kv_dtype(self.config.backend) {
+                crate::kv::v2::StateDType::F16 => "f16",
+                _ => "f32",
+            }
+            .into();
         } else if matches!(
             variant.family(),
             crate::catalog::ModelFamily::Lfm2Chat | crate::catalog::ModelFamily::Lfm3Chat
@@ -6883,7 +6890,8 @@ mod tests {
     }
 
     /// The profile names the storage the LFM executors actually use: chat
-    /// KV is F16 on Metal and CUDA and F32 on CPU; the audio models keep F32.
+    /// and LFM3-Audio KV is F16 on Metal and CUDA and F32 on CPU;
+    /// LFM2.5-Audio keeps F32.
     #[test]
     fn lfm_profiles_report_the_kv_dtype_they_store() {
         for (backend, chat_kv) in [
@@ -6899,7 +6907,7 @@ mod tests {
                 (ModelVariant::Lfm2512BInstructGguf, chat_kv),
                 (ModelVariant::Lfm317BGguf, chat_kv),
                 (ModelVariant::Lfm25Audio15BGguf, "f32"),
-                (ModelVariant::Lfm3Audio2BGguf, "f32"),
+                (ModelVariant::Lfm3Audio2BGguf, chat_kv),
             ] {
                 let mut request = if variant.is_chat() {
                     EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {

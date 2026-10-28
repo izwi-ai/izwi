@@ -106,9 +106,14 @@ fn fresh_state(model: &Lfm3AudioModel) -> RetainedLmState {
         .max()
         .unwrap();
     let head_dim = config.embedding_length / config.attention_head_count;
+    // The KV storage production leases on this backend.
+    let kv_dtype = match super::super::physical::lfm3_audio_kv_dtype(model.device().kind.into()) {
+        crate::kv::v2::StateDType::F16 => DType::F16,
+        _ => DType::F32,
+    };
     let cache = test_physical_caches_for_model_layers_on(
         &model.device().device,
-        DType::F32,
+        kv_dtype,
         &layout.attention_model_layers,
         kv_heads,
         head_dim,

@@ -3,19 +3,25 @@
 //! is stateless and the encoder and codec streams are bounded host state,
 //! so no other domain exists. The domain ids are LFM2.5-Audio's, so the
 //! engine's audio-chat leases serve both families.
+//!
+//! Each workload leases only the context it can use (a 30 s ASR chunk, one
+//! TTS segment, a conversation), and paged KV is F16 on Metal and CUDA, so
+//! the four capabilities of one loaded model reserve a few hundred MiB per
+//! row instead of four full 32K-token contexts.
 
+use crate::backends::BackendKind;
 use crate::engine::{NativeBatchMode, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationLeaseScope,
     InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
     InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy, RetainedStateCapability,
-    StateCapacityAxis, StateCapacityBinding, StateDomainId, StateDomainSpec, WorkspaceFormula,
-    CURRENT_INFERENCE_STATE_ABI,
+    StateCapacityAxis, StateCapacityBinding, StateDType, StateDomainId, StateDomainSpec,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::lfm2::config::Lfm2BackboneConfig;
 use crate::models::architectures::lfm2::physical::{
-    lfm2_main_invocation_contract, paged_f32_invocation_bytes, ring_f32_invocation_bytes,
+    lfm2_main_invocation_contract_with_kv, paged_invocation_bytes, ring_f32_invocation_bytes,
     Lfm2StateIds, Lfm2StateLayout,
 };
 use crate::models::architectures::lfm25_audio::physical::{
@@ -23,9 +29,43 @@ use crate::models::architectures::lfm25_audio::physical::{
     LFM25_MAIN_SHORTCONV_STATE_DOMAIN, LFM25_MAIN_STATE_GROUP,
 };
 
-/// The invocation workspace of one scalar LFM3-Audio request.
+/// What a capability's invocation holds, which bounds its context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lfm3AudioWorkload {
+    /// One ASR chunk of at most 30 s: the prompt, 375 encoder tokens and
+    /// at most 512 text tokens.
+    Asr,
+    /// One TTS segment: the prompt with its text and at most 2,048 frames.
+    Tts,
+    /// A voice-chat turn: the history, the spoken turn and the reply.
+    Conversation,
+}
+
+impl Lfm3AudioWorkload {
+    /// Tokens of language-model context the workload's invocation leases.
+    pub(crate) const fn context_tokens(self) -> usize {
+        match self {
+            Self::Asr => 2_048,
+            Self::Tts => 4_096,
+            Self::Conversation => 16_384,
+        }
+    }
+}
+
+/// The paged KV storage LFM3-Audio uses on `backend`: F16 on Metal and
+/// CUDA, F32 on the CPU (as LFM chat stores it).
+pub(crate) const fn lfm3_audio_kv_dtype(backend: BackendKind) -> StateDType {
+    match backend {
+        BackendKind::Cpu => StateDType::F32,
+        BackendKind::Metal | BackendKind::Cuda => StateDType::F16,
+    }
+}
+
+/// The invocation workspace of one scalar LFM3-Audio request of `workload`.
 pub(crate) fn lfm3_audio_physical_state_spec(
     lm_config: &Lfm2BackboneConfig,
+    workload: Lfm3AudioWorkload,
+    kv_dtype: StateDType,
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<Lfm25AudioPhysicalStateSpec> {
     if stage_graphs.is_empty() {
@@ -49,7 +89,7 @@ pub(crate) fn lfm3_audio_physical_state_spec(
         }
     }
     let layout = Lfm2StateLayout::from_config(lm_config)?;
-    let invocation = lfm2_main_invocation_contract(
+    let invocation = lfm2_main_invocation_contract_with_kv(
         lm_config,
         &layout,
         Lfm2StateIds {
@@ -57,9 +97,19 @@ pub(crate) fn lfm3_audio_physical_state_spec(
             shortconv: LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
             main_group: LFM25_MAIN_STATE_GROUP,
         },
+        kv_dtype,
     )?;
-    let context = u64::try_from(lm_config.context_length)
+    let context = u64::try_from(workload.context_tokens().min(lm_config.context_length))
         .map_err(|_| Error::ModelLoadError("LFM3-Audio context exceeds u64".into()))?;
+    let kv_element_bytes = match kv_dtype {
+        StateDType::F32 => 4,
+        StateDType::F16 | StateDType::Bf16 => 2,
+        other => {
+            return Err(Error::ModelLoadError(format!(
+                "LFM3-Audio paged KV cannot be stored as {other:?}"
+            )))
+        }
+    };
     let max_domain_id = invocation
         .domains
         .iter()
@@ -84,9 +134,10 @@ pub(crate) fn lfm3_audio_physical_state_spec(
                             )?,
                         };
                         (
-                            paged_f32_invocation_bytes(
+                            paged_invocation_bytes(
                                 &state,
                                 capacity.paged_max_tokens().expect("paged capacity"),
+                                kv_element_bytes,
                             )?,
                             capacity,
                         )

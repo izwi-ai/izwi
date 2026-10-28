@@ -1027,15 +1027,18 @@ impl ModelLifecycleController {
             CapabilityKind::SpeechToSpeech,
         ];
         for (index, capability) in capabilities.into_iter().enumerate() {
+            use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
             let contracts = bundle_draft.execution_contracts(capability)?;
             let stage_graphs = contracts
                 .iter()
                 .map(|contract| contract.stages.as_ref())
                 .collect::<Vec<_>>();
-            let physical_spec = model.physical_state_spec(
-                crate::models::architectures::lfm25_audio::physical::Lfm25AudioStateMode::MainOnly,
-                &stage_graphs,
-            )?;
+            let workload = match capability {
+                CapabilityKind::Asr => Lfm3AudioWorkload::Asr,
+                CapabilityKind::Tts => Lfm3AudioWorkload::Tts,
+                _ => Lfm3AudioWorkload::Conversation,
+            };
+            let physical_spec = model.lfm3_audio_physical_state_spec(workload, &stage_graphs)?;
             let publication = self
                 .load_invocation_workspace_publication_with_remaining_groups(
                     model_instance_id,

@@ -135,7 +135,18 @@ pub(crate) fn lfm2_main_invocation_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
-    lfm2_main_contract(config, layout, ids, invocation_header, StateDType::F32)
+    lfm2_main_invocation_contract_with_kv(config, layout, ids, StateDType::F32)
+}
+
+/// [`lfm2_main_invocation_contract`] with paged KV stored as `kv_dtype`
+/// (activations stay F32; the attention call sites cast to and from it).
+pub(crate) fn lfm2_main_invocation_contract_with_kv(
+    config: &Lfm2BackboneConfig,
+    layout: &Lfm2StateLayout,
+    ids: Lfm2StateIds,
+    kv_dtype: StateDType,
+) -> Result<InferenceStateContract> {
+    lfm2_main_contract(config, layout, ids, invocation_header, kv_dtype)
 }
 
 /// Scheduler-owned cache contract for incremental LFM2 chat.
@@ -305,6 +316,16 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
 }
 
 pub(crate) fn paged_f32_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+    paged_invocation_bytes(state, max_tokens, 4)
+}
+
+/// The bytes of a paged invocation domain holding `max_tokens` (rounded up
+/// to whole pages) at `element_bytes` per K/V element.
+pub(crate) fn paged_invocation_bytes(
+    state: &StateDomainSpec,
+    max_tokens: u64,
+    element_bytes: u64,
+) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 paged byte bound received non-paged state".into(),
@@ -333,7 +354,7 @@ pub(crate) fn paged_f32_invocation_bytes(state: &StateDomainSpec, max_tokens: u6
         .try_fold(0_u64, |total, layer| {
             let per_token = u64::from(layer.kv_heads)
                 .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
-                .and_then(|elements| elements.checked_mul(4))
+                .and_then(|elements| elements.checked_mul(element_bytes))
                 .ok_or_else(|| Error::ModelLoadError("LFM2 KV geometry overflow".into()))?;
             total
                 .checked_add(per_token)

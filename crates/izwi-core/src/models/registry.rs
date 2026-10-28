@@ -72,7 +72,9 @@ use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::lfm3_audio::model::{InvocationLmState, Lfm3AudioModel};
-use crate::models::architectures::lfm3_audio::physical::lfm3_audio_physical_state_spec;
+use crate::models::architectures::lfm3_audio::physical::{
+    lfm3_audio_kv_dtype, lfm3_audio_physical_state_spec, Lfm3AudioWorkload,
+};
 use crate::models::architectures::maya1::Maya1TtsModel;
 use crate::models::architectures::maya2::Maya2TtsModel;
 use crate::models::architectures::nemotron::asr::{
@@ -3782,10 +3784,30 @@ impl NativeAudioChatModel {
         match self {
             Self::Lfm25Audio(model) => model.physical_state_spec(mode, stage_graphs),
             // One scalar invocation: the language model's paged attention
-            // and ShortConv ring, whatever the capability.
-            Self::Lfm3Audio(model) => {
-                lfm3_audio_physical_state_spec(model.lm_config(), stage_graphs)
+            // and ShortConv ring, sized for a conversation.
+            Self::Lfm3Audio(_) => {
+                self.lfm3_audio_physical_state_spec(Lfm3AudioWorkload::Conversation, stage_graphs)
             }
+        }
+    }
+
+    /// LFM3-Audio's invocation workspace for `workload`: the context that
+    /// workload can use, with paged KV in the backend's storage dtype.
+    pub(crate) fn lfm3_audio_physical_state_spec(
+        &self,
+        workload: Lfm3AudioWorkload,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioPhysicalStateSpec> {
+        match self {
+            Self::Lfm3Audio(model) => lfm3_audio_physical_state_spec(
+                model.lm_config(),
+                workload,
+                lfm3_audio_kv_dtype(BackendKind::from(model.device().kind)),
+                stage_graphs,
+            ),
+            Self::Lfm25Audio(_) => Err(Error::InvalidInput(
+                "LFM2.5-Audio has no LFM3-Audio workload spec".into(),
+            )),
         }
     }
 

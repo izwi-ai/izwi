@@ -114,6 +114,9 @@ pub(crate) trait Lfm3AudioLmState {
     /// Empty the state before a generation; it may hold an earlier one's.
     fn reset(&mut self) -> Result<()>;
 
+    /// Positions the state can hold: the context this request leased.
+    fn capacity_tokens(&self) -> usize;
+
     fn forward(
         &mut self,
         lm: &QuantizedLfm2Backbone,
@@ -136,6 +139,10 @@ impl Lfm3AudioLmState for InvocationLmState<'_> {
             self.shortconv.reset_invocation()?;
         }
         Ok(())
+    }
+
+    fn capacity_tokens(&self) -> usize {
+        self.cache.capacity_tokens()
     }
 
     fn forward(
@@ -162,6 +169,10 @@ impl Lfm3AudioLmState for RetainedLmState {
             ));
         }
         Ok(())
+    }
+
+    fn capacity_tokens(&self) -> usize {
+        self.cache.capacity_tokens()
     }
 
     fn forward(
@@ -335,12 +346,15 @@ impl Lfm3AudioModel {
     ) -> Result<Lfm3AudioOutput> {
         let (embeds, prompt_tokens) = self.prompt_embeds(&request)?;
         state.reset()?;
-        if prompt_tokens + request.max_slots > self.lm_config.context_length {
+        // The request leases a context sized for its workload: a prompt
+        // that fills it is refused, and the slots stop where it ends.
+        let context = state.capacity_tokens().min(self.lm_config.context_length);
+        if prompt_tokens >= context {
             return Err(Error::InvalidInput(format!(
-                "LFM3-Audio prompt of {prompt_tokens} tokens plus {} slots exceeds the {}-token context",
-                request.max_slots, self.lm_config.context_length
+                "LFM3-Audio prompt of {prompt_tokens} tokens does not fit this request's {context}-token context"
             )));
         }
+        let max_slots = request.max_slots.min(context - prompt_tokens);
         let hidden = state.forward(&self.lm, &embeds, 0)?;
         let mut last = hidden
             .i((.., prompt_tokens - 1..prompt_tokens, ..))?
@@ -381,7 +395,7 @@ impl Lfm3AudioModel {
             Ok(())
         };
 
-        for slot in 0..request.max_slots {
+        for slot in 0..max_slots {
             if should_stop() {
                 output.stop_reason = "cancelled";
                 break;
@@ -489,7 +503,7 @@ impl Lfm3AudioModel {
                 output.stop_reason = "eos";
                 break;
             }
-            if slot + 1 == request.max_slots {
+            if slot + 1 == max_slots {
                 break;
             }
             let hidden = state.forward(&self.lm, &next, prompt_tokens + slot)?;
@@ -586,7 +600,9 @@ impl Lfm3AudioModel {
             &mut |_| {},
         )?;
         if output.stop_reason == "cancelled" {
-            return Err(Error::Cancelled("LFM3-Audio transcription cancelled".into()));
+            return Err(Error::Cancelled(
+                "LFM3-Audio transcription cancelled".into(),
+            ));
         }
         Ok(output.text.trim().to_string())
     }
