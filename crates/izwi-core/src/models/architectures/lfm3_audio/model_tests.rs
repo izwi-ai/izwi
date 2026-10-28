@@ -556,10 +556,8 @@ fn rows_are_batch_invariant(profile: DeviceProfile) {
         return;
     }
     let backend = format!("{:?}", profile.kind);
-    let mut model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
-    let differs = lm_decode_rows(&model, false) != lm_decode_rows(&model, true);
-    eprintln!("{backend}: default rows differ alone and four wide: {differs}");
-    model.lm.make_decode_rows_invariant();
+    // LFM3-Audio loads with `make_decode_rows_invariant` on.
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
     assert_eq!(
         lm_decode_rows(&model, false),
         lm_decode_rows(&model, true),

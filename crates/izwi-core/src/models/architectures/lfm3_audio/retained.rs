@@ -217,9 +217,9 @@ impl Lfm3AudioModel {
     }
 
     /// One decode step for every row: each fills its next slot (the speaking
-    /// rows' frames drawn apart, each from its own generator), then every row
-    /// that continues feeds its slot back through one batched forward of the
-    /// language model. Returns whether each row has finished.
+    /// rows' frames in one depth batch, each from its own generator), then
+    /// every row that continues feeds its slot back through one batched
+    /// forward of the language model. Returns whether each row has finished.
     pub(crate) fn retained_decode_batch(
         &self,
         rows: &mut [Lfm3AudioStepRow<'_>],

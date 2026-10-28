@@ -5,7 +5,8 @@
 //! `IZWI_LFM3_AUDIO_MODELS_DIR` names the models directory and is otherwise
 //! reported as not run.
 //!
-//! `IZWI_LFM3_AUDIO_BACKEND=metal` runs it on Metal instead of the CPU.
+//! `IZWI_LFM3_AUDIO_BACKEND=metal` runs it on Metal instead of the CPU, and
+//! `IZWI_LFM3_AUDIO_BATCH=4` runs speech rows four wide.
 //!
 //! Run: `IZWI_LFM3_AUDIO_MODELS_DIR=~/Library/Application\ Support/izwi/models cargo test -p izwi-core --features metal --release --lib lfm3_audio_tests -- --nocapture`
 
@@ -83,9 +84,20 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
             "lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set",
         )
     });
+    // Speech rows run two wide on CPU and Metal (the portable certified
+    // width); `IZWI_LFM3_AUDIO_BATCH=4` sets an explicit width, as an
+    // operator's `IZWI_MAX_BATCH_SIZE` does.
+    let max_batch_size = std::env::var("IZWI_LFM3_AUDIO_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(std::num::NonZeroUsize::new)
+        .map_or(crate::config::BatchSizePreference::Auto, |rows| {
+            crate::config::BatchSizePreference::Fixed(rows)
+        });
     let runtime = RuntimeService::new(EngineConfig {
         models_dir: models_dir.into(),
         backend,
+        max_batch_size,
         ..Default::default()
     })
     .expect("runtime");
@@ -102,6 +114,15 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         snapshot.reserved_host_memory_bytes as f64 / f64::from(1u32 << 30),
         resident_bytes() as f64 / f64::from(1u32 << 30),
     );
+    for model in runtime.core_engine.kv_cache_snapshot().await.models {
+        eprintln!(
+            "arena: {} tokens per sequence, {} aggregate, {} full-context rows, retained rows {:?}",
+            model.single_sequence_token_capacity,
+            model.aggregate_token_capacity,
+            model.full_context_sequence_capacity,
+            model.retained_sequence_capacity
+        );
+    }
     let model_id = variant.to_string();
     let fox =
         std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav"))
@@ -211,6 +232,7 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         );
     }
     let serial = started.elapsed();
+    let before = crate::engine::metrics::engine_batch_metrics_snapshot();
     let started = Instant::now();
     let together = futures::future::join_all(
         requests
@@ -219,6 +241,15 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
     )
     .await;
     let concurrent = started.elapsed();
+    let after = crate::engine::metrics::engine_batch_metrics_snapshot();
+    let batches = after.model_tensor_batches_total - before.model_tensor_batches_total;
+    let rows = after.model_tensor_batch_rows_total - before.model_tensor_batch_rows_total;
+    let scalar = after.model_scalar_row_dispatches_total - before.model_scalar_row_dispatches_total;
+    eprintln!(
+        "TTS x{}: {batches} tensor calls over {rows} rows (mean width {:.2}), {scalar} scalar rows",
+        requests.len(),
+        rows as f64 / batches.max(1) as f64
+    );
     let audio: f64 = alone
         .iter()
         .map(|result| result.samples.len() as f64 / f64::from(result.sample_rate))

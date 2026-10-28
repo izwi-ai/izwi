@@ -174,7 +174,9 @@ impl Lfm3DepthDecoder {
     /// The frame inputs `[rows, CODEBOOKS, HIDDEN]` of language-model hidden
     /// states `[rows, 2048]`: computed once per frame, shared by its passes.
     /// Each row projects as its own `[1, 1, 2048]` mat-vec, so its inputs do
-    /// not depend on the rows beside it.
+    /// not depend on the rows beside it; the rest of the pass is row-local at
+    /// any row count (a real-weight test holds each row's frames alone and
+    /// four wide).
     pub(crate) fn frame_inputs(&self, hidden: &Tensor) -> Result<Tensor> {
         let rows = hidden.dim(0)?;
         Ok(self
@@ -301,22 +303,6 @@ impl Lfm3DepthDecoder {
             return Err(Error::InvalidInput(
                 "LFM3-Audio depth rows do not match their histories".into(),
             ));
-        }
-        if rows > 1 {
-            // Rows sample apart: the trunk's matmuls round differently at
-            // another row count, and a row must draw the same frame alone or
-            // beside others. Each row's generator is its own, so the order
-            // of rows does not matter.
-            let mut frames = Vec::with_capacity(rows);
-            for row in 0..rows {
-                frames.extend(self.sample_frames(
-                    &hidden.narrow(0, row, 1)?,
-                    &samplings[row..=row],
-                    &histories[row..=row],
-                    &mut rngs[row..=row],
-                )?);
-            }
-            return Ok(frames);
         }
         let inputs = self.frame_inputs(hidden)?;
         let orders = rngs
