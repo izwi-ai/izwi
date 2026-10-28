@@ -466,6 +466,24 @@ thread_local! {
     /// `QMatMul`, for A/B timing against the small-batch mat-vec.
     pub(crate) static FORCE_CANDLE_MATVEC: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test-only switch that sends this thread's LFM3 sandwich norms and
+    /// attention output gates down the op-by-op path, for A/B timing
+    /// against `kernels::metal_lfm_norm`.
+    pub(crate) static FORCE_UNFUSED_LFM_NORM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether the LFM3 sandwich norm and output gate fusions run on `device`:
+/// Metal with fused kernels on and diagnostics off.
+#[cfg(feature = "metal")]
+fn lfm_norm_fusion_on(device: &Device) -> bool {
+    #[cfg(test)]
+    if FORCE_UNFUSED_LFM_NORM.with(std::cell::Cell::get) {
+        return false;
+    }
+    device.is_metal()
+        && crate::kernels::use_fused_kernels_for_device(device)
+        && !diagnostics::enabled()
 }
 
 /// One decode step's KV writes and next ShortConv states, not yet
@@ -618,14 +636,68 @@ impl LayerWeights {
         }
     }
 
-    /// The FFN of a normalized input, as the residual stream receives it.
-    fn ffn_output(&self, normalized: &Tensor) -> Result<Tensor> {
+    /// `residual` plus the operator output as the residual stream receives
+    /// it; `check` sees the output before the add when it is computed apart.
+    fn operator_residual(
+        &self,
+        hidden: Tensor,
+        residual: &Tensor,
+        check: impl Fn(&Tensor, &str) -> Result<()>,
+    ) -> Result<Tensor> {
+        let fused = fused_sandwich_add(self.post_operator_norm.as_ref(), &hidden, residual)?;
+        if let Some(sum) = fused {
+            return Ok(sum);
+        }
+        let hidden = self.operator_output(hidden)?;
+        check(&hidden, "operator output")?;
+        Ok((&hidden + residual)?)
+    }
+
+    /// `residual` plus the FFN of a normalized input, as
+    /// [`Self::operator_residual`] adds the operator output.
+    fn ffn_residual(
+        &self,
+        normalized: &Tensor,
+        residual: &Tensor,
+        check: impl Fn(&Tensor, &str) -> Result<()>,
+    ) -> Result<Tensor> {
         let output = self.mlp.forward(normalized)?;
-        match &self.post_ffn_norm {
-            Some(norm) => norm.forward(&output.contiguous()?),
-            None => Ok(output),
+        if let Some(sum) = fused_sandwich_add(self.post_ffn_norm.as_ref(), &output, residual)? {
+            return Ok(sum);
+        }
+        let output = match &self.post_ffn_norm {
+            Some(norm) => norm.forward(&output.contiguous()?)?,
+            None => output,
+        };
+        check(&output, "MLP output")?;
+        Ok((&output + residual)?)
+    }
+}
+
+/// `residual + norm(output)` in one Metal dispatch for an LFM3 sandwich
+/// norm, or `None` where the ops run apart: no sandwich norm, another
+/// device, or diagnostics on (they check the norm's output).
+fn fused_sandwich_add(
+    norm: Option<&LfmRmsNorm>,
+    output: &Tensor,
+    residual: &Tensor,
+) -> Result<Option<Tensor>> {
+    #[cfg(feature = "metal")]
+    if let Some(norm) = norm {
+        if lfm_norm_fusion_on(output.device()) {
+            let output = output.contiguous()?;
+            let residual = residual.contiguous()?;
+            return Ok(crate::kernels::metal_lfm_norm::try_rms_norm_add(
+                &output,
+                &residual,
+                norm.weight(),
+                norm.eps(),
+            ));
         }
     }
+    #[cfg(not(feature = "metal"))]
+    let _ = (norm, output, residual);
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -817,7 +889,19 @@ impl AttentionLayer {
         };
         let dims = attn_output.dims();
         let lead = &dims[..dims.len() - 1];
-        let gate = candle_nn::ops::sigmoid(&gate.forward(input)?)?;
+        let gate = gate.forward(input)?;
+        #[cfg(feature = "metal")]
+        if lfm_norm_fusion_on(attn_output.device()) {
+            let heads = attn_output.contiguous()?;
+            if let Some(gated) = crate::kernels::metal_lfm_norm::try_sigmoid_gate(
+                &heads,
+                &gate.contiguous()?,
+                self.head_dim,
+            ) {
+                return self.wo.forward(&gated).map_err(Error::from);
+            }
+        }
+        let gate = candle_nn::ops::sigmoid(&gate)?;
         let heads = attn_output.reshape([lead, &[self.n_head, self.head_dim]].concat())?;
         let gate = gate.reshape([lead, &[self.n_head, 1]].concat())?;
         let gated = heads.broadcast_mul(&gate)?.reshape(dims)?;
@@ -2129,16 +2213,15 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_retained_decode_batch(&hidden, &mut refs)?
                     }
                 };
-                let hidden = layer.operator_output(hidden)?;
-                diagnostics::check_batch_layer(&hidden, "operator output", layer_idx, positions)?;
-                hidden_states = (&hidden + &residual)?;
+                let check = |tensor: &Tensor, stage: &str| {
+                    diagnostics::check_batch_layer(tensor, stage, layer_idx, positions)
+                };
+                hidden_states = layer.operator_residual(hidden, &residual, check)?;
                 diagnostics::check_batch_layer(&hidden_states, "residual", layer_idx, positions)?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
                 diagnostics::check_batch_layer(&hidden, "FFN norm", layer_idx, positions)?;
-                let mlp = layer.ffn_output(&hidden)?;
-                diagnostics::check_batch_layer(&mlp, "MLP output", layer_idx, positions)?;
-                hidden_states = (&mlp + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
                 diagnostics::check_batch_layer(
                     &hidden_states,
                     "MLP residual",
@@ -2279,12 +2362,10 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_mixed(&hidden, &layout, &mut working)?
                     }
                 };
-                let hidden = layer.operator_output(hidden)?;
-                hidden_states = (&hidden + &residual)?;
+                hidden_states = layer.operator_residual(hidden, &residual, |_, _| Ok(()))?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let mlp = layer.ffn_output(&hidden)?;
-                hidden_states = (&mlp + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, |_, _| Ok(()))?;
             }
             if sample_tokens.is_empty() {
                 return Ok(None);
@@ -2448,16 +2529,15 @@ impl QuantizedLfm2Backbone {
                 }
                 LayerKind::ShortConv(layer) => layer.forward_retained(&hidden, &mut working)?,
             };
-            let hidden = layer.operator_output(hidden)?;
-            diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-            hidden_states = (&hidden + &residual)?;
+            let check = |tensor: &Tensor, stage: &str| {
+                diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+            };
+            hidden_states = layer.operator_residual(hidden, &residual, check)?;
             diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
             let residual = hidden_states.clone();
             let hidden = layer.ffn_norm.forward(&hidden_states)?;
             diagnostics::check_layer(&hidden, "FFN norm", layer_idx, index_pos)?;
-            let mlp = layer.ffn_output(&hidden)?;
-            diagnostics::check_layer(&mlp, "MLP output", layer_idx, index_pos)?;
-            hidden_states = (&mlp + &residual)?;
+            hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
             diagnostics::check_layer(&hidden_states, "MLP residual", layer_idx, index_pos)?;
         }
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -2543,16 +2623,15 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_physical(&hidden, transaction)?
                     }
                 };
-                let hidden = layer.operator_output(hidden)?;
-                diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-                hidden_states = (&hidden + &residual)?;
+                let check = |tensor: &Tensor, stage: &str| {
+                    diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+                };
+                hidden_states = layer.operator_residual(hidden, &residual, check)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let hidden = layer.ffn_output(&hidden)?;
-                diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
-                hidden_states = (&hidden + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
             }
             {
@@ -2627,16 +2706,15 @@ impl QuantizedLfm2Backbone {
             }
             LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
         };
-        let hidden = layer.operator_output(hidden)?;
-        diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-        let hidden_states = (&hidden + &residual)?;
+        let check = |tensor: &Tensor, stage: &str| {
+            diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+        };
+        let hidden_states = layer.operator_residual(hidden, &residual, check)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
         let residual = hidden_states.clone();
         let hidden = layer.ffn_norm.forward(&hidden_states)?;
-        let hidden = layer.ffn_output(&hidden)?;
-        diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
-        let hidden_states = (&hidden + &residual)?;
+        let hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
         Ok(hidden_states)
     }
