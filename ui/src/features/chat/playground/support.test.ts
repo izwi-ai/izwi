@@ -42,6 +42,8 @@ describe("chat playground support", () => {
     expect(supportsImplicitOpenThinkTagParsing("LFM2.5-1.2B-Instruct-GGUF")).toBe(
       false,
     );
+    expect(supportsImplicitOpenThinkTagParsing("LFM3-1.7B-GGUF")).toBe(true);
+    expect(supportsImplicitOpenThinkTagParsing("LFM3-1.7B-Q8_0-GGUF")).toBe(true);
     expect(
       parseAssistantContent("reasoning first</think>final answer", {
         implicitOpenThinkTag: true,
@@ -64,6 +66,7 @@ describe("chat playground support", () => {
     expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
       true,
     );
+    expect(defaultThinkingEnabledForModel("LFM3-1.7B-GGUF")).toBe(true);
   });
 
   it("uses Qwen3.8 thinking behavior without enabling image input", () => {

@@ -261,6 +261,82 @@ describe("VoicePage setup", () => {
   });
 });
 
+describe("VoicePage compact model", () => {
+  it("keeps LFM2.5 Audio as the Compact default with LFM3 Audio installed", async () => {
+    storage.set("izwi.voice.engine", "compact");
+    renderVoicePage([
+      ...standardModels("not_downloaded"),
+      model("LFM2.5-Audio-1.5B-GGUF", "downloaded"),
+      model("LFM3-Audio-2B-GGUF", "downloaded"),
+    ]);
+
+    const socket = await startConversation();
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "input_stream_start",
+          mode: "unified",
+          s2s_model_id: "LFM2.5-Audio-1.5B-GGUF",
+          speaker: "US Female",
+        }),
+      ),
+    );
+  });
+
+  it("runs the Compact engine on a chosen LFM3 Audio model and remembers it", async () => {
+    storage.set("izwi.voice.engine", "compact");
+    renderVoicePage([
+      ...standardModels("not_downloaded"),
+      model("LFM2.5-Audio-1.5B-GGUF", "not_downloaded"),
+      model("LFM3-Audio-2B-GGUF", "downloaded", 1_455_413_449),
+      model("LFM3-Audio-2B-Q8_0-GGUF", "not_downloaded", 2_202_024_137),
+    ]);
+    // The default is not on disk yet.
+    expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Voice settings" }));
+    const sheet = await screen.findByRole("dialog", { name: "Voice settings" });
+    fireEvent.click(within(sheet).getByRole("button", { name: /^Compact/ }));
+    const engine = await screen.findByRole("dialog", { name: "Engine" });
+    const choices = within(engine).getByRole("radiogroup", { name: "Models" });
+    expect(
+      within(choices)
+        .getAllByRole("radio")
+        .map((radio) => radio.getAttribute("aria-checked")),
+    ).toEqual(["true", "false", "false"]);
+    fireEvent.click(within(choices).getByRole("radio", { name: /LFM3 Audio 2B GGUF/ }));
+
+    expect(storage.get("izwi.voice.compactModel")).toBe("LFM3-Audio-2B-GGUF");
+    expect(
+      within(choices).getByRole("radio", { name: /LFM3 Audio 2B GGUF/ }),
+    ).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(engine).getAllByRole("button", { name: "Close" })[0]);
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Engine" })).toBeNull(),
+    );
+
+    const socket = await startConversation();
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "input_stream_start",
+          mode: "unified",
+          s2s_model_id: "LFM3-Audio-2B-GGUF",
+          speaker: "female",
+        }),
+      ),
+    );
+  });
+
+  it("falls back to the default when the chosen model left the catalog", () => {
+    storage.set("izwi.voice.engine", "compact");
+    storage.set("izwi.voice.compactModel", "LFM3-Audio-2B-Q8_0-GGUF");
+    renderVoicePage([model("LFM2.5-Audio-1.5B-GGUF", "downloaded")]);
+
+    expect(screen.getByRole("button", { name: "Start talking" })).toBeVisible();
+  });
+});
+
 describe("VoicePage conversation", () => {
   it("starts on downloaded models, which the server loads first", async () => {
     renderVoicePage(standardModels("downloaded"));

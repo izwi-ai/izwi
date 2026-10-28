@@ -157,6 +157,20 @@ describe("isDiarizationPipelineAsrModel", () => {
         }),
       ),
     ).toBe(false);
+    // LFM3 Audio also speaks (a TTS-route model), but still runs no
+    // speech-to-text job.
+    for (const variant of ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"]) {
+      expect(
+        isDiarizationPipelineAsrModel(
+          withCapabilities(variant, {
+            openai_audio_transcriptions: true,
+            openai_audio_speech: true,
+            text_to_speech_records: true,
+            voice_realtime_unified: true,
+          }),
+        ),
+      ).toBe(false);
+    }
   });
 
   it("offers Granite Speech 5.0 and its GGUF as the pipeline ASR", () => {

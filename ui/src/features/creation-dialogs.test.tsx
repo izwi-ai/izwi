@@ -213,6 +213,117 @@ describe("viewport-safe creation dialogs", () => {
     expect(picker).toHaveTextContent("Hindi");
   });
 
+  it("gives LFM3 Audio its two voices and the server's locales", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const lfm3Audio = {
+      variant: "LFM3-Audio-2B-GGUF",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        built_in_voice_count: 2,
+        supports_reference_voice: false,
+        supports_voice_description: false,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        // The server's order, default first.
+        languages: [
+          { code: "en-US", name: "American English" },
+          { code: "en-GB", name: "British English" },
+          { code: "ar", name: "Arabic" },
+          { code: "ja", name: "Japanese" },
+          { code: "zh", name: "Chinese" },
+        ],
+      },
+    } as ModelInfo;
+    const onCreateStream = vi.fn().mockResolvedValue({ id: "record" });
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={lfm3Audio.variant}
+        selectedModelInfo={lfm3Audio}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={onCreateStream}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Built-in voice" })).toHaveTextContent(
+      "Female",
+    );
+    expect(screen.queryByRole("combobox", { name: "Saved voice" })).toBeNull();
+    expect(screen.queryByRole("slider", { name: "Speed" })).toBeNull();
+    const picker = screen.getByRole("combobox", { name: "Language" });
+    expect(picker).toHaveTextContent("American English");
+
+    const script = screen.getByRole("textbox", { name: "Script" });
+    fireEvent.change(script, { target: { value: "Hello there." } });
+    fireEvent.click(screen.getByRole("button", { name: "Create generation" }));
+    await waitFor(() => expect(onCreateStream).toHaveBeenCalledTimes(1));
+    expect(onCreateStream.mock.calls[0][0]).toMatchObject({
+      model_id: "LFM3-Audio-2B-GGUF",
+      speaker: "female",
+      language: "en-US",
+    });
+  });
+
+  it("sends the LFM3 Audio locale the user picks", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const lfm3Audio = {
+      variant: "LFM3-Audio-2B-Q8_0-GGUF",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        built_in_voice_count: 2,
+        supports_reference_voice: false,
+        supports_voice_description: false,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        languages: [
+          { code: "en-US", name: "American English" },
+          { code: "ja", name: "Japanese" },
+        ],
+      },
+    } as ModelInfo;
+    const onCreateStream = vi.fn().mockResolvedValue({ id: "record" });
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={lfm3Audio.variant}
+        selectedModelInfo={lfm3Audio}
+        selectedModelReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={onCreateStream}
+      />,
+    );
+
+    const picker = screen.getByRole("combobox", { name: "Language" });
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Japanese" }));
+    expect(picker).toHaveTextContent("Japanese");
+    const voice = screen.getByRole("combobox", { name: "Built-in voice" });
+    fireEvent.keyDown(voice, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Male" }));
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
+      target: { value: "こんにちは。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create generation" }));
+    await waitFor(() => expect(onCreateStream).toHaveBeenCalledTimes(1));
+    expect(onCreateStream.mock.calls[0][0]).toMatchObject({
+      model_id: "LFM3-Audio-2B-Q8_0-GGUF",
+      speaker: "male",
+      language: "ja",
+    });
+  });
+
   it("offers no language to a model that speaks one", () => {
     render(
       <NewTextToSpeechModal

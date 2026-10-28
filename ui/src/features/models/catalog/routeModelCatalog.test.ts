@@ -152,6 +152,24 @@ describe("route model catalog", () => {
     expect(TRANSCRIPTION_PREFERRED_MODELS[0]).toBe("Qwen3-ASR-0.6B-GGUF");
   });
 
+  it("offers LFM3 Audio on its routes without making it a default pick", () => {
+    for (const variant of ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"]) {
+      expect(TEXT_TO_SPEECH_PREFERRED_MODELS).not.toContain(variant);
+      expect(TRANSCRIPTION_PREFERRED_MODELS).not.toContain(variant);
+      expect(MODEL_DETAILS[variant]?.categories).toEqual(["asr", "tts"]);
+    }
+    expect(
+      resolvePreferredRouteModel({
+        models: [
+          { variant: "LFM3-Audio-2B-GGUF", status: "ready" },
+          { variant: "Kokoro-82M", status: "ready" },
+        ],
+        selectedModel: null,
+        preferredVariants: TEXT_TO_SPEECH_PREFERRED_MODELS,
+      }),
+    ).toBe("Kokoro-82M");
+  });
+
   it("keeps Fish S2 discoverable in the voice cloning route", () => {
     expect(VOICE_CLONING_PREFERRED_MODELS[0]).toBe("FishAudio-S2-Pro");
   });

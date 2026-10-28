@@ -41,8 +41,14 @@ export function routeIdFromPathname(pathname: string): RouteId | null {
 
 export function modelCategoryFromVariant(
   modelVariant: string,
-): "chat" | "asr" | "tts" | "other" {
+): "chat" | "asr" | "tts" | "audio" | "other" {
   const normalized = modelVariant.toLowerCase();
+
+  // One model that transcribes, speaks and holds voice chats. LFM2.5 Audio
+  // keeps its historical "chat" category below.
+  if (normalized.includes("lfm3-audio")) {
+    return "audio";
+  }
 
   if (
     normalized.includes("qwen3-asr") ||

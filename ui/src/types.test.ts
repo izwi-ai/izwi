@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { VIEW_CONFIGS, getSpeakerProfilesForVariant } from "@/types";
+import {
+  VIEW_CONFIGS,
+  getSpeakerProfilesForVariant,
+  isLfm25AudioVariant,
+  isLfm3AudioVariant,
+} from "@/types";
+
+const LFM3_AUDIO_VARIANTS = ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"];
 
 describe("VIEW_CONFIGS.chat.modelFilter", () => {
   it("includes the shipped Qwen3.5 chat variants", () => {
@@ -19,6 +26,9 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3-TTS-12Hz-0.6B-Base")).toBe(
       false,
     );
+    for (const variant of LFM3_AUDIO_VARIANTS) {
+      expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(false);
+    }
   });
 });
 
@@ -95,6 +105,15 @@ describe("speech route model filters", () => {
     );
   });
 
+  it("puts lfm3 audio on both the transcription and tts route filters", () => {
+    for (const variant of LFM3_AUDIO_VARIANTS) {
+      expect(VIEW_CONFIGS.transcription.modelFilter(variant)).toBe(true);
+      expect(VIEW_CONFIGS["custom-voice"].modelFilter(variant)).toBe(true);
+      expect(VIEW_CONFIGS["voice-clone"].modelFilter(variant)).toBe(false);
+      expect(VIEW_CONFIGS["voice-design"].modelFilter(variant)).toBe(false);
+    }
+  });
+
   it("includes voxtral tts on the standalone tts route filter", () => {
     expect(VIEW_CONFIGS["custom-voice"].modelFilter("Voxtral-4B-TTS-2603")).toBe(
       true,
@@ -128,6 +147,23 @@ describe("speech route model filters", () => {
   });
 });
 
+describe("audio model ids", () => {
+  it("tells LFM3 Audio from LFM2.5 Audio and LFM3 chat", () => {
+    for (const variant of [
+      ...LFM3_AUDIO_VARIANTS,
+      "lfm3-audio-2b-q8_0-gguf",
+      " LiquidAI/LFM3-Audio-2B-GGUF ",
+      "LiquidAI/LFM3-Audio-2B",
+    ]) {
+      expect(isLfm3AudioVariant(variant)).toBe(true);
+      expect(isLfm25AudioVariant(variant)).toBe(false);
+    }
+    expect(isLfm3AudioVariant("LFM2.5-Audio-1.5B-GGUF")).toBe(false);
+    expect(isLfm3AudioVariant("LFM3-1.7B-GGUF")).toBe(false);
+    expect(isLfm25AudioVariant("LFM2.5-Audio-1.5B-GGUF")).toBe(true);
+  });
+});
+
 describe("getSpeakerProfilesForVariant", () => {
   it("maps lfm25 audio to its built-in speaker presets", () => {
     expect(
@@ -135,6 +171,21 @@ describe("getSpeakerProfilesForVariant", () => {
         (speaker) => speaker.id,
       ),
     ).toEqual(["US Female", "US Male", "UK Female", "UK Male"]);
+  });
+
+  it("maps lfm3 audio to its two multilingual voices", () => {
+    for (const variant of [...LFM3_AUDIO_VARIANTS, "LiquidAI/LFM3-Audio-2B"]) {
+      expect(
+        getSpeakerProfilesForVariant(variant).map(({ id, name, language }) => ({
+          id,
+          name,
+          language,
+        })),
+      ).toEqual([
+        { id: "female", name: "Female", language: "Multilingual" },
+        { id: "male", name: "Male", language: "Multilingual" },
+      ]);
+    }
   });
 
   it("maps voxtral tts to the official preset voices", () => {

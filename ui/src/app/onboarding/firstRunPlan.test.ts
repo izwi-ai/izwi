@@ -195,6 +195,17 @@ describe("modelGroup", () => {
       "diar_streaming_sortformer_4spk-v2.1": "speakers",
       "Qwen3-TTS-Tokenizer-12Hz": null,
     });
+    // LFM3 Audio speaks too, but its task keeps it with the voice models.
+    expect(
+      modelGroup(
+        model("LFM3-Audio-2B-GGUF", "audio_chat", {
+          speech_capabilities: speech({
+            supports_builtin_voices: true,
+            built_in_voice_count: 2,
+          }),
+        }),
+      ),
+    ).toBe("voice");
   });
 
   it("falls back to route capabilities without a task", () => {

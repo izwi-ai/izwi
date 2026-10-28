@@ -30,6 +30,17 @@ export function isLfm25AudioVariant(variant: string): boolean {
   );
 }
 
+/** LFM3-Audio: one model for transcription, text to speech and voice chat. */
+export function isLfm3AudioVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "lfm3-audio-2b-gguf" ||
+    normalized === "lfm3-audio-2b-q8_0-gguf" ||
+    normalized === "liquidai/lfm3-audio-2b-gguf" ||
+    normalized === "liquidai/lfm3-audio-2b"
+  );
+}
+
 export function isVoxtralTtsVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -154,6 +165,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isLfm25AudioVariant(variant)) {
     return LFM25_AUDIO_SPEAKERS;
   }
+  if (isLfm3AudioVariant(variant)) {
+    return LFM3_AUDIO_SPEAKERS;
+  }
   if (isVoxtralTtsVariant(variant)) {
     return VOXTRAL_TTS_SPEAKERS;
   }
@@ -183,7 +197,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "custom-voice",
     label: "Text to Speech",
     description:
-      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native)",
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, LFM3 Audio)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") ||
@@ -191,10 +205,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isVoxtralTtsVariant(variant) ||
       isChatterboxVariant(variant) ||
       isMaya1Variant(variant) ||
-      isMaya2Variant(variant),
+      isMaya2Variant(variant) ||
+      isLfm3AudioVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, Maya1, or Maya 2 Native TTS model to generate speech",
+      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, or LFM3 Audio TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -225,7 +240,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
+      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
@@ -236,15 +251,17 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
       isVoxtralAsrVariant(variant) ||
-      isLfm25AudioVariant(variant),
+      isLfm25AudioVariant(variant) ||
+      isLfm3AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
   },
   chat: {
     id: "chat",
     label: "Chat",
-    description: "Text and multimodal chat with Qwen3, Qwen3.5, Qwen3.8, LFM2.5, and Gemma 3",
+    description:
+      "Text and multimodal chat with Qwen3, Qwen3.5, Qwen3.8, LFM2.5, LFM3, and Gemma 3",
     icon: "MessageSquare",
     modelFilter: (variant) =>
       variant === "Qwen3.5-0.8B" ||
@@ -255,10 +272,12 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       variant === "Qwen3.6-35B-A3B-FP8" ||
       variant === "LFM2.5-1.2B-Instruct-GGUF" ||
       variant === "LFM2.5-1.2B-Thinking-GGUF" ||
+      variant === "LFM3-1.7B-GGUF" ||
+      variant === "LFM3-1.7B-Q8_0-GGUF" ||
       variant === "Gemma-3-4b-it",
     emptyStateTitle: "No Chat Model Loaded",
     emptyStateDescription:
-      "Load a Qwen3, Qwen3.5, Qwen3.8, LFM2.5, or Gemma chat model (including GGUF variants) to start chatting",
+      "Load a Qwen3, Qwen3.5, Qwen3.8, LFM2.5, LFM3, or Gemma chat model (including GGUF variants) to start chatting",
   },
 };
 
@@ -350,6 +369,23 @@ const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
     name: "UK Male",
     language: "English",
     description: "UK male preset voice",
+  },
+];
+
+// LFM3-Audio's two built-in voices speak any of its languages; the
+// request's `language` picks the locale.
+const LFM3_AUDIO_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "female",
+    name: "Female",
+    language: "Multilingual",
+    description: "Female built-in voice (LFM3 Audio)",
+  },
+  {
+    id: "male",
+    name: "Male",
+    language: "Multilingual",
+    description: "Male built-in voice (LFM3 Audio)",
   },
 ];
 

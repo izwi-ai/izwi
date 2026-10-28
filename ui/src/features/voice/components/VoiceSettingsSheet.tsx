@@ -21,6 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import {
   VOICE_ENGINES,
+  compactVoiceModels,
   voiceEngineModels,
   voiceEngineSpeakerVariant,
   voiceEngineTotalBytes,
@@ -29,6 +30,7 @@ import {
 } from "@/features/voice/engine";
 import {
   formatBytes,
+  formatModelVariantLabel,
   isUsableVoiceModelStatus,
   type VoicePageProps,
 } from "@/features/voice/realtime/support";
@@ -50,6 +52,8 @@ interface VoiceSettingsSheetProps {
   view: VoiceSettingsView;
   onViewChange: (view: VoiceSettingsView) => void;
   preferences: VoicePreferences;
+  /** The model the Compact engine runs: the chosen one, else its default. */
+  compactModel: string;
   speakers: SpeakerProfile[];
   speaker: SpeakerProfile | null;
   models: ModelInfo[];
@@ -134,6 +138,7 @@ function engineStatus(rows: VoiceEngineModel[]): {
 function MainView({
   onViewChange,
   preferences,
+  compactModel,
   speakers,
   speaker,
   models,
@@ -145,7 +150,7 @@ function MainView({
   const memoryId = useId();
   const [showAllVoices, setShowAllVoices] = useState(false);
   const preview = useReadAloud(onError);
-  const engineRows = voiceEngineModels(preferences.engine, models);
+  const engineRows = voiceEngineModels(preferences.engine, models, compactModel);
   const status = engineStatus(engineRows);
 
   const visibleVoices = useMemo(() => {
@@ -255,7 +260,10 @@ function MainView({
                             item.id,
                             `Hi, I'm ${item.name}. This is how I sound.`,
                             {
-                              modelId: voiceEngineSpeakerVariant(preferences.engine),
+                              modelId: voiceEngineSpeakerVariant(
+                                preferences.engine,
+                                compactModel,
+                              ),
                               speaker: item.id,
                             },
                           )
@@ -501,8 +509,33 @@ function modelStatusLabel(
   }
 }
 
+/** A model's state in the engine view: a dot, filled once loaded, and a label. */
+function EngineModelStatus({
+  model,
+  downloadProgress,
+}: {
+  model: ModelInfo | null;
+  downloadProgress: VoicePageProps["downloadProgress"];
+}) {
+  return (
+    <span className="flex items-center gap-2 whitespace-nowrap text-[13px] text-(--text-muted)">
+      <span
+        aria-hidden="true"
+        className={cn(
+          "h-[7px] w-[7px] rounded-full",
+          model?.status === "ready"
+            ? "bg-(--status-positive-solid)"
+            : "border-[1.5px] border-(--border-strong)",
+        )}
+      />
+      {modelStatusLabel(model, downloadProgress)}
+    </span>
+  );
+}
+
 function EngineView({
   preferences,
+  compactModel,
   models,
   downloadProgress,
   onDownload,
@@ -511,8 +544,13 @@ function EngineView({
   isConversationActive,
 }: VoiceSettingsSheetProps) {
   const groupId = useId();
+  const modelsId = useId();
   const engines: VoiceEngineId[] = ["standard", "compact"];
-  const rows = voiceEngineModels(preferences.engine, models);
+  const rows = voiceEngineModels(preferences.engine, models, compactModel);
+  // The Compact engine runs one of several audio models: offer the choice
+  // once the catalog lists more than one.
+  const compactChoices =
+    preferences.engine === "compact" ? compactVoiceModels(models) : [];
   const missing = rows.filter(
     (row) =>
       row.model &&
@@ -557,7 +595,9 @@ function EngineView({
           </span>
           {engines.map((id) => {
             const checked = preferences.engine === id;
-            const bytes = voiceEngineTotalBytes(voiceEngineModels(id, models));
+            const bytes = voiceEngineTotalBytes(
+              voiceEngineModels(id, models, compactModel),
+            );
             return (
               <button
                 key={id}
@@ -602,34 +642,63 @@ function EngineView({
         </div>
 
         <section className="flex flex-col">
-          <h3 className={sectionTitle}>Models</h3>
-          <ul>
-            {rows.map((row) => (
-              <li
-                key={row.variant}
-                className="grid min-h-[52px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-(--border-muted)"
-              >
-                <span className="flex min-w-0 flex-col gap-0.5">
-                  <span className="truncate text-sm font-medium text-(--text-primary)">
-                    {row.label}
+          <h3 id={modelsId} className={sectionTitle}>
+            Models
+          </h3>
+          {compactChoices.length > 1 ? (
+            <div role="radiogroup" aria-labelledby={modelsId}>
+              {compactChoices.map((model) => {
+                const checked = model.variant === compactModel;
+                const bytes = model.size_bytes ?? model.estimated_size_bytes ?? 0;
+                return (
+                  <button
+                    key={model.variant}
+                    type="button"
+                    role="radio"
+                    aria-checked={checked}
+                    onClick={() => preferences.setCompactModel(model.variant)}
+                    className="grid min-h-[52px] w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-t border-(--border-muted) text-left"
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        "h-4 w-4 shrink-0 rounded-full",
+                        checked
+                          ? "border-[5px] border-(--accent-solid)"
+                          : "border-[1.5px] border-(--border-strong)",
+                      )}
+                    />
+                    <span className="flex min-w-0 flex-col gap-0.5">
+                      <span className="truncate text-sm font-medium text-(--text-primary)">
+                        {formatModelVariantLabel(model.variant)}
+                      </span>
+                      <span className="text-xs text-(--text-muted)">
+                        {bytes > 0 ? formatBytes(bytes) : "Listens, thinks and speaks"}
+                      </span>
+                    </span>
+                    <EngineModelStatus model={model} downloadProgress={downloadProgress} />
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <ul>
+              {rows.map((row) => (
+                <li
+                  key={row.variant}
+                  className="grid min-h-[52px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-(--border-muted)"
+                >
+                  <span className="flex min-w-0 flex-col gap-0.5">
+                    <span className="truncate text-sm font-medium text-(--text-primary)">
+                      {row.label}
+                    </span>
+                    <span className="text-xs text-(--text-muted)">{row.role}</span>
                   </span>
-                  <span className="text-xs text-(--text-muted)">{row.role}</span>
-                </span>
-                <span className="flex items-center gap-2 whitespace-nowrap text-[13px] text-(--text-muted)">
-                  <span
-                    aria-hidden="true"
-                    className={cn(
-                      "h-[7px] w-[7px] rounded-full",
-                      row.model?.status === "ready"
-                        ? "bg-(--status-positive-solid)"
-                        : "border-[1.5px] border-(--border-strong)",
-                    )}
-                  />
-                  {modelStatusLabel(row.model, downloadProgress)}
-                </span>
-              </li>
-            ))}
-          </ul>
+                  <EngineModelStatus model={row.model} downloadProgress={downloadProgress} />
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       </div>
       <div className="flex shrink-0 items-center justify-between gap-3 border-t border-(--border-muted) px-6 py-3.5">

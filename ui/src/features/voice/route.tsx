@@ -4,6 +4,7 @@ import { Mic, SlidersHorizontal } from "lucide-react";
 import { PageShell } from "@/components/PageShell";
 import {
   isVoiceEngineReady,
+  resolveCompactVoiceModel,
   resolveVoiceSpeaker,
   voiceEngineDownloadBytes,
   voiceEngineModels,
@@ -82,19 +83,24 @@ export function VoicePage({
     [onError],
   );
   const preferences = useVoicePreferences(reportError);
+  const compactModel = resolveCompactVoiceModel(
+    preferences.compactModel,
+    models,
+  );
   const engineRows = useMemo(
-    () => voiceEngineModels(preferences.engine, models),
-    [models, preferences.engine],
+    () => voiceEngineModels(preferences.engine, models, compactModel),
+    [compactModel, models, preferences.engine],
   );
   const isReady = isVoiceEngineReady(engineRows);
   const speakers = useMemo(
-    () => voiceEngineSpeakers(preferences.engine),
-    [preferences.engine],
+    () => voiceEngineSpeakers(preferences.engine, compactModel),
+    [compactModel, preferences.engine],
   );
   const speaker = resolveVoiceSpeaker(speakers, preferences.speaker);
   const sessionEngine = useMemo(
-    () => (isReady ? voiceSessionEngine(preferences.engine) : null),
-    [isReady, preferences.engine],
+    () =>
+      isReady ? voiceSessionEngine(preferences.engine, compactModel) : null,
+    [compactModel, isReady, preferences.engine],
   );
   const session = useVoiceSession({
     engine: sessionEngine,
@@ -347,6 +353,7 @@ export function VoicePage({
         view={settingsView}
         onViewChange={setSettingsView}
         preferences={preferences}
+        compactModel={compactModel}
         speakers={speakers}
         speaker={speaker}
         models={models}

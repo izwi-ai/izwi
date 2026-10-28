@@ -7,6 +7,7 @@ import { VOICE_AGENT_SYSTEM_PROMPT } from "@/features/voice/realtime/support";
 export type VoiceEngineId = "standard" | "compact";
 
 const ENGINE_STORAGE_KEY = "izwi.voice.engine";
+const COMPACT_MODEL_STORAGE_KEY = "izwi.voice.compactModel";
 const SPEAKER_STORAGE_KEY = "izwi.voice.speaker";
 
 function readStored(key: string): string | null {
@@ -28,13 +29,17 @@ function writeStored(key: string, value: string) {
 export type PromptSaveState = "idle" | "saving" | "saved" | "error";
 
 /**
- * What the user chose for voice conversations: the engine and voice are
- * remembered on this device; the instructions and memory setting live in
- * the server's voice profile.
+ * What the user chose for voice conversations: the engine, the Compact
+ * engine's model and the voice are remembered on this device; the
+ * instructions and memory setting live in the server's voice profile.
  */
 export function useVoicePreferences(onError?: (message: string) => void) {
   const [engine, setEngineState] = useState<VoiceEngineId>(() =>
     readStored(ENGINE_STORAGE_KEY) === "compact" ? "compact" : "standard",
+  );
+  // Null until one is chosen: the Compact engine then runs its default.
+  const [compactModel, setCompactModelState] = useState<string | null>(() =>
+    readStored(COMPACT_MODEL_STORAGE_KEY),
   );
   const [speaker, setSpeakerState] = useState<string | null>(() =>
     readStored(SPEAKER_STORAGE_KEY),
@@ -87,6 +92,11 @@ export function useVoicePreferences(onError?: (message: string) => void) {
   const setEngine = useCallback((next: VoiceEngineId) => {
     setEngineState(next);
     writeStored(ENGINE_STORAGE_KEY, next);
+  }, []);
+
+  const setCompactModel = useCallback((next: string) => {
+    setCompactModelState(next);
+    writeStored(COMPACT_MODEL_STORAGE_KEY, next);
   }, []);
 
   const setSpeaker = useCallback((next: string) => {
@@ -171,6 +181,8 @@ export function useVoicePreferences(onError?: (message: string) => void) {
     () => ({
       engine,
       setEngine,
+      compactModel,
+      setCompactModel,
       speaker,
       setSpeaker,
       savedPrompt,
@@ -188,6 +200,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       forgetAllMemories,
     }),
     [
+      compactModel,
       defaultPrompt,
       engine,
       forgetAllMemories,
@@ -200,6 +213,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       promptSaveState,
       savePrompt,
       savedPrompt,
+      setCompactModel,
       setEngine,
       setMemoryEnabled,
       setSpeaker,

@@ -244,6 +244,38 @@ describe("VoicesPage", () => {
     expect(searchEcho).toHaveTextContent("model=MockVoiceModel");
   });
 
+  it("lists LFM3 Audio's built-in voices but keeps LFM2.5 Audio's out", async () => {
+    const actual = await vi.importActual<typeof import("@/types")>("@/types");
+    typeMocks.isLfm25AudioVariant.mockImplementation(actual.isLfm25AudioVariant);
+    const audioModels = [
+      "LFM2.5-Audio-1.5B-GGUF",
+      "LFM3-Audio-2B-GGUF",
+      "LFM3-Audio-2B-Q8_0-GGUF",
+    ].map((variant) =>
+      buildModel({
+        variant,
+        speech_capabilities: {
+          ...buildModel().speech_capabilities!,
+          supports_reference_voice: false,
+          supports_speed_control: false,
+        },
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <VoicesPage {...baseProps} models={audioModels} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(apiMocks.listSavedVoices).toHaveBeenCalled());
+
+    const { modelFilter } = hookMocks.useRouteModelSelection.mock.calls[0][0] as {
+      modelFilter: (variant: string) => boolean;
+    };
+    expect(modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(false);
+    expect(modelFilter("LFM3-Audio-2B-GGUF")).toBe(true);
+    expect(modelFilter("LFM3-Audio-2B-Q8_0-GGUF")).toBe(true);
+  });
+
   it("loads more saved voices", async () => {
     apiMocks.listSavedVoicePage.mockReset();
     apiMocks.listSavedVoicePage

@@ -380,7 +380,7 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   if (isQwen38ThinkingModel(variant)) {
     return true;
   }
-  if (isLfm25ThinkingModel(variant)) {
+  if (isLfm25ThinkingModel(variant) || isLfm3Model(variant)) {
     return true;
   }
   return normalized.startsWith("qwen3-");
@@ -414,16 +414,26 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
   return variant.trim().toLowerCase() === "lfm2.5-1.2b-thinking-gguf";
 }
 
+/** LFM3 chat reasons by default and its template opens `<think>`. */
+export function isLfm3Model(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("lfm3-1.7b");
+}
+
 /**
  * Name-based fallback for models missing from the catalog: the Qwen3.5/3.6/
- * 3.8 and LFM2.5 Thinking templates pre-open `<think>` in the generation
- * prompt, so their output can start inside an unopened think block.
+ * 3.8, LFM2.5 Thinking and LFM3 templates pre-open `<think>` in the
+ * generation prompt, so their output can start inside an unopened think
+ * block.
  */
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
   return (
     isLfm25ThinkingModel(variant) ||
+    isLfm3Model(variant) ||
     isQwen35ThinkingModel(variant) ||
     isQwen36ThinkingModel(variant) ||
     isQwen38ThinkingModel(variant)
