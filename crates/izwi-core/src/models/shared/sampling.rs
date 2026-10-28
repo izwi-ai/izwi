@@ -755,21 +755,12 @@ pub(crate) fn raw_logprobs_stats(
             .map(|v| (v - max_logit).exp())
             .sum::<f32>()
             .ln();
-    let mut indexed: Vec<(usize, f32)> = values
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_finite())
-        .map(|(index, v)| (index, *v))
-        .collect();
-    indexed.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top = indexed
+    // `ranked_candidates` selects the top entries without sorting the whole
+    // vocabulary, in the order a stable full sort gives (ties by index).
+    let top = ranked_candidates(values, top_logprobs.max(1))
         .into_iter()
         .take(top_logprobs)
+        .map(|index| (index, values[index]))
         .map(|(index, value)| {
             u32::try_from(index)
                 .map(|token| (token, value - logsumexp))
@@ -2144,6 +2135,34 @@ mod tests {
                 permuted as f32 * 0.03125 + index as f32 * 0.000_001
             })
             .collect()
+    }
+
+    /// The top logprobs come from a partial selection; they equal a stable
+    /// full sort's prefix, ties in index order.
+    #[test]
+    fn raw_logprob_tops_equal_a_full_sort_prefix() {
+        let mut values = crate::kernels::numeric_check::xorshift_values(4_096, 9, 4.0);
+        values[17] = values[3];
+        values[40] = f32::NEG_INFINITY;
+        for k in [0, 1, 5, 20, 4_096] {
+            let (_, top) = raw_logprobs_stats(&values, k).unwrap();
+            let mut sorted = values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .collect::<Vec<_>>();
+            sorted.sort_by(|left, right| right.1.partial_cmp(left.1).unwrap());
+            let expected = sorted
+                .into_iter()
+                .take(k)
+                .map(|(index, _)| index as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                top.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+                expected,
+                "top {k}"
+            );
+        }
     }
 
     #[test]
