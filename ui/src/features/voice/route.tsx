@@ -21,9 +21,10 @@ import {
 } from "@/features/voice/components/VoiceSettingsSheet";
 import { VoiceSetup } from "@/features/voice/components/VoiceSetup";
 import { VoiceTranscript } from "@/features/voice/components/VoiceTranscript";
-import type {
-  RuntimeStatus,
-  VoicePageProps,
+import {
+  formatModelVariantLabel,
+  type RuntimeStatus,
+  type VoicePageProps,
 } from "@/features/voice/realtime/support";
 import { useVoicePreferences } from "@/features/voice/useVoicePreferences";
 import { useVoiceSession } from "@/features/voice/useVoiceSession";
@@ -254,6 +255,7 @@ export function VoicePage({
             ? () => preferences.setEngine("compact")
             : undefined
         }
+        compactLabel={formatModelVariantLabel(compactModel)}
       />
     );
   } else {

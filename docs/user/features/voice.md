@@ -30,7 +30,7 @@ Voice has two engines, chosen in **Voice settings › Engine**:
 | Engine | Models | Notes |
 |--------|--------|-------|
 | **Standard** (default) | `Parakeet-TDT-0.6B-v3` (speech recognition), `Qwen3.5-4B` (assistant), `Kokoro-82M` (voice) | Best answers and the full voice library |
-| **Compact** | `LFM2.5-Audio-1.5B-GGUF` | One model listens and speaks; smaller download, fewer voices |
+| **Compact** | `LFM2.5-Audio-1.5B-GGUF` (default) or `LFM3-Audio-2B-GGUF` | One model listens and speaks; smaller download, fewer voices |
 
 To download them from the command line instead:
 
@@ -86,9 +86,10 @@ protocol.
 
 `LFM3-Audio-2B-GGUF` also answers spoken turns, with interleaved text and
 speech, through the same speech-to-speech routes: name it as `s2s_model_id` in
-the WebSocket's `unified` mode. The **Compact** engine still uses
-`LFM2.5-Audio-1.5B-GGUF`. Spoken tool calls are not supported with LFM3 Audio
-yet.
+the WebSocket's `unified` mode. The **Compact** engine uses
+`LFM2.5-Audio-1.5B-GGUF` by default: choose an LFM3 Audio model in
+**Voice settings › Engine**, and with only LFM3 Audio downloaded the Compact
+engine uses it. Spoken tool calls are not supported with LFM3 Audio yet.
 
 ---
 

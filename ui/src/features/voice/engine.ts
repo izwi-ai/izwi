@@ -34,16 +34,23 @@ export function compactVoiceModels(models: ModelInfo[]): ModelInfo[] {
 }
 
 /** The Compact engine's model: the one chosen while the catalog still
- * offers it, else the default. */
+ * offers it, else one already on disk (the default first), else the
+ * default, so a user with only LFM3 Audio is not asked to download LFM2.5. */
 export function resolveCompactVoiceModel(
   chosen: string | null,
   models: ModelInfo[],
 ): string {
-  return chosen &&
+  if (
+    chosen &&
     isCompactVoiceModel(chosen) &&
     models.some((model) => model.variant === chosen)
-    ? chosen
-    : COMPACT_VOICE_MODEL;
+  ) {
+    return chosen;
+  }
+  const onDisk = compactVoiceModels(models).find((model) =>
+    isUsableVoiceModelStatus(model.status),
+  );
+  return onDisk?.variant ?? COMPACT_VOICE_MODEL;
 }
 
 /** Kokoro's most natural English voice; other engines start on their first. */

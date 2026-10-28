@@ -239,6 +239,18 @@ describe("VoicePage setup", () => {
     );
   });
 
+  it("names the model the Compact engine would use", () => {
+    renderVoicePage([
+      ...standardModels("not_downloaded"),
+      model("LFM2.5-Audio-1.5B-GGUF", "not_downloaded"),
+      model("LFM3-Audio-2B-GGUF", "downloaded"),
+    ]);
+
+    expect(screen.getByText(/Prefer a smaller download/)).toHaveTextContent(
+      "Prefer a smaller download? Use the compact engine (LFM3 Audio 2B GGUF).",
+    );
+  });
+
   it("switches to the Compact engine from setup and remembers it", async () => {
     renderVoicePage([
       ...standardModels("not_downloaded"),
@@ -291,8 +303,8 @@ describe("VoicePage compact model", () => {
       model("LFM3-Audio-2B-GGUF", "downloaded", 1_455_413_449),
       model("LFM3-Audio-2B-Q8_0-GGUF", "not_downloaded", 2_202_024_137),
     ]);
-    // The default is not on disk yet.
-    expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
+    // With the default not on disk, the LFM3 Audio model on disk stands in.
+    expect(screen.getByRole("button", { name: "Start talking" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Voice settings" }));
     const sheet = await screen.findByRole("dialog", { name: "Voice settings" });
@@ -303,7 +315,7 @@ describe("VoicePage compact model", () => {
       within(choices)
         .getAllByRole("radio")
         .map((radio) => radio.getAttribute("aria-checked")),
-    ).toEqual(["true", "false", "false"]);
+    ).toEqual(["false", "true", "false"]);
     fireEvent.click(within(choices).getByRole("radio", { name: /LFM3 Audio 2B GGUF/ }));
 
     expect(storage.get("izwi.voice.compactModel")).toBe("LFM3-Audio-2B-GGUF");

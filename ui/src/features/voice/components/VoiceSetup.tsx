@@ -42,6 +42,7 @@ export function VoiceSetup({
   onDownload,
   onCancel,
   onUseCompact,
+  compactLabel,
 }: {
   rows: VoiceEngineModel[];
   downloadProgress: DownloadProgress;
@@ -51,6 +52,8 @@ export function VoiceSetup({
   onCancel?: () => void;
   /** Offered while the Standard engine is chosen. */
   onUseCompact?: () => void;
+  /** The model the compact engine would use. */
+  compactLabel?: string;
 }) {
   const isDownloading = rows.some((row) => row.model?.status === "downloading");
   const totalBytes = voiceEngineTotalBytes(rows);
@@ -136,8 +139,8 @@ export function VoiceSetup({
               className="text-(--text-primary) underline decoration-(--border-strong) underline-offset-[3px] hover:text-(--text-muted)"
             >
               Use the compact engine
-            </button>{" "}
-            (LFM2.5 Audio).
+            </button>
+            {compactLabel ? ` (${compactLabel}).` : "."}
           </p>
         )}
       </div>
