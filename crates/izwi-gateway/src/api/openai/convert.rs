@@ -18,26 +18,42 @@ pub enum InboundContent {
     Parts(Vec<InboundContentPart>),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// One content part. Fields this server reads are named; any others (a
+/// `tool_reference`'s `name`, a tool search's `result`) are kept in `extra`,
+/// so a part serializes back as the client sent it, minus absent fields.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct InboundContentPart {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_image: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_url: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_video: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Message content as JSON: a string, or the list of parts.
+pub fn inbound_content_value(content: Option<&InboundContent>) -> Result<Option<Value>, ApiError> {
+    match content {
+        None => Ok(None),
+        Some(InboundContent::Text(text)) => Ok(Some(Value::String(text.clone()))),
+        Some(InboundContent::Parts(parts)) => serde_json::to_value(parts)
+            .map(Some)
+            .map_err(|err| ApiError::internal(err.to_string())),
+    }
 }
 
 /// Flatten message content into prompt text plus the media it references.
@@ -206,14 +222,7 @@ mod tests {
     fn part(kind: &str) -> InboundContentPart {
         InboundContentPart {
             kind: Some(kind.to_string()),
-            text: None,
-            input_text: None,
-            image_url: None,
-            input_image: None,
-            image: None,
-            video: None,
-            video_url: None,
-            input_video: None,
+            ..InboundContentPart::default()
         }
     }
 

@@ -100,6 +100,10 @@ pub struct OpenAiInboundMessage {
     /// On a `tool` message: the id of the call it answers.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// On a `tool` message, for LFM3 models: deferred tools the result
+    /// reveals (their definitions, or a flag that the content holds them).
+    #[serde(default)]
+    pub additional_tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use candle_core::{Tensor, D};
+pub(crate) use izwi_model_catalog::chat::tools::write_python_json;
 use serde::Deserialize;
 use tracing::info;
 
@@ -1454,37 +1455,6 @@ fn validate_generation_config(config: &ChatGenerationConfig) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
-/// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
-/// kept. Object keys follow `serde_json`'s map order.
-pub(crate) fn write_python_json(value: &serde_json::Value, out: &mut String) {
-    match value {
-        serde_json::Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
-                }
-                write_python_json(item, out);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            out.push('{');
-            for (index, (key, item)) in map.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&serde_json::Value::String(key.clone()).to_string());
-                out.push_str(": ");
-                write_python_json(item, out);
-            }
-            out.push('}');
-        }
-        scalar => out.push_str(&scalar.to_string()),
-    }
 }
 
 fn lfm2_chat_gguf_name(variant: ModelVariant) -> Result<&'static str> {

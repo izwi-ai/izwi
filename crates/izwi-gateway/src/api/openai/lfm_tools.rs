@@ -13,6 +13,7 @@
 //! request the model can also write the list as JSON objects
 //! (`[{"name": ..., "arguments": {...}}]`); the parser accepts both.
 
+pub(super) use izwi_model_catalog::chat::tools::write_python_json;
 use serde_json::{Map, Value};
 
 use crate::error::ApiError;
@@ -94,35 +95,6 @@ fn python_argument(value: &Value) -> String {
         Value::Bool(false) => "False".to_string(),
         Value::Null => "None".to_string(),
         Value::Number(number) => number.to_string(),
-    }
-}
-
-/// Python `json.dumps(value, ensure_ascii=False)` spacing.
-pub(super) fn write_python_json(value: &Value, out: &mut String) {
-    match value {
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
-                }
-                write_python_json(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            for (index, (key, item)) in map.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push_str(": ");
-                write_python_json(item, out);
-            }
-            out.push('}');
-        }
-        scalar => out.push_str(&scalar.to_string()),
     }
 }
 

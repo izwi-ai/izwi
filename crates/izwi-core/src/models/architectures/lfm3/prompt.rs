@@ -7,7 +7,8 @@
 
 use serde_json::Value;
 
-use crate::models::architectures::lfm2::chat::write_python_json;
+use izwi_model_catalog::chat::tools::{is_deferred_tool, tool_to_json};
+
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
 pub(crate) const BOS: &str = "<|startoftext|>";
@@ -50,7 +51,8 @@ impl Default for Lfm3PromptOptions {
 ///   a later one keeps its content and gets `<think></think>` only when it
 ///   has no `</think>`. `preserve_thinking` keeps every turn whole.
 /// * A tool turn is wrapped in `<tool_response>\n...\n</tool_response>` unless
-///   it already holds one.
+///   it already holds one or is empty (rendered by the gateway, which
+///   resolves deferred tools: `api/openai/tool_response.rs`).
 /// * The generation prompt `<|im_start|>assistant\n<think>`, or
 ///   `...\n<think></think>` with thinking off.
 ///
@@ -71,7 +73,7 @@ pub(crate) fn render_lfm3_chat_prompt(
     let mut system = system;
     let tool_lines = tools
         .iter()
-        .filter(|tool| !is_deferred(tool))
+        .filter(|tool| !is_deferred_tool(tool))
         .map(tool_to_json)
         .collect::<Vec<_>>();
     if !tool_lines.is_empty() {
@@ -111,8 +113,11 @@ pub(crate) fn render_lfm3_chat_prompt(
                 push_turn(&mut out, "assistant", &rendered);
             }
             ChatRole::Tool => {
+                // A turn the gateway rendered already (`<tool_response>`
+                // blocks, or the empty turn of a tool search that revealed
+                // nothing) passes through as the template's own output.
                 let content = &message.content;
-                let rendered = if content.contains(TOOL_RESPONSE_OPEN) {
+                let rendered = if content.is_empty() || content.contains(TOOL_RESPONSE_OPEN) {
                     content.clone()
                 } else {
                     format!("{TOOL_RESPONSE_OPEN}\n{content}\n</tool_response>")
@@ -141,44 +146,6 @@ fn push_turn(out: &mut String, role: &str, content: &str) {
     out.push_str(content);
     out.push_str(IM_END);
     out.push('\n');
-}
-
-/// A tool with `defer_loading` stays out of `<tools>` until a tool search
-/// returns it.
-fn is_deferred(tool: &Value) -> bool {
-    let function = tool.get("function").unwrap_or(tool);
-    [tool, function]
-        .iter()
-        .any(|value| value.get("defer_loading").and_then(Value::as_bool) == Some(true))
-}
-
-/// The template's `tool_to_json`: the function object without
-/// `defer_loading`, serialized like Python's `json.dumps`.
-fn tool_to_json(tool: &Value) -> String {
-    let function = tool.get("function").unwrap_or(tool);
-    let mut out = String::new();
-    match function {
-        Value::Object(map) => {
-            out.push('{');
-            let mut first = true;
-            for (key, value) in map {
-                if key == "defer_loading" {
-                    continue;
-                }
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push_str(": ");
-                write_python_json(value, &mut out);
-            }
-            out.push('}');
-        }
-        Value::String(text) => out.push_str(text),
-        other => write_python_json(other, &mut out),
-    }
-    out
 }
 
 #[cfg(test)]
@@ -274,6 +241,23 @@ mod tests {
              <parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n\
              <|im_start|>tool\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n\
              <|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn tool_turns_the_gateway_rendered_pass_through() {
+        let rendered = "<tool_response>\n<additional_tools>\n{\"name\": \"a\"}\n</additional_tools>\n</tool_response>";
+        let messages = [
+            message(ChatRole::User, "q"),
+            message(ChatRole::Tool, rendered),
+            message(ChatRole::Tool, ""),
+        ];
+        assert_eq!(
+            render_lfm3_chat_prompt(&messages, &[], Lfm3PromptOptions::default()),
+            format!(
+                "<|startoftext|><|im_start|>user\nq<|im_end|>\n<|im_start|>tool\n{rendered}<|im_end|>\n\
+                 <|im_start|>tool\n<|im_end|>\n<|im_start|>assistant\n<think>"
+            )
         );
     }
 

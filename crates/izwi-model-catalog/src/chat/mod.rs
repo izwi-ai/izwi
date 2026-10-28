@@ -6,6 +6,7 @@ mod generation;
 mod messages;
 pub mod reasoning;
 mod sampling;
+pub mod tools;
 
 pub use generation::{
     ChatGeneration, FinishReason, LatencyBreakdown, TokenLogprob, TopTokenLogprob,

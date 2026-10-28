@@ -265,6 +265,7 @@ fn tool_results_must_answer_a_call_of_the_preceding_turn() {
         content: Some(InboundContent::Text("x".to_string())),
         tool_calls,
         tool_call_id: tool_call_id.map(str::to_owned),
+        additional_tools: None,
     };
     let call = Some(vec![json!({
         "id": "call_a", "type": "function", "function": {"name": "f", "arguments": "{}"}
@@ -276,10 +277,11 @@ fn tool_results_must_answer_a_call_of_the_preceding_turn() {
             message("tool", None, Some(id)),
         ]
     };
-    to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_a"))
+    to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_a"), &[])
         .expect("the result answers the call");
-    let error = to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_b"))
-        .expect_err("an unknown call id is refused");
+    let error =
+        to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_b"), &[])
+            .expect_err("an unknown call id is refused");
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert!(error.message.contains("call_b"), "{}", error.message);
 }
@@ -291,6 +293,7 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
         content: Some(InboundContent::Text(content.to_string())),
         tool_calls: None,
         tool_call_id: None,
+        additional_tools: None,
     };
     let messages = vec![
         text("user", "Weather in Paris?"),
@@ -303,11 +306,13 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
             })]),
             tool_call_id: None,
+            additional_tools: None,
         },
         text("tool", "{\"temperature_c\": 21}"),
     ];
     let (lfm, _) =
-        to_core_messages_with_media(ModelVariant::Lfm2512BInstructGguf, messages.clone()).unwrap();
+        to_core_messages_with_media(ModelVariant::Lfm2512BInstructGguf, messages.clone(), &[])
+            .unwrap();
     assert_eq!(
         lfm[1].content,
         "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
@@ -316,7 +321,7 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
     assert_eq!(lfm[2].content, "{\"temperature_c\": 21}");
 
     // Other families keep the Qwen tool format.
-    let (qwen, _) = to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages).unwrap();
+    let (qwen, _) = to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages, &[]).unwrap();
     assert!(qwen[1].content.contains("<function=get_weather>"));
     assert_eq!(qwen[2].role, ChatRole::User);
     assert!(qwen[2].content.starts_with("<tool_response>"));
@@ -338,10 +343,13 @@ fn to_core_messages_collects_multimodal_parts() {
                 video: None,
                 video_url: None,
                 input_video: None,
+                ..InboundContentPart::default()
             }])),
             tool_calls: None,
             tool_call_id: None,
+            additional_tools: None,
         }],
+        &[],
     )
     .expect("multimodal parts should normalize");
 
@@ -364,6 +372,7 @@ fn validates_rejects_non_zero_frequency_penalty() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            additional_tools: None,
         }],
         max_tokens: None,
         max_completion_tokens: None,
@@ -407,6 +416,7 @@ fn strict_profile_accepts_stop_sequences() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            additional_tools: None,
         }],
         max_tokens: None,
         max_completion_tokens: None,
@@ -474,6 +484,7 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            additional_tools: None,
         }],
         max_tokens: None,
         max_completion_tokens: None,
@@ -504,4 +515,44 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
 
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
         .expect("relaxed mode should allow passthrough");
+}
+
+fn inbound(message: serde_json::Value) -> OpenAiInboundMessage {
+    serde_json::from_value(message).expect("valid inbound message")
+}
+
+#[test]
+fn lfm3_tool_results_name_deferred_tools_as_the_template_does() {
+    let tools = [
+        json!({"type": "function", "function": {"name": "search_tools"}}),
+        json!({"type": "function", "defer_loading": true,
+               "function": {"name": "get_weather", "parameters": {}}}),
+    ];
+    let call = json!({"id": "call_1", "type": "function",
+                      "function": {"name": "search_tools", "arguments": "{}"}});
+    let messages = vec![
+        inbound(json!({"role": "user", "content": "Weather?"})),
+        inbound(json!({"role": "assistant", "content": "", "tool_calls": [call]})),
+        inbound(json!({"role": "tool", "tool_call_id": "call_1", "content": "Found 1 tool."})),
+        inbound(json!({"role": "tool", "tool_call_id": "call_1",
+                       "content": [{"type": "tool_reference", "name": "get_weather"}]})),
+    ];
+    let (core, _) =
+        to_core_messages_with_media(ModelVariant::Lfm317BGguf, messages.clone(), &tools).unwrap();
+    // The two results answering one call are one turn.
+    assert_eq!(core.len(), 3);
+    assert_eq!(core[2].role, ChatRole::Tool);
+    assert_eq!(
+        core[2].content,
+        "<tool_response>\nFound 1 tool.\n<additional_tools>\n\
+         {\"name\": \"get_weather\", \"parameters\": {}}\n</additional_tools>\n</tool_response>"
+    );
+
+    // A reference the request's tools do not define, and the construct on
+    // a model whose template has none, are refused.
+    assert!(
+        to_core_messages_with_media(ModelVariant::Lfm317BGguf, messages.clone(), &tools[..1])
+            .is_err()
+    );
+    assert!(to_core_messages_with_media(ModelVariant::Qwen359BGguf, messages, &tools).is_err());
 }
