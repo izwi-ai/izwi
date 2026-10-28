@@ -562,6 +562,91 @@ fn assert_trunk_matches_reference(device: &Device) {
     );
 }
 
+/// Resumable prefill in any split equals one-shot prefill: every single
+/// cut, a split into 1-token spans, and spans cut on both sides of the
+/// 3-token window and inside the 7-tap ShortConv history.
+fn assert_any_prefill_split_matches_one_shot(device: &Device, tolerance: f64) {
+    let tiny = tiny_gguf(11);
+    let loader = &tiny.loader;
+    let config = parse_lfm3_backbone_config(loader).unwrap();
+    let backbone = QuantizedLfm2Backbone::load(loader, config, device).unwrap();
+    let tokens: Vec<u32> = vec![3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8];
+    let run = |cuts: &[usize]| -> Vec<Vec<f64>> {
+        let mut caches =
+            crate::models::shared::attention::physical::test_physical_caches_for_model_layers_on(
+                device,
+                DType::F32,
+                &[2, 4],
+                KV_HEADS,
+                HEAD_DIM,
+                32,
+                1,
+            );
+        let mut cache = caches.pop().unwrap();
+        let mut shortconv = backbone.new_shortconv_state();
+        let mut rows = Vec::new();
+        let mut start = 0;
+        for end in cuts.iter().copied().chain(std::iter::once(tokens.len())) {
+            let input = Tensor::from_slice(&tokens[start..end], (1, end - start), device).unwrap();
+            let embeds = backbone.embed_tokens(&input).unwrap();
+            let hidden = backbone
+                .forward_embeds_retained(&embeds, start, &mut cache, &mut shortconv)
+                .unwrap()
+                .squeeze(0)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F64)
+                .unwrap()
+                .to_vec2::<f64>()
+                .unwrap();
+            rows.extend(hidden);
+            start = end;
+        }
+        rows
+    };
+    let one_shot = run(&[]);
+    let mut splits = (1..tokens.len()).map(|cut| vec![cut]).collect::<Vec<_>>();
+    splits.push((1..tokens.len()).collect());
+    splits.push(vec![2, 3, 4, 7, 8]);
+    for cuts in splits {
+        let rows = run(&cuts);
+        let worst = rows
+            .iter()
+            .flatten()
+            .zip(one_shot.iter().flatten())
+            .map(|(a, b)| {
+                let difference = (a - b).abs();
+                if difference.is_finite() {
+                    difference
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .fold(0f64, f64::max);
+        assert!(
+            worst <= tolerance,
+            "prefill split at {cuts:?} differs from one shot by {worst}"
+        );
+    }
+}
+
+#[test]
+fn any_prefill_split_matches_one_shot_on_cpu() {
+    // Spans of other lengths run other matmul shapes: float noise only.
+    assert_any_prefill_split_matches_one_shot(&Device::Cpu, 1e-4);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn any_prefill_split_matches_one_shot_on_metal() {
+    if let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("any_prefill_split_matches_one_shot_on_metal")
+    {
+        assert_any_prefill_split_matches_one_shot(&device, 1e-3);
+    }
+}
+
 #[test]
 fn lfm3_trunk_matches_the_reference_on_cpu() {
     assert_trunk_matches_reference(&Device::Cpu);
@@ -570,7 +655,9 @@ fn lfm3_trunk_matches_the_reference_on_cpu() {
 #[cfg(feature = "metal")]
 #[test]
 fn lfm3_trunk_matches_the_reference_on_metal() {
-    if let Ok(device) = Device::new_metal(0) {
+    if let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("lfm3_trunk_matches_the_reference_on_metal")
+    {
         assert_trunk_matches_reference(&device);
     }
 }

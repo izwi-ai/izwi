@@ -7,8 +7,11 @@
 //! `LFM3-1.7B-GGUF` is missing. Each backend leg checks:
 //! * prompt ids equal the checkpoint chat template's rendering (thinking on
 //!   and off, preserved and stripped reasoning, tools, tool round trips);
-//! * one-shot and two-span prefill agree, the spans cut inside the 256-token
-//!   sliding window of a 1,042-token prompt;
+//! * one-shot and resumable prefill agree for spans cut at 255, 256 and 257
+//!   tokens across the 256-token sliding window of a 1,042-token prompt, and
+//!   pick the same next token, within the reference budget, cut into
+//!   1-token spans at page boundaries;
+//! * a row rebuilt by replay continues exactly as the row never preempted;
 //! * teacher-forced decode, scalar and two-row batched, tracks the reference
 //!   top-8 logits, and the argmax equals the reference token wherever the
 //!   reference is not a near tie.
@@ -159,6 +162,92 @@ fn run_leg(profile: DeviceProfile, tol: Tolerance) {
         }
         stats.assert_within(&label, &tol);
     }
+
+    // Resumable prefill of the long prompt cut on both sides of the 256-token
+    // sliding window and at page boundaries equals one-shot prefill. Cut into
+    // one-token spans it runs every op at a single row, another shape: float
+    // noise, which CPU's Q8 activation quantization can turn into a whole
+    // quantization step (0.34 measured), so that sweep keeps the argmax and
+    // stays within the backend's reference budget. Then a row rebuilt by
+    // replay from the prompt and its generated tokens continues exactly as
+    // the row that was never preempted.
+    let (long_index, (long_name, long_prompt)) = prompts
+        .iter()
+        .enumerate()
+        .find(|(_, (_, prompt))| prompt.prompt_ids.len() > 600)
+        .expect("a prompt longer than the sliding window");
+    let ids = &long_prompt.prompt_ids;
+    for spans in [
+        vec![255],
+        vec![256],
+        vec![257],
+        vec![1, 2, 255, 256, 257, 511, 512, 513, 767, 1_000],
+    ] {
+        let mut state = prefill(&model, ids, sessions.session(0), &spans);
+        let values = row(&state.unconsumed_output.take().unwrap());
+        let drift = values
+            .iter()
+            .zip(&first_rows[long_index])
+            .map(|(lhs, rhs)| abs_err(*lhs, *rhs))
+            .fold(0f32, f32::max);
+        eprintln!("{backend}/{long_name}: prefill cut at {spans:?} drift {drift:.2e}");
+        let one_token_spans = spans.windows(2).any(|pair| pair[1] == pair[0] + 1);
+        let limit = if one_token_spans {
+            tol.logit
+        } else {
+            tol.chunked
+        };
+        assert!(
+            drift <= limit,
+            "{backend}/{long_name}: prefill cut at {spans:?} drift {drift}"
+        );
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+        };
+        assert_eq!(
+            argmax(&values),
+            argmax(&first_rows[long_index]),
+            "{backend}/{long_name}: prefill cut at {spans:?} changed the next token"
+        );
+    }
+    let mut baseline = prefill(&model, ids, sessions.session(0), &[]);
+    let mut suspended = prefill(&model, ids, sessions.session(1), &[]);
+    for _ in 0..8 {
+        let step = model.decode_step(&mut baseline).unwrap();
+        assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+    }
+    if !baseline.finished {
+        let checkpoint = suspended.replay_checkpoint().unwrap();
+        drop(suspended);
+        let mut replayed = model
+            .begin_replay_managed(&checkpoint, sessions.session(1))
+            .unwrap();
+        model.continue_replay(&mut replayed, ids, 0, 300).unwrap();
+        model
+            .continue_replay(&mut replayed, ids, 300, ids.len())
+            .unwrap();
+        for start in ids.len()..checkpoint.replay_tokens() {
+            model
+                .continue_replay(&mut replayed, ids, start, start + 1)
+                .unwrap();
+        }
+        for step in 0..16 {
+            if baseline.finished {
+                break;
+            }
+            let expected = model.decode_step(&mut baseline).unwrap();
+            let actual = model.decode_step(&mut replayed).unwrap();
+            assert_eq!(
+                actual.delta, expected.delta,
+                "{backend}/{long_name}: replayed row diverged at step {step}"
+            );
+        }
+    }
+    drop(baseline);
 
     // Batched path: a two-span prefill per prompt (cut at 300 tokens, inside
     // the long prompt's sliding window, or at 5), then every prompt decodes

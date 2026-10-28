@@ -375,8 +375,11 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         chat(F::Qwen35Chat).resumable(),
         chat(F::Qwen35MoeChat),
         chat(F::Qwen38Chat).resumable(),
-        chat(F::Lfm2Chat),
-        chat(F::Lfm3Chat),
+        // LFM2 and LFM3 prefill resumes at any span: one-shot equality and
+        // replay are proven across LFM3's sliding window
+        // (`lfm2::chat::lfm3_reference_tests`, `lfm3::tests`).
+        chat(F::Lfm2Chat).resumable(),
+        chat(F::Lfm3Chat).resumable(),
         chat(F::Gemma3Chat),
         // Pipelines and artifacts.
         row(
