@@ -924,6 +924,68 @@ async fn lfm3_audio_answers_chat_about_audio_if_env_set() {
         "{error}"
     );
 
+    // With tools, the reply calls one as LFM3's XML, and answers from its
+    // result.
+    let mut with_tools = audio_chat(&[]);
+    with_tools.tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    })];
+    let question = user("What is the weather in Paris right now?".to_string());
+    let tool_budget = || GenerationParams {
+        max_tokens: 512,
+        ..greedy()
+    };
+    let call = runtime
+        .chat_generate_with_runtime_context(
+            variant,
+            question.clone(),
+            tool_budget(),
+            with_tools.clone(),
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .expect("a tool call");
+    eprintln!("{backend:?}: tools -> {:?}", call.text);
+    assert!(
+        call.text
+            .contains("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis"),
+        "{:?}",
+        call.text
+    );
+    let mut conversation = question;
+    conversation.push(crate::models::shared::chat::ChatMessage {
+        role: crate::models::shared::chat::ChatRole::Assistant,
+        content: call.text.clone(),
+    });
+    conversation.push(crate::models::shared::chat::ChatMessage {
+        role: crate::models::shared::chat::ChatRole::Tool,
+        content: r#"{"temperature_c": 21, "sky": "clear"}"#.to_string(),
+    });
+    let answer = runtime
+        .chat_generate_with_runtime_context(
+            variant,
+            conversation,
+            tool_budget(),
+            with_tools,
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .await
+        .expect("an answer from the tool result");
+    eprintln!("{backend:?}: tool result -> {:?}", answer.text);
+    let answer = answer.text.rsplit("</think>").next().unwrap_or_default();
+    assert!(answer.contains("21") && !answer.contains("<tool_call>"), "{answer:?}");
+
     // A clip the messages do not place is refused before it runs.
     assert!(runtime
         .chat_generate_with_runtime_context(

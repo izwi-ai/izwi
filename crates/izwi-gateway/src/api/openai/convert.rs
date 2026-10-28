@@ -94,9 +94,12 @@ pub fn append_assistant_tool_calls(
         content.push_str(&lfm_tools::render_tool_calls(tool_calls)?);
         return Ok(());
     }
-    if variant.family() == ModelFamily::Lfm3Chat {
-        // LFM3's template writes its XML calls right after the text too, one
-        // blank line apart.
+    if matches!(
+        variant.family(),
+        ModelFamily::Lfm3Chat | ModelFamily::Lfm3Audio
+    ) {
+        // LFM3's and LFM3-Audio's templates write their XML calls right
+        // after the text too, one blank line apart.
         content.push_str(&render_lfm3_tool_calls(tool_calls)?);
         return Ok(());
     }
@@ -108,13 +111,13 @@ pub fn append_assistant_tool_calls(
     Ok(())
 }
 
-/// A tool result turn. LFM2.5 and LFM3 have a native `tool` role (LFM3's
-/// template wraps it in `<tool_response>` itself); the Qwen templates read
-/// results as a user turn wrapped in `<tool_response>`.
+/// A tool result turn. LFM2.5, LFM3 and LFM3-Audio have a native `tool` role
+/// (the LFM3 templates wrap it in `<tool_response>` themselves); the Qwen
+/// templates read results as a user turn wrapped in `<tool_response>`.
 pub fn tool_result_message(variant: ModelVariant, content: String) -> ChatMessage {
     if matches!(
         variant.family(),
-        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat
+        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat | ModelFamily::Lfm3Audio
     ) {
         ChatMessage {
             role: ChatRole::Tool,
@@ -157,7 +160,8 @@ fn render_qwen_tool_calls(tool_calls: &[Value]) -> Result<String, ApiError> {
     Ok(rendered.join("\n"))
 }
 
-/// Render OpenAI `tool_calls` the way LFM3's chat template does:
+/// Render OpenAI `tool_calls` the way LFM3's (and LFM3-Audio's) chat
+/// template does:
 /// `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n...
 /// </function>\n</tool_call>` per call, calls one blank line apart. A value
 /// is written raw when it is a string, `true`/`false`/`null` for JSON

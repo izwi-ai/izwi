@@ -87,8 +87,8 @@ pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
 }
 
 /// Whether a chat model's prompt renders `ChatRequestConfig::tools` with a
-/// tool-calling template (the Qwen3.5 family's and LFM3's XML calls,
-/// LFM2.5's marker list). Other chat models have no tool template.
+/// tool-calling template (the Qwen3.5 family's, LFM3's and LFM3-Audio's XML
+/// calls, LFM2.5's marker list). Other chat models have no tool template.
 pub fn chat_supports_tools(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
@@ -97,6 +97,7 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
+            | ModelFamily::Lfm3Audio
     )
 }
 
@@ -391,6 +392,8 @@ mod tests {
         assert!(!chat_supports_json_object(ModelVariant::Qwen3827BFp8));
         assert!(chat_supports_tools(ModelVariant::Qwen3827BFp8));
         assert!(chat_supports_tools(ModelVariant::Lfm2512BInstructGguf));
+        assert!(chat_supports_tools(ModelVariant::Lfm3Audio2BGguf));
+        assert!(!chat_supports_json_object(ModelVariant::Lfm3Audio2BGguf));
         assert!(!chat_supports_tools(ModelVariant::Qwen314BGguf));
         assert!(!chat_supports_tools(ModelVariant::Gemma34BIt));
     }

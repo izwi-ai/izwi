@@ -67,7 +67,8 @@ pub const LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT: &str = "Respond with interleaved
 pub const LFM3_AUDIO_TOOLS_SYSTEM_PROMPT: &str =
     "Respond with function calls, and interleaved text and audio.";
 
-/// The line the system prompt names the tools after (LFM3-Audio's card).
+/// The line a voice reply's system prompt names the tools after
+/// (LFM3-Audio's card).
 const TOOL_LIST_HEADER: &str = "List of tools:";
 
 /// What a reply writes.
@@ -279,11 +280,12 @@ impl PromptBuilder {
 /// template renders them, each [`CHAT_AUDIO_PLACEHOLDER`] in a user turn a
 /// speech clip.
 ///
-/// * The system turn: the reply's mode line (interleaved replies only;
-///   [`LFM3_AUDIO_TOOLS_SYSTEM_PROMPT`] when it may call tools), the leading
-///   system message, and with tools `List of tools:`, blank lines apart; the
-///   template then appends `<tools>` with one definition per line (deferred
-///   ones left out).
+/// * The system turn: an interleaved reply's mode line
+///   ([`LFM3_AUDIO_TOOLS_SYSTEM_PROMPT`] when it may call tools), the leading
+///   system message, and for an interleaved reply with tools `List of
+///   tools:`, blank lines apart; the template then appends `<tools>` with
+///   one definition per line (deferred ones left out). A text reply's system
+///   turn is the template's own.
 /// * An assistant turn at or before the last user turn keeps only the text
 ///   after its last `</think>`, unless `preserve_thinking`; later ones are
 ///   kept whole.
@@ -316,12 +318,15 @@ pub(crate) fn reply_prompt(
         .filter(|tool| !is_deferred_tool(tool))
         .map(tool_to_json)
         .collect::<Vec<_>>();
-    if !tool_lines.is_empty() {
+    if output == Lfm3AudioReplyOutput::Interleaved && !tool_lines.is_empty() {
         lines.push(TOOL_LIST_HEADER);
     }
     let mut system = lines.join("\n\n");
     if !tool_lines.is_empty() {
-        system.push_str("\n\n<tools>\n");
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str("<tools>\n");
         system.push_str(&tool_lines.join("\n"));
         system.push_str("\n</tools>");
     }
@@ -600,9 +605,9 @@ mod tests {
         );
     }
 
-    /// With tools the system turn lists them (deferred ones left out), an
-    /// interleaved reply switches to speech itself, and tool results are
-    /// native tool turns.
+    /// With tools the system turn lists them (deferred ones left out; a text
+    /// reply's as the template writes it), an interleaved reply switches to
+    /// speech itself, and tool results are native tool turns.
     #[test]
     fn reply_prompts_list_tools_and_render_their_results() {
         let tools = [
@@ -634,7 +639,7 @@ mod tests {
                 false
             )),
             format!(
-                "<|startoftext|><|im_start|>system\nBe brief.\n\nList of tools:\n\n\
+                "<|startoftext|><|im_start|>system\nBe brief.\n\n\
                  <tools>\n{{\"name\": \"get_time\"}}\n</tools><|im_end|>\n{turns}"
             )
         );
@@ -661,6 +666,17 @@ mod tests {
                 false
             )),
             "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // Without a system message the tools are the system turn.
+        assert_eq!(
+            text(&reply_prompt(
+                &[message(ChatRole::User, "Hi")],
+                &tools,
+                Lfm3AudioReplyOutput::Text,
+                false
+            )),
+            "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_time\"}\n</tools>\
+             <|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 }

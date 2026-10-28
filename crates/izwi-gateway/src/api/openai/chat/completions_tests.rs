@@ -321,6 +321,21 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
     assert_eq!(lfm[2].role, ChatRole::Tool);
     assert_eq!(lfm[2].content, "{\"temperature_c\": 21}");
 
+    // LFM3-Audio writes LFM3's XML calls and reads results in its own tool
+    // turns, as its template renders them.
+    let (audio, _) =
+        to_core_messages_with_media(ModelVariant::Lfm3Audio2BGguf, messages.clone(), &[]).unwrap();
+    assert_eq!(
+        audio[1].content,
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+         </function>\n</tool_call>"
+    );
+    assert_eq!(audio[2].role, ChatRole::Tool);
+    assert_eq!(
+        audio[2].content,
+        "<tool_response>\n{\"temperature_c\": 21}\n</tool_response>"
+    );
+
     // Other families keep the Qwen tool format.
     let (qwen, _) = to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages, &[]).unwrap();
     assert!(qwen[1].content.contains("<function=get_weather>"));

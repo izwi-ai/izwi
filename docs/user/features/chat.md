@@ -164,7 +164,7 @@ streaming sequence.
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | LFM3 | `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF` (reasoning on by default, tool calling) |
-| LFM3-Audio | `LFM3-Audio-2B-GGUF`, `LFM3-Audio-2B-Q8_0-GGUF` (audio questions, text answers; local server only) |
+| LFM3-Audio | `LFM3-Audio-2B-GGUF`, `LFM3-Audio-2B-Q8_0-GGUF` (audio questions, text answers, tool calling; local server only) |
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
