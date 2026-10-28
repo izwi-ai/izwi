@@ -39,7 +39,8 @@ mod realtime;
 mod sequence_asr;
 mod tts;
 use asr::{
-    ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, ParakeetAsrExecutionAdapter,
+    ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
+    ParakeetAsrExecutionAdapter,
 };
 use chat::ContinuousChatExecutionAdapter;
 use descriptor::loaded_execution_contracts;
@@ -79,6 +80,7 @@ const CHATTERBOX_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const MAYA1_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);

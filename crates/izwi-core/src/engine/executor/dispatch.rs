@@ -75,7 +75,7 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         task: TaskType::TTS,
         variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::Lfm3Audio),
         handler: |executor, request, scheduled| {
-            executor.lfm3_audio_tts_request_with_managed_cache(request, scheduled, None)
+            executor.lfm3_audio_request_with_managed_cache(request, scheduled, None)
         },
     },
     DispatchRoute {
@@ -440,11 +440,7 @@ impl NativeExecutor {
                         scheduled_req,
                         reservation,
                     )?;
-                    self.lfm3_audio_tts_request_with_managed_cache(
-                        request,
-                        scheduled_req,
-                        Some(state),
-                    )
+                    self.lfm3_audio_request_with_managed_cache(request, scheduled_req, Some(state))
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -1068,7 +1064,7 @@ impl NativeExecutor {
         )
     }
 
-    pub(super) fn execute_static_lfm3_audio_tts_prefill_requests_with_rows(
+    pub(super) fn execute_static_lfm3_audio_prefill_requests_with_rows(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
@@ -1094,7 +1090,7 @@ impl NativeExecutor {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
-        let outputs = self.lfm3_audio_tts_batch_with_managed(&ordered, scheduled, managed)?;
+        let outputs = self.lfm3_audio_batch_with_managed(&ordered, scheduled, managed)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,

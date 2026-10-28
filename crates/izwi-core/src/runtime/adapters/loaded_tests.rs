@@ -1058,9 +1058,13 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         && variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr;
                     let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
-                    let lfm25_audio_asr = execution.metadata().capability
+                    let lfm_audio_asr = execution.metadata().capability
                         == CapabilityKind::Asr
-                        && variant.family() == crate::catalog::ModelFamily::Lfm25Audio;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::Lfm25Audio
+                                | crate::catalog::ModelFamily::Lfm3Audio
+                        );
                     let qwen3_tts = matches!(
                         execution.metadata().capability,
                         CapabilityKind::Tts | CapabilityKind::StreamingTts
@@ -1092,7 +1096,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     if (qwen3_asr
                         || vibevoice_asr
                         || granite_asr
-                        || lfm25_audio_asr
+                        || lfm_audio_asr
                         || qwen3_tts
                         || retained_tts
                         || parakeet_asr

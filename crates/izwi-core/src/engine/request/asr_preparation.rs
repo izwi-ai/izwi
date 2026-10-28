@@ -40,7 +40,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -94,7 +94,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         for (stage_id, cost) in prepared_costs {
@@ -762,7 +762,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
-                | PreparedIncrementalModel::Lfm3AudioTts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -783,9 +783,23 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
-                | PreparedIncrementalModel::Lfm3AudioTts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
+    }
+
+    /// The language an LFM3-Audio transcription names in its prompt: none
+    /// for `auto`, so the model picks.
+    pub(crate) fn lfm3_audio_asr_language(&self) -> Option<&str> {
+        self.asr_language_for_execution()
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+    }
+
+    /// The text tokens an LFM3-Audio clip may decode: the caller's limit, or
+    /// `None` when the caller left it to the clip's length.
+    pub(crate) fn lfm3_audio_asr_token_limit(&self) -> Option<usize> {
+        (!self.asr_auto_max_tokens).then_some(self.params.max_tokens)
     }
 
     pub(crate) fn prepared_lfm25_audio_asr_model_lease_for_executor(
@@ -806,7 +820,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
-                | PreparedIncrementalModel::Lfm3AudioTts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

@@ -992,10 +992,10 @@ impl ModelLifecycleController {
         Ok(())
     }
 
-    /// LFM3-Audio: speech runs as retained rows on the managed arena (the
-    /// language model's paged attention and ShortConv ring, kept between
-    /// quanta); transcription and voice chat each lease one scalar
-    /// invocation workspace and run atomically.
+    /// LFM3-Audio: speech and transcription run as retained rows on one
+    /// managed arena (the language model's paged attention and ShortConv
+    /// ring, kept between quanta); long-form transcription and voice chat
+    /// each lease one scalar invocation workspace and run atomically.
     pub(super) async fn allocate_lfm3_audio_state(
         &self,
         variant: ModelVariant,
@@ -1027,7 +1027,10 @@ impl ModelLifecycleController {
             .iter()
             .map(|contract| contract.stages.as_ref())
             .collect::<Vec<_>>();
-        let tts_spec = model.lfm3_audio_retained_tts_state_spec(&stage_graphs)?;
+        let tts_spec = model.lfm3_audio_retained_state_spec(
+            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts,
+            &stage_graphs,
+        )?;
         let retained = self
             .core_engine
             .load_managed_model_state(
@@ -1061,11 +1064,68 @@ impl ModelLifecycleController {
             retained_uses,
         )?;
         state_publications.insert(CapabilityKind::Tts, publication);
-        let capabilities = [
+
+        // Transcription rows share the speech arena (the same contract
+        // returns the bound runtime); its long form leases the main
+        // invocation workspace.
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let asr_spec = model.lfm3_audio_retained_state_spec(
+            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Asr,
+            &stage_graphs,
+        )?;
+        let retained = self
+            .core_engine
+            .load_managed_model_state(
+                model_instance_id,
+                &asr_spec.retained,
+                Some(tts_spec.retained_max_tokens),
+                0,
+                state_fit_reserve,
+                0,
+            )
+            .await?;
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
             CapabilityKind::Asr,
-            CapabilityKind::AudioChat,
-            CapabilityKind::SpeechToSpeech,
-        ];
+            retained.state_plan_v2(),
+        )?;
+        let retained_uses = contracts
+            .iter()
+            .map(|contract| {
+                let retained_use = match contract.execution_profile.mode {
+                    crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
+                    crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
+                    _ => {
+                        return Err(Error::ModelLoadError(
+                            "LFM3-Audio ASR graph has an incompatible retained-state profile"
+                                .into(),
+                        ))
+                    }
+                };
+                Ok((stage_graph_fingerprint(&contract.stages)?, retained_use))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let main_invocation = asr_spec.main_invocation.as_ref().ok_or_else(|| {
+            Error::ModelLoadError("LFM3-Audio ASR is missing its long-form workspace".into())
+        })?;
+        let publication = self
+            .load_invocation_workspace_publication_with_remaining_groups(
+                model_instance_id,
+                &contracts,
+                asr_spec.descriptor,
+                main_invocation,
+                Some(retained.into()),
+                retained_uses,
+                LaterStateGroups::sharing(3),
+            )
+            .await?;
+        state_publications.insert(CapabilityKind::Asr, publication);
+
+        let capabilities = [CapabilityKind::AudioChat, CapabilityKind::SpeechToSpeech];
         for (index, capability) in capabilities.into_iter().enumerate() {
             use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
             let contracts = bundle_draft.execution_contracts(capability)?;
@@ -1073,10 +1133,7 @@ impl ModelLifecycleController {
                 .iter()
                 .map(|contract| contract.stages.as_ref())
                 .collect::<Vec<_>>();
-            let workload = match capability {
-                CapabilityKind::Asr => Lfm3AudioWorkload::Asr,
-                _ => Lfm3AudioWorkload::Conversation,
-            };
+            let workload = Lfm3AudioWorkload::Conversation;
             let physical_spec = model.lfm3_audio_physical_state_spec(workload, &stage_graphs)?;
             let publication = self
                 .load_invocation_workspace_publication_with_remaining_groups(

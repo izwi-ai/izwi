@@ -3950,7 +3950,7 @@ impl NativeExecutor {
                 .model_variant
                 .is_some_and(|variant| variant.family() == ModelFamily::Lfm3Audio)
         }) {
-            return self.lfm3_audio_tts_batch_with_managed(
+            return self.lfm3_audio_batch_with_managed(
                 &ordered_requests,
                 scheduled,
                 managed_caches,

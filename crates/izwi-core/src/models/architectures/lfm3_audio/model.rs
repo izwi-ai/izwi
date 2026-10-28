@@ -258,6 +258,26 @@ impl Lfm3AudioLmState for RetainedLmState {
     }
 }
 
+/// A transcription of one clip's encoder embeddings `audio` (at most 30 s),
+/// greedy, in `language` or the one the model hears, at most `max_tokens`
+/// text tokens.
+pub(crate) fn asr_request(
+    audio: Tensor,
+    language: Option<&str>,
+    max_tokens: usize,
+) -> Result<Lfm3AudioRequest> {
+    Ok(Lfm3AudioRequest {
+        prompt: asr_prompt(language)?,
+        audio: Some(audio),
+        mode: Lfm3AudioMode::Text,
+        text_only: true,
+        max_slots: max_tokens.max(1),
+        text_sampling: Lfm3TextSampling::default(),
+        audio_sampling: Lfm3AudioSampling::default(),
+        seed: 0,
+    })
+}
+
 /// A speech request: `text` in `voice`, at most `max_frames` frames.
 pub(crate) fn tts_request(
     text: &str,
@@ -382,11 +402,9 @@ impl Lfm3AudioModel {
         &self.lm_config
     }
 
-    /// Positions one speech row may hold: its TTS segment's context.
-    pub(crate) fn tts_row_context(&self) -> usize {
-        super::physical::Lfm3AudioWorkload::Tts
-            .context_tokens()
-            .min(self.max_context_tokens())
+    /// Positions one row of `workload` may hold: that workload's context.
+    pub(crate) fn row_context(&self, workload: super::physical::Lfm3AudioWorkload) -> usize {
+        workload.context_tokens().min(self.max_context_tokens())
     }
 
     pub(crate) fn lm(&self) -> &QuantizedLfm2Backbone {
@@ -410,6 +428,23 @@ impl Lfm3AudioModel {
                 prompt_tokens,
             },
         ))
+    }
+
+    /// A transcription row of one clip (at most 30 s) at any rate, in
+    /// `language` or the one the model hears: its prompt with the clip's
+    /// encoder embeddings, decoding at most `max_tokens` text tokens (from
+    /// the clip's length when `None`).
+    pub(crate) fn prepare_asr_row(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        max_tokens: Option<usize>,
+    ) -> Result<std::sync::Arc<super::retained::Lfm3AudioPreparedArtifact>> {
+        let seconds = samples.len() as f32 / sample_rate.max(1) as f32;
+        let budget = max_tokens.unwrap_or_else(|| lfm3_audio_asr_max_tokens(seconds));
+        let audio = self.encode_audio(samples, sample_rate)?;
+        self.prepare_row(asr_request(audio, language, budget)?)
     }
 
     pub fn max_context_tokens(&self) -> usize {
@@ -783,18 +818,8 @@ impl Lfm3AudioModel {
         should_stop: &mut dyn FnMut() -> bool,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Lfm3AudioOutput> {
-        let prompt = asr_prompt(language)?;
         self.generate(
-            Lfm3AudioRequest {
-                prompt,
-                audio: Some(audio),
-                mode: Lfm3AudioMode::Text,
-                text_only: true,
-                max_slots: max_tokens.max(1),
-                text_sampling: Lfm3TextSampling::default(),
-                audio_sampling: Lfm3AudioSampling::default(),
-                seed: 0,
-            },
+            asr_request(audio, language, max_tokens)?,
             state,
             should_stop,
             on_text,
@@ -1020,6 +1045,10 @@ pub fn lfm3_audio_tts_auto_max_frames(text: &str) -> usize {
         crate::model::ModelVariant::LFM3_AUDIO_MAX_OUTPUT_FRAMES,
     )
 }
+
+/// The longest clip one transcription covers: the training clips' length.
+/// Longer audio is transcribed in chunks.
+pub(crate) const LFM3_AUDIO_MAX_CLIP_SECS: f32 = 30.0;
 
 /// ASR tokens a clip of `seconds` may need: 12 per second (well above
 /// speech in any of the 18 languages) plus 32, between 64 and 512.

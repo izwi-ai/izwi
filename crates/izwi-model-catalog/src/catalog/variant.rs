@@ -101,6 +101,7 @@ impl ModelFamily {
                 | Self::GraniteSpeechAsr
                 | Self::GraniteSpeech5Asr
                 | Self::Lfm25Audio
+                | Self::Lfm3Audio
         )
     }
 
@@ -133,6 +134,7 @@ impl ModelFamily {
                 | Self::ParakeetAsr
                 | Self::NemotronAsr
                 | Self::Lfm25Audio
+                | Self::Lfm3Audio
                 | Self::Voxtral
         )
     }

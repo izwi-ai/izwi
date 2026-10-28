@@ -22,8 +22,8 @@ mod handler_audio_chat;
 mod handler_chat;
 mod handler_chatterbox;
 mod handler_lfm3_audio;
+mod handler_lfm3_audio_rows;
 mod handler_maya1;
-mod handler_lfm3_audio_tts;
 mod handler_maya2;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
@@ -107,7 +107,7 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishS2TtsDecode,
-    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioTtsDecode, ActiveMaya1TtsDecode,
+    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode, ActiveMaya1TtsDecode,
     ActiveMaya2TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
     ActiveVoxtralRealtime, ActiveVoxtralTtsDecode, PendingVoxtralRealtimeQuantum,
     PreparedVoxtralRealtimeQuantum,
@@ -2647,7 +2647,7 @@ pub struct NativeExecutor {
     chatterbox_tts_decode_states: ExecutorStateStore<ActiveChatterboxTtsDecode>,
     maya1_tts_decode_states: ExecutorStateStore<ActiveMaya1TtsDecode>,
     maya2_tts_decode_states: ExecutorStateStore<ActiveMaya2TtsDecode>,
-    lfm3_audio_tts_decode_states: ExecutorStateStore<ActiveLfm3AudioTtsDecode>,
+    lfm3_audio_decode_states: ExecutorStateStore<ActiveLfm3AudioDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
     long_form_asr: Arc<long_form::LongFormAsrRuns>,
@@ -2736,7 +2736,7 @@ impl NativeExecutor {
             chatterbox_tts_decode_states: Mutex::new(HashMap::new()),
             maya1_tts_decode_states: Mutex::new(HashMap::new()),
             maya2_tts_decode_states: Mutex::new(HashMap::new()),
-            lfm3_audio_tts_decode_states: Mutex::new(HashMap::new()),
+            lfm3_audio_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
             long_form_asr,
@@ -2904,6 +2904,13 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .flatten()
                     .map(|_| (true, true))
             })
+            .or_else(|| {
+                request
+                    .prepared_lfm3_audio_model_lease_for_executor()
+                    .ok()
+                    .flatten()
+                    .map(|_| (true, true))
+            })
             .unwrap_or((false, false)),
         TaskType::TTS
             if request
@@ -2919,7 +2926,7 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .prepared_maya2_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some())
                 || request
-                    .prepared_lfm3_audio_tts_model_lease_for_executor()
+                    .prepared_lfm3_audio_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some()) =>
         {
             (true, true)
@@ -3093,6 +3100,13 @@ impl ModelExecutor for NativeExecutor {
                         .ok()
                         .flatten()
                         .map(|_| request.uses_asr_retained_sequence())
+                })
+                .or_else(|| {
+                    request
+                        .prepared_lfm3_audio_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| request.uses_asr_retained_sequence())
                 }),
             super::types::TaskType::TTS => {
                 let loaded = request
@@ -3128,7 +3142,7 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_maya2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
-                        .prepared_lfm3_audio_tts_model_lease_for_executor()
+                        .prepared_lfm3_audio_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(matches!(
@@ -3202,6 +3216,13 @@ impl ModelExecutor for NativeExecutor {
                         .ok()
                         .flatten()
                         .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_lfm3_audio_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
                 }),
             super::types::TaskType::TTS => request
                 .prepared_qwen_tts_model_for_executor()
@@ -3252,7 +3273,7 @@ impl ModelExecutor for NativeExecutor {
                 })
                 .or_else(|| {
                     request
-                        .prepared_lfm3_audio_tts_model_lease_for_executor()
+                        .prepared_lfm3_audio_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -3581,6 +3602,23 @@ impl ModelExecutor for NativeExecutor {
                     stage: NativeAudioStage::SequencePrefill,
                     mode: NativeBatchMode::Static,
                     ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Lfm3Audio
+                    }) && request.uses_asr_retained_sequence()
+                }) =>
+                {
+                    self.execute_static_lfm3_audio_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
                 } if execution.batch.lane.kernel_mode
                     == crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE
                     && has_native_vibevoice_tokenizer_batch(execution.scheduled)
@@ -3766,7 +3804,7 @@ impl ModelExecutor for NativeExecutor {
                     })
                 }) =>
                 {
-                    self.execute_static_lfm3_audio_tts_prefill_requests_with_rows(
+                    self.execute_static_lfm3_audio_prefill_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -3914,7 +3952,7 @@ impl ModelExecutor for NativeExecutor {
             .maya2_tts_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("Maya2 decode state mutex poisoned".to_string()))?;
-        let mut lfm3_audio_tts = self.lfm3_audio_tts_decode_states.lock().map_err(|_| {
+        let mut lfm3_audio_rows = self.lfm3_audio_decode_states.lock().map_err(|_| {
             Error::InferenceError("LFM3-Audio decode state mutex poisoned".to_string())
         })?;
         if self.voxtral_realtime.abort_matching(|_| true).is_err() {
@@ -3944,7 +3982,7 @@ impl ModelExecutor for NativeExecutor {
         chatterbox_tts.clear();
         maya1_tts.clear();
         maya2_tts.clear();
-        lfm3_audio_tts.clear();
+        lfm3_audio_rows.clear();
         voxtral.clear();
         tts.clear();
         drop((
@@ -3959,7 +3997,7 @@ impl ModelExecutor for NativeExecutor {
             chatterbox_tts,
             maya1_tts,
             maya2_tts,
-            lfm3_audio_tts,
+            lfm3_audio_rows,
             voxtral,
             tts,
         ));
@@ -4001,7 +4039,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
-            Ok(mut lfm3_audio_tts),
+            Ok(mut lfm3_audio_rows),
             Ok(mut voxtral),
             Ok(mut tts),
         ) = (
@@ -4016,7 +4054,7 @@ impl ModelExecutor for NativeExecutor {
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
-            self.lfm3_audio_tts_decode_states.lock(),
+            self.lfm3_audio_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
@@ -4035,7 +4073,7 @@ impl ModelExecutor for NativeExecutor {
         let chatterbox_tts = cleanup_request_states_locked(&mut chatterbox_tts, request_id);
         let maya1_tts = cleanup_request_states_locked(&mut maya1_tts, request_id);
         let maya2_tts = cleanup_request_states_locked(&mut maya2_tts, request_id);
-        let lfm3_audio_tts = cleanup_request_states_locked(&mut lfm3_audio_tts, request_id);
+        let lfm3_audio_rows = cleanup_request_states_locked(&mut lfm3_audio_rows, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
         cleanup_report(
@@ -4049,7 +4087,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
                 .combine(maya2_tts)
-                .combine(lfm3_audio_tts)
+                .combine(lfm3_audio_rows)
                 .combine(voxtral)
                 .combine(tts),
         )
@@ -4087,7 +4125,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
-            Ok(mut lfm3_audio_tts),
+            Ok(mut lfm3_audio_rows),
             Ok(mut voxtral),
             Ok(mut tts),
         ) = (
@@ -4102,7 +4140,7 @@ impl ModelExecutor for NativeExecutor {
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
-            self.lfm3_audio_tts_decode_states.lock(),
+            self.lfm3_audio_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
@@ -4125,7 +4163,7 @@ impl ModelExecutor for NativeExecutor {
         let chatterbox_tts = cleanup_session_state_locked(&mut chatterbox_tts, session);
         let maya1_tts = cleanup_session_state_locked(&mut maya1_tts, session);
         let maya2_tts = cleanup_session_state_locked(&mut maya2_tts, session);
-        let lfm3_audio_tts = cleanup_session_state_locked(&mut lfm3_audio_tts, session);
+        let lfm3_audio_rows = cleanup_session_state_locked(&mut lfm3_audio_rows, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
         cleanup_report(
@@ -4139,7 +4177,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
                 .combine(maya2_tts)
-                .combine(lfm3_audio_tts)
+                .combine(lfm3_audio_rows)
                 .combine(voxtral)
                 .combine(tts),
         )
@@ -4164,14 +4202,14 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
-            Ok(mut lfm3_audio_tts),
+            Ok(mut lfm3_audio_rows),
         ) = (
             self.voxtral_realtime.states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
-            self.lfm3_audio_tts_decode_states.lock(),
+            self.lfm3_audio_decode_states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
@@ -4198,7 +4236,7 @@ impl ModelExecutor for NativeExecutor {
                     |active| active.variant,
                 ))
                 .combine(cleanup_model_states_locked(
-                    &mut lfm3_audio_tts,
+                    &mut lfm3_audio_rows,
                     variant,
                     |active| active.variant,
                 )),

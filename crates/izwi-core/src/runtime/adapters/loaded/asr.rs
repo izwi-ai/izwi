@@ -423,6 +423,182 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
     }
 }
 
+/// LFM3-Audio transcription. A clip of at most 30 s runs as a retained row
+/// (scalar preparation that encodes the audio and embeds the prompt, static
+/// prefill, continuous decode batched across rows); longer audio runs as one
+/// atomic invocation that chunks inside it, on the language model's leased
+/// pages and ring (the workspace the diarization pipeline also leases).
+#[derive(Debug)]
+pub(super) struct Lfm3AudioAsrExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) max_batch_size: usize,
+}
+
+impl Lfm3AudioAsrExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for Lfm3AudioAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        LFM3_AUDIO_ASR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.cancellation = CancellationGranularity::OperationBoundary;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefix_reuse_safe = false;
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.lfm3_audio.atomic",
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            dispatch_long_form_asr_by_chunk(
+                &mut stage,
+                &metadata,
+                "asr.long_form.lfm3_audio.chunked",
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:asr:{}:lfm3-audio-state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = false;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+        let rows = self.max_batch_size as u64;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.lfm3_audio",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        // Mel features and the encoder over at most 30 s of audio.
+        preparation.max_workspace_bytes = 512 * 1024 * 1024;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.prefill.lfm3_audio.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = 2_048_u64.saturating_mul(rows);
+        // Each row's prompt (with its 375 encoder tokens) prefills alone.
+        prefill.max_workspace_bytes = (256_u64 * 1024 * 1024).saturating_mul(rows);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.decode.lfm3_audio.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = 64_u64.saturating_mul(rows);
+        // A text step's logits row and the language model's activations.
+        decode.max_workspace_bytes = (64_u64 * 1024 * 1024).saturating_mul(rows);
+        for stage in [&mut preparation, &mut prefill, &mut decode] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Lfm25AudioAsrExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,

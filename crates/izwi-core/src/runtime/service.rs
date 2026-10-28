@@ -74,6 +74,7 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparedPromptArtifact,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
+use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
 use crate::models::architectures::maya1::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
     MAYA1_DEFAULT_VOICE, MAYA1_VOICE_PRESETS,
@@ -964,6 +965,7 @@ fn bind_request_to_residency(
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
+                | ModelFamily::Lfm3Audio
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1015,6 +1017,16 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "LFM2.5 Audio normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Lfm3Audio
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request.prepared_lfm3_audio_artifact_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "LFM3-Audio normal execution shape has no matching prepared artifact".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {

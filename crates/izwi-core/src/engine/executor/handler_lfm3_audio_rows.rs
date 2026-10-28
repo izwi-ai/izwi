@@ -1,8 +1,9 @@
-//! LFM3-Audio speech as retained continuous rows: each quantum prefills a
+//! LFM3-Audio requests as retained continuous rows: each quantum prefills a
 //! row's prompt span, or steps every row one slot with the language model in
 //! one batched forward, over each row's retained paged KV and ShortConv ring.
-//! A streamed request sends its speech as the codec decodes it; a final-only
-//! request gets its audio when its row finishes.
+//! A speech row streams its audio as the codec decodes it (a final-only
+//! request gets it when its row finishes); a transcription row returns its
+//! text so far and streams each quantum's new text.
 
 use std::sync::Arc;
 
@@ -15,22 +16,22 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
-use super::super::types::AudioOutput;
+use super::super::types::{AudioOutput, TaskType};
 use super::handler_tts::{retained_tts_batch_model_call, stream_committed_tts_audio};
-use super::state::ActiveLfm3AudioTtsDecode;
+use super::state::ActiveLfm3AudioDecode;
 use super::{ExecutorOutput, ExecutorStateLease, ModelSessionResult, NativeExecutor};
 
 const SAMPLE_RATE: u32 = 24_000;
 
-struct Lfm3AudioTtsRow<'a> {
+struct Lfm3AudioBatchRow<'a> {
     index: usize,
-    lease: Option<ExecutorStateLease<'a, ActiveLfm3AudioTtsDecode>>,
+    lease: Option<ExecutorStateLease<'a, ActiveLfm3AudioDecode>>,
     cache: PhysicalPagedKvCache,
     cache_start: usize,
     checkpoint: Option<Lfm3AudioRetainedCheckpoint>,
 }
 
-impl Lfm3AudioTtsRow<'_> {
+impl Lfm3AudioBatchRow<'_> {
     fn state_mut(&mut self) -> Result<&mut Lfm3AudioRetainedState> {
         Ok(&mut self
             .lease
@@ -55,12 +56,12 @@ impl Lfm3AudioTtsRow<'_> {
 }
 
 /// Rolls back every armed row if the quantum does not reach its commit.
-struct Lfm3AudioTtsBatch<'a> {
-    rows: Vec<Lfm3AudioTtsRow<'a>>,
+struct Lfm3AudioBatch<'a> {
+    rows: Vec<Lfm3AudioBatchRow<'a>>,
     armed: bool,
 }
 
-impl Drop for Lfm3AudioTtsBatch<'_> {
+impl Drop for Lfm3AudioBatch<'_> {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -76,13 +77,13 @@ impl Drop for Lfm3AudioTtsBatch<'_> {
 }
 
 impl NativeExecutor {
-    pub(super) fn lfm3_audio_tts_request_with_managed_cache(
+    pub(super) fn lfm3_audio_request_with_managed_cache(
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
         retained: Option<super::RetainedRowManagedState>,
     ) -> Result<ModelSessionResult> {
-        let mut outputs = self.lfm3_audio_tts_batch_with_managed(
+        let mut outputs = self.lfm3_audio_batch_with_managed(
             &[request],
             std::slice::from_ref(scheduled),
             vec![retained],
@@ -94,7 +95,7 @@ impl NativeExecutor {
 
     /// One quantum for every row: a prompt span each, or one slot each with
     /// the language model batched across rows.
-    pub(super) fn lfm3_audio_tts_batch_with_managed(
+    pub(super) fn lfm3_audio_batch_with_managed(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
@@ -134,7 +135,7 @@ impl NativeExecutor {
             return Err(Error::InvalidInput("LFM3-Audio batch mixed phases".into()));
         }
         let model = requests[live[0]]
-            .prepared_lfm3_audio_tts_model_lease_for_executor()?
+            .prepared_lfm3_audio_model_lease_for_executor()?
             .ok_or_else(|| Error::InferenceError("LFM3-Audio batch lost its model".into()))?;
         let model_arc = model.model_arc();
         let lfm3 = model.lfm3_audio()?;
@@ -144,7 +145,7 @@ impl NativeExecutor {
             let request = requests[index];
             let variant = Self::resolve_variant(request)?;
             let row_model = request
-                .prepared_lfm3_audio_tts_model_lease_for_executor()?
+                .prepared_lfm3_audio_model_lease_for_executor()?
                 .ok_or_else(|| Error::InferenceError("LFM3-Audio row lost its model".into()))?;
             if variant.family() != ModelFamily::Lfm3Audio
                 || !Arc::ptr_eq(&model_arc, &row_model.model_arc())
@@ -169,10 +170,10 @@ impl NativeExecutor {
             let cache_start = cache.context_len();
             retained.ensure_all_paged_consumed()?;
             let mut lease = ExecutorStateLease::checkout(
-                &self.lfm3_audio_tts_decode_states,
+                &self.lfm3_audio_decode_states,
                 scheduled[index].session_key(),
                 variant,
-                "LFM3-Audio TTS",
+                "LFM3-Audio row",
             )?;
             if lease.state().is_some_and(|active| {
                 active.variant != variant || !Arc::ptr_eq(&active.model.model_arc(), &model_arc)
@@ -186,19 +187,30 @@ impl NativeExecutor {
                     ));
                 }
                 let artifact = request
-                    .prepared_lfm3_audio_tts_artifact_for_executor()?
+                    .prepared_lfm3_audio_artifact_for_executor()?
                     .ok_or_else(|| {
                         Error::InferenceError("LFM3-Audio row lost its prompt".into())
                     })?;
+                let input_audio = match request.task_type {
+                    TaskType::ASR => {
+                        let (samples, rate) =
+                            request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                                Error::InferenceError("LFM3-Audio row lost its audio".into())
+                            })?;
+                        Some((rate, samples.len()))
+                    }
+                    _ => None,
+                };
                 // The row holds its prompt and every slot it may decode.
                 let context = artifact.prompt_tokens + request.params.max_tokens;
-                lease.install_state(ActiveLfm3AudioTtsDecode {
+                lease.install_state(ActiveLfm3AudioDecode {
                     variant,
                     model: model.clone(),
                     state: Lfm3AudioRetainedState::new(lfm3, artifact, context)?,
                     stream_sequence: 0,
                     streamed_samples: 0,
                     rendered: Vec::new(),
+                    input_audio,
                 })?;
             }
             let active = lease.require_state_mut()?;
@@ -211,7 +223,7 @@ impl NativeExecutor {
             }
             let checkpoint = active.state.begin_quantum(&cache)?;
             lease.mark_dirty();
-            rows.push(Lfm3AudioTtsRow {
+            rows.push(Lfm3AudioBatchRow {
                 index,
                 lease: Some(lease),
                 cache,
@@ -219,7 +231,7 @@ impl NativeExecutor {
                 checkpoint: Some(checkpoint),
             });
         }
-        let mut batch = Lfm3AudioTtsBatch { rows, armed: true };
+        let mut batch = Lfm3AudioBatch { rows, armed: true };
         for row in &mut batch.rows {
             if requests[row.index].is_cancelled() {
                 row.rollback()?;
@@ -241,7 +253,7 @@ impl NativeExecutor {
                         continue;
                     }
                     let span = scheduled[row.index].num_tokens;
-                    let Lfm3AudioTtsRow { lease, cache, .. } = row;
+                    let Lfm3AudioBatchRow { lease, cache, .. } = row;
                     let state = &mut lease
                         .as_mut()
                         .expect("armed LFM3-Audio lease")
@@ -255,7 +267,7 @@ impl NativeExecutor {
                     if row.checkpoint.is_none() {
                         continue;
                     }
-                    let Lfm3AudioTtsRow { lease, cache, .. } = row;
+                    let Lfm3AudioBatchRow { lease, cache, .. } = row;
                     step_rows.push(Lfm3AudioStepRow {
                         state: &mut lease
                             .as_mut()
@@ -329,42 +341,46 @@ impl NativeExecutor {
             let mut lease = row.lease.take().expect("armed LFM3-Audio lease");
             let active = lease.require_state_mut()?;
             let finished = active.state.finished();
-            let samples = active.state.take_samples();
-            let audio = if is_prefill {
-                AudioOutput::new(Vec::new(), SAMPLE_RATE)
-            } else {
-                match Self::stream_sender(request) {
-                    Some(tx) => stream_committed_tts_audio(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active.stream_sequence,
-                        &mut active.streamed_samples,
-                        samples,
-                        SAMPLE_RATE,
-                        finished,
-                    )?,
-                    None => {
-                        active.rendered.extend(samples);
+            let (audio, text) = match active.input_audio {
+                Some((sample_rate, input_samples)) => {
+                    let delta = active.state.take_text();
+                    if let Some(tx) = Self::stream_sender(request) {
+                        if !delta.is_empty() {
+                            Self::stream_text_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                                delta,
+                            )?;
+                        }
                         if finished {
-                            AudioOutput::new(std::mem::take(&mut active.rendered), SAMPLE_RATE)
-                        } else {
-                            AudioOutput::new(Vec::new(), SAMPLE_RATE)
+                            Self::stream_final_marker_with_policy(
+                                &tx,
+                                request.stream_policy,
+                                &request.id,
+                                &mut active.stream_sequence,
+                            )?;
                         }
                     }
+                    let text = active
+                        .state
+                        .output()
+                        .map(|output| output.text.clone())
+                        .unwrap_or_default();
+                    let audio = AudioOutput {
+                        streamed_samples: None,
+                        samples: Vec::new(),
+                        sample_rate,
+                        duration_secs: input_samples as f32 / sample_rate.max(1) as f32,
+                    };
+                    (audio, Some(text))
                 }
+                None => (
+                    self.lfm3_audio_speech_output(request, active, is_prefill)?,
+                    None,
+                ),
             };
-            if finished
-                && active
-                    .state
-                    .output()
-                    .is_some_and(|output| output.audio_frames == 0)
-            {
-                return Err(Error::InferenceError(format!(
-                    "LFM3-Audio spoke no audio for request {}",
-                    request.id
-                )));
-            }
             lease.mark_clean();
             if finished {
                 lease.release()?;
@@ -374,7 +390,7 @@ impl NativeExecutor {
             let output = ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(audio),
-                text: None,
+                text,
                 input_transcription: None,
                 tokens_processed: if is_prefill {
                     scheduled[index].num_tokens
@@ -396,6 +412,54 @@ impl NativeExecutor {
         }
         batch.armed = false;
         collect_outputs(outputs)
+    }
+}
+
+impl NativeExecutor {
+    /// A speech row's audio for this quantum: streamed as the codec decoded
+    /// it, or kept until a final-only request finishes.
+    fn lfm3_audio_speech_output(
+        &self,
+        request: &EngineCoreRequest,
+        active: &mut ActiveLfm3AudioDecode,
+        is_prefill: bool,
+    ) -> Result<AudioOutput> {
+        if is_prefill {
+            return Ok(AudioOutput::new(Vec::new(), SAMPLE_RATE));
+        }
+        let finished = active.state.finished();
+        if finished
+            && active
+                .state
+                .output()
+                .is_some_and(|output| output.audio_frames == 0)
+        {
+            return Err(Error::InferenceError(format!(
+                "LFM3-Audio spoke no audio for request {}",
+                request.id
+            )));
+        }
+        let samples = active.state.take_samples();
+        Ok(match Self::stream_sender(request) {
+            Some(tx) => stream_committed_tts_audio(
+                &tx,
+                request.stream_policy,
+                &request.id,
+                &mut active.stream_sequence,
+                &mut active.streamed_samples,
+                samples,
+                SAMPLE_RATE,
+                finished,
+            )?,
+            None => {
+                active.rendered.extend(samples);
+                if finished {
+                    AudioOutput::new(std::mem::take(&mut active.rendered), SAMPLE_RATE)
+                } else {
+                    AudioOutput::new(Vec::new(), SAMPLE_RATE)
+                }
+            }
+        })
     }
 }
 

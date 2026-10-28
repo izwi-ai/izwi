@@ -35,6 +35,7 @@ pub(crate) enum LoadedAdapterKind {
     Maya1Tts,
     Maya2Tts,
     Lfm3AudioTts,
+    Lfm3AudioAsr,
     KokoroStaticTts,
     Scalar,
 }
@@ -60,6 +61,7 @@ impl LoadedAdapterKind {
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
             Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
             Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
+            Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -360,12 +362,12 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // Audio chat.
         row(F::Lfm25Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm25Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
-        // LFM3-Audio speech runs as retained rows that batch: the language
-        // model's pages and ring stay in the managed arena between quanta,
-        // and speech streams as the codec decodes it. Transcription and
-        // voice chat run as one atomic invocation on leased pages and ring;
-        // ASR on the direct audio-chat route, long audio chunked inside the
-        // invocation.
+        // LFM3-Audio speech and transcription run as retained rows that
+        // batch: the language model's pages and ring stay in the managed
+        // arena between quanta. Speech streams as the codec decodes it; a
+        // clip of at most 30 s transcribes as a row, longer audio in clips
+        // of at most 30 s, one atomic dispatch each. Voice chat runs as one
+        // atomic invocation on leased pages and ring.
         row(
             F::Lfm3Audio,
             C::Tts,
@@ -373,9 +375,14 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
-        row(F::Lfm3Audio, C::Asr, Loaded::Scalar, Invocation)
-            .chunked()
-            .target(Target::DirectModel),
+        row(
+            F::Lfm3Audio,
+            C::Asr,
+            Loaded::Lfm3AudioAsr,
+            RetainedAndInvocation,
+        )
+        .chunked()
+        .sequence(),
         row(F::Lfm3Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm3Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
         // Chat.

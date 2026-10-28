@@ -203,7 +203,7 @@ pub(super) struct ActiveMaya2TtsDecode {
     pub(super) rendered: Vec<f32>,
 }
 
-pub(super) struct ActiveLfm3AudioTtsDecode {
+pub(super) struct ActiveLfm3AudioDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: Lfm25AudioModelLease,
     pub(super) state: crate::models::architectures::lfm3_audio::retained::Lfm3AudioRetainedState,
@@ -213,6 +213,8 @@ pub(super) struct ActiveLfm3AudioTtsDecode {
     pub(super) streamed_samples: usize,
     /// A final-only request's samples, handed over when it finishes.
     pub(super) rendered: Vec<f32>,
+    /// A transcription's input audio: its sample rate and length.
+    pub(super) input_audio: Option<(u32, usize)>,
 }
 
 pub(super) struct ActiveVoxtralRealtime {

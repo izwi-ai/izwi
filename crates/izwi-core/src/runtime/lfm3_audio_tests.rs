@@ -6,7 +6,7 @@
 //! reported as not run.
 //!
 //! `IZWI_LFM3_AUDIO_BACKEND=metal` runs it on Metal instead of the CPU, and
-//! `IZWI_LFM3_AUDIO_BATCH=4` runs speech rows four wide.
+//! `IZWI_LFM3_AUDIO_BATCH=4` runs speech and transcription rows four wide.
 //!
 //! Run: `IZWI_LFM3_AUDIO_MODELS_DIR=~/Library/Application\ Support/izwi/models cargo test -p izwi-core --features metal --release --lib lfm3_audio_tests -- --nocapture`
 
@@ -43,6 +43,17 @@ fn resident_bytes() -> u64 {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.trim().parse::<u64>().ok())
         .map_or(0, |kib| kib * 1024)
+}
+
+/// A 16-bit mono WAV's samples and rate.
+fn wav_samples(bytes: &[u8]) -> (Vec<f32>, u32) {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+    let sample_rate = reader.spec().sample_rate;
+    let samples = reader
+        .samples::<i16>()
+        .map(|sample| f32::from(sample.unwrap()) / 32_768.0)
+        .collect();
+    (samples, sample_rate)
 }
 
 fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
@@ -146,6 +157,64 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         .asr_transcribe_bytes(&fox, Some(&model_id), Some("tlh"))
         .await
         .is_err());
+
+    // ASR, streamed: the deltas make up the final text.
+    let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = streamed.clone();
+    let transcription = runtime
+        .asr_transcribe_bytes_with_variant_streaming_and_prompt(
+            variant,
+            &fox,
+            Some("en"),
+            None,
+            None,
+            move |delta| sink.lock().unwrap().push_str(&delta),
+        )
+        .await
+        .expect("stream a transcription");
+    let streamed = streamed.lock().unwrap().clone();
+    eprintln!("ASR stream -> {streamed:?}");
+    assert_eq!(streamed.trim(), transcription.text.trim());
+
+    // ASR of 29.7 s in one row, then of 34 s in clips of at most 30 s.
+    let (fox_samples, fox_rate) = wav_samples(&fox);
+    let test_wav =
+        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/test.wav"))
+            .expect("fixture");
+    let test_text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/test.md"),
+    )
+    .expect("fixture");
+    let (test_samples, test_rate) = wav_samples(&test_wav);
+    assert_eq!(test_rate, fox_rate);
+    let pause = vec![0.0; fox_rate as usize];
+    let long = [test_samples.as_slice(), &pause, &fox_samples].concat();
+    let recall = |reference: &str, heard: &str| {
+        let heard = words(heard);
+        let reference = words(reference);
+        reference.iter().filter(|word| heard.contains(word)).count() as f64 / reference.len() as f64
+    };
+    for (name, audio, reference) in [
+        ("29.7 s", test_wav.clone(), test_text.clone()),
+        (
+            "34 s",
+            wav_bytes(&long, fox_rate),
+            format!("{test_text} {SENTENCE}"),
+        ),
+    ] {
+        let started = Instant::now();
+        let transcription = runtime
+            .asr_transcribe_bytes(&audio, Some(&model_id), Some("en"))
+            .await
+            .expect("transcribe long audio");
+        let recall = recall(&reference, &transcription.text);
+        eprintln!(
+            "ASR {name} -> recall {recall:.2} in {:.2}s: {:?}",
+            started.elapsed().as_secs_f64(),
+            transcription.text
+        );
+        assert!(recall >= 0.9, "{name}: recall {recall:.2}");
+    }
 
     // TTS, final-only.
     let mut request = GenerationRequest::new(SENTENCE);
@@ -269,6 +338,56 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         );
     }
 
+    // Concurrent transcriptions batch in the engine: each reads exactly
+    // what it reads alone.
+    let inputs = [
+        fox.clone(),
+        wav_bytes(&alone[1].samples, alone[1].sample_rate),
+        wav_bytes(&alone[3].samples, alone[3].sample_rate),
+        wav_bytes(
+            &[vec![0.0; fox_rate as usize], fox_samples.clone()].concat(),
+            fox_rate,
+        ),
+    ];
+    let started = Instant::now();
+    let mut alone = Vec::new();
+    for input in &inputs {
+        alone.push(
+            runtime
+                .asr_transcribe_bytes(input, Some(&model_id), Some("en"))
+                .await
+                .expect("transcribe alone")
+                .text,
+        );
+    }
+    let serial = started.elapsed();
+    let before = crate::engine::metrics::engine_batch_metrics_snapshot();
+    let started = Instant::now();
+    let together = futures::future::join_all(
+        inputs
+            .iter()
+            .map(|input| runtime.asr_transcribe_bytes(input, Some(&model_id), Some("en"))),
+    )
+    .await;
+    let concurrent = started.elapsed();
+    let after = crate::engine::metrics::engine_batch_metrics_snapshot();
+    let batches = after.model_tensor_batches_total - before.model_tensor_batches_total;
+    let rows = after.model_tensor_batch_rows_total - before.model_tensor_batch_rows_total;
+    eprintln!(
+        "ASR x{}: {batches} tensor calls over {rows} rows (mean width {:.2}); \
+         serially {:.2}s, concurrently {:.2}s",
+        inputs.len(),
+        rows as f64 / batches.max(1) as f64,
+        serial.as_secs_f64(),
+        concurrent.as_secs_f64()
+    );
+    for (index, (alone, together)) in alone.iter().zip(together).enumerate() {
+        let together = together.expect("transcribe concurrently").text;
+        eprintln!("ASR row {index}: {alone:?}");
+        assert!(!alone.trim().is_empty(), "row {index} heard speech");
+        assert_eq!(*alone, together, "row {index} differs under concurrency");
+    }
+
     // A spoken turn answered with interleaved text and speech.
     let started = Instant::now();
     let reply = runtime
@@ -298,4 +417,26 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
     );
     assert!(!reply.text.trim().is_empty());
     assert!(reply.samples.len() > 24_000 / 2, "the reply speaks");
+
+    // Diarization with LFM3-Audio as its ASR, which transcribes on the
+    // long-form graph's invocation workspace.
+    let started = Instant::now();
+    let diarized = runtime
+        .diarize_with_transcript_bytes(
+            &test_wav,
+            None,
+            Some(&model_id),
+            None,
+            &DiarizationConfig::default(),
+            &DiarizationPipelineOptions::default(),
+        )
+        .await
+        .expect("diarize");
+    let heard = recall(&test_text, &diarized.asr_text);
+    eprintln!(
+        "diarized: {} speakers, ASR recall {heard:.2} in {:.2}s",
+        diarized.speaker_count,
+        started.elapsed().as_secs_f64()
+    );
+    assert!(heard >= 0.9, "diarization ASR recall {heard:.2}");
 }

@@ -1603,7 +1603,7 @@ impl RuntimeService {
                 .model_variant
                 .is_none_or(|variant| variant.family() != ModelFamily::Lfm3Audio)
             || request
-                .prepared_lfm3_audio_tts_artifact_for_executor()?
+                .prepared_lfm3_audio_artifact_for_executor()?
                 .is_some()
         {
             return Ok((request, job));
@@ -1632,7 +1632,7 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let context_limit = model.lfm3_audio()?.tts_row_context();
+        let context_limit = model.lfm3_audio()?.row_context(Lfm3AudioWorkload::Tts);
         let speech = request.lfm3_audio_tts_request()?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("LFM3-Audio retained request exceeds u64".into()))?;
@@ -1714,10 +1714,10 @@ impl RuntimeService {
         };
         let retained = artifact.retained;
         let mut prepared = request;
-        prepared.install_lfm3_audio_tts_execution_model(
+        prepared.install_lfm3_audio_execution_model(
             variant,
             model,
-            artifact.value,
+            Some(artifact.value),
             context_limit,
         )?;
         let (execution, _) = self.coordinator_job_for_request(&prepared)?;

@@ -283,7 +283,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         for (stage, cost) in stage_costs {
@@ -345,7 +345,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -398,7 +398,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -444,7 +444,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -490,7 +490,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -536,7 +536,7 @@ impl EngineCoreRequest {
             maya1_tts_params: Some(params),
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -584,7 +584,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: Some(artifact),
             maya2_tts_params: Some(params),
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -652,36 +652,51 @@ impl EngineCoreRequest {
         tts_request(text, voice, max_frames, self.lfm3_audio_sampling(), seed)
     }
 
-    /// Seal an LFM3-Audio speech request as a retained row: its prompt
-    /// embeddings are computed, and it decodes at most its request's slots
-    /// (frames, the end-of-audio frame and `<|im_end|>`).
-    pub(crate) fn install_lfm3_audio_tts_execution_model(
+    /// Seal an LFM3-Audio request as a retained row: its prompt embeddings
+    /// are computed, and it decodes at most its request's slots (speech
+    /// frames or text tokens, and `<|im_end|>`). A long-form transcription
+    /// has no row: it keeps only the model, and chunks its prepared audio.
+    pub(crate) fn install_lfm3_audio_execution_model(
         &mut self,
         model_variant: ModelVariant,
         model: Lfm25AudioModelLease,
-        artifact: Arc<Lfm3AudioPreparedArtifact>,
+        artifact: Option<Arc<Lfm3AudioPreparedArtifact>>,
         max_sequence_tokens: usize,
     ) -> Result<()> {
-        let prompt = artifact.prompt_tokens;
-        let slots = artifact.request.max_slots;
-        if self.task_type != TaskType::TTS
-            || self.model_variant != Some(model_variant)
-            || model_variant.family() != ModelFamily::Lfm3Audio
-            || prompt == 0
-            || slots == 0
-            || prompt >= max_sequence_tokens
-        {
+        let routed = self.model_variant == Some(model_variant)
+            && model_variant.family() == ModelFamily::Lfm3Audio;
+        let shaped = match (self.task_type, artifact.as_ref()) {
+            (TaskType::TTS, Some(_)) => true,
+            (TaskType::ASR, Some(_)) => !self.uses_asr_long_form_atomic(),
+            (TaskType::ASR, None) => self.uses_asr_long_form_atomic(),
+            _ => false,
+        };
+        let fits = artifact.as_ref().is_none_or(|artifact| {
+            artifact.prompt_tokens > 0
+                && artifact.request.max_slots > 0
+                && artifact.prompt_tokens < max_sequence_tokens
+        });
+        if !routed || !shaped || !fits {
             return Err(Error::InvalidInput(format!(
                 "LFM3-Audio request {} preparation does not match its routed model/context",
                 self.id
             )));
         }
         self.prepared_stage_costs.clear();
-        self.prepared_sequence_input_tokens = Some(prompt);
-        self.params.max_tokens = slots.min(max_sequence_tokens - prompt);
+        if let Some(artifact) = artifact.as_ref() {
+            let prompt = artifact.prompt_tokens;
+            self.prepared_sequence_input_tokens = Some(prompt);
+            self.params.max_tokens = artifact.request.max_slots.min(max_sequence_tokens - prompt);
+            if self.task_type == TaskType::ASR {
+                self.prepared_asr_execution_shape =
+                    Some(PreparedAsrExecutionShape::RetainedSequence {
+                        input_tokens: prompt,
+                    });
+            }
+        }
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
-            model: PreparedIncrementalModel::Lfm3AudioTts(model),
+            model: PreparedIncrementalModel::Lfm3Audio(model),
             qwen_tts: None,
             lfm25_audio_tts: None,
             vibevoice_tts: None,
@@ -696,7 +711,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: Some(artifact),
+            lfm3_audio: artifact,
             kokoro_tts: None,
         });
         Ok(())
@@ -753,7 +768,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: Some(artifact),
         });
         if let Some((stage, cost)) = prepared_stage_cost {
@@ -865,7 +880,7 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
-            lfm3_audio_tts: None,
+            lfm3_audio: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
@@ -1118,7 +1133,7 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.maya2_tts_params))
     }
 
-    pub(crate) fn prepared_lfm3_audio_tts_model_lease_for_executor(
+    pub(crate) fn prepared_lfm3_audio_model_lease_for_executor(
         &self,
     ) -> Result<Option<Lfm25AudioModelLease>> {
         self.validate_incremental_model_execution_preparation()?;
@@ -1126,19 +1141,19 @@ impl EngineCoreRequest {
             .incremental_model_execution_ready
             .as_ref()
             .and_then(|ready| match &ready.model {
-                PreparedIncrementalModel::Lfm3AudioTts(model) => Some(model.clone()),
+                PreparedIncrementalModel::Lfm3Audio(model) => Some(model.clone()),
                 _ => None,
             }))
     }
 
-    pub(crate) fn prepared_lfm3_audio_tts_artifact_for_executor(
+    pub(crate) fn prepared_lfm3_audio_artifact_for_executor(
         &self,
     ) -> Result<Option<Arc<Lfm3AudioPreparedArtifact>>> {
         self.validate_incremental_model_execution_preparation()?;
         Ok(self
             .incremental_model_execution_ready
             .as_ref()
-            .and_then(|ready| ready.lfm3_audio_tts.clone()))
+            .and_then(|ready| ready.lfm3_audio.clone()))
     }
 
     pub(crate) fn prepared_kokoro_tts_model_lease_for_executor(
@@ -1182,7 +1197,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
-                | PreparedIncrementalModel::Lfm3AudioTts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }
@@ -1205,7 +1220,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
-                | PreparedIncrementalModel::Lfm3AudioTts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             }))
     }

@@ -433,7 +433,7 @@ enum PreparedIncrementalModel {
     Maya1Tts(Maya1TtsModelLease),
     Maya2Tts(Maya2TtsModelLease),
     /// LFM3-Audio speech as a retained row (the audio-chat model's lease).
-    Lfm3AudioTts(Lfm25AudioModelLease),
+    Lfm3Audio(Lfm25AudioModelLease),
     KokoroTts(KokoroTtsModelLease),
 }
 
@@ -450,7 +450,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
             Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
-            Self::Lfm3AudioTts(model) => write!(formatter, "Lfm3AudioTts({:p})", &**model),
+            Self::Lfm3Audio(model) => write!(formatter, "Lfm3Audio({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
@@ -474,7 +474,7 @@ pub(super) struct IncrementalModelExecutionReady {
     maya1_tts_params: Option<Maya1GenerationParams>,
     maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
     maya2_tts_params: Option<Maya2GenerationParams>,
-    lfm3_audio_tts: Option<Arc<Lfm3AudioPreparedArtifact>>,
+    lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

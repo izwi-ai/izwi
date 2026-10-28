@@ -3625,10 +3625,19 @@ impl NativeAudioChatModel {
     }
 
     /// ASR route capabilities: LFM2.5 Audio sets no invocation window and
-    /// chunks long audio with its own long-form config.
+    /// chunks long audio with its own long-form config; LFM3-Audio
+    /// transcribes one clip of at most 30 s per invocation.
     pub(crate) fn asr_route_capabilities(&self) -> crate::engine::AsrRouteCapabilities {
-        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
-            .with_chunk_config(lfm25_audio_asr_long_form_config())
+        match self {
+            Self::Lfm25Audio(_) => {
+                crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
+                    .with_chunk_config(lfm25_audio_asr_long_form_config())
+            }
+            Self::Lfm3Audio(_) => crate::engine::AsrRouteCapabilities::for_family(
+                ModelFamily::Lfm3Audio,
+                Some(crate::models::architectures::lfm3_audio::model::LFM3_AUDIO_MAX_CLIP_SECS),
+            ),
+        }
     }
 
     /// Decode budget for one long-form chunk of `duration_secs` audio, or the
@@ -3792,16 +3801,18 @@ impl NativeAudioChatModel {
         }
     }
 
-    /// LFM3-Audio speech as retained rows (see
-    /// [`lfm3_audio_retained_tts_state_spec`]).
-    pub(crate) fn lfm3_audio_retained_tts_state_spec(
+    /// LFM3-Audio speech or transcription as retained rows (see
+    /// [`lfm3_audio_retained_state_spec`]).
+    pub(crate) fn lfm3_audio_retained_state_spec(
         &self,
+        workload: Lfm3AudioWorkload,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<crate::models::architectures::lfm25_audio::physical::Lfm25AudioRetainedStateSpec>
     {
         let model = self.lfm3_audio()?;
-        crate::models::architectures::lfm3_audio::physical::lfm3_audio_retained_tts_state_spec(
+        crate::models::architectures::lfm3_audio::physical::lfm3_audio_retained_state_spec(
             model.lm_config(),
+            workload,
             lfm3_audio_kv_dtype(BackendKind::from(model.device().kind)),
             stage_graphs,
         )
@@ -3970,6 +3981,59 @@ impl NativeAudioChatModel {
             leases,
             on_delta,
         )
+    }
+
+    /// One LFM3-Audio clip (at most 30 s), greedy, on the main backbone's
+    /// invocation workspace: at most `max_tokens` text tokens (from the
+    /// clip's length when `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lfm3_audio_transcribe_clip_from_invocation_workspace(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+        should_stop: &mut dyn FnMut() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAsrTranscription> {
+        let model = self.lfm3_audio()?;
+        let (attention, shortconv) = leases.lease_pair_mut(
+            LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+            LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+        )?;
+        let mut state = InvocationLmState {
+            cache: attention.paged_cache_mut()?,
+            shortconv: shortconv.typed_mut::<InvocationTensorLease>()?,
+        };
+        let seconds = audio.len() as f32 / sample_rate.max(1) as f32;
+        let budget = max_tokens.unwrap_or_else(|| {
+            crate::models::architectures::lfm3_audio::model::lfm3_audio_asr_max_tokens(seconds)
+        });
+        let output = model.transcribe_clip(
+            audio,
+            sample_rate,
+            language,
+            budget,
+            &mut state,
+            should_stop,
+            on_delta,
+        )?;
+        if output.stop_reason == "cancelled" {
+            return Err(Error::Cancelled(
+                "LFM3-Audio transcription cancelled".into(),
+            ));
+        }
+        Ok(NativeAsrTranscription {
+            text: output.text.trim().to_string(),
+            language: None,
+            diagnostics: Some(serde_json::json!({
+                "model": "lfm3_audio",
+                "task": "asr",
+                "max_new_tokens": budget,
+                "stop_reason": output.stop_reason,
+            })),
+        })
     }
 
     pub(crate) fn transcribe_single_pass_with_callback_and_options_from_invocation_workspace(

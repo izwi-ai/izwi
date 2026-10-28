@@ -1230,6 +1230,181 @@ impl RuntimeService {
         }
     }
 
+    /// Seal an LFM3-Audio transcription: audio of one clip (at most 30 s)
+    /// becomes a retained row whose prompt holds the clip's encoder
+    /// embeddings, and longer audio the long-form route, which chunks it.
+    pub(super) async fn prepare_lfm3_audio_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm3Audio)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated LFM3-Audio variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM3-Audio ASR preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = model.lfm3_audio()?.row_context(Lfm3AudioWorkload::Asr);
+        let model_for_plan = model.clone();
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &model_for_plan.asr_route_capabilities(),
+                    request.streaming,
+                );
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if plan.requires_chunk_path() {
+                    request.install_prepared_asr_long_form_atomic(plan)?;
+                }
+                Ok(request)
+            })
+            .await?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("LFM3-Audio ASR retained input exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        if prepared.uses_asr_long_form_atomic() {
+            let mut prepared = prepared;
+            prepared.install_lfm3_audio_execution_model(variant, model, None, context_limit)?;
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+                .map(|job| (prepared, job))
+                .map_err(|failure| failure.error);
+        }
+        // Mel features and the encoder over at most 30 s of audio.
+        let workspace = 512 * 1024 * 1024;
+        let backend = self.backend_router.context().backend_kind;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: prepared.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: prepared.priority,
+                    workload_class: prepared.workload_class,
+                    deadline: prepared.deadline,
+                    resources: asr_encoder_retained_resources(
+                        backend,
+                        retained_request_bytes,
+                        workspace,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("LFM3-Audio decoded audio was lost".into()))?;
+        let language = prepared.lfm3_audio_asr_language().map(str::to_string);
+        let token_limit = prepared.lfm3_audio_asr_token_limit();
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.lfm3_audio".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            super::tts_preparation::lfm25_audio_tts_preparation_workspace(backend, workspace),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "LFM3-Audio ASR preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.lfm3_audio()?.prepare_asr_row(
+                    &samples,
+                    sample_rate,
+                    language.as_deref(),
+                    token_limit,
+                )?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: 0,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM3-Audio ASR preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = prepared;
+        prepared.install_lfm3_audio_execution_model(
+            variant,
+            model,
+            Some(artifact.value),
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_parakeet_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1562,7 +1737,10 @@ impl RuntimeService {
         let (request, job) = self
             .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)
             .await?;
-        self.prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
+        let (request, job) = self
+            .prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        self.prepare_lfm3_audio_asr_shape_for_binding(request, job, residency_lease)
             .await
     }
 
