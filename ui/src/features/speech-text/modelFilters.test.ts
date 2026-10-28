@@ -157,19 +157,21 @@ describe("isDiarizationPipelineAsrModel", () => {
         }),
       ),
     ).toBe(false);
-    // LFM3 Audio also speaks (a TTS-route model), but still runs no
-    // speech-to-text job.
+  });
+
+  it("offers LFM3 Audio, which runs speech-to-text jobs, as the pipeline ASR", () => {
     for (const variant of ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"]) {
       expect(
         isDiarizationPipelineAsrModel(
           withCapabilities(variant, {
             openai_audio_transcriptions: true,
             openai_audio_speech: true,
+            speech_to_text_jobs: true,
             text_to_speech_records: true,
             voice_realtime_unified: true,
           }),
         ),
-      ).toBe(false);
+      ).toBe(true);
     }
   });
 

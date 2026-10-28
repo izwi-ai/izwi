@@ -474,8 +474,7 @@ impl AdminModelRouteCapabilities {
             openai_audio_transcriptions: variant.is_asr()
                 || variant.is_voxtral()
                 || variant.is_audio_chat(),
-            speech_to_text_jobs: variant.is_asr()
-                || variant.is_voxtral()
+            speech_to_text_jobs: variant.runs_speech_to_text_jobs()
                 || variant.supports_diarization_records(),
             speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
             speech_translation: variant.supports_asr_translation(),

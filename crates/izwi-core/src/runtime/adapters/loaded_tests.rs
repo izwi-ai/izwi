@@ -1513,17 +1513,18 @@ fn every_pipeline_selectable_asr_publishes_an_atomic_long_form_graph() {
             );
         }
     }
-    // Every native ASR family and Voxtral is selectable by its catalog id
-    // (no variant escapes the check through an unparseable name), and no
-    // audio-chat model is: the pipeline cannot hold one as its ASR.
+    // Every native ASR family, Voxtral and LFM3-Audio is selectable by its
+    // catalog id (no variant escapes the check through an unparseable
+    // name); LFM2.5-Audio, whose ASR is a retained sequence, is not.
     let expected = ModelVariant::all()
         .iter()
         .copied()
-        .filter(|variant| variant.is_asr() || variant.is_voxtral())
+        .filter(|variant| variant.runs_speech_to_text_jobs())
         .collect::<Vec<_>>();
     assert_eq!(selectable, expected);
     assert!(selectable.contains(&ModelVariant::ParakeetTdt06BV3));
     assert!(selectable.contains(&ModelVariant::VoxtralMini4BRealtime2602));
+    assert!(selectable.contains(&ModelVariant::Lfm3Audio2BGguf));
     assert!(!selectable.contains(&ModelVariant::Lfm25Audio15BGguf));
 }
 

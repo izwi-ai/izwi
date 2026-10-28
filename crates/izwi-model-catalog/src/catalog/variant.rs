@@ -561,7 +561,7 @@ pub fn resolve_diarization_asr_model_variant(input: Option<&str>) -> Result<Mode
         return Ok(ModelVariant::ParakeetTdt06BV3);
     };
     match parse_model_variant(raw) {
-        Ok(variant) if variant.is_asr() || variant.is_voxtral() => Ok(variant),
+        Ok(variant) if variant.runs_speech_to_text_jobs() => Ok(variant),
         Ok(variant) => Err(format!(
             "Model '{raw}' cannot transcribe in the diarization pipeline (resolved to {variant:?}); choose an ASR model."
         )),
@@ -1109,6 +1109,10 @@ mod tests {
         assert_eq!(
             resolve_diarization_asr_model_variant(Some("Voxtral-Mini-4B-Realtime-2602")),
             Ok(ModelVariant::VoxtralMini4BRealtime2602)
+        );
+        assert_eq!(
+            resolve_diarization_asr_model_variant(Some("LFM3-Audio-2B-GGUF")),
+            Ok(ModelVariant::Lfm3Audio2BGguf)
         );
         for rejected in [
             "bogus",

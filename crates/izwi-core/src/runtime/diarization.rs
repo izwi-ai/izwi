@@ -309,20 +309,31 @@ struct TranscribedChunk {
 enum DiarizationAsrRegistryRoute {
     Native,
     Voxtral,
+    AudioChat,
 }
 
 fn diarization_asr_registry_route(variant: ModelVariant) -> DiarizationAsrRegistryRoute {
     if variant.family() == crate::catalog::ModelFamily::Voxtral {
         DiarizationAsrRegistryRoute::Voxtral
+    } else if variant.is_audio_chat() {
+        DiarizationAsrRegistryRoute::AudioChat
     } else {
         DiarizationAsrRegistryRoute::Native
     }
 }
 
+/// LFM3-Audio transcribes clips of at most 30 s, the length it was trained
+/// on, as 12.5 encoder tokens per second.
+const LFM3_AUDIO_ASR_SECONDS: f32 = 30.0;
+const LFM3_AUDIO_ASR_TOKEN_RATE: f32 = 12.5;
+
 #[derive(Clone)]
 enum DiarizationAsrModel {
     Native(Arc<NativeAsrModel>),
     Voxtral(VoxtralModelLease),
+    /// An audio-chat model that transcribes on its invocation state
+    /// (LFM3-Audio).
+    AudioChat(Arc<crate::models::registry::NativeAudioChatModel>),
 }
 
 impl DiarizationAsrModel {
@@ -332,6 +343,7 @@ impl DiarizationAsrModel {
             // Chunk Voxtral within its offline frame cap; a longer single
             // pass fails on CPU/Metal instead of truncating.
             Self::Voxtral(_) => Some(VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT),
+            Self::AudioChat(_) => Some(LFM3_AUDIO_ASR_SECONDS),
         }
     }
 
@@ -341,6 +353,7 @@ impl DiarizationAsrModel {
         match self {
             Self::Native(model) => model.audio_token_rate(),
             Self::Voxtral(_) => None,
+            Self::AudioChat(_) => Some(LFM3_AUDIO_ASR_TOKEN_RATE),
         }
     }
 
@@ -377,6 +390,17 @@ impl DiarizationAsrModel {
                     diagnostics: output.diagnostics,
                 })
             }
+            // The pipeline's chunks fit one 30 s ASR window; `prompt` is
+            // not read by LFM3-Audio.
+            Self::AudioChat(model) => model
+                .transcribe_with_callback_and_max_tokens_from_invocation_workspace(
+                    audio,
+                    sample_rate,
+                    language,
+                    Some(options.max_new_tokens),
+                    leases,
+                    &mut |_| {},
+                ),
         }
     }
 }
@@ -897,6 +921,12 @@ impl RuntimeService {
                 DiarizationAsrRegistryRoute::Native => DiarizationAsrModel::Native(
                     self.model_registry
                         .get_asr(asr_variant)
+                        .await
+                        .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+                ),
+                DiarizationAsrRegistryRoute::AudioChat => DiarizationAsrModel::AudioChat(
+                    self.model_registry
+                        .get_audio_chat(asr_variant)
                         .await
                         .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
                 ),

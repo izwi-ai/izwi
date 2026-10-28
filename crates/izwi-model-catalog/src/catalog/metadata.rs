@@ -969,6 +969,16 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this model transcribes a speech-to-text job, the diarization
+    /// pipeline's ASR among them: the ASR families, Voxtral, and LFM3-Audio,
+    /// which transcribes in one invocation per chunk. LFM2.5-Audio's ASR is a
+    /// retained sequence the pipeline cannot run.
+    pub fn runs_speech_to_text_jobs(&self) -> bool {
+        self.is_asr()
+            || self.is_voxtral()
+            || self.family() == crate::catalog::ModelFamily::Lfm3Audio
+    }
+
     /// Whether this is an audio-chat model.
     pub fn is_audio_chat(&self) -> bool {
         matches!(
