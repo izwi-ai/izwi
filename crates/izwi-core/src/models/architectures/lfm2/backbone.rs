@@ -338,6 +338,20 @@ fn direct_shortconv_ring(
     cursor: u64,
     valid: u64,
 ) -> Result<Tensor> {
+    if ring.device().is_cpu() {
+        return host_shortconv_ring(ring, input, weight, cursor, valid);
+    }
+    op_shortconv_ring(ring, input, weight, cursor, valid)
+}
+
+/// [`direct_shortconv_ring`] as Candle ops, one per tap and step.
+fn op_shortconv_ring(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    cursor: u64,
+    valid: u64,
+) -> Result<Tensor> {
     let (_, hidden, steps) = input.dims3()?;
     let capacity = ring.dim(0)?;
     let oldest = cursor.saturating_sub(valid);
@@ -380,6 +394,66 @@ fn direct_shortconv_ring(
         })?);
     }
     Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2).map_err(Error::from)
+}
+
+/// [`direct_shortconv_ring`] over host memory in one pass: each output sums
+/// the same taps in the same order, so it is bit-identical, without one
+/// Candle op per tap and step (LFM3's 7-tap convolution made a 1K-token CPU
+/// prefill issue about 100K of them per layer stack).
+fn host_shortconv_ring(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    cursor: u64,
+    valid: u64,
+) -> Result<Tensor> {
+    let (batch, hidden, steps) = input.dims3()?;
+    let capacity = ring.dim(0)?;
+    if batch != 1 || ring.elem_count() != capacity * hidden || weight.dims2()? != (hidden, capacity)
+    {
+        return Err(Error::InvalidInput(
+            "LFM2 ShortConv ring geometry mismatch".into(),
+        ));
+    }
+    let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+        Ok(tensor
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?)
+    };
+    let (ring_values, inputs, weights) = (host(ring)?, host(input)?, host(weight)?);
+    let oldest = cursor.saturating_sub(valid);
+    let mut output = vec![0f32; hidden * steps];
+    for channel in 0..hidden {
+        let taps = &weights[channel * capacity..][..capacity];
+        let row = &inputs[channel * steps..][..steps];
+        for step in 0..steps {
+            let window_start = (cursor + step as u64) as i128 + 1 - capacity as i128;
+            let mut sum = None::<f32>;
+            for (tap, weight) in taps.iter().enumerate() {
+                let source = window_start + tap as i128;
+                if source < 0 {
+                    continue;
+                }
+                let source = source as u64;
+                let value = if source < cursor {
+                    if source < oldest {
+                        continue;
+                    }
+                    ring_values[(source % capacity as u64) as usize * hidden + channel]
+                } else {
+                    row[(source - cursor) as usize]
+                };
+                let contribution = value * weight;
+                sum = Some(sum.map_or(contribution, |sum| sum + contribution));
+            }
+            output[channel * steps + step] = sum.ok_or_else(|| {
+                Error::InferenceError("LFM2 ShortConv produced no current contribution".into())
+            })?;
+        }
+    }
+    Tensor::from_vec(output, (1, hidden, steps), input.device()).map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -3643,6 +3717,27 @@ pub(crate) mod tests {
     #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
     fn unfused_shortconv_ring_falls_back_on_cuda() {
         assert_unfused_ring_matches_cpu(&Device::new_cuda(0).expect("CUDA device required"));
+    }
+
+    /// The host ring loop sums the same taps in the same order as the op
+    /// path: bit-identical, across a wrapped ring with a partial history.
+    #[test]
+    fn host_shortconv_ring_is_bit_identical_to_the_op_path() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = &Device::Cpu;
+        for (capacity, cursor, valid, steps) in [(7, 0, 0, 12), (7, 23, 7, 5), (7, 9, 4, 1), (3, 40, 3, 9)] {
+            let hidden = 6;
+            let ring = xorshift_tensor(&[capacity, 1, hidden], 11, 1.0, device).unwrap();
+            let input = xorshift_tensor(&[1, hidden, steps], 12, 1.0, device).unwrap();
+            let weight = xorshift_tensor(&[hidden, capacity], 13, 1.0, device).unwrap();
+            let host = super::host_shortconv_ring(&ring, &input, &weight, cursor, valid).unwrap();
+            let ops = super::op_shortconv_ring(&ring, &input, &weight, cursor, valid).unwrap();
+            assert_eq!(
+                host.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                ops.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "capacity {capacity}, cursor {cursor}, valid {valid}, steps {steps}"
+            );
+        }
     }
 
     #[test]
