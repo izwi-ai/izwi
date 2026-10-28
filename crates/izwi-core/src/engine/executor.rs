@@ -3026,12 +3026,16 @@ impl ModelExecutor for NativeExecutor {
         // consumed by these executors, including the cache namespace.
         if matches!(
             variant.family(),
-            crate::catalog::ModelFamily::Lfm2Chat | crate::catalog::ModelFamily::Lfm25Audio
+            crate::catalog::ModelFamily::Lfm25Audio | crate::catalog::ModelFamily::Lfm3Audio
         ) {
+            // The audio models keep F32 activations and F32 invocation KV.
             profile.compute_dtype = "f32".into();
             profile.kv_dtype = "f32".into();
-        } else if variant.family() == crate::catalog::ModelFamily::Lfm3Chat {
-            // LFM3 activations stay F32; its paged KV is stored as
+        } else if matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::Lfm2Chat | crate::catalog::ModelFamily::Lfm3Chat
+        ) {
+            // LFM chat activations stay F32; its paged KV is stored as
             // `lfm2_chat_kv_dtype` picks (F16 on Metal and CUDA, F32 on CPU).
             profile.compute_dtype = "f32".into();
             profile.kv_dtype = match crate::models::architectures::lfm2::chat::lfm2_chat_kv_dtype(
@@ -6876,6 +6880,41 @@ mod tests {
         assert_eq!(long_profile.decode_batch, NativeBatchMode::None);
         assert_eq!(long_profile.concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(long_profile.max_batch_size, 1);
+    }
+
+    /// The profile names the storage the LFM executors actually use: chat
+    /// KV is F16 on Metal and CUDA and F32 on CPU; the audio models keep F32.
+    #[test]
+    fn lfm_profiles_report_the_kv_dtype_they_store() {
+        for (backend, chat_kv) in [
+            (BackendKind::Cpu, "f32"),
+            (BackendKind::Metal, "f16"),
+            (BackendKind::Cuda, "f16"),
+        ] {
+            let executor = NativeExecutor::new(WorkerConfig {
+                backend,
+                ..Default::default()
+            });
+            for (variant, kv) in [
+                (ModelVariant::Lfm2512BInstructGguf, chat_kv),
+                (ModelVariant::Lfm317BGguf, chat_kv),
+                (ModelVariant::Lfm25Audio15BGguf, "f32"),
+                (ModelVariant::Lfm3Audio2BGguf, "f32"),
+            ] {
+                let mut request = if variant.is_chat() {
+                    EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
+                        role: crate::models::shared::chat::ChatRole::User,
+                        content: "hello".into(),
+                    }])
+                } else {
+                    EngineCoreRequest::tts("hello")
+                };
+                request.model_variant = Some(variant);
+                let profile = executor.execution_profile(&request).unwrap();
+                assert_eq!(profile.compute_dtype, "f32", "{backend:?} {variant}");
+                assert_eq!(profile.kv_dtype, kv, "{backend:?} {variant}");
+            }
+        }
     }
 
     #[test]
