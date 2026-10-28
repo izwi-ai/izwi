@@ -54,6 +54,7 @@ pub(crate) use cache::invocation_tensor::{InvocationStaticAttentionLease, Invoca
 #[cfg(test)]
 pub(crate) use cache::{
     invocation::InvocationPagedKvPoolOwner, invocation_tensor::InvocationTensorPoolOwner,
+    tensor_snapshots::tensor_snapshot_prefix_policy,
 };
 
 pub(crate) use cache::composite::{

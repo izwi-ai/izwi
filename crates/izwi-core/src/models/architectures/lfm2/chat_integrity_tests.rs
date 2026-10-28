@@ -163,6 +163,53 @@ fn cache() -> PhysicalPagedKvCache {
     PhysicalPagedKvCache::new(arena, bindings(), blocks, 0).unwrap()
 }
 
+/// One arena whose blocks several caches address, so a publisher and an
+/// attacher can share prefix pages and keep their own suffix pages.
+fn shared_arena() -> (Arc<CpuKvArena>, KvArenaId, KvGroupId) {
+    let id = KvArenaId {
+        model_instance: ModelInstanceId::new(102),
+        backend: BackendKind::Cpu,
+        device_ordinal: None,
+        generation: 1,
+    };
+    let group = KvGroupId::new(1);
+    let arena = Arc::new(
+        CpuKvArena::new(KvArenaConfig {
+            id,
+            group,
+            page_tokens: 4,
+            capacity_pages: 24,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding: bindings()[0],
+                num_kv_heads: 1,
+                key_head_dim: 4,
+                value_head_dim: 4,
+            }],
+        })
+        .unwrap(),
+    );
+    (arena, id, group)
+}
+
+fn cache_on(
+    (arena, id, group): &(Arc<CpuKvArena>, KvArenaId, KvGroupId),
+    blocks: impl IntoIterator<Item = u32>,
+    context_len: usize,
+) -> PhysicalPagedKvCache {
+    let blocks = blocks
+        .into_iter()
+        .map(|index| CacheBlockRef {
+            arena: *id,
+            group: *group,
+            index,
+            slot_generation: 1,
+        })
+        .collect();
+    PhysicalPagedKvCache::new(arena.clone(), bindings(), blocks, context_len).unwrap()
+}
+
 fn reservation(state: &ChatDecodeState) -> PhysicalPagedKvCache {
     PhysicalPagedKvCache::new(
         state.physical_kv.arena().clone(),
@@ -646,4 +693,76 @@ fn abs_err(lhs: f32, rhs: f32) -> f32 {
     } else {
         f32::INFINITY
     }
+}
+
+/// A request that attaches a published prefix (the publisher's pages below a
+/// page-aligned boundary and its ShortConv ring at that cursor) prefills and
+/// decodes exactly as a fresh request split at the same boundary.
+#[test]
+fn lfm2_attached_prefix_continues_exactly_as_a_fresh_run() {
+    let mut model = random_tiny_lfm_model(21);
+    model.set_prefix_caching(true);
+    let shared = shared_arena();
+    let prompt = [3u32, 4, 5, 6, 3, 4, 5, 6, 3, 4];
+    let boundary = 8;
+    let config = ChatGenerationConfig::default();
+
+    let begin = |cache| {
+        model
+            .begin_resumable_prefill_state_managed(&prompt, 16, &config, cache)
+            .unwrap()
+    };
+    let mut fresh = begin(cache_on(&shared, 0..6, 0));
+    model
+        .continue_resumable_prefill_managed(&mut fresh, &prompt, 0, boundary)
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut fresh, &prompt, boundary, prompt.len())
+        .unwrap();
+
+    let mut publisher = begin(cache_on(&shared, 6..12, 0));
+    model
+        .continue_resumable_prefill_managed(&mut publisher, &prompt, 0, boundary)
+        .unwrap();
+    let ring = publisher.shortconv.clone();
+
+    // Two shared prefix pages, then the attacher's own pages.
+    let mut attached = begin(cache_on(&shared, [6, 7, 12, 13, 14, 15], boundary));
+    assert_eq!(attached.prefill_progress(), boundary);
+    attached.shortconv = ring;
+    model
+        .continue_resumable_prefill_managed(&mut attached, &prompt, boundary, prompt.len())
+        .unwrap();
+
+    let logits = |state: &mut ChatDecodeState| {
+        state
+            .unconsumed_output
+            .clone()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    assert_eq!(logits(&mut attached), logits(&mut fresh));
+    for _ in 0..4 {
+        let expected = model.decode_step(&mut fresh).unwrap();
+        let actual = model.decode_step(&mut attached).unwrap();
+        assert_eq!(actual.delta, expected.delta);
+        if fresh.finished {
+            break;
+        }
+    }
+
+    // Without prefix caching the model refuses a cache that starts above
+    // zero, rather than continuing from a reset ring.
+    model.set_prefix_caching(false);
+    assert!(model
+        .begin_resumable_prefill_state_managed(
+            &prompt,
+            16,
+            &config,
+            cache_on(&shared, [6, 7, 16, 17], boundary),
+        )
+        .is_err());
 }

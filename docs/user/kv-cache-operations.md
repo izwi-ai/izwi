@@ -125,10 +125,10 @@ config file `[runtime]` keys (`enable_prefix_caching`,
 (`IZWI_ENABLE_PREFIX_CACHING`, `IZWI_MANAGED_PREFIX_CACHE_SALT`,
 `IZWI_MAX_PREFIX_CACHE_PAGES`). Note that a model must also opt in through its
 cache contract: dense families (Qwen3, Gemma3, Voxtral, VibeVoice) participate,
-and so do the hybrid chat families Qwen3.8 and Qwen3.6, which snapshot their
-recurrent and convolution state at each chat turn's history boundary (see
-[Hybrid prefix snapshots](#hybrid-prefix-snapshots)). Qwen3.5 and LFM2 keep
-their hybrid state private. `IZWI_QWEN38_PREFIX_REUSE=0` turns reuse off for
+and so do the hybrid chat families Qwen3.8, Qwen3.6, LFM2.5 and LFM3, which
+snapshot their recurrent and convolution state at each chat turn's history
+boundary (see [Hybrid prefix snapshots](#hybrid-prefix-snapshots)). Qwen3.5,
+LFM2.5 Audio and LFM3 Audio keep their hybrid state private. `IZWI_QWEN38_PREFIX_REUSE=0` turns reuse off for
 Qwen3.8 alone, and a Qwen3.8 load with its MTP head (`IZWI_QWEN38_MTP=1` on
 CUDA, the default elsewhere) keeps every domain private.
 
@@ -207,10 +207,12 @@ before expanding capacity.
 ### Hybrid prefix snapshots
 
 Hybrid models (recurrent or convolution state beside attention, such as
-Qwen3.6 and Qwen3.8) can attach a shared prefix only where a committed
-snapshot of that state exists. Each snapshot is one row of the model's
-recurrent state (156,893,184 bytes for Qwen3.8-27B) and outlives the request
-that published it, so snapshots have their own budget:
+Qwen3.6, Qwen3.8, LFM2.5 and LFM3) can attach a shared prefix only where a
+committed snapshot of that state exists. Each snapshot is one row of the
+model's recurrent state (156,893,184 bytes for Qwen3.8-27B; the LFM ShortConv
+rings are small, 745,472 bytes for LFM3-1.7B and 245,760 bytes for
+LFM2.5-1.2B) and outlives the request that published it, so snapshots have
+their own budget:
 
 - `IZWI_MAX_PREFIX_SNAPSHOTS` (engine field `max_prefix_snapshots`, default
   8) bounds the snapshots one model may hold. `0` keeps hybrid state private,
@@ -228,6 +230,11 @@ Watch `models[].prefix_snapshot_capacity`, `prefix_snapshot_budget_bytes`,
 plus the `tensor_snapshot_publishes`, `tensor_snapshot_attaches`,
 `tensor_snapshot_truncations` and `tensor_snapshot_evictions` counters.
 `prefix_snapshot_bytes` never exceeds the budget.
+
+On CPU and Metal a prompt attaches a prefix only through resumable prefill,
+which is off by default there: set `IZWI_ENABLE_CHUNKED_PREFILL=1` for chat
+history reuse on those backends. CUDA turns it on with its incremental chat
+policy.
 
 ## CUDA build and provider controls
 

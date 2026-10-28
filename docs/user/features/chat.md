@@ -215,10 +215,17 @@ figures if they do not fit.
 
 ### Chat history reuse
 
-Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA and Qwen3.6 on
-CPU and CUDA do not recompute the history they already processed (Qwen3.8 on CPU and
-Metal too, once its MTP draft head is off with `IZWI_QWEN38_MTP=0`). A
-turn's prompt is split before its final assistant header (earlier answers are
+Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA, Qwen3.6 on
+CPU and CUDA, and LFM2.5 and LFM3 on CPU and Metal do not recompute the history they
+already processed (Qwen3.8 on CPU and Metal too, once its MTP draft head is off with
+`IZWI_QWEN38_MTP=0`). On CPU and Metal this needs resumable prefill, which is off by
+default there:
+
+```bash
+export IZWI_ENABLE_CHUNKED_PREFILL=1
+```
+
+A turn's prompt is split before its final assistant header (earlier answers are
 re-rendered, so only the history up to there repeats in the next turn); the server
 keeps the KV pages of that history and a snapshot of the recurrent state at its last
 full 64-token page. The next turn of the conversation attaches there and prefills only
@@ -227,7 +234,7 @@ conversations. A history shorter than one page has no snapshot, so after a very 
 first prompt the third turn is the first to reuse.
 
 Snapshots are bounded: `IZWI_MAX_PREFIX_SNAPSHOTS` (default 8) snapshots per model,
-about 157 MB each for Qwen3.8, reserved at load. The least recently used snapshot is
+about 157 MB each for Qwen3.8 and under 1 MB for LFM2.5 and LFM3, reserved at load. The least recently used snapshot is
 dropped first, so up to 8 conversations continue with their history reused at once;
 others prefill in full. History pages share the KV cache and are released when a
 request needs the room. A conversation's whole history must fit the prefix page

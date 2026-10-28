@@ -5,7 +5,7 @@ use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape,
     CheckpointPolicy, ComponentShapeInstantiation, DomainStepIntent,
     InferenceStateContract, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
-    PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
+    PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
     StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
     StateGroupSpec, StateScope, StateUpdateKind, TensorComponentSpec, TensorRole, CURRENT_INFERENCE_STATE_ABI,
 };
@@ -146,7 +146,7 @@ pub(crate) fn lfm2_main_invocation_contract_with_kv(
     ids: Lfm2StateIds,
     kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
-    lfm2_main_contract(config, layout, ids, invocation_header, kv_dtype)
+    lfm2_main_contract(config, layout, ids, invocation_header, kv_dtype, false)
 }
 
 /// Scheduler-owned cache contract for incremental LFM2 chat.
@@ -160,6 +160,20 @@ pub(crate) fn lfm2_managed_cache_contract(
     config: &Lfm2BackboneConfig,
     kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
+    lfm2_managed_cache_contract_with_prefix(config, kv_dtype, false)
+}
+
+/// [`lfm2_managed_cache_contract`] that, with `share_prefixes`, shares
+/// conversation prefixes across requests: attention publishes committed
+/// pages and the ShortConv ring a snapshot at every page boundary, so a
+/// request attaches the pages of a shared prefix and restores the ring at
+/// its end. Sliding-window layers need nothing more: they share the one
+/// page table and narrow their own view.
+pub(crate) fn lfm2_managed_cache_contract_with_prefix(
+    config: &Lfm2BackboneConfig,
+    kv_dtype: StateDType,
+    share_prefixes: bool,
+) -> Result<InferenceStateContract> {
     let layout = Lfm2StateLayout::from_config(config)?;
     lfm2_main_contract(
         config,
@@ -167,6 +181,7 @@ pub(crate) fn lfm2_managed_cache_contract(
         Lfm2StateIds::CANONICAL,
         retained_header,
         kv_dtype,
+        share_prefixes,
     )
 }
 
@@ -176,6 +191,7 @@ fn lfm2_main_contract(
     ids: Lfm2StateIds,
     header: fn(StateDomainId, StateClock) -> StateDomainHeader,
     kv_dtype: StateDType,
+    share_prefixes: bool,
 ) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
@@ -183,7 +199,11 @@ fn lfm2_main_contract(
     let head_dim = u32::try_from(head_dim)
         .map_err(|_| Error::ModelLoadError("LFM2 attention head dimension exceeds u32".into()))?;
     // LFM3 mixes global and sliding-window layers; the mixed domain keeps one
-    // full page table and each local layer narrows its own view.
+    // full page table and each local layer narrows its own view. A separate
+    // sliding domain would release the local layers' hidden pages, but a
+    // shared prefix attaches whole committed pages: an attached request needs
+    // the window behind its boundary, which a released sliding page no longer
+    // holds. Prefix reuse wins; the local layers keep every page.
     let pattern = |model_layer: usize| -> Result<AttentionPattern> {
         Ok(match config.layer_sliding_window(model_layer) {
             Some(window_tokens) => AttentionPattern::SlidingWindow {
@@ -217,8 +237,18 @@ fn lfm2_main_contract(
         .collect::<Result<Vec<_>>>()?;
     let preferred_tokens = u32::try_from(default_kv_page_size())
         .map_err(|_| Error::ModelLoadError("LFM2 page size exceeds u32".into()))?;
+    let mut attention_header = header(ids.attention, StateClock::DecoderTokens);
+    let mut shortconv_header = header(ids.shortconv, StateClock::DecoderTokens);
+    if share_prefixes {
+        attention_header.prefix = PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        };
+        shortconv_header.prefix = PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred_tokens),
+        };
+    }
     let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: header(ids.attention, StateClock::DecoderTokens),
+        header: attention_header,
         layers,
         page_size: PageSizeConstraint {
             min_tokens: 1,
@@ -231,7 +261,7 @@ fn lfm2_main_contract(
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
     let shortconv = StateDomainSpec::Ring(RingStateDomainSpec {
-        header: header(ids.shortconv, StateClock::DecoderTokens),
+        header: shortconv_header,
         components_per_step: layout
             .shortconv_components
             .iter()
@@ -538,5 +568,22 @@ mod tests {
         assert_eq!(per_slot * 16, 50_424_053_760);
         assert!(per_slot + CONSERVATIVE_MODEL_BYTES < L40S_BYTES);
         assert!(per_slot * 16 + CONSERVATIVE_MODEL_BYTES > L40S_BYTES);
+    }
+
+    /// With prefix sharing the contract passes the hybrid snapshot gate:
+    /// committed pages for attention and a ring snapshot at every page.
+    /// Without it (LFM2.5-Audio, a backend the catalog does not enable) it
+    /// stays admission-inert.
+    #[test]
+    fn prefix_sharing_contract_passes_the_snapshot_gate_only_when_enabled() {
+        use crate::engine::tensor_snapshot_prefix_policy;
+        let shared =
+            lfm2_managed_cache_contract_with_prefix(&config(), StateDType::F16, true).unwrap();
+        let policy = tensor_snapshot_prefix_policy(&shared).expect("hybrid sharing policy");
+        assert_eq!(policy.paged_domain, LFM2_ATTENTION_STATE_DOMAIN);
+        assert_eq!(&*policy.tensor_domains, &[LFM2_SHORTCONV_STATE_DOMAIN]);
+        assert_eq!(policy.interval_steps, default_kv_page_size() as u64);
+        let plain = lfm2_managed_cache_contract(&config(), StateDType::F16).unwrap();
+        assert!(tensor_snapshot_prefix_policy(&plain).is_none());
     }
 }

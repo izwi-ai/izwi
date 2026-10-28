@@ -411,11 +411,12 @@ fn load_lfm2_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Lfm2(Lfm2ChatModel::load(
-        model_dir, variant, device,
-    )?))
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    let mut model = Lfm2ChatModel::load(model_dir, variant, device)?;
+    model.set_prefix_caching(prefix_reuse);
+    Ok(NativeChatModel::Lfm2(model))
 }
 
 fn load_qwen35_chat_model(
@@ -5071,6 +5072,19 @@ pub enum NativeChatPreparedPrompt {
     Qwen38(Qwen38PreparedPrompt),
 }
 
+/// The end of a prompt's first turn (the system turn, with any tools, when
+/// there is one): what requests sharing a system prompt share. The history
+/// boundary opens the final turn on an `<|im_start|>`, so the first turn ends
+/// at that token's first later occurrence. `None` when no turn ends before
+/// the history boundary.
+pub(crate) fn managed_preamble_boundary(ids: &[u32], history: usize) -> Option<usize> {
+    let turn_start = *ids.get(history)?;
+    ids.get(1..history)?
+        .iter()
+        .position(|id| *id == turn_start)
+        .map(|offset| offset + 1)
+}
+
 impl NativeChatPreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         match self {
@@ -5104,13 +5118,7 @@ impl NativeChatPreparedPrompt {
     /// first turn ends at that token's first later occurrence. `None` when no
     /// turn ends before the history boundary.
     pub fn managed_preamble_boundary(&self) -> Option<usize> {
-        let history = self.managed_snapshot_boundary()?;
-        let ids = self.prompt_ids();
-        let turn_start = *ids.get(history)?;
-        ids.get(1..history)?
-            .iter()
-            .position(|id| *id == turn_start)
-            .map(|offset| offset + 1)
+        managed_preamble_boundary(self.prompt_ids(), self.managed_snapshot_boundary()?)
     }
 
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
@@ -5741,6 +5749,16 @@ impl NativeChatModel {
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen38(model) => model.supports_continuous_decode_batch(),
             Self::Lfm2(model) => model.supports_continuous_decode_batch(),
+        }
+    }
+
+    /// The history boundary of a prompt prepared without a prompt artifact:
+    /// LFM chat sharing prefixes snapshots before its final `<|im_start|>`.
+    /// `None` for every model that does not share prefixes this way.
+    pub(crate) fn managed_history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
+        match self {
+            Self::Lfm2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
+            _ => None,
         }
     }
 

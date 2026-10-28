@@ -326,7 +326,7 @@ buffers while the runtime orchestrates longer inputs.
 | Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
 | `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
 | CUDA FP8 E4M3 KV | Experimental, blocked | Kernel experiments exist, but scaled storage, scale-aware mutation/accounting, and NVIDIA evidence are incomplete. Arena and direct dispatch both fail closed to dense KV. |
-| Prefix reuse | Catalog default | Engaged per model and backend where the catalog cell is supported (Qwen3.8 on CPU, Metal and CUDA, without its MTP head; Qwen3.6 on CPU and CUDA), with a per-process namespace and bounded page and snapshot budgets. `IZWI_ENABLE_PREFIX_CACHING=0` turns it off; `IZWI_QWEN38_PREFIX_REUSE=0` for Qwen3.8 alone. |
+| Prefix reuse | Catalog default | Engaged per model and backend where the catalog cell is supported (Qwen3.8 on CPU, Metal and CUDA, without its MTP head; Qwen3.6 on CPU and CUDA; LFM2.5 and LFM3 chat on CPU and Metal, with resumable prefill on), with a per-process namespace and bounded page and snapshot budgets. `IZWI_ENABLE_PREFIX_CACHING=0` turns it off; `IZWI_QWEN38_PREFIX_REUSE=0` for Qwen3.8 alone. |
 | Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to the validated Portable route. |
 | Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
 

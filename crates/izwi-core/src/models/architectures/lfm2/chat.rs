@@ -36,7 +36,7 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::backbone::{Lfm2ShortConvRuntimeState, QuantizedLfm2Backbone};
 use super::config::{parse_lfm2_backbone_config, Lfm2BackboneConfig};
-use super::physical::lfm2_managed_cache_contract;
+use super::physical::lfm2_managed_cache_contract_with_prefix;
 
 pub struct ChatDecodeState {
     shortconv: Lfm2ShortConvRuntimeState,
@@ -490,6 +490,10 @@ pub struct Lfm2ChatModel {
     prompt_scaffold: PromptScaffoldTokens,
     config: Lfm2BackboneConfig,
     text_model: QuantizedLfm2Backbone,
+    /// Share conversation prefixes across requests: the contract publishes
+    /// committed pages and ShortConv ring snapshots, and a request may begin
+    /// on an attached prefix.
+    prefix_caching: bool,
 }
 
 impl Lfm2ChatModel {
@@ -545,7 +549,32 @@ impl Lfm2ChatModel {
             prompt_scaffold,
             config,
             text_model,
+            prefix_caching: false,
         })
+    }
+
+    /// Share conversation prefixes across requests (the catalog's
+    /// prefix-reuse cell for this family and backend engages it at load).
+    pub(crate) fn set_prefix_caching(&mut self, enabled: bool) {
+        self.prefix_caching = enabled;
+    }
+
+    pub(crate) fn prefix_caching(&self) -> bool {
+        self.prefix_caching
+    }
+
+    /// Tokens of a rendered prompt's stable history: everything before its
+    /// final `<|im_start|>`, the assistant generation header every LFM
+    /// render ends with. The next turn renders exactly these tokens again
+    /// (an answer re-renders differently from the tokens generated: LFM3
+    /// reduces earlier reasoning to `<think></think>`), so a snapshot here
+    /// is what the next turn attaches.
+    pub(crate) fn history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
+        let im_start = self.tokenizer.specials.im_start;
+        prompt_ids
+            .iter()
+            .rposition(|id| *id == im_start)
+            .filter(|boundary| *boundary > 0)
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
@@ -624,9 +653,19 @@ impl Lfm2ChatModel {
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        if prompt_ids.is_empty() || cache.context_len() != 0 {
+        // An attached prefix starts the cache above zero: its pages hold the
+        // prompt's first `attached` tokens, and the engine restores the ring
+        // snapshot at that cursor before the first span.
+        let attached = cache.context_len();
+        if prompt_ids.is_empty() || attached >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "LFM2 managed prefill requires a non-empty prompt and empty cache".into(),
+                "LFM2 managed prefill requires a non-empty prompt beyond any attached prefix"
+                    .into(),
+            ));
+        }
+        if attached > 0 && !self.prefix_caching {
+            return Err(Error::InvalidInput(
+                "LFM2 managed prefill received an attached prefix without prefix caching".into(),
             ));
         }
         validate_generation_config(config)?;
@@ -664,8 +703,8 @@ impl Lfm2ChatModel {
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
-            position: 0,
-            prefill_progress: 0,
+            position: attached,
+            prefill_progress: attached,
             replay_end: None,
             pending_logprobs: Vec::new(),
         })
@@ -1378,7 +1417,11 @@ impl Lfm2ChatModel {
 impl InferenceStateContractProvider for Lfm2ChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         Ok(InferenceStateCapability::Managed(
-            lfm2_managed_cache_contract(&self.config, lfm2_chat_kv_dtype(self.device_kind()))?,
+            lfm2_managed_cache_contract_with_prefix(
+                &self.config,
+                lfm2_chat_kv_dtype(self.device_kind()),
+                self.prefix_caching,
+            )?,
         ))
     }
 }

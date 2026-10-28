@@ -43,9 +43,9 @@ evidence; a cell supported ahead of its evidence says so). An explicit
 `0` is the kill switch. Auto degrades to Disabled with a recorded reason when
 the runtime's page budget cannot fit a safe prefix reserve.
 
-Hybrid chat families (Qwen3.8, Qwen3.6) declare where a prompt's stable
-history ends (before the final assistant generation header), snapshot their
-recurrent state there, and attach the next turn at that snapshot, so a turn
+Hybrid chat families (Qwen3.8, Qwen3.6, LFM2.5, LFM3) declare where a prompt's
+stable history ends (before the final assistant generation header), snapshot their
+recurrent or ShortConv state there, and attach the next turn at that snapshot, so a turn
 prefills only the previous answer and the new message. Their snapshots have
 their own budget (`IZWI_MAX_PREFIX_SNAPSHOTS`, default 8 rows of recurrent
 state), reserved on the model lease at load. A Qwen3.8 load with its MTP head
@@ -55,6 +55,7 @@ keeps every state domain private (no reuse).
 |---|---|---|---|
 | Qwen3.8 chat (hybrid) | Supported — process parity (`backend_parity` prefix leg) | Supported — process parity (metal-feature leg) | Supported ahead of evidence (operator decision) — contract declared; the GPU pre-flight runs `cuda_attached_history_matches_the_fresh_run`; `IZWI_QWEN38_PREFIX_REUSE=0` turns it off |
 | Qwen3.6 chat (hybrid MoE) | Supported — fixture suite (attach test bit-identical, three-turn chain) | Not enabled — attach leg passes, opt-in | Supported ahead of evidence (operator decision) — contract declared; the GPU pre-flight runs `cuda_attached_prefill_matches_the_fresh_run` |
+| LFM2.5 / LFM3 chat (hybrid ShortConv) | Supported — fixture suite (`lfm2_attached_prefix_continues_exactly_as_a_fresh_run` bit-identical, `lfm_ring_snapshots_publish_and_fork_into_the_attaching_request`); real-weight cut at the 256-token page boundary equals one-shot prefill | Supported — real-weight page-boundary cut equals one-shot prefill on Metal and the snapshot fork test is device-agnostic; the attach test itself runs on CPU | Not enabled — contract declared, no GPU evidence |
 | Qwen3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
 | Gemma3 chat (dense) | Supported — DS1.2 fixture suite | Not enabled — contract declared, no lane parity | Not enabled — no lane evidence |
 | Voxtral (LM) | Not enabled — contract declared, no lane parity | Not enabled | Not enabled |

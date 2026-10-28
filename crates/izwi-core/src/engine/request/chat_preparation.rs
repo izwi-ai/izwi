@@ -291,14 +291,23 @@ impl EngineCoreRequest {
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
-        self.managed_snapshot_boundary = prepared_chat_prompt
+        // A prepared prompt declares its own boundaries; a model that shares
+        // prefixes without one (LFM chat) finds them in the prompt tokens.
+        let history_boundary = prepared_chat_prompt
             .as_ref()
             .and_then(NativeChatPreparedPrompt::managed_snapshot_boundary)
+            .or_else(|| match &model {
+                PreparedChatModel::Exact(model) => model.managed_history_boundary(&prompt_tokens),
+                #[cfg(test)]
+                PreparedChatModel::ValidationOnly => None,
+            });
+        let preamble_boundary = history_boundary.and_then(|history| {
+            crate::models::registry::managed_preamble_boundary(&prompt_tokens, history)
+        });
+        self.managed_snapshot_boundary = history_boundary
             .filter(|boundary| *boundary <= prompt_tokens.len())
             .and_then(|boundary| u32::try_from(boundary).ok());
-        self.managed_preamble_boundary = prepared_chat_prompt
-            .as_ref()
-            .and_then(NativeChatPreparedPrompt::managed_preamble_boundary)
+        self.managed_preamble_boundary = preamble_boundary
             .filter(|boundary| *boundary <= prompt_tokens.len())
             .and_then(|boundary| u32::try_from(boundary).ok());
         self.prompt_tokens = prompt_tokens;
