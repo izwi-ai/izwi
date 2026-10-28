@@ -3029,6 +3029,9 @@ struct Lfm2QuantizedWeight {
 struct Lfm2Linear {
     matmul: QMatMul,
     small_batch: Option<SmallBatchMatVec>,
+    /// Every `[rows, 1, k]` input, one row included, takes the small-batch
+    /// mat-vec in groups (see [`QuantizedLfm2Backbone::make_decode_rows_invariant`]).
+    rows_invariant: bool,
 }
 
 impl Lfm2Linear {
@@ -3036,6 +3039,7 @@ impl Lfm2Linear {
         Ok(Self {
             matmul: QMatMul::from_weights(weight.tensor)?,
             small_batch: weight.small_batch,
+            rows_invariant: false,
         })
     }
 
@@ -3044,10 +3048,50 @@ impl Lfm2Linear {
         #[cfg(test)]
         let per_row_mat_vec = per_row_mat_vec && !FORCE_CANDLE_MATVEC.with(std::cell::Cell::get);
         match &self.small_batch {
+            Some(small_batch)
+                if per_row_mat_vec && self.rows_invariant && small_batch.takes(input) =>
+            {
+                small_batch.forward_in_groups(input)
+            }
             Some(small_batch) if per_row_mat_vec && small_batch.accepts(input) => {
                 small_batch.forward(input)
             }
             _ => self.matmul.forward(input),
+        }
+    }
+}
+
+impl QuantizedLfm2Backbone {
+    /// Give every decode row the same bits whatever rows decode beside it.
+    /// On Metal a lone row takes Candle's mat-vec and two to eight rows
+    /// izwi's k-quant mat-vec, which round differently; sampled audio drawn
+    /// from those logits would drift between a request served alone and the
+    /// same request under load. Here every `[rows, 1, k]` projection, the LM
+    /// head included, takes the k-quant mat-vec in groups of at most eight.
+    /// CPU's quantized matmul is already row-invariant. Chat keeps the
+    /// default: Candle's mat-vec is faster for a lone row.
+    pub(crate) fn make_decode_rows_invariant(&mut self) {
+        let head = self.output_head.iter_mut().map(|head| &mut head.weight);
+        let layers = self.layers.iter_mut().flat_map(|layer| {
+            let mut linears = vec![&mut layer.mlp.gate, &mut layer.mlp.down, &mut layer.mlp.up];
+            match &mut layer.kind {
+                LayerKind::Attention(attention) => {
+                    linears.extend([
+                        &mut attention.wq,
+                        &mut attention.wk,
+                        &mut attention.wv,
+                        &mut attention.wo,
+                    ]);
+                    linears.extend(attention.gate.as_mut());
+                }
+                LayerKind::ShortConv(shortconv) => {
+                    linears.extend([&mut shortconv.in_proj, &mut shortconv.out_proj]);
+                }
+            }
+            linears
+        });
+        for linear in head.chain(layers) {
+            linear.rows_invariant = true;
         }
     }
 }
@@ -3067,6 +3111,14 @@ impl SmallBatchMatVec {
     }
 
     fn forward(&self, _: &Tensor) -> candle_core::Result<Tensor> {
+        match *self {}
+    }
+
+    fn takes(&self, _: &Tensor) -> bool {
+        match *self {}
+    }
+
+    fn forward_in_groups(&self, _: &Tensor) -> candle_core::Result<Tensor> {
         match *self {}
     }
 }

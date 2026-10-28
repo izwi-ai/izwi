@@ -415,3 +415,187 @@ fn lfm3_audio_component_timing_on_metal() {
     }
     time_components(profile);
 }
+
+/// Each language-model decode row's hidden state, step by step, decoded
+/// alone (`width` 1) or beside the other rows, after a solo prefill of a
+/// prompt of its own length.
+fn lm_decode_rows(model: &Lfm3AudioModel, together: bool) -> Vec<Vec<Vec<f32>>> {
+    use crate::kernels::numeric_check::xorshift_tensor;
+    let config = model.lm_config();
+    let layout = Lfm2StateLayout::from_config(config).unwrap();
+    let kv_heads = config
+        .attention_head_count_kv
+        .iter()
+        .copied()
+        .max()
+        .unwrap();
+    let head_dim = config.embedding_length / config.attention_head_count;
+    let kv_dtype = match super::super::physical::lfm3_audio_kv_dtype(model.device().kind.into()) {
+        crate::kv::v2::StateDType::F16 => DType::F16,
+        _ => DType::F32,
+    };
+    let device = &model.device().device;
+    let hidden = config.embedding_length;
+    let prompts = [5usize, 9, 3, 12];
+    let mut caches = test_physical_caches_for_model_layers_on(
+        device,
+        kv_dtype,
+        &layout.attention_model_layers,
+        kv_heads,
+        head_dim,
+        256,
+        prompts.len(),
+    );
+    let mut states = (0..prompts.len())
+        .map(|_| model.lm.new_shortconv_state())
+        .collect::<Vec<_>>();
+    for (row, len) in prompts.iter().enumerate() {
+        let prompt = xorshift_tensor(&[1, *len, hidden], 100 + row as u64, 0.5, device).unwrap();
+        model
+            .lm
+            .forward_embeds_retained(&prompt, 0, &mut caches[row], &mut states[row])
+            .unwrap();
+    }
+    let mut out = vec![Vec::new(); prompts.len()];
+    for step in 0..6u64 {
+        let embeds = (0..prompts.len())
+            .map(|row| xorshift_tensor(&[1, 1, hidden], 1000 * step + row as u64, 0.5, device))
+            .collect::<candle_core::Result<Vec<_>>>()
+            .unwrap();
+        let positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let groups: Vec<Vec<usize>> = if together {
+            vec![(0..prompts.len()).collect()]
+        } else {
+            (0..prompts.len()).map(|row| vec![row]).collect()
+        };
+        for group in groups {
+            let mut group_states = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| group.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            let mut group_caches = caches
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| group.contains(row))
+                .map(|(_, cache)| cache)
+                .collect::<Vec<_>>();
+            let output = model
+                .lm
+                .forward_embeds_retained_batch(
+                    &group
+                        .iter()
+                        .map(|row| embeds[*row].clone())
+                        .collect::<Vec<_>>(),
+                    &group.iter().map(|row| positions[*row]).collect::<Vec<_>>(),
+                    &mut group_states,
+                    &mut group_caches,
+                )
+                .unwrap();
+            for (row, last) in group.iter().zip(output.last_hidden) {
+                out[*row].push(last.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Each row's speech frames over a few draws, from its own generator and
+/// history, sampled alone or beside the other rows.
+fn depth_frames(model: &Lfm3AudioModel, hidden: &Tensor, together: bool) -> Vec<[u32; CODEBOOKS]> {
+    let rows = hidden.dim(0).unwrap();
+    let sampling = Lfm3AudioSampling::default();
+    let mut rngs = (0..rows)
+        .map(|row| SplitMix64::new(7 + row as u64))
+        .collect::<Vec<_>>();
+    let history = FrameHistory::default();
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        if together {
+            frames.extend(
+                model
+                    .depth
+                    .sample_frames(
+                        hidden,
+                        &vec![&sampling; rows],
+                        &vec![&history; rows],
+                        &mut rngs.iter_mut().collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
+            );
+        } else {
+            for (row, rng) in rngs.iter_mut().enumerate() {
+                frames.extend(
+                    model
+                        .depth
+                        .sample_frames(
+                            &hidden.narrow(0, row, 1).unwrap(),
+                            &[&sampling],
+                            &[&history],
+                            &mut [rng],
+                        )
+                        .unwrap(),
+                );
+            }
+        }
+    }
+    frames
+}
+
+/// With rows made invariant, a decode row has the same bits alone and four
+/// wide, in the language model and the depth decoder: batched audio then
+/// samples what a request served alone samples.
+fn rows_are_batch_invariant(profile: DeviceProfile) {
+    let dir = models_dir().join(FOLDER);
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let backend = format!("{:?}", profile.kind);
+    let mut model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    let differs = lm_decode_rows(&model, false) != lm_decode_rows(&model, true);
+    eprintln!("{backend}: default rows differ alone and four wide: {differs}");
+    model.lm.make_decode_rows_invariant();
+    assert_eq!(
+        lm_decode_rows(&model, false),
+        lm_decode_rows(&model, true),
+        "{backend}: invariant language-model rows"
+    );
+
+    let hidden = crate::kernels::numeric_check::xorshift_tensor(
+        &[4, model.lm_config().embedding_length],
+        77,
+        2.0,
+        &model.device().device,
+    )
+    .unwrap();
+    assert_eq!(
+        depth_frames(&model, &hidden, true),
+        depth_frames(&model, &hidden, false),
+        "{backend}: depth rows differ alone and four wide"
+    );
+}
+
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_rows_are_batch_invariant_on_cpu() {
+    rows_are_batch_invariant(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_rows_are_batch_invariant_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease =
+        crate::backends::metal_test_device_or_skip("lfm3_audio_rows_are_batch_invariant_on_metal");
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        return;
+    }
+    rows_are_batch_invariant(profile);
+}

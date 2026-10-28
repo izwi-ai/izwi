@@ -24,7 +24,10 @@
 //! 12.8, 4 rows 23.9 -> 16.9; a single row was slower in the model (7.3 ->
 //! 7.9) despite the isolated timing, so one row stays on Candle.
 //! Results match Candle's to float rounding (sums regroup). Q4_0 serves
-//! LFM3-1.7B's quantization-aware distilled checkpoint.
+//! LFM3-1.7B's quantization-aware distilled checkpoint. A row sums in the
+//! same order however many rows share its dispatch, so
+//! [`MetalKQuantMatVec::forward_in_groups`] serves one row too for a decode
+//! that must be batch-invariant.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -103,11 +106,16 @@ impl MetalKQuantMatVec {
 
     /// Whether `x` (`[..., cols]`, F32, on Metal) has 2..=[`MAX_ROWS`] rows.
     pub(crate) fn accepts(&self, x: &Tensor) -> bool {
-        let rows = x.elem_count() / self.cols.max(1);
+        self.takes(x) && (2..=MAX_ROWS).contains(&(x.elem_count() / self.cols.max(1)))
+    }
+
+    /// Whether `x` (`[..., cols]`, F32, on Metal) has any rows at all, for
+    /// [`Self::forward_in_groups`].
+    pub(crate) fn takes(&self, x: &Tensor) -> bool {
         x.device().is_metal()
             && x.dtype() == DType::F32
             && x.dims().last() == Some(&self.cols)
-            && (2..=MAX_ROWS).contains(&rows)
+            && x.elem_count() >= self.cols
     }
 
     /// `x @ weightᵀ` for `x` of shape `[..., cols]`; the result is
@@ -121,9 +129,40 @@ impl MetalKQuantMatVec {
                 x.dtype()
             )
         }
+        self.matvec(x)
+    }
+
+    /// [`Self::forward`] for any number of rows, one included, in
+    /// dispatches of at most [`MAX_ROWS`]. Each row sums in the same order
+    /// whatever rows share its dispatch, so its bits do not depend on the
+    /// batch: what sampled decoding needs to be batch-invariant.
+    pub(crate) fn forward_in_groups(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        if !self.takes(x) {
+            bail!(
+                "izwi k-quant mat-vec needs F32 Metal rows of {}, got {:?} {:?}",
+                self.cols,
+                x.dims(),
+                x.dtype()
+            )
+        }
+        let batch = x.elem_count() / self.cols;
+        if batch <= MAX_ROWS {
+            return self.matvec(x);
+        }
+        let mut dims = x.dims().to_vec();
+        *dims.last_mut().expect("checked above") = self.rows;
+        let rows = x.contiguous()?.reshape((batch, self.cols))?;
+        let groups = (0..batch)
+            .step_by(MAX_ROWS)
+            .map(|start| self.matvec(&rows.narrow(0, start, MAX_ROWS.min(batch - start))?))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Tensor::cat(&groups, 0)?.reshape(dims)
+    }
+
+    fn matvec(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let mut dims = x.dims().to_vec();
         let batch = x.elem_count() / self.cols;
-        *dims.last_mut().expect("checked above") = self.rows;
+        *dims.last_mut().expect("checked by the callers") = self.rows;
         x.contiguous()?
             .reshape((batch, self.cols))?
             .apply_op1_no_bwd(self)?
@@ -188,8 +227,8 @@ impl CustomOp1 for MetalKQuantMatVec {
                 self.cols
             )
         }
-        if !(2..=MAX_ROWS).contains(&batch) {
-            bail!("izwi-kquant-mat-vec serves 2..={MAX_ROWS} rows, got {batch}")
+        if !(1..=MAX_ROWS).contains(&batch) {
+            bail!("izwi-kquant-mat-vec serves 1..={MAX_ROWS} rows, got {batch}")
         }
         let kind = match self.dtype {
             GgmlDType::Q4K => "q4_K",
@@ -502,6 +541,7 @@ template [[host_name("izwi_kq_ext_q6_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext
 template [[host_name("izwi_kq_ext_q8_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q8_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q8_0>; \
 template [[host_name("izwi_kq_ext_q4_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q4_0>;
 
+IZWI_KQ_EXT(1)
 IZWI_KQ_EXT(2)
 IZWI_KQ_EXT(3)
 IZWI_KQ_EXT(4)
@@ -593,6 +633,51 @@ mod tests {
                     assert!(
                         (a - e).abs() <= 2e-6 * scale,
                         "{dtype:?} {rows}x{cols} batch {batch} [{index}]: {a} vs {e} (scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A row's result has the same bits alone and beside any number of
+    /// other rows, across the eight-row dispatch boundary too.
+    #[test]
+    fn a_row_has_the_same_bits_in_every_batch() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("a_row_has_the_same_bits_in_every_batch")
+        else {
+            return;
+        };
+        let batches = 11;
+        for (dtype, rows, cols) in [
+            (GgmlDType::Q4K, 12, 768),
+            (GgmlDType::Q6K, 6, 1024),
+            (GgmlDType::Q8_0, 9, 96),
+            (GgmlDType::Q4_0, 64, 512),
+        ] {
+            // The kernel reads the `QMatMul`'s buffer: keep its owner alive,
+            // or Candle's pool hands the memory to the next allocation.
+            let (ext, _matmul) = weight(&device, dtype, rows, cols);
+            let x = Tensor::from_vec(
+                xorshift(0x51ce, batches * cols, 4.0),
+                (batches, 1, cols),
+                &device,
+            )
+            .unwrap();
+            let bits = |x: &Tensor| {
+                let y = ext.forward_in_groups(x).unwrap();
+                y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            };
+            let alone = (0..batches)
+                .map(|row| bits(&x.narrow(0, row, 1).unwrap()))
+                .collect::<Vec<_>>();
+            for batch in 1..=batches {
+                let together = bits(&x.narrow(0, 0, batch).unwrap());
+                for (row, expected) in alone.iter().take(batch).enumerate() {
+                    assert_eq!(
+                        &together[row * rows..(row + 1) * rows],
+                        expected.as_slice(),
+                        "{dtype:?} {rows}x{cols}: row {row} of {batch}"
                     );
                 }
             }

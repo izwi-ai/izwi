@@ -173,11 +173,13 @@ impl Lfm3DepthDecoder {
 
     /// The frame inputs `[rows, CODEBOOKS, HIDDEN]` of language-model hidden
     /// states `[rows, 2048]`: computed once per frame, shared by its passes.
+    /// Each row projects as its own `[1, 1, 2048]` mat-vec, so its inputs do
+    /// not depend on the rows beside it.
     pub(crate) fn frame_inputs(&self, hidden: &Tensor) -> Result<Tensor> {
         let rows = hidden.dim(0)?;
         Ok(self
             .proj_in
-            .forward(&hidden.to_dtype(DType::F32)?)?
+            .forward(&hidden.to_dtype(DType::F32)?.unsqueeze(1)?)?
             .broadcast_add(&self.proj_in_bias)?
             .reshape((rows, CODEBOOKS, HIDDEN))?)
     }
