@@ -382,6 +382,13 @@ impl Lfm3AudioModel {
         &self.lm_config
     }
 
+    /// Positions one speech row may hold: its TTS segment's context.
+    pub(crate) fn tts_row_context(&self) -> usize {
+        super::physical::Lfm3AudioWorkload::Tts
+            .context_tokens()
+            .min(self.max_context_tokens())
+    }
+
     pub(crate) fn lm(&self) -> &QuantizedLfm2Backbone {
         &self.lm
     }

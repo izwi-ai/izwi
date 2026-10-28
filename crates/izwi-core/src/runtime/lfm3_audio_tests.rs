@@ -184,6 +184,60 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
     assert_eq!(finals, 1, "one terminal chunk");
     assert_eq!(samples, result.samples, "streamed equals final-only");
 
+    // Concurrent speech batches in the engine: each seeded request speaks
+    // exactly what it speaks alone.
+    let requests = [
+        (SENTENCE, "female", 21),
+        ("Batching keeps every voice its own.", "female", 22),
+        (SENTENCE, "male", 23),
+        ("A late row joins mid-sentence.", "male", 24),
+    ]
+    .map(|(text, voice, seed)| {
+        let mut request = GenerationRequest::new(text);
+        request.model_variant = Some(variant);
+        request.config.options.voice = Some(voice.into());
+        request.config.options.speech.seed = Some(seed);
+        request.language = Some("en-US".into());
+        request
+    });
+    let started = Instant::now();
+    let mut alone = Vec::new();
+    for request in &requests {
+        alone.push(
+            runtime
+                .generate(request.clone())
+                .await
+                .expect("speak alone"),
+        );
+    }
+    let serial = started.elapsed();
+    let started = Instant::now();
+    let together = futures::future::join_all(
+        requests
+            .iter()
+            .map(|request| runtime.generate(request.clone())),
+    )
+    .await;
+    let concurrent = started.elapsed();
+    let audio: f64 = alone
+        .iter()
+        .map(|result| result.samples.len() as f64 / f64::from(result.sample_rate))
+        .sum();
+    eprintln!(
+        "TTS x{}: {audio:.2}s of audio serially in {:.2}s, concurrently in {:.2}s",
+        requests.len(),
+        serial.as_secs_f64(),
+        concurrent.as_secs_f64()
+    );
+    for (index, (alone, together)) in alone.iter().zip(together).enumerate() {
+        let together = together.expect("speak concurrently");
+        assert!(!alone.samples.is_empty(), "request {index} spoke");
+        assert!(
+            alone.samples == together.samples,
+            "request {index} differs under concurrency"
+        );
+    }
+
     // A spoken turn answered with interleaved text and speech.
     let started = Instant::now();
     let reply = runtime

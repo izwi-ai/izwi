@@ -34,6 +34,7 @@ pub(crate) enum LoadedAdapterKind {
     ChatterboxTts,
     Maya1Tts,
     Maya2Tts,
+    Lfm3AudioTts,
     KokoroStaticTts,
     Scalar,
 }
@@ -58,6 +59,7 @@ impl LoadedAdapterKind {
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
             Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
+            Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -358,11 +360,19 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // Audio chat.
         row(F::Lfm25Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm25Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
-        // LFM3-Audio runs every request as one atomic invocation on leased
-        // pages and ring. Speech streams from the engine as frames decode;
-        // ASR runs on the direct audio-chat route, long audio chunked
-        // inside the invocation.
-        row(F::Lfm3Audio, C::Tts, Loaded::Scalar, Invocation).chunked(),
+        // LFM3-Audio speech runs as retained rows that batch: the language
+        // model's pages and ring stay in the managed arena between quanta,
+        // and speech streams as the codec decodes it. Transcription and
+        // voice chat run as one atomic invocation on leased pages and ring;
+        // ASR on the direct audio-chat route, long audio chunked inside the
+        // invocation.
+        row(
+            F::Lfm3Audio,
+            C::Tts,
+            Loaded::Lfm3AudioTts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
         row(F::Lfm3Audio, C::Asr, Loaded::Scalar, Invocation)
             .chunked()
             .target(Target::DirectModel),

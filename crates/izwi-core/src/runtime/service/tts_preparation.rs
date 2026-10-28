@@ -1589,6 +1589,145 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    /// Prepare an LFM3-Audio speech request as a retained row: resolve its
+    /// voice, locale, frame cap, sampling and seed, and embed its prompt
+    /// once, so its row prefills from the artifact.
+    pub(super) async fn prepare_lfm3_audio_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Lfm3Audio)
+            || request
+                .prepared_lfm3_audio_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated LFM3-Audio variant");
+        let model = self
+            .model_registry
+            .get_lfm25_audio_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("LFM3-Audio preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = model.lfm3_audio()?.tts_row_context();
+        let speech = request.lfm3_audio_tts_request()?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("LFM3-Audio retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        // Tokenizing the prompt and gathering its embeddings.
+        let workspace = 64 * 1024 * 1024;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        workspace,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.lfm3_audio".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                workspace,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "LFM3-Audio preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact = model_for_preparation.lfm3_audio()?.prepare_row(speech)?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: 0,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("LFM3-Audio preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_lfm3_audio_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_lfm25_audio_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1860,6 +1999,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_lfm25_audio_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_lfm3_audio_tts_for_binding(request, job, residency_lease)
             .await?;
         Ok((request, job))
     }

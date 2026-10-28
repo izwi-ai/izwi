@@ -25,7 +25,7 @@ use crate::models::architectures::lfm2::physical::{
     Lfm2StateIds, Lfm2StateLayout,
 };
 use crate::models::architectures::lfm25_audio::physical::{
-    Lfm25AudioPhysicalStateSpec, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+    Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
     LFM25_MAIN_SHORTCONV_STATE_DOMAIN, LFM25_MAIN_STATE_GROUP,
 };
 
@@ -62,6 +62,97 @@ pub(crate) const fn lfm3_audio_kv_dtype(backend: BackendKind) -> StateDType {
 }
 
 /// The invocation workspace of one scalar LFM3-Audio request of `workload`.
+/// Speech as retained rows: the language model's paged attention and
+/// ShortConv ring stay in the managed arena between quanta, sized for one
+/// TTS segment per row. The depth decoder and codec keep no state between
+/// quanta; each stage leases its activations as per-row scratch.
+pub(crate) fn lfm3_audio_retained_tts_state_spec(
+    lm_config: &Lfm2BackboneConfig,
+    kv_dtype: StateDType,
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<Lfm25AudioRetainedStateSpec> {
+    if stage_graphs.is_empty() {
+        return Err(Error::ModelLoadError(
+            "LFM3-Audio retained TTS state has no execution graph".into(),
+        ));
+    }
+    let retained = crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(
+        lm_config, kv_dtype,
+    )?;
+    let max_domain_id = retained
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .unwrap_or(0);
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let per_row = if stage.workspace_per_row_bytes == 0 {
+                stage.max_workspace_bytes / u64::try_from(stage.max_batch_size.max(1)).unwrap_or(1)
+            } else {
+                stage.workspace_per_row_bytes
+            };
+            let domains = if per_row == 0 {
+                Vec::new()
+            } else {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError("LFM3-Audio stage count exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("LFM3-Audio scratch domain overflow".into())
+                    })?;
+                vec![InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: per_row,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                }]
+            };
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: Vec::new(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(Lfm25AudioRetainedStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens: Lfm3AudioWorkload::Tts
+            .context_tokens()
+            .min(lm_config.context_length),
+        main_invocation: None,
+        depthformer_invocation: None,
+    })
+}
+
 pub(crate) fn lfm3_audio_physical_state_spec(
     lm_config: &Lfm2BackboneConfig,
     workload: Lfm3AudioWorkload,

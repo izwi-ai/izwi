@@ -56,8 +56,9 @@ use sequence_asr::{
 };
 use tts::{
     ChatterboxTtsExecutionAdapter, FishS2TtsExecutionAdapter, Lfm25AudioTtsExecutionAdapter,
-    Maya1TtsExecutionAdapter, Maya2TtsExecutionAdapter, PhysicalQwenTtsExecutionAdapter,
-    StaticTtsExecutionAdapter, VibeVoiceTtsExecutionAdapter, VoxtralTtsExecutionAdapter,
+    Lfm3AudioTtsExecutionAdapter, Maya1TtsExecutionAdapter, Maya2TtsExecutionAdapter,
+    PhysicalQwenTtsExecutionAdapter, StaticTtsExecutionAdapter, VibeVoiceTtsExecutionAdapter,
+    VoxtralTtsExecutionAdapter,
 };
 
 const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
@@ -77,6 +78,7 @@ const VOXTRAL_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const CHATTERBOX_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA1_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);

@@ -534,6 +534,24 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm3AudioTts(_)) {
+            let prepared = ready.lfm3_audio_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "LFM3-Audio request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::Lfm3Audio
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens)
+                || self.params.max_tokens == 0
+                || self.params.max_tokens > prepared.request.max_slots
+            {
+                return Err(Error::InvalidInput(format!(
+                    "LFM3-Audio request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
             let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -627,6 +645,12 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Lfm3AudioTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::Lfm3Audio
+                    && ready.lfm3_audio_tts.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::KokoroTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::KokoroTts
                     && ready.kokoro_tts.is_some() =>
@@ -700,6 +724,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
+                | PreparedIncrementalModel::Lfm3AudioTts(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())

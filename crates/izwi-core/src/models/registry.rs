@@ -3792,6 +3792,33 @@ impl NativeAudioChatModel {
         }
     }
 
+    /// LFM3-Audio speech as retained rows (see
+    /// [`lfm3_audio_retained_tts_state_spec`]).
+    pub(crate) fn lfm3_audio_retained_tts_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<crate::models::architectures::lfm25_audio::physical::Lfm25AudioRetainedStateSpec>
+    {
+        let model = self.lfm3_audio()?;
+        crate::models::architectures::lfm3_audio::physical::lfm3_audio_retained_tts_state_spec(
+            model.lm_config(),
+            lfm3_audio_kv_dtype(BackendKind::from(model.device().kind)),
+            stage_graphs,
+        )
+    }
+
+    /// The LFM3-Audio model, for its retained rows.
+    pub(crate) fn lfm3_audio(
+        &self,
+    ) -> Result<&crate::models::architectures::lfm3_audio::model::Lfm3AudioModel> {
+        match self {
+            Self::Lfm3Audio(model) => Ok(model),
+            Self::Lfm25Audio(_) => Err(Error::InvalidInput(
+                "LFM2.5-Audio is not an LFM3-Audio model".into(),
+            )),
+        }
+    }
+
     /// LFM3-Audio's invocation workspace for `workload`: the context that
     /// workload can use, with paged KV in the backend's storage dtype.
     pub(crate) fn lfm3_audio_physical_state_spec(
@@ -8437,13 +8464,14 @@ impl ModelRegistry {
             .map(|inner| Lfm25AudioModelLease { inner })
     }
 
-    /// Publish retained LFM2.5 Audio discovery only after lifecycle sealing
-    /// and authoritative slot publication have both committed.
+    /// Publish retained LFM2.5 Audio or LFM3-Audio discovery only after
+    /// lifecycle sealing and authoritative slot publication have both
+    /// committed.
     pub(crate) async fn publish_lfm25_audio_ready(&self, variant: ModelVariant) -> Result<()> {
         let guard = self.audio_chat_models.read().await;
         let entry = guard.get(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
-                "cannot publish missing LFM2.5 Audio model {variant} as ready"
+                "cannot publish missing audio model {variant} as ready"
             ))
         })?;
         entry.publish_ready()

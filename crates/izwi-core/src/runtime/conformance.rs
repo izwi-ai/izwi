@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            59
+            61
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            21
+            19
         );
 
         assert_eq!(

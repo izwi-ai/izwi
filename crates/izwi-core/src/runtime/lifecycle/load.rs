@@ -275,6 +275,10 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::Maya2Tts => {
             crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
         }
+        crate::catalog::ModelFamily::Lfm3Audio => {
+            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts
+                .context_tokens()
+        }
         _ => 0,
     };
     tokens as u64
@@ -1135,6 +1139,7 @@ impl ModelLifecycleController {
                 variant,
                 model_instance_id,
                 backend,
+                state_fit_reserve,
                 &bundle_draft,
                 &mut state_publications,
             )
@@ -1255,7 +1260,10 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::Voxtral {
                 self.model_registry.publish_voxtral_ready(variant).await?;
             }
-            if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+            if matches!(
+                variant.family(),
+                crate::catalog::ModelFamily::Lfm25Audio | crate::catalog::ModelFamily::Lfm3Audio
+            ) {
                 self.model_registry
                     .publish_lfm25_audio_ready(variant)
                     .await?;

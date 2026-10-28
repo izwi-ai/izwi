@@ -203,6 +203,18 @@ pub(super) struct ActiveMaya2TtsDecode {
     pub(super) rendered: Vec<f32>,
 }
 
+pub(super) struct ActiveLfm3AudioTtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Lfm25AudioModelLease,
+    pub(super) state: crate::models::architectures::lfm3_audio::retained::Lfm3AudioRetainedState,
+    /// A streamed request's next chunk sequence.
+    pub(super) stream_sequence: usize,
+    /// Samples a streamed request has published so far.
+    pub(super) streamed_samples: usize,
+    /// A final-only request's samples, handed over when it finishes.
+    pub(super) rendered: Vec<f32>,
+}
+
 pub(super) struct ActiveVoxtralRealtime {
     pub(super) variant: ModelVariant,
     pub(super) model: VoxtralModelLease,

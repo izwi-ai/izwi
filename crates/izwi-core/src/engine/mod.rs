@@ -2409,6 +2409,61 @@ impl Engine {
                     })??;
                 }
             }
+            TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Lfm3Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+                    })?;
+                if request
+                    .prepared_lfm3_audio_tts_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = model.lfm3_audio()?.tts_row_context();
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM3-Audio TTS preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let speech = request.lfm3_audio_tts_request()?;
+                        let artifact = model.lfm3_audio()?.prepare_row(speech)?;
+                        request.install_lfm3_audio_tts_execution_model(
+                            variant,
+                            model,
+                            artifact,
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM3-Audio TTS request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
             TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Qwen3Tts => {
                 let model = registry.get_qwen_tts_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("Qwen TTS model {variant} is not loaded"))

@@ -74,7 +74,9 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         name: "lfm3_audio_tts",
         task: TaskType::TTS,
         variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::Lfm3Audio),
-        handler: NativeExecutor::lfm3_audio_tts_request,
+        handler: |executor, request, scheduled| {
+            executor.lfm3_audio_tts_request_with_managed_cache(request, scheduled, None)
+        },
     },
     DispatchRoute {
         name: "tts",
@@ -426,6 +428,23 @@ impl NativeExecutor {
                         reservation,
                     )?;
                     self.maya2_tts_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::Lfm3Audio
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.lfm3_audio_tts_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(state),
+                    )
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -1040,6 +1059,42 @@ impl NativeExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = self.maya2_tts_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
+    pub(super) fn execute_static_lfm3_audio_tts_prefill_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("static LFM3-Audio row lost its request".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                rows.and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.lfm3_audio_tts_batch_with_managed(&ordered, scheduled, managed)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,

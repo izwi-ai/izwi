@@ -992,14 +992,16 @@ impl ModelLifecycleController {
         Ok(())
     }
 
-    /// LFM3-Audio: one scalar invocation workspace (the language model's
-    /// paged attention and ShortConv ring) per capability; every request
-    /// runs atomically.
+    /// LFM3-Audio: speech runs as retained rows on the managed arena (the
+    /// language model's paged attention and ShortConv ring, kept between
+    /// quanta); transcription and voice chat each lease one scalar
+    /// invocation workspace and run atomically.
     pub(super) async fn allocate_lfm3_audio_state(
         &self,
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
         backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
         bundle_draft: &LoadedModelBundleDraft,
         state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<()> {
@@ -1020,9 +1022,47 @@ impl ModelLifecycleController {
                     "loaded LFM3-Audio model {variant} is missing from the registry"
                 ))
             })?;
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let tts_spec = model.lfm3_audio_retained_tts_state_spec(&stage_graphs)?;
+        let retained = self
+            .core_engine
+            .load_managed_model_state(
+                model_instance_id,
+                &tts_spec.retained,
+                Some(tts_spec.retained_max_tokens),
+                tts_state_minimum_tokens(variant),
+                state_fit_reserve,
+                0,
+            )
+            .await?;
+        self.model_registry.publish_kv_storage(variant, &retained);
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
+            CapabilityKind::Tts,
+            retained.state_plan_v2(),
+        )?;
+        let retained_uses = contracts
+            .iter()
+            .map(|contract| {
+                Ok((
+                    stage_graph_fingerprint(&contract.stages)?,
+                    RetainedStateUseV2::ExternalPaged,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let publication = self.load_scratch_only_workspace_publication(
+            &contracts,
+            tts_spec.descriptor,
+            Some(retained.into()),
+            retained_uses,
+        )?;
+        state_publications.insert(CapabilityKind::Tts, publication);
         let capabilities = [
             CapabilityKind::Asr,
-            CapabilityKind::Tts,
             CapabilityKind::AudioChat,
             CapabilityKind::SpeechToSpeech,
         ];
@@ -1035,7 +1075,6 @@ impl ModelLifecycleController {
                 .collect::<Vec<_>>();
             let workload = match capability {
                 CapabilityKind::Asr => Lfm3AudioWorkload::Asr,
-                CapabilityKind::Tts => Lfm3AudioWorkload::Tts,
                 _ => Lfm3AudioWorkload::Conversation,
             };
             let physical_spec = model.lfm3_audio_physical_state_spec(workload, &stage_graphs)?;

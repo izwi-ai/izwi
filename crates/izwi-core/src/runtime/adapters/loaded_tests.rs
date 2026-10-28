@@ -1079,6 +1079,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                                 | crate::catalog::ModelFamily::ChatterboxTts
                                 | crate::catalog::ModelFamily::Maya1Tts
                                 | crate::catalog::ModelFamily::Maya2Tts
+                                | crate::catalog::ModelFamily::Lfm3Audio
                         );
                     let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;

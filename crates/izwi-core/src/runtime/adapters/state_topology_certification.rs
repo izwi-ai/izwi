@@ -21,6 +21,7 @@ enum CertifiedTopology {
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
+    RetainedPagedRingAndInvocationScratch,
     RetainedPagedStaticAndInvocationPagedStatic,
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
@@ -40,6 +41,7 @@ impl CertifiedTopology {
             Self::RetainedPagedTensorAndInvocationPaged
             | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedRingAndInvocationPagedRing
+            | Self::RetainedPagedRingAndInvocationScratch
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedRotatingAndInvocationScratch
@@ -72,6 +74,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedRingAndInvocationPagedRing
+            | Self::RetainedPagedRingAndInvocationScratch
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedTensorTensor => true,
             Self::Stateless
@@ -168,9 +171,11 @@ fn certified_topology(
         (Lfm25Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, Tts) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
-        // LFM3-Audio runs every capability as one scalar invocation on the
-        // language model's pages and ShortConv ring.
-        (Lfm3Audio, Asr | Tts | AudioChat | SpeechToSpeech) => InvocationPagedRing,
+        // LFM3-Audio speech retains the language model's pages and ring
+        // between quanta and leases scratch per stage; the other
+        // capabilities run one scalar invocation on leased pages and ring.
+        (Lfm3Audio, Tts) => RetainedPagedRingAndInvocationScratch,
+        (Lfm3Audio, Asr | AudioChat | SpeechToSpeech) => InvocationPagedRing,
 
         (SortformerDiarization, Diarization) => InvocationTensor,
         (Qwen3ForcedAligner, ForcedAlignment) => Stateless,
