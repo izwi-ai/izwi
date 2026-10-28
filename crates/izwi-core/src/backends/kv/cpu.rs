@@ -821,8 +821,10 @@ fn validate_decode_query(query: &Tensor, dtype: DType) -> Result<()> {
     Ok(())
 }
 
-/// Tokens one CPU attention task covers before the context is split further.
-const CPU_ATTENTION_MIN_PARTITION_TOKENS: usize = 256;
+/// Tokens of one row's context one CPU attention task covers. A row is cut
+/// at multiples of it whatever else its batch holds, so it attends with the
+/// same bits alone and batched.
+const CPU_ATTENTION_PARTITION_TOKENS: usize = 256;
 
 /// One (row, KV head, context slice) unit of CPU paged attention: the
 /// online-softmax state of every query head in the KV head's group.
@@ -875,32 +877,37 @@ where
     }
 
     // Split long contexts so a small batch still uses every core; each slice
-    // is merged back by its log-sum-exp state.
-    let base_tasks = (batch_size * kv_heads).max(1);
-    let max_context = tables
+    // is merged back by its log-sum-exp state. A row's slices depend only on
+    // its own context: batch-invariant rows (sampled audio that a concurrent
+    // request must replay exactly) need the same summation alone and batched.
+    let partitions = tables
         .rows
         .iter()
-        .map(|row| row.context_len)
-        .max()
-        .unwrap_or(0);
-    let partitions = rayon::current_num_threads()
-        .div_ceil(base_tasks)
-        .min(max_context.div_ceil(CPU_ATTENTION_MIN_PARTITION_TOKENS))
-        .max(1);
-    let partition_tokens = max_context.div_ceil(partitions).max(1);
+        .map(|row| {
+            row.context_len
+                .div_ceil(CPU_ATTENTION_PARTITION_TOKENS)
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    let tasks = partitions
+        .iter()
+        .enumerate()
+        .flat_map(|(row, &slices)| {
+            (0..kv_heads).flat_map(move |kv_head| {
+                (0..slices).map(move |partition| (row, kv_head, partition))
+            })
+        })
+        .collect::<Vec<_>>();
 
     // The softmax scale is folded into the queries, converted once.
     let scaled_queries = (0..batch_size * query_heads * key_dim)
         .map(|index| f32::from(queries[query_start + index]) * softmax_scale)
         .collect::<Vec<_>>();
 
-    let compute = |task: usize| -> CpuAttentionPartial {
-        let row = task / (kv_heads * partitions);
-        let kv_head = (task / partitions) % kv_heads;
-        let partition = task % partitions;
+    let compute = |&(row, kv_head, partition): &(usize, usize, usize)| -> CpuAttentionPartial {
         let table = &tables.rows[row];
-        let start = (partition * partition_tokens).min(table.context_len);
-        let end = ((partition + 1) * partition_tokens).min(table.context_len);
+        let start = (partition * CPU_ATTENTION_PARTITION_TOKENS).min(table.context_len);
+        let end = ((partition + 1) * CPU_ATTENTION_PARTITION_TOKENS).min(table.context_len);
         let query_base = (row * query_heads + kv_head * group) * key_dim;
         let group_queries = &scaled_queries[query_base..query_base + group * key_dim];
         let mut partial = CpuAttentionPartial {
@@ -973,17 +980,17 @@ where
         partial
     };
 
-    let tasks = batch_size * kv_heads * partitions;
-    let partials = if tasks > 1 {
-        (0..tasks).into_par_iter().map(compute).collect::<Vec<_>>()
+    let partials = if tasks.len() > 1 {
+        tasks.par_iter().map(compute).collect::<Vec<_>>()
     } else {
-        (0..tasks).map(compute).collect::<Vec<_>>()
+        tasks.iter().map(compute).collect::<Vec<_>>()
     };
 
     let mut output = vec![0.0f32; batch_size * query_heads * value_dim];
-    for (base, slices) in partials.chunks_exact(partitions).enumerate() {
-        let row = base / kv_heads;
-        let kv_head = base % kv_heads;
+    let mut next = 0;
+    for (row, kv_head) in (0..batch_size).flat_map(|row| (0..kv_heads).map(move |kv| (row, kv))) {
+        let slices = &partials[next..next + partitions[row]];
+        next += partitions[row];
         for head in 0..group {
             let global_max = slices
                 .iter()
@@ -1783,6 +1790,98 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+        Ok(())
+    }
+
+    /// A row attends with the same bits alone and beside a longer row: its
+    /// context is sliced by its own length, not the batch's.
+    #[test]
+    fn paged_decode_rows_are_batch_invariant_past_one_slice() -> Result<()> {
+        let page_tokens = 64_u32;
+        let pages = 16_u32;
+        let (kv_heads, dim) = (2_u32, 8_usize);
+        let arena = CpuKvArena::new(KvArenaConfig {
+            page_tokens,
+            capacity_pages: pages,
+            layers: vec![KvLayerConfig {
+                binding: LAYER,
+                num_kv_heads: kv_heads,
+                key_head_dim: dim as u32,
+                value_head_dim: dim as u32,
+            }],
+            ..config(DType::F32)
+        })?;
+        let tokens = (page_tokens * pages) as usize;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut noise = |count: usize| {
+            (0..count)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % 2_001) as f32 / 1_000.0 - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let width = tokens * kv_heads as usize * dim;
+        let slots = (0..pages)
+            .flat_map(|page| {
+                (0..page_tokens).map(move |offset| KvSlotRef {
+                    block: block(page),
+                    offset,
+                })
+            })
+            .collect::<Vec<_>>();
+        arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &Tensor::from_vec(
+                    noise(width),
+                    (tokens, kv_heads as usize, dim),
+                    &Device::Cpu,
+                )?,
+                values: &Tensor::from_vec(
+                    noise(width),
+                    (tokens, kv_heads as usize, dim),
+                    &Device::Cpu,
+                )?,
+                slots: arena.lower_slots(&slots)?.as_ref(),
+            },
+        )?;
+        let short = KvSequenceBlockTable {
+            blocks: (0..5).map(block).collect(),
+            first_page_offset: 3,
+            context_len: 300,
+        };
+        let long = KvSequenceBlockTable {
+            blocks: (5..15).map(block).collect(),
+            first_page_offset: 0,
+            context_len: 600,
+        };
+        let queries = noise(2 * 4 * dim);
+        let decode = |rows: Vec<KvSequenceBlockTable>| -> Result<Vec<f32>> {
+            let count = rows.len();
+            arena
+                .paged_decode(
+                    LAYER,
+                    PagedKvDecodeArgs {
+                        queries: &Tensor::from_vec(
+                            queries[..count * 4 * dim].to_vec(),
+                            (count, 4, dim),
+                            &Device::Cpu,
+                        )?,
+                        batch: &KvDecodeBatchMetadata { sequences: rows },
+                        softmax_scale: 0.35,
+                        softcap: None,
+                    },
+                )?
+                .flatten_all()?
+                .to_vec1::<f32>()
+                .map_err(Into::into)
+        };
+        let alone = decode(vec![short.clone()])?;
+        let batched = decode(vec![short, long])?;
+        assert_eq!(alone, batched[..alone.len()]);
         Ok(())
     }
 
