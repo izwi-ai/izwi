@@ -16,4 +16,4 @@ pub use model::{ModelBackend, ModelOutput, ModelRequest};
 pub use planner::{PlanSummary, Planner, PlanningMode, SimplePlanner};
 pub use reasoning::{strip_reasoning, ReasoningFilter};
 pub use session::{AgentEvent, AgentSession, AgentTurnResult, ToolCallRecord, TurnInput};
-pub use tools::{NoopTool, TimeTool, Tool, ToolRegistry};
+pub use tools::{NoopTool, TimeTool, Tool, ToolContext, ToolOutput, ToolRegistry};

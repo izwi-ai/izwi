@@ -145,6 +145,7 @@ impl RuntimeService {
         variant: ModelVariant,
         audio_input: SpeechAudioInput<'_>,
         messages: Vec<ChatMessage>,
+        tools: Vec<serde_json::Value>,
         mut params: GenerationParams,
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
@@ -170,6 +171,7 @@ impl RuntimeService {
             audio_bytes,
             &messages,
             messages.capacity(),
+            &tools,
             &params,
             system_prompt,
             correlation_id,
@@ -244,7 +246,7 @@ impl RuntimeService {
                         )?
                     }
                 };
-                Ok(runtime_request.into_engine_request())
+                Ok(runtime_request.with_tools(tools).into_engine_request())
             },
         )
         .await
@@ -265,6 +267,7 @@ impl RuntimeService {
                     variant,
                     SpeechAudioInput::Bytes(audio_bytes),
                     messages,
+                    Vec::new(),
                     params,
                     system_prompt,
                     correlation_id,
@@ -307,6 +310,7 @@ impl RuntimeService {
                     variant,
                     SpeechAudioInput::Base64(audio_base64),
                     messages,
+                    Vec::new(),
                     params,
                     system_prompt,
                     correlation_id,
@@ -380,18 +384,62 @@ impl RuntimeService {
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
+        on_chunk: F,
+    ) -> Result<SpeechToSpeechGeneration>
+    where
+        F: FnMut(StreamingOutput) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        self.speech_to_speech_round_streaming_bytes(
+            variant,
+            audio_bytes,
+            messages,
+            Vec::new(),
+            true,
+            params,
+            system_prompt,
+            correlation_id,
+            runtime_context,
+            on_chunk,
+        )
+        .await
+    }
+
+    /// One model round of a spoken turn: the reply to `audio_bytes` after
+    /// `messages`, with the `tools` it may call (LFM3-Audio), streamed to
+    /// `on_chunk`. A tool round's continuation passes the round so far in
+    /// `messages` (the spoken turn as its `<|audio|>` user turn, then the
+    /// calls and their results) and `transcribe: false`, as the first round
+    /// already transcribed the turn.
+    pub async fn speech_to_speech_round_streaming_bytes<F, Fut>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        messages: Vec<ChatMessage>,
+        tools: Vec<serde_json::Value>,
+        transcribe: bool,
+        params: GenerationParams,
+        system_prompt: Option<&str>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
         mut on_chunk: F,
     ) -> Result<SpeechToSpeechGeneration>
     where
         F: FnMut(StreamingOutput) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
+        if !tools.is_empty() && variant.family() != ModelFamily::Lfm3Audio {
+            return Err(Error::InvalidInput(format!(
+                "{variant} cannot call tools in a spoken turn; LFM3-Audio can"
+            )));
+        }
         let reply = async {
             let admitted = self
                 .build_speech_to_speech_request(
                     variant,
                     SpeechAudioInput::Bytes(audio_bytes),
                     messages,
+                    tools,
                     params,
                     system_prompt,
                     correlation_id,
@@ -421,15 +469,20 @@ impl RuntimeService {
                 streamed_sample_rate,
             ))
         };
-        let ((output, streamed_text, streamed_samples, streamed_sample_rate), transcript) = tokio::try_join!(
-            reply,
+        let transcript = async {
+            if !transcribe {
+                return Ok(None);
+            }
             self.lfm3_audio_turn_transcript(
                 variant,
                 SpeechAudioInput::Bytes(audio_bytes),
                 correlation_id,
                 runtime_context,
             )
-        )?;
+            .await
+        };
+        let ((output, streamed_text, streamed_samples, streamed_sample_rate), transcript) =
+            tokio::try_join!(reply, transcript)?;
 
         Ok(SpeechToSpeechGeneration {
             text: output.text.unwrap_or(streamed_text),
@@ -443,7 +496,9 @@ impl RuntimeService {
             } else {
                 streamed_sample_rate
             },
-            input_transcription: transcript.or(output.input_transcription),
+            input_transcription: transcript
+                .or(output.input_transcription)
+                .filter(|_| transcribe),
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
         })
     }
@@ -521,6 +576,7 @@ mod tests {
             .build_speech_to_speech_request(
                 ModelVariant::Lfm25Audio15BGguf,
                 SpeechAudioInput::Base64("AAAA"),
+                Vec::new(),
                 Vec::new(),
                 GenerationParams::default(),
                 None,

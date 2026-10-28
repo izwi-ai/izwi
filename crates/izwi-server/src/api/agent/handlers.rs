@@ -9,7 +9,7 @@ use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentTurnOptions, MemoryMessage,
     MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest,
-    NoopTool, TimeTool, ToolRegistry, TurnInput,
+    TurnInput,
 };
 use izwi_core::{
     parse_chat_model_variant, ChatMessage, ChatRole, RuntimeRequestContext, WorkloadClass,
@@ -175,9 +175,7 @@ pub async fn create_turn(
         runtime_context: permit.runtime_context(),
     };
     let planner = SimplePlanner;
-    let mut tools = ToolRegistry::new();
-    tools.register(NoopTool);
-    tools.register(TimeTool);
+    let tools = crate::app::voice_tools::builtin_tool_registry();
 
     let engine = AgentEngine;
     let result = engine

@@ -1391,6 +1391,7 @@ Client JSON messages:
 | `input_stream_stop` | Stops listening and closes the current session. |
 | `interrupt` | Optional `reason`; interrupts active assistant turn. |
 | `conversation_item_truncate` | `utterance_seq` and `audio_end_ms`: the client played only that much of the reply's audio (also accepted as `conversation.item.truncate`, after OpenAI Realtime). The conversation remembers the reply only up to there. |
+| `function_call_output` | `call_id` and `output` (text, or any JSON): the result of a call the server sent as `function_call` to the client. A call that is unknown, already answered or timed out is an `error`. |
 | `ping` | Optional `timestamp_ms`. |
 
 `mode` values:
@@ -1418,6 +1419,9 @@ Client JSON messages:
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
+| `tools` | Unified mode on LFM3-Audio only: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
+| `builtin_tools` | Unified mode on LFM3-Audio: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
+| `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
 
 Client binary frame:
 
@@ -1459,6 +1463,8 @@ Server events:
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
 | `assistant_text_start`, `assistant_text_snapshot`, `assistant_text_final` | Assistant text events. A snapshot carries the whole reply so far; the final event also has `raw_text`. |
 | `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks; the start event names the `sample_rate` and `audio_format`. |
+| `function_call` | The reply calls a tool: `call_id`, `name`, `arguments` (a JSON object as text) and `executor`, `server` for a built-in tool (the server runs it) or `client` (answer with `function_call_output`); `null` for a tool the session does not offer. The typed v2 protocol sends it as `function_call`. |
+| `function_call_completed` | A call's `call_id`, `name`, `status` (`ok`, `error` or `timeout`) and the `output` the reply hears. The typed v2 protocol sends it as `function_call_completed`. |
 | `conversation_item_truncated` | Acknowledges a truncate with the `text` the conversation now remembers for that reply. |
 | `turn_done` | Terminal turn status: `ok`, `error`, `timeout`, `interrupted`, or `no_input`. |
 | `pong` | Ping response. |
@@ -1471,5 +1477,11 @@ How a modular turn runs:
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
 - The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+
+How a unified turn with tools runs (LFM3-Audio):
+
+- The reply is told the tools in its system prompt. A reply that calls them speaks nothing in that round; the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round hears their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
+- Each round takes its own request admission slot, so no slot is held while a tool runs. An interruption ends a call the client has not answered.
+- Text events and the remembered reply carry what the reply says, never its call markup. Audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.

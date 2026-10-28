@@ -475,6 +475,7 @@ pub(crate) fn retained_speech_to_speech_preparation_input_bytes(
     audio_input_bytes: usize,
     messages: &[ChatMessage],
     messages_capacity: usize,
+    tools: &[serde_json::Value],
     params: &GenerationParams,
     system_prompt: Option<&str>,
     correlation_id: Option<&str>,
@@ -487,6 +488,15 @@ pub(crate) fn retained_speech_to_speech_preparation_input_bytes(
         "speech-to-speech borrowed audio",
     )?;
     add_chat_messages_allocations(&mut total, messages, messages_capacity)?;
+    add_retained_allocation(
+        &mut total,
+        tools.len(),
+        std::mem::size_of::<serde_json::Value>(),
+        "speech-to-speech tools",
+    )?;
+    for tool in tools {
+        add_json_allocations(&mut total, tool, "speech-to-speech tool")?;
+    }
     add_generation_param_allocations(&mut total, params)?;
     add_retained_allocation(
         &mut total,

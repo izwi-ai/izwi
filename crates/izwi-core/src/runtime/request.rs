@@ -337,6 +337,7 @@ pub(crate) struct AudioChatRuntimeRequest {
     envelope: RequestEnvelope,
     audio: RuntimeAudioInput,
     messages: Vec<ChatMessage>,
+    tools: Vec<serde_json::Value>,
     params: CoreGenerationParams,
     system_prompt: Option<String>,
 }
@@ -360,6 +361,7 @@ impl AudioChatRuntimeRequest {
                 .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
+            tools: Vec::new(),
             params,
             system_prompt,
         })
@@ -383,9 +385,16 @@ impl AudioChatRuntimeRequest {
                 .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
+            tools: Vec::new(),
             params,
             system_prompt,
         })
+    }
+
+    /// The tools the reply may call (LFM3-Audio).
+    pub(crate) fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
     }
 
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
@@ -399,6 +408,7 @@ impl AudioChatRuntimeRequest {
         };
         self.envelope.apply_to(&mut request);
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
+        request.chat_config.tools = self.tools;
         request.system_prompt = self
             .system_prompt
             .map(|value| value.trim().to_string())

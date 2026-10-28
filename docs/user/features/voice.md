@@ -89,7 +89,13 @@ speech, through the same speech-to-speech routes: name it as `s2s_model_id` in
 the WebSocket's `unified` mode. The **Compact** engine uses
 `LFM2.5-Audio-1.5B-GGUF` by default: choose an LFM3 Audio model in
 **Voice settings › Engine**, and with only LFM3 Audio downloaded the Compact
-engine uses it. Spoken tool calls are not supported with LFM3 Audio yet.
+engine uses it.
+
+With LFM3 Audio a spoken turn can call tools: the server's built-in tools (the
+local date and time) by default, and function tools a WebSocket client declares
+in `input_stream_start` and answers with `function_call_output`. The reply calls
+a tool, hears its result, then speaks the answer. See
+[Voice Realtime](/api#voice-realtime) for the fields and events.
 
 ---
 

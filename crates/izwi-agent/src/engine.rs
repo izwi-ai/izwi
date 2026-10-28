@@ -168,6 +168,7 @@ impl AgentEngine {
                         session_id: session.id.clone(),
                         thread_id: session.thread_id.clone(),
                         user_text: user_text.clone(),
+                        arguments: serde_json::Value::Null,
                     })
                     .await?;
                 events.push(AgentEvent::ToolCallCompleted {

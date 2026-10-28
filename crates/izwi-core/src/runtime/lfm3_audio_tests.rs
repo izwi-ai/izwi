@@ -761,7 +761,8 @@ fn greedy_chat() -> GenerationParams {
 }
 
 /// Chat completions through LFM3-Audio: questions about WAV and MP3 clips,
-/// two clips in one turn, streamed and cut-off replies, answered in text.
+/// two clips in one turn, streamed and cut-off replies, answered in text;
+/// tool calls in chat and in a spoken turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lfm3_audio_answers_chat_about_audio_if_env_set() {
     use crate::models::shared::chat::ChatTruncation;
@@ -985,6 +986,90 @@ async fn lfm3_audio_answers_chat_about_audio_if_env_set() {
     eprintln!("{backend:?}: tool result -> {:?}", answer.text);
     let answer = answer.text.rsplit("</think>").next().unwrap_or_default();
     assert!(answer.contains("21") && !answer.contains("<tool_call>"), "{answer:?}");
+
+    // A spoken turn with tools: the first round calls one, the next hears
+    // its result and speaks the answer.
+    let mut ask = GenerationRequest::new("What time is it right now?");
+    ask.model_variant = Some(variant);
+    ask.config.options.voice = Some("female".into());
+    ask.config.options.speech.seed = Some(3);
+    ask.language = Some("en-US".into());
+    let spoken = runtime.generate(ask).await.expect("speak the question");
+    let question_wav = wav_bytes(&spoken.samples, spoken.sample_rate);
+    let time_tool = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "time",
+            "description": "Returns the current local date and time.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    })];
+    let spoken_params = || GenerationParams {
+        max_tokens: 400,
+        ..Default::default()
+    };
+    let first = runtime
+        .speech_to_speech_round_streaming_bytes(
+            variant,
+            &question_wav,
+            Vec::new(),
+            time_tool.clone(),
+            true,
+            spoken_params(),
+            None,
+            None,
+            RuntimeRequestContext::default(),
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("the first round");
+    eprintln!(
+        "{backend:?}: spoken tools round 0 heard {:?} -> {:?} ({:.2}s of speech)",
+        first.input_transcription,
+        first.text,
+        first.samples.len() as f64 / f64::from(first.sample_rate.max(1))
+    );
+    assert!(
+        first.text.contains("<tool_call>\n<function=time>"),
+        "{:?}",
+        first.text
+    );
+    let round = vec![
+        crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::User,
+            content: AUDIO.to_string(),
+        },
+        crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::Assistant,
+            content: first.text.clone(),
+        },
+        crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::Tool,
+            content: "It is Thursday 29 October 2026, 14:05 (UTC+02:00).".to_string(),
+        },
+    ];
+    let second = runtime
+        .speech_to_speech_round_streaming_bytes(
+            variant,
+            &question_wav,
+            round,
+            time_tool,
+            false,
+            spoken_params(),
+            None,
+            None,
+            RuntimeRequestContext::default(),
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("the answer round");
+    let seconds = second.samples.len() as f64 / f64::from(second.sample_rate.max(1));
+    eprintln!(
+        "{backend:?}: spoken tools round 1 -> {:?} ({seconds:.2}s of speech)",
+        second.text
+    );
+    assert!(second.input_transcription.is_none());
+    assert!(seconds > 0.5, "the answer round spoke {seconds:.2}s");
 
     // A clip the messages do not place is refused before it runs.
     assert!(runtime

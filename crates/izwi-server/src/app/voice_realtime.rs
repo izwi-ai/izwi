@@ -22,7 +22,7 @@ use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
     strip_reasoning, AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, HistoryBudget,
     MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput,
-    ModelRequest, NoopTool, ReasoningFilter, TimeTool, ToolRegistry, TurnInput,
+    ModelRequest, ReasoningFilter, TurnInput,
 };
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
@@ -41,12 +41,13 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
-    RealtimeCloseReason, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeInterruptionReason,
-    RealtimeProtocol, RealtimeServerEvent, RealtimeSpeechEndReason, RealtimeTurnStatus,
-    VOICE_REALTIME_VERSION,
+    RealtimeCloseReason, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeFunctionCallStatus,
+    RealtimeFunctionExecutor, RealtimeInterruptionReason, RealtimeProtocol, RealtimeServerEvent,
+    RealtimeSpeechEndReason, RealtimeTurnStatus, VOICE_REALTIME_VERSION,
 };
 use crate::app::realtime_transport::{
     now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, spawn_writer,
@@ -54,6 +55,10 @@ use crate::app::realtime_transport::{
     OutboundLimits, OutboundMailbox, OutboundMessage,
 };
 use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
+use crate::app::voice_tools::{
+    builtin_tool_registry, run_builtin_call, FunctionCallOutcome, FunctionExecutor,
+    PendingFunctionCalls, VoiceTools, MAX_TOOL_ROUNDS, MAX_TURN_FUNCTION_CALLS,
+};
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
 use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
@@ -439,46 +444,13 @@ enum ClientEvent {
         #[serde(default)]
         resume_from_event_id: Option<u64>,
     },
-    InputStreamStart {
-        #[serde(default)]
-        mode: RealtimeVoiceMode,
-        #[serde(default)]
-        asr_model_id: Option<String>,
-        #[serde(default)]
-        text_model_id: Option<String>,
-        #[serde(default)]
-        tts_model_id: Option<String>,
-        #[serde(default)]
-        s2s_model_id: Option<String>,
-        #[serde(default)]
-        speaker: Option<String>,
-        #[serde(default)]
-        asr_language: Option<String>,
-        #[serde(default)]
-        max_output_tokens: Option<usize>,
-        #[serde(default)]
-        vad_threshold: Option<f32>,
-        #[serde(default)]
-        min_speech_ms: Option<u32>,
-        #[serde(default)]
-        silence_duration_ms: Option<u32>,
-        #[serde(default)]
-        max_utterance_ms: Option<u32>,
-        #[serde(default)]
-        pre_roll_ms: Option<u32>,
-        #[serde(default)]
-        barge_in_min_speech_ms: Option<u32>,
-        /// Energy above the noise floor, in dB, a frame needs to start an
-        /// utterance. Half of it keeps one going. `0` disables the check.
-        #[serde(default)]
-        vad_snr_margin_db: Option<f32>,
-        #[serde(default)]
-        input_sample_rate: Option<u32>,
-        /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
-        #[serde(default)]
-        output_audio_format: Option<String>,
-    },
+    InputStreamStart(Box<InputStreamStartEvent>),
     InputStreamStop,
+    /// The output of a call the server sent as `function_call`.
+    FunctionCallOutput {
+        call_id: String,
+        output: serde_json::Value,
+    },
     Interrupt {
         #[serde(default)]
         reason: Option<String>,
@@ -495,6 +467,59 @@ enum ClientEvent {
         #[serde(default)]
         timestamp_ms: Option<u64>,
     },
+}
+
+/// `input_stream_start`: how the session listens and answers.
+#[derive(Debug, Deserialize)]
+struct InputStreamStartEvent {
+    #[serde(default)]
+    mode: RealtimeVoiceMode,
+    #[serde(default)]
+    asr_model_id: Option<String>,
+    #[serde(default)]
+    text_model_id: Option<String>,
+    #[serde(default)]
+    tts_model_id: Option<String>,
+    #[serde(default)]
+    s2s_model_id: Option<String>,
+    #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    asr_language: Option<String>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    vad_threshold: Option<f32>,
+    #[serde(default)]
+    min_speech_ms: Option<u32>,
+    #[serde(default)]
+    silence_duration_ms: Option<u32>,
+    #[serde(default)]
+    max_utterance_ms: Option<u32>,
+    #[serde(default)]
+    pre_roll_ms: Option<u32>,
+    #[serde(default)]
+    barge_in_min_speech_ms: Option<u32>,
+    /// Energy above the noise floor, in dB, a frame needs to start an
+    /// utterance. Half of it keeps one going. `0` disables the check.
+    #[serde(default)]
+    vad_snr_margin_db: Option<f32>,
+    #[serde(default)]
+    input_sample_rate: Option<u32>,
+    /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
+    #[serde(default)]
+    output_audio_format: Option<String>,
+    /// Function tools a unified LFM3-Audio turn may call; the client
+    /// answers their calls with `function_call_output`.
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// Whether those turns may call the server's built-in tools
+    /// (default `true`).
+    #[serde(default)]
+    builtin_tools: Option<bool>,
+    /// How long a turn waits for the client's output of a call.
+    #[serde(default)]
+    function_call_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -531,6 +556,8 @@ struct UnifiedVoiceTurnConfig {
     speaker: Option<String>,
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
+    /// The tools its turns may call (LFM3-Audio).
+    tools: Option<VoiceTools>,
 }
 
 #[derive(Debug, Clone)]
@@ -1079,6 +1106,8 @@ struct ConnectionState {
     transport_session_id: String,
     owner_instance_id: String,
     next_turn_generation: u64,
+    /// The client's tool calls the session's turns await.
+    function_calls: PendingFunctionCalls,
 }
 
 impl Default for ConnectionState {
@@ -1100,6 +1129,7 @@ impl Default for ConnectionState {
             transport_session_id: uuid::Uuid::new_v4().to_string(),
             owner_instance_id: process_owner_instance_id().to_string(),
             next_turn_generation: 0,
+            function_calls: PendingFunctionCalls::default(),
         }
     }
 }
@@ -1579,6 +1609,7 @@ fn finalize_stream_vad_utterance(
             control: control.clone(),
             output_generation,
             model_leases: conn.model_leases.clone(),
+            function_calls: conn.function_calls.clone(),
         },
         record,
         wav_bytes,
@@ -1815,25 +1846,29 @@ async fn handle_text_message(
                 }),
             );
         }
-        ClientEvent::InputStreamStart {
-            mode,
-            asr_model_id,
-            text_model_id,
-            tts_model_id,
-            s2s_model_id,
-            speaker,
-            asr_language,
-            max_output_tokens,
-            vad_threshold,
-            min_speech_ms,
-            silence_duration_ms,
-            max_utterance_ms,
-            pre_roll_ms,
-            barge_in_min_speech_ms,
-            vad_snr_margin_db,
-            input_sample_rate,
-            output_audio_format,
-        } => {
+        ClientEvent::InputStreamStart(start) => {
+            let InputStreamStartEvent {
+                mode,
+                asr_model_id,
+                text_model_id,
+                tts_model_id,
+                s2s_model_id,
+                speaker,
+                asr_language,
+                max_output_tokens,
+                vad_threshold,
+                min_speech_ms,
+                silence_duration_ms,
+                max_utterance_ms,
+                pre_roll_ms,
+                barge_in_min_speech_ms,
+                vad_snr_margin_db,
+                input_sample_rate,
+                output_audio_format,
+                tools,
+                builtin_tools,
+                function_call_timeout_ms,
+            } = *start;
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
             }
@@ -1892,6 +1927,7 @@ async fn handle_text_message(
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
+                    VoiceTools::parse(tools, builtin_tools, function_call_timeout_ms, false)?;
 
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
@@ -1920,11 +1956,18 @@ async fn handle_text_message(
                             s2s_model_id
                         ));
                     }
+                    let tools = VoiceTools::parse(
+                        tools,
+                        builtin_tools,
+                        function_call_timeout_ms,
+                        variant.family() == izwi_core::ModelFamily::Lfm3Audio,
+                    )?;
                     VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
                         s2s_model_id,
                         speaker: normalized_speaker,
                         max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
                         output_format,
+                        tools,
                     })
                 }
             };
@@ -2025,6 +2068,13 @@ async fn handle_text_message(
             if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
+            }
+        }
+        ClientEvent::FunctionCallOutput { call_id, output } => {
+            if !conn.function_calls.resolve(&call_id, &output) {
+                return Err(format!(
+                    "No tool call `{call_id}` awaits an output (unknown, settled or timed out)"
+                ));
             }
         }
         ClientEvent::ConversationItemTruncate {
@@ -2157,6 +2207,7 @@ struct TurnContext {
     control: TurnControl,
     output_generation: u64,
     model_leases: SessionModelLeases,
+    function_calls: PendingFunctionCalls,
 }
 
 fn spawn_turn_task(
@@ -2179,6 +2230,7 @@ fn spawn_turn_task(
             control,
             output_generation,
             model_leases,
+            function_calls,
         } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
@@ -2486,27 +2538,29 @@ fn spawn_turn_task(
 
                     let history_messages =
                         build_unified_history(&state, &voice_session_id, &turn_record_id).await?;
-                    let generation = with_stage_permit(&state, async |runtime_context| {
-                        stream_unified_s2s_to_socket(
-                            &state,
-                            &out_tx,
-                            &correlation_id,
-                            &commit.utterance_id,
-                            commit.utterance_seq,
-                            &config.s2s_model_id,
-                            config.speaker.clone(),
-                            &system_prompt,
-                            history_messages,
-                            config.max_output_tokens,
-                            config.output_format,
-                            audio_bytes.as_slice(),
-                            runtime_context,
-                            &control,
-                            output_generation,
-                            &model_leases,
-                        )
-                        .await
-                    })
+                    let tools = config.tools.as_ref().map(|tools| UnifiedTurnTools {
+                        tools,
+                        pending: &function_calls,
+                        voice_session_id: &voice_session_id,
+                    });
+                    let generation = stream_unified_s2s_to_socket(
+                        &state,
+                        &out_tx,
+                        &correlation_id,
+                        &commit.utterance_id,
+                        commit.utterance_seq,
+                        &config.s2s_model_id,
+                        config.speaker.clone(),
+                        &system_prompt,
+                        history_messages,
+                        config.max_output_tokens,
+                        config.output_format,
+                        audio_bytes.as_slice(),
+                        tools,
+                        &control,
+                        output_generation,
+                        &model_leases,
+                    )
                     .await?;
 
                     let user_text = generation
@@ -3118,6 +3172,31 @@ async fn build_unified_history(
         .collect())
 }
 
+/// What a spoken turn's model rounds share while they stream.
+#[derive(Default)]
+struct UnifiedReplyStream {
+    encoder: Option<AudioOutputEncoder>,
+    /// Added to a round's own chunk numbers, so they count on across rounds.
+    chunk_offset: u32,
+    next_chunk: u32,
+    /// The reply's visible text so far: tool-call markup is left out.
+    text: String,
+    /// The round's tool-call parser, when the turn offers tools.
+    parser: Option<ToolCallParser>,
+}
+
+/// The tools a spoken turn offers and how their calls reach the client.
+struct UnifiedTurnTools<'a> {
+    tools: &'a VoiceTools,
+    pending: &'a PendingFunctionCalls,
+    voice_session_id: &'a str,
+}
+
+/// A unified spoken turn: the model's reply streamed to the socket. With
+/// tools, a round that calls them is followed by one that hears their
+/// results, at most [`MAX_TOOL_ROUNDS`] rounds and
+/// [`MAX_TURN_FUNCTION_CALLS`] calls; each round holds its own admission
+/// permit, so none is held while a tool runs.
 #[allow(clippy::too_many_arguments)]
 async fn stream_unified_s2s_to_socket(
     state: &AppState,
@@ -3132,7 +3211,7 @@ async fn stream_unified_s2s_to_socket(
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
     audio_bytes: &[u8],
-    runtime_context: RuntimeRequestContext,
+    tools: Option<UnifiedTurnTools<'_>>,
     control: &TurnControl,
     output_generation: u64,
     model_leases: &SessionModelLeases,
@@ -3165,147 +3244,196 @@ async fn stream_unified_s2s_to_socket(
         }),
     );
 
-    let mut encoder: Option<AudioOutputEncoder> = None;
+    let stream = Arc::new(Mutex::new(UnifiedReplyStream::default()));
     let delivery_error = Arc::new(Mutex::new(None::<String>));
-    let params = GenerationParams {
-        max_tokens: max_output_tokens.clamp(1, 4096),
-        speaker: speaker.clone(),
-        voice: speaker,
-        ..Default::default()
+    let definitions = tools
+        .as_ref()
+        .map(|tools| tools.tools.definitions())
+        .unwrap_or_default();
+    let mut messages = history_messages;
+    let mut reply = izwi_core::SpeechToSpeechGeneration {
+        text: String::new(),
+        samples: Vec::new(),
+        sample_rate: 24_000,
+        input_transcription: None,
+        generation_time_ms: 0.0,
     };
+    let mut calls_made = 0usize;
+    for round in 0..MAX_TOOL_ROUNDS {
+        {
+            let mut stream = lock_reply_stream(&stream);
+            stream.chunk_offset = stream.next_chunk;
+            stream.parser =
+                (!definitions.is_empty()).then(|| ToolCallParser::new(ToolCallFormat::QwenXml));
+        }
+        let params = GenerationParams {
+            max_tokens: max_output_tokens.clamp(1, 4096),
+            speaker: speaker.clone(),
+            voice: speaker.clone(),
+            ..Default::default()
+        };
+        let permit = acquire_stage_permit(state).await?;
+        let generation = state
+            .runtime
+            .speech_to_speech_round_streaming_bytes(
+                variant,
+                audio_bytes,
+                messages.clone(),
+                definitions.clone(),
+                round == 0,
+                params,
+                Some(system_prompt),
+                Some(correlation_id),
+                permit.runtime_context(),
+                unified_chunk_sink(
+                    out_tx,
+                    utterance_id,
+                    utterance_seq,
+                    output_format,
+                    control,
+                    output_generation,
+                    state.runtime.clone(),
+                    stream.clone(),
+                    delivery_error.clone(),
+                ),
+            )
+            .await
+            .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
+        drop(permit);
+        if let Some(err) = delivery_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            return Err(err);
+        }
 
-    let generation = state
-        .runtime
-        .speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context(
-            variant,
-            audio_bytes,
-            history_messages,
-            params,
-            Some(system_prompt),
-            Some(correlation_id),
-            runtime_context,
-            {
-                let out_tx = out_tx.clone();
-                let utterance_id = utterance_id.to_string();
-                let control = control.clone();
-                let delivery_error = delivery_error.clone();
-                let mut text_snapshot = String::new();
-                let runtime = state.runtime.clone();
-                move |chunk| {
-                    // A cancelled turn stops the reply at its next token
-                    // instead of letting it run to its end (SPK-F5).
-                    let cancelled =
-                        || izwi_core::Error::Cancelled("unified voice turn cancelled".to_string());
-                    if control.is_cancelled() {
-                        return futures::future::Either::Left(std::future::ready(Err(cancelled())));
-                    }
-                    if let Some(delta) = chunk.text.as_deref() {
-                        if !delta.is_empty() {
-                            text_snapshot.push_str(delta);
-                            send_turn_text_snapshot(
-                                &out_tx,
-                                output_generation,
-                                format!("assistant-text-{utterance_seq}"),
-                                json!({
-                                    "type": "assistant_text_snapshot",
-                                    "utterance_id": utterance_id,
-                                    "utterance_seq": utterance_seq,
-                                    "text": text_snapshot,
-                                }),
-                            );
-                        }
-                    }
+        // The parser holds back text that could still open a call.
+        let tail = {
+            let mut stream = lock_reply_stream(&stream);
+            let tail = stream
+                .parser
+                .take()
+                .map(|mut parser| parser.finish().content)
+                .unwrap_or_default();
+            stream.text.push_str(&tail);
+            (!tail.is_empty()).then(|| stream.text.clone())
+        };
+        if let Some(text) = tail {
+            send_turn_text_snapshot(
+                out_tx,
+                output_generation,
+                format!("assistant-text-{utterance_seq}"),
+                json!({
+                    "type": "assistant_text_snapshot",
+                    "utterance_id": utterance_id,
+                    "utterance_seq": utterance_seq,
+                    "text": text,
+                }),
+            );
+        }
+        if round == 0 {
+            reply.input_transcription = generation.input_transcription.clone();
+        }
+        if !generation.samples.is_empty() {
+            reply.sample_rate = generation.sample_rate;
+            reply.samples.extend_from_slice(&generation.samples);
+        }
+        reply.generation_time_ms += generation.generation_time_ms;
 
-                    let mut frame = None;
-                    if !chunk.samples.is_empty() {
-                        let encoded = match encoder.as_mut() {
-                            Some(encoder) => encoder.encode(&chunk.samples),
-                            None => {
-                                AudioOutputEncoder::new(output_format, chunk.sample_rate.max(1))
-                                    .and_then(|created| {
-                                        encoder.insert(created).encode(&chunk.samples)
-                                    })
-                            }
-                        };
-                        match encoded {
-                            Ok(encoded) => {
-                                let chunk_seq = u32::try_from(chunk.sequence).unwrap_or(u32::MAX);
-                                let model_rate = chunk.sample_rate.max(1);
-                                let duration_ms = (chunk.samples.len() as u64)
-                                    .saturating_mul(1_000)
-                                    .checked_div(u64::from(model_rate))
-                                    .unwrap_or(0);
-                                frame = Some((
-                                    encode_assistant_audio_binary_frame(
-                                        output_format,
-                                        utterance_seq,
-                                        chunk_seq,
-                                        output_format.wire_rate(model_rate),
-                                        chunk.is_final,
-                                        &encoded,
-                                    ),
-                                    encoded.len(),
-                                    duration_ms,
-                                ));
-                            }
-                            Err(err) => {
-                                send_turn_error(
-                                    &out_tx,
-                                    output_generation,
-                                    Some(utterance_id.clone()),
-                                    Some(utterance_seq),
-                                    format!("Failed to encode unified streamed audio chunk: {err}"),
-                                );
-                            }
-                        }
-                    }
-                    let Some((frame, bytes, duration_ms)) = frame else {
-                        return futures::future::Either::Left(std::future::ready(Ok(())));
-                    };
-                    // Audio waits for the client's playback credit, as the
-                    // cascaded pipeline's does (SPK-F11): a reply generated
-                    // faster than real time is held back, not dropped.
-                    let out_tx = out_tx.clone();
-                    let control = control.clone();
-                    let delivery_error = delivery_error.clone();
-                    let runtime = runtime.clone();
-                    futures::future::Either::Right(async move {
-                        match out_tx
-                            .send_audio(
-                                output_generation,
-                                Message::Binary(frame.into()),
-                                bytes,
-                                duration_ms,
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                control.audio_sent(&runtime, Duration::from_millis(duration_ms));
-                                Ok(())
-                            }
-                            Err(err) => {
-                                *delivery_error
-                                    .lock()
-                                    .unwrap_or_else(|poison| poison.into_inner()) =
-                                    Some(format!("Outbound audio delivery failed: {err:?}"));
-                                control.cancel("socket_closed");
-                                Err(cancelled())
-                            }
-                        }
-                    })
+        let Some(tools) = tools.as_ref() else {
+            break;
+        };
+        let (_, calls) = parse_answer(ToolCallFormat::QwenXml, &generation.text);
+        if calls.is_empty() {
+            break;
+        }
+        if round + 1 == MAX_TOOL_ROUNDS {
+            return Err(format!(
+                "The reply called tools in each of its {MAX_TOOL_ROUNDS} rounds without answering"
+            ));
+        }
+        calls_made += calls.len();
+        if calls_made > MAX_TURN_FUNCTION_CALLS {
+            return Err(format!(
+                "The reply made more than {MAX_TURN_FUNCTION_CALLS} tool calls in one turn"
+            ));
+        }
+        if round == 0 {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: izwi_core::CHAT_AUDIO_PLACEHOLDER.to_string(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: generation.text.clone(),
+        });
+        let user_text = reply.input_transcription.clone().unwrap_or_default();
+        for call in calls {
+            let executor = tools.tools.executor(&call.function.name);
+            send_turn_json(
+                out_tx,
+                output_generation,
+                json!({
+                    "type": "function_call",
+                    "utterance_id": utterance_id,
+                    "utterance_seq": utterance_seq,
+                    "call_id": call.id,
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                    "executor": executor.as_ref().map(FunctionExecutor::as_str),
+                }),
+            );
+            let outcome = match executor {
+                Some(FunctionExecutor::Server(tool)) => {
+                    run_builtin_call(
+                        tool,
+                        &call.function.arguments,
+                        izwi_agent::ToolContext {
+                            session_id: tools.voice_session_id.to_string(),
+                            thread_id: utterance_id.to_string(),
+                            user_text: user_text.clone(),
+                            arguments: serde_json::Value::Null,
+                        },
+                        tools.tools.timeout,
+                    )
+                    .await
                 }
-            },
-        )
-        .await
-        .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
-
-    if let Some(err) = delivery_error
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take()
-    {
-        return Err(err);
+                Some(FunctionExecutor::Client) => {
+                    tools
+                        .pending
+                        .await_output(&call.id, tools.tools.timeout, control.cancelled())
+                        .await
+                }
+                None => FunctionCallOutcome::error(format!(
+                    "No tool named `{}` is available.",
+                    call.function.name
+                )),
+            };
+            send_turn_json(
+                out_tx,
+                output_generation,
+                json!({
+                    "type": "function_call_completed",
+                    "utterance_id": utterance_id,
+                    "utterance_seq": utterance_seq,
+                    "call_id": call.id,
+                    "name": call.function.name,
+                    "status": outcome.status,
+                    "output": outcome.output,
+                }),
+            );
+            if control.is_cancelled() {
+                return Err("Turn cancelled".to_string());
+            }
+            messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: outcome.output,
+            });
+        }
     }
+    reply.text = lock_reply_stream(&stream).text.clone();
 
     send_turn_json(
         out_tx,
@@ -3317,7 +3445,152 @@ async fn stream_unified_s2s_to_socket(
         }),
     );
 
-    Ok(generation)
+    Ok(reply)
+}
+
+fn lock_reply_stream(
+    stream: &Mutex<UnifiedReplyStream>,
+) -> std::sync::MutexGuard<'_, UnifiedReplyStream> {
+    stream.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The sink of one round's stream: visible text as snapshots, speech as
+/// binary frames held back for the client's playback credit (SPK-F11).
+#[allow(clippy::too_many_arguments)]
+fn unified_chunk_sink(
+    out_tx: &OutboundTx,
+    utterance_id: &str,
+    utterance_seq: u64,
+    output_format: OutputAudioFormat,
+    control: &TurnControl,
+    output_generation: u64,
+    runtime: Arc<RuntimeService>,
+    stream: Arc<Mutex<UnifiedReplyStream>>,
+    delivery_error: Arc<Mutex<Option<String>>>,
+) -> impl FnMut(
+    izwi_core::StreamingOutput,
+) -> futures::future::Either<
+    std::future::Ready<izwi_core::Result<()>>,
+    std::pin::Pin<Box<dyn std::future::Future<Output = izwi_core::Result<()>> + Send>>,
+> + Send
+       + 'static {
+    let out_tx = out_tx.clone();
+    let utterance_id = utterance_id.to_string();
+    let control = control.clone();
+    move |chunk| {
+        // A cancelled turn stops the reply at its next token instead of
+        // letting it run to its end (SPK-F5).
+        let cancelled = || izwi_core::Error::Cancelled("unified voice turn cancelled".to_string());
+        if control.is_cancelled() {
+            return futures::future::Either::Left(std::future::ready(Err(cancelled())));
+        }
+        let mut frame = None;
+        {
+            let mut stream = lock_reply_stream(&stream);
+            if let Some(delta) = chunk.text.as_deref().filter(|delta| !delta.is_empty()) {
+                let visible = match stream.parser.as_mut() {
+                    Some(parser) => parser.push(delta).content,
+                    None => delta.to_string(),
+                };
+                if !visible.is_empty() {
+                    stream.text.push_str(&visible);
+                    send_turn_text_snapshot(
+                        &out_tx,
+                        output_generation,
+                        format!("assistant-text-{utterance_seq}"),
+                        json!({
+                            "type": "assistant_text_snapshot",
+                            "utterance_id": utterance_id,
+                            "utterance_seq": utterance_seq,
+                            "text": stream.text,
+                        }),
+                    );
+                }
+            }
+
+            if !chunk.samples.is_empty() {
+                let model_rate = chunk.sample_rate.max(1);
+                let encoded = match stream.encoder.as_mut() {
+                    Some(encoder) => encoder.encode(&chunk.samples),
+                    None => AudioOutputEncoder::new(output_format, model_rate)
+                        .and_then(|created| stream.encoder.insert(created).encode(&chunk.samples)),
+                };
+                match encoded {
+                    Ok(encoded) => {
+                        let chunk_seq = stream
+                            .chunk_offset
+                            .saturating_add(u32::try_from(chunk.sequence).unwrap_or(u32::MAX));
+                        stream.next_chunk = chunk_seq.saturating_add(1);
+                        // A round that calls tools is not the reply's last.
+                        let is_final = chunk.is_final
+                            && !stream
+                                .parser
+                                .as_ref()
+                                .is_some_and(ToolCallParser::saw_tool_calls);
+                        let duration_ms = (chunk.samples.len() as u64)
+                            .saturating_mul(1_000)
+                            .checked_div(u64::from(model_rate))
+                            .unwrap_or(0);
+                        frame = Some((
+                            encode_assistant_audio_binary_frame(
+                                output_format,
+                                utterance_seq,
+                                chunk_seq,
+                                output_format.wire_rate(model_rate),
+                                is_final,
+                                &encoded,
+                            ),
+                            encoded.len(),
+                            duration_ms,
+                        ));
+                    }
+                    Err(err) => {
+                        send_turn_error(
+                            &out_tx,
+                            output_generation,
+                            Some(utterance_id.clone()),
+                            Some(utterance_seq),
+                            format!("Failed to encode unified streamed audio chunk: {err}"),
+                        );
+                    }
+                }
+            }
+        }
+        let Some((frame, bytes, duration_ms)) = frame else {
+            return futures::future::Either::Left(std::future::ready(Ok(())));
+        };
+        // Audio waits for the client's playback credit, as the cascaded
+        // pipeline's does (SPK-F11): a reply generated faster than real time
+        // is held back, not dropped.
+        let out_tx = out_tx.clone();
+        let control = control.clone();
+        let delivery_error = delivery_error.clone();
+        let runtime = runtime.clone();
+        futures::future::Either::Right(Box::pin(async move {
+            match out_tx
+                .send_audio(
+                    output_generation,
+                    Message::Binary(frame.into()),
+                    bytes,
+                    duration_ms,
+                )
+                .await
+            {
+                Ok(()) => {
+                    control.audio_sent(&runtime, Duration::from_millis(duration_ms));
+                    Ok(())
+                }
+                Err(err) => {
+                    *delivery_error
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) =
+                        Some(format!("Outbound audio delivery failed: {err:?}"));
+                    control.cancel("socket_closed");
+                    Err(cancelled())
+                }
+            }
+        }))
+    }
 }
 
 /// Interrupt the active turn without waiting for it (SPK-F19): its output
@@ -3528,9 +3801,7 @@ async fn run_agent_turn(
         usage: Mutex::new(None),
     };
     let planner = SimplePlanner;
-    let mut tools = ToolRegistry::new();
-    tools.register(NoopTool);
-    tools.register(TimeTool);
+    let tools = builtin_tool_registry();
 
     let result = AgentEngine
         .run_turn(
@@ -3806,6 +4077,26 @@ fn map_typed_voice_event(
         "assistant_audio_done" => RealtimeServerEvent::AssistantAudioCompleted {
             last_chunk_sequence: typed.last_audio_chunk_sequence,
         },
+        "function_call" => RealtimeServerEvent::FunctionCall {
+            call_id: json_str(value, "call_id"),
+            name: json_str(value, "name"),
+            arguments: json_str(value, "arguments"),
+            executor: match value.get("executor").and_then(serde_json::Value::as_str) {
+                Some("server") => Some(RealtimeFunctionExecutor::Server),
+                Some("client") => Some(RealtimeFunctionExecutor::Client),
+                _ => None,
+            },
+        },
+        "function_call_completed" => RealtimeServerEvent::FunctionCallCompleted {
+            call_id: json_str(value, "call_id"),
+            name: json_str(value, "name"),
+            status: match value.get("status").and_then(serde_json::Value::as_str) {
+                Some("ok") => RealtimeFunctionCallStatus::Ok,
+                Some("timeout") => RealtimeFunctionCallStatus::Timeout,
+                _ => RealtimeFunctionCallStatus::Error,
+            },
+            output: json_str(value, "output"),
+        },
         "turn_interrupted" => RealtimeServerEvent::Interruption {
             reason: match value
                 .get("reason")
@@ -3893,6 +4184,15 @@ fn map_typed_voice_event(
         _ => return None,
     };
     Some((event, utterance_id, turn_id))
+}
+
+/// A string field of a legacy event, empty when absent.
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
@@ -4194,6 +4494,188 @@ mod tests {
             std::env::remove_var(key);
         }
         (temp_dir, state)
+    }
+
+    /// A unified LFM3-Audio turn's tool rounds on real weights: a built-in
+    /// call, then a client call answered over the socket, each followed by a
+    /// spoken answer. Set `IZWI_LFM3_AUDIO_MODELS_DIR` (and
+    /// `IZWI_LFM3_AUDIO_BACKEND=metal` with the `metal` feature) to run it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unified_turns_call_builtin_and_client_tools_if_env_set() {
+        let Some(models_dir) = std::env::var_os("IZWI_LFM3_AUDIO_MODELS_DIR") else {
+            eprintln!("IZWI_LFM3_AUDIO_MODELS_DIR unset; not run");
+            return;
+        };
+        let backend = std::env::var("IZWI_LFM3_AUDIO_BACKEND")
+            .ok()
+            .and_then(|name| izwi_core::backends::BackendPreference::parse(&name))
+            .unwrap_or(izwi_core::backends::BackendPreference::Cpu);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state = {
+            let _env = crate::test_support::env_lock();
+            std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("izwi.sqlite3"));
+            std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+            let serve_config = izwi_core::ServeRuntimeConfig {
+                backend,
+                ui_enabled: false,
+                models_dir: models_dir.into(),
+                ..izwi_core::ServeRuntimeConfig::default()
+            };
+            let runtime = RuntimeService::new(serve_config.engine_config()).expect("runtime");
+            let state = AppState::new(runtime, &serve_config).expect("state");
+            for key in ["IZWI_DB_PATH", "IZWI_MEDIA_DIR"] {
+                std::env::remove_var(key);
+            }
+            state
+        };
+        let variant = izwi_core::ModelVariant::Lfm3Audio2BGguf;
+        state
+            .runtime
+            .load_model(variant)
+            .await
+            .expect("load LFM3-Audio");
+        let tools = VoiceTools::parse(
+            Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather in a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            })]),
+            None,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let pending = PendingFunctionCalls::default();
+        for (question, tool, executor, client_output) in [
+            ("What time is it right now?", "time", "server", None),
+            (
+                "What is the weather in Paris right now?",
+                "get_weather",
+                "client",
+                Some(json!({"temperature_c": 21, "sky": "clear"})),
+            ),
+        ] {
+            let mut request = GenerationRequest::new(question);
+            request.model_variant = Some(variant);
+            request.config.options.voice = Some("female".into());
+            request.config.options.speech.seed = Some(3);
+            request.language = Some("en-US".into());
+            let speech = state.runtime.generate(request).await.expect("speak");
+            let audio = izwi_core::audio::AudioEncoder::new(speech.sample_rate, 1)
+                .encode(&speech.samples, izwi_core::audio::AudioFormat::Wav)
+                .expect("wav");
+
+            let out_tx = OutboundTx::new(state.runtime.clone(), "voice tools test");
+            let reader = {
+                let out_tx = out_tx.clone();
+                let pending = pending.clone();
+                tokio::spawn(async move {
+                    let (mut events, mut chunks) = (Vec::new(), Vec::new());
+                    while let Some(output) = out_tx.mailbox.next().await {
+                        let crate::app::realtime_transport::MailboxOutput::Message(message) =
+                            output
+                        else {
+                            break;
+                        };
+                        match message {
+                            Message::Text(text) => {
+                                let event: serde_json::Value =
+                                    serde_json::from_str(text.as_str()).expect("json");
+                                if event["type"] == "function_call" && event["executor"] == "client"
+                                {
+                                    let output = client_output.clone().expect("a client call");
+                                    let call_id = event["call_id"].as_str().unwrap();
+                                    assert!(pending.resolve(call_id, &output));
+                                }
+                                events.push(event);
+                            }
+                            Message::Binary(frame) => chunks.push((
+                                u32::from_le_bytes(frame[16..20].try_into().unwrap()),
+                                frame[6] & 1 == 1,
+                            )),
+                            _ => {}
+                        }
+                    }
+                    (events, chunks)
+                })
+            };
+            let started = Instant::now();
+            let reply = {
+                let control = TurnControl::new(Instant::now());
+                let turn_tools = UnifiedTurnTools {
+                    tools: &tools,
+                    pending: &pending,
+                    voice_session_id: "voice-session-1",
+                };
+                stream_unified_s2s_to_socket(
+                    &state,
+                    &out_tx,
+                    "voice-tools-test",
+                    "utterance-1",
+                    1,
+                    &variant.to_string(),
+                    None,
+                    "You are a helpful voice assistant.",
+                    Vec::new(),
+                    400,
+                    OutputAudioFormat::parse(None).unwrap(),
+                    &audio,
+                    Some(turn_tools),
+                    &control,
+                    0,
+                    &SessionModelLeases::default(),
+                )
+                .await
+                .expect("a turn with tools")
+            };
+            out_tx.close();
+            let (events, chunks) = reader.await.unwrap();
+            let seconds = reply.samples.len() as f64 / f64::from(reply.sample_rate.max(1));
+            eprintln!(
+                "{question:?} heard {:?} -> {:?} ({seconds:.2}s of speech, {} chunks) in {:.2}s",
+                reply.input_transcription,
+                reply.text,
+                chunks.len(),
+                started.elapsed().as_secs_f64()
+            );
+            let of_type = |kind: &str| {
+                events
+                    .iter()
+                    .filter(|event| event["type"] == kind)
+                    .collect::<Vec<_>>()
+            };
+            let calls = of_type("function_call");
+            assert_eq!(calls.len(), 1, "{events:?}");
+            assert_eq!(calls[0]["name"], tool);
+            assert_eq!(calls[0]["executor"], executor);
+            let completed = of_type("function_call_completed");
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0]["status"], "ok", "{:?}", completed[0]);
+            assert_eq!(completed[0]["call_id"], calls[0]["call_id"]);
+            assert_eq!(of_type("assistant_audio_start").len(), 1);
+            assert_eq!(of_type("assistant_audio_done").len(), 1);
+            assert!(!reply.text.contains("<tool_call>") && !reply.text.trim().is_empty());
+            assert!(of_type("assistant_text_snapshot")
+                .iter()
+                .all(|event| !event["text"].as_str().unwrap().contains("<tool_call>")));
+            assert!(reply.input_transcription.is_some());
+            assert!(seconds > 0.5, "spoke {seconds:.2}s");
+            // Chunk numbers count on across rounds; at most the last is
+            // final.
+            assert!(
+                chunks.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{chunks:?}"
+            );
+            assert!(chunks[..chunks.len() - 1].iter().all(|(_, last)| !last));
+        }
     }
 
     fn realtime_permits_available(state: &AppState) -> usize {
@@ -4727,6 +5209,7 @@ mod tests {
                 speaker: None,
                 max_output_tokens: 32,
                 output_format: OutputAudioFormat::PcmI16,
+                tools: None,
             }),
             vad_threshold: DEFAULT_STREAM_VAD_THRESHOLD,
             min_speech_ms: 50,
@@ -4814,6 +5297,99 @@ mod tests {
         )
         .expect_err("resume must be rejected")
         .contains("non-resumable"));
+    }
+
+    #[test]
+    fn voice_sessions_declare_tools_and_answer_calls() {
+        let start: ClientEvent = serde_json::from_value(json!({
+            "type": "input_stream_start",
+            "mode": "unified",
+            "s2s_model_id": "LFM3-Audio-2B-GGUF",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "builtin_tools": false,
+            "function_call_timeout_ms": 5000
+        }))
+        .unwrap();
+        let ClientEvent::InputStreamStart(start) = start else {
+            panic!("an input stream start");
+        };
+        let InputStreamStartEvent {
+            tools,
+            builtin_tools,
+            function_call_timeout_ms,
+            ..
+        } = *start;
+        assert_eq!(tools.map(|tools| tools.len()), Some(1));
+        assert_eq!(builtin_tools, Some(false));
+        assert_eq!(function_call_timeout_ms, Some(5000));
+        let output: ClientEvent = serde_json::from_value(json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": {"temperature_c": 21}
+        }))
+        .unwrap();
+        assert!(matches!(
+            output,
+            ClientEvent::FunctionCallOutput { ref call_id, .. } if call_id == "call_1"
+        ));
+    }
+
+    /// The typed v2 protocol reports tool calls with their turn.
+    #[test]
+    fn typed_voice_events_report_tool_calls() {
+        let mut typed =
+            TypedVoiceSession::new("voice-session-1".to_string(), "process-42".to_string());
+        let (call, _, turn_id) = map_typed_voice_event(
+            &json!({
+                "type": "function_call",
+                "utterance_id": "utterance-3",
+                "utterance_seq": 3,
+                "call_id": "call_1",
+                "name": "time",
+                "arguments": "{}",
+                "executor": "server"
+            }),
+            &mut typed,
+        )
+        .expect("a typed function call");
+        assert_eq!(turn_id.as_deref(), Some("turn-3"));
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            json!({"type": "function_call", "data": {
+                "call_id": "call_1", "name": "time", "arguments": "{}", "executor": "server"
+            }})
+        );
+        let (completed, _, _) = map_typed_voice_event(
+            &json!({
+                "type": "function_call_completed",
+                "utterance_id": "utterance-3",
+                "utterance_seq": 3,
+                "call_id": "call_2",
+                "name": "lookup",
+                "status": "timeout",
+                "output": "The tool did not answer within 10000 ms."
+            }),
+            &mut typed,
+        )
+        .expect("a typed completion");
+        assert_eq!(
+            completed,
+            RealtimeServerEvent::FunctionCallCompleted {
+                call_id: "call_2".to_string(),
+                name: "lookup".to_string(),
+                status: RealtimeFunctionCallStatus::Timeout,
+                output: "The tool did not answer within 10000 ms.".to_string(),
+            }
+        );
+        let (unknown, _, _) = map_typed_voice_event(
+            &json!({"type": "function_call", "call_id": "call_3", "name": "x",
+                    "arguments": "{}", "executor": null}),
+            &mut typed,
+        )
+        .expect("a call to an unknown tool");
+        assert!(serde_json::to_value(&unknown).unwrap()["data"]
+            .get("executor")
+            .is_none());
     }
 
     #[test]
