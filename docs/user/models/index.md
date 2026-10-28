@@ -27,6 +27,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Maya 2 Native (English and 11 Indic languages; 20 voices; reference-voice cloning) | `Maya2-Native-2.5B` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
+| LFM3 Audio (two built-in voices; 19 locales; also ASR and voice chat) | `LFM3-Audio-2B-GGUF` (Q4_K_M, default), `LFM3-Audio-2B-Q8_0-GGUF` |
 
 > `Kokoro-82M` requires `espeak-ng`:
 > [macOS](/installation/macos#optional-install-espeak-ng-for-kokoro-82m),
@@ -99,6 +100,25 @@ Those endpoints only show variants that are enabled for download/use.
 > other languages. Hebrew is spoken without vowel points and Russian without
 > stress marks, as upstream does without its optional add-ons.
 
+> `LFM3-Audio-2B-GGUF` is Liquid AI's LFM3-Audio-2B (LFM Open License v1.0,
+> free below US$10 million in annual revenue), one model that speaks,
+> transcribes and holds voice conversations. It pairs a Q4_K_M language model
+> with a Q8_0 mmproj file that holds the speech encoder, the MaskGIT depth
+> decoder and the LiquidCodec decoder; `izwi pull LFM3-Audio-2B-GGUF`
+> downloads both (about 1.46 GB), and Izwi estimates about 3 GB of memory.
+> `LFM3-Audio-2B-Q8_0-GGUF` keeps the language model in Q8_0: about 2.20 GB
+> to download and about 4 GB of memory. For speech it uses a `female` or
+> `male` voice in 19 locales (American English by default; see
+> [Voice Presets](/models/voice-presets#lfm3-audio)), streams 24 kHz audio,
+> and splits long text into sentences; it has no voice cloning, voice
+> description or speed control. It transcribes 18 languages, and in voice
+> chat answers a spoken turn with interleaved text and speech through the same
+> speech-to-speech routes as LFM2.5 Audio, which remains the default
+> **Compact** voice model. Its native streaming transcription mode (LiveASR),
+> spoken tool calls and prefix reuse are not supported yet. It runs on CPU,
+> Metal and CUDA; CUDA is compile-checked only and has not yet run on an
+> NVIDIA GPU.
+
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ### Speech Recognition (ASR)
@@ -116,6 +136,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `Granite-Speech-5.0-2B` | IBM Granite Speech 5.0: punctuated transcripts (en, fr, de, es, pt, ja), speech translation to and from English (plus English to Italian and Mandarin), and keyword lists of up to 2,000 terms; the recommended Granite Speech model |
 | `Granite-Speech-5.0-2B-GGUF` | IBM's GGUF release of Granite Speech 5.0: the same transcription, translation and keywords with a Q8_0 language model, in less memory and faster (several times faster on CPU) |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
+| `LFM3-Audio-2B-GGUF` | Unified audio model (ASR in 18 languages, speech generation and voice chat); `LFM3-Audio-2B-Q8_0-GGUF` has a Q8_0 language model |
 | `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
 ### Diarization and Alignment
@@ -133,6 +154,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text chat) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text chat; 28.74 GiB checkpoint payload) |
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
+| LFM3 text | `LFM3-1.7B-GGUF` (QAD Q4_0, default), `LFM3-1.7B-Q8_0-GGUF` |
 
 `Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
 Qwen3.5 compatibility or backend evidence is not applied to it implicitly.
@@ -213,6 +235,10 @@ izwi pull Maya1-3B-GGUF
 
 # Download Maya Research Maya 2 Native (about 5.5 GB)
 izwi pull Maya2-Native-2.5B
+
+# Download Liquid AI LFM3 Audio (about 1.46 GB, or 2.20 GB with a Q8_0 language model)
+izwi pull LFM3-Audio-2B-GGUF
+izwi pull LFM3-Audio-2B-Q8_0-GGUF
 ```
 
 ### Via Web UI

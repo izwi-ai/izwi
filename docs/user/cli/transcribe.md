@@ -96,6 +96,21 @@ izwi transcribe standup.wav \
 keyword biasing (`Granite-Speech-5.0-2B` and its GGUF release); the server
 rejects them for other models.
 
+### LFM3 Audio transcription
+
+```bash
+izwi transcribe interview.wav \
+  --model LFM3-Audio-2B-GGUF \
+  --language fr
+```
+
+`LFM3-Audio-2B-GGUF` (and `LFM3-Audio-2B-Q8_0-GGUF`) transcribes 18
+languages: `en`, `ar`, `da`, `de`, `el`, `es`, `fi`, `fr`, `he`, `it`, `ja`,
+`ko`, `nl`, `pl`, `pt`, `sv`, `tr` and `zh`. Without `--language`, or with
+`auto`, the model chooses; the server refuses any other code with `400`. It
+ignores `--prompt`, has no word timestamps of its own, and transcribes long
+audio in chunks of at most 30 seconds.
+
 ### Word timestamps
 
 ```bash
@@ -193,6 +208,7 @@ selected model or forced aligner can provide word timing metadata.
 | `Granite-Speech-5.0-2B` | 4.6 GB | Medium | IBM ASR with punctuated transcripts, speech translation (`--translate-to`) and keyword biasing (`--keyword`) |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Fast | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
+| `LFM3-Audio-2B-GGUF` | 1.46 GB | Not yet measured | Unified audio model with transcription in 18 languages; `LFM3-Audio-2B-Q8_0-GGUF` (2.20 GB) has a Q8_0 language model |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
 ---

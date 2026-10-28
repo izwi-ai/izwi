@@ -84,6 +84,12 @@ sessions, and low-latency WebSocket transport. See the
 voice state and [Voice Realtime](/api#voice-realtime) for the WebSocket
 protocol.
 
+`LFM3-Audio-2B-GGUF` also answers spoken turns, with interleaved text and
+speech, through the same speech-to-speech routes: name it as `s2s_model_id` in
+the WebSocket's `unified` mode. The **Compact** engine still uses
+`LFM2.5-Audio-1.5B-GGUF`. Spoken tool calls are not supported with LFM3 Audio
+yet.
+
 ---
 
 ## Tips for Best Results

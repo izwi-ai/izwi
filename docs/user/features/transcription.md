@@ -220,6 +220,7 @@ transcripts, and `job_kind=diarization` for speaker timelines.
 | `Granite-Speech-5.0-2B` | 4.6 GB | IBM ASR with punctuated transcripts, speech translation and keyword biasing | Medium |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU | Fast |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
+| `LFM3-Audio-2B-GGUF` | 1.46 GB | Integrated speech model in 18 languages; no word timestamps of its own | Not yet measured |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |
 
 Use larger models for:

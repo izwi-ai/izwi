@@ -78,7 +78,7 @@ izwi tts "Your text here" --output output.wav
 | `--reference-text-file` | File containing the reference transcript | — |
 | `--instructions`, `--voice-description` | Voice-design direction prompt; for `Maya1-3B`, the voice to speak with | — |
 | `--temperature`, `-t` | Sampling temperature | Model default |
-| `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; `Maya2-Native-2.5B`: a code such as `hi`, or `auto`; a hint for Qwen3-TTS) | Model default |
+| `--language` | Language of the text (`Chatterbox-Multilingual-500M`: a code such as `fr` or a name; `Maya2-Native-2.5B`: a code such as `hi`, or `auto`; `LFM3-Audio-2B-GGUF`: one of its 19 locales such as `en-GB` or `ja`; a hint for Qwen3-TTS) | Model default |
 | `--reference-language` | Language of the reference audio (`Maya2-Native-2.5B` only; read from the transcript when unset) | — |
 | `--exaggeration` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
@@ -237,7 +237,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
 
 For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
-For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF` or `Maya2-Native-2.5B`.  
+For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its
@@ -259,6 +259,11 @@ text. On an Apple M1 Pro with Metal it streams first audio in about 2 s and
 runs at a real-time factor of about 4.5 for one request (about 3 with
 `Maya1-3B-GGUF`, which also needs half the memory). A request's audio is the
 same alone, streamed or beside other requests for the same `seed`.
+`LFM3-Audio-2B-GGUF` (24 kHz, LFM Open License v1.0) speaks with a `female`
+or `male` voice in one of 19 locales named with `language` (American English
+when unset). It streams, splits long text into sentences automatically, and
+has no voice cloning, voice design or speed control. The same model also
+transcribes speech and answers in voice chat.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---

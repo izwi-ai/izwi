@@ -12,7 +12,7 @@ Have local conversations with chat models running on your own machine.
 Izwi chat provides:
 
 - **Local inference** — Model execution stays on-device
-- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, and LFM2.5
+- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, and LFM3
 - **System prompts** — Shape assistant behavior
 - **Streaming output** — Incremental response tokens
 - **Multimodal support (Qwen3.5 only)** — Image inputs in chat API requests
@@ -139,6 +139,7 @@ streaming sequence.
 | Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text only) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
+| LFM3 | `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF` (reasoning on by default, tool calling) |
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
@@ -160,7 +161,7 @@ scale-aware Q8_0 fallback.
 
 1. Use `izwi list` to pick a currently enabled model ID.
 2. Use stronger models (`Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory; check the [Qwen3.8 CUDA residency requirements](/support-matrix#qwen38-cuda-weight-residency) before deploying the 27B checkpoint.
-3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`) for low-latency usage.
+3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`, `LFM3-1.7B-GGUF`) for low-latency usage.
 
 ---
 

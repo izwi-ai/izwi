@@ -230,17 +230,17 @@ Supported request fields:
 | `stream` | `true` returns SSE chat chunks. The request is admitted before the stream starts, so a request that cannot run (for example `context_length_exceeded`) is a plain HTTP error, not a stream. |
 | `stream_options.include_usage` | Sends the usage in one more chunk after the finish chunk, with `choices: []`; every earlier chunk then carries `usage: null`, as in OpenAI. |
 | `logprobs`, `top_logprobs` | Per-token logprobs (`top_logprobs` 0–20 alternatives). Returned on `choices[].logprobs.content` in the completion and in each stream chunk. |
-| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. LFM3 1.7B defaults to its card and `generation_config.json`: temperature 0.1, top-k 50, repetition penalty 1.1. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `seed` | Optional signed 64-bit sampling seed. The same seed and parameters sample the same tokens on the same backend; without one, each request samples independently. |
 | `stop` | A string or an array of up to 4 non-empty strings (each at most 1024 bytes). Generation ends before the first match, the stop text is not returned, and `finish_reason` is `stop`. Streams hold back text that could still begin a stop string until it is settled. Requests with `stop` decode one token per scheduler step. |
 | `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
-| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8 and LFM2.5 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5 and LFM3 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
 | `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
-| `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 defaults to `true`. |
+| `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 and LFM3 default to `true`; LFM3 with `false` answers directly. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
-| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
+| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. LFM3 defaults to `false` (its template keeps reasoning only for turns after the last user message). Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
 | `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`, including the `<think>` a Qwen prompt opens when thinking is on; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
@@ -317,6 +317,12 @@ Tool behavior:
   `tool_calls`. The Qwen3.5 family uses Qwen's XML tool format.
 - LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
   cards, on every backend.
+- LFM3 uses the Qwen XML call format (`<tool_call>`, `<function=…>`,
+  `<parameter=…>`): tools are listed in the system turn inside `<tools>`, one
+  JSON object per line, `tool` messages become native tool turns wrapped in
+  `<tool_response>`, and calls are returned as `tool_calls`. Its context is
+  32,768 tokens by default; the server's `IZWI_LFM3_CONTEXT_TOKENS` raises it
+  up to the checkpoint's 262,144.
 
 Multimodal content parts:
 
@@ -357,7 +363,7 @@ Request fields:
 | `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
 | `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
 | `speed` | Optional model-dependent speed control. |
-| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox or Maya 2 Native model's languages in `speech_capabilities.languages`. |
+| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. LFM3 Audio takes one of its 19 locales (`en-US` when unset, `en-GB`, `fr`, `ja`, …) and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox, Maya 2 Native or LFM3 Audio model's languages in `speech_capabilities.languages`. |
 | `temperature`, `top_k` | Optional sampling controls. |
 | `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
@@ -463,6 +469,25 @@ the request names: Arabic, Chinese, Danish, Dutch, English, Finnish, French, Ger
 `sw`, `sv`, `tr`). Without `language`, or with `Auto`, it speaks English.
 Japanese returns `400` until Izwi has its text processing.
 
+`LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` specifics:
+
+- Its voice is `female` (the default) or `male` (see
+  [Voice Presets](/models/voice-presets#lfm3-audio)). `language` names one of
+  19 locales: `en-US` (the default), `en-GB`, `ar`, `da`, `de`, `el`, `fi`,
+  `fr`, `he`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `es`, `sv`, `tr` or `zh`.
+- A reference voice (`reference_audio` or a saved voice), `instructions` and
+  `speed` each return `400`.
+- Sampling defaults follow Liquid AI's model card: `temperature` 1.0, top-k
+  128, and a repetition penalty of 1.1 over the last 4,096 frames. `seed`
+  makes a request reproducible.
+- `stream: true` streams 24 kHz audio as it is generated. Long text is split
+  into sentences automatically.
+- The same model transcribes speech (see
+  [Audio Transcriptions](#audio-transcriptions)) and answers spoken turns with
+  interleaved text and speech in the `unified` mode of
+  [Voice Realtime](#voice-realtime). Its native streaming transcription mode
+  (LiveASR), spoken tool calls and prefix reuse are not supported yet.
+
 Non-stream response:
 
 - Body is binary audio.
@@ -511,16 +536,20 @@ Multipart fields:
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
-| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. |
+| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. LFM3 Audio takes one of its 18 ISO 639-1 codes (en, ar, da, de, el, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh), or none or `auto` to let the model choose, and rejects any other code with `400`. |
 | `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
 | `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters); others return `400`. A long list shortens the audio one invocation can hold. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
 | `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. |
 | `max_tokens` | Optional ASR decoder token budget. |
 | `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
+
+`LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` produce no word timestamps
+of their own, so `timestamp_granularities[]` falls back to the forced aligner.
+They transcribe long audio in chunks of at most 30 seconds.
 
 `json` response:
 
@@ -1371,7 +1400,7 @@ Client JSON messages:
 | Field | Notes |
 |-------|-------|
 | `asr_model_id`, `text_model_id`, `tts_model_id` | Modular model overrides. |
-| `s2s_model_id` | Unified audio-chat model override. |
+| `s2s_model_id` | Unified audio-chat model override (`LFM2.5-Audio-1.5B-GGUF` or `LFM3-Audio-2B-GGUF`). |
 | `speaker` | TTS speaker/voice. |
 | `asr_language` | Language hint. |
 | `max_output_tokens` | Reply token budget: default `384` in modular mode (a few spoken sentences), `1536` in unified mode. |

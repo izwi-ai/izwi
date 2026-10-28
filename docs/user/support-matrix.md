@@ -92,6 +92,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - `Chatterbox-500M` and `Chatterbox-Multilingual-500M` build for CUDA but are compile-checked only: they have not yet run on an NVIDIA GPU. Their T3 speech-token models run in BF16 on CUDA devices with BF16, F16 on Metal and F32 on CPU, behind a load-time self-check that falls back to F32; their other networks run in F32. `Chatterbox-500M` is verified end to end on CPU and Metal, and `Chatterbox-Multilingual-500M` on Metal.
 - `Maya1-3B` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. Its decoder runs in BF16 on CUDA devices with BF16 and F32 on CPU, each behind a load-time range probe that falls back to F32, and in F16 on Metal, where a failed probe refuses the load (F32 would need 13.2 GB of weights); SNAC runs in F32 everywhere. `Maya1-3B-GGUF` keeps its decoder's weights in Q8_0 and runs it in F32 on every backend, with no probe. Both are verified on Metal (16 GB M1 Pro): the decoder tracks upstream's BF16 logits, the release server passes its end-to-end checks (voices, tags, streaming, cancellation, reload, Whisper transcripts), and requests at four and eight in flight sound exactly as they do alone; CPU runs the unit and layer-truncated parity tests only.
 - `Maya2-Native-2.5B` has a CUDA path but has not yet run on an NVIDIA GPU. Its Qwen3 backbone runs in BF16 on CUDA devices with BF16, behind a load-time range probe that falls back to F32; in F16 on Metal, where a failed probe refuses the load (F32 would need 10 GB of weights); and in F32 on CPU. Its depth decoder runs in F16 on Metal and CUDA and in F32 on CPU or after an F32 fallback; Mimi runs in F32 everywhere, and the ECAPA speaker encoder for clones runs on the CPU in F32.
+- `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` build for CUDA but are compile-checked only: they have not yet run on an NVIDIA GPU. On CUDA the quantized language model, speech encoder, MaskGIT depth decoder and LiquidCodec decoder use Candle CUDA kernels, while mel features, sampling and the inverse FFT run on the host. LFM3 Audio is verified end to end on real weights on CPU and Metal.
 
 ### Qwen3.8 CUDA weight residency
 
@@ -246,8 +247,10 @@ The load path currently publishes ABI-v2 state as follows:
 | **Qwen3.8 chat (`Qwen38Chat`)** | Composite retained paged/tensor state under an independent family contract | Separate conformance and backend evidence required; Qwen3.5 results do not certify this family |
 | **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **LFM3 chat** | The LFM2.5 chat state: retained paged attention (global and 256-token sliding-window layers share one page table) plus the transactional ShortConv ring | Real-checkpoint parity on CPU and Metal; CUDA compile-checked, unverified on hardware |
 | **LFM2.5 chat** | Retained paged attention plus transactional ShortConv ring state | Portable route validated; eligible accelerator cells remain unverified until hardware evidence is retained |
 | **LFM2.5 Audio** | Bounded invocation-scoped paged/ring/composite state | ABI-v2 physical ownership; no Optimized attestation |
+| **LFM3 Audio** | Bounded invocation-scoped paged/ring state: each speech, transcription or voice-chat request runs as one invocation on the language model's leased attention pages and ShortConv ring | Verified end to end on real weights on CPU and Metal; CUDA compile-checked only, unverified on hardware |
 | **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite Speech 4.1 publishes both ASR routes; Granite Speech 5.0 leases its 16k-token decoder pages per invocation | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
@@ -279,6 +282,7 @@ native CUDA ceilings are:
 | Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
 | Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
 | LFM2.5 chat | 32,768 tokens (Izwi cap; the checkpoint advertises 128,000) | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
+| LFM3 chat | 32,768 tokens by default; `IZWI_LFM3_CONTEXT_TOKENS` raises it to the checkpoint's 262,144 | [Pinned LFM3-1.7B config](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/config.json) |
 
 Optional YaRN extensions are not included: the local adapters do not implement
 their scaling parameters. Qwen3.8 fits its effective context to remaining

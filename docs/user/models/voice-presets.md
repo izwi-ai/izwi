@@ -1,6 +1,6 @@
 ---
 title: "Voice Presets"
-description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, Chatterbox, Maya1, and Maya 2 Native."
+description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, LFM3 Audio, Chatterbox, Maya1, and Maya 2 Native."
 sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
@@ -20,6 +20,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | Kokoro-82M | 41 voice IDs (English, Spanish, French, Hindi, Italian, Portuguese); requires `espeak-ng` |
 | Voxtral TTS | 20 bundled preset voices |
 | LFM2.5 Audio | Four English regional presets |
+| LFM3 Audio | Two voices (`female`, `male`) in 19 locales |
 | VibeVoice-1.5B | Reference voice or saved voice only; no built-in presets |
 | FishAudio-S2-Pro | Reference voice or saved voice only |
 | Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
@@ -120,6 +121,33 @@ izwi tts "Hello from Bella." \
 | `US Male` | US male preset |
 | `UK Female` | UK female preset |
 | `UK Male` | UK male preset |
+
+---
+
+## LFM3 Audio
+
+`LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` have two voices. Voice
+names are not case-sensitive, and a request without one uses `female`.
+
+| ID | Voice |
+|----|-------|
+| `female` | Female voice (default) |
+| `male` | Male voice |
+
+Either voice speaks any of the 19 locales that `language` (`--language` in the
+CLI) names: `en-US` (American English, the default), `en-GB` (British
+English), `ar`, `da`, `de`, `el`, `fi`, `fr`, `he`, `it`, `ja`, `ko`, `nl`,
+`pl`, `pt`, `es`, `sv`, `tr` and `zh`. Any other language returns `400`.
+
+Example:
+
+```bash
+izwi tts "Guten Morgen, Ihre Bestellung ist unterwegs." \
+  --model LFM3-Audio-2B-GGUF \
+  --speaker male \
+  --language de \
+  --output lfm3-audio-de.wav
+```
 
 ---
 

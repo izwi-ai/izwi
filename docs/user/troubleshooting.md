@@ -417,9 +417,9 @@ Ensure required models are loaded:
 
 | Feature | Required Model Type |
 |---------|---------------------|
-| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, or `Maya2-Native-2.5B` |
-| Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, or `LFM2.5-Audio-*` |
-| Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, or `LFM2.5-1.2B-*` |
+| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, `Maya2-Native-2.5B`, or `LFM3-Audio-2B-*` |
+| Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, `LFM2.5-Audio-*`, or `LFM3-Audio-2B-*` |
+| Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, `LFM2.5-1.2B-*`, or `LFM3-1.7B-*` |
 | Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, or `Maya2-Native-2.5B` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` or `Maya1-3B` |
 
