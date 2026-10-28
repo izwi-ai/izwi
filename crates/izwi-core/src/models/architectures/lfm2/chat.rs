@@ -1,4 +1,7 @@
-//! LFM2/LFM2.5 GGUF text-chat model loader and generation.
+//! LFM2/LFM2.5 and LFM3 GGUF text-chat model loader and generation.
+//!
+//! Both generations run on the LFM2 backbone; [`LfmChatDialect`] selects the
+//! GGUF metadata, the context policy and the chat template.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -15,13 +18,16 @@ use crate::backends::state::{
 };
 use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
+use crate::models::architectures::lfm3::parse_lfm3_backbone_config;
+use crate::models::architectures::lfm3::prompt::{render_lfm3_chat_prompt, Lfm3PromptOptions};
 use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{
-    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRole,
+    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole,
 };
 use crate::models::shared::sampling::{sample_chat_rows_guarded, ChatSampler};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
@@ -274,6 +280,55 @@ struct AddedToken {
     special: bool,
 }
 
+/// `tokenizer.json`'s added tokens, for a `tokenizer_config.json` that does
+/// not list them (LFM3's `TokenizersBackend` config).
+#[derive(Debug, Deserialize)]
+struct TokenizerJsonAddedTokens {
+    #[serde(default)]
+    added_tokens: Vec<TokenizerJsonAddedToken>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenizerJsonAddedToken {
+    id: u32,
+    content: String,
+    #[serde(default)]
+    special: bool,
+}
+
+/// The checkpoint family a chat model was loaded as. It selects the GGUF
+/// metadata, the context policy and the chat template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LfmChatDialect {
+    /// LFM2 and LFM2.5: `lfm2.*` metadata, `List of tools:` prompts.
+    Lfm2,
+    /// LFM3: `lfm3.*` metadata, `<tools>` prompts, reasoning by default.
+    Lfm3,
+}
+
+impl LfmChatDialect {
+    pub(crate) fn of(variant: ModelVariant) -> Self {
+        if variant.family() == ModelFamily::Lfm3Chat {
+            Self::Lfm3
+        } else {
+            Self::Lfm2
+        }
+    }
+
+    /// The backbone configuration with the dialect's served context.
+    fn parse_config(self, loader: &GgufLoader) -> Result<Lfm2BackboneConfig> {
+        let mut config = match self {
+            Self::Lfm2 => parse_lfm2_backbone_config(loader)?,
+            Self::Lfm3 => parse_lfm3_backbone_config(loader)?,
+        };
+        config.context_length = match self {
+            Self::Lfm2 => lfm25_chat_context_limit(config.context_length),
+            Self::Lfm3 => lfm3_chat_context_limit(config.context_length),
+        };
+        Ok(config)
+    }
+}
+
 struct ChatTokenizer {
     inner: Tokenizer,
     vocab_size: usize,
@@ -313,7 +368,24 @@ impl ChatTokenizer {
 
         let config_path = model_dir.join("tokenizer_config.json");
         let config_str = fs::read_to_string(config_path)?;
-        let config: TokenizerConfig = serde_json::from_str(&config_str)?;
+        let mut config: TokenizerConfig = serde_json::from_str(&config_str)?;
+        if config.added_tokens_decoder.is_empty() {
+            let tokenizer_json = fs::read_to_string(model_dir.join("tokenizer.json"))?;
+            let added: TokenizerJsonAddedTokens = serde_json::from_str(&tokenizer_json)?;
+            config.added_tokens_decoder = added
+                .added_tokens
+                .into_iter()
+                .map(|token| {
+                    (
+                        token.id.to_string(),
+                        AddedToken {
+                            content: token.content,
+                            special: token.special,
+                        },
+                    )
+                })
+                .collect();
+        }
 
         for (id, token) in &config.added_tokens_decoder {
             let expected = id.parse::<u32>().map_err(|_| {
@@ -408,6 +480,7 @@ impl ChatTokenizer {
 
 pub struct Lfm2ChatModel {
     device: DeviceProfile,
+    dialect: LfmChatDialect,
     tokenizer: ChatTokenizer,
     /// Additive logits mask: 0 for generatable ids, -inf for control tokens
     /// and ids past the tokenizer vocabulary. Applied before greedy argmax
@@ -438,11 +511,11 @@ impl Lfm2ChatModel {
             )));
         }
 
+        let dialect = LfmChatDialect::of(variant);
         let tokenizer = ChatTokenizer::load(model_dir)?;
         let loader =
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
-        let mut config = parse_lfm2_backbone_config(&loader)?;
-        config.context_length = lfm25_chat_context_limit(config.context_length);
+        let config = dialect.parse_config(&loader)?;
         let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         if tokenizer.vocab_size == 0 || tokenizer.vocab_size > text_model.vocab_size() {
             return Err(Error::ModelLoadError(
@@ -458,12 +531,15 @@ impl Lfm2ChatModel {
         )?;
 
         info!(
-            "Loaded LFM2 GGUF chat model on {:?} from {}",
+            "Loaded {:?} GGUF chat model on {:?} from {} ({} context tokens)",
+            dialect,
             device.kind,
-            gguf_path.display()
+            gguf_path.display(),
+            config.context_length
         );
         Ok(Self {
             device,
+            dialect,
             tokenizer,
             generation_mask,
             prompt_scaffold,
@@ -1161,7 +1237,7 @@ impl Lfm2ChatModel {
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        self.build_prompt(messages, &[])
+        self.prompt_token_ids_for_request(messages, &ChatRequestConfig::default())
     }
 
     /// Prompt ids with the request's tool definitions in the system turn.
@@ -1170,7 +1246,45 @@ impl Lfm2ChatModel {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> Result<Vec<u32>> {
-        self.build_prompt(messages, tools)
+        self.prompt_token_ids_for_request(
+            messages,
+            &ChatRequestConfig {
+                tools: tools.to_vec(),
+                ..ChatRequestConfig::default()
+            },
+        )
+    }
+
+    /// Prompt ids of a chat request in this checkpoint's template: its
+    /// messages and tool definitions, and for LFM3 its thinking switches
+    /// (`enable_thinking` defaults on, `preserve_thinking` off).
+    pub fn prompt_token_ids_for_request(
+        &self,
+        messages: &[ChatMessage],
+        request: &ChatRequestConfig,
+    ) -> Result<Vec<u32>> {
+        match self.dialect {
+            LfmChatDialect::Lfm2 => self.build_prompt(messages, &request.tools),
+            LfmChatDialect::Lfm3 => {
+                if messages.is_empty() {
+                    return Err(Error::InvalidInput(
+                        "Chat request must include at least one message".to_string(),
+                    ));
+                }
+                let text = render_lfm3_chat_prompt(
+                    messages,
+                    &request.tools,
+                    Lfm3PromptOptions {
+                        enable_thinking: request.enable_thinking.unwrap_or(true),
+                        preserve_thinking: request.preserve_thinking.unwrap_or(false),
+                    },
+                );
+                // One encode of the whole rendering, as the template's
+                // tokenization: special and added tokens split where it puts
+                // them.
+                self.tokenizer.encode_text(&text)
+            }
+        }
     }
 
     /// Render `messages` exactly like the checkpoint's chat template:
@@ -1301,7 +1415,7 @@ fn validate_generation_config(config: &ChatGenerationConfig) -> Result<()> {
 /// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
 /// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
 /// kept. Object keys follow `serde_json`'s map order.
-fn write_python_json(value: &serde_json::Value, out: &mut String) {
+pub(crate) fn write_python_json(value: &serde_json::Value, out: &mut String) {
     match value {
         serde_json::Value::Array(items) => {
             out.push('[');
@@ -1333,6 +1447,8 @@ fn lfm2_chat_gguf_name(variant: ModelVariant) -> Result<&'static str> {
     match variant {
         ModelVariant::Lfm2512BInstructGguf => Ok("LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
         ModelVariant::Lfm2512BThinkingGguf => Ok("LFM2.5-1.2B-Thinking-Q4_K_M.gguf"),
+        ModelVariant::Lfm317BGguf => Ok("LFM3-1.7B-QAD-Q4_0.gguf"),
+        ModelVariant::Lfm317BQ8Gguf => Ok("LFM3-1.7B-Q8_0.gguf"),
         _ => Err(Error::ModelLoadError(format!(
             "Unsupported LFM2 GGUF chat variant: {variant}"
         ))),
@@ -1344,6 +1460,9 @@ pub(crate) struct Lfm2ChatLoadLayout {
     pub(crate) gguf: std::path::PathBuf,
     /// (positions, head dim) of the backbone's RoPE tables.
     pub(crate) rope_table: (usize, usize),
+    /// How many such table sets the backbone builds: LFM3's sliding-window
+    /// layers rotate at their own base, a second set.
+    pub(crate) rope_table_sets: usize,
 }
 
 pub(crate) fn lfm2_chat_load_layout(
@@ -1351,10 +1470,15 @@ pub(crate) fn lfm2_chat_load_layout(
     variant: ModelVariant,
 ) -> Result<Lfm2ChatLoadLayout> {
     let gguf = model_dir.join(lfm2_chat_gguf_name(variant)?);
-    let mut config = parse_lfm2_backbone_config(&GgufLoader::from_path(&gguf)?)?;
-    config.context_length = lfm25_chat_context_limit(config.context_length);
+    let config = LfmChatDialect::of(variant).parse_config(&GgufLoader::from_path(&gguf)?)?;
     Ok(Lfm2ChatLoadLayout {
         rope_table: super::backbone::rope_table_geometry(&config)?,
+        rope_table_sets: 1 + usize::from(
+            config
+                .lfm3
+                .as_ref()
+                .is_some_and(|features| features.rope_freq_base_swa.is_some()),
+        ),
         gguf,
     })
 }
@@ -1381,6 +1505,21 @@ const LFM25_CHAT_CONTEXT_TOKENS: usize = 32_768;
 
 fn lfm25_chat_context_limit(checkpoint_context: usize) -> usize {
     checkpoint_context.min(LFM25_CHAT_CONTEXT_TOKENS)
+}
+
+/// LFM3's default served context. The checkpoint is trained to 262,144
+/// tokens, and its KV is cheap (six global layers, 12 KiB per token in F16),
+/// but the context sizes the RoPE tables and every backend's reservation at
+/// load: the default keeps LFM2.5's footprint on 16 GB machines, and
+/// `IZWI_LFM3_CONTEXT_TOKENS` raises it.
+const LFM3_CHAT_CONTEXT_TOKENS: usize = 32_768;
+
+fn lfm3_chat_context_limit(checkpoint_context: usize) -> usize {
+    let requested = crate::env::value("IZWI_LFM3_CONTEXT_TOKENS")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(LFM3_CHAT_CONTEXT_TOKENS);
+    checkpoint_context.min(requested)
 }
 
 fn generation_mask(
@@ -1539,6 +1678,10 @@ pub(crate) fn tiny_lfm_model_for_test(seed: u64) -> Lfm2ChatModel {
 #[cfg(test)]
 #[path = "chat_reference_tests.rs"]
 mod reference_tests;
+
+#[cfg(test)]
+#[path = "chat_lfm3_reference_tests.rs"]
+mod lfm3_reference_tests;
 
 #[cfg(test)]
 #[path = "chat_bench_tests.rs"]

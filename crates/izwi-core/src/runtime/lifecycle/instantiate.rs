@@ -88,6 +88,7 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
         | ModelFamily::Qwen35MoeChat
         | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
+        | ModelFamily::Lfm3Chat
         | ModelFamily::Gemma3Chat => {
             registry.load_chat(variant, model_path).await?;
             InstantiatedPayload::None

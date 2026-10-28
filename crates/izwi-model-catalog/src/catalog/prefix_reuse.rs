@@ -203,7 +203,7 @@ impl ModelFamily {
                     "default-on by operator decision ahead of CUDA evidence; the GPU pre-flight runs the qwen36moe device attach test (cuda_attached_prefill_matches_the_fresh_run); IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
-            Self::Lfm2Chat => excluded(
+            Self::Lfm2Chat | Self::Lfm3Chat => excluded(
                 "hybrid state domains keep per-request KV; reuse is not proven for this family",
             ),
             Self::Lfm25Audio => not_enabled(

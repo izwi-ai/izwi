@@ -119,6 +119,7 @@ fn certified_topology(
         // LFM2 commits sparse attention pages and its ShortConv ring under one
         // retained decoder-token transaction.
         (Lfm2Chat, Chat) => RetainedPagedRing,
+        (Lfm3Chat, Chat) => RetainedPagedRing,
 
         // Qwen TTS retains talker pages plus tensor continuation state and
         // leases a separate predictor page domain per invocation.

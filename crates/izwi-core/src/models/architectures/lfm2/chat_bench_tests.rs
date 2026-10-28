@@ -4,6 +4,8 @@
 //! `decode_step_batch` (mask, finite check, selection) for one row.
 //!
 //! Run: `cargo test -p izwi-core --features metal --release --lib lfm2::chat::bench_tests -- --ignored --nocapture`
+//! (`IZWI_BENCH_LFM_MODEL=LFM3-1.7B-GGUF` times LFM3-1.7B in the decode-step
+//! bench instead).
 use super::reference_tests::{models_dir_for_bench, Sessions};
 use super::*;
 use crate::backends::DeviceProfile;
@@ -26,13 +28,26 @@ fn profile_rounds() -> usize {
         .unwrap_or(0)
 }
 
+/// The checkpoint the decode-step bench loads: LFM2.5-1.2B-Instruct, or the
+/// catalog GGUF `IZWI_BENCH_LFM_MODEL` names.
+fn bench_variant() -> ModelVariant {
+    std::env::var("IZWI_BENCH_LFM_MODEL")
+        .ok()
+        .map(|name| {
+            crate::catalog::parse_model_variant(&name)
+                .expect("IZWI_BENCH_LFM_MODEL names a catalog model")
+        })
+        .unwrap_or(ModelVariant::Lfm2512BInstructGguf)
+}
+
 fn bench(profile: DeviceProfile) {
-    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    let variant = bench_variant();
+    let dir = models_dir_for_bench().join(variant.dir_name());
     if !dir.exists() {
         eprintln!("skipping: {} is missing", dir.display());
         return;
     }
-    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let model = Lfm2ChatModel::load(&dir, variant, profile).unwrap();
     let backend = format!("{:?}", model.device_kind());
     let sessions = Sessions::new(&model);
     let device = model.device.device.clone();

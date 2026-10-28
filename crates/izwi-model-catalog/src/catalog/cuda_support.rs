@@ -321,6 +321,7 @@ impl ModelVariant {
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::SortformerDiarization
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Lfm25Audio
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::Voxtral
@@ -367,6 +368,7 @@ impl ModelVariant {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Qwen3Tts
             | ModelFamily::VoxtralTts
@@ -533,6 +535,7 @@ impl ModelVariant {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Lfm25Audio
             | ModelFamily::Gemma3Chat
             | ModelFamily::Qwen3ForcedAligner
@@ -622,7 +625,8 @@ impl ModelVariant {
             ),
             _ if self.is_qwen_chat_gguf()
                 || self.is_qwen35_chat_gguf()
-                || self.is_lfm2_chat_gguf() =>
+                || self.is_lfm2_chat_gguf()
+                || self.is_lfm3_chat_gguf() =>
             {
                 CudaQuantizationInfo::new(
                     CudaQuantizationSupportLevel::CandleQuantizedGeneric,

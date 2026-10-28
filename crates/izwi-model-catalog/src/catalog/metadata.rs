@@ -82,6 +82,16 @@ pub enum ModelVariant {
         alias = "LFM2.5-Audio-1.5B-Q4_0.gguf"
     )]
     Lfm25Audio15BGguf,
+    /// LFM3 1.7B from Liquid AI (GGUF, quantization-aware distilled Q4_0)
+    #[serde(
+        rename = "LFM3-1.7B-GGUF",
+        alias = "LiquidAI/LFM3-1.7B-GGUF",
+        alias = "LFM3-1.7B-QAD-Q4_0.gguf"
+    )]
+    Lfm317BGguf,
+    /// LFM3 1.7B from Liquid AI (GGUF Q8_0)
+    #[serde(rename = "LFM3-1.7B-Q8_0-GGUF", alias = "LFM3-1.7B-Q8_0.gguf")]
+    Lfm317BQ8Gguf,
     /// Kokoro-82M TTS model from hexgrad
     #[serde(rename = "Kokoro-82M")]
     Kokoro82M,
@@ -393,6 +403,13 @@ impl ModelVariant {
     pub const MAYA1_BUILT_IN_VOICE_COUNT: usize = 9;
     /// Maya 2 Native's release 1.0 (2026-10-25) as of its card rewrite.
     pub const MAYA2_ARTIFACT_REVISION: &'static str = "1403b841a6af0f920781319e851d4d6bdeb596c6";
+    /// LiquidAI/LFM3-1.7B-GGUF (QAD-Q4_0 and Q8_0 files).
+    pub const LFM3_17B_GGUF_ARTIFACT_REVISION: &'static str =
+        "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf";
+    /// LiquidAI/LFM3-1.7B: the tokenizer, chat template and configs the GGUF
+    /// repo does not ship.
+    pub const LFM3_17B_COMPANION_REVISION: &'static str =
+        "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd";
     /// Upstream's absolute per-piece ceiling: 1,500 frames (120 s).
     pub const MAYA2_MAX_OUTPUT_FRAMES: usize = 1_500;
     /// Mimi frames per second.
@@ -461,6 +478,7 @@ impl ModelVariant {
             Self::Maya13B => Some(Self::MAYA1_ARTIFACT_REVISION),
             Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
             Self::Maya2Native25B => Some(Self::MAYA2_ARTIFACT_REVISION),
+            Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => Some(Self::LFM3_17B_GGUF_ARTIFACT_REVISION),
             Self::DiarStreamingSortformer4SpkV21 => {
                 Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
             }
@@ -499,6 +517,7 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf => "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
+            Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => "LiquidAI/LFM3-1.7B-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
             Self::ParakeetTdt06BV3 => "nvidia/parakeet-tdt-0.6b-v3",
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
@@ -554,6 +573,8 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf => "LFM2.5 1.2B Instruct GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5 1.2B Thinking GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5 Audio 1.5B GGUF",
+            Self::Lfm317BGguf => "LFM3 1.7B GGUF",
+            Self::Lfm317BQ8Gguf => "LFM3 1.7B Q8_0 GGUF",
             Self::Kokoro82M => "Kokoro 82M",
             Self::ParakeetTdt06BV3 => "Parakeet TDT 0.6B v3",
             Self::WhisperLargeV3Turbo => "Whisper Large v3 Turbo",
@@ -611,6 +632,8 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5-Audio-1.5B-GGUF",
+            Self::Lfm317BGguf => "LFM3-1.7B-GGUF",
+            Self::Lfm317BQ8Gguf => "LFM3-1.7B-Q8_0-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
             Self::ParakeetTdt06BV3 => "Parakeet-TDT-0.6B-v3",
             Self::WhisperLargeV3Turbo => "Whisper-Large-v3-Turbo",
@@ -668,6 +691,10 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf => 730_895_168,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
+            // QAD-Q4_0 GGUF 1,049,615,680 B + companion files 17,924,183 B (HF tree @ pins)
+            Self::Lfm317BGguf => 1_067_539_863,
+            // Q8_0 GGUF 1,846,238,496 B + companion files 17,924,183 B
+            Self::Lfm317BQ8Gguf => 1_864_162_679,
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
             Self::ParakeetTdt06BV3 => 2_509_332_480,    // .nemo 2,509,332,480 B (HF tree, Oct 2026)
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
@@ -736,6 +763,8 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => 1.0,
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
             Self::Lfm25Audio15BGguf => 5.0,
+            Self::Lfm317BGguf => 2.0,
+            Self::Lfm317BQ8Gguf => 3.0,
             Self::Kokoro82M => 2.0,
             Self::ParakeetTdt06BV3 => 12.0,
             Self::WhisperLargeV3Turbo => 4.0,
@@ -882,6 +911,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
+                | crate::catalog::ModelFamily::Lfm3Chat
         )
     }
 
@@ -924,6 +954,7 @@ impl ModelVariant {
             | Self::Maya13B
             | Self::Maya13BGguf
             | Self::Maya2Native25B => Some("Apache-2.0"),
+            Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => Some("LFM Open License v1.0"),
             _ => None,
         }
     }
@@ -1103,6 +1134,9 @@ impl ModelVariant {
             Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
             Self::Qwen36Moe35BA3BFp8 => (true, Vec::new(), false),
             Self::Lfm2512BThinkingGguf => (true, Vec::new(), false),
+            // LFM3 reasons by default; `enable_thinking=false` closes an empty
+            // `<think></think>` instead.
+            Self::Lfm317BGguf | Self::Lfm317BQ8Gguf => (true, Vec::new(), true),
             _ => return None,
         };
 
@@ -1217,6 +1251,8 @@ impl ModelVariant {
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
                 | Self::Lfm25Audio15BGguf
+                | Self::Lfm317BGguf
+                | Self::Lfm317BQ8Gguf
                 | Self::Qwen306B4Bit
                 | Self::Qwen317B4Bit
                 | Self::Qwen3Asr06BGguf
@@ -1247,6 +1283,8 @@ impl ModelVariant {
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
                 | Self::Lfm25Audio15BGguf
+                | Self::Lfm317BGguf
+                | Self::Lfm317BQ8Gguf
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
                 | Self::GraniteSpeech502BGguf
@@ -1312,6 +1350,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this is an LFM3 chat GGUF variant.
+    pub fn is_lfm3_chat_gguf(&self) -> bool {
+        matches!(self, Self::Lfm317BGguf | Self::Lfm317BQ8Gguf)
+    }
+
     /// Whether this is an LFM2.5 Audio GGUF bundle variant.
     pub fn is_lfm25_audio_gguf(&self) -> bool {
         matches!(self, Self::Lfm25Audio15BGguf)
@@ -1343,6 +1386,8 @@ impl ModelVariant {
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Lfm25Audio15BGguf
+            | Self::Lfm317BGguf
+            | Self::Lfm317BQ8Gguf
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => true,
@@ -1382,6 +1427,8 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf,
             Self::Lfm2512BThinkingGguf,
             Self::Lfm25Audio15BGguf,
+            Self::Lfm317BGguf,
+            Self::Lfm317BQ8Gguf,
             Self::Kokoro82M,
             Self::ParakeetTdt06BV3,
             Self::WhisperLargeV3Turbo,

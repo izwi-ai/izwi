@@ -82,6 +82,7 @@ impl ModelLifecycleController {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
             }

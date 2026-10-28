@@ -3029,6 +3029,17 @@ impl ModelExecutor for NativeExecutor {
         ) {
             profile.compute_dtype = "f32".into();
             profile.kv_dtype = "f32".into();
+        } else if variant.family() == crate::catalog::ModelFamily::Lfm3Chat {
+            // LFM3 activations stay F32; its paged KV is stored as
+            // `lfm2_chat_kv_dtype` picks (F16 on Metal and CUDA, F32 on CPU).
+            profile.compute_dtype = "f32".into();
+            profile.kv_dtype = match crate::models::architectures::lfm2::chat::lfm2_chat_kv_dtype(
+                self.config.backend,
+            ) {
+                crate::kv::v2::StateDType::F16 => "f16",
+                _ => "f32",
+            }
+            .into();
         } else {
             profile.compute_dtype = self.config.dtype.clone();
             profile.kv_dtype = self.config.kv_cache_dtype.clone();

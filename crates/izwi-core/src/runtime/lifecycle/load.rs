@@ -343,7 +343,7 @@ fn managed_chat_capacity_policy(
         ModelFamily::Qwen38Chat | ModelFamily::Qwen35MoeChat => CudaResidentPool::RetainedRows,
         // Without a fit LFM2.5 grew a 128K-token arena on demand, with a
         // replacement-copy peak and no CUDA context reserve (A1).
-        ModelFamily::Lfm2Chat => CudaResidentPool::OneContext,
+        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat => CudaResidentPool::OneContext,
         _ => CudaResidentPool::Disabled,
     };
     ManagedChatCapacityPolicy {
@@ -517,6 +517,7 @@ fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool 
         || matches!(
             variant.family(),
             crate::catalog::ModelFamily::Lfm2Chat
+                | crate::catalog::ModelFamily::Lfm3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::FishS2Tts
         ))

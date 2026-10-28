@@ -249,6 +249,8 @@ fn resolve_max_output_tokens_for_model(
         izwi_core::ModelVariant::Gemma34BIt => 4096,
         izwi_core::ModelVariant::Lfm2512BInstructGguf => 4096,
         izwi_core::ModelVariant::Lfm2512BThinkingGguf => 4096,
+        // LFM3 reasons before it answers.
+        izwi_core::ModelVariant::Lfm317BGguf | izwi_core::ModelVariant::Lfm317BQ8Gguf => 4096,
         _ => 1536,
     };
     Ok(requested.unwrap_or(default).clamp(1, 4096))

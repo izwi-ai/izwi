@@ -171,18 +171,23 @@ fn lfm2_main_contract(
         .map_err(|_| Error::ModelLoadError("LFM2 query-head count exceeds u32".into()))?;
     let head_dim = u32::try_from(head_dim)
         .map_err(|_| Error::ModelLoadError("LFM2 attention head dimension exceeds u32".into()))?;
-    let pattern = match config.attention_sliding_window {
-        Some(window_tokens) => AttentionPattern::SlidingWindow {
-            window_tokens: u32::try_from(window_tokens)
-                .map_err(|_| Error::ModelLoadError("LFM2 sliding window exceeds u32".into()))?,
-        },
-        None => AttentionPattern::Full,
+    // LFM3 mixes global and sliding-window layers; the mixed domain keeps one
+    // full page table and each local layer narrows its own view.
+    let pattern = |model_layer: usize| -> Result<AttentionPattern> {
+        Ok(match config.layer_sliding_window(model_layer) {
+            Some(window_tokens) => AttentionPattern::SlidingWindow {
+                window_tokens: u32::try_from(window_tokens)
+                    .map_err(|_| Error::ModelLoadError("LFM2 sliding window exceeds u32".into()))?,
+            },
+            None => AttentionPattern::Full,
+        })
     };
     let layers = layout
         .attention_model_layers
         .iter()
         .map(|model_layer| {
             let kv_heads = config.attention_head_count_kv[*model_layer as usize];
+            let pattern = pattern(*model_layer as usize)?;
             Ok(PagedAttentionLayerSpec {
                 model_layer: *model_layer,
                 query_heads,
@@ -286,6 +291,7 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
         || config.attention_head_count_kv.len() != config.block_count
         || config.shortconv_l_cache == 0
         || config.attention_sliding_window == Some(0)
+        || (0..config.block_count).any(|layer| config.layer_sliding_window(layer) == Some(0))
         || config
             .attention_head_count_kv
             .iter()
@@ -380,6 +386,7 @@ mod tests {
             attention_sliding_window: Some(8),
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         }
     }
 
@@ -496,6 +503,7 @@ mod tests {
             attention_sliding_window: None,
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         };
         let layout = Lfm2StateLayout::from_config(&config).unwrap();
         let contract =

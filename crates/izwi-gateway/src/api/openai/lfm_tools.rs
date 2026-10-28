@@ -98,7 +98,7 @@ fn python_argument(value: &Value) -> String {
 }
 
 /// Python `json.dumps(value, ensure_ascii=False)` spacing.
-fn write_python_json(value: &Value, out: &mut String) {
+pub(super) fn write_python_json(value: &Value, out: &mut String) {
     match value {
         Value::Array(items) => {
             out.push('[');

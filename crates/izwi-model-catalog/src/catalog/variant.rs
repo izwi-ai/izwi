@@ -34,6 +34,9 @@ pub enum ModelFamily {
     Qwen38Chat,
     Lfm2Chat,
     Lfm25Audio,
+    /// LFM3 text chat: the tri-hybrid trunk on the LFM2 backbone, with its
+    /// own chat template and tool-call format.
+    Lfm3Chat,
     Gemma3Chat,
     Qwen3ForcedAligner,
     Voxtral,
@@ -71,6 +74,7 @@ impl ModelFamily {
             | Self::Qwen35MoeChat
             | Self::Qwen38Chat
             | Self::Lfm2Chat
+            | Self::Lfm3Chat
             | Self::Gemma3Chat
             | Self::Qwen3ForcedAligner
             | Self::Tokenizer => false,
@@ -398,6 +402,7 @@ impl ModelVariant {
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
+            Lfm317BGguf | Lfm317BQ8Gguf => ModelFamily::Lfm3Chat,
             Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B => ModelFamily::Qwen3ForcedAligner,
             VoxtralMini4BRealtime2602 => ModelFamily::Voxtral,
@@ -428,6 +433,7 @@ impl ModelVariant {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
             ModelFamily::Voxtral => ModelTask::Asr,
@@ -822,6 +828,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(lfm2_variant);
     }
 
+    if let Some(lfm3_variant) = resolve_lfm3_chat_variant(normalized) {
+        return Some(lfm3_variant);
+    }
+
     if let Some(lfm25_audio_variant) = resolve_lfm25_audio_variant(normalized) {
         return Some(lfm25_audio_variant);
     }
@@ -977,6 +987,24 @@ fn resolve_lfm2_chat_variant(normalized: &str) -> Option<ModelVariant> {
     }
 
     None
+}
+
+fn resolve_lfm3_chat_variant(normalized: &str) -> Option<ModelVariant> {
+    use ModelVariant::*;
+
+    if normalized.contains("audio") || !normalized.contains("lfm3") {
+        return None;
+    }
+
+    if !normalized.contains("17b") {
+        return None;
+    }
+
+    if normalized.contains("q80") || normalized.contains("q8") {
+        return Some(Lfm317BQ8Gguf);
+    }
+
+    Some(Lfm317BGguf)
 }
 
 fn resolve_lfm25_audio_variant(normalized: &str) -> Option<ModelVariant> {

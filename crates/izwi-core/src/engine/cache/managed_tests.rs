@@ -1681,6 +1681,7 @@ fn prefix_gate_rejects_paged_attach_beside_an_unsnapshotted_ring() {
         attention_sliding_window: None,
         rope_freq_base: 1_000_000.0,
         shortconv_l_cache: 3,
+        lfm3: None,
     };
     let mut contract =
         crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(

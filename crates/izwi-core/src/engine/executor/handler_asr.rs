@@ -258,6 +258,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::Qwen35MoeChat
         | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
+        | ModelFamily::Lfm3Chat
         | ModelFamily::Gemma3Chat
         | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
             "{family:?} has no physical ASR route on the generic executor path"

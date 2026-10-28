@@ -366,6 +366,7 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         chat(F::Qwen35MoeChat),
         chat(F::Qwen38Chat).resumable(),
         chat(F::Lfm2Chat),
+        chat(F::Lfm3Chat),
         chat(F::Gemma3Chat),
         // Pipelines and artifacts.
         row(

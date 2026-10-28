@@ -138,6 +138,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_LFM25_METAL_PREFILL_SDPA` | flag | `true` | first use | Enables the Metal fused SDPA path for LFM2.5 full-attention prefill. |
 | `IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL` | integer | `20` | first use | Sets LFM2.5-Audio TTS audio frames between stop checks under greedy audio sampling (clamped 1-32). |
 | `IZWI_LFM2_DIAGNOSTICS` | flag | `false` | first use | Enables opt-in LFM2 activation finiteness checks and token diagnostics during forward passes and sampling. |
+| `IZWI_LFM3_CONTEXT_TOKENS` | integer | `32768` | model load | Sets the LFM3 chat context in tokens, up to the checkpoint's 262,144; it sizes the RoPE tables and KV reservation. |
 | `IZWI_LFM_CUDA_DEPTHWISE_CONV` | flag | `false` | first use | Enables the experimental chunked CUDA depthwise Conv1d path in the LFM2.5-Audio conformer. |
 | `IZWI_LOADING_CACHE_DIR` | path | unset (loader default location) | startup | Directory for the derived-weight loading cache. |
 | `IZWI_LOADING_CACHE_MAX_BYTES` | bytes | 68719476736 (64 GiB) | startup | Size cap in bytes for the derived-weight loading cache (u64; invalid = startup error). |

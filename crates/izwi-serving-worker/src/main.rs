@@ -874,12 +874,14 @@ impl WorkerProcessConfig {
                 let variant = izwi_core::parse_chat_model_variant(Some(&model))
                     .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
                 if variant != ModelVariant::Lfm2512BInstructGguf
+                    && variant != ModelVariant::Lfm317BGguf
+                    && variant != ModelVariant::Lfm317BQ8Gguf
                     && variant != ModelVariant::Qwen3827BFp8
                     && variant != ModelVariant::Qwen3Moe30bA3bGguf
                     && variant != ModelVariant::Qwen36Moe35BA3BFp8
                 {
                     bail!(
-                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
+                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, LFM3-1.7B-GGUF, LFM3-1.7B-Q8_0-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
                     );
                 }
                 variant
@@ -1428,6 +1430,8 @@ fn execution_profile(
     Ok(match task {
         TaskKind::Chat => match variant {
             ModelVariant::Lfm2512BInstructGguf => ("gguf-q4_k_m", "native-lfm2"),
+            ModelVariant::Lfm317BGguf => ("gguf-q4_0", "native-lfm3"),
+            ModelVariant::Lfm317BQ8Gguf => ("gguf-q8_0", "native-lfm3"),
             ModelVariant::Qwen3Moe30bA3bGguf => ("gguf-q4_k_m", "native-qwen3-moe"),
             ModelVariant::Qwen3827BFp8 => ("fp8-block", "native-qwen38"),
             ModelVariant::Qwen36Moe35BA3BFp8 => ("fp8-block", "native-qwen35-moe"),

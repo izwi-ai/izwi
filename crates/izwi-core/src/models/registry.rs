@@ -637,6 +637,12 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         family: ModelFamily::Lfm2Chat,
         loader: load_lfm2_chat_model,
     },
+    // LFM3 runs on the same model with its own dialect.
+    ChatLoaderRegistration {
+        name: "lfm3_chat",
+        family: ModelFamily::Lfm3Chat,
+        loader: load_lfm2_chat_model,
+    },
 ];
 
 const DIARIZATION_LOADER_REGISTRY: &[DiarizationLoaderRegistration] =
@@ -5348,7 +5354,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
-            Self::Lfm2(model) => model.prompt_token_ids_with_tools(messages, &config.request.tools),
+            Self::Lfm2(model) => model.prompt_token_ids_for_request(messages, &config.request),
         }
     }
 
@@ -6785,6 +6791,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen35MoeChat => "qwen35_moe_chat",
         ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
+        ModelFamily::Lfm3Chat => "lfm3_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
         ModelFamily::Gemma3Chat => "gemma3_chat",
         ModelFamily::Qwen3ForcedAligner => "qwen3_forced_aligner",

@@ -13,6 +13,7 @@ pub mod granite_speech5;
 pub mod kokoro;
 pub mod lfm2;
 pub mod lfm25_audio;
+pub mod lfm3;
 pub mod maya1;
 pub mod maya2;
 pub mod nemotron;

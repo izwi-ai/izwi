@@ -81,13 +81,14 @@ pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
         ModelFamily::Qwen3Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Qwen35MoeChat
     )
 }
 
 /// Whether a chat model's prompt renders `ChatRequestConfig::tools` with a
-/// tool-calling template (the Qwen3.5 family's XML calls, LFM2.5's marker
-/// list). Other chat models have no tool template.
+/// tool-calling template (the Qwen3.5 family's and LFM3's XML calls,
+/// LFM2.5's marker list). Other chat models have no tool template.
 pub fn chat_supports_tools(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
@@ -95,6 +96,7 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
     )
 }
 
@@ -127,6 +129,16 @@ pub fn resolve_chat_sampling(
             top_p: 1.0,
             top_k: 50,
             repetition_penalty: 1.05,
+            presence_penalty: 0.0,
+        }
+    } else if variant.family() == ModelFamily::Lfm3Chat {
+        // LFM3-1.7B's card and `generation_config.json` (general use: chat,
+        // tools, agents): temperature 0.1, top-k 50, repetition penalty 1.1.
+        ResolvedChatSampling {
+            temperature: 0.1,
+            top_p: 1.0,
+            top_k: 50,
+            repetition_penalty: 1.1,
             presence_penalty: 0.0,
         }
     } else {
@@ -257,6 +269,27 @@ mod tests {
                 sampling(temperature, 1.0, 50, 1.05, 0.0),
                 "{variant:?}"
             );
+        }
+    }
+
+    #[test]
+    fn lfm3_uses_its_model_card_sampling_and_supports_tools_and_json() {
+        for variant in [ModelVariant::Lfm317BGguf, ModelVariant::Lfm317BQ8Gguf] {
+            for enable_thinking in [None, Some(true), Some(false)] {
+                assert_eq!(
+                    resolve_chat_sampling(variant, enable_thinking, ChatSamplingRequest::default()),
+                    sampling(0.1, 1.0, 50, 1.1, 0.0),
+                    "{variant:?} enable_thinking={enable_thinking:?}"
+                );
+            }
+            assert!(chat_supports_tools(variant) && chat_supports_json_object(variant));
+            assert!(crate::chat::reasoning::reasoning_opened_in_prompt(
+                variant, None
+            ));
+            assert!(!crate::chat::reasoning::reasoning_opened_in_prompt(
+                variant,
+                Some(false)
+            ));
         }
     }
 

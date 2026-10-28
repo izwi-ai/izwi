@@ -503,6 +503,9 @@ struct AttentionLayer {
     neg_inf: Tensor,
     physical_layer: usize,
     model_layer: usize,
+    /// LFM3: `[hidden -> heads]`; each head's output is scaled by the sigmoid
+    /// of its gate before the output projection.
+    gate: Option<Lfm2Linear>,
 }
 
 #[derive(Debug)]
@@ -526,6 +529,29 @@ struct LayerWeights {
     ffn_norm: LfmRmsNorm,
     mlp: Mlp,
     kind: LayerKind,
+    /// LFM3 sandwich norms: applied to the operator and FFN outputs before
+    /// their residual adds.
+    post_operator_norm: Option<LfmRmsNorm>,
+    post_ffn_norm: Option<LfmRmsNorm>,
+}
+
+impl LayerWeights {
+    /// The operator output as the residual stream receives it.
+    fn operator_output(&self, hidden: Tensor) -> Result<Tensor> {
+        match &self.post_operator_norm {
+            Some(norm) => norm.forward(&hidden.contiguous()?),
+            None => Ok(hidden),
+        }
+    }
+
+    /// The FFN of a normalized input, as the residual stream receives it.
+    fn ffn_output(&self, normalized: &Tensor) -> Result<Tensor> {
+        let output = self.mlp.forward(normalized)?;
+        match &self.post_ffn_norm {
+            Some(norm) => norm.forward(&output.contiguous()?),
+            None => Ok(output),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -643,9 +669,10 @@ fn rotary_decode_batch(
     RotaryDecodeRows::gather(cos, sin, positions, query.dim(0)?)?.rotate(query, key)
 }
 
-/// The rotary rows of one decode step. Every attention layer shares the same
-/// tables, so a step gathers them once (one position upload) instead of once
-/// per layer.
+/// The rotary rows of one decode step. Attention layers share their tables
+/// (LFM2 has one set, LFM3 one for global and one for sliding layers), so a
+/// step gathers each table once (one position upload) instead of once per
+/// layer.
 struct RotaryDecodeRows {
     table: candle_core::TensorId,
     cos: Tensor,
@@ -675,16 +702,20 @@ impl RotaryDecodeRows {
 
     /// This step's rows of `cos`/`sin`, gathered on first use.
     fn for_step<'a>(
-        rows: &'a mut Option<Self>,
+        rows: &'a mut Vec<Self>,
         cos: &Tensor,
         sin: &Tensor,
         positions: &[usize],
         batch: usize,
     ) -> Result<&'a Self> {
-        if rows.as_ref().is_some_and(|rows| rows.table == cos.id()) {
-            return Ok(rows.as_ref().expect("checked above"));
-        }
-        Ok(rows.insert(Self::gather(cos, sin, positions, batch)?))
+        let index = match rows.iter().position(|rows| rows.table == cos.id()) {
+            Some(index) => index,
+            None => {
+                rows.push(Self::gather(cos, sin, positions, batch)?);
+                rows.len() - 1
+            }
+        };
+        Ok(&rows[index])
     }
 
     fn rotate(&self, query: &Tensor, key: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -701,6 +732,22 @@ impl RotaryDecodeRows {
 }
 
 impl AttentionLayer {
+    /// The output projection of the attention heads `attn_output`
+    /// (`[.., heads * head_dim]`) for the layer input `input` (`[.., hidden]`),
+    /// after LFM3's per-head sigmoid gate when the layer has one.
+    fn project_output(&self, input: &Tensor, attn_output: &Tensor) -> Result<Tensor> {
+        let Some(gate) = &self.gate else {
+            return self.wo.forward(attn_output).map_err(Error::from);
+        };
+        let dims = attn_output.dims();
+        let lead = &dims[..dims.len() - 1];
+        let gate = candle_nn::ops::sigmoid(&gate.forward(input)?)?;
+        let heads = attn_output.reshape([lead, &[self.n_head, self.head_dim]].concat())?;
+        let gate = gate.reshape([lead, &[self.n_head, 1]].concat())?;
+        let gated = heads.broadcast_mul(&gate)?.reshape(dims)?;
+        self.wo.forward(&gated).map_err(Error::from)
+    }
+
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, _, seq_len, _) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
@@ -847,7 +894,7 @@ impl AttentionLayer {
                     attn_output
                         .transpose(1, 2)?
                         .reshape((batch_size, seq_len, hidden_size))?;
-                return self.wo.forward(&attn_output).map_err(Error::from);
+                return self.project_output(hidden_states, &attn_output);
             }
         }
 
@@ -870,7 +917,7 @@ impl AttentionLayer {
                     attn_output
                         .transpose(1, 2)?
                         .reshape((batch_size, seq_len, hidden_size))?;
-                return self.wo.forward(&attn_output).map_err(Error::from);
+                return self.project_output(hidden_states, &attn_output);
             }
         }
 
@@ -908,7 +955,7 @@ impl AttentionLayer {
             attn_output
                 .transpose(1, 2)?
                 .reshape((batch_size, seq_len, hidden_size))?;
-        self.wo.forward(&attn_output).map_err(Error::from)
+        self.project_output(hidden_states, &attn_output)
     }
 
     fn forward_physical(
@@ -962,7 +1009,7 @@ impl AttentionLayer {
             index_pos,
         )?;
         let output = output.reshape((batch_size, seq_len, hidden_size))?;
-        self.wo.forward(&output).map_err(Error::from)
+        self.project_output(hidden_states, &output)
     }
 
     fn forward_retained_decode_batch(
@@ -972,7 +1019,7 @@ impl AttentionLayer {
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         completions: &mut KvWriteCompletionCollector,
-        rotary_rows: &mut Option<RotaryDecodeRows>,
+        rotary_rows: &mut Vec<RotaryDecodeRows>,
     ) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
         if batch == 0 || seq_len != 1 || positions.len() != batch || caches.len() != batch {
@@ -1096,9 +1143,7 @@ impl AttentionLayer {
             self.model_layer,
             positions,
         )?;
-        self.wo
-            .forward(&output.reshape((batch, 1, hidden_size))?)
-            .map_err(Error::from)
+        self.project_output(hidden_states, &output.reshape((batch, 1, hidden_size))?)
     }
 }
 
@@ -1164,7 +1209,7 @@ impl AttentionLayer {
         let output = output
             .to_dtype(hidden_states.dtype())?
             .reshape((1, tokens, hidden_size))?;
-        self.wo.forward(&output).map_err(Error::from)
+        self.project_output(hidden_states, &output)
     }
 }
 
@@ -1474,8 +1519,24 @@ impl QuantizedLfm2Backbone {
     ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (context_length, head_dim) = rope_table_geometry(&cfg)?;
-        let (cos, sin) = precompute_freqs(head_dim, cfg.rope_freq_base, context_length, device)?;
+        let lfm3 = cfg.lfm3.clone().unwrap_or_default();
+        let (cos, sin) = precompute_freqs_scaled(
+            head_dim,
+            cfg.rope_freq_base,
+            lfm3.rope_freq_factors.as_deref(),
+            context_length,
+            device,
+        )?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+        // LFM3's sliding-window layers rotate at their own base.
+        let swa_tables = lfm3
+            .rope_freq_base_swa
+            .map(|base| -> Result<(Tensor, Tensor, Tensor)> {
+                let (cos, sin) = precompute_freqs(head_dim, base, context_length, device)?;
+                let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+                Ok((cos, sin, cos_sin))
+            })
+            .transpose()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let embedding_names = [
@@ -1562,6 +1623,28 @@ impl QuantizedLfm2Backbone {
             )?;
             let mlp =
                 Mlp::load_with_prefixes(loader, device, &[prefix.clone(), legacy_prefix.clone()])?;
+            let (post_operator_norm, post_ffn_norm) = if lfm3.sandwich_norm {
+                let norm = |names: [String; 3]| -> Result<LfmRmsNorm> {
+                    LfmRmsNorm::from_qtensor(
+                        load_qtensor_any(loader, device, &names)?,
+                        cfg.attention_layer_norm_rms_epsilon,
+                    )
+                };
+                (
+                    Some(norm([
+                        format!("{prefix}.post_attention_norm.weight"),
+                        format!("{prefix}.post_operator_norm.weight"),
+                        format!("{legacy_prefix}.post_operator_norm.weight"),
+                    ])?),
+                    Some(norm([
+                        format!("{prefix}.post_ffw_norm.weight"),
+                        format!("{prefix}.post_ffn_norm.weight"),
+                        format!("{legacy_prefix}.post_ffn_norm.weight"),
+                    ])?),
+                )
+            } else {
+                (None, None)
+            };
 
             let is_attention = cfg
                 .attention_head_count_kv
@@ -1608,6 +1691,26 @@ impl QuantizedLfm2Backbone {
                 )?;
                 let qk_norm_weight =
                     Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
+                let (layer_cos, layer_sin, layer_cos_sin) = match &swa_tables {
+                    Some((cos, sin, cos_sin)) if cfg.layer_uses_swa_rope(layer_idx) => {
+                        (cos.clone(), sin.clone(), cos_sin.clone())
+                    }
+                    _ => (cos.clone(), sin.clone(), cos_sin.clone()),
+                };
+                let gate = lfm3
+                    .attention_output_gate
+                    .then(|| {
+                        load_linear_any(
+                            loader,
+                            device,
+                            &[
+                                format!("{prefix}.attn_gate.weight"),
+                                format!("{prefix}.self_attn.gate_proj.weight"),
+                                format!("{legacy_prefix}.self_attn.gate_proj.weight"),
+                            ],
+                        )
+                    })
+                    .transpose()?;
                 LayerKind::Attention(AttentionLayer {
                     wq: load_linear_any(
                         loader,
@@ -1651,13 +1754,14 @@ impl QuantizedLfm2Backbone {
                     n_head: cfg.attention_head_count,
                     n_kv_head,
                     head_dim: cfg.embedding_length / cfg.attention_head_count,
-                    sliding_window: cfg.attention_sliding_window,
-                    cos: cos.clone(),
-                    sin: sin.clone(),
-                    cos_sin: cos_sin.clone(),
+                    sliding_window: cfg.layer_sliding_window(layer_idx),
+                    cos: layer_cos,
+                    sin: layer_sin,
+                    cos_sin: layer_cos_sin,
                     neg_inf: neg_inf.clone(),
                     physical_layer,
                     model_layer: layer_idx,
+                    gate,
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {
@@ -1704,6 +1808,8 @@ impl QuantizedLfm2Backbone {
                 ffn_norm,
                 mlp,
                 kind,
+                post_operator_norm,
+                post_ffn_norm,
             });
         }
 
@@ -1902,7 +2008,7 @@ impl QuantizedLfm2Backbone {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Tensor> {
             let mut hidden_states = input_embeds.clone();
-            let mut rotary_rows = None;
+            let mut rotary_rows = Vec::new();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 diagnostics::check_batch_layer(&hidden_states, "input", layer_idx, positions)?;
                 let residual = hidden_states.clone();
@@ -1922,13 +2028,14 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_retained_decode_batch(&hidden, &mut refs)?
                     }
                 };
+                let hidden = layer.operator_output(hidden)?;
                 diagnostics::check_batch_layer(&hidden, "operator output", layer_idx, positions)?;
                 hidden_states = (&hidden + &residual)?;
                 diagnostics::check_batch_layer(&hidden_states, "residual", layer_idx, positions)?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
                 diagnostics::check_batch_layer(&hidden, "FFN norm", layer_idx, positions)?;
-                let mlp = layer.mlp.forward(&hidden)?;
+                let mlp = layer.ffn_output(&hidden)?;
                 diagnostics::check_batch_layer(&mlp, "MLP output", layer_idx, positions)?;
                 hidden_states = (&mlp + &residual)?;
                 diagnostics::check_batch_layer(
@@ -2071,10 +2178,11 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_mixed(&hidden, &layout, &mut working)?
                     }
                 };
+                let hidden = layer.operator_output(hidden)?;
                 hidden_states = (&hidden + &residual)?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let mlp = layer.mlp.forward(&hidden)?;
+                let mlp = layer.ffn_output(&hidden)?;
                 hidden_states = (&mlp + &residual)?;
             }
             if sample_tokens.is_empty() {
@@ -2239,13 +2347,14 @@ impl QuantizedLfm2Backbone {
                 }
                 LayerKind::ShortConv(layer) => layer.forward_retained(&hidden, &mut working)?,
             };
+            let hidden = layer.operator_output(hidden)?;
             diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
             hidden_states = (&hidden + &residual)?;
             diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
             let residual = hidden_states.clone();
             let hidden = layer.ffn_norm.forward(&hidden_states)?;
             diagnostics::check_layer(&hidden, "FFN norm", layer_idx, index_pos)?;
-            let mlp = layer.mlp.forward(&hidden)?;
+            let mlp = layer.ffn_output(&hidden)?;
             diagnostics::check_layer(&mlp, "MLP output", layer_idx, index_pos)?;
             hidden_states = (&mlp + &residual)?;
             diagnostics::check_layer(&hidden_states, "MLP residual", layer_idx, index_pos)?;
@@ -2333,13 +2442,14 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_physical(&hidden, transaction)?
                     }
                 };
+                let hidden = layer.operator_output(hidden)?;
                 diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
                 hidden_states = (&hidden + &residual)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let hidden = layer.mlp.forward(&hidden)?;
+                let hidden = layer.ffn_output(&hidden)?;
                 diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
                 hidden_states = (&hidden + &residual)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
@@ -2416,13 +2526,14 @@ impl QuantizedLfm2Backbone {
             }
             LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
         };
+        let hidden = layer.operator_output(hidden)?;
         diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
         let hidden_states = (&hidden + &residual)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
         let residual = hidden_states.clone();
         let hidden = layer.ffn_norm.forward(&hidden_states)?;
-        let hidden = layer.mlp.forward(&hidden)?;
+        let hidden = layer.ffn_output(&hidden)?;
         diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
         let hidden_states = (&hidden + &residual)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
@@ -2630,10 +2741,47 @@ fn precompute_freqs(
     ))
 }
 
+/// [`precompute_freqs`] with each inverse frequency divided by its factor
+/// (GGUF `rope_freqs.weight`, as llama.cpp applies it). LFM3's global layers
+/// carry 1e30 on their low-frequency half, which leaves it unrotated.
+fn precompute_freqs_scaled(
+    head_dim: usize,
+    freq_base: f64,
+    factors: Option<&[f64]>,
+    context_length: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    if factors.is_some_and(|factors| factors.len() != head_dim / 2) {
+        return Err(Error::ModelLoadError(format!(
+            "LFM RoPE frequency factors must cover {} frequencies",
+            head_dim / 2
+        )));
+    }
+    let (cos, sin) = rope_tables_f64_scaled(head_dim, freq_base, factors, context_length);
+    let half = head_dim / 2;
+    Ok((
+        Tensor::from_vec(cos, (context_length, half), device)?,
+        Tensor::from_vec(sin, (context_length, half), device)?,
+    ))
+}
+
 fn rope_tables_f64(head_dim: usize, freq_base: f64, context_length: usize) -> (Vec<f32>, Vec<f32>) {
+    rope_tables_f64_scaled(head_dim, freq_base, None, context_length)
+}
+
+fn rope_tables_f64_scaled(
+    head_dim: usize,
+    freq_base: f64,
+    factors: Option<&[f64]>,
+    context_length: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let inv_freq: Vec<f64> = (0..head_dim)
         .step_by(2)
-        .map(|index| 1.0 / freq_base.powf(index as f64 / head_dim as f64))
+        .enumerate()
+        .map(|(pair, index)| {
+            let factor = factors.map_or(1.0, |factors| factors[pair]);
+            1.0 / freq_base.powf(index as f64 / head_dim as f64) / factor
+        })
         .collect();
     let mut cos = Vec::with_capacity(context_length * inv_freq.len());
     let mut sin = Vec::with_capacity(context_length * inv_freq.len());
@@ -3314,8 +3462,9 @@ pub(crate) mod tests {
             }
         }
 
-        // One gather serves every layer of a step; another table regathers.
-        let mut rows = None;
+        // One gather serves every layer of a step; another table gathers once
+        // more, and the first stays cached for the layers that alternate.
+        let mut rows = Vec::new();
         let first = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
             .unwrap()
             .cos
@@ -3329,6 +3478,16 @@ pub(crate) mod tests {
         let other =
             super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3).unwrap();
         assert_ne!(other.cos.id(), first);
+        let other_id = other.cos.id();
+        let again = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        assert_eq!(again, first);
+        assert_eq!(rows.len(), 2);
+        let other = super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3)
+            .unwrap();
+        assert_eq!(other.cos.id(), other_id);
         let (q2, k2) = other.rotate(&query, &key).unwrap();
         for (left, right) in [(&q, &q2), (&k, &k2)] {
             assert_eq!(
