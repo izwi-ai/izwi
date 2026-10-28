@@ -290,15 +290,31 @@ impl Lfm3DepthDecoder {
     pub(crate) fn sample_frames(
         &self,
         hidden: &Tensor,
-        sampling: &Lfm3AudioSampling,
+        samplings: &[&Lfm3AudioSampling],
         histories: &[&FrameHistory],
         rngs: &mut [&mut SplitMix64],
     ) -> Result<Vec<[u32; CODEBOOKS]>> {
         let rows = hidden.dim(0)?;
-        if histories.len() != rows || rngs.len() != rows {
+        if samplings.len() != rows || histories.len() != rows || rows == 0 || rngs.len() != rows {
             return Err(Error::InvalidInput(
                 "LFM3-Audio depth rows do not match their histories".into(),
             ));
+        }
+        if rows > 1 {
+            // Rows sample apart: the trunk's matmuls round differently at
+            // another row count, and a row must draw the same frame alone or
+            // beside others. Each row's generator is its own, so the order
+            // of rows does not matter.
+            let mut frames = Vec::with_capacity(rows);
+            for row in 0..rows {
+                frames.extend(self.sample_frames(
+                    &hidden.narrow(0, row, 1)?,
+                    &samplings[row..=row],
+                    &histories[row..=row],
+                    &mut rngs[row..=row],
+                )?);
+            }
+            return Ok(frames);
         }
         let inputs = self.frame_inputs(hidden)?;
         let orders = rngs
@@ -327,12 +343,12 @@ impl Lfm3DepthDecoder {
                     apply_repetition_penalty(
                         &mut scores,
                         histories[row].codebook(codebook),
-                        sampling.repetition_penalty,
+                        samplings[row].repetition_penalty,
                     );
                     codes[row][codebook] = sample(
                         &mut scores,
-                        sampling.temperature,
-                        sampling.top_k,
+                        samplings[row].temperature,
+                        samplings[row].top_k,
                         1.0,
                         rngs[row],
                     );

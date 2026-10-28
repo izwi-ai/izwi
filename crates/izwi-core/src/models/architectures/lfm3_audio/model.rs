@@ -108,6 +108,79 @@ pub struct Lfm3AudioOutput {
     pub stop_reason: &'static str,
 }
 
+/// One request's generation outside the language model: its mode, sampling
+/// state, histories and codec stream, and the hidden state its next slot
+/// reads. [`Lfm3AudioModel::generate`] drives one row; a batched step drives
+/// many through [`Lfm3AudioModel::choose_slots`], each row drawing from its
+/// own generator, so a row samples the same alone or beside others.
+#[derive(Debug, Clone)]
+pub(crate) struct Lfm3AudioRow {
+    text_sampling: Lfm3TextSampling,
+    audio_sampling: Lfm3AudioSampling,
+    max_slots: usize,
+    /// The next slot to fill.
+    slot: usize,
+    /// The final-norm hidden state `[1, 2048]` the next slot reads.
+    last: Tensor,
+    rng: SplitMix64,
+    decoder: IncrementalDecoder,
+    text_history: std::collections::VecDeque<u32>,
+    audio_history: FrameHistory,
+    codec: LiquidCodecStream,
+    pending_frames: Vec<[u32; CODEBOOKS]>,
+    mode: Lfm3AudioMode,
+    slots_left: usize,
+    speaking: bool,
+    text_done: bool,
+    suppress: Vec<u32>,
+    output: Lfm3AudioOutput,
+    done: bool,
+    /// Text and 24 kHz samples decoded since the caller last took them.
+    new_text: String,
+    new_samples: Vec<f32>,
+}
+
+impl Lfm3AudioRow {
+    /// Whether the row has stopped: its output is complete.
+    pub(crate) fn finished(&self) -> bool {
+        self.done
+    }
+
+    pub(crate) fn output(&self) -> &Lfm3AudioOutput {
+        &self.output
+    }
+
+    pub(crate) fn into_output(self) -> Lfm3AudioOutput {
+        self.output
+    }
+
+    /// Text decoded since the last call.
+    pub(crate) fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.new_text)
+    }
+
+    /// Samples decoded since the last call.
+    pub(crate) fn take_samples(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.new_samples)
+    }
+
+    /// The language model's hidden state `[1, 2048]` after the embedding
+    /// [`Lfm3AudioModel::choose_slots`] returned.
+    pub(crate) fn accept_hidden(&mut self, hidden: Tensor) {
+        self.last = hidden;
+    }
+
+    fn speaks_next(&self) -> bool {
+        self.mode == Lfm3AudioMode::Audio
+            || (self.mode == Lfm3AudioMode::Interleaved && self.speaking)
+    }
+
+    fn push_text(&mut self, delta: &str) {
+        self.output.text.push_str(delta);
+        self.new_text.push_str(delta);
+    }
+}
+
 /// The language model's sequence state: a forward over new embeddings at
 /// the sequence's current length returns their final-norm hidden states.
 pub(crate) trait Lfm3AudioLmState {
@@ -183,6 +256,15 @@ impl Lfm3AudioLmState for RetainedLmState {
     ) -> Result<Tensor> {
         lm.forward_embeds_retained(embeds, position, &mut self.cache, &mut self.shortconv)
     }
+}
+
+fn check_prompt_fits(prompt_tokens: usize, context: usize) -> Result<()> {
+    if prompt_tokens >= context {
+        return Err(Error::InvalidInput(format!(
+            "LFM3-Audio prompt of {prompt_tokens} tokens does not fit this request's {context}-token context"
+        )));
+    }
+    Ok(())
 }
 
 pub struct Lfm3AudioModel {
@@ -349,175 +431,281 @@ impl Lfm3AudioModel {
         // The request leases a context sized for its workload: a prompt
         // that fills it is refused, and the slots stop where it ends.
         let context = state.capacity_tokens().min(self.lm_config.context_length);
-        if prompt_tokens >= context {
-            return Err(Error::InvalidInput(format!(
-                "LFM3-Audio prompt of {prompt_tokens} tokens does not fit this request's {context}-token context"
-            )));
-        }
-        let max_slots = request.max_slots.min(context - prompt_tokens);
+        check_prompt_fits(prompt_tokens, context)?;
         let hidden = state.forward(&self.lm, &embeds, 0)?;
-        let mut last = hidden
-            .i((.., prompt_tokens - 1..prompt_tokens, ..))?
-            .squeeze(1)?;
-        let mut rng = SplitMix64::new(request.seed);
-        let mut decoder = IncrementalDecoder::new(true);
-        let mut output = Lfm3AudioOutput {
-            prompt_tokens,
-            stop_reason: "length",
-            ..Lfm3AudioOutput::default()
-        };
-        let mut text_history = std::collections::VecDeque::new();
-        let mut audio_history = FrameHistory::default();
-        let mut codec = LiquidCodecStream::default();
-        let mut pending_frames = Vec::<[u32; CODEBOOKS]>::new();
-        let mut mode = request.mode;
-        let mut slots_left = INTERLEAVED_TEXT;
-        let (mut speaking, mut text_done) = (false, false);
+        let mut row = self.begin_row(&request, prompt_tokens, context, &hidden)?;
+        loop {
+            if should_stop() {
+                self.stop_row(&mut row, "cancelled")?;
+            }
+            let next = self.choose_slots(&mut [&mut row])?.pop().flatten();
+            let text = row.take_text();
+            if !text.is_empty() {
+                on_text(&text);
+            }
+            let samples = row.take_samples();
+            if !samples.is_empty() {
+                on_audio(&samples);
+            }
+            let Some((embed, position)) = next else {
+                break;
+            };
+            let hidden = state.forward(&self.lm, &embed, position)?;
+            row.accept_hidden(hidden.squeeze(1)?);
+        }
+        Ok(row.output)
+    }
+
+    /// Prompt embeddings `[1, tokens, 2048]` and their token count, for a
+    /// caller that prefills a row's language-model state itself.
+    pub(crate) fn row_prompt(&self, request: &Lfm3AudioRequest) -> Result<(Tensor, usize)> {
+        self.prompt_embeds(request)
+    }
+
+    /// A row after its prompt's prefill: `hidden` holds the prompt's
+    /// language-model hidden states `[1, prompt_tokens, 2048]`, and the
+    /// row's slots stop where its `context` ends.
+    pub(crate) fn begin_row(
+        &self,
+        request: &Lfm3AudioRequest,
+        prompt_tokens: usize,
+        context: usize,
+        hidden: &Tensor,
+    ) -> Result<Lfm3AudioRow> {
+        check_prompt_fits(prompt_tokens, context)?;
         let mut suppress = vec![AUDIO_PLACEHOLDER, AUDIO_OUT_PLACEHOLDER];
         if request.text_only {
             suppress.extend([AUDIO_START, MIXED_START]);
         }
+        Ok(Lfm3AudioRow {
+            text_sampling: request.text_sampling,
+            audio_sampling: request.audio_sampling,
+            max_slots: request.max_slots.min(context - prompt_tokens),
+            slot: 0,
+            last: hidden
+                .i((.., prompt_tokens - 1..prompt_tokens, ..))?
+                .squeeze(1)?,
+            rng: SplitMix64::new(request.seed),
+            decoder: IncrementalDecoder::new(true),
+            text_history: std::collections::VecDeque::new(),
+            audio_history: FrameHistory::default(),
+            codec: LiquidCodecStream::default(),
+            pending_frames: Vec::new(),
+            mode: request.mode,
+            slots_left: INTERLEAVED_TEXT,
+            speaking: false,
+            text_done: false,
+            suppress,
+            output: Lfm3AudioOutput {
+                prompt_tokens,
+                stop_reason: "length",
+                ..Lfm3AudioOutput::default()
+            },
+            done: false,
+            new_text: String::new(),
+            new_samples: Vec::new(),
+        })
+    }
 
-        let mut flush = |pending: &mut Vec<[u32; CODEBOOKS]>,
-                         codec: &mut LiquidCodecStream,
-                         output: &mut Lfm3AudioOutput,
-                         finalize: bool|
-         -> Result<()> {
-            if pending.is_empty() && !finalize {
-                return Ok(());
+    /// Fill each live row's next slot, a speech frame or a text token: the
+    /// speaking rows draw their frames in one depth batch, each from its own
+    /// sampling and generator. Returns, per row, the embedding to feed back
+    /// and its position, or `None` once the row has finished (its text and
+    /// audio are then complete).
+    pub(crate) fn choose_slots(
+        &self,
+        rows: &mut [&mut Lfm3AudioRow],
+    ) -> Result<Vec<Option<(Tensor, usize)>>> {
+        let speaking = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.done && row.speaks_next())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut frames = vec![None; rows.len()];
+        if !speaking.is_empty() {
+            let hidden = Tensor::cat(
+                &speaking
+                    .iter()
+                    .map(|&index| &rows[index].last)
+                    .collect::<Vec<_>>(),
+                0,
+            )?;
+            let (samplings, (histories, mut rngs)): (Vec<_>, (Vec<_>, Vec<_>)) = rows
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| speaking.contains(index))
+                .map(|(_, row)| {
+                    let Lfm3AudioRow {
+                        audio_sampling,
+                        audio_history,
+                        rng,
+                        ..
+                    } = &mut **row;
+                    (&*audio_sampling, (&*audio_history, rng))
+                })
+                .unzip();
+            let drawn = self
+                .depth
+                .sample_frames(&hidden, &samplings, &histories, &mut rngs)?;
+            for (&index, frame) in speaking.iter().zip(drawn) {
+                frames[index] = Some(frame);
             }
-            let samples = self.codec.decode_stream(codec, pending, finalize)?;
-            pending.clear();
-            if !samples.is_empty() {
-                on_audio(&samples);
-                output.samples.extend_from_slice(&samples);
-            }
-            Ok(())
-        };
-
-        for slot in 0..max_slots {
-            if should_stop() {
-                output.stop_reason = "cancelled";
-                break;
-            }
-            let interleaving = mode == Lfm3AudioMode::Interleaved;
-            let mut finished = false;
-            let next = if mode == Lfm3AudioMode::Audio || (interleaving && speaking) {
-                let frame = self.depth.sample_frames(
-                    &last,
-                    &request.audio_sampling,
-                    &[&audio_history],
-                    &mut [&mut rng],
-                )?[0];
-                if frame[0] == AUDIO_EOS_CODE {
-                    mode = Lfm3AudioMode::Text;
-                    flush(&mut pending_frames, &mut codec, &mut output, true)?;
-                    codec = LiquidCodecStream::default();
-                } else {
-                    audio_history.push(frame, request.audio_sampling.repetition_window);
-                    output.audio_frames += 1;
-                    output.frames.push(frame);
-                    pending_frames.push(frame);
-                    let due = if output.audio_frames <= FIRST_STREAM_FRAMES {
-                        FIRST_STREAM_FRAMES
-                    } else {
-                        STREAM_FRAMES
-                    };
-                    if pending_frames.len() >= due {
-                        flush(&mut pending_frames, &mut codec, &mut output, false)?;
-                    }
+        }
+        rows.iter_mut()
+            .zip(frames)
+            .map(|(row, frame)| {
+                if row.done {
+                    return Ok(None);
                 }
-                self.feedback_embed(&frame)?
+                self.fill_slot(row, frame)
+            })
+            .collect()
+    }
+
+    /// One slot of one row: the generate loop's body.
+    fn fill_slot(
+        &self,
+        row: &mut Lfm3AudioRow,
+        frame: Option<[u32; CODEBOOKS]>,
+    ) -> Result<Option<(Tensor, usize)>> {
+        if row.slot >= row.max_slots {
+            self.stop_row(row, "length")?;
+            return Ok(None);
+        }
+        let interleaving = row.mode == Lfm3AudioMode::Interleaved;
+        let mut finished = false;
+        let next = if let Some(frame) = frame {
+            if frame[0] == AUDIO_EOS_CODE {
+                row.mode = Lfm3AudioMode::Text;
+                self.flush_row(row, true)?;
+                row.codec = LiquidCodecStream::default();
             } else {
-                let mut scores = self
-                    .lm
-                    .project_hidden(&last)?
-                    .squeeze(0)?
-                    .to_dtype(DType::F32)?
-                    .to_device(&Device::Cpu)?
-                    .to_vec1::<f32>()?;
-                for (score, mask) in scores.iter_mut().zip(&self.text_mask) {
-                    *score += mask;
+                row.audio_history
+                    .push(frame, row.audio_sampling.repetition_window);
+                row.output.audio_frames += 1;
+                row.output.frames.push(frame);
+                row.pending_frames.push(frame);
+                let due = if row.output.audio_frames <= FIRST_STREAM_FRAMES {
+                    FIRST_STREAM_FRAMES
+                } else {
+                    STREAM_FRAMES
+                };
+                if row.pending_frames.len() >= due {
+                    self.flush_row(row, false)?;
                 }
-                apply_repetition_penalty(
-                    &mut scores,
-                    text_history.iter().copied(),
-                    request.text_sampling.repetition_penalty,
-                );
-                for id in &suppress {
-                    scores[*id as usize] = f32::NEG_INFINITY;
+            }
+            self.feedback_embed(&frame)?
+        } else {
+            let mut scores = self
+                .lm
+                .project_hidden(&row.last)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?;
+            for (score, mask) in scores.iter_mut().zip(&self.text_mask) {
+                *score += mask;
+            }
+            apply_repetition_penalty(
+                &mut scores,
+                row.text_history.iter().copied(),
+                row.text_sampling.repetition_penalty,
+            );
+            for id in &row.suppress {
+                scores[*id as usize] = f32::NEG_INFINITY;
+            }
+            let token = sample(
+                &mut scores,
+                row.text_sampling.temperature,
+                row.text_sampling.top_k,
+                row.text_sampling.top_p,
+                &mut row.rng,
+            );
+            if row.text_sampling.repetition_window > 0 {
+                if row.text_history.len() == row.text_sampling.repetition_window {
+                    row.text_history.pop_front();
                 }
-                let token = sample(
-                    &mut scores,
-                    request.text_sampling.temperature,
-                    request.text_sampling.top_k,
-                    request.text_sampling.top_p,
-                    &mut rng,
-                );
-                if request.text_sampling.repetition_window > 0 {
-                    if text_history.len() == request.text_sampling.repetition_window {
-                        text_history.pop_front();
-                    }
-                    text_history.push_back(token);
-                }
-                output.text_tokens += 1;
-                let delta = self.tokenizer.decode_incrementally(&mut decoder, token)?;
-                if !delta.is_empty() {
-                    on_text(&delta);
-                    output.text.push_str(&delta);
-                }
-                if token == TEXT_END {
-                    if interleaving {
-                        text_done = true;
-                        speaking = true;
-                    } else {
-                        finished = true;
-                    }
-                } else if token == IM_END || token == END_OF_TEXT {
+                row.text_history.push_back(token);
+            }
+            row.output.text_tokens += 1;
+            let delta = self
+                .tokenizer
+                .decode_incrementally(&mut row.decoder, token)?;
+            row.push_text(&delta);
+            if token == TEXT_END {
+                if interleaving {
+                    row.text_done = true;
+                    row.speaking = true;
+                } else {
                     finished = true;
-                } else if interleaving {
-                    // Inside a block the mode markers are ordinary text.
-                } else if token == AUDIO_START {
-                    mode = Lfm3AudioMode::Audio;
-                } else if token == MIXED_START {
-                    mode = Lfm3AudioMode::Interleaved;
-                    slots_left = INTERLEAVED_TEXT;
-                    speaking = false;
-                    text_done = false;
                 }
-                let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
-                self.lm.embed_tokens(&input)?
-            };
-            if interleaving && !text_done {
-                slots_left -= 1;
-                if slots_left == 0 {
-                    speaking = !speaking;
-                    slots_left = if speaking {
-                        INTERLEAVED_AUDIO
-                    } else {
-                        INTERLEAVED_TEXT
-                    };
-                }
+            } else if token == IM_END || token == END_OF_TEXT {
+                finished = true;
+            } else if interleaving {
+                // Inside a block the mode markers are ordinary text.
+            } else if token == AUDIO_START {
+                row.mode = Lfm3AudioMode::Audio;
+            } else if token == MIXED_START {
+                row.mode = Lfm3AudioMode::Interleaved;
+                row.slots_left = INTERLEAVED_TEXT;
+                row.speaking = false;
+                row.text_done = false;
             }
-            if finished {
-                output.stop_reason = "eos";
-                break;
+            let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
+            self.lm.embed_tokens(&input)?
+        };
+        if interleaving && !row.text_done {
+            row.slots_left -= 1;
+            if row.slots_left == 0 {
+                row.speaking = !row.speaking;
+                row.slots_left = if row.speaking {
+                    INTERLEAVED_AUDIO
+                } else {
+                    INTERLEAVED_TEXT
+                };
             }
-            if slot + 1 == max_slots {
-                break;
-            }
-            let hidden = state.forward(&self.lm, &next, prompt_tokens + slot)?;
-            last = hidden.squeeze(1)?;
         }
-        let tail = self.tokenizer.finish_incremental_decode(&mut decoder)?;
-        if !tail.is_empty() {
-            on_text(&tail);
-            output.text.push_str(&tail);
+        let position = row.output.prompt_tokens + row.slot;
+        row.slot += 1;
+        if finished {
+            self.stop_row(row, "eos")?;
+            return Ok(None);
         }
-        if codec.has_rows() || !pending_frames.is_empty() {
-            flush(&mut pending_frames, &mut codec, &mut output, true)?;
+        if row.slot == row.max_slots {
+            self.stop_row(row, "length")?;
+            return Ok(None);
         }
-        Ok(output)
+        Ok(Some((next, position)))
+    }
+
+    /// End a row: the tail of its text and its last speech.
+    pub(crate) fn stop_row(&self, row: &mut Lfm3AudioRow, reason: &'static str) -> Result<()> {
+        if row.done {
+            return Ok(());
+        }
+        row.done = true;
+        row.output.stop_reason = reason;
+        let tail = self.tokenizer.finish_incremental_decode(&mut row.decoder)?;
+        row.push_text(&tail);
+        if row.codec.has_rows() || !row.pending_frames.is_empty() {
+            self.flush_row(row, true)?;
+        }
+        Ok(())
+    }
+
+    /// Decode the row's pending frames (all of them with `finalize`).
+    fn flush_row(&self, row: &mut Lfm3AudioRow, finalize: bool) -> Result<()> {
+        if row.pending_frames.is_empty() && !finalize {
+            return Ok(());
+        }
+        let samples = self
+            .codec
+            .decode_stream(&mut row.codec, &row.pending_frames, finalize)?;
+        row.pending_frames.clear();
+        row.output.samples.extend_from_slice(&samples);
+        row.new_samples.extend_from_slice(&samples);
+        Ok(())
     }
 
     /// Transcribe one clip of at most 30 s (the training clips' length),

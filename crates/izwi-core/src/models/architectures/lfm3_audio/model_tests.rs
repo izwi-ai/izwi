@@ -341,7 +341,7 @@ fn time_components(profile: DeviceProfile) {
     time("frame (depth + feedback + LM step)", 24, &mut || {
         let frame = model
             .depth
-            .sample_frames(&last, &sampling, &[&history], &mut [&mut rng])
+            .sample_frames(&last, &[&sampling], &[&history], &mut [&mut rng])
             .unwrap()[0];
         frames.push(frame);
         let next = model.feedback_embed(&frame).unwrap();
@@ -356,7 +356,7 @@ fn time_components(profile: DeviceProfile) {
     time("depth sample_frames (3 passes)", 24, &mut || {
         model
             .depth
-            .sample_frames(&last, &sampling, &[&history], &mut [&mut rng])
+            .sample_frames(&last, &[&sampling], &[&history], &mut [&mut rng])
             .unwrap();
     });
     let inputs = model.depth.frame_inputs(&last).unwrap();
