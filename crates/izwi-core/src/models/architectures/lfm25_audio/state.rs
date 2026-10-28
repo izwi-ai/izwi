@@ -55,7 +55,7 @@ pub(crate) struct Lfm25AudioRetainedCheckpoint {
 }
 
 impl Lfm25AudioRetainedState {
-    pub(super) fn new(
+    pub(crate) fn new(
         mode: Lfm25AudioRetainedMode,
         shortconv: Lfm2ShortConvRuntimeState,
         max_depthformer_steps: usize,
@@ -76,6 +76,12 @@ impl Lfm25AudioRetainedState {
 
     pub(crate) const fn main_position(&self) -> usize {
         self.main_position
+    }
+
+    /// The ShortConv ring, for a model outside LFM2.5-Audio that runs its
+    /// language model on this state (LFM3-Audio).
+    pub(crate) fn shortconv_mut(&mut self) -> &mut Lfm2ShortConvRuntimeState {
+        &mut self.shortconv
     }
 
     pub(crate) const fn depthformer_step(&self) -> usize {

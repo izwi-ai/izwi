@@ -599,3 +599,152 @@ fn lfm3_audio_rows_are_batch_invariant_on_metal() {
     }
     rows_are_batch_invariant(profile);
 }
+
+/// One test arena's paged caches for `rows` language-model rows, in the KV
+/// dtype production leases on this backend.
+fn row_caches(model: &Lfm3AudioModel, rows: usize, capacity: usize) -> Vec<PhysicalPagedKvCache> {
+    let config = model.lm_config();
+    let layout = Lfm2StateLayout::from_config(config).unwrap();
+    let kv_heads = config
+        .attention_head_count_kv
+        .iter()
+        .copied()
+        .max()
+        .unwrap();
+    let head_dim = config.embedding_length / config.attention_head_count;
+    let kv_dtype = match super::super::physical::lfm3_audio_kv_dtype(model.device().kind.into()) {
+        crate::kv::v2::StateDType::F16 => DType::F16,
+        _ => DType::F32,
+    };
+    test_physical_caches_for_model_layers_on(
+        &model.device().device,
+        kv_dtype,
+        &layout.attention_model_layers,
+        kv_heads,
+        head_dim,
+        capacity,
+        rows,
+    )
+}
+
+/// Each seeded speech row's frames and samples. Row `i` prefills and joins
+/// the batch at decode step `joins[i]`; alone, every row runs by itself.
+fn tts_rows(
+    model: &Lfm3AudioModel,
+    rows: &[(&str, Lfm3AudioVoice, u64)],
+    joins: &[usize],
+    together: bool,
+) -> Vec<(Vec<[u32; CODEBOOKS]>, Vec<f32>)> {
+    use super::super::retained::{Lfm3AudioRetainedState, Lfm3AudioStepRow};
+    let capacity = 512;
+    let mut caches = row_caches(model, rows.len(), capacity);
+    let mut states = rows
+        .iter()
+        .map(|&(text, voice, seed)| {
+            let request = tts_request(text, voice, 60, Lfm3AudioSampling::default(), seed).unwrap();
+            Lfm3AudioRetainedState::new(model, model.prepare_row(request).unwrap(), capacity)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut samples = vec![Vec::new(); rows.len()];
+    let schedules: Vec<Vec<usize>> = if together {
+        vec![(0..rows.len()).collect()]
+    } else {
+        (0..rows.len()).map(|row| vec![row]).collect()
+    };
+    for group in schedules {
+        let mut joined = Vec::new();
+        for step in 0.. {
+            for &row in &group {
+                if !joined.contains(&row) && (!together || joins[row] == step) {
+                    let span = states[row].prompt_tokens();
+                    model
+                        .retained_prefill(&mut states[row], &mut caches[row], span)
+                        .unwrap();
+                    joined.push(row);
+                }
+            }
+            let live = joined
+                .iter()
+                .copied()
+                .filter(|&row| !states[row].finished())
+                .collect::<Vec<_>>();
+            if live.is_empty() && joined.len() == group.len() {
+                break;
+            }
+            let mut step_rows = states
+                .iter_mut()
+                .zip(caches.iter_mut())
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(_, (state, cache))| Lfm3AudioStepRow { state, cache })
+                .collect::<Vec<_>>();
+            if !step_rows.is_empty() {
+                model.retained_decode_batch(&mut step_rows).unwrap();
+            }
+            drop(step_rows);
+            for &row in &live {
+                samples[row].extend(states[row].take_samples());
+            }
+        }
+    }
+    states
+        .iter()
+        .zip(samples)
+        .map(|(state, samples)| (state.output().unwrap().frames.clone(), samples))
+        .collect()
+}
+
+/// Speech rows joining a running batch at different steps each speak
+/// exactly what they speak alone: the same frames and the same samples.
+fn tts_rows_are_batch_invariant(profile: DeviceProfile) {
+    let dir = models_dir().join(FOLDER);
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let backend = format!("{:?}", profile.kind);
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    let female = Lfm3AudioVoice::resolve(Some("female"), None).unwrap();
+    let male = Lfm3AudioVoice::resolve(Some("male"), None).unwrap();
+    let rows = [
+        (SENTENCE, female, 11),
+        ("Batching keeps every voice its own.", female, 12),
+        (SENTENCE, male, 13),
+        ("A late row joins mid-sentence.", female, 14),
+    ];
+    let joins = [0, 0, 5, 11];
+    let alone = tts_rows(&model, &rows, &joins, false);
+    let together = tts_rows(&model, &rows, &joins, true);
+    for (index, (alone, together)) in alone.iter().zip(&together).enumerate() {
+        eprintln!(
+            "{backend}: row {index}: {} frames, {} samples alone",
+            alone.0.len(),
+            alone.1.len()
+        );
+        assert!(!alone.0.is_empty(), "{backend}: row {index} spoke");
+        assert_eq!(alone.0, together.0, "{backend}: row {index} frames");
+        assert!(alone.1 == together.1, "{backend}: row {index} samples");
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_tts_rows_are_batch_invariant_on_cpu() {
+    tts_rows_are_batch_invariant(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_tts_rows_are_batch_invariant_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "lfm3_audio_tts_rows_are_batch_invariant_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        return;
+    }
+    tts_rows_are_batch_invariant(profile);
+}

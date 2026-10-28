@@ -14,6 +14,7 @@ pub(crate) mod model;
 pub(crate) mod physical;
 pub(crate) mod preprocessor;
 pub mod prompts;
+pub(crate) mod retained;
 pub(crate) mod sampling;
 
 pub use model::{lfm3_audio_tts_auto_max_frames, Lfm3AudioModel, Lfm3AudioOutput};

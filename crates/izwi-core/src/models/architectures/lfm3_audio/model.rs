@@ -258,6 +258,30 @@ impl Lfm3AudioLmState for RetainedLmState {
     }
 }
 
+/// A speech request: `text` in `voice`, at most `max_frames` frames.
+pub(crate) fn tts_request(
+    text: &str,
+    voice: Lfm3AudioVoice,
+    max_frames: usize,
+    sampling: Lfm3AudioSampling,
+    seed: u64,
+) -> Result<Lfm3AudioRequest> {
+    if text.trim().is_empty() {
+        return Err(Error::InvalidInput("LFM3-Audio TTS needs text".into()));
+    }
+    Ok(Lfm3AudioRequest {
+        prompt: tts_prompt(text, voice),
+        audio: None,
+        mode: Lfm3AudioMode::Audio,
+        text_only: false,
+        // The end-of-audio frame and the closing `<|im_end|>`.
+        max_slots: max_frames.max(1) + 2,
+        text_sampling: Lfm3TextSampling::default(),
+        audio_sampling: sampling,
+        seed,
+    })
+}
+
 fn check_prompt_fits(prompt_tokens: usize, context: usize) -> Result<()> {
     if prompt_tokens >= context {
         return Err(Error::InvalidInput(format!(
@@ -302,7 +326,10 @@ impl Lfm3AudioModel {
         let lm_loader = GgufLoader::from_path_with_backend(&path(lm_file)?, backend)?;
         let mut lm_config = parse_lfm3_backbone_config(&lm_loader)?;
         lm_config.context_length = lm_config.context_length.min(LFM3_AUDIO_CONTEXT_TOKENS);
-        let lm = QuantizedLfm2Backbone::load(&lm_loader, lm_config.clone(), &device.device)?;
+        let mut lm = QuantizedLfm2Backbone::load(&lm_loader, lm_config.clone(), &device.device)?;
+        // Rows decode alone or batched; sampled speech must not depend on
+        // which.
+        lm.make_decode_rows_invariant();
         let mmproj = GgufLoader::from_path_with_backend(&path(mmproj_file)?, backend)?;
         let encoder = Lfm3AudioEncoder::load(&mmproj, &device.device)?;
         let depth = Lfm3DepthDecoder::load(&mmproj, &device.device)?;
@@ -353,6 +380,29 @@ impl Lfm3AudioModel {
 
     pub(crate) fn lm_config(&self) -> &Lfm2BackboneConfig {
         &self.lm_config
+    }
+
+    pub(crate) fn lm(&self) -> &QuantizedLfm2Backbone {
+        &self.lm
+    }
+
+    pub(crate) fn new_lm_shortconv_state(&self) -> Lfm2ShortConvRuntimeState {
+        self.lm.new_shortconv_state()
+    }
+
+    /// A request's prompt embeddings, computed once before its row runs.
+    pub(crate) fn prepare_row(
+        &self,
+        request: Lfm3AudioRequest,
+    ) -> Result<std::sync::Arc<super::retained::Lfm3AudioPreparedArtifact>> {
+        let (embeds, prompt_tokens) = self.prompt_embeds(&request)?;
+        Ok(std::sync::Arc::new(
+            super::retained::Lfm3AudioPreparedArtifact {
+                request,
+                embeds,
+                prompt_tokens,
+            },
+        ))
     }
 
     pub fn max_context_tokens(&self) -> usize {
@@ -456,15 +506,9 @@ impl Lfm3AudioModel {
         Ok(row.output)
     }
 
-    /// Prompt embeddings `[1, tokens, 2048]` and their token count, for a
-    /// caller that prefills a row's language-model state itself.
-    pub(crate) fn row_prompt(&self, request: &Lfm3AudioRequest) -> Result<(Tensor, usize)> {
-        self.prompt_embeds(request)
-    }
-
-    /// A row after its prompt's prefill: `hidden` holds the prompt's
-    /// language-model hidden states `[1, prompt_tokens, 2048]`, and the
-    /// row's slots stop where its `context` ends.
+    /// A row after its prompt's prefill: `hidden` holds the language-model
+    /// hidden states `[1, span, 2048]` of the prompt's last prefill span, and
+    /// the row's slots stop where its `context` ends.
     pub(crate) fn begin_row(
         &self,
         request: &Lfm3AudioRequest,
@@ -482,9 +526,7 @@ impl Lfm3AudioModel {
             audio_sampling: request.audio_sampling,
             max_slots: request.max_slots.min(context - prompt_tokens),
             slot: 0,
-            last: hidden
-                .i((.., prompt_tokens - 1..prompt_tokens, ..))?
-                .squeeze(1)?,
+            last: hidden.i((.., hidden.dim(1)? - 1, ..))?,
             rng: SplitMix64::new(request.seed),
             decoder: IncrementalDecoder::new(true),
             text_history: std::collections::VecDeque::new(),
@@ -808,21 +850,8 @@ impl Lfm3AudioModel {
         should_stop: &mut dyn FnMut() -> bool,
         on_audio: &mut dyn FnMut(&[f32]),
     ) -> Result<Lfm3AudioOutput> {
-        if text.trim().is_empty() {
-            return Err(Error::InvalidInput("LFM3-Audio TTS needs text".into()));
-        }
         self.generate(
-            Lfm3AudioRequest {
-                prompt: tts_prompt(text, voice),
-                audio: None,
-                mode: Lfm3AudioMode::Audio,
-                text_only: false,
-                // The end-of-audio frame and the closing `<|im_end|>`.
-                max_slots: max_frames.max(1) + 2,
-                text_sampling: Lfm3TextSampling::default(),
-                audio_sampling: sampling,
-                seed,
-            },
+            tts_request(text, voice, max_frames, sampling, seed)?,
             state,
             should_stop,
             &mut |_| {},
