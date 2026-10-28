@@ -181,6 +181,51 @@ fn loaded_lfm_chat_profile_selects_published_sequence_stages() {
 }
 
 #[test]
+fn realtime_profiles_check_out_against_the_lfm3_audio_live_asr_graph() {
+    let variant = ModelVariant::Lfm3Audio2BGguf;
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    for contract in draft
+        .execution_contracts(CapabilityKind::RealtimeAsr)
+        .unwrap()
+    {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new()).with_model_variant(variant);
+        request
+            .bind_execution_adapter(ExecutionAdapterBinding {
+                execution_group_id: contract.execution_group_id,
+                model_instance_id: contract.model_instance_id,
+                adapter_instance_id: contract.adapter_instance_id,
+                adapter_abi_revision: contract.adapter_abi_revision,
+                model_variant: variant,
+                capability_id: "realtime_asr".into(),
+                stages: contract.stages,
+            })
+            .unwrap();
+        let mut profile = contract.execution_profile;
+        let checked = crate::engine::core::EngineCore::apply_adapter_execution_contract(
+            &request,
+            profile.clone(),
+        )
+        .unwrap();
+        assert_eq!(checked.mode, crate::engine::ExecutionMode::Realtime);
+        assert_eq!(checked.prefill_batch, NativeBatchMode::Static);
+        assert_eq!(checked.decode_batch, NativeBatchMode::Continuous);
+        // A sequence profile names steps the realtime graph has no stage for.
+        profile.mode = crate::engine::ExecutionMode::Sequence;
+        assert!(
+            crate::engine::core::EngineCore::apply_adapter_execution_contract(&request, profile)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn lfm_audio_profiles_report_actual_f32_despite_global_bf16_preference() {
     let executor = NativeExecutor::new(WorkerConfig {
         backend: BackendKind::Cuda,

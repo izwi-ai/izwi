@@ -1365,7 +1365,8 @@ Constraints:
 
 Noise handling:
 
-- Models that stream natively (Voxtral Realtime, Nemotron) transcribe as audio arrives. Voxtral would otherwise turn background noise into made-up words, so its input passes a noise gate: audio is held for 500 ms, and anything that is not confirmed speech (300 ms of voiced speech, 6 dB above the stream's own noise floor) reaches the model as silence. Its transcripts therefore arrive about 500 ms later. Steady noise such as a fan, hum or pink noise produces no text; music and crowd babble can still pass. `IZWI_ASR_REALTIME_NOISE_GATE=0` turns the gate off.
+- Models that stream natively (Voxtral Realtime, Nemotron, LFM3-Audio) transcribe as audio arrives. Voxtral and LFM3-Audio would otherwise turn background noise into made-up words, so their input passes a noise gate: audio is held for 500 ms, and anything that is not confirmed speech (300 ms of voiced speech, 6 dB above the stream's own noise floor) reaches the model as silence. Their transcripts therefore arrive about 500 ms later. Steady noise such as a fan, hum or pink noise produces no text; music and crowd babble can still pass. `IZWI_ASR_REALTIME_NOISE_GATE=0` turns the gate off.
+- LFM3-Audio transcribes English only and takes no prompt. It writes the text of each 0.96 s of audio once that audio has arrived. Every 29 s (sooner at a pause after about 23 s) a stream continues in a fresh context that hears the last 2.88 s again; the transcript keeps the repeated words once.
 - Other models re-transcribe a rolling window of recent audio. A window that only grew by non-speech since the last pass is not transcribed again.
 
 ### Voice Realtime

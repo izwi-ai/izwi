@@ -658,10 +658,13 @@ impl ModelLifecycleController {
         bundle_draft: &LoadedModelBundleDraft,
         state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<()> {
+        // LFM3-Audio's LiveASR sessions share the arena of its other
+        // capabilities (`allocate_lfm3_audio_state`).
         if self
             .adapter_registry
             .require(CapabilityKind::RealtimeAsr, variant)
             .is_ok()
+            && variant.family() != crate::catalog::ModelFamily::Lfm3Audio
         {
             let contracts =
                 bundle_draft.execution_contracts(CapabilityKind::RealtimeAsr)?;
@@ -1032,6 +1035,7 @@ impl ModelLifecycleController {
                 CapabilityKind::SpeechToSpeech,
                 Lfm3AudioWorkload::Conversation,
             ),
+            (CapabilityKind::RealtimeAsr, Lfm3AudioWorkload::LiveAsr),
         ];
         let mut plans = Vec::with_capacity(capabilities.len());
         for (capability, workload) in capabilities {
@@ -1075,7 +1079,10 @@ impl ModelLifecycleController {
                 .iter()
                 .map(|contract| {
                     let retained_use = match contract.execution_profile.mode {
-                        crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
+                        crate::engine::ExecutionMode::Sequence
+                        | crate::engine::ExecutionMode::Realtime => {
+                            RetainedStateUseV2::ExternalPaged
+                        }
                         crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
                         _ => {
                             return Err(Error::ModelLoadError(

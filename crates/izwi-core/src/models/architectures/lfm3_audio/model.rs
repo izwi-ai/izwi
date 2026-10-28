@@ -1035,6 +1035,10 @@ pub(crate) fn lfm3_audio_asr_max_tokens(seconds: f32) -> usize {
 
 #[path = "live_asr.rs"]
 mod live_asr;
+pub(crate) use live_asr::{
+    lfm3_live_asr_operation_bounds, Lfm3LiveAsr, Lfm3LiveTranscript, LFM3_LIVE_ASR_OVERLAP_SECONDS,
+    LFM3_LIVE_ASR_SEGMENT_SECONDS,
+};
 
 #[cfg(test)]
 #[path = "model_tests.rs"]

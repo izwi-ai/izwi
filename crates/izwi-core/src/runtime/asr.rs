@@ -1,11 +1,12 @@
 //! ASR runtime methods routed through the unified core engine.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::audio::HighQualityResampler;
 use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId};
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
@@ -26,13 +27,16 @@ use crate::models::architectures::granite_speech5::asr::{
     validate_granite_speech5_request, GraniteSpeech5RequestOptions,
     GRANITE_SPEECH5_AUTO_MAX_TOKENS,
 };
+use crate::models::architectures::lfm3_audio::model::{
+    Lfm3LiveTranscript, LFM3_LIVE_ASR_OVERLAP_SECONDS, LFM3_LIVE_ASR_SEGMENT_SECONDS,
+};
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
     VoxtralRealtimePreparationMode, VoxtralRealtimePreparationStageSeal,
     VoxtralRealtimePreparedResourceUsage,
 };
 use crate::models::registry::{
-    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
+    Lfm25AudioModelLease, NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
     VoxtralModelLease,
 };
@@ -77,20 +81,21 @@ mod speaker_attribution;
 mod transcribe;
 use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
 use realtime_session::{
-    add_realtime_stream_reservation, map_native_realtime_events, realtime_asr_execution_path,
-    realtime_segment_rollover_due, realtime_state_observation,
-    realtime_state_with_input_observation, realtime_stream_resource_vector,
-    realtime_trailing_quiet_samples, release_realtime_asr_cleanup, run_realtime_blocking_operation,
-    spawn_realtime_asr_watchdog, validate_realtime_input_copy,
-    voxtral_realtime_committed_observation, voxtral_realtime_preparation_cost,
-    RealtimeAsrEngineOperationHandles, RealtimeAsrOperationGuard, RealtimeAsrOperationHandles,
-    RealtimeAsrSessionLease, RealtimeEngineSegment, RuntimeAsrRealtimeResources,
-    RuntimeAsrRealtimeState, RuntimeEngineRealtimeSession,
+    add_realtime_stream_reservation, engine_realtime_family_name, lfm3_live_asr_language,
+    map_native_realtime_events, realtime_asr_execution_path, realtime_segment_rollover_due,
+    realtime_state_observation, realtime_state_with_input_observation,
+    realtime_stream_resource_vector, realtime_trailing_quiet_samples, release_realtime_asr_cleanup,
+    run_realtime_blocking_operation, spawn_realtime_asr_watchdog, validate_realtime_input_copy,
+    EngineRealtimeModel, Lfm3RealtimeInput, RealtimeAsrEngineOperationHandles,
+    RealtimeAsrOperationGuard, RealtimeAsrOperationHandles, RealtimeAsrSessionLease,
+    RealtimeEngineSegment, RuntimeAsrRealtimeResources, RuntimeAsrRealtimeState,
+    RuntimeEngineRealtimeSession,
 };
 #[cfg(test)]
 use realtime_session::{
-    realtime_asr_session_expiration, voxtral_realtime_preparation_cost_from_geometry,
-    RealtimeAsrCleanupGuard, RealtimeAsrDetachedResources, REALTIME_SEGMENT_PAUSE_MS,
+    realtime_asr_session_expiration, voxtral_realtime_committed_observation,
+    voxtral_realtime_preparation_cost_from_geometry, RealtimeAsrCleanupGuard,
+    RealtimeAsrDetachedResources, REALTIME_SEGMENT_PAUSE_MS,
     REALTIME_SEGMENT_SOFT_ROLLOVER_DIVISOR,
 };
 #[cfg(test)]
@@ -664,6 +669,8 @@ pub struct RuntimeAsrRealtimeStream {
     engine_text: String,
     engine_chunk_index: usize,
     segment: RealtimeEngineSegment,
+    /// LFM3-Audio's 16 kHz input and joined transcript across segments.
+    lfm3: Option<Lfm3RealtimeInput>,
 }
 
 #[derive(Debug, Clone)]

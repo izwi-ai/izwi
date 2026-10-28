@@ -37,6 +37,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm3AudioTts,
     Lfm3AudioAsr,
     Lfm3AudioChat,
+    Lfm3AudioRealtime,
     KokoroStaticTts,
     Scalar,
 }
@@ -64,6 +65,7 @@ impl LoadedAdapterKind {
             Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
             Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
             Self::Lfm3AudioChat => "builtin.lfm3_audio_chat.physical_sequence",
+            Self::Lfm3AudioRealtime => "builtin.lfm3_audio_realtime.physical_session",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -368,7 +370,8 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // retained rows that batch: the language model's pages and ring stay
         // in the managed arena between quanta. Speech streams as the codec
         // decodes it; a clip of at most 30 s transcribes as a row, longer
-        // audio in clips of at most 30 s, one atomic dispatch each.
+        // audio in clips of at most 30 s, one atomic dispatch each. LiveASR
+        // sessions (English) run as engine realtime rows on the same arena.
         row(
             F::Lfm3Audio,
             C::Tts,
@@ -398,6 +401,13 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
+        row(
+            F::Lfm3Audio,
+            C::RealtimeAsr,
+            Loaded::Lfm3AudioRealtime,
+            RetainedAndInvocation,
+        )
+        .realtime(RealtimeAsrPath::Engine),
         // Chat.
         chat(F::Qwen3Chat).only(QWEN3_RESUMABLE_CHAT).resumable(),
         chat(F::Qwen3Chat).only(QWEN3_ATOMIC_CHAT),

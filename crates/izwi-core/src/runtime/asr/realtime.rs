@@ -15,11 +15,17 @@ impl RuntimeService {
         absolute_deadline: Instant,
         idle_timeout: Duration,
     ) -> Result<RuntimeAsrRealtimeStream> {
-        if variant.family() == ModelFamily::Voxtral
-            && prompt.is_some_and(|prompt| !prompt.trim().is_empty())
+        if prompt.is_some_and(|prompt| !prompt.trim().is_empty()) {
+            return Err(Error::InvalidInput(format!(
+                "{} realtime ASR does not support an initial text prompt",
+                engine_realtime_family_name(variant.family())
+            )));
+        }
+        if variant.family() == ModelFamily::Lfm3Audio
+            && language.is_some_and(|language| !lfm3_live_asr_language(language))
         {
             return Err(Error::InvalidInput(
-                "Voxtral realtime ASR does not support an initial text prompt".into(),
+                "LFM3-Audio realtime ASR transcribes English only".into(),
             ));
         }
         // The session's operations run on the engine's step driver, which
@@ -46,15 +52,20 @@ impl RuntimeService {
                 CapabilityLoadOptions::default(),
             )
             .await?;
-        let (
-            model,
-            max_samples,
-            max_host_bytes,
-            max_tensor_bytes,
-            max_output_steps,
-            max_cache_append,
-            voxtral_model,
-        ) = match variant.family() {
+        let kv_reach = state_binding
+            .state
+            .managed_kv_runtime()
+            .map(|runtime| runtime.logical_token_reach())
+            .filter(|tokens| *tokens > 0)
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "realtime ASR state has no finite physical KV-token ceiling".into(),
+                )
+            })?;
+        let (model, max_samples, max_host_bytes, max_tensor_bytes, max_cache_append) = match variant
+            .family()
+        {
             ModelFamily::Voxtral => {
                 let model = self
                     .model_registry
@@ -65,25 +76,46 @@ impl RuntimeService {
                     })?;
                 let peak = model.realtime_stream_peak_reservation()?;
                 let max_output_steps = model.realtime_max_output_steps()?;
-                let max_cache_append = state_binding
-                    .state
-                    .managed_kv_runtime()
-                    .map(|runtime| runtime.logical_token_reach())
-                    .filter(|tokens| *tokens > 0)
-                    .and_then(|tokens| usize::try_from(tokens).ok())
-                    .ok_or_else(|| {
-                        Error::ModelLoadError(
-                            "Voxtral realtime state has no finite physical KV-token ceiling".into(),
-                        )
-                    })?;
                 (
-                    model.clone(),
+                    EngineRealtimeModel::Voxtral {
+                        model,
+                        max_output_steps,
+                    },
                     peak.max_source_samples,
                     peak.max_host_bytes,
                     peak.max_tensor_bytes,
-                    max_output_steps,
-                    max_cache_append,
-                    Some(model),
+                    kv_reach,
+                )
+            }
+            ModelFamily::Lfm3Audio => {
+                use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
+                use crate::models::architectures::lfm3_audio::{
+                    LFM3_AUDIO_REALTIME_STATE_HOST_BYTES, LFM3_AUDIO_REALTIME_STATE_TENSOR_BYTES,
+                };
+                let model = self
+                    .model_registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+                    })?;
+                model.lfm3_audio()?;
+                (
+                    EngineRealtimeModel::Lfm3Audio { _model: model },
+                    Lfm3RealtimeInput::segment_samples(),
+                    LFM3_AUDIO_REALTIME_STATE_HOST_BYTES
+                        .checked_add(u64::try_from(metadata_bytes).map_err(|_| {
+                            Error::Overloaded(
+                                "realtime ASR retained metadata usage exceeds u64".into(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            Error::Overloaded("LFM3-Audio retained host usage overflowed".into())
+                        })?,
+                    LFM3_AUDIO_REALTIME_STATE_TENSOR_BYTES,
+                    // The arena serves every LFM3-Audio capability; a
+                    // segment's pages grow to its own context at most.
+                    kv_reach.min(Lfm3AudioWorkload::LiveAsr.context_tokens()),
                 )
             }
             _ => {
@@ -151,11 +183,10 @@ impl RuntimeService {
         let engine_session = RuntimeEngineRealtimeSession {
             engine: self.core_engine.clone(),
             handle,
-            model,
+            model: model.clone(),
             retained_metadata_bytes: u64::try_from(metadata_bytes).map_err(|_| {
                 Error::Overloaded("realtime ASR retained metadata usage exceeds u64".into())
             })?,
-            max_output_steps,
             max_cache_append,
         };
         let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
@@ -166,7 +197,7 @@ impl RuntimeService {
             job: Some(job),
             session_lease: Some(session_lease),
             engine_session: Some(engine_session),
-            voxtral_model,
+            engine_model: Some(model),
             absolute_deadline,
             idle_timeout,
             last_activity: Instant::now(),
@@ -188,6 +219,7 @@ impl RuntimeService {
             engine_text: String::new(),
             engine_chunk_index: 0,
             segment: RealtimeEngineSegment::new(language, prompt),
+            lfm3: (variant.family() == ModelFamily::Lfm3Audio).then(Lfm3RealtimeInput::new),
         })
     }
 
@@ -329,7 +361,7 @@ impl RuntimeService {
             job: Some(job),
             session_lease: Some(session_lease),
             engine_session: None,
-            voxtral_model: None,
+            engine_model: None,
             absolute_deadline,
             idle_timeout: limits.idle_timeout,
             last_activity: Instant::now(),
@@ -352,6 +384,7 @@ impl RuntimeService {
             engine_text: String::new(),
             engine_chunk_index: 0,
             segment: RealtimeEngineSegment::default(),
+            lfm3: None,
         }))
     }
 
@@ -392,6 +425,10 @@ impl RuntimeService {
             return Ok(Vec::new());
         }
         if stream.execution_path() == RealtimeAsrPath::Engine {
+            if let Some(lfm3) = stream.lfm3.as_mut() {
+                let heard = lfm3.resample(samples, sample_rate)?;
+                return self.push_lfm3_realtime_samples(stream, &heard).await;
+            }
             let mut events = Vec::new();
             if realtime_segment_rollover_due(
                 stream.committed_samples,
@@ -414,113 +451,10 @@ impl RuntimeService {
                     }
                 };
             }
-            let total_samples = stream
-                .committed_samples
-                .checked_add(samples.len())
-                .ok_or_else(|| Error::Overloaded("realtime ASR sample clock overflowed".into()))?;
-            validate_realtime_input_copy(total_samples, stream.max_samples)?;
-            let handles = stream.begin_engine_operation(true)?;
-            let operation_lease = self
-                .model_lifecycle
-                .try_acquire_ready_lease(stream.variant)
-                .ok_or_else(|| {
-                    Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
-                });
-            let operation_lease = match operation_lease {
-                Ok(lease) => lease,
-                Err(error) => {
-                    stream.close();
-                    return Err(error);
-                }
-            };
-            let RealtimeAsrEngineOperationHandles {
-                session,
-                job,
-                session_lease,
-                _guard: operation_guard,
-            } = handles;
-            if stream
-                .engine_sample_rate
-                .is_some_and(|established| established != sample_rate)
-            {
-                drop((operation_lease, session_lease, operation_guard));
-                return Err(Error::InvalidInput(
-                    "realtime ASR sample rate changed within one stream".into(),
-                ));
-            }
-            // Voxtral recomputes its preparation over the committed prefix.
-            let geometry = session
-                .model
-                .realtime_preparation_geometry_for_source_samples(
-                    total_samples,
-                    sample_rate,
-                    VoxtralRealtimePreparationMode::Push,
-                )?;
-            let preparation_cost = voxtral_realtime_preparation_cost(&session.model, geometry)?;
-            let committed_observation = voxtral_realtime_committed_observation(
-                session.retained_metadata_bytes,
-                session.model.realtime_prepared_resource_usage(geometry)?,
-            )?;
-            let ordering = match self
-                .coordinator
-                .acquire_job_ordering(&job, stream.operation_gate.clone())
-                .await
-            {
-                Ok(ordering) => ordering,
-                Err(error) => {
-                    drop((operation_lease, session_lease, operation_guard));
-                    if matches!(error, Error::Timeout(_)) {
-                        stream.close_due_to_timeout();
-                    } else {
-                        stream.close();
-                    }
-                    return Err(error);
-                }
-            };
-            let operation = session
-                .engine
-                .push_realtime_asr_samples_with_outputs_and_cost(
-                    &session.handle,
-                    samples.to_vec(),
-                    sample_rate,
-                    session.max_output_steps,
-                    session.max_cache_append,
-                    preparation_cost,
-                );
-            let result = match job.spec.deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
-                    Ok(result) => result,
-                    Err(_) => Err(Error::Timeout("realtime ASR Engine push".into())),
-                },
-                None => operation.await,
-            };
-            drop((ordering, operation_lease, session_lease, operation_guard));
-            let (ack, outputs) = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    if matches!(error, Error::Timeout(_)) {
-                        stream.close_due_to_timeout();
-                    } else {
-                        stream.close();
-                    }
-                    return Err(error);
-                }
-            };
-            if ack.accepted_samples() != samples.len() {
-                stream.close();
-                return Err(Error::InferenceError(
-                    "realtime ASR Engine acknowledgement reported the wrong sample span".into(),
-                ));
-            }
-            if let Err(error) = job.record_materialized_usage(committed_observation) {
-                stream.close();
-                return Err(error);
-            }
-            stream.committed_samples = total_samples;
-            stream.engine_sample_rate = Some(sample_rate);
-            stream.segment.trailing_quiet_samples =
-                realtime_trailing_quiet_samples(stream.segment.trailing_quiet_samples, samples);
-            events.extend(stream.map_engine_outputs(outputs));
+            events.extend(
+                self.push_engine_realtime_operation(stream, samples, sample_rate)
+                    .await?,
+            );
             return Ok(events);
         }
         let handles = stream.begin_operation(true)?;
@@ -581,6 +515,161 @@ impl RuntimeService {
         Ok(map_native_realtime_events(events))
     }
 
+    /// One push on the stream's current Engine session.
+    async fn push_engine_realtime_operation(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let total_samples = stream
+            .committed_samples
+            .checked_add(samples.len())
+            .ok_or_else(|| Error::Overloaded("realtime ASR sample clock overflowed".into()))?;
+        validate_realtime_input_copy(total_samples, stream.max_samples)?;
+        let handles = stream.begin_engine_operation(true)?;
+        let operation_lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(stream.variant)
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+            });
+        let operation_lease = match operation_lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                stream.close();
+                return Err(error);
+            }
+        };
+        let RealtimeAsrEngineOperationHandles {
+            session,
+            job,
+            session_lease,
+            _guard: operation_guard,
+        } = handles;
+        if stream
+            .engine_sample_rate
+            .is_some_and(|established| established != sample_rate)
+        {
+            drop((operation_lease, session_lease, operation_guard));
+            return Err(Error::InvalidInput(
+                "realtime ASR sample rate changed within one stream".into(),
+            ));
+        }
+        let budget = session.operation_budget(
+            stream.committed_samples,
+            samples.len(),
+            sample_rate,
+            false,
+        )?;
+        let ordering = match self
+            .coordinator
+            .acquire_job_ordering(&job, stream.operation_gate.clone())
+            .await
+        {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                drop((operation_lease, session_lease, operation_guard));
+                if matches!(error, Error::Timeout(_)) {
+                    stream.close_due_to_timeout();
+                } else {
+                    stream.close();
+                }
+                return Err(error);
+            }
+        };
+        let operation = session
+            .engine
+            .push_realtime_asr_samples_with_outputs_and_cost(
+                &session.handle,
+                samples.to_vec(),
+                sample_rate,
+                budget.max_output_steps,
+                session.max_cache_append,
+                budget.preparation_cost,
+            );
+        let result = match job.spec.deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::Timeout("realtime ASR Engine push".into())),
+            },
+            None => operation.await,
+        };
+        drop((ordering, operation_lease, session_lease, operation_guard));
+        let (ack, outputs) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error, Error::Timeout(_)) {
+                    stream.close_due_to_timeout();
+                } else {
+                    stream.close();
+                }
+                return Err(error);
+            }
+        };
+        if ack.accepted_samples() != samples.len() {
+            stream.close();
+            return Err(Error::InferenceError(
+                "realtime ASR Engine acknowledgement reported the wrong sample span".into(),
+            ));
+        }
+        if let Err(error) = job.record_materialized_usage(budget.committed_observation) {
+            stream.close();
+            return Err(error);
+        }
+        stream.committed_samples = total_samples;
+        stream.engine_sample_rate = Some(sample_rate);
+        stream.segment.trailing_quiet_samples =
+            realtime_trailing_quiet_samples(stream.segment.trailing_quiet_samples, samples);
+        if let Some(lfm3) = stream.lfm3.as_mut() {
+            lfm3.heard(samples);
+        }
+        Ok(stream.map_engine_outputs(outputs))
+    }
+
+    /// Push LFM3-Audio's 16 kHz audio. A segment rolls over before it would
+    /// hear more than its context holds, and the new one hears the old one's
+    /// last seconds again, so a piece leaves room for that overlap.
+    async fn push_lfm3_realtime_samples(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+        heard: &[f32],
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let sample_rate = Lfm3RealtimeInput::SAMPLE_RATE;
+        if heard.is_empty() {
+            // The resampler still holds this audio.
+            stream.ensure_open()?;
+            return Ok(Vec::new());
+        }
+        let piece_samples = stream.max_samples - Lfm3RealtimeInput::overlap_samples();
+        let mut events = Vec::new();
+        for piece in heard.chunks(piece_samples) {
+            if realtime_segment_rollover_due(
+                stream.committed_samples,
+                piece.len(),
+                stream.segment.trailing_quiet_samples,
+                stream.max_samples,
+                sample_rate,
+            ) {
+                match self
+                    .roll_over_engine_realtime_segment(stream, sample_rate)
+                    .await
+                {
+                    Ok(rolled) => events.extend(rolled),
+                    Err(error) => {
+                        stream.close();
+                        return Err(error);
+                    }
+                }
+            }
+            events.extend(
+                self.push_engine_realtime_operation(stream, piece, sample_rate)
+                    .await?,
+            );
+        }
+        Ok(events)
+    }
+
     /// Flushes the current Engine session's audio and returns its final
     /// outputs. Success leaves the stream open so the caller decides between
     /// ending it and rolling over into a fresh session.
@@ -611,18 +700,7 @@ impl RuntimeService {
         let sample_rate = stream.engine_sample_rate.ok_or_else(|| {
             Error::InvalidInput("realtime ASR finish requires committed audio".into())
         })?;
-        let geometry = session
-            .model
-            .realtime_preparation_geometry_for_source_samples(
-                stream.committed_samples,
-                sample_rate,
-                VoxtralRealtimePreparationMode::Finish,
-            )?;
-        let preparation_cost = voxtral_realtime_preparation_cost(&session.model, geometry)?;
-        let committed_observation = voxtral_realtime_committed_observation(
-            session.retained_metadata_bytes,
-            session.model.realtime_prepared_resource_usage(geometry)?,
-        )?;
+        let budget = session.operation_budget(stream.committed_samples, 0, sample_rate, true)?;
         let ordering = match self
             .coordinator
             .acquire_job_ordering(&job, stream.operation_gate.clone())
@@ -643,9 +721,9 @@ impl RuntimeService {
             .engine
             .finish_realtime_asr_session_with_outputs_and_cost(
                 &session.handle,
-                session.max_output_steps,
+                budget.max_output_steps,
                 session.max_cache_append,
-                preparation_cost,
+                budget.preparation_cost,
             );
         let result = match job.spec.deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
@@ -666,7 +744,7 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        if let Err(error) = job.record_materialized_usage(committed_observation) {
+        if let Err(error) = job.record_materialized_usage(budget.committed_observation) {
             stream.close();
             return Err(error);
         }
@@ -691,7 +769,22 @@ impl RuntimeService {
         }
         let (session_lease, absolute_deadline, idle_timeout) = stream.segment_authorities()?;
         let outputs = self.finish_engine_realtime_segment(stream).await?;
-        let mut events = stream.map_engine_outputs(outputs);
+        let mut events = match stream.lfm3.as_mut() {
+            // LFM3-Audio's last block heard audio cut at the boundary, maybe
+            // mid-word. The next segment hears that audio again whole, so
+            // the block's text is left to it; text the transcript still
+            // holds from an earlier boundary is settled.
+            Some(lfm3) => {
+                drop(outputs);
+                let settled = lfm3.transcript.flush();
+                if settled.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![stream.engine_text_event(settled, false)]
+                }
+            }
+            None => stream.map_engine_outputs(outputs),
+        };
         for event in &mut events {
             event.is_final = false;
         }
@@ -723,6 +816,20 @@ impl RuntimeService {
             )
             .await?;
         stream.continue_on(&mut next);
+        if let Some(lfm3) = stream.lfm3.as_mut() {
+            // LFM3-Audio's new segment hears the old one's last seconds
+            // again, so its first words have context; the transcript drops
+            // their repeat.
+            let settled = lfm3.transcript.start_segment();
+            let overlap = lfm3.overlap();
+            if !settled.is_empty() {
+                events.push(stream.engine_text_event(settled, false));
+            }
+            events.extend(
+                self.push_engine_realtime_operation(stream, &overlap, sample_rate)
+                    .await?,
+            );
+        }
         Ok(events)
     }
 
@@ -749,9 +856,21 @@ impl RuntimeService {
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
         if stream.execution_path() == RealtimeAsrPath::Engine {
+            let mut events = Vec::new();
+            if let Some(lfm3) = stream.lfm3.as_mut() {
+                let tail = match lfm3.finish() {
+                    Ok(tail) => tail,
+                    Err(error) => {
+                        stream.close();
+                        return Err(error);
+                    }
+                };
+                events = self.push_lfm3_realtime_samples(stream, &tail).await?;
+            }
             let outputs = self.finish_engine_realtime_segment(stream).await?;
             stream.close();
-            return Ok(stream.map_engine_outputs(outputs));
+            events.extend(stream.map_engine_outputs(outputs));
+            return Ok(events);
         }
         let handles = stream.begin_operation(false)?;
         let operation_lease = self

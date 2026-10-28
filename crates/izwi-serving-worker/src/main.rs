@@ -894,9 +894,10 @@ impl WorkerProcessConfig {
                     .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
                 match variant.family() {
                     izwi_core::catalog::ModelFamily::NemotronAsr
-                    | izwi_core::catalog::ModelFamily::Voxtral => variant,
+                    | izwi_core::catalog::ModelFamily::Voxtral
+                    | izwi_core::catalog::ModelFamily::Lfm3Audio => variant,
                     other => bail!(
-                        "realtime speech_to_text workers support only Nemotron ASR and Voxtral families; {model} is {other:?}"
+                        "realtime speech_to_text workers support only Nemotron ASR, Voxtral and LFM3-Audio families; {model} is {other:?}"
                     ),
                 }
             }
@@ -1441,13 +1442,17 @@ fn execution_profile(
             ModelVariant::Qwen36Moe35BA3BFp8 => ("fp8-block", "native-qwen35-moe"),
             other => bail!("no serving execution profile for chat model {other}"),
         },
-        TaskKind::SpeechToText => (
-            "fp16",
-            match variant.family() {
-                izwi_core::catalog::ModelFamily::NemotronAsr => "native-nemotron-realtime",
-                _ => "native-voxtral-realtime",
-            },
-        ),
+        TaskKind::SpeechToText => match variant {
+            ModelVariant::Lfm3Audio2BGguf => ("gguf-q4_k_m", "native-lfm3-audio-realtime"),
+            ModelVariant::Lfm3Audio2BQ8Gguf => ("gguf-q8_0", "native-lfm3-audio-realtime"),
+            _ => (
+                "fp16",
+                match variant.family() {
+                    izwi_core::catalog::ModelFamily::NemotronAsr => "native-nemotron-realtime",
+                    _ => "native-voxtral-realtime",
+                },
+            ),
+        },
         TaskKind::TextToSpeech => ("fp32", "native-tts-realtime"),
         TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     })

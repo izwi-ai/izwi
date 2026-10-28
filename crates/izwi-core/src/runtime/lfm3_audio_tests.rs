@@ -1,12 +1,13 @@
 //! LFM3-Audio through the runtime: load, then every public speech route
 //! the server calls, on the backend the runtime selects.
 //!
-//! The test needs the published GGUFs. It runs when
+//! The tests need the published GGUFs. They run when
 //! `IZWI_LFM3_AUDIO_MODELS_DIR` names the models directory and is otherwise
 //! reported as not run.
 //!
-//! `IZWI_LFM3_AUDIO_BACKEND=metal` runs it on Metal instead of the CPU, and
-//! `IZWI_LFM3_AUDIO_BATCH=4` runs speech and transcription rows four wide.
+//! `IZWI_LFM3_AUDIO_BACKEND=metal` runs them on Metal instead of the CPU,
+//! and `IZWI_LFM3_AUDIO_BATCH=4` runs speech and transcription rows four
+//! wide.
 //!
 //! Run: `IZWI_LFM3_AUDIO_MODELS_DIR=~/Library/Application\ Support/izwi/models cargo test -p izwi-core --features metal --release --lib lfm3_audio_tests -- --nocapture`
 
@@ -189,11 +190,6 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
     assert_eq!(test_rate, fox_rate);
     let pause = vec![0.0; fox_rate as usize];
     let long = [test_samples.as_slice(), &pause, &fox_samples].concat();
-    let recall = |reference: &str, heard: &str| {
-        let heard = words(heard);
-        let reference = words(reference);
-        reference.iter().filter(|word| heard.contains(word)).count() as f64 / reference.len() as f64
-    };
     for (name, audio, reference) in [
         ("29.7 s", test_wav.clone(), test_text.clone()),
         (
@@ -537,4 +533,158 @@ async fn lfm3_audio_serves_asr_tts_and_voice_chat_if_env_set() {
         started.elapsed().as_secs_f64()
     );
     assert!(heard >= 0.9, "diarization ASR recall {heard:.2}");
+}
+
+/// The share of `reference`'s words that `heard` says.
+fn recall(reference: &str, heard: &str) -> f64 {
+    let heard = words(heard);
+    let reference = words(reference);
+    reference.iter().filter(|word| heard.contains(word)).count() as f64 / reference.len() as f64
+}
+
+/// Word pairs `heard` says more often than `reference` does: a new
+/// segment's repeat of the previous one's end shows up here.
+fn repeated_pairs(reference: &str, heard: &str) -> Vec<String> {
+    let pairs = |text: &str| {
+        words(text)
+            .windows(2)
+            .map(|pair| pair.join(" "))
+            .collect::<Vec<_>>()
+    };
+    let (reference, heard) = (pairs(reference), pairs(heard));
+    let count = |pairs: &[String], pair: &String| pairs.iter().filter(|p| *p == pair).count();
+    let mut repeated = heard
+        .iter()
+        .filter(|pair| count(&heard, pair) > count(&reference, pair).max(1))
+        .cloned()
+        .collect::<Vec<_>>();
+    repeated.sort();
+    repeated.dedup();
+    repeated
+}
+
+/// Stream `samples` at `rate` in 100 ms pushes and finish: the transcript
+/// the events' deltas make up, each event carrying it so far.
+async fn live_transcribe(
+    runtime: &RuntimeService,
+    model_id: &str,
+    samples: &[f32],
+    rate: u32,
+) -> String {
+    let mut stream = runtime
+        .try_start_asr_realtime_stream(Some(model_id), Some("en"), None)
+        .await
+        .expect("start LiveASR")
+        .expect("LFM3-Audio streams");
+    let mut text = String::new();
+    let mut take = |events: Vec<RuntimeAsrRealtimeEvent>| {
+        for event in events {
+            text.push_str(&event.delta);
+            assert_eq!(event.text, text, "an event carries the transcript so far");
+        }
+    };
+    for piece in samples.chunks(rate as usize / 10) {
+        take(
+            runtime
+                .push_asr_realtime_samples(&mut stream, piece, rate)
+                .await
+                .expect("push"),
+        );
+    }
+    let last = runtime
+        .finish_asr_realtime_stream(&mut stream)
+        .await
+        .expect("finish");
+    assert!(last.last().is_some_and(|event| event.is_final));
+    take(last);
+    assert!(stream.is_closed());
+    text
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm3_audio_live_asr_streams_on_engine_sessions_if_env_set() {
+    let Some(models_dir) = std::env::var_os("IZWI_LFM3_AUDIO_MODELS_DIR") else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "IZWI_LFM3_AUDIO_MODELS_DIR unset; not run"
+        );
+        return;
+    };
+    let backend = std::env::var("IZWI_LFM3_AUDIO_BACKEND")
+        .ok()
+        .and_then(|name| crate::backends::BackendPreference::parse(&name))
+        .unwrap_or(crate::backends::BackendPreference::Cpu);
+    #[cfg(feature = "metal")]
+    let _metal_lease = (backend == crate::backends::BackendPreference::Metal).then(|| {
+        crate::backends::metal_test_device_or_skip(
+            "lfm3_audio_live_asr_streams_on_engine_sessions_if_env_set",
+        )
+    });
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.into(),
+        backend,
+        ..Default::default()
+    })
+    .expect("runtime");
+    let backend = runtime.backend_context().backend_kind;
+    let variant = ModelVariant::Lfm3Audio2BGguf;
+    runtime.load_model(variant).await.expect("load LFM3-Audio");
+    let model_id = variant.to_string();
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let (fox, rate) = wav_samples(&std::fs::read(data.join("fox.wav")).expect("fixture"));
+    let (speech, speech_rate) =
+        wav_samples(&std::fs::read(data.join("test.wav")).expect("fixture"));
+    assert_eq!(speech_rate, rate);
+    let reference = format!(
+        "{} {SENTENCE}",
+        std::fs::read_to_string(data.join("test.md")).expect("fixture")
+    );
+    let long = [speech.as_slice(), &vec![0.0; rate as usize], &fox].concat();
+
+    // LiveASR is English only, and takes no prompt.
+    assert!(runtime
+        .try_start_asr_realtime_stream(Some(&model_id), Some("fr"), None)
+        .await
+        .is_err());
+    assert!(runtime
+        .try_start_asr_realtime_stream(Some(&model_id), None, Some("Ada Lovelace"))
+        .await
+        .is_err());
+
+    // The 24 kHz pushes are heard at 16 kHz.
+    let started = Instant::now();
+    let fox_text = live_transcribe(&runtime, &model_id, &fox, rate).await;
+    eprintln!(
+        "{backend:?}: LiveASR 3.6 s -> {fox_text:?} in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(words(&fox_text), words(SENTENCE));
+
+    // 34 s runs past one segment: the next hears the end again, and the
+    // transcript keeps its words once.
+    let started = Instant::now();
+    let long_text = live_transcribe(&runtime, &model_id, &long, rate).await;
+    let heard = recall(&reference, &long_text);
+    let seconds = long.len() as f64 / f64::from(rate);
+    eprintln!(
+        "{backend:?}: LiveASR 34 s -> recall {heard:.2}, RTF {:.2}: {long_text:?}",
+        started.elapsed().as_secs_f64() / seconds
+    );
+    assert!(heard >= 0.9, "LiveASR recall {heard:.2}");
+    let repeated = repeated_pairs(&reference, &long_text);
+    assert!(repeated.is_empty(), "LiveASR repeated {repeated:?}");
+
+    // Streams at once are engine rows that batch: each writes what it
+    // writes alone.
+    let started = Instant::now();
+    let (long_together, fox_together) = tokio::join!(
+        live_transcribe(&runtime, &model_id, &long, rate),
+        live_transcribe(&runtime, &model_id, &fox, rate),
+    );
+    eprintln!(
+        "{backend:?}: LiveASR 34 s and 3.6 s at once in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(long_together, long_text);
+    assert_eq!(fox_together, fox_text);
 }

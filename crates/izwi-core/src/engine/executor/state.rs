@@ -217,6 +217,39 @@ pub(super) struct ActiveLfm3AudioDecode {
     pub(super) input_audio: Option<(u32, usize)>,
 }
 
+/// One LFM3-Audio LiveASR session between quanta: its segment's host
+/// state, the language model's ShortConv ring (kept here, never in the
+/// arena) and the paged-KV authority, and what the next quantum feeds.
+pub(super) struct ActiveLfm3AudioRealtime {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Lfm25AudioModelLease,
+    pub(super) live: crate::models::architectures::lfm3_audio::model::Lfm3LiveAsr,
+    pub(super) retained: crate::models::architectures::lfm25_audio::state::Lfm25AudioRetainedState,
+    /// The embeddings the next prefill or decode quantum feeds, and where.
+    pub(super) feed: Option<(candle_core::Tensor, usize)>,
+    /// The segment's text so far.
+    pub(super) text: String,
+    pub(super) stream_sequence: usize,
+    /// Samples heard so far.
+    pub(super) heard_samples: usize,
+}
+
+/// An LFM3-Audio LiveASR quantum that has run but is not authoritative
+/// until EngineCore accepts the matching physical result.
+pub(super) struct PendingLfm3AudioRealtimeQuantum {
+    pub(super) session: crate::engine::SessionKey,
+    pub(super) active: ActiveLfm3AudioRealtime,
+    pub(super) cache: PhysicalPagedKvCache,
+    pub(super) checkpoint:
+        crate::models::architectures::lfm25_audio::state::Lfm25AudioRetainedCheckpoint,
+    pub(super) prior_live: crate::models::architectures::lfm3_audio::model::Lfm3LiveAsr,
+    pub(super) prior_feed: Option<(candle_core::Tensor, usize)>,
+    pub(super) prior_text_len: usize,
+    pub(super) prior_stream_sequence: usize,
+    pub(super) prior_heard_samples: usize,
+    pub(super) finished: bool,
+}
+
 pub(super) struct ActiveVoxtralRealtime {
     pub(super) variant: ModelVariant,
     pub(super) model: VoxtralModelLease,
@@ -237,14 +270,6 @@ pub(super) struct PendingVoxtralRealtimeQuantum {
     pub(super) prior_stream_sequence: usize,
     pub(super) prior_input_sample_rate: u32,
     pub(super) finished: bool,
-}
-
-/// A pending quantum whose model checkpoint has been resolved, but whose
-/// retained state cannot be published until Core resolves the matching managed
-/// KV transaction.
-pub(super) struct PreparedVoxtralRealtimeQuantum {
-    pub(super) session: crate::engine::SessionKey,
-    pub(super) replacement: Option<ActiveVoxtralRealtime>,
 }
 
 pub(super) enum QwenTtsPhysicalState {

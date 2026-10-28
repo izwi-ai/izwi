@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 
 pub(crate) const N_MELS: usize = 128;
 const N_FFT: usize = 400;
-const HOP: usize = 160;
+pub(crate) const HOP: usize = 160;
 const BINS: usize = N_FFT / 2 + 1;
 const SAMPLE_RATE: f64 = 16_000.0;
 const LOG_FLOOR: f32 = -12.0;

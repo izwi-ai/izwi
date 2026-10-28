@@ -63,6 +63,8 @@ mod granite_speech5;
 mod lfm25_audio;
 #[path = "handler_asr/lfm3_audio.rs"]
 mod lfm3_audio;
+#[path = "handler_asr/lfm3_live.rs"]
+mod lfm3_live;
 #[path = "handler_asr/parakeet.rs"]
 mod parakeet;
 #[path = "handler_asr/qwen3.rs"]
@@ -502,6 +504,12 @@ impl NativeExecutor {
                 Error::InferenceError("Voxtral realtime ASR lost retained paged state".into())
             })?;
             return self.voxtral_realtime_request(request, scheduled, retained);
+        }
+        if family == ModelFamily::Lfm3Audio && request.is_realtime_asr_session() {
+            let retained = managed_state.take().ok_or_else(|| {
+                Error::InferenceError("LFM3-Audio LiveASR lost retained paged state".into())
+            })?;
+            return self.lfm3_audio_realtime_request(request, scheduled, retained);
         }
         if family == ModelFamily::Qwen3Asr && request.uses_asr_retained_sequence() {
             return self.qwen3_asr_sequence_request(request, scheduled, managed_state.take());

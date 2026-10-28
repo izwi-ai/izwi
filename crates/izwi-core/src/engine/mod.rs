@@ -3194,7 +3194,9 @@ impl Engine {
         if request.task_type != TaskType::ASR
             || !matches!(
                 variant.family(),
-                crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+                crate::catalog::ModelFamily::Voxtral
+                    | crate::catalog::ModelFamily::NemotronAsr
+                    | crate::catalog::ModelFamily::Lfm3Audio
             )
         {
             return Err(Error::InvalidInput(

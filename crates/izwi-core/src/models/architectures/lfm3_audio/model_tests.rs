@@ -776,10 +776,12 @@ fn live_asr_transcribes_while_streaming(profile: DeviceProfile) {
         for (index, piece) in pieces.iter().enumerate() {
             let push = Instant::now();
             if heard + piece.len() > segment {
-                let tail = model
+                // The last block heard audio cut at the boundary; the next
+                // segment hears it again whole, so its text is dropped.
+                model
                     .push_live_asr(&mut live, &[], true, &mut state)
                     .unwrap();
-                text.push_str(&transcript.push(&tail));
+                text.push_str(&transcript.flush());
                 live = model.start_live_asr();
                 state = fresh_state(&model);
                 segments += 1;

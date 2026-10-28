@@ -1,4 +1,5 @@
-//! Realtime ASR execution adapters: Voxtral (paged) and Nemotron (tensor).
+//! Realtime ASR execution adapters: Voxtral and LFM3-Audio (paged) and
+//! Nemotron (tensor).
 
 use super::*;
 
@@ -205,6 +206,168 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
         decode.validate()?;
         completion.validate()?;
 
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([preparation, prompt, decode, completion]),
+        })
+    }
+}
+
+/// LFM3-Audio LiveASR sessions as retained rows: preparation hears a push
+/// (mel features and the streaming encoder, static-batched across sessions,
+/// each row its own), each 0.96 s chunk prefills alone, and its text
+/// decodes one token per step, batched across sessions. The language model's pages live
+/// in the model's managed arena; the ShortConv ring and the encoder stream
+/// are each session's own checkpointed host state, so every stage selects no
+/// retained tensor state.
+#[derive(Debug)]
+pub(super) struct Lfm3AudioRealtimeExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) max_batch_size: usize,
+}
+
+impl Lfm3AudioRealtimeExecutionAdapter {
+    /// Positions one chunk's block feeds: the prompt or `<|text_end|>` and
+    /// the chunk's 12 encoder tokens.
+    const MAX_PREFILL_POSITIONS: u64 = 256;
+    /// One feed's activations and a text step's logits row.
+    const STEP_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for Lfm3AudioRealtimeExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        LFM3_AUDIO_REALTIME_ADAPTER_ABI
+    }
+
+    fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        use crate::models::architectures::lfm3_audio::{
+            LFM3_AUDIO_REALTIME_COMPLETION_STAGE, LFM3_AUDIO_REALTIME_DECODE_STAGE,
+            LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES, LFM3_AUDIO_REALTIME_PREPARATION_STAGE,
+            LFM3_AUDIO_REALTIME_PREPARATION_WORKSPACE_BYTES,
+            LFM3_AUDIO_REALTIME_PROMPT_PREFILL_STAGE,
+        };
+        let metadata = self.metadata();
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
+        execution_profile.mode = ExecutionMode::Realtime;
+        execution_profile.prefill = PrefillMode::None;
+        execution_profile.incremental_decode = true;
+        execution_profile.prefill_batch = NativeBatchMode::Static;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:lfm3-audio-realtime-state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".into();
+        execution_profile.cancellation = CancellationGranularity::RealtimeChunk;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
+        execution_profile.recompute_safe = false;
+        execution_profile.cache_release_safe = true;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.resolved_from_loaded_model = true;
+        let width = self.max_batch_size as u64;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            LFM3_AUDIO_REALTIME_PREPARATION_STAGE,
+            &execution_profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::RealtimePreparation;
+        preparation.max_batch_size = self.max_batch_size;
+        preparation.max_work_units =
+            LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES.saturating_mul(width);
+        preparation.workspace_per_row_bytes = LFM3_AUDIO_REALTIME_PREPARATION_WORKSPACE_BYTES;
+        preparation.max_workspace_bytes =
+            LFM3_AUDIO_REALTIME_PREPARATION_WORKSPACE_BYTES.saturating_mul(width);
+        preparation.shape_policy = StageShapePolicy::Ragged;
+        preparation.max_padding_basis_points = 0;
+        preparation.retained_state_selections = Some(vec![]);
+
+        let mut prompt = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            LFM3_AUDIO_REALTIME_PROMPT_PREFILL_STAGE,
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        prompt.selector = StageWorkSelector::RealtimePromptPrefill;
+        prompt.max_batch_size = 1;
+        prompt.max_work_units = Self::MAX_PREFILL_POSITIONS;
+        prompt.workspace_per_row_bytes = Self::STEP_WORKSPACE_BYTES;
+        prompt.max_workspace_bytes = Self::STEP_WORKSPACE_BYTES;
+        prompt.concurrency = ConcurrencyClass::Exclusive;
+        prompt.shape_policy = StageShapePolicy::Exact;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            LFM3_AUDIO_REALTIME_DECODE_STAGE,
+            &execution_profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::RealtimeDecodeContinuation;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.max_batch_size = self.max_batch_size;
+        decode.max_work_units = width;
+        decode.workspace_per_row_bytes = Self::STEP_WORKSPACE_BYTES;
+        decode.max_workspace_bytes = Self::STEP_WORKSPACE_BYTES.saturating_mul(width);
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.retained_state_selections = Some(vec![]);
+
+        let mut completion = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            LFM3_AUDIO_REALTIME_COMPLETION_STAGE,
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        completion.selector = StageWorkSelector::RealtimeCompletion;
+        completion.max_batch_size = 1;
+        completion.max_work_units = 1;
+        completion.concurrency = ConcurrencyClass::Exclusive;
+        completion.shape_policy = StageShapePolicy::Exact;
+
+        for stage in [&mut preparation, &mut prompt, &mut decode, &mut completion] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,

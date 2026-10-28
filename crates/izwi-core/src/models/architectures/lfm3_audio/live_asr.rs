@@ -15,19 +15,33 @@
 //! each new one first hears the previous one's last
 //! [`LFM3_LIVE_ASR_OVERLAP_SECONDS`] again, since the model writes a word a
 //! chunk or so after it hears it, and [`Lfm3LiveTranscript`] drops the words
-//! that overlap repeats.
+//! that overlap repeats. The old segment's last block, which heard audio cut
+//! at the boundary (maybe mid-word), is not kept: the overlap covers it, and
+//! the new segment hears it whole.
 
 use std::collections::VecDeque;
 
 use super::*;
 use crate::models::architectures::lfm3_audio::encoder::Lfm3AudioEncoderStream;
-use crate::models::architectures::lfm3_audio::preprocessor::{Lfm3AudioMelStream, N_MELS};
+use crate::models::architectures::lfm3_audio::preprocessor::{Lfm3AudioMelStream, HOP, N_MELS};
 
 /// Seconds of audio one segment hears, its re-heard overlap included: under
 /// a context's 30 s with room for the last partial chunk.
 pub(crate) const LFM3_LIVE_ASR_SEGMENT_SECONDS: f32 = 29.0;
 /// Seconds of the previous segment's end a new segment hears again.
 pub(crate) const LFM3_LIVE_ASR_OVERLAP_SECONDS: f32 = 2.88;
+
+/// What one push of `samples` 16 kHz samples (or the finish, `is_final`)
+/// may take: the mel frames it adds, and the language model steps of the
+/// blocks it completes, each a prefill and at most the last block's text
+/// budget. Frames held from earlier pushes and the final flush's padding
+/// complete at most two chunks more, and the finish adds the last partial
+/// one.
+pub(crate) fn lfm3_live_asr_operation_bounds(samples: usize, is_final: bool) -> (usize, usize) {
+    let frames = samples.div_ceil(HOP).max(1);
+    let blocks = frames / CHUNK_FRAMES + 2 + usize::from(is_final);
+    (frames, blocks * (1 + FINAL_TEXT_TOKENS))
+}
 
 /// Mel frames per chunk: `interleaved_n_audio` encoder tokens.
 const CHUNK_FRAMES: usize = INTERLEAVED_AUDIO * ENCODER_STRIDE;

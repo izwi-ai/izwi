@@ -355,7 +355,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             realtime_families,
-            [ModelFamily::NemotronAsr, ModelFamily::Voxtral]
+            [
+                ModelFamily::NemotronAsr,
+                ModelFamily::Lfm3Audio,
+                ModelFamily::Voxtral
+            ]
         );
         assert!(
             registrations_for_capability(CapabilityKind::SpeakerAttributedAsr)

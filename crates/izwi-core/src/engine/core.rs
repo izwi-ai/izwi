@@ -941,7 +941,9 @@ impl EngineCore {
             || request.model_variant.is_none_or(|variant| {
                 !matches!(
                     variant.family(),
-                    crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+                    crate::catalog::ModelFamily::Voxtral
+                        | crate::catalog::ModelFamily::NemotronAsr
+                        | crate::catalog::ModelFamily::Lfm3Audio
                 )
             })
         {
@@ -969,6 +971,7 @@ impl EngineCore {
         match request.model_variant.expect("validated realtime variant").family() {
             crate::catalog::ModelFamily::Voxtral => crate::models::architectures::voxtral::authenticate_voxtral_realtime_execution_binding(execution)?,
             crate::catalog::ModelFamily::NemotronAsr => crate::models::architectures::nemotron::asr::authenticate_realtime_execution_binding(execution)?,
+            crate::catalog::ModelFamily::Lfm3Audio => crate::models::architectures::lfm3_audio::authenticate_lfm3_audio_realtime_execution_binding(execution)?,
             _ => unreachable!("validated realtime family"),
         }
         if execution.model_instance_id != model_instance {

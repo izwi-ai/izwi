@@ -370,7 +370,7 @@ pub(super) struct RuntimeAsrRealtimeResources {
     pub(super) job: Option<JobLease>,
     pub(super) session_lease: Option<Arc<RealtimeAsrSessionLease>>,
     pub(super) engine_session: Option<RuntimeEngineRealtimeSession>,
-    pub(super) voxtral_model: Option<VoxtralModelLease>,
+    pub(super) engine_model: Option<EngineRealtimeModel>,
     pub(super) absolute_deadline: Instant,
     pub(super) idle_timeout: Duration,
     pub(super) last_activity: Instant,
@@ -419,7 +419,7 @@ impl RuntimeAsrRealtimeResources {
             job: self.job.take(),
             session_lease: self.session_lease.take(),
             engine_session: self.engine_session.take(),
-            voxtral_model: self.voxtral_model.take(),
+            engine_model: self.engine_model.take(),
         })
     }
 
@@ -444,7 +444,7 @@ pub(super) struct RealtimeAsrDetachedResources {
     pub(super) job: Option<JobLease>,
     pub(super) session_lease: Option<Arc<RealtimeAsrSessionLease>>,
     pub(super) engine_session: Option<RuntimeEngineRealtimeSession>,
-    pub(super) voxtral_model: Option<VoxtralModelLease>,
+    pub(super) engine_model: Option<EngineRealtimeModel>,
 }
 
 impl RealtimeAsrDetachedResources {
@@ -458,7 +458,7 @@ impl RealtimeAsrDetachedResources {
         self.job.take();
         self.session_lease.take();
         self.engine_session.take();
-        self.voxtral_model.take();
+        self.engine_model.take();
     }
 }
 
@@ -618,12 +618,232 @@ pub(super) struct RealtimeAsrOperationHandles {
 pub(super) struct RuntimeEngineRealtimeSession {
     pub(super) engine: Arc<crate::engine::Engine>,
     pub(super) handle: RealtimeAsrSessionHandle,
-    /// The Engine path serves Voxtral only: Nemotron's retained tensor state
-    /// runs on the direct path (`realtime_asr_execution_path`).
-    pub(super) model: VoxtralModelLease,
+    pub(super) model: EngineRealtimeModel,
     pub(super) retained_metadata_bytes: u64,
-    pub(super) max_output_steps: usize,
     pub(super) max_cache_append: usize,
+}
+
+/// A family's name in an Engine realtime error.
+pub(super) fn engine_realtime_family_name(family: ModelFamily) -> &'static str {
+    match family {
+        ModelFamily::Lfm3Audio => "LFM3-Audio",
+        ModelFamily::Voxtral => "Voxtral",
+        _ => "this model's",
+    }
+}
+
+/// Whether `language` asks for English, the one language LFM3-Audio's
+/// LiveASR transcribes.
+pub(super) fn lfm3_live_asr_language(language: &str) -> bool {
+    let language = language.trim().to_ascii_lowercase();
+    language.is_empty()
+        || language == "en"
+        || language == "english"
+        || language.starts_with("en-")
+        || language.starts_with("en_")
+}
+
+/// The loaded model an Engine realtime session runs on. The Engine path
+/// serves Voxtral and LFM3-Audio; Nemotron's retained tensor state runs on
+/// the direct path (`realtime_asr_execution_path`).
+#[derive(Clone)]
+pub(super) enum EngineRealtimeModel {
+    /// Voxtral bounds every operation's output steps alike.
+    Voxtral {
+        model: VoxtralModelLease,
+        max_output_steps: usize,
+    },
+    /// LFM3-Audio hears 16 kHz audio and bounds each operation by it; the
+    /// lease keeps the model loaded for the session.
+    Lfm3Audio { _model: Lfm25AudioModelLease },
+}
+
+/// What one Engine realtime operation costs, the retained usage it leaves,
+/// and the output steps it may take.
+pub(super) struct EngineRealtimeOperationBudget {
+    pub(super) preparation_cost: WorkCost,
+    pub(super) committed_observation: JobResourceObservation,
+    pub(super) max_output_steps: usize,
+}
+
+impl RuntimeEngineRealtimeSession {
+    /// The budget of a push of `pushed` samples after `committed` ones, or
+    /// of the finish (`finish`, nothing pushed).
+    pub(super) fn operation_budget(
+        &self,
+        committed: usize,
+        pushed: usize,
+        sample_rate: u32,
+        finish: bool,
+    ) -> Result<EngineRealtimeOperationBudget> {
+        match &self.model {
+            EngineRealtimeModel::Voxtral {
+                model,
+                max_output_steps,
+            } => {
+                // Voxtral recomputes its preparation over the committed prefix.
+                let total = committed.checked_add(pushed).ok_or_else(|| {
+                    Error::Overloaded("realtime ASR sample clock overflowed".into())
+                })?;
+                let mode = if finish {
+                    VoxtralRealtimePreparationMode::Finish
+                } else {
+                    VoxtralRealtimePreparationMode::Push
+                };
+                let geometry = model.realtime_preparation_geometry_for_source_samples(
+                    total,
+                    sample_rate,
+                    mode,
+                )?;
+                Ok(EngineRealtimeOperationBudget {
+                    preparation_cost: voxtral_realtime_preparation_cost(model, geometry)?,
+                    committed_observation: voxtral_realtime_committed_observation(
+                        self.retained_metadata_bytes,
+                        model.realtime_prepared_resource_usage(geometry)?,
+                    )?,
+                    max_output_steps: *max_output_steps,
+                })
+            }
+            EngineRealtimeModel::Lfm3Audio { .. } => {
+                lfm3_audio_realtime_operation_budget(self.retained_metadata_bytes, pushed, finish)
+            }
+        }
+    }
+}
+
+/// An LFM3-Audio push hears only its own audio: its cost follows its mel
+/// frames, and the session retains its bounded streams whatever it heard.
+pub(super) fn lfm3_audio_realtime_operation_budget(
+    retained_metadata_bytes: u64,
+    pushed: usize,
+    finish: bool,
+) -> Result<EngineRealtimeOperationBudget> {
+    use crate::models::architectures::lfm3_audio::model::lfm3_live_asr_operation_bounds;
+    use crate::models::architectures::lfm3_audio::preprocessor::N_MELS;
+    use crate::models::architectures::lfm3_audio::{
+        LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES,
+        LFM3_AUDIO_REALTIME_PREPARATION_WORKSPACE_BYTES, LFM3_AUDIO_REALTIME_STATE_HOST_BYTES,
+        LFM3_AUDIO_REALTIME_STATE_TENSOR_BYTES,
+    };
+    let (frames, max_output_steps) = lfm3_live_asr_operation_bounds(pushed, finish);
+    let frames = u64::try_from(frames)
+        .ok()
+        .filter(|frames| *frames <= LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES)
+        .ok_or_else(|| {
+            Error::InvalidInput("LFM3-Audio LiveASR push exceeds its preparation bound".into())
+        })?;
+    Ok(EngineRealtimeOperationBudget {
+        preparation_cost: WorkCost::new(
+            frames,
+            frames * N_MELS as u64,
+            LFM3_AUDIO_REALTIME_PREPARATION_WORKSPACE_BYTES,
+        ),
+        committed_observation: JobResourceObservation::new(
+            retained_metadata_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(LFM3_AUDIO_REALTIME_STATE_HOST_BYTES))
+                .ok_or_else(|| {
+                    Error::Overloaded("LFM3-Audio retained host usage overflowed".into())
+                })?,
+            LFM3_AUDIO_REALTIME_STATE_TENSOR_BYTES,
+        ),
+        max_output_steps,
+    })
+}
+
+/// LFM3-Audio's side of an Engine realtime stream, which outlives its
+/// segments: the source audio resampled to the model's 16 kHz, the audio a
+/// new segment hears again, and the transcript the segments join into.
+pub(super) struct Lfm3RealtimeInput {
+    resampler: Option<HighQualityResampler>,
+    source_rate: u32,
+    source_samples: usize,
+    heard_samples: usize,
+    /// The last `LFM3_LIVE_ASR_OVERLAP_SECONDS` of 16 kHz audio heard.
+    recent: VecDeque<f32>,
+    pub(super) transcript: Lfm3LiveTranscript,
+}
+
+impl Lfm3RealtimeInput {
+    pub(super) const SAMPLE_RATE: u32 =
+        crate::models::architectures::lfm3_audio::config::INPUT_SAMPLE_RATE;
+
+    pub(super) fn new() -> Self {
+        Self {
+            resampler: None,
+            source_rate: 0,
+            source_samples: 0,
+            heard_samples: 0,
+            recent: VecDeque::new(),
+            transcript: Lfm3LiveTranscript::default(),
+        }
+    }
+
+    /// Samples one segment hears, its re-heard overlap included.
+    pub(super) fn segment_samples() -> usize {
+        (LFM3_LIVE_ASR_SEGMENT_SECONDS * Self::SAMPLE_RATE as f32) as usize
+    }
+
+    pub(super) fn overlap_samples() -> usize {
+        (LFM3_LIVE_ASR_OVERLAP_SECONDS * Self::SAMPLE_RATE as f32) as usize
+    }
+
+    /// `samples` at `sample_rate` as the model's 16 kHz audio, as far as the
+    /// resampler has produced it.
+    pub(super) fn resample(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
+        if self.source_rate == 0 {
+            self.resampler = (sample_rate != Self::SAMPLE_RATE)
+                .then(|| HighQualityResampler::new(sample_rate, Self::SAMPLE_RATE))
+                .transpose()?;
+            self.source_rate = sample_rate;
+        } else if self.source_rate != sample_rate {
+            return Err(Error::InvalidInput(
+                "realtime ASR sample rate changed within one stream".into(),
+            ));
+        }
+        self.source_samples = self
+            .source_samples
+            .checked_add(samples.len())
+            .ok_or_else(|| Error::Overloaded("realtime ASR sample clock overflowed".into()))?;
+        let mut heard = Vec::new();
+        match self.resampler.as_mut() {
+            Some(resampler) => resampler.push(samples, &mut heard)?,
+            None => heard.extend_from_slice(samples),
+        }
+        self.heard_samples += heard.len();
+        Ok(heard)
+    }
+
+    /// The resampler's tail at the stream's end, cut to the stream's exact
+    /// 16 kHz length.
+    pub(super) fn finish(&mut self) -> Result<Vec<f32>> {
+        let Some(mut resampler) = self.resampler.take() else {
+            return Ok(Vec::new());
+        };
+        let target = crate::audio::target_sample_count(
+            self.source_samples,
+            self.source_rate,
+            Self::SAMPLE_RATE,
+        );
+        let mut tail = Vec::new();
+        resampler.finish(&mut tail, target)?;
+        tail.truncate(target.saturating_sub(self.heard_samples));
+        self.heard_samples += tail.len();
+        Ok(tail)
+    }
+
+    /// Remember audio the current segment heard.
+    pub(super) fn heard(&mut self, samples: &[f32]) {
+        let keep = Self::overlap_samples();
+        self.recent.extend(samples.iter().copied());
+        let excess = self.recent.len().saturating_sub(keep);
+        self.recent.drain(..excess);
+    }
+
+    /// The audio a new segment hears again.
+    pub(super) fn overlap(&self) -> Vec<f32> {
+        self.recent.iter().copied().collect()
+    }
 }
 
 /// Where a realtime session executes, from the capability table. Voxtral
@@ -848,7 +1068,14 @@ impl RuntimeAsrRealtimeStream {
             .into_iter()
             .map(|output| {
                 let mut delta = output.text.unwrap_or_default();
-                if self.segment.separator_pending && !delta.is_empty() {
+                if let Some(lfm3) = self.lfm3.as_mut() {
+                    // A segment's text joins the transcript past whatever it
+                    // repeats of the previous segment's end.
+                    delta = lfm3.transcript.push(&delta);
+                    if output.is_final {
+                        delta.push_str(&lfm3.transcript.flush());
+                    }
+                } else if self.segment.separator_pending && !delta.is_empty() {
                     // A new segment's decoder starts without the previous
                     // word, so it may not emit the space between them.
                     self.segment.separator_pending = false;
@@ -859,17 +1086,26 @@ impl RuntimeAsrRealtimeStream {
                         delta.insert(0, ' ');
                     }
                 }
-                self.engine_text.push_str(&delta);
-                let chunk_index = self.engine_chunk_index;
-                self.engine_chunk_index = self.engine_chunk_index.saturating_add(1);
-                RuntimeAsrRealtimeEvent {
-                    delta,
-                    text: self.engine_text.clone(),
-                    is_final: output.is_final,
-                    chunk_index,
-                }
+                self.engine_text_event(delta, output.is_final)
             })
             .collect()
+    }
+
+    /// The event that adds `delta` to the stream's transcript.
+    pub(super) fn engine_text_event(
+        &mut self,
+        delta: String,
+        is_final: bool,
+    ) -> RuntimeAsrRealtimeEvent {
+        self.engine_text.push_str(&delta);
+        let chunk_index = self.engine_chunk_index;
+        self.engine_chunk_index = self.engine_chunk_index.saturating_add(1);
+        RuntimeAsrRealtimeEvent {
+            delta,
+            text: self.engine_text.clone(),
+            is_final,
+            chunk_index,
+        }
     }
     pub(super) fn begin_operation(&mut self, refresh_activity: bool) -> Result<RealtimeAsrOperationHandles> {
         let now = Instant::now();

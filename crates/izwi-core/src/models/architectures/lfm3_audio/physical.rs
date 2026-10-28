@@ -38,6 +38,9 @@ pub(crate) enum Lfm3AudioWorkload {
     Tts,
     /// A voice-chat turn: the history, the spoken turn and the reply.
     Conversation,
+    /// One LiveASR segment: the prompt and at most 30 s of 0.96 s chunks,
+    /// each with its text.
+    LiveAsr,
 }
 
 impl Lfm3AudioWorkload {
@@ -47,6 +50,7 @@ impl Lfm3AudioWorkload {
             Self::Asr => 2_048,
             Self::Tts => 4_096,
             Self::Conversation => 16_384,
+            Self::LiveAsr => 2_048,
         }
     }
 }

@@ -470,6 +470,57 @@ fn voxtral_realtime_sealed_graph_is_exact_on_supported_backends() {
 }
 
 #[test]
+fn lfm3_audio_realtime_sealed_graph_is_exact_on_supported_backends() {
+    use crate::models::architectures::lfm3_audio::{
+        authenticate_lfm3_audio_realtime_execution_binding,
+        LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES,
+    };
+    let metadata = AdapterMetadata {
+        id: "test.lfm3_audio.realtime",
+        capability: CapabilityKind::RealtimeAsr,
+        model_variant: ModelVariant::Lfm3Audio2BGguf,
+        streaming_mode: StreamingMode::Realtime,
+        execution_target: ExecutionTargetKind::RealtimeRunner,
+        sequence_execution: SequenceExecutionMode::None,
+        state_requirement: InferenceStateRequirement::RetainedAndInvocation,
+    };
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let contract = Lfm3AudioRealtimeExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(9),
+            metadata,
+            backend,
+            3,
+        )
+        .contract(StreamingRequirements::native(true))
+        .expect("sealed LFM3-Audio graph");
+        assert_eq!(
+            contract.adapter_abi_revision,
+            LFM3_AUDIO_REALTIME_ADAPTER_ABI
+        );
+        assert_eq!(contract.execution_profile.max_batch_size, 3);
+        assert_eq!(contract.stages.len(), 4);
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(contract.stages[0].shape_policy, StageShapePolicy::Ragged);
+        assert_eq!(
+            contract.stages[0].max_work_units,
+            3 * LFM3_AUDIO_REALTIME_MAX_PREPARATION_FRAMES
+        );
+        assert_eq!(contract.stages[1].max_batch_size, 1);
+        assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
+        assert_eq!(contract.stages[2].shape_policy, StageShapePolicy::Ragged);
+        // The ShortConv ring and encoder streams stay in each session's
+        // host state: preparation and decode select no retained tensors.
+        assert_eq!(contract.stages[0].retained_state_selections, Some(vec![]));
+        assert_eq!(contract.stages[2].retained_state_selections, Some(vec![]));
+        authenticate_lfm3_audio_realtime_execution_binding(
+            &contract.adapter_binding().expect("binding"),
+        )
+        .expect("exact LFM3-Audio authentication");
+    }
+}
+
+#[test]
 fn managed_v2_publication_requires_a_physical_runtime_before_ready() {
     let registry = RuntimeAdapterRegistry::built_in();
     let draft = LoadedModelBundleDraft::build(
@@ -1090,9 +1141,13 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     let nemotron_realtime = execution.metadata().capability
                         == CapabilityKind::RealtimeAsr
                         && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
-                    let voxtral_realtime = execution.metadata().capability
+                    let engine_realtime = execution.metadata().capability
                         == CapabilityKind::RealtimeAsr
-                        && variant == ModelVariant::VoxtralMini4BRealtime2602;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::Voxtral
+                                | crate::catalog::ModelFamily::Lfm3Audio
+                        );
                     if (qwen3_asr
                         || vibevoice_asr
                         || granite_asr
@@ -1100,7 +1155,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         || qwen3_tts
                         || retained_tts
                         || parakeet_asr
-                        || voxtral_realtime
+                        || engine_realtime
                         || nemotron_realtime)
                         && contract.execution_profile.mode == ExecutionMode::Sequence
                     {
@@ -1110,7 +1165,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         );
                         assert_eq!(contract.execution_profile.max_batch_size, 8);
                         assert!(contract.execution_profile.capabilities().native_batch);
-                    } else if voxtral_realtime {
+                    } else if engine_realtime {
                         assert_eq!(contract.execution_profile.max_batch_size, 8);
                         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
                         assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);

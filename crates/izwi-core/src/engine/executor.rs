@@ -106,10 +106,10 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishS2TtsDecode,
-    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode, ActiveMaya1TtsDecode,
-    ActiveMaya2TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode,
-    ActiveVoxtralRealtime, ActiveVoxtralTtsDecode, PendingVoxtralRealtimeQuantum,
-    PreparedVoxtralRealtimeQuantum,
+    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode, ActiveLfm3AudioRealtime,
+    ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
+    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
+    PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2205,13 +2205,121 @@ impl<'a, T> ExecutorStateLease<'a, T> {
     }
 }
 
-struct VoxtralRealtimeStateCoordinator {
-    states: ExecutorStateStore<ActiveVoxtralRealtime>,
-    pending: Mutex<HashMap<PlanId, PendingVoxtralRealtimeQuantum>>,
-    prepared: Mutex<HashMap<PlanId, PreparedVoxtralRealtimeQuantum>>,
+/// A realtime session quantum that has run but is not authoritative until
+/// EngineCore accepts the matching physical result.
+pub(super) trait PendingRealtimeQuantum: Send + Sized {
+    /// The session's state between quanta.
+    type Active: Send;
+    /// The family, as errors name it.
+    const FAMILY: &'static str;
+
+    fn session(&self) -> &SessionKey;
+
+    fn variant(active: &Self::Active) -> ModelVariant;
+
+    /// Commit or roll back the quantum: the session's state afterwards and
+    /// whether the session finished with it.
+    fn resolve(self, decision: PendingQuantumDecision) -> Result<(SessionKey, Self::Active, bool)>;
 }
 
-impl VoxtralRealtimeStateCoordinator {
+/// A pending quantum whose model checkpoint has been resolved, but whose
+/// retained state cannot be published until Core resolves the matching managed
+/// KV transaction.
+pub(super) struct PreparedRealtimeQuantum<A> {
+    session: SessionKey,
+    replacement: Option<A>,
+}
+
+/// Realtime session states of one family and their quanta in flight: each
+/// session stays in flight from its quantum's execution until Core commits
+/// or aborts the quantum, then publishes the resolved state.
+struct RealtimeStateCoordinator<Q: PendingRealtimeQuantum> {
+    states: ExecutorStateStore<Q::Active>,
+    pending: Mutex<HashMap<PlanId, Q>>,
+    prepared: Mutex<HashMap<PlanId, PreparedRealtimeQuantum<Q::Active>>>,
+}
+
+type VoxtralRealtimeStateCoordinator = RealtimeStateCoordinator<PendingVoxtralRealtimeQuantum>;
+type Lfm3AudioRealtimeStateCoordinator = RealtimeStateCoordinator<PendingLfm3AudioRealtimeQuantum>;
+
+impl PendingRealtimeQuantum for PendingLfm3AudioRealtimeQuantum {
+    type Active = ActiveLfm3AudioRealtime;
+    const FAMILY: &'static str = "LFM3-Audio";
+
+    fn session(&self) -> &SessionKey {
+        &self.session
+    }
+
+    fn variant(active: &Self::Active) -> ModelVariant {
+        active.variant
+    }
+
+    fn resolve(
+        mut self,
+        decision: PendingQuantumDecision,
+    ) -> Result<(SessionKey, Self::Active, bool)> {
+        match decision {
+            PendingQuantumDecision::Commit => {
+                self.active
+                    .retained
+                    .commit_quantum(&self.cache, None, &self.checkpoint)?;
+            }
+            PendingQuantumDecision::Abort => {
+                self.active.live = self.prior_live;
+                self.active.feed = self.prior_feed;
+                self.active.text.truncate(self.prior_text_len);
+                self.active.stream_sequence = self.prior_stream_sequence;
+                self.active.heard_samples = self.prior_heard_samples;
+                self.active
+                    .retained
+                    .rollback_quantum(&mut self.cache, None, &self.checkpoint)?;
+            }
+        }
+        Ok((self.session, self.active, self.finished))
+    }
+}
+
+impl PendingRealtimeQuantum for PendingVoxtralRealtimeQuantum {
+    type Active = ActiveVoxtralRealtime;
+    const FAMILY: &'static str = "Voxtral";
+
+    fn session(&self) -> &SessionKey {
+        &self.session
+    }
+
+    fn variant(active: &Self::Active) -> ModelVariant {
+        active.variant
+    }
+
+    fn resolve(
+        mut self,
+        decision: PendingQuantumDecision,
+    ) -> Result<(SessionKey, Self::Active, bool)> {
+        match decision {
+            PendingQuantumDecision::Commit => {
+                self.active.model.commit_realtime_quantum(
+                    &mut self.active.state,
+                    &self.cache,
+                    &mut self.checkpoint,
+                )?;
+                self.active.last_tokens_generated = self.active.state.tokens_generated();
+            }
+            PendingQuantumDecision::Abort => {
+                self.active.last_tokens_generated = self.prior_last_tokens_generated;
+                self.active.stream_sequence = self.prior_stream_sequence;
+                self.active.input_sample_rate = self.prior_input_sample_rate;
+                self.active.model.rollback_realtime_quantum(
+                    &mut self.active.state,
+                    &mut self.cache,
+                    &mut self.checkpoint,
+                )?;
+            }
+        }
+        Ok((self.session, self.active, self.finished))
+    }
+}
+
+impl<Q: PendingRealtimeQuantum> RealtimeStateCoordinator<Q> {
     fn new() -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
@@ -2222,16 +2330,12 @@ impl VoxtralRealtimeStateCoordinator {
 
     // Returning the pending quantum preserves ownership when registration fails.
     #[allow(clippy::result_large_err)]
-    fn register(
-        &self,
-        plan_id: PlanId,
-        pending: PendingVoxtralRealtimeQuantum,
-    ) -> std::result::Result<(), (Error, PendingVoxtralRealtimeQuantum)> {
+    fn register(&self, plan_id: PlanId, pending: Q) -> std::result::Result<(), (Error, Q)> {
         let mut quanta = match self.pending.lock() {
             Ok(quanta) => quanta,
             Err(_) => {
                 return Err((
-                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    Error::InferenceError(format!("{} pending-quantum mutex poisoned", Q::FAMILY)),
                     pending,
                 ));
             }
@@ -2239,7 +2343,8 @@ impl VoxtralRealtimeStateCoordinator {
         if quanta.contains_key(&plan_id) {
             return Err((
                 Error::InferenceError(format!(
-                    "Voxtral pending quantum already exists for plan {plan_id}"
+                    "{} pending quantum already exists for plan {plan_id}",
+                    Q::FAMILY
                 )),
                 pending,
             ));
@@ -2250,13 +2355,13 @@ impl VoxtralRealtimeStateCoordinator {
 
     fn register_batch(
         &self,
-        rows: Vec<(PlanId, PendingVoxtralRealtimeQuantum)>,
-    ) -> std::result::Result<(), (Error, Vec<(PlanId, PendingVoxtralRealtimeQuantum)>)> {
+        rows: Vec<(PlanId, Q)>,
+    ) -> std::result::Result<(), (Error, Vec<(PlanId, Q)>)> {
         let mut quanta = match self.pending.lock() {
             Ok(quanta) => quanta,
             Err(_) => {
                 return Err((
-                    Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string()),
+                    Error::InferenceError(format!("{} pending-quantum mutex poisoned", Q::FAMILY)),
                     rows,
                 ));
             }
@@ -2267,9 +2372,10 @@ impl VoxtralRealtimeStateCoordinator {
             .any(|(plan_id, _)| !plan_ids.insert(*plan_id) || quanta.contains_key(plan_id))
         {
             return Err((
-                Error::InferenceError(
-                    "Voxtral cohort contains a duplicate pending plan".to_string(),
-                ),
+                Error::InferenceError(format!(
+                    "{} cohort contains a duplicate pending plan",
+                    Q::FAMILY
+                )),
                 rows,
             ));
         }
@@ -2280,7 +2386,7 @@ impl VoxtralRealtimeStateCoordinator {
     fn replace_in_flight(
         &self,
         session: &SessionKey,
-        replacement: Option<ActiveVoxtralRealtime>,
+        replacement: Option<Q::Active>,
     ) -> Result<()> {
         // Publication follows a successful model prepare and managed-KV
         // finalize. Recover the guard so mutex poisoning cannot strand a
@@ -2291,15 +2397,14 @@ impl VoxtralRealtimeStateCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let marker_variant = match states.get(session) {
             Some(ExecutorStateSlot::InFlight { variant }) => *variant,
-            _ => replacement
-                .as_ref()
-                .map(|active| active.variant)
-                .ok_or_else(|| {
-                    Error::InferenceError(format!(
-                        "Voxtral realtime session {}:{} lost its pending variant identity",
-                        session.request_id, session.epoch
-                    ))
-                })?,
+            _ => replacement.as_ref().map(Q::variant).ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "{} realtime session {}:{} lost its pending variant identity",
+                    Q::FAMILY,
+                    session.request_id,
+                    session.epoch
+                ))
+            })?,
         };
         if !matches!(
             states.get(session),
@@ -2312,22 +2417,25 @@ impl VoxtralRealtimeStateCoordinator {
                 },
             );
             return Err(Error::InferenceError(format!(
-                "Voxtral realtime session {}:{} lost its pending ownership marker",
-                session.request_id, session.epoch
+                "{} realtime session {}:{} lost its pending ownership marker",
+                Q::FAMILY,
+                session.request_id,
+                session.epoch
             )));
         }
         match replacement {
             Some(active) => {
-                if active.variant != marker_variant {
+                if Q::variant(&active) != marker_variant {
                     states.insert(
                         session.clone(),
                         ExecutorStateSlot::Poisoned {
                             variant: marker_variant,
                         },
                     );
-                    return Err(Error::InferenceError(
-                        "Voxtral pending state crossed its retained model variant".into(),
-                    ));
+                    return Err(Error::InferenceError(format!(
+                        "{} pending state crossed its retained model variant",
+                        Q::FAMILY
+                    )));
                 }
                 states.insert(
                     session.clone(),
@@ -2359,48 +2467,26 @@ impl VoxtralRealtimeStateCoordinator {
 
     fn resolve_pending(
         &self,
-        mut pending: PendingVoxtralRealtimeQuantum,
+        pending: Q,
         decision: PendingQuantumDecision,
-    ) -> Result<PreparedVoxtralRealtimeQuantum> {
-        let operation = match decision {
-            PendingQuantumDecision::Commit => pending.active.model.commit_realtime_quantum(
-                &mut pending.active.state,
-                &pending.cache,
-                &mut pending.checkpoint,
-            ),
-            PendingQuantumDecision::Abort => {
-                pending.active.last_tokens_generated = pending.prior_last_tokens_generated;
-                pending.active.stream_sequence = pending.prior_stream_sequence;
-                pending.active.input_sample_rate = pending.prior_input_sample_rate;
-                pending.active.model.rollback_realtime_quantum(
-                    &mut pending.active.state,
-                    &mut pending.cache,
-                    &mut pending.checkpoint,
-                )
+    ) -> Result<PreparedRealtimeQuantum<Q::Active>> {
+        let session = pending.session().clone();
+        let (session, active, finished) = match pending.resolve(decision) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.poison_in_flight(&session);
+                return Err(error);
             }
         };
-        if let Err(error) = operation {
-            self.poison_in_flight(&pending.session);
-            return Err(error);
-        }
-        if decision == PendingQuantumDecision::Commit {
-            pending.active.last_tokens_generated = pending.active.state.tokens_generated();
-        }
-        let replacement = if decision == PendingQuantumDecision::Commit && pending.finished {
-            None
-        } else {
-            Some(pending.active)
-        };
-        Ok(PreparedVoxtralRealtimeQuantum {
-            session: pending.session,
+        let replacement =
+            (decision != PendingQuantumDecision::Commit || !finished).then_some(active);
+        Ok(PreparedRealtimeQuantum {
+            session,
             replacement,
         })
     }
 
-    fn abort_matching(
-        &self,
-        predicate: impl Fn(&PendingVoxtralRealtimeQuantum) -> bool,
-    ) -> Result<usize> {
+    fn abort_matching(&self, predicate: impl Fn(&Q) -> bool) -> Result<usize> {
         let pending = {
             let mut quanta = self
                 .pending
@@ -2417,12 +2503,16 @@ impl VoxtralRealtimeStateCoordinator {
         let count = pending.len();
         let mut failure = None;
         for quantum in pending {
-            let session = quantum.session.clone();
+            let session = quantum.session().clone();
             let result = self
                 .resolve_pending(quantum, PendingQuantumDecision::Abort)
                 .and_then(|prepared| self.replace_in_flight(&session, prepared.replacement));
             if let Err(error) = result {
-                error!(error = %error, "Failed to abort a pending Voxtral realtime quantum");
+                error!(
+                    error = %error,
+                    family = Q::FAMILY,
+                    "Failed to abort a pending realtime quantum"
+                );
                 failure.get_or_insert(error);
             }
         }
@@ -2439,14 +2529,21 @@ impl VoxtralRealtimeStateCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty()
     }
+
+    fn holds_prepared(&self, plan_id: PlanId) -> bool {
+        self.prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&plan_id)
+    }
 }
 
-impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
+impl<Q: PendingRealtimeQuantum> PendingQuantumFinalizer for RealtimeStateCoordinator<Q> {
     fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.pending
             .lock()
             .ok()
-            .and_then(|pending| pending.get(&plan_id).map(|row| &row.session == session))
+            .and_then(|pending| pending.get(&plan_id).map(|row| row.session() == session))
             .unwrap_or(false)
     }
 
@@ -2458,12 +2555,12 @@ impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
     ) -> Result<PendingQuantumFinalizeStatus> {
         let pending = {
             let mut quanta = self.pending.lock().map_err(|_| {
-                Error::InferenceError("Voxtral pending-quantum mutex poisoned".to_string())
+                Error::InferenceError(format!("{} pending-quantum mutex poisoned", Q::FAMILY))
             })?;
             let Some(pending) = quanta.get(&plan_id) else {
                 return Ok(PendingQuantumFinalizeStatus::NotFound);
             };
-            if &pending.session != session {
+            if pending.session() != session {
                 return Err(Error::InferenceError(format!(
                     "pending quantum plan {plan_id} belongs to a different session"
                 )));
@@ -2475,12 +2572,13 @@ impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
         let prepared = self.resolve_pending(pending, decision)?;
         let mut rows = self.prepared.lock().map_err(|_| {
             self.poison_in_flight(session);
-            Error::InferenceError("Voxtral prepared-quantum mutex poisoned".to_string())
+            Error::InferenceError(format!("{} prepared-quantum mutex poisoned", Q::FAMILY))
         })?;
         if rows.insert(plan_id, prepared).is_some() {
             self.poison_in_flight(session);
             return Err(Error::InferenceError(format!(
-                "Voxtral prepared quantum already exists for plan {plan_id}"
+                "{} prepared quantum already exists for plan {plan_id}",
+                Q::FAMILY
             )));
         }
         Ok(PendingQuantumFinalizeStatus::Finalized)
@@ -2528,6 +2626,7 @@ impl PendingQuantumFinalizer for VoxtralRealtimeStateCoordinator {
 struct RealtimePendingQuantumFinalizer {
     fish: Arc<FishStateCoordinator>,
     voxtral: Arc<VoxtralRealtimeStateCoordinator>,
+    lfm3_audio: Arc<Lfm3AudioRealtimeStateCoordinator>,
     long_form: Arc<long_form::LongFormAsrRuns>,
 }
 
@@ -2535,6 +2634,7 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.fish.contains(plan_id, session)
             || self.voxtral.contains(plan_id, session)
+            || self.lfm3_audio.contains(plan_id, session)
             || self.long_form.contains(plan_id, session)
     }
     fn prepare(
@@ -2547,6 +2647,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             self.fish.prepare(plan_id, session, decision)
         } else if self.long_form.contains(plan_id, session) {
             self.long_form.prepare(plan_id, session, decision)
+        } else if self.lfm3_audio.contains(plan_id, session) {
+            self.lfm3_audio.prepare(plan_id, session, decision)
         } else {
             self.voxtral.prepare(plan_id, session, decision)
         }
@@ -2560,6 +2662,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             self.fish.publish(plan_id, session)
         } else if self.long_form.has_prepared(plan_id) {
             self.long_form.publish(plan_id, session)
+        } else if self.lfm3_audio.holds_prepared(plan_id) {
+            self.lfm3_audio.publish(plan_id, session)
         } else {
             self.voxtral.publish(plan_id, session)
         }
@@ -2569,6 +2673,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             self.fish.discard(plan_id, session);
         } else if self.long_form.has_prepared(plan_id) {
             self.long_form.discard(plan_id, session)
+        } else if self.lfm3_audio.holds_prepared(plan_id) {
+            self.lfm3_audio.discard(plan_id, session)
         } else {
             self.voxtral.discard(plan_id, session)
         }
@@ -2653,13 +2759,17 @@ pub struct NativeExecutor {
     maya2_tts_decode_states: ExecutorStateStore<ActiveMaya2TtsDecode>,
     lfm3_audio_decode_states: ExecutorStateStore<ActiveLfm3AudioDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+    lfm3_audio_realtime: Arc<Lfm3AudioRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
     long_form_asr: Arc<long_form::LongFormAsrRuns>,
 }
 
 impl NativeExecutor {
-    fn execute_voxtral_realtime_batch_with_rows(
+    /// Run a realtime ASR session batch of one family (Voxtral or
+    /// LFM3-Audio) on its rows' retained reservations.
+    fn execute_realtime_asr_batch_with_rows(
         &self,
+        family: crate::catalog::ModelFamily,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
         rows: &[ReadyQuantum],
@@ -2674,7 +2784,7 @@ impl NativeExecutor {
                     .find(|request| request.id == scheduled.request_id)
                     .ok_or_else(|| {
                         Error::InferenceError(
-                            "Voxtral native batch lost its request snapshot".into(),
+                            "realtime ASR native batch lost its request snapshot".into(),
                         )
                     })
             })
@@ -2689,14 +2799,25 @@ impl NativeExecutor {
                     .and_then(|row| row.managed_cache.as_ref())
                     .ok_or_else(|| {
                         Error::InferenceError(
-                            "Voxtral native batch lost its retained reservation".into(),
+                            "realtime ASR native batch lost its retained reservation".into(),
                         )
                     })?;
                 retained_row_managed_state_for_row(request, scheduled, reservation).map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
-        let outputs =
-            self.voxtral_realtime_batch_with_managed(&ordered_requests, scheduled, managed)?;
+        let outputs = match family {
+            crate::catalog::ModelFamily::Voxtral => {
+                self.voxtral_realtime_batch_with_managed(&ordered_requests, scheduled, managed)?
+            }
+            crate::catalog::ModelFamily::Lfm3Audio => {
+                self.lfm3_audio_realtime_batch_with_managed(&ordered_requests, scheduled, managed)?
+            }
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "{family:?} has no realtime ASR session batch"
+                )))
+            }
+        };
         self.finish_scheduled_execution(
             requests,
             scheduled,
@@ -2712,6 +2833,7 @@ impl NativeExecutor {
         Self::with_realtime_coordinators(
             config,
             Arc::new(VoxtralRealtimeStateCoordinator::new()),
+            Arc::new(Lfm3AudioRealtimeStateCoordinator::new()),
             Arc::new(FishStateCoordinator::new()),
             Arc::default(),
         )
@@ -2720,6 +2842,7 @@ impl NativeExecutor {
     fn with_realtime_coordinators(
         config: WorkerConfig,
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
+        lfm3_audio_realtime: Arc<Lfm3AudioRealtimeStateCoordinator>,
         fish_s2_pending: Arc<FishStateCoordinator>,
         long_form_asr: Arc<long_form::LongFormAsrRuns>,
     ) -> Self {
@@ -2742,6 +2865,7 @@ impl NativeExecutor {
             maya2_tts_decode_states: Mutex::new(HashMap::new()),
             lfm3_audio_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
+            lfm3_audio_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
             long_form_asr,
         }
@@ -2808,6 +2932,23 @@ impl NativeExecutor {
             }
         }
     }
+}
+
+/// The one family a realtime ASR session batch belongs to, when every row
+/// is a session of the same engine realtime family.
+fn realtime_asr_batch_family(
+    requests: &[&EngineCoreRequest],
+) -> Option<crate::catalog::ModelFamily> {
+    let family = requests.first()?.model_variant?.family();
+    (matches!(
+        family,
+        crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::Lfm3Audio
+    ) && requests.iter().all(|request| {
+        request
+            .model_variant
+            .is_some_and(|variant| variant.family() == family)
+    }))
+    .then_some(family)
 }
 
 /// Whether the request's loaded adapter runs it in a mixed prefill+decode
@@ -3581,37 +3722,29 @@ impl ModelExecutor for NativeExecutor {
                     stage: NativeAudioStage::RealtimePreparation,
                     mode: NativeBatchMode::Static,
                     ..
-                } if execution.requests.iter().all(|request| {
-                    request.model_variant.is_some_and(|variant| {
-                        variant.family() == crate::catalog::ModelFamily::Voxtral
-                    })
-                }) =>
-                {
-                    self.execute_voxtral_realtime_batch_with_rows(
+                } if realtime_asr_batch_family(execution.requests).is_some() => self
+                    .execute_realtime_asr_batch_with_rows(
+                        realtime_asr_batch_family(execution.requests)
+                            .expect("route guard checked the batch family"),
                         execution.requests,
                         execution.scheduled,
                         &execution.batch.rows,
                         NativeBatchMode::Static,
-                    )
-                }
+                    ),
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::RealtimeDecodeContinuation,
                     mode: NativeBatchMode::Continuous,
                     ..
-                } if execution.requests.iter().all(|request| {
-                    request.model_variant.is_some_and(|variant| {
-                        variant.family() == crate::catalog::ModelFamily::Voxtral
-                    })
-                }) =>
-                {
-                    self.execute_voxtral_realtime_batch_with_rows(
+                } if realtime_asr_batch_family(execution.requests).is_some() => self
+                    .execute_realtime_asr_batch_with_rows(
+                        realtime_asr_batch_family(execution.requests)
+                            .expect("route guard checked the batch family"),
                         execution.requests,
                         execution.scheduled,
                         &execution.batch.rows,
                         NativeBatchMode::Continuous,
-                    )
-                }
+                    ),
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::SequencePrefill,
@@ -4054,6 +4187,19 @@ impl ModelExecutor for NativeExecutor {
                 "cannot shut down with a prepared Voxtral realtime quantum".to_string(),
             ));
         }
+        if self.lfm3_audio_realtime.abort_matching(|_| true).is_err() {
+            return Err(Error::InferenceError(
+                "failed to abort pending LFM3-Audio realtime state during shutdown".to_string(),
+            ));
+        }
+        if self.lfm3_audio_realtime.has_prepared() {
+            return Err(Error::InferenceError(
+                "cannot shut down with a prepared LFM3-Audio realtime quantum".to_string(),
+            ));
+        }
+        let mut lfm3_live = self.lfm3_audio_realtime.states.lock().map_err(|_| {
+            Error::InferenceError("LFM3-Audio realtime state mutex poisoned".to_string())
+        })?;
         let mut voxtral = self.voxtral_realtime.states.lock().map_err(|_| {
             Error::InferenceError("Voxtral realtime state mutex poisoned".to_string())
         })?;
@@ -4072,6 +4218,7 @@ impl ModelExecutor for NativeExecutor {
         maya1_tts.clear();
         maya2_tts.clear();
         lfm3_audio_rows.clear();
+        lfm3_live.clear();
         voxtral.clear();
         tts.clear();
         drop((
@@ -4113,6 +4260,10 @@ impl ModelExecutor for NativeExecutor {
             .voxtral_realtime
             .abort_matching(|pending| pending.session.request_id == request_id)
             .is_err()
+            || self
+                .lfm3_audio_realtime
+                .abort_matching(|pending| pending.session.request_id == request_id)
+                .is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
@@ -4130,6 +4281,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
             Ok(mut voxtral),
+            Ok(mut lfm3_live),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -4145,6 +4297,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
+            self.lfm3_audio_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -4164,6 +4317,7 @@ impl ModelExecutor for NativeExecutor {
         let maya2_tts = cleanup_request_states_locked(&mut maya2_tts, request_id);
         let lfm3_audio_rows = cleanup_request_states_locked(&mut lfm3_audio_rows, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
+        let lfm3_live = cleanup_request_states_locked(&mut lfm3_live, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
         cleanup_report(
             chat.combine(asr)
@@ -4178,6 +4332,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
                 .combine(voxtral)
+                .combine(lfm3_live)
                 .combine(tts),
         )
     }
@@ -4199,6 +4354,10 @@ impl ModelExecutor for NativeExecutor {
             .voxtral_realtime
             .abort_matching(|pending| &pending.session == session)
             .is_err()
+            || self
+                .lfm3_audio_realtime
+                .abort_matching(|pending| &pending.session == session)
+                .is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
@@ -4216,6 +4375,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
             Ok(mut voxtral),
+            Ok(mut lfm3_live),
             Ok(mut tts),
         ) = (
             self.chat_decode_states.lock(),
@@ -4231,6 +4391,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
+            self.lfm3_audio_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
         )
         else {
@@ -4254,6 +4415,7 @@ impl ModelExecutor for NativeExecutor {
         let maya2_tts = cleanup_session_state_locked(&mut maya2_tts, session);
         let lfm3_audio_rows = cleanup_session_state_locked(&mut lfm3_audio_rows, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
+        let lfm3_live = cleanup_session_state_locked(&mut lfm3_live, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
         cleanup_report(
             chat.combine(asr)
@@ -4268,6 +4430,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
                 .combine(voxtral)
+                .combine(lfm3_live)
                 .combine(tts),
         )
     }
@@ -4282,6 +4445,10 @@ impl ModelExecutor for NativeExecutor {
             .voxtral_realtime
             .abort_matching(|pending| pending.active.variant == variant)
             .is_err()
+            || self
+                .lfm3_audio_realtime
+                .abort_matching(|pending| pending.active.variant == variant)
+                .is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
@@ -4292,6 +4459,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
+            Ok(mut lfm3_live),
         ) = (
             self.voxtral_realtime.states.lock(),
             self.voxtral_tts_decode_states.lock(),
@@ -4299,6 +4467,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
+            self.lfm3_audio_realtime.states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
@@ -4326,6 +4495,11 @@ impl ModelExecutor for NativeExecutor {
                 ))
                 .combine(cleanup_model_states_locked(
                     &mut lfm3_audio_rows,
+                    variant,
+                    |active| active.variant,
+                ))
+                .combine(cleanup_model_states_locked(
+                    &mut lfm3_live,
                     variant,
                     |active| active.variant,
                 )),
@@ -4379,6 +4553,7 @@ impl UnifiedExecutor {
                     authority: authority.clone(),
                 });
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
+        let lfm3_audio_realtime = Arc::new(Lfm3AudioRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
         let long_form_asr = Arc::new(long_form::LongFormAsrRuns::default());
         let device = match DeviceThread::for_device(&config.backend_context.device.device) {
@@ -4395,6 +4570,7 @@ impl UnifiedExecutor {
                 NativeExecutor::with_realtime_coordinators(
                     config,
                     voxtral_realtime.clone(),
+                    lfm3_audio_realtime.clone(),
                     fish_s2_pending.clone(),
                     long_form_asr.clone(),
                 ),
@@ -4404,6 +4580,7 @@ impl UnifiedExecutor {
             pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
                 fish: fish_s2_pending,
                 voxtral: voxtral_realtime,
+                lfm3_audio: lfm3_audio_realtime,
                 long_form: long_form_asr,
             })),
         }

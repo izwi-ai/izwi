@@ -15,7 +15,7 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 #[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 55;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 80;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 82;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -442,7 +442,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            67
+            69
         );
         assert_eq!(
             manifest
@@ -494,6 +494,14 @@ mod tests {
             .retained_state,
             Stateless
         );
+        for variant in [
+            ModelVariant::Lfm3Audio2BGguf,
+            ModelVariant::Lfm3Audio2BQ8Gguf,
+        ] {
+            let lfm3_realtime = manifest_case(&manifest, variant, CapabilityKind::RealtimeAsr);
+            assert_eq!(lfm3_realtime.retained_state, Managed);
+            assert_eq!(lfm3_realtime.workspace, InvocationStateRequired);
+        }
         let voxtral_realtime = manifest_case(
             &manifest,
             ModelVariant::VoxtralMini4BRealtime2602,
