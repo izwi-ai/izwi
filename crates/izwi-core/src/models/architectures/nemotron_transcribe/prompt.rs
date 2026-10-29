@@ -185,9 +185,19 @@ pub fn normalize_context_terms(terms: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// The instruction a request renders.
+/// The instruction a request renders. A custom prompt replaces the whole
+/// instruction and a translation has its own, so options either would drop
+/// are refused rather than ignored.
 pub fn render_instruction(options: &NemotronPromptOptions) -> Result<String> {
     if let Some(custom) = options.instruction_override.as_deref() {
+        if options.translate_to.is_some()
+            || !options.context_terms.is_empty()
+            || options.speaker_attribution
+        {
+            return Err(Error::InvalidInput(
+                "a Nemotron 3.5 Transcribe prompt replaces the whole instruction; it cannot be combined with translation, keywords or speaker labels".into(),
+            ));
+        }
         let custom = sanitize_user_text(custom);
         if custom.is_empty() {
             return Err(Error::InvalidInput(
@@ -233,6 +243,11 @@ pub fn render_instruction(options: &NemotronPromptOptions) -> Result<String> {
         if options.speaker_attribution {
             return Err(Error::InvalidInput(
                 "speaker attribution cannot be combined with translation".into(),
+            ));
+        }
+        if !options.context_terms.is_empty() {
+            return Err(Error::InvalidInput(
+                "Nemotron 3.5 Transcribe keywords cannot be combined with translation".into(),
             ));
         }
         return Ok(format!(
@@ -428,6 +443,19 @@ mod tests {
             ..Default::default()
         };
         assert!(render_instruction(&norwegian).is_err());
+        // Options a translation or a custom prompt would drop are refused.
+        let translated_terms = NemotronPromptOptions {
+            translate_to: Some("de".into()),
+            context_terms: vec!["Izwi".into()],
+            ..Default::default()
+        };
+        assert!(render_instruction(&translated_terms).is_err());
+        let prompted_terms = NemotronPromptOptions {
+            instruction_override: Some("Transcribe.".into()),
+            context_terms: vec!["Izwi".into()],
+            ..Default::default()
+        };
+        assert!(render_instruction(&prompted_terms).is_err());
         let speakers = NemotronPromptOptions {
             speaker_attribution: true,
             ..Default::default()

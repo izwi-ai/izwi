@@ -32,6 +32,8 @@ use crate::ModelVariant;
 use izwi_asr_toolkit::{
     chunk_seam_secs, plan_audio_chunks, spacing_between, AsrLongFormConfig, AudioChunk, TimedWord,
 };
+
+mod one_model;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -843,6 +845,16 @@ impl RuntimeService {
     ) -> Result<DiarizationTranscriptResult> {
         audio_input.validate()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
+        if diarization_variant.diarizes_in_one_model() {
+            if asr_model_id.is_some() || aligner_model_id.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "{diarization_variant} diarizes on its own; it takes no pipeline ASR or aligner"
+                )));
+            }
+            return self
+                .diarize_in_one_model(audio_input, diarization_variant, config, options)
+                .await;
+        }
         // Refuse an ASR or aligner the pipeline cannot run before diarizing:
         // the ASR's long-form graph must run as one blocking stage (the
         // predicate the post-load guard applies).

@@ -1584,8 +1584,7 @@ fn every_pipeline_selectable_asr_publishes_an_atomic_long_form_graph() {
     let expected = ModelVariant::all()
         .iter()
         .copied()
-        .filter(|variant| variant.runs_speech_to_text_jobs())
-        .filter(|variant| variant.family() != crate::catalog::ModelFamily::NemotronTranscribeAsr)
+        .filter(|variant| variant.serves_diarization_pipeline_asr())
         .collect::<Vec<_>>();
     assert_eq!(selectable, expected);
     assert!(selectable.contains(&ModelVariant::ParakeetTdt06BV3));

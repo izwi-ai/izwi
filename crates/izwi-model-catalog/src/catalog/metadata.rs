@@ -953,6 +953,8 @@ impl ModelVariant {
         match self {
             Self::DiarStreamingSortformer4SpkV21 => Some(4),
             Self::Nemotron3Diarization => Some(8),
+            // Its embedded Nemotron-3-Diarization head.
+            Self::Nemotron35Transcribe30BA4BFp8 => Some(8),
             _ => None,
         }
     }
@@ -964,7 +966,20 @@ impl ModelVariant {
 
     /// Whether this model can produce model-native speaker-attributed ASR text.
     pub fn supports_speaker_attributed_asr(&self) -> bool {
+        self.runs_speaker_attributed_asr_capability() || self.supports_asr_speaker_tags()
+    }
+
+    /// Whether speaker-attributed ASR runs as an execution capability of its
+    /// own (Granite Speech Plus's chunked pipeline).
+    pub fn runs_speaker_attributed_asr_capability(&self) -> bool {
         matches!(self, Self::GraniteSpeech412BPlus)
+    }
+
+    /// Whether a transcription request may ask this model to tag speakers in
+    /// its transcript (Nemotron 3.5 Transcribe's `<spk:N>`): speaker
+    /// attribution on its ordinary ASR route, timed by its CTC head.
+    pub fn supports_asr_speaker_tags(&self) -> bool {
+        matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
     }
 
     /// Whether a transcription request may ask this model to translate the
@@ -987,6 +1002,28 @@ impl ModelVariant {
                 | Self::GraniteSpeech502BGguf
                 | Self::Nemotron35Transcribe30BA4BFp8
         )
+    }
+
+    /// Whether this model diarizes a recording on its own (speaker tags,
+    /// its diarizer's segments and CTC word times from one transcription),
+    /// so a diarization job naming it loads no diarizer, ASR or aligner.
+    pub fn diarizes_in_one_model(&self) -> bool {
+        self.supports_asr_speaker_tags() && self.supports_native_word_timestamps()
+    }
+
+    /// Whether the diarization pipeline may use this model as its ASR stage:
+    /// every speech-to-text model but Nemotron 3.5 Transcribe, whose
+    /// transcripts run only as resumable engine rows (never the one blocking
+    /// stage the pipeline needs) and which tags speakers itself.
+    pub fn serves_diarization_pipeline_asr(&self) -> bool {
+        self.runs_speech_to_text_jobs() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
+    }
+
+    /// Whether this ASR model may serve live transcription and voice turns:
+    /// every ASR model but Nemotron 3.5 Transcribe, whose card says offline
+    /// (a 30B decoder over 40 s perception windows).
+    pub fn serves_live_asr(&self) -> bool {
+        self.is_asr() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
     }
 
     /// Whether this model times words itself (a CTC timestamp head), so a

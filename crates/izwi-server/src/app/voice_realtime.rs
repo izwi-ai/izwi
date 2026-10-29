@@ -1916,7 +1916,7 @@ async fn handle_text_message(
 
                     let asr_variant = parse_model_variant(asr_model_id.as_str())
                         .map_err(|err| format!("Unsupported ASR model: {err}"))?;
-                    if !asr_variant.is_asr() {
+                    if !asr_variant.serves_live_asr() {
                         return Err(format!(
                             "Model `{asr_model_id}` is not a supported modular ASR model."
                         ));

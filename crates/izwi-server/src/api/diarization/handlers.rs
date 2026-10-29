@@ -370,6 +370,7 @@ async fn create_pending_record(
 ) -> Result<DiarizationRecord, ApiError> {
     reject_granite_diarization_model(parsed.model_id.as_deref())?;
     validate_diarization_model_id(parsed.model_id.as_deref())?;
+    reject_pipeline_models_for_one_model_diarization(parsed)?;
     resolve_pipeline_model_ids(parsed)?;
     validate_speaker_bounds(
         parsed.model_id.as_deref(),
@@ -432,6 +433,28 @@ fn reject_granite_diarization_model(model_id: Option<&str>) -> Result<(), ApiErr
         return Err(ApiError::bad_request(
             "Granite-Speech-4.1-2B-Plus is a speaker-attributed ASR model, not a diarization model. Use `job_kind=speaker_attributed_asr` to preserve Granite's speaker-turn transcript.",
         ));
+    }
+    Ok(())
+}
+
+/// A model that diarizes on its own (Nemotron 3.5 Transcribe) runs no
+/// pipeline: an ASR or aligner id beside it would be silently ignored, so it
+/// is refused.
+fn reject_pipeline_models_for_one_model_diarization(
+    parsed: &ParsedDiarizationCreateRequest,
+) -> Result<(), ApiError> {
+    let Some(variant) = parsed
+        .model_id
+        .as_deref()
+        .and_then(|raw| parse_model_variant(raw).ok())
+        .filter(ModelVariant::diarizes_in_one_model)
+    else {
+        return Ok(());
+    };
+    if parsed.asr_model_id.is_some() || parsed.aligner_model_id.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "{variant} diarizes on its own; omit `asr_model` and `aligner_model`."
+        )));
     }
     Ok(())
 }
@@ -1841,6 +1864,7 @@ mod tests {
 
     #[test]
     fn diarization_model_id_validation_accepts_diarization_variants_and_none() {
+        assert!(validate_diarization_model_id(Some("Nemotron-3.5-Transcribe-30B-A4B-FP8")).is_ok());
         assert!(validate_diarization_model_id(None).is_ok());
         assert!(validate_diarization_model_id(Some("Nemotron-3-Diarization")).is_ok());
         assert!(validate_diarization_model_id(Some("diar_streaming_sortformer_4spk-v2.1")).is_ok());

@@ -91,9 +91,17 @@ fn synthetic_models_dir(tag: &str) -> ModelsDir {
 }
 
 async fn runtime_with(models: &ModelsDir, rows: usize) -> RuntimeService {
+    runtime_on(models, rows, crate::backends::BackendPreference::Cpu).await
+}
+
+async fn runtime_on(
+    models: &ModelsDir,
+    rows: usize,
+    backend: crate::backends::BackendPreference,
+) -> RuntimeService {
     let runtime = RuntimeService::new(EngineConfig {
         models_dir: models.0.clone(),
-        backend: crate::backends::BackendPreference::Cpu,
+        backend,
         max_batch_size: crate::config::BatchSizePreference::Fixed(
             std::num::NonZeroUsize::new(rows).unwrap(),
         ),
@@ -107,6 +115,9 @@ async fn runtime_with(models: &ModelsDir, rows: usize) -> RuntimeService {
     runtime
 }
 
+// The env lock is held across awaits on purpose: it keeps the span
+// variable fixed for the whole test.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn synthetic_rows_transcribe_alone_and_concurrently_alike() {
     // Prefill in 16-token spans, so every prompt resumes across several
@@ -189,6 +200,9 @@ async fn synthetic_requests_are_validated_before_admission() {
         .expect("auto");
 }
 
+// The env lock is held across awaits on purpose: it keeps the span
+// variable fixed for the whole test.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn synthetic_single_row_resumes_prefill_across_spans() {
     let _env = crate::env_test_lock()
@@ -209,4 +223,146 @@ async fn synthetic_single_row_resumes_prefill_across_spans() {
         .text;
     eprintln!("spans: {text:?} in {:?}", started.elapsed());
     assert!(!text.is_empty());
+}
+
+/// The same rows on Metal (FP8 weights, F32 activations, F16 KV): load,
+/// resumable spans, and two concurrent rows transcribing as they do alone.
+#[cfg(feature = "metal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthetic_rows_transcribe_alike_on_metal() {
+    let Some(_metal) =
+        crate::backends::metal_test_device_or_skip("synthetic_rows_transcribe_alike_on_metal")
+    else {
+        return;
+    };
+    let models = synthetic_models_dir("metal");
+    let runtime = runtime_on(&models, 2, crate::backends::BackendPreference::Metal).await;
+    let clips = [wav_bytes(&fox(0.0, 5.0)), wav_bytes(&fox(1.0, 7.0))];
+    let mut solo = Vec::new();
+    for clip in &clips {
+        solo.push(
+            transcribe(&runtime, clip, None)
+                .await
+                .expect("transcribe")
+                .text,
+        );
+    }
+    eprintln!("synthetic Metal transcripts: {solo:?}");
+    assert!(solo.iter().all(|text| !text.is_empty()), "{solo:?}");
+    let concurrent =
+        futures::future::join_all(clips.iter().map(|clip| transcribe(&runtime, clip, None))).await;
+    for (result, expected) in concurrent.into_iter().zip(&solo) {
+        assert_eq!(&result.expect("concurrent transcribe").text, expected);
+    }
+}
+
+/// Word timestamps through the transcription route: the CTC stage runs on
+/// the row and its words reach `timestamp_words` (tags left out) and the
+/// full `ctc_timestamps` object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_word_timestamps_reach_the_diagnostics() {
+    let models = synthetic_models_dir("timestamps");
+    let runtime = runtime_with(&models, 1).await;
+    let clip = wav_bytes(&fox(0.0, 4.0));
+    let output = runtime
+        .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+            &clip,
+            Some(&VARIANT.to_string()),
+            None,
+            None,
+            crate::engine::AsrTaskOptions::default(),
+            Some(MAX_TOKENS),
+            None,
+            RuntimeRequestContext::default(),
+            true,
+        )
+        .await
+        .expect("transcribe with timestamps");
+    let diagnostics = output.asr_diagnostics.expect("diagnostics");
+    assert!(
+        diagnostics["ctc_timestamps"]["error"].is_null(),
+        "{diagnostics}"
+    );
+    let words = diagnostics["timestamp_words"]
+        .as_array()
+        .expect("timestamp_words");
+    assert!(!words.is_empty(), "{diagnostics}");
+    for word in words {
+        let text = word["word"].as_str().unwrap();
+        assert!(!text.starts_with('<'), "{word}");
+        let (start, end) = (
+            word["start"].as_f64().unwrap(),
+            word["end"].as_f64().unwrap(),
+        );
+        assert!(0.0 <= start && start <= end && end <= 4.0 + 1e-6, "{word}");
+    }
+    // Without the flag, no CTC stage.
+    let plain = transcribe(&runtime, &clip, None).await.expect("transcribe");
+    assert!(plain
+        .asr_diagnostics
+        .is_none_or(|d| d.get("ctc_timestamps").is_none()));
+}
+
+/// Speaker-attributed ASR and one-model diarization run on the model's own
+/// rows: one transcription with speaker tags and word timestamps each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_speaker_attribution_and_one_model_diarization() {
+    let models = synthetic_models_dir("speakers");
+    let runtime = runtime_with(&models, 1).await;
+    let clip = wav_bytes(&fox(0.0, 4.0));
+    let started = std::time::Instant::now();
+    let saa = runtime
+        .speaker_attributed_asr_bytes(&clip, Some(&VARIANT.to_string()), Some("en"), None, None)
+        .await
+        .expect("speaker-attributed ASR");
+    eprintln!("SAA in {:?}: {saa:?}", started.elapsed());
+    assert!(!saa.text.is_empty());
+    assert!(!saa.speaker_turns.is_empty());
+    let config = crate::runtime::DiarizationConfig::default();
+    let options = crate::runtime::DiarizationPipelineOptions::default();
+    // A pipeline ASR beside a model that diarizes on its own is refused.
+    let error = runtime
+        .diarize_with_transcript_bytes(
+            &clip,
+            Some(&VARIANT.to_string()),
+            Some("parakeet-tdt-0.6b-v3"),
+            None,
+            &config,
+            &options,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::error::Error::InvalidInput(_)),
+        "{error}"
+    );
+    let started = std::time::Instant::now();
+    let diarized = runtime
+        .diarize_with_transcript_bytes(
+            &clip,
+            Some(&VARIANT.to_string()),
+            None,
+            None,
+            &config,
+            &options,
+        )
+        .await
+        .expect("one-model diarization");
+    eprintln!("diarization in {:?}: {diarized:?}", started.elapsed());
+    assert!(!diarized.asr_text.is_empty());
+    // The random model may write more tokens than its CTC timeline holds;
+    // then the job keeps the transcript and says why it has no words.
+    if diarized.words.is_empty() {
+        assert!(!diarized.warnings.is_empty(), "{diarized:?}");
+    }
+    assert!(diarized
+        .words
+        .iter()
+        .all(|word| word.speaker.starts_with("SPEAKER_") || word.speaker == "UNKNOWN"));
+    // Decoder special tokens never reach the text.
+    assert!(
+        !saa.text.contains("<|im_start|>") && !saa.text.contains("<reserved_"),
+        "{}",
+        saa.text
+    );
 }

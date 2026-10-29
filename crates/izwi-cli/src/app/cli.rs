@@ -490,6 +490,11 @@ pub enum Commands {
         /// Include word-level timestamps
         #[arg(long)]
         word_timestamps: bool,
+
+        /// Tag speakers in the transcript and print the speaker turns
+        /// (models that do, such as Nemotron-3.5-Transcribe-30B-A4B-FP8)
+        #[arg(long)]
+        speaker_labels: bool,
     },
 
     /// Chat with a multimodal model
@@ -525,7 +530,8 @@ pub enum Commands {
         /// Audio file to analyze
         file: PathBuf,
 
-        /// Diarization model to use
+        /// Diarization model to use; a model that diarizes on its own
+        /// (Nemotron-3.5-Transcribe-30B-A4B-FP8) runs without a pipeline ASR
         #[arg(short, long, default_value = "diar_streaming_sortformer_4spk-v2.1")]
         model: String,
 
@@ -545,9 +551,10 @@ pub enum Commands {
         #[arg(long)]
         transcribe: bool,
 
-        /// ASR model used for transcript generation
-        #[arg(long, default_value = "parakeet-tdt-0.6b-v3")]
-        asr_model: String,
+        /// ASR model used for transcript generation (the server's default,
+        /// parakeet-tdt-0.6b-v3, when omitted)
+        #[arg(long)]
+        asr_model: Option<String>,
     },
 
     /// Forced alignment
@@ -1013,9 +1020,11 @@ mod tests {
                     izwi_core::resolve_diarization_model_variant_strict(&model),
                     Ok(izwi_core::ModelVariant::DiarStreamingSortformer4SpkV21)
                 );
-                assert!(
-                    izwi_core::resolve_diarization_asr_model_variant(Some(&asr_model)).is_ok(),
-                    "{asr_model}"
+                // The server's default pipeline ASR.
+                assert_eq!(asr_model, None);
+                assert_eq!(
+                    izwi_core::resolve_diarization_asr_model_variant(None),
+                    Ok(izwi_core::ModelVariant::ParakeetTdt06BV3)
                 );
             }
             _ => panic!("expected diarize command"),

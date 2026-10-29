@@ -111,7 +111,7 @@ use speaker_attribution::{
 };
 
 #[derive(Clone, Copy)]
-enum AsrAudioInput<'a> {
+pub(super) enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
 }
@@ -465,6 +465,11 @@ pub fn validate_asr_task(
             "{variant} does not take keywords; pass them in the prompt instead"
         )));
     }
+    if task.speaker_attribution && !variant.supports_asr_speaker_tags() {
+        return Err(Error::InvalidInput(format!(
+            "{variant} does not tag speakers in a transcript"
+        )));
+    }
     match variant.family() {
         ModelFamily::GraniteSpeech5Asr => {
             validate_granite_speech5_request(&GraniteSpeech5RequestOptions {
@@ -488,7 +493,7 @@ pub fn validate_asr_task(
                     .map(str::to_string),
                 context_terms: task.keywords.clone(),
                 translate_to: task.translate_to.clone(),
-                speaker_attribution: false,
+                speaker_attribution: task.speaker_attribution,
                 verbatim: false,
                 instruction_override: prompt
                     .map(str::trim)

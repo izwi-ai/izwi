@@ -134,7 +134,7 @@ impl EngineCoreRequest {
                 language,
                 context_terms: self.asr_task.keywords.clone(),
                 translate_to: self.asr_task.translate_to.clone(),
-                speaker_attribution: false,
+                speaker_attribution: self.asr_task.speaker_attribution,
                 verbatim: false,
                 instruction_override: self
                     .asr_prompt_for_execution()

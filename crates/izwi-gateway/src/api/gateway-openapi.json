@@ -306,6 +306,10 @@
       },
       "AdminModelRouteCapabilities": {
         "properties": {
+          "diarization_pipeline_asr": {
+            "description": "The diarization pipeline may use the model as its ASR stage.",
+            "type": "boolean"
+          },
           "diarization_records": {
             "type": "boolean"
           },
@@ -314,6 +318,14 @@
           },
           "keyword_biasing": {
             "description": "Transcription requests may bias recognition with `keywords`.",
+            "type": "boolean"
+          },
+          "native_word_timestamps": {
+            "description": "Word timestamps come from the model itself (no forced aligner).",
+            "type": "boolean"
+          },
+          "one_model_diarization": {
+            "description": "Diarization jobs may name the model alone: it transcribes, tags\nspeakers and times words itself, with no pipeline ASR or aligner.",
             "type": "boolean"
           },
           "openai_audio_speech": {
@@ -379,11 +391,14 @@
           "openai_audio_speech",
           "openai_audio_transcriptions",
           "speech_to_text_jobs",
+          "diarization_pipeline_asr",
           "speech_to_text_realtime",
           "speech_translation",
           "keyword_biasing",
           "speaker_attributed_asr",
+          "native_word_timestamps",
           "diarization_records",
+          "one_model_diarization",
           "text_to_speech_records",
           "voice_design_records",
           "voice_clone_records",
@@ -2328,6 +2343,13 @@
               "null"
             ]
           },
+          "speaker_labels": {
+            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "stream": {
             "type": [
               "boolean",
@@ -2420,6 +2442,13 @@
             "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "speaker_labels": {
+            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -2632,6 +2661,14 @@
             "items": {
               "$ref": "#/components/schemas/TranscriptionTimestampSegment"
             },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "speaker_turns": {
+            "description": "With `speaker_labels`: the model's speaker turns (`speaker` is its\ntag, null before the first; `start` and `end` when it timed them).",
+            "items": {},
             "type": [
               "array",
               "null"

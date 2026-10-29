@@ -421,6 +421,7 @@ impl RuntimeService {
             on_progress,
             true,
             RuntimeRequestContext::default(),
+            false,
         )
         .await
     }
@@ -439,6 +440,7 @@ impl RuntimeService {
         on_progress: P,
         broker_streaming_required: bool,
         runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
@@ -456,7 +458,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 true,
-                false,
+                native_word_timestamps,
             )
             .await?;
         self.stream_admitted_asr_request(
@@ -965,6 +967,7 @@ impl RuntimeService {
             |_progress| {},
             true,
             runtime_context,
+            false,
         )
         .await
     }
@@ -1025,6 +1028,7 @@ impl RuntimeService {
             on_progress,
             true,
             runtime_context,
+            false,
         )
         .await
     }
@@ -1055,6 +1059,7 @@ impl RuntimeService {
             on_progress,
             false,
             RuntimeRequestContext::default(),
+            false,
         )
         .await
     }
@@ -1070,6 +1075,7 @@ impl RuntimeService {
         task: AsrTaskOptions,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
         on_delta: F,
         on_progress: P,
     ) -> Result<AsrTranscription>
@@ -1090,6 +1096,7 @@ impl RuntimeService {
             on_progress,
             false,
             runtime_context,
+            native_word_timestamps,
         )
         .await
     }

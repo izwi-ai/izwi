@@ -595,12 +595,10 @@ pub fn resolve_diarization_asr_model_variant(input: Option<&str>) -> Result<Mode
         return Ok(ModelVariant::ParakeetTdt06BV3);
     };
     match parse_model_variant(raw) {
-        // Its transcripts run only as resumable engine rows, never as the
-        // one blocking stage the pipeline needs; it tags speakers itself.
-        Ok(variant) if variant.family() == ModelFamily::NemotronTranscribeAsr => Err(format!(
+        Ok(variant) if variant.serves_diarization_pipeline_asr() => Ok(variant),
+        Ok(variant) if variant.supports_asr_speaker_tags() => Err(format!(
             "Model '{raw}' cannot transcribe in the diarization pipeline; it attributes speakers in its own transcripts."
         )),
-        Ok(variant) if variant.runs_speech_to_text_jobs() => Ok(variant),
         Ok(variant) => Err(format!(
             "Model '{raw}' cannot transcribe in the diarization pipeline (resolved to {variant:?}); choose an ASR model."
         )),
@@ -616,7 +614,7 @@ pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     };
 
     match parse_model_variant(raw) {
-        Ok(variant) if variant.is_diarization() => variant,
+        Ok(variant) if variant.is_diarization() || variant.diarizes_in_one_model() => variant,
         Ok(_) => DiarStreamingSortformer4SpkV21,
         Err(_) => DiarStreamingSortformer4SpkV21,
     }
@@ -656,7 +654,7 @@ pub fn resolve_diarization_model_variant_strict(
     input: &str,
 ) -> Result<ModelVariant, String> {
     match parse_model_variant(input) {
-        Ok(variant) if variant.is_diarization() => Ok(variant),
+        Ok(variant) if variant.is_diarization() || variant.diarizes_in_one_model() => Ok(variant),
         Ok(variant) => Err(format!(
             "Model '{input}' is not a diarization model (resolved to {variant:?})."
         )),
@@ -1474,6 +1472,30 @@ mod tests {
             ModelVariant::Nemotron35Transcribe30BA4BFp8.primary_task(),
             ModelTask::Asr
         );
+        // Speaker attribution is a tag on its ASR rows, not a capability of
+        // its own; Granite Speech Plus keeps its pipeline.
+        let variant = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+        assert!(variant.supports_speaker_attributed_asr());
+        assert!(variant.supports_asr_speaker_tags());
+        assert!(!variant.runs_speaker_attributed_asr_capability());
+        assert!(variant.supports_native_word_timestamps());
+        assert!(!variant.serves_live_asr());
+        // It diarizes on its own: a diarization job may name it.
+        assert!(variant.diarizes_in_one_model());
+        assert_eq!(variant.diarization_speaker_channels(), Some(8));
+        assert_eq!(
+            resolve_diarization_model_variant_strict("Nemotron-3.5-Transcribe-30B-A4B-FP8"),
+            Ok(variant)
+        );
+        assert_eq!(
+            resolve_diarization_model_variant(Some("Nemotron-3.5-Transcribe-30B-A4B-FP8")),
+            variant
+        );
+        assert!(!ModelVariant::GraniteSpeech412BPlus.diarizes_in_one_model());
+        assert!(ModelVariant::ParakeetTdt06BV3.serves_live_asr());
+        let granite = ModelVariant::GraniteSpeech412BPlus;
+        assert!(granite.runs_speaker_attributed_asr_capability());
+        assert!(!granite.supports_asr_speaker_tags());
     }
 
     #[test]
