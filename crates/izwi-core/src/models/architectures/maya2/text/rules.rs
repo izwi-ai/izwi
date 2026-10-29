@@ -2,7 +2,8 @@
 //! normaliser (R9's paise words are installed in `lang.rs`).
 //!
 //! Pre (outside e-mail / URL spans, in this order): R10 percent ranges
-//! written with two signs, R11 price per unit, R12 "p.a.", R7 version
+//! written with two signs, R11 price per unit, R12 "p.a.", Izwi's own
+//! English "<number> ms" as milliseconds (not upstream), R7 version
 //! strings, R4 spaced card / phone digit groups, R1 dates with a two-digit
 //! year, R2 card expiry next to an expiry / date word or a CVV, R3 financial
 //! years, R5 a PIN keyword's digits, R6 bare six-digit PIN codes, R8 Tamil
@@ -166,6 +167,22 @@ fn pre_piece(text: &[char], lang: &str, l: &Lang) -> R<String> {
             format!("{} {}", l.letter('P'), l.letter('A'))
         }
     });
+
+    // Not upstream: a number's "ms" is milliseconds. English's abbreviation
+    // table reads every standalone "ms" as the honorific "miss" (upstream
+    // too), which made "50 ms" "fifty miss".
+    if lang == "en" {
+        let cur = t_.clone();
+        t_ = re!(r"(?<![\w.])(\d+(?:,\d{3})*(?:\.\d+)?)[\s-]?(?:ms|MS)\b").sub_with(&cur, |m| {
+            let n = m.str(&cur, 1);
+            let unit = if n == "1" {
+                "millisecond"
+            } else {
+                "milliseconds"
+            };
+            format!("{n} {unit}")
+        });
+    }
 
     // R7 v4.5.2 -> "v four point five point two"
     let cur = t_.clone();

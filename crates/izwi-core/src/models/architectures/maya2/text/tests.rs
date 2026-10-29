@@ -443,6 +443,44 @@ fn tags_are_protected() {
 }
 
 #[test]
+fn milliseconds_are_not_the_honorific() {
+    // Not upstream: its abbreviation table reads every "ms" as "miss".
+    assert_eq!(
+        normalise_text("Time to first token can be as low as 50 ms.", "en"),
+        "Time to first token can be as low as fifty milliseconds."
+    );
+    assert_eq!(
+        normalise_text("a 200ms delay", "en"),
+        "a two hundred milliseconds delay"
+    );
+    assert_eq!(
+        normalise_text("a 50-ms budget", "en"),
+        "a fifty milliseconds budget"
+    );
+    assert_eq!(
+        normalise_text("TIMEOUT 500MS", "en"),
+        "Timeout five hundred milliseconds"
+    );
+    assert_eq!(normalise_text("1 ms", "en"), "one millisecond");
+    assert_eq!(
+        normalise_text("1.5 ms", "en"),
+        "one point five milliseconds"
+    );
+    // the honorific, and a word that merely starts with "ms", are untouched
+    assert_eq!(
+        normalise_text("Ms Smith is here", "en"),
+        "miss Smith is here"
+    );
+    assert_eq!(
+        normalise_text("Ms. Smith is here", "en"),
+        "miss Smith is here"
+    );
+    assert_eq!(normalise_text("50 msec", "en"), "fifty msec");
+    // other languages have no "miss" to avoid and keep upstream's reading
+    assert!(!normalise_text("50 ms", "hi").contains("millisecond"));
+}
+
+#[test]
 fn whitespace_is_collapsed() {
     assert_eq!(normalise_text(" \t a \n\n b \u{a0} c  ", "en"), "a b c");
     assert_eq!(normalise_text("", "en"), "");
