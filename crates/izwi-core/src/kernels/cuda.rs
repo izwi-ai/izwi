@@ -3448,6 +3448,12 @@ mod cuda_ptx {
     include!(concat!(env!("OUT_DIR"), "/qwen35_ptx.rs"));
 }
 
+/// The PTX of `kernels/cuda/mamba2.cu` (`kernels::mamba2`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_mamba2() -> &'static str {
+    cuda_ptx::MAMBA2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

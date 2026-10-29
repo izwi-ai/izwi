@@ -15,6 +15,7 @@ pub mod cuda;
 pub mod depthwise_conv;
 pub mod f16_weight_linear;
 pub(crate) mod lfm_shortconv_step;
+pub mod mamba2;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
