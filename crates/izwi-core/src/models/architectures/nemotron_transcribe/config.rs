@@ -692,7 +692,7 @@ fn transformer_config(
     let rotary_dims = rotary.round() as usize;
     if (rotary - rotary_dims as f64).abs() > 1e-9
         || rotary_dims == 0
-        || rotary_dims % 2 != 0
+        || !rotary_dims.is_multiple_of(2)
         || rotary_dims > head_dim
     {
         return Err(invalid(format!(

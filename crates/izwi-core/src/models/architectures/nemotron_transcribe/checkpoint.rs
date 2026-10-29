@@ -102,6 +102,25 @@ pub struct CtcGeometry {
     pub model_proto_bytes: usize,
 }
 
+impl CtcGeometry {
+    /// The trunk: NeMo's TransformerEncoder without pre-encoding, its
+    /// default RoPE base and LayerNorm epsilon (the artifact sets neither).
+    pub fn trunk(&self) -> super::config::SpeechTransformerConfig {
+        super::config::SpeechTransformerConfig {
+            feat_in: self.feat_in,
+            d_model: self.feat_in,
+            heads: self.heads,
+            layers: self.layers,
+            ff_dim: self.ff_dim,
+            qk_norm: true,
+            rotary_dims: self.rotary_dims,
+            rope_base: 10_000.0,
+            stacking: 1,
+            layer_norm_eps: 1e-5,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawIndex {
     weight_map: BTreeMap<String, String>,
@@ -339,12 +358,16 @@ impl NemotronCheckpoint {
         let bytes = self.bytes(name)?;
         match dtype {
             Dtype::BF16 => Ok(bytes
-                .chunks_exact(2)
-                .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b).to_f32())
                 .collect()),
             Dtype::F32 => Ok(bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect()),
             other => Err(load_error(format!("{name} is {other:?}, not BF16 or F32"))),
         }
@@ -360,8 +383,10 @@ impl NemotronCheckpoint {
         }
         Ok(self
             .bytes(name)?
-            .chunks_exact(2)
-            .map(|b| bf16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
             .collect())
     }
 
@@ -887,18 +912,7 @@ pub fn expected_census(
             F32,
             &[ctc.num_classes + 1],
         );
-        let trunk = super::config::SpeechTransformerConfig {
-            feat_in: width,
-            d_model: width,
-            heads: ctc.heads,
-            layers: ctc.layers,
-            ff_dim: ctc.ff_dim,
-            qk_norm: true,
-            rotary_dims: ctc.rotary_dims,
-            rope_base: 10_000.0,
-            stacking: 1,
-            layer_norm_eps: 1e-5,
-        };
+        let trunk = ctc.trunk();
         transformer_entries(
             &mut out,
             config,

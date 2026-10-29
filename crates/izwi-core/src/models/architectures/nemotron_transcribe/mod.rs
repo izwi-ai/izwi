@@ -19,6 +19,8 @@
 
 pub mod checkpoint;
 pub mod config;
+pub mod ctc;
+pub mod ctc_head;
 pub mod decoder;
 pub mod frontend;
 pub mod linear;

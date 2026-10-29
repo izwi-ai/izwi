@@ -120,6 +120,20 @@ pub struct NemotronPerception {
     device: Device,
 }
 
+/// What the CTC timestamp stage keeps of one window: its stored encoder
+/// output and the diarizer's probabilities, not its decoder embeddings.
+#[derive(Debug, Clone)]
+pub struct TimestampWindow {
+    /// The first audio token of the window's core.
+    pub first_token: usize,
+    /// The pre-`asr_norm` encoder output `[core, d_model]`.
+    pub ctc_input: Tensor,
+    /// 80 ms diarizer probabilities, aligned to the core.
+    pub speaker_preds: Vec<Vec<f32>>,
+    /// Native 10 ms probabilities of the core.
+    pub speaker_preds_10ms: Vec<Vec<f32>>,
+}
+
 /// What one encoded window yields.
 #[derive(Debug, Clone)]
 pub struct EncodedWindow {
@@ -252,7 +266,8 @@ impl NemotronPerception {
         Ok(EncodedWindow {
             first_token,
             embeddings,
-            ctc_input: keep_ctc_input.then_some(asr),
+            // A copy, so the window's context frames are not kept alive.
+            ctc_input: keep_ctc_input.then(|| asr.copy()).transpose()?,
             speaker_preds,
             speaker_preds_10ms: diar.preds_10ms,
         })
@@ -273,7 +288,7 @@ pub struct PerceptionStream {
     keep_ctc_input: bool,
     /// Everything the CTC stage and diarization segments need, kept per
     /// window when requested.
-    retained: Vec<EncodedWindow>,
+    retained: Vec<TimestampWindow>,
 }
 
 impl std::fmt::Debug for PerceptionStream {
@@ -337,7 +352,7 @@ impl PerceptionStream {
                 )
             })?;
             let update = index + 1 < self.windows.len();
-            let encoded = perception.encode_window(
+            let mut encoded = perception.encode_window(
                 &self.mel,
                 &window,
                 &mut self.state,
@@ -347,8 +362,13 @@ impl PerceptionStream {
             )?;
             self.next_window += 1;
             self.produced += encoded.embeddings.dim(0)?;
-            if self.keep_ctc_input {
-                self.retained.push(encoded.clone());
+            if let Some(ctc_input) = encoded.ctc_input.take() {
+                self.retained.push(TimestampWindow {
+                    first_token: encoded.first_token,
+                    ctc_input,
+                    speaker_preds: std::mem::take(&mut encoded.speaker_preds),
+                    speaker_preds_10ms: std::mem::take(&mut encoded.speaker_preds_10ms),
+                });
             }
             self.ready.push_back(encoded);
         }
@@ -398,7 +418,9 @@ impl PerceptionStream {
     }
 
     /// Every window, for a stream that kept them (CTC timestamps).
-    pub fn retained_windows(&self) -> &[EncodedWindow] {
+    /// The windows encoded so far, as the CTC stage keeps them (empty
+    /// unless the stream was created to keep them).
+    pub fn retained_windows(&self) -> &[TimestampWindow] {
         &self.retained
     }
 

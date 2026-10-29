@@ -20,6 +20,12 @@ use tokenizers::Tokenizer;
 
 use super::checkpoint::NemotronCheckpoint;
 use super::config::{NemotronTranscribeConfig, TOKENIZER_FILE};
+use super::ctc::{
+    align, clean_sot_transcript, diarization_segments, prepare as prepare_alignment,
+    CtcAlignmentConfig, CtcAlignmentInputs, CtcTimestampError, CtcTimestamps, CtcTokenizer,
+    SpeakerActivity,
+};
+use super::ctc_head::NemotronCtcHead;
 use super::decoder::{DecodeRow, DecoderTrace, NemotronDecoder, NemotronMambaState, TraceRequest};
 use super::frontend::NemotronMelFrontend;
 use super::linear::Residency;
@@ -311,6 +317,89 @@ pub struct NemotronTranscription {
     pub prompt_tokens: usize,
     pub audio_tokens: usize,
     pub windows: usize,
+    /// Word timestamps and diarization segments, when the request asked.
+    pub timestamps: Option<CtcTimestamps>,
+}
+
+/// One speaker turn of a finished transcript, timed when the CTC stage
+/// aligned its words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NemotronTimedTurn {
+    /// The `<spk:N>` tag; `None` for text before the first tag.
+    pub speaker: Option<u32>,
+    pub text: String,
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+}
+
+impl NemotronTranscription {
+    /// The transcript's speaker turns, each timed from its own words: the
+    /// aligner's words of the turn's speaker, taken in order while their
+    /// text (whitespace removed, so character units of Chinese and Japanese
+    /// match too) continues the turn's text. A turn whose words do not match
+    /// stays untimed.
+    pub fn timed_turns(&self) -> Vec<NemotronTimedTurn> {
+        // Words carry upstream's `str(tag)`: "None" before the first tag,
+        // and "0" throughout a transcript without tags (one untagged turn).
+        let tagged = self
+            .transcript
+            .turns
+            .iter()
+            .any(|turn| turn.speaker.is_some());
+        let mut streams: std::collections::HashMap<Option<u32>, std::collections::VecDeque<_>> =
+            std::collections::HashMap::new();
+        for word in self
+            .timestamps
+            .iter()
+            .filter(|timestamps| timestamps.error.is_none())
+            .flat_map(|timestamps| timestamps.words.iter())
+            // Event and style tags are aligned as units but are not text.
+            .filter(|word| !(word.word.starts_with('<') && word.word.ends_with('>')))
+        {
+            let speaker = tagged.then(|| word.speaker.parse::<u32>().ok()).flatten();
+            streams.entry(speaker).or_default().push_back(word);
+        }
+        let squash = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        self.transcript
+            .turns
+            .iter()
+            .map(|turn| {
+                let target = squash(&turn.text);
+                let mut matched = String::new();
+                let (mut start, mut end) = (None, None);
+                if let Some(stream) = streams.get_mut(&turn.speaker) {
+                    while let Some(word) = stream.front() {
+                        let next = format!("{matched}{}", squash(&word.word));
+                        if next.is_empty() || !target.starts_with(&next) {
+                            break;
+                        }
+                        start = start.or(Some(word.start));
+                        end = Some(word.end);
+                        matched = next;
+                        stream.pop_front();
+                    }
+                }
+                NemotronTimedTurn {
+                    speaker: turn.speaker,
+                    text: turn.text.clone(),
+                    start,
+                    end,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The CTC timestamp stage: the head, its tokenizer and NeMo's aligner
+/// settings.
+struct CtcStage {
+    head: NemotronCtcHead,
+    tokenizer: CtcTokenizer,
+    config: CtcAlignmentConfig,
 }
 
 /// Load-time checks and counters.
@@ -338,6 +427,10 @@ pub struct NemotronTranscribeModel {
     perception: NemotronPerception,
     decoder: NemotronDecoder,
     tokenizer: Tokenizer,
+    /// The tokenizer's special tokens, removed from decoded text.
+    special_tokens: Vec<String>,
+    /// Present when the checkpoint has the CTC artifact.
+    ctc: Option<CtcStage>,
     audio_token_id: u32,
     /// Added `<…>` tokens, left out of streamed text.
     tag_ids: std::collections::HashSet<u32>,
@@ -415,6 +508,14 @@ impl NemotronTranscribeModel {
             .filter(|(_, token)| token.content.starts_with('<') && token.content.ends_with('>'))
             .map(|(id, _)| id)
             .collect();
+        // Decoded text is cleaned of these as vLLM cleans it (speaker, event
+        // and style tags stay for the transcript parser and the aligner).
+        let special_tokens = tokenizer
+            .get_added_tokens_decoder()
+            .into_values()
+            .filter(|token| token.special)
+            .map(|token| token.content)
+            .collect::<Vec<_>>();
 
         // Self-checks: each resident projection kind against the exactly
         // dequantized checkpoint weights (before the mapping is dropped),
@@ -425,7 +526,8 @@ impl NemotronTranscribeModel {
                 let original =
                     checkpoint.fp8(&module, linear.out_features(), linear.in_features())?;
                 let error = linear.check_against(&original, device)?;
-                if !(error <= PROJECTION_CHECK_LIMIT) {
+                // A NaN error fails the check too.
+                if error.is_nan() || error > PROJECTION_CHECK_LIMIT {
                     return Err(Error::ModelLoadError(format!(
                         "Nemotron 3.5 Transcribe: resident {module} deviates from the checkpoint by {error:.3e}"
                     )));
@@ -438,13 +540,33 @@ impl NemotronTranscribeModel {
         } else {
             let error =
                 crate::kernels::mamba2::verify_device(device, config.decoder.mamba.state.min(128))?;
-            if !(error <= SCAN_CHECK_LIMIT) {
+            if error.is_nan() || error > SCAN_CHECK_LIMIT {
                 return Err(Error::ModelLoadError(format!(
                     "Nemotron 3.5 Transcribe: the device Mamba2 scan deviates from the CPU scan by {error:.3e}"
                 )));
             }
             Some(error)
         };
+        let ctc = checkpoint
+            .ctc_geometry()?
+            .map(|geometry| -> Result<CtcStage> {
+                let head =
+                    NemotronCtcHead::load(&checkpoint, &config, &geometry, device, fp8_mode)?;
+                let tokenizer = CtcTokenizer::from_model_proto(head.model_proto())?;
+                if tokenizer.len() + 1 != head.classes() {
+                    return Err(Error::ModelLoadError(format!(
+                        "the CTC tokenizer has {} pieces for a {}-class head",
+                        tokenizer.len(),
+                        head.classes()
+                    )));
+                }
+                Ok(CtcStage {
+                    head,
+                    tokenizer,
+                    config: CtcAlignmentConfig::default(),
+                })
+            })
+            .transpose()?;
         drop(checkpoint);
         let load_seconds = started.elapsed().as_secs_f64();
         tracing::info!(
@@ -465,6 +587,8 @@ impl NemotronTranscribeModel {
             perception,
             decoder,
             tokenizer,
+            special_tokens,
+            ctc,
             audio_token_id,
             tag_ids,
             identity: NEXT_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -529,7 +653,15 @@ impl NemotronTranscribeModel {
 
     /// Resident device bytes of the weights.
     pub fn resident_bytes(&self) -> usize {
-        self.decoder.resident_bytes() + self.perception.resident_bytes()
+        self.decoder.resident_bytes()
+            + self.perception.resident_bytes()
+            + self.ctc.as_ref().map_or(0, |ctc| ctc.head.resident_bytes())
+    }
+
+    /// Whether word timestamps can be computed (the checkpoint has the CTC
+    /// artifact).
+    pub fn supports_word_timestamps(&self) -> bool {
+        self.ctc.is_some()
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
@@ -554,6 +686,7 @@ impl NemotronTranscribeModel {
             "frontend_tables_checked": d.frontend_checked,
             "projection_checks": d.projection_checks.iter().map(|(m, e)| json!({"module": m, "relative_l2": e})).collect::<Vec<_>>(),
             "mamba2_scan_check": d.scan_check,
+            "ctc_timestamp_head": self.ctc.is_some(),
             "prefill_spans": d.prefill_spans.load(Ordering::Relaxed),
             "decode_steps": d.decode_steps.load(Ordering::Relaxed),
             "windows_encoded": d.windows_encoded.load(Ordering::Relaxed),
@@ -662,7 +795,7 @@ impl NemotronTranscribeModel {
         let perception = PerceptionStream::new(
             artifact.mel.clone(),
             self.perception.stacking(),
-            artifact.request.word_timestamps,
+            artifact.request.word_timestamps && self.ctc.is_some(),
         );
         if perception.audio_tokens() != artifact.layout.audio_tokens {
             return Err(Error::InferenceError(
@@ -870,7 +1003,7 @@ impl NemotronTranscribeModel {
                     })?;
                 step_rows.push(DecodeRow {
                     state: &mut state.mamba,
-                    cache: &mut **cache,
+                    cache,
                     token,
                 });
             }
@@ -895,17 +1028,119 @@ impl NemotronTranscribeModel {
             .as_ref()
             .filter(|d| d.finished())
             .ok_or_else(|| Error::InferenceError("the row has not finished".into()))?;
-        let text = self
+        let decoded = self
             .tokenizer
             .decode(&decode.generated, false)
             .map_err(|err| Error::TokenizationError(err.to_string()))?;
+        let special_tokens = self
+            .special_tokens
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let transcript = parse_transcript(&clean_sot_transcript(&decoded, &special_tokens));
+        let timestamps = state
+            .artifact
+            .request
+            .word_timestamps
+            .then(|| self.word_timestamps(state, &transcript.raw));
         Ok(NemotronTranscription {
-            transcript: parse_transcript(&text),
+            transcript,
             finish_reason: decode.finished.expect("finished"),
             generated_tokens: decode.generated.len(),
             prompt_tokens: state.prompt_tokens(),
             audio_tokens: state.artifact.layout.audio_tokens,
             windows: state.perception.windows_encoded(),
+            timestamps,
+        })
+    }
+
+    /// The CTC stage over a finished row: the head over the stored encoder
+    /// output (only the transcript's columns leave the device), then NeMo's
+    /// aligner with the diarizer's probabilities. A failure is reported in
+    /// the result's `error`, as upstream does, and never fails the
+    /// transcript.
+    fn word_timestamps(&self, state: &NemotronRetainedState, transcript: &str) -> CtcTimestamps {
+        let Some(ctc) = &self.ctc else {
+            return CtcTimestamps::failed(CtcTimestampError::NotEnabled);
+        };
+        let windows = state.perception.retained_windows();
+        if windows.is_empty() {
+            return CtcTimestamps::failed(CtcTimestampError::CaptureUnavailable);
+        }
+        let run = || -> Result<CtcTimestamps> {
+            let flatten = |rows: &mut dyn Iterator<Item = &Vec<f32>>| {
+                let mut values = Vec::new();
+                let mut frames = 0;
+                let mut speakers = 0;
+                for row in rows {
+                    speakers = row.len();
+                    values.extend_from_slice(row);
+                    frames += 1;
+                }
+                (values, frames, speakers)
+            };
+            let (speaker_values, speaker_frames, speakers) =
+                flatten(&mut windows.iter().flat_map(|w| w.speaker_preds.iter()));
+            // The native predictions past the recording's valid mel frames
+            // are padding.
+            let valid = state.perception.valid_frames();
+            let (diar_values, diar_frames, diar_speakers) = flatten(
+                &mut windows
+                    .iter()
+                    .flat_map(|w| w.speaker_preds_10ms.iter())
+                    .take(valid),
+            );
+            let diarization = (diar_frames > 0).then_some(SpeakerActivity {
+                values: &diar_values,
+                frames: diar_frames,
+                speakers: diar_speakers,
+            });
+            let audio_duration = f64::from(state.artifact.duration_secs);
+            let inputs = windows
+                .iter()
+                .map(|window| window.ctc_input.clone())
+                .collect::<Vec<_>>();
+            let states = Tensor::cat(&inputs, 0)?;
+            let ctc_frames = states.dim(0)? * ctc.head.factor();
+            // No language: NeMo serves with per-transcript script detection.
+            let prepared = match prepare_alignment(
+                &ctc.tokenizer,
+                transcript,
+                None,
+                ctc_frames,
+                ctc.head.blank(),
+                &ctc.config,
+            ) {
+                Ok(prepared) => prepared,
+                // Upstream keeps the diarization when the text cannot align.
+                Err(error) => {
+                    return Ok(CtcTimestamps::without_words(
+                        Some(error),
+                        diarization.map_or_else(Vec::new, |activity| {
+                            diarization_segments(activity, audio_duration, &ctc.config)
+                        }),
+                    ))
+                }
+            };
+            let log_probs = ctc.head.log_prob_columns(&states, &prepared.columns)?;
+            Ok(align(
+                &prepared,
+                CtcAlignmentInputs {
+                    log_probs: &log_probs,
+                    speaker_probs: (speaker_frames > 0).then_some(SpeakerActivity {
+                        values: &speaker_values,
+                        frames: speaker_frames,
+                        speakers,
+                    }),
+                    diarization,
+                    audio_duration,
+                },
+                &ctc.config,
+            ))
+        };
+        run().unwrap_or_else(|error| {
+            tracing::warn!("Nemotron 3.5 Transcribe word timestamps failed: {error}");
+            CtcTimestamps::failed(CtcTimestampError::AlignmentFailed)
         })
     }
 

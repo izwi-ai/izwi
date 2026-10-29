@@ -30,7 +30,7 @@ use super::decoder::moe::Routing;
 use super::decoder::{DecoderTrace, TraceRequest};
 use super::frontend::NemotronMel;
 use super::model::{NemotronStepRow, NemotronTranscribeModel, NemotronTranscribeRequest};
-use super::perception::{EncodedWindow, PerceptionStream, PerceptionWindow};
+use super::perception::{PerceptionStream, PerceptionWindow, TimestampWindow};
 use super::prompt::NemotronPromptOptions;
 use super::speech_transformer::host_values;
 use super::transcript::NemotronFinishReason;
@@ -50,7 +50,7 @@ fn fixture_dir() -> PathBuf {
 struct Observed {
     mel: NemotronMel,
     plan: Vec<PerceptionWindow>,
-    windows: Vec<EncodedWindow>,
+    windows: Vec<TimestampWindow>,
     /// `[audio_tokens, hidden]`.
     embeddings: Vec<f32>,
     prompt_ids: Vec<u32>,
@@ -316,12 +316,8 @@ fn compare(
         let Some(encoded) = observed.windows.get(index) else {
             continue;
         };
-        let width = encoded.ctc_input.as_ref().map_or(0, |t| t.dims()[1]);
-        let asr = encoded
-            .ctc_input
-            .as_ref()
-            .map(|t| host_values(t).unwrap())
-            .unwrap_or_default();
+        let width = encoded.ctc_input.dims()[1];
+        let asr = host_values(&encoded.ctc_input).unwrap();
         let rel = tolerance(tolerances, &["asr_core_rows", "rel_l2"], backend, 2e-2);
         for row in window["asr_core_rows"].as_array().into_iter().flatten() {
             let r = row["row"].as_u64().unwrap_or(0) as usize;
@@ -561,8 +557,10 @@ fn read_pcm16_wav(path: &Path) -> Vec<f32> {
 fn read_f32_le(path: &Path) -> Vec<f32> {
     std::fs::read(path)
         .unwrap()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 

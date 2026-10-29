@@ -263,3 +263,55 @@ fn metal_loads_the_synthetic_checkpoint_and_tracks_the_cpu_prefill() {
     let error = crate::kernels::numeric_check::relative_l2(&b, &a);
     assert!(error < 5e-2, "{error}");
 }
+
+/// A request with word timestamps runs the CTC stage on the synthetic
+/// artifact (on CPU and Metal): every word is timed inside the recording,
+/// in order, and the speaker turns take their times from their own words.
+#[test]
+fn word_timestamps_run_the_ctc_stage_and_time_the_turns() {
+    let dir = temp_checkpoint();
+    #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+    let mut devices = vec![Device::Cpu];
+    #[cfg(feature = "metal")]
+    if let Ok(device) = Device::new_metal(0) {
+        devices.push(device);
+    }
+    for device in devices {
+        let model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
+        assert!(model.supports_word_timestamps());
+        assert_eq!(model.diagnostics_summary()["ctc_timestamp_head"], true);
+        let audio = test_audio(3.0, 1);
+        let mut cache = caches(&device, &model, 1, 1024).remove(0);
+        let mut timed = request(16);
+        timed.word_timestamps = true;
+        let result = model
+            .transcribe_with_cache(&audio, timed, &mut cache, 64)
+            .unwrap();
+        let timestamps = result
+            .timestamps
+            .as_ref()
+            .expect("timestamps were asked for");
+        eprintln!("{device:?}: {:?} → {timestamps:?}", result.transcript.raw);
+        assert!(timestamps.error.is_none(), "{:?}", timestamps.error);
+        assert!(!timestamps.words.is_empty());
+        let mut previous = 0.0;
+        for word in &timestamps.words {
+            assert!(
+                word.start >= previous - 1e-9 && word.end >= word.start,
+                "{word:?}"
+            );
+            assert!(word.end <= 3.0 + 1e-6, "{word:?}");
+            previous = word.start;
+        }
+        let turns = result.timed_turns();
+        assert_eq!(turns.len(), result.transcript.turns.len());
+        assert!(turns.iter().any(|turn| turn.start.is_some()), "{turns:?}");
+        // Without the request flag the stage does not run.
+        let mut cache = caches(&device, &model, 1, 1024).remove(0);
+        let plain = model
+            .transcribe_with_cache(&audio, request(16), &mut cache, 64)
+            .unwrap();
+        assert!(plain.timestamps.is_none());
+        assert_eq!(plain.transcript, result.transcript);
+    }
+}

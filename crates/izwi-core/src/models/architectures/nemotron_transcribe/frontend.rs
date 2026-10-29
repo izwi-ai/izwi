@@ -354,8 +354,10 @@ mod tests {
     fn published_tables() -> (Vec<f32>, Vec<f32>) {
         let read = |bytes: &[u8]| {
             bytes
-                .chunks_exact(2)
-                .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b).to_f32())
                 .collect::<Vec<_>>()
         };
         (

@@ -125,7 +125,7 @@ fn q8_0_bytes(rows: usize, cols: usize, value: impl Fn(usize, &mut [f32]) + Sync
         .for_each(|(row, bytes)| {
             let mut values = vec![0f32; cols];
             value(row, &mut values);
-            for (block, chunk) in values.chunks_exact(32).enumerate() {
+            for (block, chunk) in values.as_chunks::<32>().0.iter().enumerate() {
                 let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
                 let d = amax / 127.0;
                 let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -307,7 +307,7 @@ impl NtLinear {
         })
     }
 
-    fn with_bias(
+    pub(crate) fn with_bias(
         mut self,
         checkpoint: &NemotronCheckpoint,
         module: &str,

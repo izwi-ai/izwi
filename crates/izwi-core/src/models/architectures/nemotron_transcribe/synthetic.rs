@@ -269,6 +269,193 @@ fn exclude_list() -> Vec<String> {
     out
 }
 
+/// The synthetic CTC tokenizer's pieces (piece, score, SentencePiece
+/// type): `<unk>`, the ten speaker tags, `▁`, `w`, the digits and `▁w`,
+/// so the synthetic decoder's `w153` encodes as `▁w 1 5 3`.
+pub fn ctc_pieces() -> Vec<(String, f32, u64)> {
+    const NORMAL: u64 = 1;
+    const UNKNOWN: u64 = 2;
+    const USER_DEFINED: u64 = 4;
+    let mut pieces = vec![("<unk>".to_string(), 0.0, UNKNOWN)];
+    pieces.extend((0..10).map(|i| (format!("<spk:{i}>"), 0.0, USER_DEFINED)));
+    pieces.push(("\u{2581}".into(), -1.0, NORMAL));
+    pieces.push(("w".into(), -2.0, NORMAL));
+    pieces.extend((0..10).map(|d| (d.to_string(), -3.0 - d as f32 * 0.01, NORMAL)));
+    pieces.push(("\u{2581}w".into(), -0.5, NORMAL));
+    pieces
+}
+
+/// A SentencePiece BPE `ModelProto` over `ctc_pieces` (unk 0, no BOS, EOS
+/// or PAD, the identity normalizer with SentencePiece's whitespace rules).
+/// sentencepiece 0.2.1 loads these bytes and encodes as the comment above.
+pub fn ctc_model_proto() -> Vec<u8> {
+    fn varint(out: &mut Vec<u8>, value: i64) {
+        let mut v = value as u64;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    fn key(out: &mut Vec<u8>, field: u64, wire: u64) {
+        varint(out, (field << 3 | wire) as i64);
+    }
+    fn message(out: &mut Vec<u8>, field: u64, payload: &[u8]) {
+        key(out, field, 2);
+        varint(out, payload.len() as i64);
+        out.extend_from_slice(payload);
+    }
+    let mut proto = Vec::new();
+    for (piece, score, kind) in ctc_pieces() {
+        let mut p = Vec::new();
+        message(&mut p, 1, piece.as_bytes());
+        key(&mut p, 2, 5);
+        p.extend_from_slice(&score.to_le_bytes());
+        key(&mut p, 3, 0);
+        varint(&mut p, kind as i64);
+        message(&mut proto, 1, &p);
+    }
+    let mut trainer = Vec::new();
+    for (field, value) in [
+        (3, 2),
+        (4, ctc_pieces().len() as i64),
+        (40, 0),
+        (41, -1),
+        (42, -1),
+        (43, -1),
+    ] {
+        key(&mut trainer, field, 0);
+        varint(&mut trainer, value);
+    }
+    message(&mut proto, 2, &trainer);
+    let mut normalizer = Vec::new();
+    message(&mut normalizer, 1, b"identity");
+    for field in [3, 4, 5] {
+        key(&mut normalizer, field, 0);
+        varint(&mut normalizer, 1);
+    }
+    message(&mut proto, 3, &normalizer);
+    proto
+}
+
+/// The CTC timestamp artifact at the published layout and metadata: the
+/// head over the encoder width, two trunk layers of two heads (RoPE on 8
+/// of 16 dims), F32 throughout, and the `ctc_model_proto` tokenizer.
+fn write_ctc_artifact(dir: &Path, weight_map: &mut BTreeMap<String, String>) {
+    let d = ENCODER_WIDTH;
+    let ff = d / 2;
+    let head = d / 2;
+    let pieces = ctc_pieces();
+    let classes = pieces.len() + 1;
+    let mut w = Writer {
+        files: BTreeMap::new(),
+        seed: 101,
+    };
+    let f = CTC_FILE;
+    let c = "ctc_timestamp.decoder";
+    let dense = |w: &mut Writer, name: String, rows: usize, cols: usize, bias: bool| {
+        let values = w.values(rows * cols, (cols as f32).sqrt().recip());
+        w.f32(f, format!("{name}.weight"), &[rows, cols], &values);
+        if bias {
+            let values = w.values(rows, 0.02);
+            w.f32(f, format!("{name}.bias"), &[rows], &values);
+        }
+    };
+    let norm = |w: &mut Writer, name: String, width: usize| {
+        let gains = w
+            .values(width, 0.2)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        w.f32(f, format!("{name}.weight"), &[width], &gains);
+        let bias = w.values(width, 0.05);
+        w.f32(f, format!("{name}.bias"), &[width], &bias);
+    };
+    let upsample = w.values(d * d * 2, (d as f32).sqrt().recip());
+    w.f32(f, format!("{c}.upsample.weight"), &[d, d, 2], &upsample);
+    let bias = w.values(d, 0.02);
+    w.f32(f, format!("{c}.upsample.bias"), &[d], &bias);
+    w.push(
+        f,
+        format!("{c}.upsample_factor"),
+        Dtype::I64,
+        &[],
+        2i64.to_le_bytes().to_vec(),
+    );
+    w.f32(f, format!("{c}.residual_scale"), &[], &[0.1]);
+    // Large logits, so greedy CTC decisions are clear-cut.
+    let classifier = w.values(classes * d, 4.0);
+    w.f32(
+        f,
+        format!("{c}.decoder_layers.0.weight"),
+        &[classes, d, 1],
+        &classifier,
+    );
+    let bias = w.values(classes, 0.5);
+    w.f32(f, format!("{c}.decoder_layers.0.bias"), &[classes], &bias);
+    let t = format!("{c}.transformer");
+    norm(&mut w, format!("{t}.embed_norm"), d);
+    norm(&mut w, format!("{t}.final_norm"), d);
+    for layer in 0..2 {
+        let l = format!("{t}.layers.{layer}");
+        norm(&mut w, format!("{l}.norm1"), d);
+        norm(&mut w, format!("{l}.norm2"), d);
+        dense(&mut w, format!("{l}.attn.w_qkv"), 3 * d, d, false);
+        dense(&mut w, format!("{l}.attn.out_proj"), d, d, true);
+        dense(&mut w, format!("{l}.ffn.net.0"), ff, d, true);
+        dense(&mut w, format!("{l}.ffn.net.3"), d, ff, true);
+        norm(&mut w, format!("{l}.attn.q_norm"), head);
+        norm(&mut w, format!("{l}.attn.k_norm"), head);
+    }
+    let proto = ctc_model_proto();
+    w.push(
+        f,
+        "ctc_timestamp.tokenizer.model_proto",
+        Dtype::U8,
+        &[proto.len()],
+        proto,
+    );
+    let decoder_config = json!({
+        "feat_in": d, "num_classes": pieces.len(),
+        "vocabulary": pieces.iter().map(|(piece, _, _)| piece.clone()).collect::<Vec<_>>(),
+        "use_transformer": true, "n_heads": 2, "n_layers": 2, "qkv_bias": false,
+        "qk_norm": true, "ff_expansion": 0.5, "pre_block_norm": true,
+        "self_attention_model": "rope", "rotary_fraction": 0.5, "xscaling": false,
+        "residual": true, "residual_scale": 0.1, "learnable_residual_scale": false,
+        "upsampling_factor": 2, "upsampling_mode": "conv_transpose"
+    });
+    let metadata = std::collections::HashMap::from([
+        (
+            "ctc_timestamp_format".to_string(),
+            "nemo_ctc_timestamp_artifact_v1".to_string(),
+        ),
+        (
+            "ctc_timestamp_decoder_config".to_string(),
+            decoder_config.to_string(),
+        ),
+        (
+            "ctc_timestamp_tokenizer_config".to_string(),
+            json!({"library": "sentencepiece"}).to_string(),
+        ),
+    ]);
+    let tensors = w.files.remove(f).unwrap_or_default();
+    let views = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| {
+            weight_map.insert(name.clone(), f.to_string());
+            (
+                name.clone(),
+                TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    safetensors::serialize_to_file(views, Some(metadata), &dir.join(f)).unwrap();
+}
+
 /// The word-level tokenizer: specials at the published ids, words after.
 pub fn tokenizer_json() -> serde_json::Value {
     let mut vocab = serde_json::Map::new();
@@ -329,8 +516,10 @@ pub fn write_checkpoint(dir: &Path) {
     let p = PERCEPTION_FILE;
     let read = |bytes: &[u8]| {
         bytes
-            .chunks_exact(2)
-            .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b).to_f32())
             .collect::<Vec<_>>()
     };
     let fb = read(include_bytes!(
@@ -529,7 +718,7 @@ pub fn write_checkpoint(dir: &Path) {
         }
         safetensors::serialize_to_file(views, None, &dir.join(file)).unwrap();
     }
-    let _ = CTC_FILE;
+    write_ctc_artifact(dir, &mut weight_map);
     std::fs::write(
         dir.join(INDEX_FILE),
         serde_json::to_vec_pretty(&json!({"metadata": {}, "weight_map": weight_map})).unwrap(),

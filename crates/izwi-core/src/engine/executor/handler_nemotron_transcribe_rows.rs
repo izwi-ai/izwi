@@ -376,15 +376,23 @@ impl NativeExecutor {
             let artifact = active.state.artifact().clone();
             let (text, asr_diagnostics) = if finished {
                 let transcription = nemotron.finish_row(&active.state)?;
-                let diagnostics = serde_json::json!({
+                let mut diagnostics = serde_json::json!({
                     "family": "nemotron_transcribe_asr",
                     "finish_reason": transcription.finish_reason.as_str(),
                     "raw_text": transcription.transcript.raw,
+                    // Timed from the CTC words when the request asked for
+                    // timestamps and the stage aligned them.
                     "speaker_turns": transcription
-                        .transcript
-                        .turns
+                        .timed_turns()
                         .iter()
-                        .map(|turn| serde_json::json!({"speaker": turn.speaker, "text": turn.text}))
+                        .map(|turn| {
+                            serde_json::json!({
+                                "speaker": turn.speaker,
+                                "text": turn.text,
+                                "start": turn.start,
+                                "end": turn.end,
+                            })
+                        })
                         .collect::<Vec<_>>(),
                     "prompt_tokens": transcription.prompt_tokens,
                     "audio_tokens": transcription.audio_tokens,
@@ -395,6 +403,20 @@ impl NativeExecutor {
                         .decode_loop()
                         .map_or(0, |decode| decode.near_ties()),
                 });
+                // NeMo's public `ctc_timestamps` object, and its words as the
+                // `timestamp_words` the transcription routes read, without
+                // the event and style tags the returned text leaves out.
+                if let Some(timestamps) = &transcription.timestamps {
+                    let words = timestamps
+                        .words
+                        .iter()
+                        .filter(|word| !(word.word.starts_with('<') && word.word.ends_with('>')))
+                        .collect::<Vec<_>>();
+                    diagnostics["timestamp_words"] = serde_json::to_value(words)
+                        .map_err(|err| Error::InferenceError(err.to_string()))?;
+                    diagnostics["ctc_timestamps"] = serde_json::to_value(timestamps)
+                        .map_err(|err| Error::InferenceError(err.to_string()))?;
+                }
                 (Some(transcription.transcript.text), Some(diagnostics))
             } else {
                 (Some(String::new()), None)
