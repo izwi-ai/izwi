@@ -1084,3 +1084,185 @@ async fn lfm3_audio_answers_chat_about_audio_if_env_set() {
         .await
         .is_err());
 }
+
+/// The edit distance between two token lists over the reference's length.
+fn error_rate(reference: &[String], heard: &[String]) -> f64 {
+    let mut row = (0..=heard.len()).collect::<Vec<_>>();
+    for (i, expected) in reference.iter().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, got) in heard.iter().enumerate() {
+            let substitution = previous + usize::from(expected != got);
+            previous = row[j + 1];
+            row[j + 1] = substitution.min(row[j] + 1).min(row[j + 1] + 1);
+        }
+    }
+    row[heard.len()] as f64 / reference.len().max(1) as f64
+}
+
+/// Words, or for Japanese (no spaces) its characters, punctuation left out.
+fn tokens(language: &str, text: &str) -> Vec<String> {
+    if language == "ja" {
+        return text
+            .chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .map(String::from)
+            .collect();
+    }
+    words(text)
+}
+
+/// LFM3-Audio beyond English, cross-checked by other models: it transcribes
+/// French, German, Spanish and Japanese speech Qwen3-TTS 1.7B speaks, and
+/// Whisper Large v3 Turbo transcribes the speech it speaks in each. Error
+/// rates are word rates, character rates for Japanese.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lfm3_audio_hears_and_speaks_four_languages_if_env_set() {
+    let Some(models_dir) = std::env::var_os("IZWI_LFM3_AUDIO_MODELS_DIR") else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "IZWI_LFM3_AUDIO_MODELS_DIR unset; not run"
+        );
+        return;
+    };
+    let backend = std::env::var("IZWI_LFM3_AUDIO_BACKEND")
+        .ok()
+        .and_then(|name| crate::backends::BackendPreference::parse(&name))
+        .unwrap_or(crate::backends::BackendPreference::Cpu);
+    #[cfg(feature = "metal")]
+    let _metal_lease = (backend == crate::backends::BackendPreference::Metal).then(|| {
+        crate::backends::metal_test_device_or_skip(
+            "lfm3_audio_hears_and_speaks_four_languages_if_env_set",
+        )
+    });
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.into(),
+        backend,
+        ..Default::default()
+    })
+    .expect("runtime");
+    let backend = runtime.backend_context().backend_kind;
+    let lfm3 = ModelVariant::Lfm3Audio2BGguf;
+    let speaker = ModelVariant::Qwen3Tts12Hz17BCustomVoice;
+    let listener = ModelVariant::WhisperLargeV3Turbo;
+    for variant in [lfm3, speaker] {
+        runtime.load_model(variant).await.expect("load a model");
+    }
+    // (language, Qwen3-TTS's name for it, text, highest error rates heard and
+    // spoken)
+    let cases = [
+        (
+            "fr",
+            "French",
+            "Le chat dort sur le canapé pendant que la pluie tombe dehors.",
+            // Qwen3-TTS says "canapé" badly (Whisper hears "canneby") and
+            // LFM3-Audio then drifts into English for a few words: 0.50 on
+            // Metal; it hears its own clean French exactly.
+            (0.6, 0.15),
+        ),
+        (
+            "de",
+            "German",
+            "Der Hund läuft schnell durch den Park und spielt mit dem Ball.",
+            (0.15, 0.15),
+        ),
+        (
+            "es",
+            "Spanish",
+            "Mañana vamos a visitar a mis abuelos en la ciudad de Sevilla.",
+            (0.15, 0.15),
+        ),
+        (
+            "ja",
+            "Japanese",
+            "今日はとても良い天気なので、公園を散歩しましょう。",
+            (0.15, 0.15),
+        ),
+    ];
+    // Qwen3-TTS speaks each sentence and LFM3-Audio transcribes it, then
+    // LFM3-Audio speaks it.
+    let mut heard = Vec::new();
+    let mut speech = Vec::new();
+    for (language, qwen_language, text, _) in cases {
+        let mut request = GenerationRequest::new(text);
+        request.model_variant = Some(speaker);
+        request.config.options.speaker = Some("Serena".into());
+        request.config.options.speech.seed = Some(7);
+        request.language = Some(qwen_language.into());
+        let spoken = runtime.generate(request).await.expect("Qwen3-TTS speaks");
+        let qwen_wav = wav_bytes(&spoken.samples, spoken.sample_rate);
+        heard.push(
+            runtime
+                .asr_transcribe_bytes(&qwen_wav, Some(&lfm3.to_string()), Some(language))
+                .await
+                .expect("LFM3-Audio transcribes")
+                .text,
+        );
+
+        let mut request = GenerationRequest::new(text);
+        request.model_variant = Some(lfm3);
+        request.config.options.voice = Some("female".into());
+        request.config.options.speech.seed = Some(7);
+        request.language = Some(language.into());
+        let spoken = runtime.generate(request).await.expect("LFM3-Audio speaks");
+        let lfm3_wav = wav_bytes(&spoken.samples, spoken.sample_rate);
+        let self_heard = runtime
+            .asr_transcribe_bytes(&lfm3_wav, Some(&lfm3.to_string()), Some(language))
+            .await
+            .expect("LFM3-Audio transcribes its own speech")
+            .text;
+        speech.push((qwen_wav, lfm3_wav, self_heard));
+    }
+
+    // Whisper transcribes both speakers (the three models do not fit in
+    // memory together): Qwen3-TTS's speech checks what LFM3-Audio heard was
+    // intelligible.
+    for variant in [speaker, lfm3] {
+        runtime.unload_model(variant).await.expect("unload a model");
+    }
+    runtime.load_model(listener).await.expect("load Whisper");
+    let mut failures = Vec::new();
+    let results = heard.into_iter().zip(speech);
+    for ((language, _, text, (max_heard, max_spoken)), (heard, clips)) in
+        cases.into_iter().zip(results)
+    {
+        let (qwen_wav, lfm3_wav, self_heard) = clips;
+        let mut whisper = Vec::new();
+        for wav in [&qwen_wav, &lfm3_wav] {
+            whisper.push(
+                runtime
+                    .asr_transcribe_bytes(wav, Some(&listener.to_string()), Some(language))
+                    .await
+                    .expect("Whisper transcribes")
+                    .text,
+            );
+        }
+        let reference = tokens(language, text);
+        let rate = |transcript: &str| error_rate(&reference, &tokens(language, transcript));
+        let (input_rate, heard_rate, spoken_rate, self_rate) = (
+            rate(&whisper[0]),
+            rate(&heard),
+            rate(&whisper[1]),
+            rate(&self_heard),
+        );
+        eprintln!(
+            "{backend:?} {language}: input {input_rate:.2} {:?}\n  LFM3-Audio heard \
+             {heard_rate:.2} {heard:?}\n  LFM3-Audio spoke {spoken_rate:.2} {:?}\n  \
+             and heard itself {self_rate:.2} {self_heard:?}",
+            whisper[0], whisper[1]
+        );
+        // Speech Whisper cannot follow either says nothing about LFM3-Audio
+        // (Qwen3-TTS's French varies with the backend's sampling).
+        let judged = input_rate <= 0.2;
+        if !judged {
+            eprintln!("  Qwen3-TTS's {language} input is unclear: LFM3-Audio not judged on it");
+        }
+        if (judged && heard_rate > max_heard) || spoken_rate > max_spoken || self_rate > 0.15 {
+            failures.push(format!(
+                "{language}: heard {heard_rate:.2}, spoken {spoken_rate:.2}, \
+                 heard itself {self_rate:.2}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
