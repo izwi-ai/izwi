@@ -14,7 +14,7 @@ import {
 } from "@/types";
 
 /** The Compact engine's default model. */
-export const COMPACT_VOICE_MODEL = "LFM2.5-Audio-1.5B-GGUF";
+export const COMPACT_VOICE_MODEL = "LFM3-Audio-2B-GGUF";
 
 /** Whether the Compact engine can run this model: one audio model that
  * listens, thinks and speaks (LFM2.5 Audio, LFM3 Audio). */
@@ -35,7 +35,7 @@ export function compactVoiceModels(models: ModelInfo[]): ModelInfo[] {
 
 /** The Compact engine's model: the one chosen while the catalog still
  * offers it, else one already on disk (the default first), else the
- * default, so a user with only LFM3 Audio is not asked to download LFM2.5. */
+ * default, so a user with only LFM2.5 Audio is not asked to download LFM3. */
 export function resolveCompactVoiceModel(
   chosen: string | null,
   models: ModelInfo[],
@@ -76,7 +76,7 @@ export const VOICE_ENGINES: Record<
   compact: {
     label: "Compact",
     description:
-      "One model (LFM2.5 or LFM3 Audio) listens and speaks. Quicker to set up, fewer voices.",
+      "One model (LFM3 or LFM2.5 Audio) listens and speaks. Quicker to set up, fewer voices.",
   },
 };
 

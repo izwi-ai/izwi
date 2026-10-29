@@ -30,7 +30,7 @@ Voice has two engines, chosen in **Voice settings › Engine**:
 | Engine | Models | Notes |
 |--------|--------|-------|
 | **Standard** (default) | `Parakeet-TDT-0.6B-v3` (speech recognition), `Qwen3.5-4B` (assistant), `Kokoro-82M` (voice) | Best answers and the full voice library |
-| **Compact** | `LFM2.5-Audio-1.5B-GGUF` (default) or `LFM3-Audio-2B-GGUF` | One model listens and speaks; smaller download, fewer voices |
+| **Compact** | `LFM3-Audio-2B-GGUF` (default) or `LFM2.5-Audio-1.5B-GGUF` | One model listens and speaks; smaller download, fewer voices |
 
 To download them from the command line instead:
 
@@ -41,7 +41,7 @@ izwi pull Qwen3.5-4B
 izwi pull Kokoro-82M
 
 # Compact
-izwi pull LFM2.5-Audio-1.5B-GGUF
+izwi pull LFM3-Audio-2B-GGUF
 ```
 
 ---
@@ -84,12 +84,13 @@ sessions, and low-latency WebSocket transport. See the
 voice state and [Voice Realtime](/api#voice-realtime) for the WebSocket
 protocol.
 
-`LFM3-Audio-2B-GGUF` also answers spoken turns, with interleaved text and
-speech, through the same speech-to-speech routes: name it as `s2s_model_id` in
-the WebSocket's `unified` mode. The **Compact** engine uses
-`LFM2.5-Audio-1.5B-GGUF` by default: choose an LFM3 Audio model in
-**Voice settings › Engine**, and with only LFM3 Audio downloaded the Compact
-engine uses it.
+`LFM3-Audio-2B-GGUF` answers spoken turns with interleaved text and speech,
+through the same speech-to-speech routes as `LFM2.5-Audio-1.5B-GGUF`: name
+either as `s2s_model_id` in the WebSocket's `unified` mode. The **Compact**
+engine uses `LFM3-Audio-2B-GGUF` by default, which picks its own voice in
+conversation. LFM2.5 Audio stays selectable in **Voice settings › Engine**,
+with its four voices, and with only LFM2.5 Audio downloaded the Compact engine
+uses it.
 
 With LFM3 Audio a spoken turn can call tools: the server's built-in tools (the
 local date and time) by default, and function tools a WebSocket client declares

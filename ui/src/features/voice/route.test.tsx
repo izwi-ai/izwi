@@ -242,12 +242,12 @@ describe("VoicePage setup", () => {
   it("names the model the Compact engine would use", () => {
     renderVoicePage([
       ...standardModels("not_downloaded"),
-      model("LFM2.5-Audio-1.5B-GGUF", "not_downloaded"),
-      model("LFM3-Audio-2B-GGUF", "downloaded"),
+      model("LFM2.5-Audio-1.5B-GGUF", "downloaded"),
+      model("LFM3-Audio-2B-GGUF", "not_downloaded"),
     ]);
 
     expect(screen.getByText(/Prefer a smaller download/)).toHaveTextContent(
-      "Prefer a smaller download? Use the compact engine (LFM3 Audio 2B GGUF).",
+      "Prefer a smaller download? Use the compact engine (LFM2.5 Audio 1.5B GGUF).",
     );
   });
 
@@ -274,8 +274,37 @@ describe("VoicePage setup", () => {
 });
 
 describe("VoicePage compact model", () => {
-  it("keeps LFM2.5 Audio as the Compact default with LFM3 Audio installed", async () => {
+  it("uses LFM3 Audio as the Compact default with LFM2.5 Audio installed", async () => {
     storage.set("izwi.voice.engine", "compact");
+    storage.set("izwi.voice.speaker", "af_heart");
+    renderVoicePage([
+      ...standardModels("not_downloaded"),
+      model("LFM2.5-Audio-1.5B-GGUF", "downloaded"),
+      model("LFM3-Audio-2B-GGUF", "downloaded"),
+    ]);
+
+    const socket = await startConversation();
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "input_stream_start",
+          mode: "unified",
+          s2s_model_id: "LFM3-Audio-2B-GGUF",
+        }),
+      ),
+    );
+    // LFM3 Audio picks its own voice: no Kokoro voice is sent.
+    expect(
+      socket.sent.find(
+        (message) => (message as { type?: string }).type === "input_stream_start",
+      ),
+    ).not.toHaveProperty("speaker");
+  });
+
+  it("keeps a chosen LFM2.5 Audio model, and its own voice, with LFM3 Audio installed", async () => {
+    storage.set("izwi.voice.engine", "compact");
+    storage.set("izwi.voice.compactModel", "LFM2.5-Audio-1.5B-GGUF");
+    storage.set("izwi.voice.speaker", "af_heart");
     renderVoicePage([
       ...standardModels("not_downloaded"),
       model("LFM2.5-Audio-1.5B-GGUF", "downloaded"),
@@ -295,15 +324,15 @@ describe("VoicePage compact model", () => {
     );
   });
 
-  it("runs the Compact engine on a chosen LFM3 Audio model and remembers it", async () => {
+  it("runs the Compact engine on a chosen LFM2.5 Audio model and remembers it", async () => {
     storage.set("izwi.voice.engine", "compact");
     renderVoicePage([
       ...standardModels("not_downloaded"),
-      model("LFM2.5-Audio-1.5B-GGUF", "not_downloaded"),
-      model("LFM3-Audio-2B-GGUF", "downloaded", 1_455_413_449),
+      model("LFM2.5-Audio-1.5B-GGUF", "downloaded"),
+      model("LFM3-Audio-2B-GGUF", "not_downloaded", 1_455_413_449),
       model("LFM3-Audio-2B-Q8_0-GGUF", "not_downloaded", 2_202_024_137),
     ]);
-    // With the default not on disk, the LFM3 Audio model on disk stands in.
+    // With the default not on disk, the LFM2.5 Audio model on disk stands in.
     expect(screen.getByRole("button", { name: "Start talking" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Voice settings" }));
@@ -311,16 +340,19 @@ describe("VoicePage compact model", () => {
     fireEvent.click(within(sheet).getByRole("button", { name: /^Compact/ }));
     const engine = await screen.findByRole("dialog", { name: "Engine" });
     const choices = within(engine).getByRole("radiogroup", { name: "Models" });
-    expect(
-      within(choices)
-        .getAllByRole("radio")
-        .map((radio) => radio.getAttribute("aria-checked")),
-    ).toEqual(["false", "true", "false"]);
-    fireEvent.click(within(choices).getByRole("radio", { name: /LFM3 Audio 2B GGUF/ }));
+    const radios = within(choices).getAllByRole("radio");
+    // The default first, then the catalog's order.
+    expect(radios[0]).toHaveTextContent(/^LFM3 Audio 2B GGUF/);
+    expect(radios.map((radio) => radio.getAttribute("aria-checked"))).toEqual([
+      "false",
+      "true",
+      "false",
+    ]);
+    fireEvent.click(within(choices).getByRole("radio", { name: /LFM2\.5 Audio 1\.5B GGUF/ }));
 
-    expect(storage.get("izwi.voice.compactModel")).toBe("LFM3-Audio-2B-GGUF");
+    expect(storage.get("izwi.voice.compactModel")).toBe("LFM2.5-Audio-1.5B-GGUF");
     expect(
-      within(choices).getByRole("radio", { name: /LFM3 Audio 2B GGUF/ }),
+      within(choices).getByRole("radio", { name: /LFM2\.5 Audio 1\.5B GGUF/ }),
     ).toHaveAttribute("aria-checked", "true");
     fireEvent.click(within(engine).getAllByRole("button", { name: "Close" })[0]);
     await waitFor(() =>
@@ -333,13 +365,13 @@ describe("VoicePage compact model", () => {
         expect.objectContaining({
           type: "input_stream_start",
           mode: "unified",
-          s2s_model_id: "LFM3-Audio-2B-GGUF",
+          s2s_model_id: "LFM2.5-Audio-1.5B-GGUF",
         }),
       ),
     );
   });
 
-  it("falls back to the default when the chosen model left the catalog", () => {
+  it("falls back to a model on disk when the chosen model left the catalog", () => {
     storage.set("izwi.voice.engine", "compact");
     storage.set("izwi.voice.compactModel", "LFM3-Audio-2B-Q8_0-GGUF");
     renderVoicePage([model("LFM2.5-Audio-1.5B-GGUF", "downloaded")]);

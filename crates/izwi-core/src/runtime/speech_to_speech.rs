@@ -91,7 +91,7 @@ fn resolve_audio_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
                 )))
             }
         }
-        None => Ok(ModelVariant::Lfm25Audio15BGguf),
+        None => Ok(ModelVariant::Lfm3Audio2BGguf),
     }
 }
 
@@ -554,9 +554,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_audio_chat_variant_defaults_to_lfm25_audio() {
+    fn resolve_audio_chat_variant_defaults_to_lfm3_audio() {
         let variant = resolve_audio_chat_variant(None).expect("default variant");
-        assert_eq!(variant, ModelVariant::Lfm25Audio15BGguf);
+        assert_eq!(variant, ModelVariant::Lfm3Audio2BGguf);
     }
 
     #[test]

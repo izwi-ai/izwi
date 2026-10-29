@@ -53,7 +53,8 @@ interface VoiceSettingsSheetProps {
   view: VoiceSettingsView;
   onViewChange: (view: VoiceSettingsView) => void;
   preferences: VoicePreferences;
-  /** The model the Compact engine runs: the chosen one, else its default. */
+  /** The model the Compact engine runs: the chosen one, else one on disk
+   * (LFM3 Audio first), else LFM3 Audio. */
   compactModel: string;
   speakers: SpeakerProfile[];
   speaker: SpeakerProfile | null;

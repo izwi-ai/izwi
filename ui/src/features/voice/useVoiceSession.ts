@@ -40,7 +40,7 @@ export interface VoiceSessionFailure {
 
 interface UseVoiceSessionOptions {
   engine: VoiceSessionEngine | null;
-  speaker: string;
+  speaker?: string;
   systemPrompt: string;
 }
 

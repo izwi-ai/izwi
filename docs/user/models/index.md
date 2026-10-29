@@ -112,12 +112,12 @@ Those endpoints only show variants that are enabled for download/use.
 > [Voice Presets](/models/voice-presets#lfm3-audio)), streams 24 kHz audio,
 > and splits long text into sentences; it has no voice cloning, voice
 > description or speed control. It transcribes 18 languages, and in voice
-> chat answers a spoken turn with interleaved text and speech through the same
-> speech-to-speech routes as LFM2.5 Audio, which remains the default
-> **Compact** voice model. Its native streaming transcription mode (LiveASR),
-> spoken tool calls and prefix reuse are not supported yet. It runs on CPU,
-> Metal and CUDA; CUDA is compile-checked only and has not yet run on an
-> NVIDIA GPU.
+> chat answers a spoken turn with interleaved text and speech, and can call
+> tools, through the same speech-to-speech routes as LFM2.5 Audio. It is the
+> default **Compact** voice model; LFM2.5 Audio stays selectable in **Voice
+> settings › Engine**. It also streams realtime transcription in its native
+> LiveASR mode. Prefix reuse is not supported yet. It runs on CPU, Metal and
+> CUDA; CUDA is compile-checked only and has not yet run on an NVIDIA GPU.
 
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 

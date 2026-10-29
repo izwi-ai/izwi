@@ -15,7 +15,11 @@ import {
   VOICE_DESIGN_PREFERRED_MODELS,
   diarizationSpeakerUpperBound,
 } from "@/features/models/catalog/routeModelCatalog";
-import { isVoiceEngineReady, voiceEngineModels } from "@/features/voice/engine";
+import {
+  isVoiceEngineReady,
+  resolveCompactVoiceModel,
+  voiceEngineModels,
+} from "@/features/voice/engine";
 import type { HealthResponse } from "@/shared/api/health";
 import { VIEW_CONFIGS, type ViewMode } from "@/types";
 
@@ -481,7 +485,13 @@ export function readyTasks(rows: TaskRow[], models: ModelInfo[]): TaskRow[] {
   const ready: Record<TaskId, boolean> = {
     talk:
       isVoiceEngineReady(voiceEngineModels("standard", models)) ||
-      isVoiceEngineReady(voiceEngineModels("compact", models)),
+      isVoiceEngineReady(
+        voiceEngineModels(
+          "compact",
+          models,
+          resolveCompactVoiceModel(null, models),
+        ),
+      ),
     chat: has("chat"),
     transcribe: has("asr"),
     read: has("tts"),

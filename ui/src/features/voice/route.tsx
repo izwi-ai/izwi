@@ -10,7 +10,6 @@ import {
   voiceEngineModels,
   voiceEngineSpeakers,
   voiceSessionEngine,
-  PREFERRED_SPEAKER,
 } from "@/features/voice/engine";
 import { VoiceControls } from "@/features/voice/components/VoiceControls";
 import { VoiceFailure } from "@/features/voice/components/VoiceFailure";
@@ -105,7 +104,8 @@ export function VoicePage({
   );
   const session = useVoiceSession({
     engine: sessionEngine,
-    speaker: speaker?.id ?? PREFERRED_SPEAKER,
+    // None when the engine picks its own voice (LFM3 Audio).
+    speaker: speaker?.id,
     systemPrompt: preferences.savedPrompt,
   });
 

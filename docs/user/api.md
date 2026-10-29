@@ -489,8 +489,10 @@ Japanese returns `400` until Izwi has its text processing.
 - The same model transcribes speech (see
   [Audio Transcriptions](#audio-transcriptions)) and answers spoken turns with
   interleaved text and speech in the `unified` mode of
-  [Voice Realtime](#voice-realtime). Its native streaming transcription mode
-  (LiveASR), spoken tool calls and prefix reuse are not supported yet.
+  [Voice Realtime](#voice-realtime), where it can call tools. It also streams
+  transcription in its native LiveASR mode through
+  [Transcription Realtime](#transcription-realtime), and answers chat
+  completions about audio clips. Prefix reuse is not supported yet.
 
 Non-stream response:
 
