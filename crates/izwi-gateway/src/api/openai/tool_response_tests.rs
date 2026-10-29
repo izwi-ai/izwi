@@ -32,11 +32,10 @@ fn render_all(
 fn tool_turns_match_the_checkpoint_templates() {
     let fixtures: Value = serde_json::from_str(FIXTURES).unwrap();
     let cases = fixtures["cases"].as_array().unwrap();
-    assert!(cases.len() >= 20);
+    assert!(cases.len() >= 17);
     for case in cases {
         let dialect = match case["dialect"].as_str().unwrap() {
             "lfm3_chat" => ToolResponseDialect::Lfm3Chat,
-            "lfm3_audio" => ToolResponseDialect::Lfm3Audio,
             other => panic!("unknown dialect {other}"),
         };
         let name = case["name"].as_str().unwrap();
@@ -65,17 +64,6 @@ fn an_unknown_tool_reference_is_refused_as_the_template_does() {
     )
     .unwrap_err();
     assert!(error.message.contains("Tool reference 'missing' not found"));
-}
-
-#[test]
-fn lfm3_audio_points_tool_references_at_additional_tools() {
-    let error = render_all(
-        ToolResponseDialect::Lfm3Audio,
-        &[json!({"type": "function", "function": {"name": "get_weather"}})],
-        &[json!({"role": "tool", "content": [{"type": "tool_reference", "name": "get_weather"}]})],
-    )
-    .unwrap_err();
-    assert!(error.message.contains("additional_tools"));
 }
 
 #[test]

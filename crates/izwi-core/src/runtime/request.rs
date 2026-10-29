@@ -320,16 +320,6 @@ impl ChatRuntimeRequest {
         request.prompt_tokens = self.prompt_tokens;
         request
     }
-
-    /// The request as an LFM3-Audio chat completion, whose prompt the
-    /// model's reply row prepares (see [`EngineCoreRequest::lfm3_audio_chat`]).
-    pub(crate) fn into_lfm3_audio_engine_request(self) -> EngineCoreRequest {
-        let mut request = EngineCoreRequest::lfm3_audio_chat(self.messages);
-        self.envelope.apply_to(&mut request);
-        request.params = self.params;
-        request.chat_config = self.chat_config;
-        request
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -225,7 +225,7 @@ Supported request fields:
 |-------|-------|
 | `model` | Required model variant. Must resolve to a chat-capable model. |
 | `messages` | Required array. Roles: `system`, `user`, `assistant`, `tool`. |
-| Audio input (LFM3-Audio) | A user message's content parts can carry speech: `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` (`format` is the file type, such as `wav`, `mp3` or `flac`; default `wav`), or an `audio_url` part holding a `data:audio/…;base64,` URL. The server never fetches audio URLs. LFM3-Audio hears each clip where the message places it, at most 8 clips per request and 120 s per clip, and answers in text. Other models refuse audio and LFM3-Audio refuses images and videos; audio in a system, assistant or tool message is a `400`. LFM3-Audio decodes greedily by default (its `generation_config.json`) and takes `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, the output budget, `truncation`, `tools` and `preserve_thinking`; `stop`, `logprobs`/`top_logprobs`, a non-zero `presence_penalty`, `skip_special_tokens: false`, `enable_thinking`, `reasoning_effort` and `response_format` are a `400` naming the field. Its template has no thinking switch, so the model sometimes thinks before it answers; `reasoning_format: "parsed"` moves that into `reasoning_content`. It answers on a local server only: the gateway does not send it to workers. |
+| Audio input | No chat model hears audio. A message carrying an audio content part (`input_audio`, or an `audio_url` / `audio` part) is a `400`; for spoken conversations use the [voice realtime API](#voice-realtime). LFM3-Audio is not a chat model. |
 | `modalities`, `audio` | Chat completions answer in text. `modalities` other than `["text"]`, and any `audio` output object, are a `400` naming the field; spoken replies use the [voice realtime API](#voice-realtime). |
 | `max_tokens`, `max_completion_tokens` | Optional output budgets (`max_completion_tokens` wins). Unset, the reply may use the rest of the context. An explicit budget that does not fit beside the prompt is a `400` (as in vLLM) unless `truncation` is `auto`. |
 | `truncation` | Izwi extension, as in the Responses API. `disabled` (default): a prompt that does not fit the context is a `400` with `code: context_length_exceeded`, `param: messages` and the token counts. `auto`: the oldest complete turns are dropped (the system message and newest user message are kept) and an explicit budget is shortened to the remaining context. Through the gateway, workers on worker protocol minor 4 apply this exactly as the local server; older workers still truncate automatically. |
@@ -238,12 +238,12 @@ Supported request fields:
 | `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
-| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, LFM3 and LFM3-Audio have one (LFM3-Audio writes LFM3's XML calls and reads results in its own `tool` turns); tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5 and LFM3 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
 | `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
-| Deferred tools (LFM3, LFM3-Audio) | A tool with `"defer_loading": true` (on the tool or its `function`) stays out of the prompt's tool list until a tool result names it, as LFM3's template defines. A `tool` message's content can name tools with `{"type": "tool_reference", "name": …}` items, list definitions in `{"result": {"tools": [...]}}` items, or carry them in an `additional_tools` key (definitions, or `true` when the content holds them); the model then sees them in `<additional_tools>`. Send every tool, deferred ones included, on every request: a reference to an undefined tool is a `400`. Consecutive tool messages with the same `tool_call_id` are one result. LFM3-Audio's template takes deferred tools too, but not `tool_reference` items (a `400` pointing to `additional_tools`) and without merging results. Other models refuse `tool_reference` items and `additional_tools` with a `400`. Tool definitions are written with sorted keys. |
+| Deferred tools (LFM3) | A tool with `"defer_loading": true` (on the tool or its `function`) stays out of the prompt's tool list until a tool result names it, as LFM3's template defines. A `tool` message's content can name tools with `{"type": "tool_reference", "name": …}` items, list definitions in `{"result": {"tools": [...]}}` items, or carry them in an `additional_tools` key (definitions, or `true` when the content holds them); the model then sees them in `<additional_tools>`. Send every tool, deferred ones included, on every request: a reference to an undefined tool is a `400`. Consecutive tool messages with the same `tool_call_id` are one result. Other models refuse `tool_reference` items and `additional_tools` with a `400`. Tool definitions are written with sorted keys. |
 | `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 and LFM3 default to `true`; LFM3 with `false` answers directly. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
-| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. LFM3 and LFM3-Audio default to `false` (their templates keep reasoning only for turns after the last user message). Qwen3.5 history behavior is unchanged. |
+| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. LFM3 defaults to `false` (its template keeps reasoning only for turns after the last user message). Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
 | `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`, including the `<think>` a Qwen prompt opens when thinking is on; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
@@ -256,8 +256,8 @@ server: the same sampling profiles, `seed`, `stop`, `top_k`, penalties,
 when none is ready it returns a `400` with `code: unsupported_parameter` and
 `param` naming the control, never dropping it. `tools` need a worker that
 advertises tool support; the gateway parses the calls in the worker's text
-exactly as the local server does. The reasoning controls and audio input are
-not yet supported through the gateway (400).
+exactly as the local server does. The reasoning controls are not yet supported
+through the gateway (400).
 
 Gateway limits and headers:
 
@@ -491,8 +491,8 @@ Japanese returns `400` until Izwi has its text processing.
   interleaved text and speech in the `unified` mode of
   [Voice Realtime](#voice-realtime), where it can call tools. It also streams
   transcription in its native LiveASR mode through
-  [Transcription Realtime](#transcription-realtime), and answers chat
-  completions about audio clips. Prefix reuse is not supported yet.
+  [Transcription Realtime](#transcription-realtime). It is not a chat model:
+  chat completions and Responses refuse it. Prefix reuse is not supported yet.
 
 Non-stream response:
 
@@ -690,7 +690,7 @@ Request fields:
 | Field | Notes |
 |-------|-------|
 | `model` | Required chat-capable model variant. |
-| `input` | Text, one input item, or an array of input items. Message content parts are as in chat completions, including LFM3-Audio's `input_audio` parts in user items. |
+| `input` | Text, one input item, or an array of input items. Message content parts are as in chat completions; audio parts are a `400`. |
 | `instructions` | Optional system instruction. Required if `input` is empty. |
 | `max_output_tokens` | Optional output limit. |
 | `truncation` | `disabled` (default) or `auto`; same behavior as chat completions. |
@@ -699,7 +699,7 @@ Request fields:
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
 | `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself; for LFM3, `output` may be a list with deferred-tool items and the item may carry `additional_tools`, as in chat completions. As in chat completions, `tool_choice` `required` and named functions are refused. |
-| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions (LFM3-Audio takes `preserve_thinking` only). Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
 
@@ -1017,7 +1017,7 @@ Send-message request fields:
 |-------|-------|
 | `model` | Optional chat model. |
 | `content` | User text. |
-| `content_parts` | Multimodal content parts in OpenAI-like shape: images for Qwen3.5, `input_audio` clips for LFM3-Audio. A thread can switch models: earlier turns keep their media for a model that hears it (LFM3-Audio hears the newest 8 clips, the new message's included) and otherwise reach the model as their text, or as `[Image attachment]` / `[Audio attachment]` when a turn has none. |
+| `content_parts` | Multimodal content parts in OpenAI-like shape: images for Qwen3.5. A thread can switch models: earlier turns keep their media for a model that hears it and otherwise reach the model as their text, or as `[Image attachment]` when a turn has none. A new message carrying audio is a `400`; audio clips in threads saved while LFM3-Audio answered chat still play back and reach the model as their text, or as `[Audio attachment]`. |
 | `max_tokens` | Optional output limit. |
 | `stream` | `true` emits SSE events. |
 | `system_prompt` | Optional per-request system prompt. |

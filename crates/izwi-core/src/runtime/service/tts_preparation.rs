@@ -1746,8 +1746,6 @@ impl RuntimeService {
                         &clips,
                         &settings.messages,
                         &settings.tools,
-                        settings.output,
-                        settings.preserve_thinking,
                         settings.max_slots,
                         settings.text_sampling,
                         settings.audio_sampling,

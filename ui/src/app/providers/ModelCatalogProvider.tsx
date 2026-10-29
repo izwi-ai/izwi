@@ -25,7 +25,7 @@ import { useNotifications } from "@/app/providers/NotificationProvider";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import { normalizeStoredModelId } from "@/features/models/catalog/routeModelCatalog";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
-import { isLfm3AudioVariant, VIEW_CONFIGS } from "@/types";
+import { VIEW_CONFIGS } from "@/types";
 import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
 
 /**
@@ -924,10 +924,7 @@ export function ModelCatalogProvider({
       loadModelAbortControllersRef.current.set(variant, abortController);
 
       try {
-        // LFM3-Audio also transcribes and speaks, and as a speech-pipeline
-        // model a chat switch never evicts it, so loading it evicts nothing.
-        const isChatTarget =
-          VIEW_CONFIGS.chat.modelFilter(variant) && !isLfm3AudioVariant(variant);
+        const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
         // Chat stays single-active, but pinned models and speech-pipeline
         // stack members (diarization + ASR + aligner + summary LLM) are never
         // evicted by a chat switch: unloading one silently degrades the

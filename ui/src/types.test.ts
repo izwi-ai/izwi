@@ -21,10 +21,15 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3.8-27B-FP8")).toBe(true);
   });
 
-  it("includes LFM3 Audio, which answers audio clips in text", () => {
+  it("leaves LFM3 Audio off chat, though it still transcribes and speaks", () => {
     for (const variant of LFM3_AUDIO_VARIANTS) {
-      expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(true);
+      expect(isLfm3AudioVariant(variant)).toBe(true);
+      expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(false);
+      expect(VIEW_CONFIGS.transcription.modelFilter(variant)).toBe(true);
+      expect(VIEW_CONFIGS["custom-voice"].modelFilter(variant)).toBe(true);
     }
+    expect(VIEW_CONFIGS.chat.modelFilter("LFM3-1.7B-GGUF")).toBe(true);
+    expect(VIEW_CONFIGS.chat.modelFilter("LFM3-1.7B-Q8_0-GGUF")).toBe(true);
   });
 
   it("continues to reject non-chat variants", () => {

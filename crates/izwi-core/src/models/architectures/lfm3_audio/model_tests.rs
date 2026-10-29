@@ -19,7 +19,7 @@ use crate::models::shared::attention::physical::test_physical_caches_for_model_l
 use std::time::Instant;
 
 use super::super::prompts::{
-    asr_prompt, tts_prompt, voice_reply_messages, Lfm3AudioReplyOutput, Lfm3AudioVoice,
+    asr_prompt, tts_prompt, voice_reply_messages, Lfm3AudioVoice,
 };
 
 const FOLDER: &str = "LFM3-Audio-2B-GGUF";
@@ -877,8 +877,6 @@ fn reply_rows_are_batch_invariant(profile: DeviceProfile) {
             &voice_reply_messages(&[], None),
             vec![model.encode_audio(audio, rate).unwrap()],
             &[],
-            Lfm3AudioReplyOutput::Interleaved,
-            false,
             220,
             Lfm3TextSampling::default(),
             Lfm3AudioSampling::default(),

@@ -66,12 +66,15 @@ pub async fn generate_thread_title(
     let Some((user, reply)) = first_exchange(&messages) else {
         return Ok(Json(thread));
     };
-    let model = req
-        .model
-        .as_deref()
-        .or_else(|| reply.and_then(|reply| reply.model_id.as_deref()))
-        .or(thread.model_id.as_deref());
-    let variant = model.map(parse_chat_model).transpose()?;
+    let variant = match req.model.as_deref() {
+        Some(model) => Some(parse_chat_model(model)?),
+        // A stored id may name a model that no longer chats (LFM3-Audio, or
+        // one removed from the catalog): the title then falls back.
+        None => reply
+            .and_then(|reply| reply.model_id.as_deref())
+            .or(thread.model_id.as_deref())
+            .and_then(|model| parse_chat_model(model).ok()),
+    };
     let answer = reply.map(|reply| stored_answer(&reply.content));
 
     let generated = match variant {

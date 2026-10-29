@@ -969,14 +969,6 @@ impl ModelVariant {
         )
     }
 
-    /// Whether the chat routes (chat completions, Responses, chat threads)
-    /// serve this model: the text chat models, and LFM3-Audio, which answers
-    /// a conversation with audio clips in text. Only those routes use this;
-    /// everything that loads or runs a text chat model reads [`Self::is_chat`].
-    pub fn serves_chat_requests(&self) -> bool {
-        self.is_chat() || self.family() == crate::catalog::ModelFamily::Lfm3Audio
-    }
-
     /// Whether this model transcribes a speech-to-text job, the diarization
     /// pipeline's ASR among them: the ASR families, Voxtral, and LFM3-Audio,
     /// which transcribes in one invocation per chunk. LFM2.5-Audio's ASR is a

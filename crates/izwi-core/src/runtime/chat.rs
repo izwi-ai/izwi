@@ -89,7 +89,7 @@ fn prompt_too_long(prompt_tokens: usize, context_limit: usize) -> Error {
 /// least one token. An unset budget takes the rest of the context, as in
 /// vLLM. An explicit budget that does not fit is an error unless the request
 /// opted into truncation, which shortens it to the remaining context.
-pub(crate) fn chat_completion_budget(
+fn chat_completion_budget(
     prompt_tokens: usize,
     requested_max_tokens: usize,
     context_limit: usize,
@@ -214,20 +214,6 @@ impl RuntimeService {
         streaming: bool,
         max_tokens_ceiling: Option<usize>,
     ) -> Result<AdmittedEngineRequest> {
-        if variant.family() == ModelFamily::Lfm3Audio {
-            return self
-                .build_lfm3_audio_chat_request(
-                    variant,
-                    messages,
-                    params,
-                    chat_config,
-                    correlation_id,
-                    runtime_context,
-                    streaming,
-                    max_tokens_ceiling,
-                )
-                .await;
-        }
         if messages.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request missing messages".to_string(),

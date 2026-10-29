@@ -16,7 +16,6 @@ import {
   Send,
   Square,
   Loader2,
-  Mic,
   Plus,
   Trash2,
   AlertTriangle,
@@ -42,17 +41,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  audioDataUrl,
   buildChatThreadMessagePayload,
-  CHAT_AUDIO_SAMPLE_RATE,
   CHAT_IMAGE_ACCEPT,
   DEFAULT_THREAD_TITLE,
-  MAX_CHAT_AUDIO_CLIP_SECS,
-  MAX_CHAT_AUDIO_CLIPS,
   type ChatPlaygroundProps,
   type GenerateTitleArgs,
   type ImagePreviewState,
-  type PendingAudioAttachment,
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
@@ -65,7 +59,6 @@ import {
   readChatImage,
   stoppedReplyContent,
   systemPromptForModel,
-  supportsAudioAttachmentsForModel,
   supportsImageAttachmentsForModel,
   threadHasImageAttachments,
   supportsImplicitOpenThinkTagParsing,
@@ -82,16 +75,10 @@ import { AssistantMessage } from "@/features/chat/components/messages/AssistantM
 import { UserMessage } from "@/features/chat/components/messages/UserMessage";
 import { DaySeparator } from "@/features/chat/components/messages/MessageParts";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
-import { useMicrophoneRecording } from "@/features/chat/hooks/useMicrophoneRecording";
-import { prepareReferenceClip } from "@/features/voice-studio/components/referenceClip";
-import { formatClockDuration } from "@/components/history/format";
-import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
-import { blobToBase64Payload } from "@/utils/audioBase64";
 import { ConfirmDeleteDialog } from "@/components/history/ConfirmDeleteDialog";
 import { ChatModelPicker } from "@/features/chat/components/ChatModelPicker";
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
-const TOO_MANY_AUDIO_CLIPS_MESSAGE = `Attach up to ${MAX_CHAT_AUDIO_CLIPS} audio clips per message.`;
 
 /** A turn the user stopped, kept on screen until the server's copy loads. */
 interface StoppedTurn {
@@ -136,7 +123,6 @@ const STOPPED_TURN_SYNC_DELAYS_MS = [0, 250, 750, 2000];
 interface ChatComposerDraft {
   input: string;
   pendingImages: PendingImageAttachment[];
-  pendingAudio: PendingAudioAttachment[];
 }
 
 function draftKeyForThread(threadId: string | null): string {
@@ -155,11 +141,7 @@ function isEditableUserMessage(message: ChatThreadMessageRecord): boolean {
 }
 
 function isEmptyDraft(draft: ChatComposerDraft): boolean {
-  return (
-    draft.input.length === 0 &&
-    draft.pendingImages.length === 0 &&
-    draft.pendingAudio.length === 0
-  );
+  return draft.input.length === 0 && draft.pendingImages.length === 0;
 }
 
 /** Whether the server has stored a stopped turn: a reply it did not have
@@ -192,7 +174,6 @@ export function ChatPlayground({
   modelSupportsThinking,
   modelChatCapabilities,
   modelSupportsImages,
-  modelSupportsAudio,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
@@ -265,7 +246,6 @@ export function ChatPlayground({
     null,
   );
   const [isReadingImages, setIsReadingImages] = useState(false);
-  const [isReadingAudio, setIsReadingAudio] = useState(false);
   const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
   // Desktop widths keep the thread list beside the conversation; narrower
   // windows open it as a drawer.
@@ -288,10 +268,6 @@ export function ChatPlayground({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
-  const audioInputRef = useRef<HTMLInputElement | null>(null);
-  const pendingAudioSeqRef = useRef(0);
-  // The draft a recording was started in, which its clip joins.
-  const recordingDraftKeyRef = useRef(NEW_CHAT_DRAFT_KEY);
   const composerDraftsRef = useRef<Record<string, ChatComposerDraft>>({});
   const revokedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef(true);
@@ -306,7 +282,6 @@ export function ChatPlayground({
   const activeDraft = composerDrafts[activeDraftKey];
   const input = activeDraft?.input ?? "";
   const pendingImages = activeDraft?.pendingImages ?? [];
-  const pendingAudio = activeDraft?.pendingAudio ?? [];
 
   useEffect(() => {
     composerDraftsRef.current = composerDrafts;
@@ -352,18 +327,18 @@ export function ChatPlayground({
     [],
   );
 
-  const revokePreviews = useCallback(
-    (attachments: Array<{ previewUrl?: string }>) => {
-      for (const attachment of attachments) {
+  const revokeImagePreviews = useCallback(
+    (images: PendingImageAttachment[]) => {
+      for (const image of images) {
         if (
-          !attachment.previewUrl ||
-          revokedPreviewUrlsRef.current.has(attachment.previewUrl) ||
+          !image.previewUrl ||
+          revokedPreviewUrlsRef.current.has(image.previewUrl) ||
           typeof URL.revokeObjectURL !== "function"
         ) {
           continue;
         }
-        URL.revokeObjectURL(attachment.previewUrl);
-        revokedPreviewUrlsRef.current.add(attachment.previewUrl);
+        URL.revokeObjectURL(image.previewUrl);
+        revokedPreviewUrlsRef.current.add(image.previewUrl);
       }
     },
     [],
@@ -376,7 +351,7 @@ export function ChatPlayground({
     ) => {
       setComposerDrafts((previous) => {
         const nextDraft = update(
-          previous[draftKey] ?? { input: "", pendingImages: [], pendingAudio: [] },
+          previous[draftKey] ?? { input: "", pendingImages: [] },
         );
         if (isEmptyDraft(nextDraft)) {
           if (!(draftKey in previous)) {
@@ -399,16 +374,13 @@ export function ChatPlayground({
         if (!removedDraft) {
           return previous;
         }
-        revokePreviews([
-          ...removedDraft.pendingImages,
-          ...removedDraft.pendingAudio,
-        ]);
+        revokeImagePreviews(removedDraft.pendingImages);
         const next = { ...previous };
         delete next[draftKey];
         return next;
       });
     },
-    [revokePreviews],
+    [revokeImagePreviews],
   );
 
   const activeThread = useMemo(
@@ -480,20 +452,6 @@ export function ChatPlayground({
   const hasUnsupportedImages =
     pendingImages.length > 0 && !supportsImageAttachments;
   const unsupportedImagesMessage = `${modelLabel ?? "This model"} can't read images. Remove them or switch to a model that accepts images.`;
-  // Audio clips, like images, stay on a switch to a model that can't hear
-  // them, and block sending until removed.
-  const supportsAudioAttachments = selectedModel
-    ? (modelSupportsAudio?.(selectedModel) ??
-      supportsAudioAttachmentsForModel(selectedModel))
-    : false;
-  const hasUnsupportedAudio =
-    pendingAudio.length > 0 && !supportsAudioAttachments;
-  const unsupportedAudioMessage = `${modelLabel ?? "This model"} can't hear audio. Remove the clips or switch to a model that accepts audio.`;
-  const askPlaceholder = supportsImageAttachments
-    ? "Ask anything or attach an image..."
-    : supportsAudioAttachments
-      ? "Ask anything or attach audio..."
-      : "Ask anything...";
   // Earlier image turns reach a text-only model as text (server side), so say
   // so and offer a model that can see them.
   const threadHasImages = useMemo(
@@ -653,10 +611,10 @@ export function ChatPlayground({
       isMountedRef.current = false;
       streamingTurnRef.current?.controller?.abort();
       for (const draft of Object.values(composerDraftsRef.current)) {
-        revokePreviews([...draft.pendingImages, ...draft.pendingAudio]);
+        revokeImagePreviews(draft.pendingImages);
       }
     };
-  }, [revokePreviews]);
+  }, [revokeImagePreviews]);
 
   useLayoutEffect(() => {
     if (followingOutputThreadRef.current !== activeThreadId) {
@@ -1041,13 +999,13 @@ export function ChatPlayground({
       const removedImages = draft.pendingImages.filter(
         (image) => image.id === imageId,
       );
-      revokePreviews(removedImages);
+      revokeImagePreviews(removedImages);
       return {
         ...draft,
         pendingImages: draft.pendingImages.filter((image) => image.id !== imageId),
       };
     });
-  }, [activeDraftKey, revokePreviews, updateComposerDraft]);
+  }, [activeDraftKey, revokeImagePreviews, updateComposerDraft]);
 
   const handleComposerImageChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1091,7 +1049,7 @@ export function ChatPlayground({
           !supportsImageAttachmentsRef.current ||
           deletedDraftKeysRef.current.has(targetDraftKey)
         ) {
-          revokePreviews(nextImages);
+          revokeImagePreviews(nextImages);
           return;
         }
 
@@ -1108,170 +1066,23 @@ export function ChatPlayground({
         event.target.value = "";
       }
     },
-    [activeDraftKey, revokePreviews, updateComposerDraft],
+    [activeDraftKey, revokeImagePreviews, updateComposerDraft],
   );
 
   const openImagePicker = useCallback(() => {
     imageInputRef.current?.click();
   }, []);
 
-  const removePendingAudio = useCallback((clipId: string) => {
-    updateComposerDraft(activeDraftKey, (draft) => {
-      revokePreviews(draft.pendingAudio.filter((clip) => clip.id === clipId));
-      return {
-        ...draft,
-        pendingAudio: draft.pendingAudio.filter((clip) => clip.id !== clipId),
-      };
-    });
-  }, [activeDraftKey, revokePreviews, updateComposerDraft]);
-
-  /**
-   * Adds files or a recording to a draft as mono 16 kHz WAV clips: the
-   * server does not decode the WebM/Opus most browsers record. A file over
-   * the length limit is refused; a recording stopped at it is cut to it.
-   */
-  const addPendingAudio = useCallback(
-    async (
-      targetDraftKey: string,
-      sources: Array<{ blob: Blob; label: string }>,
-      recorded: boolean,
-    ) => {
-      setError(null);
-      setIsReadingAudio(true);
-      const clips: PendingAudioAttachment[] = [];
-      let added = false;
-      try {
-        // One at a time: browsers limit how many audio contexts are open.
-        for (const { blob, label } of sources) {
-          const prepared = await prepareReferenceClip(blob, {
-            sampleRate: CHAT_AUDIO_SAMPLE_RATE,
-            maxSecs: recorded ? MAX_CHAT_AUDIO_CLIP_SECS : undefined,
-          }).catch(() => null);
-          if (!prepared) {
-            setError(
-              recorded
-                ? "Couldn't read the recording. Try recording again."
-                : `Couldn't read ${label}. Use ${AUDIO_FILE_HINT}.`,
-            );
-            return;
-          }
-          if (prepared.durationSecs > MAX_CHAT_AUDIO_CLIP_SECS) {
-            setError(
-              `${label} is ${formatClockDuration(Math.ceil(prepared.durationSecs))} long. Attach clips of up to ${formatClockDuration(MAX_CHAT_AUDIO_CLIP_SECS)}.`,
-            );
-            return;
-          }
-          pendingAudioSeqRef.current += 1;
-          clips.push({
-            id: `audio-${pendingAudioSeqRef.current}`,
-            data: await blobToBase64Payload(prepared.blob),
-            format: "wav",
-            label,
-            durationSecs: prepared.durationSecs,
-            previewUrl:
-              typeof URL.createObjectURL === "function"
-                ? URL.createObjectURL(prepared.blob)
-                : undefined,
-          });
-        }
-
-        if (
-          !isMountedRef.current ||
-          deletedDraftKeysRef.current.has(targetDraftKey)
-        ) {
-          return;
-        }
-        const pendingCount =
-          composerDraftsRef.current[targetDraftKey]?.pendingAudio.length ?? 0;
-        if (pendingCount + clips.length > MAX_CHAT_AUDIO_CLIPS) {
-          setError(TOO_MANY_AUDIO_CLIPS_MESSAGE);
-          return;
-        }
-
-        updateComposerDraft(targetDraftKey, (draft) => ({
-          ...draft,
-          pendingAudio: [...draft.pendingAudio, ...clips],
-        }));
-        added = true;
-      } catch (audioError) {
-        setError(getErrorMessage(audioError, "Failed to read the selected audio."));
-      } finally {
-        if (!added) {
-          revokePreviews(clips);
-        }
-        setIsReadingAudio(false);
-      }
-    },
-    [revokePreviews, updateComposerDraft],
-  );
-
-  const handleComposerAudioChange = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(event.target.files ?? []);
-      event.target.value = "";
-      if (files.length === 0) {
-        return;
-      }
-      if (pendingAudio.length + files.length > MAX_CHAT_AUDIO_CLIPS) {
-        setError(TOO_MANY_AUDIO_CLIPS_MESSAGE);
-        return;
-      }
-      void addPendingAudio(
-        activeDraftKey,
-        files.map((file) => ({ blob: file, label: file.name || "audio" })),
-        false,
-      );
-    },
-    [activeDraftKey, addPendingAudio, pendingAudio.length],
-  );
-
-  const openAudioPicker = useCallback(() => {
-    audioInputRef.current?.click();
-  }, []);
-
-  const recording = useMicrophoneRecording({
-    maxSecs: MAX_CHAT_AUDIO_CLIP_SECS,
-    onRecorded: (blob) =>
-      void addPendingAudio(
-        recordingDraftKeyRef.current,
-        [{ blob, label: "Microphone recording" }],
-        true,
-      ),
-    onError: setError,
-  });
-  const isRecordingAudio = recording.status !== "idle";
-  const stopRecording = recording.stop;
-
-  const startRecording = () => {
-    if (pendingAudio.length >= MAX_CHAT_AUDIO_CLIPS) {
-      setError(TOO_MANY_AUDIO_CLIPS_MESSAGE);
-      return;
-    }
-    setError(null);
-    recordingDraftKeyRef.current = activeDraftKey;
-    void recording.start();
-  };
-
-  // Switching chats stops a recording; its clip joins the draft it began in.
-  useEffect(() => {
-    stopRecording();
-  }, [activeDraftKey, stopRecording]);
-
   const sendMessage = async () => {
     const submittedDraftKey = activeDraftKey;
     const submittedDraft = composerDrafts[submittedDraftKey] ?? {
       input: "",
       pendingImages: [],
-      pendingAudio: [],
     };
     const text = submittedDraft.input.trim();
     if (
-      (text.length === 0 &&
-        submittedDraft.pendingImages.length === 0 &&
-        submittedDraft.pendingAudio.length === 0) ||
+      (text.length === 0 && submittedDraft.pendingImages.length === 0) ||
       (submittedDraft.pendingImages.length > 0 && !supportsImageAttachments) ||
-      (submittedDraft.pendingAudio.length > 0 && !supportsAudioAttachments) ||
-      isRecordingAudio ||
       isStreaming ||
       isPreparingThread
     ) {
@@ -1322,7 +1133,6 @@ export function ChatPlayground({
     const requestPayload = buildChatThreadMessagePayload({
       text,
       images: submittedDraft.pendingImages,
-      audio: submittedDraft.pendingAudio,
     });
 
     // eslint-disable-next-line react-hooks/purity -- runs on send, not during render
@@ -1375,10 +1185,6 @@ export function ChatPlayground({
                 input: submittedDraft.input,
                 pendingImages: submittedDraft.pendingImages.map((image) => ({
                   ...image,
-                  previewUrl: undefined,
-                })),
-                pendingAudio: submittedDraft.pendingAudio.map((clip) => ({
-                  ...clip,
                   previewUrl: undefined,
                 })),
               }
@@ -1923,56 +1729,6 @@ export function ChatPlayground({
         </div>
       )}
 
-      {pendingAudio.length > 0 && (
-        <div className="border-b border-(--border-muted) px-4 pb-3 pt-4">
-          {hasUnsupportedAudio && (
-            <p
-              role="status"
-              className="mb-3 text-xs text-(--status-warning-text)"
-            >
-              {unsupportedAudioMessage}
-            </p>
-          )}
-          <div className="flex flex-wrap gap-2">
-            {pendingAudio.map((clip) => (
-              <div
-                key={clip.id}
-                className={cn(
-                  "flex max-w-full items-center gap-2 rounded-xl border border-(--border-muted) bg-(--bg-surface-2) py-1.5 pl-3 pr-1.5",
-                  hasUnsupportedAudio && "opacity-50",
-                )}
-              >
-                <div className="min-w-0 text-xs">
-                  <span className="block max-w-40 truncate font-medium text-(--text-primary)">
-                    {clip.label}
-                  </span>
-                  {/* Whole seconds, as the player beside it counts them. */}
-                  <span className="tabular-nums text-(--text-muted)">
-                    {formatClockDuration(Math.floor(clip.durationSecs))}
-                  </span>
-                </div>
-                <audio
-                  controls
-                  preload="metadata"
-                  src={clip.previewUrl ?? audioDataUrl(clip.data, clip.format)}
-                  aria-label={`Play ${clip.label}`}
-                  className="h-8 w-56 min-w-0"
-                />
-                <button
-                  type="button"
-                  onClick={() => removePendingAudio(clip.id)}
-                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-(--text-muted) transition-colors hover:bg-(--bg-surface-3) hover:text-(--text-primary)"
-                  title={`Remove ${clip.label}`}
-                  aria-label={`Remove ${clip.label}`}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       <textarea
         ref={textareaRef}
         value={input}
@@ -2007,17 +1763,19 @@ export function ChatPlayground({
         }}
         placeholder={
           !activeThreadId
-            ? askPlaceholder
+            ? supportsImageAttachments
+              ? "Ask anything or attach an image..."
+              : "Ask anything..."
             : !selectedModel
               ? "Choose a model and ask anything..."
               : !selectedModelReady
                 ? "Model selected but not loaded. Open Models to load it."
-                : askPlaceholder
+                : supportsImageAttachments
+                  ? "Ask anything or attach an image..."
+                  : "Ask anything..."
         }
         className="chat-composer-input w-full resize-none bg-transparent px-5 pt-5 pb-2 text-[0.9375rem] focus:outline-hidden placeholder:text-(--text-muted)"
-        disabled={
-          isStreaming || isPreparingThread || isReadingImages || isReadingAudio
-        }
+        disabled={isStreaming || isPreparingThread || isReadingImages}
       />
 
       <input
@@ -2030,16 +1788,6 @@ export function ChatPlayground({
         onChange={(event) => {
           void handleComposerImageChange(event);
         }}
-      />
-
-      <input
-        ref={audioInputRef}
-        data-testid="chat-audio-input"
-        type="file"
-        accept={AUDIO_FILE_ACCEPT}
-        multiple
-        className="hidden"
-        onChange={handleComposerAudioChange}
       />
 
       <div
@@ -2061,67 +1809,6 @@ export function ChatPlayground({
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Plus className="h-3.5 w-3.5" />
-              )}
-            </Button>
-          )}
-          {supportsAudioAttachments && (
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={openAudioPicker}
-              disabled={isStreaming || isPreparingThread || isReadingAudio}
-              className={cn("w-9 p-0", composerPillClass)}
-              title="Attach audio"
-              aria-label="Attach audio"
-            >
-              {isReadingAudio ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Plus className="h-3.5 w-3.5" />
-              )}
-            </Button>
-          )}
-          {/* Kept while recording, so a model switch can't hide Stop. */}
-          {(supportsAudioAttachments || isRecordingAudio) && (
-            <Button
-              variant="outline"
-              size={recording.status === "recording" ? "sm" : "icon"}
-              onClick={
-                recording.status === "recording" ? stopRecording : startRecording
-              }
-              disabled={
-                recording.status === "starting" ||
-                (!isRecordingAudio &&
-                  (isStreaming || isPreparingThread || isReadingAudio))
-              }
-              className={cn(
-                recording.status === "recording" ? "gap-1.5 px-3.5" : "w-9 p-0",
-                composerPillClass,
-                recording.status === "recording" && composerPillActiveClass,
-              )}
-              title={
-                recording.status === "recording"
-                  ? "Stop recording"
-                  : "Record audio"
-              }
-              aria-label={
-                recording.status === "recording"
-                  ? "Stop recording"
-                  : "Record audio"
-              }
-            >
-              {recording.status === "starting" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : recording.status === "recording" ? (
-                <>
-                  <Square className="h-3.5 w-3.5" />
-                  <span className="tabular-nums">
-                    {formatClockDuration(recording.elapsedSecs)} /{" "}
-                    {formatClockDuration(MAX_CHAT_AUDIO_CLIP_SECS)}
-                  </span>
-                </>
-              ) : (
-                <Mic className="h-3.5 w-3.5" />
               )}
             </Button>
           )}
@@ -2199,14 +1886,9 @@ export function ChatPlayground({
             disabled={
               isPreparingThread ||
               isReadingImages ||
-              isReadingAudio ||
               (!isStreaming &&
-                (isRecordingAudio ||
-                  hasUnsupportedImages ||
-                  hasUnsupportedAudio ||
-                  (input.trim().length === 0 &&
-                    pendingImages.length === 0 &&
-                    pendingAudio.length === 0)))
+                (hasUnsupportedImages ||
+                  (input.trim().length === 0 && pendingImages.length === 0)))
             }
             variant="default"
             size="icon"
@@ -2215,13 +1897,9 @@ export function ChatPlayground({
                 ? "Cancel response"
                 : isPreparingThread
                   ? "Starting chat"
-                  : isRecordingAudio
-                    ? "Stop recording to send"
-                    : hasUnsupportedImages
-                      ? unsupportedImagesMessage
-                      : hasUnsupportedAudio
-                        ? unsupportedAudioMessage
-                        : "Send message"
+                  : hasUnsupportedImages
+                    ? unsupportedImagesMessage
+                    : "Send message"
             }
             aria-label={
               isStreaming

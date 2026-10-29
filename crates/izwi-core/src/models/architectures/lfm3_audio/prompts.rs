@@ -71,27 +71,6 @@ pub const LFM3_AUDIO_TOOLS_SYSTEM_PROMPT: &str =
 /// (LFM3-Audio's card).
 const TOOL_LIST_HEADER: &str = "List of tools:";
 
-/// What a reply writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Lfm3AudioReplyOutput {
-    /// Text only (chat): the reply never starts speech.
-    Text,
-    /// Interleaved text and speech (voice).
-    Interleaved,
-}
-
-impl Lfm3AudioReplyOutput {
-    /// The assistant turn's prefill: an interleaved reply opens
-    /// `<|mixed_start|>`, unless it may call tools, when the model chooses
-    /// between a call and speech itself.
-    pub(crate) fn prefill(self, tools_offered: bool) -> &'static str {
-        match self {
-            Self::Interleaved if !tools_offered => "<|mixed_start|>",
-            _ => "",
-        }
-    }
-}
-
 /// A TTS request's voice: the prompt's gender and locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lfm3AudioVoice {
@@ -276,40 +255,30 @@ impl PromptBuilder {
     }
 }
 
-/// The prompt of a reply to `messages`, rendered as LFM3-Audio's chat
-/// template renders them, each [`CHAT_AUDIO_PLACEHOLDER`] in a user turn a
-/// speech clip.
+/// The prompt of a voice reply (interleaved text and speech) to `messages`,
+/// rendered as LFM3-Audio's chat template renders them, each
+/// [`CHAT_AUDIO_PLACEHOLDER`] in a user turn a speech clip.
 ///
-/// * The system turn: an interleaved reply's mode line
-///   ([`LFM3_AUDIO_TOOLS_SYSTEM_PROMPT`] when it may call tools), the leading
-///   system message, and for an interleaved reply with tools `List of
-///   tools:`, blank lines apart; the template then appends `<tools>` with
-///   one definition per line (deferred ones left out). A text reply's system
-///   turn is the template's own.
+/// * The system turn: the mode line ([`LFM3_AUDIO_TOOLS_SYSTEM_PROMPT`] when
+///   the reply may call tools), the leading system message, and with tools
+///   `List of tools:`, blank lines apart; the template then appends
+///   `<tools>` with one definition per line (deferred ones left out).
 /// * An assistant turn at or before the last user turn keeps only the text
-///   after its last `</think>`, unless `preserve_thinking`; later ones are
-///   kept whole.
+///   after its last `</think>`; later ones are kept whole.
 /// * A tool turn is wrapped in `<tool_response>` unless it already holds one
-///   or is empty (the gateway renders deferred-tool results itself).
-/// * The assistant turn is prefilled as [`Lfm3AudioReplyOutput::prefill`].
-pub(crate) fn reply_prompt(
-    messages: &[ChatMessage],
-    tools: &[Value],
-    output: Lfm3AudioReplyOutput,
-    preserve_thinking: bool,
-) -> Vec<PromptPart> {
+///   or is empty.
+/// * The assistant turn opens `<|mixed_start|>`, unless the reply may call
+///   tools, when the model chooses between a call and speech itself.
+pub(crate) fn reply_prompt(messages: &[ChatMessage], tools: &[Value]) -> Vec<PromptPart> {
     let (system, turns) = match messages.split_first() {
         Some((first, rest)) if first.role == ChatRole::System => (first.content.trim(), rest),
         _ => ("", messages),
     };
-    let mut lines = Vec::new();
-    if output == Lfm3AudioReplyOutput::Interleaved {
-        lines.push(if tools.is_empty() {
-            LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT
-        } else {
-            LFM3_AUDIO_TOOLS_SYSTEM_PROMPT
-        });
-    }
+    let mut lines = vec![if tools.is_empty() {
+        LFM3_AUDIO_INTERLEAVED_SYSTEM_PROMPT
+    } else {
+        LFM3_AUDIO_TOOLS_SYSTEM_PROMPT
+    }];
     if !system.is_empty() {
         lines.push(system);
     }
@@ -318,23 +287,17 @@ pub(crate) fn reply_prompt(
         .filter(|tool| !is_deferred_tool(tool))
         .map(tool_to_json)
         .collect::<Vec<_>>();
-    if output == Lfm3AudioReplyOutput::Interleaved && !tool_lines.is_empty() {
+    if !tool_lines.is_empty() {
         lines.push(TOOL_LIST_HEADER);
     }
     let mut system = lines.join("\n\n");
     if !tool_lines.is_empty() {
-        if !system.is_empty() {
-            system.push_str("\n\n");
-        }
-        system.push_str("<tools>\n");
+        system.push_str("\n\n<tools>\n");
         system.push_str(&tool_lines.join("\n"));
         system.push_str("\n</tools>");
     }
 
-    let mut prompt = PromptBuilder::new();
-    if !system.is_empty() {
-        prompt = prompt.turn("system", &system);
-    }
+    let mut prompt = PromptBuilder::new().turn("system", &system);
     let last_user = turns
         .iter()
         .rposition(|message| message.role == ChatRole::User);
@@ -344,7 +307,7 @@ pub(crate) fn reply_prompt(
             ChatRole::System => prompt.turn("system", content),
             ChatRole::User => prompt.message_turn("user", content),
             ChatRole::Assistant => {
-                let keep_thinking = preserve_thinking || last_user.is_none_or(|last| index > last);
+                let keep_thinking = last_user.is_none_or(|last| index > last);
                 let content = match content.rsplit_once("</think>") {
                     Some((_, answer)) if !keep_thinking => answer.trim(),
                     _ => content,
@@ -360,7 +323,11 @@ pub(crate) fn reply_prompt(
             ),
         };
     }
-    prompt.assistant(output.prefill(!tools.is_empty()))
+    prompt.assistant(if tools.is_empty() {
+        "<|mixed_start|>"
+    } else {
+        ""
+    })
 }
 
 /// The messages of a spoken turn's reply: the instructions, the text history
@@ -534,12 +501,7 @@ mod tests {
             message(ChatRole::User, "Hi"),
             message(ChatRole::Assistant, "Hello!"),
         ];
-        let prompt = reply_prompt(
-            &voice_reply_messages(&history, Some(" Be brief. ")),
-            &[],
-            Lfm3AudioReplyOutput::Interleaved,
-            false,
-        );
+        let prompt = reply_prompt(&voice_reply_messages(&history, Some(" Be brief. ")), &[]);
         assert_eq!(
             text(&prompt),
             "<|startoftext|><|im_start|>system\nRespond with interleaved text and audio.\n\n\
@@ -549,12 +511,7 @@ mod tests {
         );
         assert_eq!(audio_slots(&prompt), 1);
         assert_eq!(
-            text(&reply_prompt(
-                &voice_reply_messages(&[], None),
-                &[],
-                Lfm3AudioReplyOutput::Interleaved,
-                false
-            )),
+            text(&reply_prompt(&voice_reply_messages(&[], None), &[])),
             "<|startoftext|><|im_start|>system\nRespond with interleaved text and audio.<|im_end|>\n\
              <|im_start|>user\n[AUDIO]<|im_end|>\n<|im_start|>assistant\n<|mixed_start|>"
         );
@@ -567,47 +524,9 @@ mod tests {
         assert_eq!(voice_reply_messages(&round, None), round);
     }
 
-    /// A chat reply is text: no mode line or prefill, each clip where its
-    /// user turn places it, and earlier answers without their thinking.
-    #[test]
-    fn chat_reply_prompts_answer_in_text() {
-        let messages = [
-            message(ChatRole::System, "Be brief."),
-            message(ChatRole::User, "<|audio|>What is said?"),
-            message(ChatRole::Assistant, "<think>a fox</think>\n\nA fox jumps."),
-            message(ChatRole::User, "And in <|audio|> and <|audio|>?"),
-        ];
-        let prompt = reply_prompt(&messages, &[], Lfm3AudioReplyOutput::Text, false);
-        assert_eq!(
-            text(&prompt),
-            "<|startoftext|><|im_start|>system\nBe brief.<|im_end|>\n\
-             <|im_start|>user\n[AUDIO]What is said?<|im_end|>\n\
-             <|im_start|>assistant\nA fox jumps.<|im_end|>\n\
-             <|im_start|>user\nAnd in [AUDIO] and [AUDIO]?<|im_end|>\n<|im_start|>assistant\n"
-        );
-        assert_eq!(audio_slots(&prompt), 3);
-        // `preserve_thinking` keeps an earlier answer's thinking.
-        assert!(text(&reply_prompt(
-            &messages,
-            &[],
-            Lfm3AudioReplyOutput::Text,
-            true
-        ))
-        .contains("<|im_start|>assistant\n<think>a fox</think>\n\nA fox jumps.<|im_end|>"));
-        assert_eq!(
-            text(&reply_prompt(
-                &[message(ChatRole::User, "Hi")],
-                &[],
-                Lfm3AudioReplyOutput::Text,
-                false
-            )),
-            "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-        );
-    }
-
-    /// With tools the system turn lists them (deferred ones left out; a text
-    /// reply's as the template writes it), an interleaved reply switches to
-    /// speech itself, and tool results are native tool turns.
+    /// With tools the system turn lists them (deferred ones left out), the
+    /// reply switches to speech itself, and tool results are native tool
+    /// turns.
     #[test]
     fn reply_prompts_list_tools_and_render_their_results() {
         let tools = [
@@ -632,51 +551,13 @@ mod tests {
              <|im_start|>tool\n<tool_response>\nkept\n</tool_response><|im_end|>\n\
              <|im_start|>assistant\n";
         assert_eq!(
-            text(&reply_prompt(
-                &messages,
-                &tools,
-                Lfm3AudioReplyOutput::Text,
-                false
-            )),
-            format!(
-                "<|startoftext|><|im_start|>system\nBe brief.\n\n\
-                 <tools>\n{{\"name\": \"get_time\"}}\n</tools><|im_end|>\n{turns}"
-            )
-        );
-        assert_eq!(
-            text(&reply_prompt(
-                &messages,
-                &tools,
-                Lfm3AudioReplyOutput::Interleaved,
-                false
-            )),
+            text(&reply_prompt(&messages, &tools)),
             format!(
                 "<|startoftext|><|im_start|>system\n\
                  Respond with function calls, and interleaved text and audio.\n\n\
                  Be brief.\n\nList of tools:\n\n\
                  <tools>\n{{\"name\": \"get_time\"}}\n</tools><|im_end|>\n{turns}"
             )
-        );
-        // Only deferred tools: nothing to list.
-        assert_eq!(
-            text(&reply_prompt(
-                &[message(ChatRole::User, "Hi")],
-                &tools[1..],
-                Lfm3AudioReplyOutput::Text,
-                false
-            )),
-            "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-        );
-        // Without a system message the tools are the system turn.
-        assert_eq!(
-            text(&reply_prompt(
-                &[message(ChatRole::User, "Hi")],
-                &tools,
-                Lfm3AudioReplyOutput::Text,
-                false
-            )),
-            "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_time\"}\n</tools>\
-             <|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 }

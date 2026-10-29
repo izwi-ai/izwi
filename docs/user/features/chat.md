@@ -12,10 +12,10 @@ Have local conversations with chat models running on your own machine.
 Izwi chat provides:
 
 - **Local inference** — Model execution stays on-device
-- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, LFM3, and LFM3-Audio
+- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, and LFM3
 - **System prompts** — Shape assistant behavior
 - **Streaming output** — Incremental response tokens
-- **Multimodal support** — Image inputs (Qwen3.5) and audio inputs (LFM3-Audio) in chat requests
+- **Multimodal support (Qwen3.5 only)** — Image inputs in chat API requests
 
 ---
 
@@ -71,9 +71,9 @@ izwi chat --model LFM2.5-1.2B-Instruct-GGUF
 3. Send and review streamed output
 4. Switch loaded models from the model selector
 
-With an LFM3-Audio model selected, attach audio files or record from your
-microphone in the composer: up to 8 clips of up to 120 s each per message.
-Each clip plays back in the conversation, and LFM3-Audio answers in text.
+LFM3-Audio is not a chat model: it powers [Voice Mode](/features/voice),
+transcription and text-to-speech. Audio clips in conversations saved before it
+left chat still play back, and a text model reads them as `[Audio attachment]`.
 
 ---
 
@@ -128,30 +128,6 @@ Image inputs are supported only on Qwen3.5 GGUF chat variants:
 }
 ```
 
-### Audio Input Example
-
-LFM3-Audio hears audio clips in user messages and answers in text. Send each
-clip inline as base64 `input_audio` (or an `audio_url` part with a `data:` URL);
-it is heard where the message places it:
-
-```json
-{
-  "model": "LFM3-Audio-2B-GGUF",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "input_audio", "input_audio": {"data": "<base64 WAV>", "format": "wav"}},
-        {"type": "text", "text": "Which animal does the speaker mention?"}
-      ]
-    }
-  ]
-}
-```
-
-A request carries at most 8 clips of at most 120 s each. Replies are text; for
-spoken replies use [Voice Mode](/features/voice).
-
 The API also supports SSE streaming, `stream_options.include_usage`, tool-call
 payloads, and strict/relaxed OpenAI compatibility profiles. See the
 [API Reference](/api#chat-completions) for the full request contract and
@@ -168,7 +144,6 @@ streaming sequence.
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | LFM3 | `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF` (reasoning on by default, tool calling) |
-| LFM3-Audio | `LFM3-Audio-2B-GGUF`, `LFM3-Audio-2B-Q8_0-GGUF` (audio questions, text answers, tool calling; local server only) |
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
@@ -180,10 +155,10 @@ scale-aware Q8_0 fallback.
 
 ## Multimodal Limits
 
-- Image chat is limited to **Qwen3.5 GGUF** models, and audio chat to **LFM3-Audio** (which hears audio only, not images).
+- Multimodal media chat is currently limited to **Qwen3.5 GGUF** models.
 - **Video inputs are not yet implemented**.
-- Other chat variants, including `Qwen3.8-27B-FP8`, support text-only requests.
-- Audio clips are sent inline; the server does not fetch audio URLs.
+- Non-Qwen3.5 chat variants, including `Qwen3.8-27B-FP8`, currently support text-only requests.
+- Chat requests carrying audio clips are refused; for spoken conversations use [Voice Mode](/features/voice).
 
 ---
 

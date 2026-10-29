@@ -33,7 +33,7 @@ use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmitt
 use crate::ids::new_prefixed_id;
 use izwi_model_catalog::{
     chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMediaKind, ChatMessage,
-    ChatRole, ModelFamily, ModelVariant,
+    ChatRole, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -419,9 +419,6 @@ pub fn prepare_execution_request(
     profile: OpenAiCompatibilityProfile,
 ) -> Result<(ChatExecutionRequest, AnswerFormat), ApiError> {
     let variant = parse_chat_model(&req.model)?;
-    if variant.family() == ModelFamily::Lfm3Audio {
-        validate_lfm3_audio_chat_controls(req)?;
-    }
     let stop_sequences = chat_stop_sequences(req.stop.as_ref())?;
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
@@ -481,47 +478,6 @@ pub fn prepare_execution_request(
         tool_calls: tool_policy.format,
     };
     Ok((execution, format))
-}
-
-/// LFM3-Audio answers chat through its own reply rows, which take the
-/// sampling controls, tools and `preserve_thinking` but not these; each is
-/// refused, never dropped. Its template has no thinking switch: the model
-/// may think, and `reasoning_format: "parsed"` splits it out.
-fn validate_lfm3_audio_chat_controls(req: &ChatCompletionRequest) -> Result<(), ApiError> {
-    let kwargs = req.chat_template_kwargs.as_ref();
-    let unsupported: [(&'static str, bool); 7] = [
-        (
-            "stop",
-            req.stop.as_ref().is_some_and(|stop| !stop.is_null()),
-        ),
-        ("logprobs", req.logprobs.unwrap_or(false)),
-        ("top_logprobs", req.top_logprobs.is_some()),
-        (
-            "presence_penalty",
-            req.presence_penalty.is_some_and(|penalty| penalty != 0.0),
-        ),
-        (
-            "skip_special_tokens",
-            req.skip_special_tokens == Some(false),
-        ),
-        (
-            "enable_thinking",
-            req.enable_thinking.is_some()
-                || kwargs.is_some_and(|kwargs| kwargs.enable_thinking.is_some()),
-        ),
-        (
-            "reasoning_effort",
-            req.reasoning_effort.is_some()
-                || kwargs.is_some_and(|kwargs| kwargs.reasoning_effort.is_some()),
-        ),
-    ];
-    match unsupported.iter().find(|(_, requested)| *requested) {
-        Some((param, _)) => Err(ApiError::invalid_param(
-            param,
-            format!("`{param}` is not supported for LFM3-Audio chat"),
-        )),
-        None => Ok(()),
-    }
 }
 
 /// Whether the request asked for `reasoning_format: "parsed"`.

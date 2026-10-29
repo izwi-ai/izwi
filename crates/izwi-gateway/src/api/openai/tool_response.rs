@@ -1,7 +1,7 @@
-//! Tool results for the LFM3 templates, rendered as their
-//! `render_tool_response` does (LiquidAI/LFM3-1.7B @ 40ebe0aa,
-//! LFM3-Audio-2B @ 9d49701c). A result becomes the template's
-//! `<tool_response>` block, which the prompt renderers pass through.
+//! Tool results for the LFM3 template, rendered as its
+//! `render_tool_response` does (LiquidAI/LFM3-1.7B @ 40ebe0aa). A result
+//! becomes the template's `<tool_response>` block, which the prompt
+//! renderers pass through.
 //!
 //! Deferred tools (`defer_loading`) reach the model this way: they stay out
 //! of the system turn's `<tools>`, and a tool search's result names them,
@@ -24,16 +24,12 @@ pub enum ToolResponseDialect {
     /// LFM3-1.7B: text items as text, `tool_reference` runs as one
     /// `<additional_tools>` block, results answering the same call merged.
     Lfm3Chat,
-    /// LFM3-Audio-2B: every other item as JSON, no `tool_reference`, no
-    /// merging.
-    Lfm3Audio,
 }
 
 impl ToolResponseDialect {
     pub fn of(variant: ModelVariant) -> Option<Self> {
         match variant.family() {
             ModelFamily::Lfm3Chat => Some(Self::Lfm3Chat),
-            ModelFamily::Lfm3Audio => Some(Self::Lfm3Audio),
             _ => None,
         }
     }
@@ -100,11 +96,6 @@ impl<'a> ToolResponses<'a> {
             (ToolResponseDialect::Lfm3Chat, None) => self
                 .render_response(&Value::String(String::new()))
                 .map(Some),
-            (ToolResponseDialect::Lfm3Audio, content) => match content.filter(|c| truthy(c)) {
-                Some(content) => self.render_response(content).map(Some),
-                // The audio template writes an empty tool turn.
-                None => Ok(Some(String::new())),
-            },
             (_, Some(content)) => self.render_response(content).map(Some),
         }
     }
@@ -156,11 +147,6 @@ impl<'a> ToolResponses<'a> {
                 out.push('\n');
             }
             if is_tool_reference(item) {
-                if self.dialect == ToolResponseDialect::Lfm3Audio {
-                    return Err(ApiError::bad_request(
-                        "LFM3-Audio does not resolve `tool_reference` items; list the tools' definitions in the tool message's `additional_tools`",
-                    ));
-                }
                 if index == 0 || !is_tool_reference(&items[index - 1]) {
                     out.push_str(ADDITIONAL_TOOLS_OPEN);
                     out.push('\n');
@@ -180,7 +166,6 @@ impl<'a> ToolResponses<'a> {
             } else {
                 match self.dialect {
                     ToolResponseDialect::Lfm3Chat => out.push_str(&parse_content(item)),
-                    ToolResponseDialect::Lfm3Audio => out.push_str(&python_json(item)),
                 }
             }
         }
