@@ -141,19 +141,20 @@ impl CustomOp3 for GatedRingStepOp {
         l3: &Layout,
     ) -> CandleResult<(CpuStorage, Shape)> {
         self.check(l1, l2, l3)?;
-        let slice = |storage: &'_ CpuStorage, layout: &Layout| -> CandleResult<Vec<f32>> {
+        // The inputs are read in place (`check` holds them contiguous).
+        fn slice<'a>(storage: &'a CpuStorage, layout: &Layout) -> CandleResult<&'a [f32]> {
             let CpuStorage::F32(values) = storage else {
                 bail!("lfm-shortconv-gated-ring-step only supports F32 tensors")
             };
             let start = layout.start_offset();
-            Ok(values[start..start + layout.shape().elem_count()].to_vec())
-        };
+            Ok(&values[start..start + layout.shape().elem_count()])
+        }
         let (projected, ring, weight) = (slice(s1, l1)?, slice(s2, l2)?, slice(s3, l3)?);
         let mut output = vec![0f32; (self.capacity + 1) * self.hidden];
         gated_ring_step_reference(
-            &projected,
-            &ring,
-            &weight,
+            projected,
+            ring,
+            weight,
             self.hidden,
             self.capacity,
             self.cursor,
