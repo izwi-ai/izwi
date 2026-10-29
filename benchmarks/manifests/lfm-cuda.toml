@@ -10,7 +10,11 @@ prompt = "Explain in two sentences how a cache avoids repeated computation."
 max_tokens = 128
 
 [benchmarks.matrix]
-model = ["LFM2.5-1.2B-Instruct-GGUF", "LFM2.5-1.2B-Thinking-GGUF"]
+model = [
+  "LFM2.5-1.2B-Instruct-GGUF",
+  "LFM2.5-1.2B-Thinking-GGUF",
+  "LFM3-1.7B-GGUF",
+]
 concurrent = [1, 2, 4, 8]
 stream = [false, true]
 
@@ -30,6 +34,30 @@ stream = [false, true]
 name = "lfm-tts-cuda"
 command = "tts"
 model = "LFM2.5-Audio-1.5B-GGUF"
+text = "Continuous audio batching should remain responsive and clear."
+iterations = 8
+warmup = true
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
+stream = [false, true]
+
+[[benchmarks]]
+name = "lfm3-audio-asr-cuda"
+command = "asr"
+model = "LFM3-Audio-2B-GGUF"
+file = "../../data/test.wav"
+iterations = 8
+warmup = true
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
+stream = [false, true]
+
+[[benchmarks]]
+name = "lfm3-audio-tts-cuda"
+command = "tts"
+model = "LFM3-Audio-2B-GGUF"
 text = "Continuous audio batching should remain responsive and clear."
 iterations = 8
 warmup = true

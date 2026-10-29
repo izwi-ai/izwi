@@ -115,8 +115,8 @@ scripts/bench/run-model-evidence.sh --backend cuda \
 Missing hardware fails by default. `--allow-unsupported` is only for local
 exploration and emits an explicit unsupported certificate; hardware CI must not
 use it. The runner never downloads models and rejects remote servers unless
-`--allow-remote` is explicit. The family manifest covers the 17 implementations
-reachable through the current chat/TTS/ASR benchmark API. Forced alignment,
+`--allow-remote` is explicit. The family manifest has one case for each of 18
+implementations reachable through the current chat/TTS/ASR benchmark API. Forced alignment,
 diarization, and the standalone speech tokenizer require dedicated benchmark
 producers before they can issue equivalent retained runtime certificates.
 
@@ -182,7 +182,7 @@ runtime backend, clean Git SHA, and captured telemetry. Until those external
 runs exist, their result is unavailable, not passing or failing.
 
 Continuous batching uses CPU, Metal, and CUDA concurrent manifests covering
-Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma. The
+Qwen3.5, Qwen3.8, LFM2.5, and LFM3. The
 certificate rejects missing run-local multi-row continuous batches, zero work,
 width below two, or physical-batch rejections:
 

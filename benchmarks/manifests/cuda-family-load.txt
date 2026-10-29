@@ -16,6 +16,8 @@ diar_streaming_sortformer_4spk-v2.1
 Qwen3.5-0.8B
 LFM2.5-1.2B-Instruct-GGUF
 LFM2.5-Audio-1.5B-GGUF
+LFM3-1.7B-GGUF
+LFM3-Audio-2B-GGUF
 Qwen3-ForcedAligner-0.6B
 Voxtral-Mini-4B-Realtime-2602
 Qwen3-TTS-Tokenizer-12Hz
