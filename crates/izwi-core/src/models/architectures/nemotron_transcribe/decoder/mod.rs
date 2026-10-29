@@ -82,6 +82,8 @@ pub struct DecoderTrace {
     pub routes: Vec<Vec<Routing>>,
     /// Hidden states after selected layers `(layer, [tokens, hidden])`.
     pub hidden: Vec<(usize, Vec<f32>)>,
+    /// The last prompt position's logits, once the prompt has prefilled.
+    pub final_logits: Vec<f32>,
 }
 
 /// Which hidden states a forward records.

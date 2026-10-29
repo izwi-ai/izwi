@@ -133,6 +133,90 @@ pub(crate) fn decoder_state_contract(
     Ok(contract)
 }
 
+/// The paged KV dtype per backend: F32 on the CPU, F16 on Metal (the
+/// LFM3-Audio precedent), BF16 on CUDA.
+pub(crate) fn kv_state_dtype(backend: crate::backends::BackendKind) -> StateDType {
+    match backend {
+        crate::backends::BackendKind::Cpu => StateDType::F32,
+        crate::backends::BackendKind::Metal => StateDType::F16,
+        crate::backends::BackendKind::Cuda => StateDType::Bf16,
+    }
+}
+
+/// The capability descriptor of the retained rows: the managed contract,
+/// and per row of each stage graph its activations as scratch.
+pub(crate) fn retained_state_descriptor(
+    contract: &InferenceStateContract,
+    stage_graphs: &[&[crate::engine::StageDescriptor]],
+) -> Result<crate::kv::v2::CapabilityStateDescriptorV2> {
+    use crate::kv::v2::{
+        stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationLeaseScope,
+        InvocationStageWorkspace, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
+        InvocationWorkspaceSet, RetainedStateCapability, WorkspaceFormula,
+    };
+    if stage_graphs.is_empty() {
+        return Err(Error::ModelLoadError(
+            "Nemotron 3.5 Transcribe retained state has no execution graph".into(),
+        ));
+    }
+    let max_domain = contract
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .unwrap_or(0);
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut workspace = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let per_row = if stage.workspace_per_row_bytes == 0 {
+                stage.max_workspace_bytes / u64::try_from(stage.max_batch_size.max(1)).unwrap_or(1)
+            } else {
+                stage.workspace_per_row_bytes
+            };
+            let mut domains = Vec::new();
+            if per_row > 0 {
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(max_domain + 1 + as_u32(index, "stage")?),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: per_row,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                });
+            }
+            workspace.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: Vec::new(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: workspace,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: contract.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(descriptor)
+}
+
 /// Bytes of one row's Mamba state (both tensor domains), whatever its
 /// length.
 pub fn recurrent_state_bytes(config: &NemotronDecoderConfig) -> u64 {

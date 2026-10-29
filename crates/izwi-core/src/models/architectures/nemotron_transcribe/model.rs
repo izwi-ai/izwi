@@ -57,6 +57,24 @@ const SCAN_CHECK_LIMIT: f64 = 1e-4;
 
 static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN`: the most prompt tokens one row
+/// prefills in one engine quantum (16 to 16,384).
+pub const PREFILL_SPAN_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN";
+
+/// The prefill span per row and quantum: 2,048 tokens on CUDA, 512 on CPU
+/// and Metal (a bounded dispatch between other users' decode steps; an
+/// hour's 45,000-token prompt is 23 or 88 spans), or the environment's.
+pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
+    std::env::var(PREFILL_SPAN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|span| (16..=16_384).contains(span))
+        .unwrap_or(match backend {
+            crate::backends::BackendKind::Cuda => 2_048,
+            crate::backends::BackendKind::Cpu | crate::backends::BackendKind::Metal => 512,
+        })
+}
+
 /// `min(16384, ceil(8 * seconds) + 128)`, the decode a request books.
 pub fn planned_decode_tokens(audio_seconds: f32) -> usize {
     ((f64::from(audio_seconds.max(0.0)) * PLANNED_TOKENS_PER_SECOND).ceil() as usize
@@ -481,6 +499,18 @@ impl NemotronTranscribeModel {
         self.identity
     }
 
+    pub fn frontend(&self) -> &NemotronMelFrontend {
+        &self.frontend
+    }
+
+    pub fn perception(&self) -> &NemotronPerception {
+        &self.perception
+    }
+
+    pub fn audio_token_id(&self) -> u32 {
+        self.audio_token_id
+    }
+
     pub fn decoder(&self) -> &NemotronDecoder {
         &self.decoder
     }
@@ -506,6 +536,16 @@ impl NemotronTranscribeModel {
         let d = &self.diagnostics;
         json!({
             "family": "nemotron_transcribe_asr",
+            "device_kind": match self.residency {
+                Residency::Cpu => "cpu",
+                Residency::Metal => "metal",
+                Residency::Cuda => "cuda",
+            },
+            "dtype": match (self.residency, self.fp8_mode) {
+                (Residency::Cpu, _) => "q8_0",
+                (_, Fp8Mode::W8A16) => "fp8_w8a16",
+                (_, Fp8Mode::VllmFp8) => "fp8_vllm_parity",
+            },
             "residency": format!("{:?}", self.residency),
             "fp8_mode": self.fp8_mode.name(),
             "load_seconds": d.load_seconds,
@@ -520,6 +560,46 @@ impl NemotronTranscribeModel {
             "greedy_near_ties": d.near_ties.load(Ordering::Relaxed),
             "loop_stops": d.loop_stops.load(Ordering::Relaxed),
         })
+    }
+
+    /// Device workspace one decode row holds during a step: the stacked
+    /// Mamba states it replaces (about one row's state) and its activations
+    /// and logits.
+    pub fn decode_workspace_per_row_bytes(&self) -> u64 {
+        let d = self.decoder.config();
+        super::decoder::state::recurrent_state_bytes(d)
+            + (d.vocab * 4 + d.mamba.in_proj_rows() * 8 + d.hidden * 64) as u64
+    }
+
+    /// Device workspace one prefill span of `tokens` holds: its activations
+    /// through the widest projection, one perception window, and a copy of
+    /// the row's Mamba state.
+    pub fn prefill_workspace_bytes(&self, tokens: usize) -> u64 {
+        let d = self.decoder.config();
+        let widest = d
+            .mamba
+            .in_proj_rows()
+            .max(d.moe.shared_intermediate)
+            .max(d.attention.heads * d.attention.head_dim);
+        let activations = tokens as u64 * (widest as u64 + 8 * d.hidden as u64) * 4;
+        let window = 600 * self.config.asr_encoder.ff_dim as u64 * 4 * 4
+            + (self.config.asr_encoder.heads * 600 * 600 * 4) as u64;
+        activations + window + super::decoder::state::recurrent_state_bytes(d)
+    }
+
+    /// [`Self::prepare`] for audio at any sample rate (resampled to 16 kHz).
+    pub fn prepare_audio(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        request: NemotronTranscribeRequest,
+    ) -> Result<NemotronPreparedArtifact> {
+        let target = self.config.frontend.sample_rate as u32;
+        if sample_rate == target {
+            return self.prepare(samples, request);
+        }
+        let resampled = crate::audio::resample_mono_high_quality(samples, sample_rate, target)?;
+        self.prepare(&resampled, request)
     }
 
     /// Host-side preparation of `samples` (mono, 16 kHz).
@@ -681,9 +761,21 @@ impl NemotronTranscribeModel {
             )));
         }
         let embeds = self.span_embeddings(state, start, span)?;
-        let hidden = self
-            .decoder
-            .forward_span(&embeds, &mut state.mamba, cache, trace)?;
+        let mut trace = trace;
+        let hidden = self.decoder.forward_span(
+            &embeds,
+            &mut state.mamba,
+            cache,
+            trace
+                .as_mut()
+                .map(|(request, trace)| (*request, &mut **trace)),
+        )?;
+        if start + span == prompt {
+            if let Some((_, trace)) = trace.as_mut() {
+                trace.final_logits =
+                    super::speech_transformer::host_values(&self.decoder.logits(&hidden)?)?;
+            }
+        }
         state.prefill_cursor = start + span;
         self.diagnostics
             .prefill_spans

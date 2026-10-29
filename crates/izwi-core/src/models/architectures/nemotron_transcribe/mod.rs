@@ -26,6 +26,7 @@ pub mod model;
 pub mod perception;
 pub mod precision;
 pub mod prompt;
+pub mod residency;
 pub mod sortformer;
 pub mod speech_transformer;
 pub mod transcript;
@@ -36,9 +37,9 @@ mod model_tests;
 pub(crate) mod synthetic;
 
 pub use model::{
-    planned_decode_tokens, NemotronPreparedArtifact, NemotronRetainedCheckpoint,
+    planned_decode_tokens, prefill_span, NemotronPreparedArtifact, NemotronRetainedCheckpoint,
     NemotronRetainedState, NemotronStepRow, NemotronTranscribeModel, NemotronTranscribeRequest,
-    NemotronTranscription, MAX_AUDIO_SECONDS, MAX_CONTEXT_TOKENS, MAX_NEW_TOKENS,
+    NemotronTranscription, MAX_AUDIO_SECONDS, MAX_CONTEXT_TOKENS, MAX_NEW_TOKENS, PREFILL_SPAN_ENV,
 };
 pub use prompt::{NemotronPromptOptions, LANGUAGES as NEMOTRON_TRANSCRIBE_LANGUAGES};
 pub use transcript::NemotronFinishReason;
