@@ -19,12 +19,29 @@
 
 pub mod checkpoint;
 pub mod config;
+pub mod decoder;
 pub mod frontend;
 pub mod linear;
+pub mod model;
 pub mod perception;
 pub mod precision;
+pub mod prompt;
 pub mod sortformer;
 pub mod speech_transformer;
+pub mod transcript;
+
+#[cfg(test)]
+mod model_tests;
+#[cfg(test)]
+pub(crate) mod synthetic;
+
+pub use model::{
+    planned_decode_tokens, NemotronPreparedArtifact, NemotronRetainedCheckpoint,
+    NemotronRetainedState, NemotronStepRow, NemotronTranscribeModel, NemotronTranscribeRequest,
+    NemotronTranscription, MAX_AUDIO_SECONDS, MAX_CONTEXT_TOKENS, MAX_NEW_TOKENS,
+};
+pub use prompt::{NemotronPromptOptions, LANGUAGES as NEMOTRON_TRANSCRIBE_LANGUAGES};
+pub use transcript::NemotronFinishReason;
 
 #[cfg(test)]
 mod isolation_tests {
