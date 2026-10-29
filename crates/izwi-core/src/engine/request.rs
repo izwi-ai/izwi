@@ -475,6 +475,10 @@ pub(super) struct IncrementalModelExecutionReady {
     maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
     maya2_tts_params: Option<Maya2GenerationParams>,
     lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
+    /// A Nemotron 3.5 Transcribe row's host preparation (the model is the
+    /// `Asr` lease).
+    nemotron_transcribe:
+        Option<Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

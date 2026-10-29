@@ -564,6 +564,12 @@ pub fn write_checkpoint(dir: &Path) {
         br#"{"audio_token": "<|audio|>", "eos_token": "<|im_end|>"}"#,
     )
     .unwrap();
+    std::fs::write(dir.join("chat_template.jinja"), b"{# synthetic #}").unwrap();
+    std::fs::write(
+        dir.join(crate::artifacts::downloader::NEMOTRON_TRANSCRIBE_SYNTHETIC_MARKER),
+        b"",
+    )
+    .unwrap();
 }
 
 /// A directory removed when dropped.

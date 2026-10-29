@@ -41,12 +41,136 @@ impl EngineCoreRequest {
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
+            nemotron_transcribe: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
         Ok(())
+    }
+
+    /// A Nemotron 3.5 Transcribe request becomes a retained row: its prompt
+    /// (text around the audio positions) prefills in resumable spans and
+    /// its decode budget is the prepared one, bounded by the row's context.
+    pub(crate) fn install_nemotron_transcribe_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: AsrModelLease,
+        artifact: Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::NemotronTranscribeAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron 3.5 Transcribe request {} preparation does not match its routed model",
+                self.id
+            )));
+        }
+        let prompt = artifact.prompt_tokens();
+        if prompt == 0 || prompt >= max_sequence_tokens {
+            return Err(Error::ContextLengthExceeded(format!(
+                "Nemotron 3.5 Transcribe request {}: a {prompt}-token prompt does not fit a {max_sequence_tokens}-token row",
+                self.id
+            )));
+        }
+        self.prepared_sequence_input_tokens = Some(prompt);
+        self.params.max_tokens = artifact
+            .max_new_tokens
+            .min(max_sequence_tokens - prompt)
+            .max(1);
+        self.prepared_asr_execution_shape = Some(PreparedAsrExecutionShape::RetainedSequence {
+            input_tokens: prompt,
+        });
+        self.prepared_stage_costs.clear();
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Asr(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
+            lfm3_audio: None,
+            nemotron_transcribe: Some(artifact),
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    /// Prepares a Nemotron 3.5 Transcribe row on the host: the decoded and
+    /// resampled audio's log-mel and statistics, the window plan, the prompt
+    /// (instruction from the request's language, prompt, context terms and
+    /// translation target) and the decode budget; then installs it. No device
+    /// work: the perception windows encode inside the prefill spans.
+    pub(crate) fn prepare_nemotron_transcribe_row(
+        &mut self,
+        model_variant: ModelVariant,
+        model: AsrModelLease,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        use crate::models::architectures::nemotron_transcribe::{
+            NemotronPromptOptions, NemotronTranscribeRequest,
+        };
+        let (samples, sample_rate) = super::super::executor::decode_request_audio_with_rate(self)?;
+        let language = self
+            .asr_language_for_execution()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+            .map(str::to_string);
+        let request = NemotronTranscribeRequest {
+            prompt: NemotronPromptOptions {
+                language,
+                context_terms: self.asr_task.keywords.clone(),
+                translate_to: self.asr_task.translate_to.clone(),
+                speaker_attribution: false,
+                verbatim: false,
+                instruction_override: self
+                    .asr_prompt_for_execution()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            },
+            max_new_tokens: Some(self.params.max_tokens.max(1)),
+            word_timestamps: self.asr_native_word_timestamps,
+        };
+        let artifact = Arc::new(model.nemotron_transcribe()?.prepare_audio(
+            &samples,
+            sample_rate,
+            request,
+        )?);
+        // The row keeps its decoded audio as the other ASR families do, so
+        // the request's materialized host usage only grows.
+        self.install_prepared_asr_audio(model_variant, samples, sample_rate)?;
+        self.install_nemotron_transcribe_execution_model(
+            model_variant,
+            model,
+            artifact,
+            max_sequence_tokens,
+        )
+    }
+
+    pub(crate) fn prepared_nemotron_transcribe_artifact_for_executor(
+        &self,
+    ) -> Result<
+        Option<Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>>,
+    > {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.nemotron_transcribe.clone()))
     }
 
     pub(crate) fn install_lfm25_audio_asr_execution_model(
@@ -95,6 +219,7 @@ impl EngineCoreRequest {
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
+            nemotron_transcribe: None,
             kokoro_tts: None,
         });
         for (stage_id, cost) in prepared_costs {

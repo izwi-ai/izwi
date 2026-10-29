@@ -26,6 +26,10 @@ pub enum ModelFamily {
     /// Granite Speech 5.0: the 4.1 encoder, projector and Granite LM shapes
     /// with a YaRN language model and its own prompt contract.
     GraniteSpeech5Asr,
+    /// Nemotron 3.5 Transcribe: a Parallel Expert Encoder (Transformer ASR
+    /// encoder and a streaming Sortformer) over a Nemotron-H Mamba2/MoE
+    /// decoder; one pass over up to an hour of audio.
+    NemotronTranscribeAsr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen3MoeChat,
@@ -59,6 +63,7 @@ impl ModelFamily {
             | Self::VibeVoiceAsr
             | Self::GraniteSpeechAsr
             | Self::GraniteSpeech5Asr
+            | Self::NemotronTranscribeAsr
             | Self::Lfm25Audio
             | Self::Lfm3Audio
             | Self::Voxtral => true,
@@ -105,6 +110,14 @@ impl ModelFamily {
         )
     }
 
+    /// Whether every prefill of this family must run in bounded resumable
+    /// spans, whatever the engine's opt-in chunked-prefill switch says: its
+    /// prompts (Nemotron 3.5 Transcribe: up to 45,000 audio tokens for an
+    /// hour) are too long for one quantum to hold the device.
+    pub fn requires_prefill_spans(self) -> bool {
+        matches!(self, Self::NemotronTranscribeAsr)
+    }
+
     /// Whether this family's ASR encoder pads every input to one fixed window
     /// (Whisper's 30 s mel window). A shorter chunk then costs a full window,
     /// so the route planner never cuts such a model's audio below its window
@@ -117,7 +130,10 @@ impl ModelFamily {
     /// window (VibeVoice's hour-long context, Parakeet's windowed encoder),
     /// rather than the shared ~30 s long-form chunk.
     pub fn asr_single_pass_spans_model_window(self) -> bool {
-        matches!(self, Self::VibeVoiceAsr | Self::ParakeetAsr)
+        matches!(
+            self,
+            Self::VibeVoiceAsr | Self::ParakeetAsr | Self::NemotronTranscribeAsr
+        )
     }
 
     /// Whether the chunked ASR route can stream this family's text token by
@@ -135,6 +151,7 @@ impl ModelFamily {
                 | Self::NemotronAsr
                 | Self::Lfm25Audio
                 | Self::Lfm3Audio
+                | Self::NemotronTranscribeAsr
                 | Self::Voxtral
         )
     }
@@ -396,6 +413,7 @@ impl ModelVariant {
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             GraniteSpeech502B | GraniteSpeech502BGguf => ModelFamily::GraniteSpeech5Asr,
+            Nemotron35Transcribe30BA4BFp8 => ModelFamily::NemotronTranscribeAsr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -432,7 +450,8 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
-            | ModelFamily::GraniteSpeech5Asr => ModelTask::Asr,
+            | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::NemotronTranscribeAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
@@ -517,6 +536,17 @@ pub fn resolve_diarization_llm_variant(
     parse_chat_model_variant(input)
 }
 
+/// Whether a normalized id names Nemotron 3.5 Transcribe (any precision of
+/// the published release resolves to the FP8 checkpoint the catalog
+/// carries; its BF16, NVFP4 and DFlash2 siblings are other artifacts).
+fn is_nemotron_transcribe(normalized: &str) -> bool {
+    normalized.contains("nemotron")
+        && normalized.contains("transcribe")
+        && !["nvfp4", "dflash"]
+            .iter()
+            .any(|other| normalized.contains(other))
+}
+
 pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
     use ModelVariant::*;
 
@@ -533,6 +563,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             let normalized = normalize_identifier(raw);
             if normalized.contains("voxtral") {
                 VoxtralMini4BRealtime2602
+            } else if is_nemotron_transcribe(&normalized) {
+                Nemotron35Transcribe30BA4BFp8
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
             } else if let Some(granite_speech) = resolve_granite_speech_variant(&normalized) {
@@ -563,6 +595,11 @@ pub fn resolve_diarization_asr_model_variant(input: Option<&str>) -> Result<Mode
         return Ok(ModelVariant::ParakeetTdt06BV3);
     };
     match parse_model_variant(raw) {
+        // Its transcripts run only as resumable engine rows, never as the
+        // one blocking stage the pipeline needs; it tags speakers itself.
+        Ok(variant) if variant.family() == ModelFamily::NemotronTranscribeAsr => Err(format!(
+            "Model '{raw}' cannot transcribe in the diarization pipeline; it attributes speakers in its own transcripts."
+        )),
         Ok(variant) if variant.runs_speech_to_text_jobs() => Ok(variant),
         Ok(variant) => Err(format!(
             "Model '{raw}' cannot transcribe in the diarization pipeline (resolved to {variant:?}); choose an ASR model."
@@ -676,6 +713,13 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         || (normalized.contains("fish") && normalized.contains("s2"))
     {
         return Some(FishAudioS2Pro);
+    }
+
+    // Nemotron 3.5 Transcribe before the 0.6B streaming ASR and the
+    // diarizer: "nemotron transcribe asr" and "nemotron transcribe
+    // diarization" name the 30B speech language model.
+    if is_nemotron_transcribe(normalized) {
+        return Some(Nemotron35Transcribe30BA4BFp8);
     }
 
     if normalized.contains("nemotron") && normalized.contains("asr") {
@@ -1121,6 +1165,7 @@ mod tests {
             "LFM2.5-Audio-1.5B-GGUF",
             "Qwen3-ForcedAligner-0.6B",
             "Qwen3.5-4B",
+            "Nemotron-3.5-Transcribe-30B-A4B-FP8",
         ] {
             assert!(
                 resolve_diarization_asr_model_variant(Some(rejected)).is_err(),
@@ -1375,6 +1420,60 @@ mod tests {
         ] {
             assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
         }
+    }
+
+    #[test]
+    fn nemotron_transcribe_names_resolve_before_the_streaming_asr_and_the_diarizer() {
+        for input in [
+            "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8",
+            "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+            "nemotron-3.5-transcribe",
+            "Nemotron 3.5 Transcribe",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::Nemotron35Transcribe30BA4BFp8,
+                "{input}"
+            );
+        }
+        for input in [
+            "nemotron transcribe asr",
+            "nemotron transcribe diarization",
+            "nemotron-transcribe",
+        ] {
+            assert_eq!(
+                resolve_asr_model_variant(Some(input)),
+                ModelVariant::Nemotron35Transcribe30BA4BFp8,
+                "{input}"
+            );
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::Nemotron35Transcribe30BA4BFp8,
+                "{input}"
+            );
+        }
+        // The other Nemotron models keep their ids.
+        assert_eq!(
+            resolve_asr_model_variant(Some("nemotron asr")),
+            ModelVariant::Nemotron35AsrStreaming06B
+        );
+        assert_eq!(
+            parse_model_variant("nemotron diarization").unwrap(),
+            ModelVariant::Nemotron3Diarization
+        );
+        // Siblings the catalog does not carry do not resolve to it.
+        assert!(parse_model_variant("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4").is_err());
+        assert!(parse_model_variant("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-DFlash2").is_err());
+        let family = ModelVariant::Nemotron35Transcribe30BA4BFp8.family();
+        assert_eq!(family, ModelFamily::NemotronTranscribeAsr);
+        assert!(family.hallucinates_on_non_speech());
+        assert!(family.asr_single_pass_spans_model_window());
+        assert!(!family.dispatches_long_form_asr_by_chunk());
+        assert!(family.asr_streams_within_chunk());
+        assert_eq!(
+            ModelVariant::Nemotron35Transcribe30BA4BFp8.primary_task(),
+            ModelTask::Asr
+        );
     }
 
     #[test]

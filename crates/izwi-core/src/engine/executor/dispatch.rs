@@ -1072,6 +1072,49 @@ impl NativeExecutor {
         )
     }
 
+    /// One Nemotron 3.5 Transcribe quantum: a static prefill of every row's
+    /// span, or a continuous decode step, as `mode` says.
+    pub(super) fn execute_nemotron_transcribe_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let kind = match mode {
+            NativeBatchMode::Continuous => BatchDispatchKind::TensorContinuous,
+            _ => BatchDispatchKind::TensorStatic,
+        };
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("Nemotron 3.5 Transcribe row lost its request".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                rows.and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.nemotron_transcribe_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(kind, scheduled.len()),
+            rows,
+        )
+    }
+
     /// One LFM3-Audio quantum over rows of any task: a static prefill or a
     /// continuous decode, as `mode` says.
     pub(super) fn execute_lfm3_audio_requests_with_rows(

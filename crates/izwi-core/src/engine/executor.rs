@@ -24,6 +24,7 @@ mod handler_chatterbox;
 mod handler_lfm3_audio_rows;
 mod handler_maya1;
 mod handler_maya2;
+mod handler_nemotron_transcribe_rows;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
 #[path = "executor/long_form.rs"]
@@ -107,9 +108,9 @@ use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishS2TtsDecode,
     ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode, ActiveLfm3AudioRealtime,
-    ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
-    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
-    PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
+    ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronTranscribeDecode,
+    ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
+    ActiveVoxtralTtsDecode, PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2758,6 +2759,7 @@ pub struct NativeExecutor {
     maya1_tts_decode_states: ExecutorStateStore<ActiveMaya1TtsDecode>,
     maya2_tts_decode_states: ExecutorStateStore<ActiveMaya2TtsDecode>,
     lfm3_audio_decode_states: ExecutorStateStore<ActiveLfm3AudioDecode>,
+    nemotron_transcribe_decode_states: ExecutorStateStore<ActiveNemotronTranscribeDecode>,
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     lfm3_audio_realtime: Arc<Lfm3AudioRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
@@ -2864,6 +2866,7 @@ impl NativeExecutor {
             maya1_tts_decode_states: Mutex::new(HashMap::new()),
             maya2_tts_decode_states: Mutex::new(HashMap::new()),
             lfm3_audio_decode_states: Mutex::new(HashMap::new()),
+            nemotron_transcribe_decode_states: Mutex::new(HashMap::new()),
             voxtral_realtime,
             lfm3_audio_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3478,10 +3481,12 @@ impl ModelExecutor for NativeExecutor {
             // Scheduler-level spans require a stronger capability than
             // incremental decode: the exact loaded family must publish a
             // resumable prefill safe point. Unsupported families remain full.
+            let spans_required = variant.family().requires_prefill_spans();
             profile.prefill = resolved_resumable_prefill_mode(
-                self.config.enable_chunked_prefill || binds_mixed_step(request),
+                self.config.enable_chunked_prefill || binds_mixed_step(request) || spans_required,
                 resumable_prefill_proof,
             );
+            profile.prefill_spans_required = spans_required;
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
@@ -3779,6 +3784,24 @@ impl ModelExecutor for NativeExecutor {
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr
+                    })
+                }) =>
+                {
+                    self.execute_nemotron_transcribe_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                        NativeBatchMode::Static,
                     )
                 }
                 NativeBatchRoute::Audio {
@@ -4177,6 +4200,9 @@ impl ModelExecutor for NativeExecutor {
         let mut lfm3_audio_rows = self.lfm3_audio_decode_states.lock().map_err(|_| {
             Error::InferenceError("LFM3-Audio decode state mutex poisoned".to_string())
         })?;
+        let mut nemotron_rows = self.nemotron_transcribe_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Nemotron 3.5 Transcribe decode state mutex poisoned".to_string())
+        })?;
         if self.voxtral_realtime.abort_matching(|_| true).is_err() {
             return Err(Error::InferenceError(
                 "failed to abort pending Voxtral realtime state during shutdown".to_string(),
@@ -4218,6 +4244,7 @@ impl ModelExecutor for NativeExecutor {
         maya1_tts.clear();
         maya2_tts.clear();
         lfm3_audio_rows.clear();
+        nemotron_rows.clear();
         lfm3_live.clear();
         voxtral.clear();
         tts.clear();
@@ -4234,6 +4261,7 @@ impl ModelExecutor for NativeExecutor {
             maya1_tts,
             maya2_tts,
             lfm3_audio_rows,
+            nemotron_rows,
             voxtral,
             tts,
         ));
@@ -4280,6 +4308,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
+            Ok(mut nemotron_rows),
             Ok(mut voxtral),
             Ok(mut lfm3_live),
             Ok(mut tts),
@@ -4296,6 +4325,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
+            self.nemotron_transcribe_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.lfm3_audio_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
@@ -4316,6 +4346,7 @@ impl ModelExecutor for NativeExecutor {
         let maya1_tts = cleanup_request_states_locked(&mut maya1_tts, request_id);
         let maya2_tts = cleanup_request_states_locked(&mut maya2_tts, request_id);
         let lfm3_audio_rows = cleanup_request_states_locked(&mut lfm3_audio_rows, request_id);
+        let nemotron_rows = cleanup_request_states_locked(&mut nemotron_rows, request_id);
         let voxtral = cleanup_request_states_locked(&mut voxtral, request_id);
         let lfm3_live = cleanup_request_states_locked(&mut lfm3_live, request_id);
         let tts = cleanup_request_states_locked(&mut tts, request_id);
@@ -4331,6 +4362,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(maya1_tts)
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
+                .combine(nemotron_rows)
                 .combine(voxtral)
                 .combine(lfm3_live)
                 .combine(tts),
@@ -4374,6 +4406,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
+            Ok(mut nemotron_rows),
             Ok(mut voxtral),
             Ok(mut lfm3_live),
             Ok(mut tts),
@@ -4390,6 +4423,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
+            self.nemotron_transcribe_decode_states.lock(),
             self.voxtral_realtime.states.lock(),
             self.lfm3_audio_realtime.states.lock(),
             self.qwen_tts_decode_states.lock(),
@@ -4414,6 +4448,7 @@ impl ModelExecutor for NativeExecutor {
         let maya1_tts = cleanup_session_state_locked(&mut maya1_tts, session);
         let maya2_tts = cleanup_session_state_locked(&mut maya2_tts, session);
         let lfm3_audio_rows = cleanup_session_state_locked(&mut lfm3_audio_rows, session);
+        let nemotron_rows = cleanup_session_state_locked(&mut nemotron_rows, session);
         let voxtral = cleanup_session_state_locked(&mut voxtral, session);
         let lfm3_live = cleanup_session_state_locked(&mut lfm3_live, session);
         let tts = cleanup_session_state_locked(&mut tts, session);
@@ -4429,6 +4464,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(maya1_tts)
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
+                .combine(nemotron_rows)
                 .combine(voxtral)
                 .combine(lfm3_live)
                 .combine(tts),
@@ -4459,6 +4495,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut maya1_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
+            Ok(mut nemotron_rows),
             Ok(mut lfm3_live),
         ) = (
             self.voxtral_realtime.states.lock(),
@@ -4467,6 +4504,7 @@ impl ModelExecutor for NativeExecutor {
             self.maya1_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
+            self.nemotron_transcribe_decode_states.lock(),
             self.lfm3_audio_realtime.states.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
@@ -4495,6 +4533,11 @@ impl ModelExecutor for NativeExecutor {
                 ))
                 .combine(cleanup_model_states_locked(
                     &mut lfm3_audio_rows,
+                    variant,
+                    |active| active.variant,
+                ))
+                .combine(cleanup_model_states_locked(
+                    &mut nemotron_rows,
                     variant,
                     |active| active.variant,
                 ))

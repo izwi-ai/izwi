@@ -40,7 +40,7 @@ mod sequence_asr;
 mod tts;
 use asr::{
     ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
-    ParakeetAsrExecutionAdapter,
+    NemotronTranscribeAsrExecutionAdapter, ParakeetAsrExecutionAdapter,
 };
 use chat::ContinuousChatExecutionAdapter;
 use descriptor::loaded_execution_contracts;
@@ -85,6 +85,7 @@ const MAYA2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_CHAT_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const NEMOTRON_TRANSCRIBE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const LFM3_AUDIO_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
     crate::models::architectures::lfm3_audio::LFM3_AUDIO_REALTIME_EXECUTION_ABI,

@@ -38,6 +38,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm3AudioAsr,
     Lfm3AudioChat,
     Lfm3AudioRealtime,
+    NemotronTranscribeAsr,
     KokoroStaticTts,
     Scalar,
 }
@@ -66,6 +67,7 @@ impl LoadedAdapterKind {
             Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
             Self::Lfm3AudioChat => "builtin.lfm3_audio_chat.physical_sequence",
             Self::Lfm3AudioRealtime => "builtin.lfm3_audio_realtime.physical_session",
+            Self::NemotronTranscribeAsr => "builtin.nemotron_transcribe_asr.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -345,6 +347,18 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // One atomic invocation per chunk on leased decoder pages; long
         // audio dispatches one chunk at a time.
         row(F::GraniteSpeech5Asr, C::Asr, Loaded::Scalar, Invocation).chunked(),
+        // Nemotron 3.5 Transcribe runs every request (up to an hour, one
+        // pass) as a retained row: resumable prefill spans that encode the
+        // perception windows they need, then decode batched across rows, on
+        // the family's paged KV and Mamba state in the managed arena.
+        row(
+            F::NemotronTranscribeAsr,
+            C::Asr,
+            Loaded::NemotronTranscribeAsr,
+            RetainedAndInvocation,
+        )
+        .sequence()
+        .resumable(),
         // Long audio is chunked inside the dispatch.
         row(F::Voxtral, C::Asr, Loaded::Scalar, Invocation).chunked(),
         row(

@@ -135,6 +135,8 @@ enum LoadedAsrStatePublicationRoute {
     Parakeet,
     NemotronOffline,
     GraniteSpeech5,
+    /// Allocated by `allocate_nemotron_transcribe_state` (retained rows).
+    NemotronTranscribe,
     LegacyCache,
 }
 
@@ -147,6 +149,9 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
         crate::catalog::ModelFamily::GraniteSpeech5Asr => {
             LoadedAsrStatePublicationRoute::GraniteSpeech5
+        }
+        crate::catalog::ModelFamily::NemotronTranscribeAsr => {
+            LoadedAsrStatePublicationRoute::NemotronTranscribe
         }
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
@@ -184,6 +189,7 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
             | crate::catalog::ModelFamily::NemotronAsr
             | crate::catalog::ModelFamily::GraniteSpeechAsr
             | crate::catalog::ModelFamily::GraniteSpeech5Asr
+            | crate::catalog::ModelFamily::NemotronTranscribeAsr
             | crate::catalog::ModelFamily::Qwen3ForcedAligner
     )
 }
@@ -1136,6 +1142,15 @@ impl ModelLifecycleController {
             )
             .await?;
             self.allocate_lfm3_audio_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
+            self.allocate_nemotron_transcribe_state(
                 variant,
                 model_instance_id,
                 backend,

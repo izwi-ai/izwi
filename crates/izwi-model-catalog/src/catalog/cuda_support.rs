@@ -331,6 +331,11 @@ impl ModelVariant {
                 Provider::CandleCudnnEligible,
                 "convolution uses Candle tensor operators and is eligible for cuDNN only when build, layout, dtype, and grouping constraints match",
             ),
+            ModelFamily::NemotronTranscribeAsr => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::CandleTensor,
+                "Nemotron 3.5 Transcribe's Mamba2 causal convolutions (four taps with bias and SiLU) and the Sortformer subpixel convolution are composed from Candle tensor operators",
+            ),
             ModelFamily::Qwen35Chat => CudaOperatorCapability::source_reviewed(
                 Operator::Convolution,
                 Provider::IzwiCudaEligible,
@@ -384,6 +389,7 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::NemotronTranscribeAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
@@ -524,6 +530,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Granite Speech 5.0 ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and YaRN Granite decoder once the native loader is selected; its RoPE tables are built on the host",
             ),
+            ModelFamily::NemotronTranscribeAsr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Nemotron 3.5 Transcribe runs on Candle CUDA tensor kernels: its ModelOpt FP8 projections stay resident as raw E4M3 on the compact FP8 kernels (BF16 activations, W8A16, SM80+), runs the Mamba2 selective scan in an Izwi CUDA kernel with F32 state, routes the sigmoid MoE in F32 on the host and attends over paged KV; the mel front end, window plan and Sortformer cache bookkeeping run on the host; source review is not runtime validation",
+            ),
             ModelFamily::Lfm3Audio => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "LFM3-Audio uses Candle CUDA tensor kernels for the quantized LFM3 language model (paged KV with sliding-window layers), the speech encoder, the MaskGIT depth decoder and the LiquidCodec decoder; the mel features, sampling and the inverse FFT run on the host",
@@ -582,6 +592,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
                 "Qwen3.5/3.6 MoE stores 128x128 block-scaled FP8 Safetensors weights; with CUDA performance optimizations on (the default) projections stay resident as raw block FP8 and the fp8 projection kernel applies weight_scale_inv per GEMM (per-tensor Q8_0 fallback for kernel-incompatible geometry); projection_backend = \"q8\" or disabled optimizations expand them to resident BF16 at load",
+            );
+        }
+
+        if self.family() == ModelFamily::NemotronTranscribeAsr {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Nemotron 3.5 Transcribe stores ModelOpt FP8 linears with one F32 scale per tensor; CUDA keeps them as raw E4M3 with the scalar broadcast to the kernels' 128x128 scale grid (exact), zero-padded to the provider's 64x128 alignment, and computes W8A16; embeddings stay BF16 on the host and the head is BF16",
             );
         }
 

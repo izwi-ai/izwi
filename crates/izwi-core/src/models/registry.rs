@@ -346,6 +346,21 @@ fn load_granite_speech5_asr_model(
     ))
 }
 
+fn load_nemotron_transcribe_asr_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
+) -> Result<NativeAsrModel> {
+    Ok(NativeAsrModel::NemotronTranscribe(
+        crate::models::architectures::nemotron_transcribe::NemotronTranscribeModel::load(
+            model_dir,
+            Some(variant),
+            &device,
+        )?,
+    ))
+}
+
 fn load_qwen_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -606,6 +621,11 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         family: ModelFamily::GraniteSpeech5Asr,
         loader: load_granite_speech5_asr_model,
     },
+    AsrLoaderRegistration {
+        name: "nemotron_transcribe_asr",
+        family: ModelFamily::NemotronTranscribeAsr,
+        loader: load_nemotron_transcribe_asr_model,
+    },
 ];
 
 const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[
@@ -742,6 +762,7 @@ fn resolve_asr_loader_registration(
         ModelFamily::VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
         ModelFamily::GraniteSpeechAsr => ModelFamily::GraniteSpeechAsr,
         ModelFamily::GraniteSpeech5Asr => ModelFamily::GraniteSpeech5Asr,
+        ModelFamily::NemotronTranscribeAsr => ModelFamily::NemotronTranscribeAsr,
         _ => return None,
     };
 
@@ -866,6 +887,9 @@ pub enum NativeAsrModel {
     VibeVoice(VibeVoiceAsrModel),
     GraniteSpeech(GraniteSpeechAsrModel),
     GraniteSpeech5(GraniteSpeech5AsrModel),
+    /// Nemotron 3.5 Transcribe: retained continuous rows (its own state
+    /// contract and row handler), never the scalar transcribe paths.
+    NemotronTranscribe(crate::models::architectures::nemotron_transcribe::NemotronTranscribeModel),
 }
 
 pub(crate) fn reject_foreign_whisper_prefill(
@@ -887,7 +911,8 @@ impl InferenceStateContractProvider for NativeAsrModel {
             | Self::WhisperTurbo(_)
             | Self::VibeVoice(_)
             | Self::GraniteSpeech(_)
-            | Self::GraniteSpeech5(_) => Ok(InferenceStateCapability::Stateless),
+            | Self::GraniteSpeech5(_)
+            | Self::NemotronTranscribe(_) => Ok(InferenceStateCapability::Stateless),
         }
     }
 }
@@ -1467,6 +1492,10 @@ impl NativeAsrModel {
         leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<NativeAsrTranscription> {
         match self {
+            Self::NemotronTranscribe(_) => Err(Error::InvalidInput(
+                "Nemotron 3.5 Transcribe runs as retained engine rows, not a scalar transcription"
+                    .into(),
+            )),
             Self::Qwen3(_) => {
                 let cache = leases
                     .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
@@ -2280,6 +2309,10 @@ impl NativeAsrModel {
                 prompt,
                 on_delta,
             ),
+            Self::NemotronTranscribe(_) => Err(Error::InvalidInput(
+                "Nemotron 3.5 Transcribe runs as retained engine rows, not a scalar transcription"
+                    .into(),
+            )),
             Self::GraniteSpeech5(_) => Err(Error::InferenceError(
                 "Granite Speech 5.0 ASR requires a lifecycle-owned physical invocation cache"
                     .into(),
@@ -2349,6 +2382,10 @@ impl NativeAsrModel {
         prompt: Option<&str>,
     ) -> Result<NativeAsrTranscription> {
         match self {
+            Self::NemotronTranscribe(_) => Err(Error::InvalidInput(
+                "Nemotron 3.5 Transcribe runs as retained engine rows, not a scalar transcription"
+                    .into(),
+            )),
             Self::GraniteSpeech5(_) => Err(Error::InferenceError(
                 "Granite Speech 5.0 ASR requires a lifecycle-owned physical invocation cache"
                     .into(),
@@ -2609,9 +2646,22 @@ impl NativeAsrModel {
         }
     }
 
+    /// The loaded Nemotron 3.5 Transcribe model.
+    pub(crate) fn nemotron_transcribe(
+        &self,
+    ) -> Result<&crate::models::architectures::nemotron_transcribe::NemotronTranscribeModel> {
+        match self {
+            Self::NemotronTranscribe(model) => Ok(model),
+            _ => Err(Error::InvalidInput(
+                "the loaded ASR model is not Nemotron 3.5 Transcribe".into(),
+            )),
+        }
+    }
+
     pub fn supports_incremental_decode(&self) -> bool {
         match self {
             Self::Qwen3(_) => true,
+            Self::NemotronTranscribe(_) => true,
             Self::GraniteSpeech(model) => model.supports_incremental_decode(),
             _ => false,
         }
@@ -2622,6 +2672,7 @@ impl NativeAsrModel {
             Self::Qwen3(model) => model.supports_resumable_prefill(),
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(model) => model.supports_resumable_prefill(),
+            Self::NemotronTranscribe(_) => true,
             _ => false,
         }
     }
@@ -2632,17 +2683,24 @@ impl NativeAsrModel {
             Self::Parakeet(_) => true,
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
+            Self::NemotronTranscribe(_) => true,
             _ => false,
         }
     }
 
     pub fn supports_static_prefill_batch(&self) -> bool {
-        matches!(self, Self::Parakeet(_) | Self::VibeVoice(_))
+        matches!(
+            self,
+            Self::Parakeet(_) | Self::VibeVoice(_) | Self::NemotronTranscribe(_)
+        )
     }
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
-            || matches!(self, Self::VibeVoice(_) | Self::GraniteSpeech(_))
+            || matches!(
+                self,
+                Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::NemotronTranscribe(_)
+            )
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
@@ -2653,6 +2711,7 @@ impl NativeAsrModel {
             ),
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
+            Self::NemotronTranscribe(model) => Ok(model.decode_workspace_per_row_bytes()),
             _ => Err(Error::InvalidInput(
                 "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),
@@ -2877,6 +2936,9 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => model.max_audio_seconds_hint(),
             Self::GraniteSpeech(model) => model.max_audio_seconds_hint(),
             Self::GraniteSpeech5(model) => model.max_audio_seconds_hint(),
+            Self::NemotronTranscribe(_) => {
+                Some(crate::models::architectures::nemotron_transcribe::MAX_AUDIO_SECONDS)
+            }
         }
     }
 
@@ -2896,6 +2958,14 @@ impl NativeAsrModel {
                     max_chunk_seconds: plan.max_chunk_seconds,
                 }
             }
+            // One pass over up to an hour: the model windows its encoders
+            // itself, so the route never chunks.
+            Self::NemotronTranscribe(_) => AsrInvocationWindow {
+                max_audio_seconds: Some(
+                    crate::models::architectures::nemotron_transcribe::MAX_AUDIO_SECONDS,
+                ),
+                max_chunk_seconds: None,
+            },
             // IBM decodes segments of up to about two minutes; longer audio
             // is cut by the generic chunk planner.
             Self::GraniteSpeech5(_) => AsrInvocationWindow {
@@ -2927,6 +2997,8 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => Some(model.audio_token_rate()),
             Self::GraniteSpeech(model) => Some(model.audio_token_rate()),
             Self::GraniteSpeech5(model) => Some(model.audio_token_rate()),
+            // One token per 80 ms (eight 10 ms mel frames).
+            Self::NemotronTranscribe(_) => Some(12.5),
         }
     }
 
@@ -2937,6 +3009,7 @@ impl NativeAsrModel {
         match self {
             Self::GraniteSpeech(model) => Some(model.nominal_decoder_context()),
             Self::GraniteSpeech5(model) => Some(model.nominal_decoder_context()),
+            Self::NemotronTranscribe(model) => Some(model.max_context_tokens()),
             _ => None,
         }
     }
@@ -2978,6 +3051,10 @@ impl NativeAsrModel {
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
         match self {
+            Self::NemotronTranscribe(_) => Err(Error::InvalidInput(
+                "Nemotron 3.5 Transcribe runs as retained engine rows, not a scalar transcription"
+                    .into(),
+            )),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "Incremental Qwen3 ASR requires scheduler-owned physical state".to_string(),
             )),
@@ -7009,6 +7086,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::NemotronAsr => "nemotron_asr",
         ModelFamily::GraniteSpeechAsr => "granite_speech_asr",
         ModelFamily::GraniteSpeech5Asr => "granite_speech5_asr",
+        ModelFamily::NemotronTranscribeAsr => "nemotron_transcribe_asr",
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",
@@ -7035,6 +7113,7 @@ fn native_asr_model_kind(model: &NativeAsrModel) -> &'static str {
         NativeAsrModel::VibeVoice(_) => "vibevoice_asr",
         NativeAsrModel::GraniteSpeech(_) => "granite_speech_asr",
         NativeAsrModel::GraniteSpeech5(_) => "granite_speech5_asr",
+        NativeAsrModel::NemotronTranscribe(_) => "nemotron_transcribe_asr",
     }
 }
 
@@ -7058,6 +7137,12 @@ fn native_asr_runtime_diagnostics(
             (actual_runtime, Some(diagnostics))
         }
         NativeAsrModel::GraniteSpeech5(model) => {
+            let diagnostics = model.diagnostics_summary();
+            let actual_runtime =
+                LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");
+            (actual_runtime, Some(diagnostics))
+        }
+        NativeAsrModel::NemotronTranscribe(model) => {
             let diagnostics = model.diagnostics_summary();
             let actual_runtime =
                 LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");

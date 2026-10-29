@@ -1138,6 +1138,9 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         );
                     let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
+                    let nemotron_transcribe_asr = execution.metadata().capability
+                        == CapabilityKind::Asr
+                        && variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr;
                     let nemotron_realtime = execution.metadata().capability
                         == CapabilityKind::RealtimeAsr
                         && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
@@ -1155,6 +1158,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         || qwen3_tts
                         || retained_tts
                         || parakeet_asr
+                        || nemotron_transcribe_asr
                         || engine_realtime
                         || nemotron_realtime)
                         && contract.execution_profile.mode == ExecutionMode::Sequence
@@ -1575,17 +1579,20 @@ fn every_pipeline_selectable_asr_publishes_an_atomic_long_form_graph() {
     }
     // Every native ASR family, Voxtral and LFM3-Audio is selectable by its
     // catalog id (no variant escapes the check through an unparseable
-    // name); LFM2.5-Audio, whose ASR is a retained sequence, is not.
+    // name); LFM2.5-Audio and Nemotron 3.5 Transcribe, whose ASR runs only
+    // as retained sequences, are not.
     let expected = ModelVariant::all()
         .iter()
         .copied()
         .filter(|variant| variant.runs_speech_to_text_jobs())
+        .filter(|variant| variant.family() != crate::catalog::ModelFamily::NemotronTranscribeAsr)
         .collect::<Vec<_>>();
     assert_eq!(selectable, expected);
     assert!(selectable.contains(&ModelVariant::ParakeetTdt06BV3));
     assert!(selectable.contains(&ModelVariant::VoxtralMini4BRealtime2602));
     assert!(selectable.contains(&ModelVariant::Lfm3Audio2BGguf));
     assert!(!selectable.contains(&ModelVariant::Lfm25Audio15BGguf));
+    assert!(!selectable.contains(&ModelVariant::Nemotron35Transcribe30BA4BFp8));
 }
 
 #[test]

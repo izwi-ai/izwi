@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 55;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 56;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 82;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 83;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -442,7 +442,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            69
+            70
         );
         assert_eq!(
             manifest
@@ -493,6 +493,17 @@ mod tests {
             )
             .retained_state,
             Stateless
+        );
+        // Nemotron 3.5 Transcribe keeps its decoder's pages and Mamba state
+        // in the managed arena between quanta.
+        assert_eq!(
+            manifest_case(
+                &manifest,
+                ModelVariant::Nemotron35Transcribe30BA4BFp8,
+                CapabilityKind::Asr,
+            )
+            .retained_state,
+            Managed
         );
         for variant in [
             ModelVariant::Lfm3Audio2BGguf,

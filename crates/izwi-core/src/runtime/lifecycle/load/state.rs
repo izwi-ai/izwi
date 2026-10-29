@@ -1000,6 +1000,98 @@ impl ModelLifecycleController {
     /// attention and ShortConv ring, kept between quanta), fitted up to a
     /// conversation's context; long-form transcription leases one scalar
     /// invocation workspace and runs atomically.
+    /// Nemotron 3.5 Transcribe rows: the family's state contract (paged KV
+    /// of the six attention layers, the Mamba SSM and convolution states) in
+    /// one managed arena, each row up to the model's 65,536-token context.
+    pub(super) async fn allocate_nemotron_transcribe_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        use crate::models::architectures::nemotron_transcribe::decoder::state as nt_state;
+        if variant.family() != crate::catalog::ModelFamily::NemotronTranscribeAsr {
+            return Ok(());
+        }
+        if !managed_kv_backend_compiled(backend) {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {variant} requires managed paged state, but the {backend:?} build has no direct paged-attention runtime"
+            )));
+        }
+        let model = self
+            .model_registry
+            .get_loading_asr(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "loaded Nemotron 3.5 Transcribe model {variant} is missing from the registry"
+                ))
+            })?;
+        let nemotron = model.nemotron_transcribe()?;
+        let contract = nt_state::decoder_state_contract(
+            nemotron.decoder().config(),
+            nt_state::kv_state_dtype(backend),
+            crate::models::shared::attention::paged::default_kv_page_size(),
+        )?;
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let descriptor = nt_state::retained_state_descriptor(&contract, &stage_graphs)?;
+        let context = self
+            .config
+            .max_sequence_length
+            .explicit_tokens()
+            .unwrap_or(nemotron.max_context_tokens())
+            .min(nemotron.max_context_tokens());
+        let retained = self
+            .core_engine
+            .load_managed_model_state(
+                model_instance_id,
+                &contract,
+                Some(context),
+                asr_minimum_tokens(variant),
+                state_fit_reserve,
+                0,
+            )
+            .await?;
+        self.model_registry.publish_effective_context(
+            variant,
+            retained.logical_token_reach().min(context as u64),
+        )?;
+        self.model_registry.publish_kv_storage(variant, &retained);
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
+            CapabilityKind::Asr,
+            retained.state_plan_v2(),
+        )?;
+        let retained_uses = contracts
+            .iter()
+            .map(|contract| {
+                let retained_use = match contract.execution_profile.mode {
+                    crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
+                    _ => return Err(Error::ModelLoadError(
+                        "Nemotron 3.5 Transcribe graph has an incompatible retained-state profile"
+                            .into(),
+                    )),
+                };
+                Ok((stage_graph_fingerprint(&contract.stages)?, retained_use))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let publication = self.load_scratch_only_workspace_publication(
+            &contracts,
+            descriptor,
+            Some(retained.into()),
+            retained_uses,
+        )?;
+        state_publications.insert(CapabilityKind::Asr, publication);
+        Ok(())
+    }
+
     pub(super) async fn allocate_lfm3_audio_state(
         &self,
         variant: ModelVariant,
