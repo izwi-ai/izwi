@@ -6,3 +6,4 @@ pub mod realtime_transport;
 pub mod transcription_realtime;
 pub mod voice_realtime;
 pub mod voice_reply;
+pub(crate) mod voice_tools;

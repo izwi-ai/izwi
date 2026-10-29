@@ -275,6 +275,10 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::Maya2Tts => {
             crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
         }
+        crate::catalog::ModelFamily::Lfm3Audio => {
+            crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts
+                .context_tokens()
+        }
         _ => 0,
     };
     tokens as u64
@@ -343,7 +347,7 @@ fn managed_chat_capacity_policy(
         ModelFamily::Qwen38Chat | ModelFamily::Qwen35MoeChat => CudaResidentPool::RetainedRows,
         // Without a fit LFM2.5 grew a 128K-token arena on demand, with a
         // replacement-copy peak and no CUDA context reserve (A1).
-        ModelFamily::Lfm2Chat => CudaResidentPool::OneContext,
+        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat => CudaResidentPool::OneContext,
         _ => CudaResidentPool::Disabled,
     };
     ManagedChatCapacityPolicy {
@@ -517,6 +521,7 @@ fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool 
         || matches!(
             variant.family(),
             crate::catalog::ModelFamily::Lfm2Chat
+                | crate::catalog::ModelFamily::Lfm3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::FishS2Tts
         ))
@@ -1130,6 +1135,15 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_lfm3_audio_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_qwen_tts_state(
                 variant,
                 model_instance_id,
@@ -1246,7 +1260,10 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::Voxtral {
                 self.model_registry.publish_voxtral_ready(variant).await?;
             }
-            if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+            if matches!(
+                variant.family(),
+                crate::catalog::ModelFamily::Lfm25Audio | crate::catalog::ModelFamily::Lfm3Audio
+            ) {
                 self.model_registry
                     .publish_lfm25_audio_ready(variant)
                     .await?;

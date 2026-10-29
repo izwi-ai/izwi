@@ -89,9 +89,36 @@ fn lfm2_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
         ModelVariant::Lfm2512BInstructGguf => Some("LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
         ModelVariant::Lfm2512BThinkingGguf => Some("LFM2.5-1.2B-Thinking-Q4_K_M.gguf"),
+        ModelVariant::Lfm317BGguf => Some("LFM3-1.7B-QAD-Q4_0.gguf"),
+        ModelVariant::Lfm317BQ8Gguf => Some("LFM3-1.7B-Q8_0.gguf"),
         _ => None,
     }
 }
+
+/// An LFM3-Audio variant's language model and mmproj GGUFs.
+fn lfm3_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 2]> {
+    match variant {
+        ModelVariant::Lfm3Audio2BGguf => Some([
+            "LFM3-Audio-2B-Q4_K_M.gguf",
+            "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+        ]),
+        ModelVariant::Lfm3Audio2BQ8Gguf => Some([
+            "LFM3-Audio-2B-Q8_0.gguf",
+            "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+        ]),
+        _ => None,
+    }
+}
+
+/// Files the LFM3 GGUF repos do not ship, from the safetensors repo.
+const LFM3_COMPANION_FILES: [&str; 6] = [
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
 
 fn lfm25_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 4]> {
     match variant {
@@ -1699,6 +1726,7 @@ impl ModelDownloader {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file =
@@ -1710,9 +1738,9 @@ impl ModelDownloader {
                     let gguf_file =
                         qwen35_chat_gguf_filename(variant).expect("checked by is_qwen35_chat_gguf");
                     path.join(gguf_file).exists() && path.join("mmproj-F16.gguf").exists()
-                } else if variant.is_lfm2_chat_gguf() {
+                } else if variant.is_lfm2_chat_gguf() || variant.is_lfm3_chat_gguf() {
                     let gguf_file =
-                        lfm2_chat_gguf_filename(variant).expect("checked by is_lfm2_chat_gguf");
+                        lfm2_chat_gguf_filename(variant).expect("checked by is_lfm*_chat_gguf");
                     path.join(gguf_file).exists()
                         && path.join("chat_template.jinja").exists()
                         && path.join("config.json").exists()
@@ -1732,6 +1760,11 @@ impl ModelDownloader {
             ModelFamily::Lfm25Audio => lfm25_audio_gguf_filenames(variant)
                 .expect("checked by is_lfm25_audio_gguf")
                 .into_iter()
+                .all(|file| path.join(file).exists()),
+            ModelFamily::Lfm3Audio => lfm3_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm3_audio_gguf")
+                .into_iter()
+                .chain(LFM3_COMPANION_FILES)
                 .all(|file| path.join(file).exists()),
             ModelFamily::Qwen3ForcedAligner => {
                 path.join("config.json").exists()
@@ -2336,6 +2369,7 @@ impl ModelDownloader {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen38_fp8() {
                     return QWEN38_REQUIRED_METADATA_FILES
@@ -2361,9 +2395,9 @@ impl ModelDownloader {
                     let gguf_file =
                         qwen35_chat_gguf_filename(variant).expect("checked by is_qwen35_chat_gguf");
                     return vec![gguf_file.to_string(), "mmproj-F16.gguf".to_string()];
-                } else if variant.is_lfm2_chat_gguf() {
+                } else if variant.is_lfm2_chat_gguf() || variant.is_lfm3_chat_gguf() {
                     let gguf_file =
-                        lfm2_chat_gguf_filename(variant).expect("checked by is_lfm2_chat_gguf");
+                        lfm2_chat_gguf_filename(variant).expect("checked by is_lfm*_chat_gguf");
                     return vec![
                         gguf_file.to_string(),
                         "chat_template.jinja".to_string(),
@@ -2406,6 +2440,12 @@ impl ModelDownloader {
             ModelFamily::Lfm25Audio => lfm25_audio_gguf_filenames(variant)
                 .expect("checked by is_lfm25_audio_gguf")
                 .into_iter()
+                .map(|file| file.to_string())
+                .collect(),
+            ModelFamily::Lfm3Audio => lfm3_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm3_audio_gguf")
+                .into_iter()
+                .chain(LFM3_COMPANION_FILES)
                 .map(|file| file.to_string())
                 .collect(),
             ModelFamily::Qwen3ForcedAligner => {
@@ -2614,7 +2654,10 @@ impl ModelDownloader {
                 .collect();
         }
 
-        if variant.is_lfm2_chat_gguf() {
+        if variant.is_lfm2_chat_gguf()
+            || variant.is_lfm3_chat_gguf()
+            || variant.is_lfm3_audio_gguf()
+        {
             // The GGUF repos ship no tokenizer, so the companion files come
             // from the safetensors repos at a pinned revision: upstream
             // replaced their chat template on 2026-08-05, and an unpinned
@@ -2627,6 +2670,14 @@ impl ModelDownloader {
                 ModelVariant::Lfm2512BThinkingGguf => (
                     "LiquidAI/LFM2.5-1.2B-Thinking",
                     "f313478934a7612d22991f752959d7a1a8756fec",
+                ),
+                ModelVariant::Lfm317BGguf | ModelVariant::Lfm317BQ8Gguf => (
+                    "LiquidAI/LFM3-1.7B",
+                    ModelVariant::LFM3_17B_COMPANION_REVISION,
+                ),
+                ModelVariant::Lfm3Audio2BGguf | ModelVariant::Lfm3Audio2BQ8Gguf => (
+                    "LiquidAI/LFM3-Audio-2B",
+                    ModelVariant::LFM3_AUDIO_2B_COMPANION_REVISION,
                 ),
                 _ => (variant.repo_id(), "main"),
             };
@@ -3046,6 +3097,16 @@ impl ModelDownloader {
                 730_895_360
             } else if file.contains("LFM2.5-Audio-1.5B") {
                 740_000_000
+            } else if file.contains("LFM3-1.7B-QAD-Q4_0") {
+                1_049_615_680
+            } else if file.contains("LFM3-1.7B-Q8_0") {
+                1_846_238_496
+            } else if file.contains("mmproj-LFM3-Audio-2B-Q8_0") {
+                337_862_080
+            } else if file.contains("LFM3-Audio-2B-Q4_K_M") {
+                1_099_626_016
+            } else if file.contains("LFM3-Audio-2B-Q8_0") {
+                1_846_236_704
             } else if lower.contains("qwen3_asr_0.6b") {
                 1_012_824_608
             } else if lower.contains("qwen3_asr_1.7b") {
@@ -4414,6 +4475,44 @@ mod tests {
     }
 
     #[test]
+    fn lfm3_chat_downloads_the_pinned_gguf_and_companion_files() {
+        let (downloader, temp_dir) = test_downloader();
+        for (variant, gguf) in [
+            (ModelVariant::Lfm317BGguf, "LFM3-1.7B-QAD-Q4_0.gguf"),
+            (ModelVariant::Lfm317BQ8Gguf, "LFM3-1.7B-Q8_0.gguf"),
+        ] {
+            let specs = downloader.get_model_file_specs(variant);
+            let weights = specs
+                .iter()
+                .find(|spec| spec.local_file == gguf)
+                .expect("gguf spec");
+            assert_eq!(weights.source_repo, "LiquidAI/LFM3-1.7B-GGUF");
+            assert_eq!(
+                weights.source_revision,
+                ModelVariant::LFM3_17B_GGUF_ARTIFACT_REVISION
+            );
+            let companions = specs
+                .iter()
+                .filter(|spec| !spec.local_file.ends_with(".gguf"))
+                .collect::<Vec<_>>();
+            assert_eq!(companions.len(), 6, "{variant:?}");
+            assert!(companions.iter().all(|spec| {
+                spec.source_repo == "LiquidAI/LFM3-1.7B"
+                    && spec.source_revision == ModelVariant::LFM3_17B_COMPANION_REVISION
+            }));
+
+            let dir = temp_dir.join(variant.dir_name());
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!downloader.is_downloaded(variant));
+            for spec in &specs {
+                std::fs::write(dir.join(&spec.local_file), b"x").unwrap();
+            }
+            assert!(downloader.is_downloaded(variant));
+        }
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
     fn lfm25_chat_companion_files_come_from_pinned_safetensors_revisions() {
         let (downloader, temp_dir) = test_downloader();
         for (variant, repo, revision) in [
@@ -4440,6 +4539,11 @@ mod tests {
                 .find(|spec| spec.local_file.ends_with(".gguf"))
                 .expect("gguf spec");
             assert_eq!(gguf.source_repo, variant.repo_id());
+            assert_eq!(
+                Some(gguf.source_revision.as_str()),
+                variant.artifact_revision(),
+                "{variant}: the GGUF comes from its pinned revision"
+            );
             assert!(specs
                 .iter()
                 .filter(|spec| !spec.local_file.ends_with(".gguf"))

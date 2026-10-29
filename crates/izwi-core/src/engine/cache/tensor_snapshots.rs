@@ -50,10 +50,12 @@ pub(crate) struct TensorSnapshotPrefixPolicy {
 ///
 /// The shape is deliberately stricter than the contract validator requires:
 /// exactly one paged-attention domain (so exactly one fork cursor), every
-/// tensor domain of the contract participating with one shared interval (a
-/// legacy tensor transaction stages and commits all domains at one cursor),
-/// one consistency group, and no append/ring domains whose clocks could
-/// diverge from the shared decoder cursor.
+/// tensor or ring domain of the contract participating with one shared
+/// interval (a legacy tensor transaction stages and commits all domains at
+/// one cursor), one consistency group, and no append domain whose clock
+/// could diverge from the shared decoder cursor. A ring (LFM's ShortConv)
+/// is staged whole into the tensor arena at the decoder cursor, so its
+/// committed state forks as a tensor's does.
 pub(crate) fn tensor_snapshot_prefix_policy(
     contract: &InferenceStateContract,
 ) -> Option<TensorSnapshotPrefixPolicy> {
@@ -63,7 +65,7 @@ pub(crate) fn tensor_snapshot_prefix_policy(
     for domain in &contract.domains {
         match domain {
             StateDomainSpec::PagedAttention(_) => paged_domains.push(domain.id()),
-            StateDomainSpec::Tensor(_) => match domain.prefix_policy() {
+            StateDomainSpec::Tensor(_) | StateDomainSpec::Ring(_) => match domain.prefix_policy() {
                 PrefixPolicy::CommittedSnapshots { interval_steps } => {
                     if interval.is_some_and(|existing| existing != *interval_steps) {
                         return None;
@@ -73,7 +75,7 @@ pub(crate) fn tensor_snapshot_prefix_policy(
                 }
                 _ => return None,
             },
-            // Append, ring, static-attention, and static-tensor state has no
+            // Append, static-attention, and static-tensor state has no
             // snapshot fork path; keep those contracts admission-inert.
             _ => return None,
         }

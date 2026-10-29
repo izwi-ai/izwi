@@ -55,7 +55,7 @@ pub(crate) struct Lfm25AudioRetainedCheckpoint {
 }
 
 impl Lfm25AudioRetainedState {
-    pub(super) fn new(
+    pub(crate) fn new(
         mode: Lfm25AudioRetainedMode,
         shortconv: Lfm2ShortConvRuntimeState,
         max_depthformer_steps: usize,
@@ -76,6 +76,12 @@ impl Lfm25AudioRetainedState {
 
     pub(crate) const fn main_position(&self) -> usize {
         self.main_position
+    }
+
+    /// The ShortConv ring, for a model outside LFM2.5-Audio that runs its
+    /// language model on this state (LFM3-Audio).
+    pub(crate) fn shortconv_mut(&mut self) -> &mut Lfm2ShortConvRuntimeState {
+        &mut self.shortconv
     }
 
     pub(crate) const fn depthformer_step(&self) -> usize {
@@ -185,11 +191,17 @@ impl Lfm25AudioRetainedState {
             self.depthformer_step = depthformer.context_len();
         }
         finish_quantum_authority(&mut self.active_quantum, checkpoint.quantum_nonce)?;
-        install_cache_authority_after_commit(
-            &mut self.main_cache_authority,
-            checkpoint.prior_main_cache_authority,
-            checkpoint.main_cache_authority,
-        )?;
+        // A sequence's first page becomes its authority once it holds a
+        // token. A quantum that commits none (LFM3-Audio's LiveASR hearing
+        // audio before its first block) leaves a fresh sequence unbound: its
+        // provisional page is released, and the next view starts elsewhere.
+        if main.context_len() > 0 {
+            install_cache_authority_after_commit(
+                &mut self.main_cache_authority,
+                checkpoint.prior_main_cache_authority,
+                checkpoint.main_cache_authority,
+            )?;
+        }
         Ok(())
     }
 

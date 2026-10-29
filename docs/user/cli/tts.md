@@ -53,7 +53,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
 | `-t, --temperature <TEMP>` | Sampling temperature | model default |
-| `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`); for `Maya2-Native-2.5B`, a code (e.g. `hi`) or `auto` to read it from the text's script | model default |
+| `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`); for `Maya2-Native-2.5B`, a code (e.g. `hi`) or `auto` to read it from the text's script; for `LFM3-Audio-2B-GGUF`, one of its 19 locales (e.g. `en-GB`, `ja`; `en-US` when unset) | model default |
 | `--reference-language <CODE>` | Language the reference audio is spoken in (`Maya2-Native-2.5B` only, which can clone a voice into another language); unset, it is read from the transcript's script | — |
 | `--exaggeration <F>` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight <F>` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
@@ -236,6 +236,27 @@ and similar are spoken as words in the text's language. Text longer than 280
 characters is spoken in whole sentences of up to 280 characters (about 20
 seconds each). It refuses `--speed` and `--instructions`.
 
+### LFM3 Audio
+
+`LFM3-Audio-2B-GGUF` speaks with a `female` or `male` voice (see
+[Voice Presets](/models/voice-presets#lfm3-audio)) in one of 19 locales that
+`--language` names: `en-US` (the default), `en-GB`, `ar`, `da`, `de`, `el`,
+`fi`, `fr`, `he`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `es`, `sv`, `tr` or
+`zh`:
+
+```bash
+izwi tts "Bonjour, votre commande arrive demain." \
+  --model LFM3-Audio-2B-GGUF \
+  --speaker male \
+  --language fr \
+  --output lfm3-audio.wav
+```
+
+Long text is split into sentences automatically, and `--stream` writes 24 kHz
+audio as it is generated. Sampling follows Liquid AI's defaults (temperature 1.0,
+top-k 128); `--temperature` overrides the temperature. It refuses
+`--reference-audio`, `--saved-voice-id`, `--instructions` and `--speed`.
+
 ### Saved voice reuse
 
 Saved voices created through Voice Studio or `/v1/voices` can be reused without
@@ -294,6 +315,7 @@ Izwi saves the streamed audio, then plays it.
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
 | `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 22 languages chosen with `--language`; watermarked, 24 kHz output, MIT |
+| `LFM3-Audio-2B-GGUF` | Preset voices | `female` or `male` in 19 locales chosen with `--language`; 24 kHz output, LFM Open License v1.0; `LFM3-Audio-2B-Q8_0-GGUF` has a Q8_0 language model |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 
 ---

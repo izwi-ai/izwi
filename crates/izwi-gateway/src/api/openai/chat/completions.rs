@@ -16,9 +16,12 @@ use super::dto::{
 use super::stream::{render_chat_stream, AuditedStream};
 use crate::api::openai::compat::{strict_guardrail_message, OpenAiCompatibilityProfile};
 use crate::api::openai::convert::{
-    append_assistant_tool_calls, flatten_content, tool_result_message,
+    append_assistant_tool_calls, flatten_content, inbound_content_value, tool_result_message,
 };
 use crate::api::openai::tool_calls::{parse_answer, resolve_tool_policy, ToolCallFormat};
+use crate::api::openai::tool_response::{
+    reject_deferred_tool_results, ToolResponseDialect, ToolResponses, ToolResult,
+};
 use crate::api::request_context::{RequestContext, StreamOutcome};
 use crate::app::chat::{
     chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
@@ -29,7 +32,8 @@ use crate::error::ApiError;
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmittedTenantWork};
 use crate::ids::new_prefixed_id;
 use izwi_model_catalog::{
-    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
+    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMediaKind, ChatMessage,
+    ChatRole, ModelFamily, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -40,19 +44,34 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The request's messages as the runtime's, with the media they carry.
+/// `tools` are the request's tool definitions, deferred ones included, which
+/// an LFM3 tool result's `tool_reference` items name.
 fn to_core_messages_with_media(
     variant: ModelVariant,
-    messages: Vec<OpenAiInboundMessage>,
+    mut messages: Vec<OpenAiInboundMessage>,
+    tools: &[serde_json::Value],
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut core = Vec::with_capacity(messages.len());
     let mut media_inputs = Vec::new();
     // The ids of the latest assistant turn's tool calls, which the tool
     // results after it answer.
     let mut call_ids: Vec<String> = Vec::new();
+    // LFM3's templates render tool results themselves (deferred tools,
+    // merged results), so their turns are rendered here as the template does.
+    let mut tool_responses =
+        ToolResponseDialect::of(variant).map(|dialect| ToolResponses::new(dialect, tools));
 
-    for message in messages {
+    for index in 0..messages.len() {
+        let message = &mut messages[index];
         let role = parse_role(&message.role)?;
-        let flattened = flatten_content(message.content)?;
+        let tool_content = if role == InboundMessageRole::Tool {
+            inbound_content_value(message.content.as_ref())?
+        } else {
+            None
+        };
+        let flattened = flatten_content(message.content.take())?;
+        let message = &messages[index];
         let mut content = flattened.runtime_text.clone();
 
         if role == InboundMessageRole::Assistant {
@@ -79,11 +98,19 @@ fn to_core_messages_with_media(
             }
         }
 
+        if role != InboundMessageRole::User
+            && flattened
+                .media_inputs
+                .iter()
+                .any(|input| input.kind == ChatMediaKind::Audio)
+        {
+            return Err(ApiError::bad_request("Only user messages can carry audio"));
+        }
         match role {
             InboundMessageRole::System => {
                 if flattened.has_media() {
                     return Err(ApiError::bad_request(
-                        "System messages cannot contain images or videos",
+                        "System messages cannot contain images, videos or audio",
                     ));
                 }
                 if content.trim().is_empty() {
@@ -127,6 +154,34 @@ fn to_core_messages_with_media(
                 });
             }
             InboundMessageRole::Tool => {
+                let result = ToolResult {
+                    content: tool_content.as_ref(),
+                    additional_tools: message.additional_tools.as_ref(),
+                    tool_call_id: message.tool_call_id.as_deref(),
+                };
+                reject_deferred_tool_results(variant, result)?;
+                if let Some(responses) = tool_responses.as_mut() {
+                    if flattened.has_media() {
+                        return Err(ApiError::bad_request(format!(
+                            "Tool results for {variant} cannot carry images, videos or audio"
+                        )));
+                    }
+                    // Only the next result's id and `additional_tools` decide a merge.
+                    let next = messages
+                        .get(index + 1)
+                        .filter(|next| {
+                            parse_role(&next.role).ok() == Some(InboundMessageRole::Tool)
+                        })
+                        .map(|next| ToolResult {
+                            content: None,
+                            additional_tools: next.additional_tools.as_ref(),
+                            tool_call_id: next.tool_call_id.as_deref(),
+                        });
+                    if let Some(rendered) = responses.render(result, next)? {
+                        core.push(tool_result_message(variant, rendered));
+                    }
+                    continue;
+                }
                 if content.trim().is_empty() && !flattened.has_media() {
                     return Err(ApiError::bad_request(
                         "Tool message content cannot be empty",
@@ -162,6 +217,22 @@ pub fn validate_chat_request_compatibility(
         return Err(ApiError::invalid_param(
             "n",
             "This server currently supports only `n=1` for chat completions",
+        ));
+    }
+    if req
+        .modalities
+        .as_deref()
+        .is_some_and(|modalities| modalities.iter().any(|modality| modality != "text"))
+    {
+        return Err(ApiError::invalid_param(
+            "modalities",
+            "Chat completions answer in text only; for spoken replies use the realtime voice API",
+        ));
+    }
+    if req.audio.is_some() {
+        return Err(ApiError::invalid_param(
+            "audio",
+            "Chat completions answer in text only; for spoken replies use the realtime voice API",
         ));
     }
 
@@ -348,12 +419,19 @@ pub fn prepare_execution_request(
     profile: OpenAiCompatibilityProfile,
 ) -> Result<(ChatExecutionRequest, AnswerFormat), ApiError> {
     let variant = parse_chat_model(&req.model)?;
+    if variant.family() == ModelFamily::Lfm3Audio {
+        validate_lfm3_audio_chat_controls(req)?;
+    }
     let stop_sequences = chat_stop_sequences(req.stop.as_ref())?;
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
     }
     let tool_policy = resolve_tool_policy(variant, req.tools.as_deref(), req.tool_choice.as_ref())?;
-    let (messages, media_inputs) = to_core_messages_with_media(variant, req.messages.clone())?;
+    let (messages, media_inputs) = to_core_messages_with_media(
+        variant,
+        req.messages.clone(),
+        req.tools.as_deref().unwrap_or_default(),
+    )?;
     validate_media_inputs_for_variant(variant, &media_inputs).map_err(ApiError::bad_request)?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -403,6 +481,47 @@ pub fn prepare_execution_request(
         tool_calls: tool_policy.format,
     };
     Ok((execution, format))
+}
+
+/// LFM3-Audio answers chat through its own reply rows, which take the
+/// sampling controls, tools and `preserve_thinking` but not these; each is
+/// refused, never dropped. Its template has no thinking switch: the model
+/// may think, and `reasoning_format: "parsed"` splits it out.
+fn validate_lfm3_audio_chat_controls(req: &ChatCompletionRequest) -> Result<(), ApiError> {
+    let kwargs = req.chat_template_kwargs.as_ref();
+    let unsupported: [(&'static str, bool); 7] = [
+        (
+            "stop",
+            req.stop.as_ref().is_some_and(|stop| !stop.is_null()),
+        ),
+        ("logprobs", req.logprobs.unwrap_or(false)),
+        ("top_logprobs", req.top_logprobs.is_some()),
+        (
+            "presence_penalty",
+            req.presence_penalty.is_some_and(|penalty| penalty != 0.0),
+        ),
+        (
+            "skip_special_tokens",
+            req.skip_special_tokens == Some(false),
+        ),
+        (
+            "enable_thinking",
+            req.enable_thinking.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.enable_thinking.is_some()),
+        ),
+        (
+            "reasoning_effort",
+            req.reasoning_effort.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.reasoning_effort.is_some()),
+        ),
+    ];
+    match unsupported.iter().find(|(_, requested)| *requested) {
+        Some((param, _)) => Err(ApiError::invalid_param(
+            param,
+            format!("`{param}` is not supported for LFM3-Audio chat"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether the request asked for `reasoning_format: "parsed"`.

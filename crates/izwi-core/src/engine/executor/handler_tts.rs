@@ -537,7 +537,7 @@ fn accepted_tts_talker_tokens(
 /// so a streamed request never also takes its model's whole-utterance
 /// finalize.
 #[allow(clippy::too_many_arguments)]
-fn stream_committed_tts_audio(
+pub(super) fn stream_committed_tts_audio(
     tx: &super::super::request::StreamStagingBuffer,
     policy: super::super::request::EngineStreamPolicy,
     request_id: &str,
@@ -3944,6 +3944,17 @@ impl NativeExecutor {
                 .is_some_and(|variant| variant.family() == ModelFamily::Maya2Tts)
         }) {
             return self.maya2_tts_batch_with_managed(&ordered_requests, scheduled, managed_caches);
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Lfm3Audio)
+        }) {
+            return self.lfm3_audio_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
         }
         if ordered_requests.first().is_some_and(|request| {
             request

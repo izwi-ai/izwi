@@ -2378,21 +2378,20 @@ impl Scheduler {
                 "realtime operation commit crossed its FIFO session fence".into(),
             ));
         }
+        // One operation may feed several prompt spans: a model that writes
+        // between input chunks (LFM3-Audio's LiveASR) prefills the next chunk
+        // after the previous one's decode.
         let transition_valid = matches!(
             (head.phase, outcome.next),
             (
-                RealtimeSubphase::Preparation,
+                RealtimeSubphase::Preparation
+                    | RealtimeSubphase::PromptPrefill { .. }
+                    | RealtimeSubphase::DecodeContinuation,
                 Some(
                     RealtimeSubphase::PromptPrefill { .. }
                         | RealtimeSubphase::DecodeContinuation
                         | RealtimeSubphase::Completion
                 )
-            ) | (
-                RealtimeSubphase::PromptPrefill { .. },
-                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
-            ) | (
-                RealtimeSubphase::DecodeContinuation,
-                Some(RealtimeSubphase::DecodeContinuation | RealtimeSubphase::Completion)
             ) | (RealtimeSubphase::Completion, None)
         ) || (outcome.next.is_none()
             && !matches!(head.phase, RealtimeSubphase::Completion));

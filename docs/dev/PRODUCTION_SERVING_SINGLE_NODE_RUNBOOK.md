@@ -218,10 +218,12 @@ Before validation:
    most 64 workers per node and rejects duplicate endpoints or exclusive
    devices and aggregate CPU/host-memory overcommit.
 5. Keep each worker deployment contract within what the worker serves. Chat
-   workers serve `LFM2.5-1.2B-Instruct-GGUF`, `Qwen3.8-27B-FP8`,
+   workers serve `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF`,
+   `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF`, `Qwen3.8-27B-FP8`,
    `Qwen3-30B-A3B-GGUF`, and `Qwen3.6-35B-A3B-FP8`; `speech_to_text` workers
    serve the Nemotron ASR and Voxtral realtime families; `text_to_speech`
-   workers serve the streaming TTS families. A chat deployment must declare
+   workers serve the streaming TTS families, LFM2.5-Audio and LFM3-Audio
+   included. A chat deployment must declare
    `max_context_tokens` and `max_output_tokens` (output within context). The
    supervisor passes the declared precision, execution representation and
    token limits to the worker (`IZWI_WORKER_PRECISION`,

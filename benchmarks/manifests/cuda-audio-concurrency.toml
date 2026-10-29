@@ -21,6 +21,7 @@ model = [
   "Granite-Speech-4.1-2B-Plus",
   "Voxtral-Mini-4B-Realtime-2602",
   "LFM2.5-Audio-1.5B-GGUF",
+  "LFM3-Audio-2B-GGUF",
 ]
 concurrent = [1, 2, 4, 8]
 
@@ -38,6 +39,7 @@ model = [
   "Kokoro-82M",
   "Voxtral-4B-TTS-2603",
   "LFM2.5-Audio-1.5B-GGUF",
+  "LFM3-Audio-2B-GGUF",
 ]
 concurrent = [1, 2, 4, 8]
 

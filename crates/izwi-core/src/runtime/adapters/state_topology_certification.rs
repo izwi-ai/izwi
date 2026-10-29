@@ -21,6 +21,7 @@ enum CertifiedTopology {
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
+    RetainedPagedRingAndInvocationScratch,
     RetainedPagedStaticAndInvocationPagedStatic,
     RetainedPagedTensorTensor,
     RetainedAppendRingTensor,
@@ -40,6 +41,7 @@ impl CertifiedTopology {
             Self::RetainedPagedTensorAndInvocationPaged
             | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedRingAndInvocationPagedRing
+            | Self::RetainedPagedRingAndInvocationScratch
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedRotatingAndInvocationScratch
@@ -72,6 +74,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedAndInvocationPaged
             | Self::RetainedPagedRingAndInvocationPagedRing
+            | Self::RetainedPagedRingAndInvocationScratch
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedTensorTensor => true,
             Self::Stateless
@@ -119,6 +122,7 @@ fn certified_topology(
         // LFM2 commits sparse attention pages and its ShortConv ring under one
         // retained decoder-token transaction.
         (Lfm2Chat, Chat) => RetainedPagedRing,
+        (Lfm3Chat, Chat) => RetainedPagedRing,
 
         // Qwen TTS retains talker pages plus tensor continuation state and
         // leases a separate predictor page domain per invocation.
@@ -167,6 +171,15 @@ fn certified_topology(
         (Lfm25Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, Tts) => RetainedPagedRingAndInvocationPagedRing,
         (Lfm25Audio, AudioChat | SpeechToSpeech) => InvocationPagedRing,
+        // LFM3-Audio speech, voice-chat replies and LiveASR sessions retain
+        // the language model's pages (and, but for LiveASR, its ring) between
+        // quanta and lease scratch per stage.
+        (Lfm3Audio, Tts | AudioChat | SpeechToSpeech | RealtimeAsr) => {
+            RetainedPagedRingAndInvocationScratch
+        }
+        // Transcription retains the same pages and ring; its long form leases
+        // the language model's pages and ring for one atomic invocation.
+        (Lfm3Audio, Asr) => RetainedPagedRingAndInvocationPagedRing,
 
         (SortformerDiarization, Diarization) => InvocationTensor,
         (Qwen3ForcedAligner, ForcedAlignment) => Stateless,

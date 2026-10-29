@@ -874,12 +874,15 @@ impl WorkerProcessConfig {
                 let variant = izwi_core::parse_chat_model_variant(Some(&model))
                     .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
                 if variant != ModelVariant::Lfm2512BInstructGguf
+                    && variant != ModelVariant::Lfm2512BThinkingGguf
+                    && variant != ModelVariant::Lfm317BGguf
+                    && variant != ModelVariant::Lfm317BQ8Gguf
                     && variant != ModelVariant::Qwen3827BFp8
                     && variant != ModelVariant::Qwen3Moe30bA3bGguf
                     && variant != ModelVariant::Qwen36Moe35BA3BFp8
                 {
                     bail!(
-                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
+                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, LFM2.5-1.2B-Thinking-GGUF, LFM3-1.7B-GGUF, LFM3-1.7B-Q8_0-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
                     );
                 }
                 variant
@@ -891,9 +894,10 @@ impl WorkerProcessConfig {
                     .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
                 match variant.family() {
                     izwi_core::catalog::ModelFamily::NemotronAsr
-                    | izwi_core::catalog::ModelFamily::Voxtral => variant,
+                    | izwi_core::catalog::ModelFamily::Voxtral
+                    | izwi_core::catalog::ModelFamily::Lfm3Audio => variant,
                     other => bail!(
-                        "realtime speech_to_text workers support only Nemotron ASR and Voxtral families; {model} is {other:?}"
+                        "realtime speech_to_text workers support only Nemotron ASR, Voxtral and LFM3-Audio families; {model} is {other:?}"
                     ),
                 }
             }
@@ -911,7 +915,8 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Maya1Tts
                     | izwi_core::catalog::ModelFamily::Maya2Tts
-                    | izwi_core::catalog::ModelFamily::Lfm25Audio => variant,
+                    | izwi_core::catalog::ModelFamily::Lfm25Audio
+                    | izwi_core::catalog::ModelFamily::Lfm3Audio => variant,
                     other => bail!(
                         "realtime text_to_speech workers support only TTS synthesis families; {model} is {other:?}"
                     ),
@@ -1427,19 +1432,27 @@ fn execution_profile(
 ) -> anyhow::Result<(&'static str, &'static str)> {
     Ok(match task {
         TaskKind::Chat => match variant {
-            ModelVariant::Lfm2512BInstructGguf => ("gguf-q4_k_m", "native-lfm2"),
+            ModelVariant::Lfm2512BInstructGguf | ModelVariant::Lfm2512BThinkingGguf => {
+                ("gguf-q4_k_m", "native-lfm2")
+            }
+            ModelVariant::Lfm317BGguf => ("gguf-q4_0", "native-lfm3"),
+            ModelVariant::Lfm317BQ8Gguf => ("gguf-q8_0", "native-lfm3"),
             ModelVariant::Qwen3Moe30bA3bGguf => ("gguf-q4_k_m", "native-qwen3-moe"),
             ModelVariant::Qwen3827BFp8 => ("fp8-block", "native-qwen38"),
             ModelVariant::Qwen36Moe35BA3BFp8 => ("fp8-block", "native-qwen35-moe"),
             other => bail!("no serving execution profile for chat model {other}"),
         },
-        TaskKind::SpeechToText => (
-            "fp16",
-            match variant.family() {
-                izwi_core::catalog::ModelFamily::NemotronAsr => "native-nemotron-realtime",
-                _ => "native-voxtral-realtime",
-            },
-        ),
+        TaskKind::SpeechToText => match variant {
+            ModelVariant::Lfm3Audio2BGguf => ("gguf-q4_k_m", "native-lfm3-audio-realtime"),
+            ModelVariant::Lfm3Audio2BQ8Gguf => ("gguf-q8_0", "native-lfm3-audio-realtime"),
+            _ => (
+                "fp16",
+                match variant.family() {
+                    izwi_core::catalog::ModelFamily::NemotronAsr => "native-nemotron-realtime",
+                    _ => "native-voxtral-realtime",
+                },
+            ),
+        },
         TaskKind::TextToSpeech => ("fp32", "native-tts-realtime"),
         TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     })
@@ -2133,6 +2146,45 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
             error.contains("file: path"),
             "error should mention file: path requirement: {error}"
         );
+    }
+
+    /// The LFM lanes: both LFM2.5 chat checkpoints and LFM3 chat serve chat,
+    /// LFM3-Audio serves realtime speech, each with its execution profile.
+    #[test]
+    fn lfm_models_take_their_worker_lanes() {
+        for (task, model, profile) in [
+            ("chat", "LFM2.5-1.2B-Instruct-GGUF", ("gguf-q4_k_m", "native-lfm2")),
+            ("chat", "LFM2.5-1.2B-Thinking-GGUF", ("gguf-q4_k_m", "native-lfm2")),
+            ("chat", "LFM3-1.7B-GGUF", ("gguf-q4_0", "native-lfm3")),
+            ("chat", "LFM3-1.7B-Q8_0-GGUF", ("gguf-q8_0", "native-lfm3")),
+            ("text_to_speech", "LFM3-Audio-2B-GGUF", ("fp32", "native-tts-realtime")),
+        ] {
+            let process = WorkerProcessConfig::from_env(&env_config::snapshot([
+                (WORKER_TASK_ENV, task),
+                ("IZWI_WORKER_MODEL", model),
+                ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+                ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+                ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+            ]))
+            .unwrap_or_else(|error| panic!("{task} {model}: {error}"));
+            assert_eq!(
+                execution_profile(process.task, process.variant).unwrap(),
+                profile,
+                "{model}"
+            );
+        }
+        // LFM3-Audio answers chat completions on a local server only: a
+        // chat worker refuses it at boot.
+        for model in ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"] {
+            assert!(WorkerProcessConfig::from_env(&env_config::snapshot([
+                (WORKER_TASK_ENV, "chat"),
+                ("IZWI_WORKER_MODEL", model),
+                ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+                ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+                ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+            ]))
+            .is_err());
+        }
     }
 
     #[test]

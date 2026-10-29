@@ -320,6 +320,16 @@ impl ChatRuntimeRequest {
         request.prompt_tokens = self.prompt_tokens;
         request
     }
+
+    /// The request as an LFM3-Audio chat completion, whose prompt the
+    /// model's reply row prepares (see [`EngineCoreRequest::lfm3_audio_chat`]).
+    pub(crate) fn into_lfm3_audio_engine_request(self) -> EngineCoreRequest {
+        let mut request = EngineCoreRequest::lfm3_audio_chat(self.messages);
+        self.envelope.apply_to(&mut request);
+        request.params = self.params;
+        request.chat_config = self.chat_config;
+        request
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +337,7 @@ pub(crate) struct AudioChatRuntimeRequest {
     envelope: RequestEnvelope,
     audio: RuntimeAudioInput,
     messages: Vec<ChatMessage>,
+    tools: Vec<serde_json::Value>,
     params: CoreGenerationParams,
     system_prompt: Option<String>,
 }
@@ -350,6 +361,7 @@ impl AudioChatRuntimeRequest {
                 .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
+            tools: Vec::new(),
             params,
             system_prompt,
         })
@@ -373,9 +385,16 @@ impl AudioChatRuntimeRequest {
                 .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
+            tools: Vec::new(),
             params,
             system_prompt,
         })
+    }
+
+    /// The tools the reply may call (LFM3-Audio).
+    pub(crate) fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
     }
 
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
@@ -389,6 +408,7 @@ impl AudioChatRuntimeRequest {
         };
         self.envelope.apply_to(&mut request);
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
+        request.chat_config.tools = self.tools;
         request.system_prompt = self
             .system_prompt
             .map(|value| value.trim().to_string())

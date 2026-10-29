@@ -7,9 +7,10 @@ import {
   within,
 } from "@testing-library/react";
 import { useEffect } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
+import { AUDIO_FILE_ACCEPT } from "@/shared/audioFileAccept";
 
 const apiMocks = vi.hoisted(() => ({
   listChatThreads: vi.fn(),
@@ -54,6 +55,15 @@ vi.mock("@/features/text-to-speech/pcmPlayer", () => ({
     playerMocks.instances.push(instance);
     return instance;
   }),
+}));
+
+// jsdom has no AudioContext to decode with.
+const clipMocks = vi.hoisted(() => ({
+  prepareReferenceClip: vi.fn(),
+}));
+
+vi.mock("@/features/voice-studio/components/referenceClip", () => ({
+  prepareReferenceClip: clipMocks.prepareReferenceClip,
 }));
 
 const createObjectUrlMock = vi.fn<(file: File) => string>();
@@ -2419,6 +2429,180 @@ describe("ChatPlayground", () => {
       ] } });
       expect(await screen.findByText(/Attach PNG, JPEG, GIF, WebP or BMP images, not logo.svg/))
         .toBeInTheDocument();
+    });
+  });
+
+  describe("audio attachments", () => {
+    const audioModel = "LFM3-Audio-2B-GGUF";
+    const thread = { id: "audio-thread", title: "Clips", model_id: audioModel,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    // What prepareReferenceClip hands back: "RIFF" is UklGRg== in base64.
+    const wav = new File(["RIFF"], "clip.wav", { type: "audio/wav" });
+
+    const chat = (model: string, label: string, props: Record<string, unknown> = {}) => (
+      <MemoryRouter initialEntries={["/chat?threadId=audio-thread"]}>
+        <ChatPlayground selectedModel={model} selectedModelReady={true}
+          supportsThinking={false} chatCapabilities={null} modelLabel={label}
+          modelOptions={[{ value: model, label, statusLabel: "Ready", isReady: true }]}
+          onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()}
+          {...props} />
+      </MemoryRouter>
+    );
+
+    const renderChat = async (props: Record<string, unknown> = {}) => {
+      const view = render(chat(audioModel, "LFM3 Audio 2B", props));
+      await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalledWith(thread.id));
+      return view;
+    };
+
+    const attach = (...names: string[]) =>
+      fireEvent.change(screen.getByTestId("chat-audio-input"), { target: {
+        files: names.map((name) => new File(["audio"], name, { type: "audio/mpeg" })),
+      } });
+
+    beforeEach(() => {
+      apiMocks.listChatThreads.mockResolvedValue([thread]);
+      apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+      apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+      clipMocks.prepareReferenceClip.mockReset();
+      clipMocks.prepareReferenceClip.mockResolvedValue({ blob: wav, durationSecs: 4.2, peaks: [] });
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      Reflect.deleteProperty(navigator, "mediaDevices");
+    });
+
+    it("sends LFM3-Audio clips as 16 kHz WAV input_audio parts, without thinking controls", async () => {
+      await renderChat();
+      expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", "Ask anything or attach audio...");
+      expect(screen.queryByRole("button", { name: "Attach image" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Record audio" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Attach audio" })).toBeInTheDocument();
+      expect(screen.getByTestId("chat-audio-input")).toHaveAttribute("accept", AUDIO_FILE_ACCEPT);
+
+      attach("question.mp3");
+      expect(await screen.findByRole("button", { name: "Remove question.mp3" })).toBeInTheDocument();
+      expect(clipMocks.prepareReferenceClip).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "question.mp3" }),
+        { sampleRate: 16_000, maxSecs: undefined },
+      );
+      expect(screen.getByText("0:04")).toBeInTheDocument();
+      expect(screen.getByLabelText("Play question.mp3")).toHaveAttribute("src", "blob:preview-clip.wav");
+
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "What is said?" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled());
+
+      const request = apiMocks.sendChatThreadMessageStream.mock.calls[0][1];
+      expect(request).toEqual(expect.objectContaining({
+        model_id: audioModel,
+        content: "What is said?",
+        content_parts: [
+          { type: "text", text: "What is said?" },
+          { type: "input_audio", input_audio: { data: "UklGRg==", format: "wav", name: "question.mp3" } },
+        ],
+      }));
+      // LFM3-Audio refuses both with a 400; undefined fields are not sent.
+      const body = JSON.parse(JSON.stringify(request));
+      expect(body).not.toHaveProperty("enable_thinking");
+      expect(body).not.toHaveProperty("reasoning_effort");
+      expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:preview-clip.wav");
+
+      // The sent message plays its clip.
+      const sent = screen.getByRole("article", { name: "Your message" });
+      expect(within(sent).getByLabelText("Play question.mp3"))
+        .toHaveAttribute("src", "data:audio/wav;base64,UklGRg==");
+    });
+
+    it("refuses a file over two minutes and more than eight clips", async () => {
+      await renderChat();
+      clipMocks.prepareReferenceClip.mockResolvedValueOnce({ blob: wav, durationSecs: 125.4, peaks: [] });
+      attach("lecture.mp3");
+      expect(await screen.findByText("lecture.mp3 is 2:06 long. Attach clips of up to 2:00."))
+        .toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove lecture.mp3" })).not.toBeInTheDocument();
+
+      clipMocks.prepareReferenceClip.mockClear();
+      attach(...Array.from({ length: 9 }, (_, index) => `clip-${index}.mp3`));
+      expect(await screen.findByText("Attach up to 8 audio clips per message.")).toBeInTheDocument();
+      expect(clipMocks.prepareReferenceClip).not.toHaveBeenCalled();
+    });
+
+    it("keeps clips on a model that can't hear them and blocks sending them", async () => {
+      const { rerender } = await renderChat();
+      attach("memo.mp3");
+      expect(await screen.findByRole("button", { name: "Remove memo.mp3" })).toBeInTheDocument();
+
+      rerender(chat("LFM2.5-1.2B-Instruct-GGUF", "LFM2.5 1.2B Instruct"));
+      expect(screen.queryByRole("button", { name: "Attach audio" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Record audio" })).not.toBeInTheDocument();
+      expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", "Ask anything...");
+      expect(screen.getByText(/LFM2\.5 1\.2B Instruct can't hear audio/)).toBeInTheDocument();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Summarize it" } });
+      expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(apiMocks.sendChatThreadMessageStream).not.toHaveBeenCalled();
+
+      // Switching back makes the same clip sendable again.
+      rerender(chat(audioModel, "LFM3 Audio 2B"));
+      expect(screen.queryByText(/can't hear audio/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+    });
+
+    it("follows the catalog audio capability over the model name", async () => {
+      await renderChat({ modelSupportsAudio: () => false });
+      expect(screen.queryByRole("button", { name: "Attach audio" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Record audio" })).not.toBeInTheDocument();
+    });
+
+    it("records until the two-minute limit and attaches the recording as WAV", async () => {
+      const track = { stop: vi.fn() };
+      const getUserMedia = vi.fn().mockResolvedValue({ getTracks: () => [track] });
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: { getUserMedia },
+      });
+      vi.stubGlobal("MediaRecorder", class {
+        static isTypeSupported = (type: string) => type === "audio/webm;codecs=opus";
+        state = "inactive";
+        mimeType: string;
+        ondataavailable: ((event: { data: Blob }) => void) | null = null;
+        onstop: (() => void) | null = null;
+        constructor(_stream: unknown, options?: { mimeType?: string }) {
+          this.mimeType = options?.mimeType ?? "";
+        }
+        start() {
+          this.state = "recording";
+        }
+        stop() {
+          this.state = "inactive";
+          this.ondataavailable?.({ data: new Blob(["opus"], { type: this.mimeType }) });
+          this.onstop?.();
+        }
+      });
+      const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+      await renderChat();
+
+      fireEvent.click(screen.getByRole("button", { name: "Record audio" }));
+      const stop = await screen.findByRole("button", { name: "Stop recording" });
+      expect(getUserMedia).toHaveBeenCalledWith({ audio: true });
+      expect(stop).toHaveTextContent("0:00 / 2:00");
+      expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+      const limit = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 120_000);
+      setTimeoutSpy.mockRestore();
+      expect(limit).toBeDefined();
+      act(() => (limit![0] as () => void)());
+
+      expect(await screen.findByRole("button", { name: "Remove Microphone recording" }))
+        .toBeInTheDocument();
+      expect(track.stop).toHaveBeenCalled();
+      const [recorded, options] = clipMocks.prepareReferenceClip.mock.calls[0];
+      // Browsers record WebM/Opus, which the server does not decode.
+      expect(recorded.type).toBe("audio/webm;codecs=opus");
+      expect(options).toEqual({ sampleRate: 16_000, maxSecs: 120 });
+      expect(screen.getByRole("button", { name: "Record audio" })).toBeInTheDocument();
     });
   });
 });

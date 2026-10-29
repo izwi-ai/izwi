@@ -71,6 +71,8 @@ use crate::models::architectures::lfm25_audio::{
     },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
+use crate::models::architectures::lfm3_audio::model::{InvocationLmState, Lfm3AudioModel};
+use crate::models::architectures::lfm3_audio::physical::{lfm3_audio_kv_dtype, Lfm3AudioWorkload};
 use crate::models::architectures::maya1::Maya1TtsModel;
 use crate::models::architectures::maya2::Maya2TtsModel;
 use crate::models::architectures::nemotron::asr::{
@@ -407,11 +409,12 @@ fn load_lfm2_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Lfm2(Lfm2ChatModel::load(
-        model_dir, variant, device,
-    )?))
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    let mut model = Lfm2ChatModel::load(model_dir, variant, device)?;
+    model.set_prefix_caching(prefix_reuse);
+    Ok(NativeChatModel::Lfm2(model))
 }
 
 fn load_qwen35_chat_model(
@@ -472,6 +475,16 @@ fn load_lfm25_audio_model(
     device: DeviceProfile,
 ) -> Result<NativeAudioChatModel> {
     Ok(NativeAudioChatModel::Lfm25Audio(Lfm25AudioModel::load(
+        model_dir, variant, device,
+    )?))
+}
+
+fn load_lfm3_audio_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeAudioChatModel> {
+    Ok(NativeAudioChatModel::Lfm3Audio(Lfm3AudioModel::load(
         model_dir, variant, device,
     )?))
 }
@@ -595,11 +608,18 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
     },
 ];
 
-const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[AudioChatLoaderRegistration {
-    name: "lfm25_audio",
-    family: ModelFamily::Lfm25Audio,
-    loader: load_lfm25_audio_model,
-}];
+const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[
+    AudioChatLoaderRegistration {
+        name: "lfm25_audio",
+        family: ModelFamily::Lfm25Audio,
+        loader: load_lfm25_audio_model,
+    },
+    AudioChatLoaderRegistration {
+        name: "lfm3_audio",
+        family: ModelFamily::Lfm3Audio,
+        loader: load_lfm3_audio_model,
+    },
+];
 
 const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
     ChatLoaderRegistration {
@@ -635,6 +655,12 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
     ChatLoaderRegistration {
         name: "lfm2_chat",
         family: ModelFamily::Lfm2Chat,
+        loader: load_lfm2_chat_model,
+    },
+    // LFM3 runs on the same model with its own dialect.
+    ChatLoaderRegistration {
+        name: "lfm3_chat",
+        family: ModelFamily::Lfm3Chat,
         loader: load_lfm2_chat_model,
     },
 ];
@@ -868,6 +894,7 @@ impl InferenceStateContractProvider for NativeAsrModel {
 
 pub enum NativeAudioChatModel {
     Lfm25Audio(Lfm25AudioModel),
+    Lfm3Audio(Lfm3AudioModel),
 }
 
 #[derive(Debug, Clone)]
@@ -3296,6 +3323,12 @@ impl NativeAsrModel {
     }
 }
 
+/// The error of an LFM2.5-Audio retained or interleaved path called on
+/// LFM3-Audio, which runs atomic invocations only.
+fn lfm25_audio_only() -> Error {
+    Error::InvalidInput("this audio-chat path serves LFM2.5-Audio only".into())
+}
+
 fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
     static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
         crate::env::ReadOnce::new(lfm25_audio_asr_long_form_config_from_env);
@@ -3402,6 +3435,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_state_spec(Lfm25AudioRetainedMode::Asr, stage_graphs)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3413,6 +3447,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_state_spec(Lfm25AudioRetainedMode::Tts, stage_graphs)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3422,12 +3457,14 @@ impl NativeAudioChatModel {
     ) -> Result<Arc<Lfm25AudioPreparedTtsArtifact>> {
         match self {
             Self::Lfm25Audio(model) => model.prepare_lfm25_audio_tts_artifact(messages),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
     pub(crate) fn lfm25_audio_tts_stage_ceiling(&self) -> Result<Lfm25AudioTtsStageCeiling> {
         match self {
             Self::Lfm25Audio(model) => model.tts_stage_ceiling(),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3437,6 +3474,7 @@ impl NativeAudioChatModel {
     ) -> Result<Lfm25AudioTtsPreparationEnvelope> {
         match self {
             Self::Lfm25Audio(model) => model.tts_preparation_envelope(messages),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3450,6 +3488,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.tts_prefill_resource_envelope(start, tokens, prompt_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3462,6 +3501,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.tts_decode_resource_envelope(position, include_depthformer)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3475,6 +3515,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.new_retained_tts_state(artifact, requested_max_new_tokens, generation)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3489,6 +3530,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_prefill_step(state, main, checkpoint, max_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3503,6 +3545,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_prefill_batch(states, mains, checkpoints, max_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3517,6 +3560,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_decode_step(state, main, depthformer, checkpoint)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3531,6 +3575,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_audio_decode_batch(states, mains, depthformers, checkpoints)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3544,6 +3589,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_tts_text_decode_batch(states, mains, checkpoints)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3553,6 +3599,7 @@ impl NativeAudioChatModel {
     ) -> Result<Vec<f32>> {
         match self {
             Self::Lfm25Audio(model) => model.detokenize_retained_tts_state(state),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3564,20 +3611,31 @@ impl NativeAudioChatModel {
     ) -> Result<Vec<f32>> {
         match self {
             Self::Lfm25Audio(model) => model.stream_retained_tts_audio(state),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
     pub(crate) fn lfm25_audio_tts_output_sample_rate(&self) -> u32 {
         match self {
             Self::Lfm25Audio(model) => model.decoder_config().output_sample_rate,
+            Self::Lfm3Audio(_) => 24_000,
         }
     }
 
     /// ASR route capabilities: LFM2.5 Audio sets no invocation window and
-    /// chunks long audio with its own long-form config.
+    /// chunks long audio with its own long-form config; LFM3-Audio
+    /// transcribes one clip of at most 30 s per invocation.
     pub(crate) fn asr_route_capabilities(&self) -> crate::engine::AsrRouteCapabilities {
-        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
-            .with_chunk_config(lfm25_audio_asr_long_form_config())
+        match self {
+            Self::Lfm25Audio(_) => {
+                crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
+                    .with_chunk_config(lfm25_audio_asr_long_form_config())
+            }
+            Self::Lfm3Audio(_) => crate::engine::AsrRouteCapabilities::for_family(
+                ModelFamily::Lfm3Audio,
+                Some(crate::models::architectures::lfm3_audio::model::LFM3_AUDIO_MAX_CLIP_SECS),
+            ),
+        }
     }
 
     /// Decode budget for one long-form chunk of `duration_secs` audio, or the
@@ -3597,6 +3655,7 @@ impl NativeAudioChatModel {
     ) -> Result<Arc<Lfm25AudioPreparedAsrArtifact>> {
         match self {
             Self::Lfm25Audio(model) => model.prepare_asr_artifact(audio, sample_rate),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3605,6 +3664,7 @@ impl NativeAudioChatModel {
     ) -> Result<Lfm25AudioAsrPreparationStageCeiling> {
         match self {
             Self::Lfm25Audio(model) => model.asr_preparation_stage_ceiling(),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3617,6 +3677,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.asr_preparation_resource_envelope(source_samples, source_sample_rate)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3629,6 +3690,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.new_retained_asr_state(artifact, requested_max_new_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3642,6 +3704,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.asr_prefill_resource_envelope(start, tokens, prompt_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3651,6 +3714,7 @@ impl NativeAudioChatModel {
     ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
         match self {
             Self::Lfm25Audio(model) => model.asr_decode_resource_envelope(position),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3665,6 +3729,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_asr_prefill_step(state, cache, checkpoint, max_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3679,6 +3744,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_asr_prefill_batch(states, caches, checkpoints, max_tokens)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3690,6 +3756,7 @@ impl NativeAudioChatModel {
     ) -> Result<Lfm25AudioAsrDecodeStep> {
         match self {
             Self::Lfm25Audio(model) => model.retained_asr_decode_step(state, cache, checkpoint),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3699,6 +3766,7 @@ impl NativeAudioChatModel {
     ) -> Result<bool> {
         match self {
             Self::Lfm25Audio(model) => model.retained_asr_decode_will_append(state),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3712,6 +3780,7 @@ impl NativeAudioChatModel {
             Self::Lfm25Audio(model) => {
                 model.retained_asr_decode_append_batch(states, caches, checkpoints)
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3722,6 +3791,36 @@ impl NativeAudioChatModel {
     ) -> Result<Lfm25AudioPhysicalStateSpec> {
         match self {
             Self::Lfm25Audio(model) => model.physical_state_spec(mode, stage_graphs),
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
+        }
+    }
+
+    /// LFM3-Audio speech or transcription as retained rows (see
+    /// [`lfm3_audio_retained_state_spec`]).
+    pub(crate) fn lfm3_audio_retained_state_spec(
+        &self,
+        workload: Lfm3AudioWorkload,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<crate::models::architectures::lfm25_audio::physical::Lfm25AudioRetainedStateSpec>
+    {
+        let model = self.lfm3_audio()?;
+        crate::models::architectures::lfm3_audio::physical::lfm3_audio_retained_state_spec(
+            model.lm_config(),
+            workload,
+            lfm3_audio_kv_dtype(BackendKind::from(model.device().kind)),
+            stage_graphs,
+        )
+    }
+
+    /// The LFM3-Audio model, for its retained rows.
+    pub(crate) fn lfm3_audio(
+        &self,
+    ) -> Result<&crate::models::architectures::lfm3_audio::model::Lfm3AudioModel> {
+        match self {
+            Self::Lfm3Audio(model) => Ok(model),
+            Self::Lfm25Audio(_) => Err(Error::InvalidInput(
+                "LFM2.5-Audio is not an LFM3-Audio model".into(),
+            )),
         }
     }
 
@@ -3758,6 +3857,7 @@ impl NativeAudioChatModel {
                     diagnostics: output.diagnostics,
                 })
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
@@ -3810,17 +3910,44 @@ impl NativeAudioChatModel {
                     diagnostics: output.diagnostics,
                 })
             }
+            Self::Lfm3Audio(_) => Err(lfm25_audio_only()),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transcribe_with_callback_and_max_tokens_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
+        language: Option<&str>,
         max_tokens: Option<usize>,
         leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
+        if let Self::Lfm3Audio(model) = self {
+            let (attention, shortconv) = leases.lease_pair_mut(
+                LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+            )?;
+            let mut state = InvocationLmState {
+                cache: attention.paged_cache_mut()?,
+                shortconv: shortconv.typed_mut::<InvocationTensorLease>()?,
+            };
+            let (text, diagnostics) = model.transcribe(
+                audio,
+                sample_rate,
+                language,
+                max_tokens,
+                &mut state,
+                &mut || false,
+                on_delta,
+            )?;
+            return Ok(NativeAsrTranscription {
+                text,
+                language: None,
+                diagnostics: Some(diagnostics),
+            });
+        }
         self.transcribe_long_form_with_callback_from_invocation_workspace(
             audio,
             sample_rate,
@@ -3828,6 +3955,59 @@ impl NativeAudioChatModel {
             leases,
             on_delta,
         )
+    }
+
+    /// One LFM3-Audio clip (at most 30 s), greedy, on the main backbone's
+    /// invocation workspace: at most `max_tokens` text tokens (from the
+    /// clip's length when `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lfm3_audio_transcribe_clip_from_invocation_workspace(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+        should_stop: &mut dyn FnMut() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAsrTranscription> {
+        let model = self.lfm3_audio()?;
+        let (attention, shortconv) = leases.lease_pair_mut(
+            LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+            LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+        )?;
+        let mut state = InvocationLmState {
+            cache: attention.paged_cache_mut()?,
+            shortconv: shortconv.typed_mut::<InvocationTensorLease>()?,
+        };
+        let seconds = audio.len() as f32 / sample_rate.max(1) as f32;
+        let budget = max_tokens.unwrap_or_else(|| {
+            crate::models::architectures::lfm3_audio::model::lfm3_audio_asr_max_tokens(seconds)
+        });
+        let output = model.transcribe_clip(
+            audio,
+            sample_rate,
+            language,
+            budget,
+            &mut state,
+            should_stop,
+            on_delta,
+        )?;
+        if output.stop_reason == "cancelled" {
+            return Err(Error::Cancelled(
+                "LFM3-Audio transcription cancelled".into(),
+            ));
+        }
+        Ok(NativeAsrTranscription {
+            text: output.text.trim().to_string(),
+            language: None,
+            diagnostics: Some(serde_json::json!({
+                "model": "lfm3_audio",
+                "task": "asr",
+                "max_new_tokens": budget,
+                "stop_reason": output.stop_reason,
+            })),
+        })
     }
 
     pub(crate) fn transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
@@ -3858,6 +4038,30 @@ impl NativeAudioChatModel {
                     diagnostics: output.diagnostics,
                 })
             }
+            Self::Lfm3Audio(model) => {
+                let (attention, shortconv) = leases.lease_pair_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                )?;
+                let mut state = InvocationLmState {
+                    cache: attention.paged_cache_mut()?,
+                    shortconv: shortconv.typed_mut::<InvocationTensorLease>()?,
+                };
+                let output = model.transcribe_clip(
+                    audio,
+                    sample_rate,
+                    None,
+                    options.max_new_tokens.max(1),
+                    &mut state,
+                    &mut || false,
+                    on_delta,
+                )?;
+                Ok(NativeAsrTranscription {
+                    text: output.text.trim().to_string(),
+                    language: None,
+                    diagnostics: None,
+                })
+            }
         }
     }
 
@@ -3869,6 +4073,16 @@ impl NativeAudioChatModel {
         leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
+        if let Self::Lfm3Audio(_) = self {
+            return self.transcribe_with_callback_and_max_tokens_from_invocation_workspace(
+                audio,
+                sample_rate,
+                None,
+                max_tokens,
+                leases,
+                on_delta,
+            );
+        }
         let duration_secs = audio_duration_secs(audio, sample_rate);
         let chunk_cfg = lfm25_audio_asr_long_form_config();
         let chunks = plan_audio_chunks(audio, sample_rate, &chunk_cfg, None);
@@ -4923,6 +5137,19 @@ pub enum NativeChatPreparedPrompt {
     Qwen38(Qwen38PreparedPrompt),
 }
 
+/// The end of a prompt's first turn (the system turn, with any tools, when
+/// there is one): what requests sharing a system prompt share. The history
+/// boundary opens the final turn on an `<|im_start|>`, so the first turn ends
+/// at that token's first later occurrence. `None` when no turn ends before
+/// the history boundary.
+pub(crate) fn managed_preamble_boundary(ids: &[u32], history: usize) -> Option<usize> {
+    let turn_start = *ids.get(history)?;
+    ids.get(1..history)?
+        .iter()
+        .position(|id| *id == turn_start)
+        .map(|offset| offset + 1)
+}
+
 impl NativeChatPreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         match self {
@@ -4956,13 +5183,7 @@ impl NativeChatPreparedPrompt {
     /// first turn ends at that token's first later occurrence. `None` when no
     /// turn ends before the history boundary.
     pub fn managed_preamble_boundary(&self) -> Option<usize> {
-        let history = self.managed_snapshot_boundary()?;
-        let ids = self.prompt_ids();
-        let turn_start = *ids.get(history)?;
-        ids.get(1..history)?
-            .iter()
-            .position(|id| *id == turn_start)
-            .map(|offset| offset + 1)
+        managed_preamble_boundary(self.prompt_ids(), self.managed_snapshot_boundary()?)
     }
 
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
@@ -5348,7 +5569,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
-            Self::Lfm2(model) => model.prompt_token_ids_with_tools(messages, &config.request.tools),
+            Self::Lfm2(model) => model.prompt_token_ids_for_request(messages, &config.request),
         }
     }
 
@@ -5593,6 +5814,16 @@ impl NativeChatModel {
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen38(model) => model.supports_continuous_decode_batch(),
             Self::Lfm2(model) => model.supports_continuous_decode_batch(),
+        }
+    }
+
+    /// The history boundary of a prompt prepared without a prompt artifact:
+    /// LFM chat sharing prefixes snapshots before its final `<|im_start|>`.
+    /// `None` for every model that does not share prefixes this way.
+    pub(crate) fn managed_history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
+        match self {
+            Self::Lfm2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
+            _ => None,
         }
     }
 
@@ -6785,7 +7016,9 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen35MoeChat => "qwen35_moe_chat",
         ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
+        ModelFamily::Lfm3Chat => "lfm3_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
+        ModelFamily::Lfm3Audio => "lfm3_audio",
         ModelFamily::Gemma3Chat => "gemma3_chat",
         ModelFamily::Qwen3ForcedAligner => "qwen3_forced_aligner",
         ModelFamily::Voxtral => "voxtral",
@@ -6837,6 +7070,7 @@ fn native_asr_runtime_diagnostics(
 fn native_audio_chat_model_kind(model: &NativeAudioChatModel) -> &'static str {
     match model {
         NativeAudioChatModel::Lfm25Audio(_) => "lfm25_audio",
+        NativeAudioChatModel::Lfm3Audio(_) => "lfm3_audio",
     }
 }
 
@@ -7076,6 +7310,12 @@ impl ModelRegistry {
                     native_audio_chat_model_kind(model),
                     match model.as_ref() {
                         NativeAudioChatModel::Lfm25Audio(model) => {
+                            LoadedModelActualRuntime::from_values(
+                                Some(&format!("{:?}", model.device().kind)),
+                                None,
+                            )
+                        }
+                        NativeAudioChatModel::Lfm3Audio(model) => {
                             LoadedModelActualRuntime::from_values(
                                 Some(&format!("{:?}", model.device().kind)),
                                 None,
@@ -8262,13 +8502,14 @@ impl ModelRegistry {
             .map(|inner| Lfm25AudioModelLease { inner })
     }
 
-    /// Publish retained LFM2.5 Audio discovery only after lifecycle sealing
-    /// and authoritative slot publication have both committed.
+    /// Publish retained LFM2.5 Audio or LFM3-Audio discovery only after
+    /// lifecycle sealing and authoritative slot publication have both
+    /// committed.
     pub(crate) async fn publish_lfm25_audio_ready(&self, variant: ModelVariant) -> Result<()> {
         let guard = self.audio_chat_models.read().await;
         let entry = guard.get(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
-                "cannot publish missing LFM2.5 Audio model {variant} as ready"
+                "cannot publish missing audio model {variant} as ready"
             ))
         })?;
         entry.publish_ready()

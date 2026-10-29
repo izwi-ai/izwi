@@ -1681,6 +1681,7 @@ fn prefix_gate_rejects_paged_attach_beside_an_unsnapshotted_ring() {
         attention_sliding_window: None,
         rope_freq_base: 1_000_000.0,
         shortconv_l_cache: 3,
+        lfm3: None,
     };
     let mut contract =
         crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(
@@ -1709,6 +1710,181 @@ fn prefix_gate_rejects_paged_attach_beside_an_unsnapshotted_ring() {
         &paged_only,
         paged_only.domains[0].id()
     ));
+}
+
+/// LFM chat with prefix sharing: a request committing a page-aligned prompt
+/// publishes its pages and a ShortConv ring snapshot; a request sharing that
+/// prefix attaches the pages and forks the ring at the boundary, isolated
+/// from the publisher's later state.
+#[test]
+fn lfm_ring_snapshots_publish_and_fork_into_the_attaching_request() {
+    use crate::models::architectures::lfm2::physical::{
+        lfm2_managed_cache_contract_with_prefix, LFM2_SHORTCONV_STATE_DOMAIN,
+    };
+    let config = crate::models::architectures::lfm2::config::Lfm2BackboneConfig {
+        architecture: "lfm2".into(),
+        block_count: 4,
+        context_length: 256,
+        embedding_length: 16,
+        embedding_length_out: None,
+        feed_forward_length: Some(32),
+        attention_head_count: 4,
+        attention_head_count_kv: vec![0, 2, 0, 2],
+        attention_layer_norm_rms_epsilon: 1e-5,
+        attention_sliding_window: None,
+        rope_freq_base: 1_000_000.0,
+        shortconv_l_cache: 3,
+        lfm3: None,
+    };
+    let contract =
+        lfm2_managed_cache_contract_with_prefix(&config, crate::kv::v2::StateDType::F32, true)
+            .unwrap();
+    let attention = contract.domains[0].id();
+    assert!(prefix_enabled_for_domain(&contract, attention));
+    let page = crate::models::shared::attention::paged::default_kv_page_size();
+    let ring_values = |value: f32| {
+        [StateComponentId::new(1), StateComponentId::new(2)]
+            .into_iter()
+            .map(|component| StateComponentValue {
+                component,
+                tensor: Some(Tensor::full(value, (3, 1, 16), &Device::Cpu).unwrap()),
+            })
+            .collect::<Vec<_>>()
+    };
+    let read_ring = |arena: &crate::backends::state::TensorStateArena, sequence: u64| {
+        let snapshot = arena
+            .read(
+                PhysicalStateSequenceId::new(sequence).unwrap(),
+                LFM2_SHORTCONV_STATE_DOMAIN,
+            )
+            .unwrap()
+            .expect("ring state");
+        let values = snapshot
+            .components
+            .iter()
+            .map(|component| {
+                component
+                    .tensor
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        (snapshot.cursor, values)
+    };
+
+    let model = ModelInstanceId::new(621);
+    let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([22; 32]));
+    let runtime = manager
+        .bind_request(
+            model,
+            BackendKind::Cpu,
+            24,
+            page,
+            &CacheCapability::Managed(contract),
+        )
+        .unwrap()
+        .unwrap();
+    let arena = runtime.tensor_state().unwrap().clone();
+    let boundary = 2 * page;
+
+    // The publisher commits a page-aligned prompt with its ring.
+    let tokens = (0..boundary as u32).collect::<Vec<u32>>();
+    let publisher = SessionKey::new("lfm-publisher".into(), 1);
+    let request = prefix_request(model, tokens.clone());
+    let first = manager
+        .prepare(
+            &runtime,
+            71,
+            &publisher,
+            &sequence_work(0, boundary),
+            Some(&request),
+        )
+        .unwrap()
+        .unwrap();
+    arena
+        .stage_replace(
+            PhysicalStateTransactionId::new(71).unwrap(),
+            LFM2_SHORTCONV_STATE_DOMAIN,
+            0,
+            boundary as u64,
+            ring_values(7.0),
+        )
+        .unwrap();
+    manager
+        .finalize(
+            &first,
+            Some(&first.completed_write_receipt_for_test()),
+            true,
+        )
+        .unwrap();
+    assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+
+    // A request sharing the prefix attaches it and forks the ring there.
+    let mut longer = tokens;
+    longer.extend([901, 902, 903]);
+    let attacher = SessionKey::new("lfm-attacher".into(), 1);
+    let request = prefix_request(model, longer);
+    let second = manager
+        .prepare(
+            &runtime,
+            72,
+            &attacher,
+            &sequence_work(0, boundary + 3),
+            Some(&request),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.domains[0].execution_start_tokens as usize, boundary);
+    let telemetry = manager.telemetry_snapshot();
+    assert_eq!(telemetry.tensor_snapshot_attaches, 1);
+    assert_eq!(telemetry.reused_tokens, boundary as u64);
+    let sequence = second
+        .clocked_state
+        .as_ref()
+        .expect("ring reservation")
+        .sequence();
+    assert_eq!(
+        read_ring(&arena, sequence),
+        (boundary as u64, vec![vec![7.0; 48]; 2]),
+        "the fork seeds the published ring"
+    );
+
+    // The publisher advancing leaves the fork untouched.
+    let continuation = manager
+        .prepare(
+            &runtime,
+            73,
+            &publisher,
+            &sequence_work(boundary, boundary + 4),
+            Some(&prefix_request(model, (0..boundary as u32 + 4).collect())),
+        )
+        .unwrap()
+        .unwrap();
+    arena
+        .stage_replace(
+            PhysicalStateTransactionId::new(73).unwrap(),
+            LFM2_SHORTCONV_STATE_DOMAIN,
+            boundary as u64,
+            boundary as u64 + 4,
+            ring_values(5.0),
+        )
+        .unwrap();
+    manager
+        .finalize(
+            &continuation,
+            Some(&continuation.completed_write_receipt_for_test()),
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        read_ring(&arena, sequence),
+        (boundary as u64, vec![vec![7.0; 48]; 2]),
+        "the fork is isolated from the publisher"
+    );
 }
 
 /// LFM2.5 chat on CUDA fits one 32K context (6 attention layers x 8 KV
@@ -4351,12 +4527,10 @@ fn realtime_selected_tensor_state_commits_without_implicit_paged_advance() {
         .prepare(&runtime, 5243, &session, &work, None)
         .unwrap()
         .unwrap();
-    assert!(
-        reservation
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens })
-    );
+    // A fresh session's view spans one page, though preparation writes none.
+    assert!(reservation.domains.iter().all(|domain| {
+        domain.execution_start_tokens == 0 && domain.target_committed_tokens == 1
+    }));
     let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
     arena
         .stage_replace(
@@ -5237,11 +5411,11 @@ fn realtime_subphase_reservations_are_exact_and_stage_scoped() {
             .unwrap()
             .expect("unchanged-prefix reservation");
         assert!(reservation.allow_unchanged_prefix);
-        assert!(
-            reservation.domains.iter().all(|domain| {
-                domain.target_committed_tokens == domain.execution_start_tokens
-            })
-        );
+        // Nothing is committed yet, so the view spans one page; the quantum
+        // still commits an unchanged prefix.
+        assert!(reservation.domains.iter().all(|domain| {
+            domain.execution_start_tokens == 0 && domain.target_committed_tokens == 1
+        }));
         let receipt = reservation
             .completed_write_receipt_for_prefix(
                 &[],

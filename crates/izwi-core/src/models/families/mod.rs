@@ -102,7 +102,10 @@ const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BInstructGguf,
     ModelVariant::Lfm2512BThinkingGguf,
 ];
+const LFM3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm317BGguf, ModelVariant::Lfm317BQ8Gguf];
 const LFM25_AUDIO_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm25Audio15BGguf];
+const LFM3_AUDIO_VARIANTS: &[ModelVariant] =
+    &[ModelVariant::Lfm3Audio2BGguf, ModelVariant::Lfm3Audio2BQ8Gguf];
 const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma34BIt];
 const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3ForcedAligner06B];
 const VOXTRAL_VARIANTS: &[ModelVariant] = &[ModelVariant::VoxtralMini4BRealtime2602];
@@ -220,9 +223,19 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         variants: LFM2_CHAT_VARIANTS,
     },
     FamilyRegistration {
+        family: ModelFamily::Lfm3Chat,
+        module_path: "crate::models::architectures::lfm2::chat",
+        variants: LFM3_CHAT_VARIANTS,
+    },
+    FamilyRegistration {
         family: ModelFamily::Lfm25Audio,
         module_path: "crate::models::architectures::lfm25_audio",
         variants: LFM25_AUDIO_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Lfm3Audio,
+        module_path: "crate::models::architectures::lfm3_audio",
+        variants: LFM3_AUDIO_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::Gemma3Chat,
@@ -342,7 +355,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             realtime_families,
-            [ModelFamily::NemotronAsr, ModelFamily::Voxtral]
+            [
+                ModelFamily::NemotronAsr,
+                ModelFamily::Lfm3Audio,
+                ModelFamily::Voxtral
+            ]
         );
         assert!(
             registrations_for_capability(CapabilityKind::SpeakerAttributedAsr)

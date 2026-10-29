@@ -96,7 +96,8 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 | ModelFamily::Qwen35MoeChat
                 | ModelFamily::Qwen38Chat
                 | ModelFamily::Gemma3Chat
-                | ModelFamily::Lfm2Chat,
+                | ModelFamily::Lfm2Chat
+                | ModelFamily::Lfm3Chat,
             CapabilityKind::Chat
         ) | (ModelFamily::Qwen3Asr, CapabilityKind::Asr)
             | (ModelFamily::VibeVoiceAsr, CapabilityKind::Asr)
@@ -117,6 +118,11 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             | (ModelFamily::ChatterboxTts, CapabilityKind::Tts)
             | (ModelFamily::Maya1Tts, CapabilityKind::Tts)
             | (ModelFamily::Maya2Tts, CapabilityKind::Tts)
+            | (ModelFamily::Lfm3Audio, CapabilityKind::Tts)
+            | (ModelFamily::Lfm3Audio, CapabilityKind::Asr)
+            | (ModelFamily::Lfm3Audio, CapabilityKind::AudioChat)
+            | (ModelFamily::Lfm3Audio, CapabilityKind::SpeechToSpeech)
+            | (ModelFamily::Lfm3Audio, CapabilityKind::RealtimeAsr)
             | (ModelFamily::GraniteSpeechAsr, CapabilityKind::Asr)
     );
     if !route_validated {

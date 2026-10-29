@@ -1,4 +1,7 @@
-use izwi_model_catalog::{ChatMediaInput, ChatMediaKind, ModelVariant};
+use izwi_model_catalog::{
+    ChatMediaInput, ChatMediaKind, ModelFamily, ModelVariant, CHAT_AUDIO_PLACEHOLDER,
+    CHAT_MAX_AUDIO_CLIPS,
+};
 use serde_json::Value;
 
 pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -50,6 +53,15 @@ pub fn flatten_thread_content(
 pub fn flatten_content_parts(parts: &[Value]) -> Result<FlattenedMultimodalContent, String> {
     let mut out = FlattenedMultimodalContent::default();
     for part in parts {
+        if content_part_is_audio(part) {
+            let source = extract_audio_source(part)?;
+            out.runtime_text.push_str(CHAT_AUDIO_PLACEHOLDER);
+            out.media_inputs.push(ChatMediaInput {
+                kind: ChatMediaKind::Audio,
+                source,
+            });
+            continue;
+        }
         if content_part_is_image(part) {
             let source = extract_media_source(part, ChatMediaKind::Image).ok_or_else(|| {
                 "Multimodal content part is missing a usable image source".to_string()
@@ -97,6 +109,70 @@ pub fn content_part_is_image(part: &Value) -> bool {
         || map.get("input_image").is_some_and(|value| !value.is_null())
 }
 
+/// An audio part: OpenAI's `{"type": "input_audio", "input_audio": {"data",
+/// "format"}}`, or an `audio_url` / `audio` part holding a `data:` URL.
+pub fn content_part_is_audio(part: &Value) -> bool {
+    let Some(map) = part.as_object() else {
+        return false;
+    };
+    if matches!(
+        map.get("type")
+            .or_else(|| map.get("kind"))
+            .and_then(|value| value.as_str()),
+        Some("input_audio") | Some("audio_url") | Some("audio")
+    ) {
+        return true;
+    }
+    map.get("input_audio").is_some_and(|value| !value.is_null())
+        || map.get("audio_url").is_some_and(|value| !value.is_null())
+}
+
+/// An audio part's clip as a `data:audio/...;base64,` URL. The server never
+/// fetches audio, so a remote URL is refused.
+fn extract_audio_source(part: &Value) -> Result<String, String> {
+    let map = part
+        .as_object()
+        .ok_or_else(|| "An audio content part must be an object".to_string())?;
+    if let Some(input) = map.get("input_audio").filter(|value| !value.is_null()) {
+        let data = input
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|data| !data.is_empty())
+            .ok_or_else(|| "An `input_audio` part needs base64 `data`".to_string())?;
+        if data.starts_with("data:") {
+            return Ok(data.to_string());
+        }
+        let format = input
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+            .unwrap_or("wav")
+            .to_ascii_lowercase();
+        let mime = match format.as_str() {
+            "mp3" | "mpeg" => "audio/mpeg".to_string(),
+            other => format!("audio/{other}"),
+        };
+        return Ok(format!("data:{mime};base64,{data}"));
+    }
+    let url = ["audio_url", "audio"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(|value| match value {
+            Value::String(url) => Some(url.trim()),
+            Value::Object(nested) => nested.get("url").and_then(Value::as_str).map(str::trim),
+            _ => None,
+        })
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "An audio content part is missing its audio".to_string())?;
+    if url.starts_with("data:") {
+        Ok(url.to_string())
+    } else {
+        Err("Audio content must be inline (`input_audio` or a `data:` URL); the server does not fetch audio URLs".to_string())
+    }
+}
+
 pub fn content_part_is_video(part: &Value) -> bool {
     let Some(map) = part.as_object() else {
         return false;
@@ -120,12 +196,45 @@ pub fn variant_accepts_image_input(variant: ModelVariant) -> bool {
     variant.is_qwen35_chat_gguf()
 }
 
+/// Whether `variant` hears chat media of `kind`: Qwen3.5 images and videos,
+/// LFM3-Audio audio clips.
+pub fn variant_accepts_media(variant: ModelVariant, kind: ChatMediaKind) -> bool {
+    match kind {
+        ChatMediaKind::Image | ChatMediaKind::Video => variant_accepts_image_input(variant),
+        ChatMediaKind::Audio => variant.family() == ModelFamily::Lfm3Audio,
+    }
+}
+
 pub fn validate_media_inputs_for_variant(
     variant: ModelVariant,
     media_inputs: &[ChatMediaInput],
 ) -> Result<(), String> {
     if media_inputs.is_empty() {
         return Ok(());
+    }
+    let audio = media_inputs
+        .iter()
+        .filter(|input| input.kind == ChatMediaKind::Audio)
+        .count();
+    if variant.family() == ModelFamily::Lfm3Audio {
+        if audio < media_inputs.len() {
+            return Err(format!(
+                "{} reads audio clips, not images or videos",
+                variant.dir_name()
+            ));
+        }
+        if audio > CHAT_MAX_AUDIO_CLIPS {
+            return Err(format!(
+                "A chat request can carry at most {CHAT_MAX_AUDIO_CLIPS} audio clips, not {audio}"
+            ));
+        }
+        return Ok(());
+    }
+    if audio > 0 {
+        return Err(format!(
+            "Audio chat input needs LFM3-Audio; {} does not read audio",
+            variant.dir_name()
+        ));
     }
     if media_inputs
         .iter()
@@ -166,6 +275,7 @@ fn extract_media_source(part: &Value, kind: ChatMediaKind) -> Option<String> {
     let direct_keys: &[&str] = match kind {
         ChatMediaKind::Image => &["image_url", "input_image", "image"],
         ChatMediaKind::Video => &["video", "video_url", "input_video"],
+        ChatMediaKind::Audio => &["input_audio", "audio_url", "audio"],
     };
     for key in direct_keys {
         if let Some(source) = map

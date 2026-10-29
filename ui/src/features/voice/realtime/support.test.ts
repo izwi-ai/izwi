@@ -39,6 +39,12 @@ describe("voice realtime support", () => {
     expect(formatModelVariantLabel("LFM2.5-Audio-1.5B-GGUF")).toBe(
       "LFM2.5 Audio 1.5B GGUF",
     );
+    expect(formatModelVariantLabel("LFM3-Audio-2B-GGUF")).toBe(
+      "LFM3 Audio 2B GGUF",
+    );
+    expect(formatModelVariantLabel("LFM3-Audio-2B-Q8_0-GGUF")).toBe(
+      "LFM3 Audio 2B Q8_0 GGUF",
+    );
   });
 
   it("keeps Voxtral out of modular voice ASR until native realtime support lands", () => {

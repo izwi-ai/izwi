@@ -84,6 +84,18 @@ weights (https://huggingface.co/kyutai/mimi), which Kyutai licenses under
 Creative Commons Attribution 4.0 (CC BY 4.0,
 https://creativecommons.org/licenses/by/4.0/); izwi downloads them unmodified.
 
+The LFM2.5 and LFM3 model families (crates/izwi-core/src/models/
+architectures/lfm2, lfm25_audio, lfm3 and lfm3_audio), LFM3-Audio-2B
+among them, run Liquid AI's open-weight checkpoints
+(https://huggingface.co/LiquidAI), which izwi downloads unmodified. Liquid AI licenses them under the LFM Open License v1.0: use is
+royalty-free, but commercial use by an entity with annual revenue of
+US$10,000,000 or more is not licensed by it (see the LICENSE file in each
+model repository). The LFM3 chat template and architecture were ported from
+Liquid AI's model code, and the LFM3 GGUF layout from llama.cpp
+(https://github.com/ggml-org/llama.cpp, MIT License). LFM3-Audio-2B's
+speech encoder, MaskGIT depth decoder, LiquidCodec decoder and generation
+loop were likewise ported from Liquid AI's model code.
+
 The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
 works above are used under these terms:
 

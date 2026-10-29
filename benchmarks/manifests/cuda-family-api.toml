@@ -23,6 +23,14 @@ prompt = "Reply with one short sentence about KV caches."
 max_tokens = 16
 
 [[benchmarks]]
+name = "lfm3-chat-cuda"
+command = "chat"
+model = "LFM3-1.7B-GGUF"
+iterations = 1
+prompt = "Reply with one short sentence about KV caches."
+max_tokens = 16
+
+[[benchmarks]]
 name = "qwen3-tts-cuda"
 command = "tts"
 model = "Qwen3-TTS-12Hz-0.6B-Base"
@@ -72,6 +80,13 @@ text = "CUDA model evidence."
 name = "lfm25-audio-tts-cuda"
 command = "tts"
 model = "LFM2.5-Audio-1.5B-GGUF"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
+name = "lfm3-audio-tts-cuda"
+command = "tts"
+model = "LFM3-Audio-2B-GGUF"
 iterations = 1
 text = "CUDA model evidence."
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Film, ImageIcon, Pencil } from "lucide-react";
+import { AudioLines, Film, ImageIcon, Pencil } from "lucide-react";
 
 import type { ChatThreadMessageRecord } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -156,10 +156,26 @@ export function UserMessage({
                       className="h-full w-full object-cover"
                     />
                   </button>
+                ) : attachment.kind === "audio" && attachment.source ? (
+                  <figure className="flex flex-col gap-1">
+                    <figcaption className="inline-flex max-w-[260px] items-center gap-1.5 text-xs text-(--text-secondary)">
+                      <AudioLines className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span className="truncate">{attachment.label}</span>
+                    </figcaption>
+                    <audio
+                      controls
+                      preload="metadata"
+                      src={attachment.source}
+                      aria-label={`Play ${attachment.label}`}
+                      className="h-9 w-64 max-w-full"
+                    />
+                  </figure>
                 ) : (
                   <div className="inline-flex max-w-[220px] items-center gap-1.5 rounded-md border border-primary-foreground/20 bg-primary-foreground/10 px-2 py-1 text-xs text-primary-foreground/90">
                     {attachment.kind === "image" ? (
                       <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+                    ) : attachment.kind === "audio" ? (
+                      <AudioLines className="h-3.5 w-3.5 shrink-0" />
                     ) : (
                       <Film className="h-3.5 w-3.5 shrink-0" />
                     )}

@@ -40,6 +40,14 @@ describe("analytics event helpers", () => {
     expect(modelCategoryFromVariant("UnmappedModel")).toBe("other");
   });
 
+  it("classifies LFM3 Audio as audio and leaves LFM2.5 Audio and LFM3 chat as chat", () => {
+    expect(modelCategoryFromVariant("LFM3-Audio-2B-GGUF")).toBe("audio");
+    expect(modelCategoryFromVariant("LFM3-Audio-2B-Q8_0-GGUF")).toBe("audio");
+    expect(modelCategoryFromVariant("LiquidAI/LFM3-Audio-2B")).toBe("audio");
+    expect(modelCategoryFromVariant("LFM2.5-Audio-1.5B-GGUF")).toBe("chat");
+    expect(modelCategoryFromVariant("LFM3-1.7B-GGUF")).toBe("chat");
+  });
+
   it("emits route and model events with normalized payloads", async () => {
     await trackRouteViewed("settings");
     await trackModelLoaded("Qwen3.5-4B");

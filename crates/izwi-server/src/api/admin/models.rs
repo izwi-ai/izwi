@@ -151,6 +151,10 @@ pub struct AdminSpeechModelCapabilities {
     /// `language` is a hint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<AdminSpeechLanguage>,
+    /// The `languages` entry a request without `language` speaks (LFM3
+    /// Audio: `en-US`); absent, pickers default to English.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_language: Option<&'static str>,
     /// Whether `language` may be left out (or `auto`) and is then read from
     /// the text's script (Maya 2 Native); the picker offers "auto-detect".
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -389,6 +393,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_auto_long_form: capabilities.supports_auto_long_form,
             controls: Vec::new(),
             languages: Vec::new(),
+            default_language: None,
             language_auto_detect: false,
             cross_lingual_reference: false,
             inline_tags: Vec::new(),
@@ -420,6 +425,16 @@ impl AdminSpeechModelCapabilities {
 
     fn with_languages(mut self, variant: ModelVariant) -> Self {
         self.cross_lingual_reference = crate::api::tts_policy::takes_reference_language(variant);
+        if variant.family() == izwi_core::ModelFamily::Lfm3Audio {
+            self.languages = izwi_core::runtime_models::architectures::lfm3_audio::LFM3_AUDIO_TTS_LOCALES
+                .iter()
+                .map(|(code, name)| AdminSpeechLanguage { code, name })
+                .collect();
+            self.default_language = Some(
+                izwi_core::runtime_models::architectures::lfm3_audio::Lfm3AudioVoice::DEFAULT_LOCALE_TAG,
+            );
+            return self;
+        }
         if variant.family() == izwi_core::ModelFamily::Maya2Tts {
             self.languages = izwi_core::catalog::MAYA2_LANGUAGES
                 .iter()
@@ -453,14 +468,15 @@ impl AdminModelRouteCapabilities {
             .is_some_and(|capabilities| capabilities.supports_voice_description);
 
         Self {
-            openai_chat_completions: variant.is_chat(),
-            openai_responses: variant.is_chat(),
+            // LFM3-Audio answers chat with audio clips in text; the text chat
+            // models are the ones `voice_realtime_text_model` marks.
+            openai_chat_completions: variant.serves_chat_requests(),
+            openai_responses: variant.serves_chat_requests(),
             openai_audio_speech: supports_tts,
             openai_audio_transcriptions: variant.is_asr()
                 || variant.is_voxtral()
                 || variant.is_audio_chat(),
-            speech_to_text_jobs: variant.is_asr()
-                || variant.is_voxtral()
+            speech_to_text_jobs: variant.runs_speech_to_text_jobs()
                 || variant.supports_diarization_records(),
             speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
             speech_translation: variant.supports_asr_translation(),
@@ -1379,6 +1395,29 @@ mod tests {
             capabilities(ModelVariant::Maya13B)["inline_tags_strict"],
             true
         );
+        assert!(maya2["default_language"].is_null());
+    }
+
+    /// LFM3 Audio lists its 19 locales and names American English as the
+    /// one a request without `language` speaks.
+    #[test]
+    fn speech_capabilities_name_lfm3_audio_locales_and_default() {
+        for variant in [ModelVariant::Lfm3Audio2BGguf, ModelVariant::Lfm3Audio2BQ8Gguf] {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            let capabilities =
+                serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                    .clone();
+            let codes = capabilities["languages"]
+                .as_array()
+                .expect("languages")
+                .iter()
+                .map(|language| language["code"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(codes.len(), 19, "{variant}");
+            assert!(codes.contains(&"en-GB".to_string()));
+            assert_eq!(capabilities["default_language"], "en-US", "{variant}");
+            assert_eq!(capabilities["built_in_voice_count"], 2);
+        }
     }
 
     /// P1.0: naming a removed variant (CLI `pull` reads it through this

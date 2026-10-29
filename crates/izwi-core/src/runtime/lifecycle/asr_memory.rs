@@ -2979,15 +2979,20 @@ pub(super) fn lfm2_chat_resource_plan(
     model_path: &Path,
     backend: BackendKind,
 ) -> Result<Option<ModelResourcePlan>> {
-    let Ok(layout) =
-        crate::models::architectures::lfm2::chat::lfm2_chat_load_layout(model_path, variant)
-    else {
+    let Ok(layout) = crate::models::architectures::lfm2::chat::lfm2_chat_load_layout(
+        model_path, variant, backend,
+    ) else {
         return Ok(None);
     };
     let Some(files) = census_of(std::slice::from_ref(&layout.gguf))? else {
         return Ok(None);
     };
-    let plan = price_lfm2_chat(&files[0], backend, layout.rope_table)?;
+    let plan = price_lfm2_chat(
+        &files[0],
+        backend,
+        layout.rope_table,
+        layout.rope_table_sets,
+    )?;
     tracing::info!(
         model = %variant,
         backend = ?plan.backend,
@@ -2995,7 +3000,7 @@ pub(super) fn lfm2_chat_resource_plan(
         resident_bytes = plan.resident_bytes,
         load_peak_bytes = plan.load_peak_bytes,
         host_staging_bytes = plan.host_staging_bytes,
-        "Priced LFM2.5 chat load from its residency plan"
+        "Priced LFM chat load from its residency plan"
     );
     plan.resource_plan().map(Some)
 }
@@ -3004,10 +3009,13 @@ fn price_lfm2_chat(
     gguf: &CensusFile,
     backend: BackendKind,
     rope_table: (usize, usize),
+    rope_table_sets: usize,
 ) -> Result<AsrResidencyPlan> {
     let mut ledger = Ledger::new(backend);
     price_lfm2_backbone(&mut ledger, gguf, true)?;
-    price_lfm2_rope_table(&mut ledger, rope_table)?;
+    for _ in 0..rope_table_sets {
+        price_lfm2_rope_table(&mut ledger, rope_table)?;
+    }
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -3635,6 +3643,21 @@ pub(super) mod tests {
     /// The generic estimate priced the GGUF bytes alone (728.5 MB on CPU and
     /// Metal) and the 2 GiB catalog figure on CUDA.
     #[test]
+    fn lfm3_chat_prices_both_rope_table_sets() {
+        let files = census!("lfm3_1_7b_qad_q4_0.json");
+        let gguf = &files[0];
+        assert_eq!(gguf.tensors.len(), 287);
+        let stored: u64 = gguf.tensors.iter().map(|tensor| tensor.stored_bytes).sum();
+        assert_eq!(stored, 1_041_368_320);
+        // Global and sliding-window layers each get cos, sin and cos||sin.
+        let rope = 2 * 32_768 * 64 * 4 * 4;
+        for backend in BACKENDS {
+            let plan = price_lfm2_chat(gguf, backend, (32_768, 128), 2).unwrap();
+            assert_eq!(plan.logical_resident_bytes, stored + rope, "{backend:?}");
+        }
+    }
+
+    #[test]
     fn lfm25_chat_prices_the_shared_quantized_table_and_rope_tables() {
         let files = census!("lfm2_5_1_2b_instruct_q4_k_m.json");
         let gguf = &files[0];
@@ -3645,7 +3668,7 @@ pub(super) mod tests {
         // The quantized table is held once, for the gather and the tied head.
         let logical = stored + rope;
         for backend in BACKENDS {
-            let plan = price_lfm2_chat(gguf, backend, (32_768, 64)).unwrap();
+            let plan = price_lfm2_chat(gguf, backend, (32_768, 64), 1).unwrap();
             assert_eq!(plan.logical_resident_bytes, logical, "{backend:?}");
             assert!(plan.resident_bytes >= logical, "{backend:?}");
             assert!(

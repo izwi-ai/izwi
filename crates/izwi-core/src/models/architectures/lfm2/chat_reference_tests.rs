@@ -31,13 +31,13 @@ const PAGES_PER_SESSION: u32 = 32;
 const SESSIONS: u32 = 8;
 /// Reference steps whose top-2 margin is below this are near ties; any
 /// quantized backend may legitimately pick either token there.
-const NEAR_TIE: f32 = 0.5;
+pub(super) const NEAR_TIE: f32 = 0.5;
 
-struct Tolerance {
+pub(super) struct Tolerance {
     /// Max |izwi - reference| over each step's reference top-8 logits.
-    logit: f32,
+    pub(super) logit: f32,
     /// Max |one-shot - two-span| over the prefill logits.
-    chunked: f32,
+    pub(super) chunked: f32,
 }
 
 #[derive(serde::Deserialize)]
@@ -69,10 +69,10 @@ struct FixturePrompt {
 }
 
 #[derive(serde::Deserialize)]
-struct FixtureStep {
-    next: u32,
-    margin: f32,
-    top: Vec<(u32, f32)>,
+pub(super) struct FixtureStep {
+    pub(super) next: u32,
+    pub(super) margin: f32,
+    pub(super) top: Vec<(u32, f32)>,
 }
 
 fn fixture() -> Fixture {
@@ -85,7 +85,7 @@ pub(super) fn models_dir_for_bench() -> PathBuf {
     models_dir()
 }
 
-fn models_dir() -> PathBuf {
+pub(super) fn models_dir() -> PathBuf {
     std::env::var_os("IZWI_LFM25_MODELS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -104,7 +104,7 @@ fn variant(key: &str) -> ModelVariant {
     }
 }
 
-fn messages(raw: &[(String, String)]) -> Vec<ChatMessage> {
+pub(super) fn messages(raw: &[(String, String)]) -> Vec<ChatMessage> {
     raw.iter()
         .map(|(role, content)| ChatMessage {
             role: match role.as_str() {
@@ -216,7 +216,7 @@ impl Sessions {
     }
 }
 
-fn row(logits: &Tensor) -> Vec<f32> {
+pub(super) fn row(logits: &Tensor) -> Vec<f32> {
     logits
         .to_dtype(DType::F32)
         .unwrap()
@@ -237,7 +237,7 @@ fn argmax_of(values: &[f32]) -> u32 {
 }
 
 /// Non-finite values saturate to infinity, so they can never pass.
-fn abs_err(lhs: f32, rhs: f32) -> f32 {
+pub(super) fn abs_err(lhs: f32, rhs: f32) -> f32 {
     let diff = (lhs - rhs).abs();
     if diff.is_finite() {
         diff
@@ -247,7 +247,7 @@ fn abs_err(lhs: f32, rhs: f32) -> f32 {
 }
 
 #[derive(Default)]
-struct StepStats {
+pub(super) struct StepStats {
     steps: usize,
     decisive: usize,
     agreed: usize,
@@ -255,7 +255,13 @@ struct StepStats {
 }
 
 impl StepStats {
-    fn check(&mut self, label: &str, step: usize, values: &[f32], reference: &FixtureStep) {
+    pub(super) fn check(
+        &mut self,
+        label: &str,
+        step: usize,
+        values: &[f32],
+        reference: &FixtureStep,
+    ) {
         self.steps += 1;
         for (id, expected) in &reference.top {
             let err = abs_err(values[*id as usize], *expected);
@@ -275,7 +281,7 @@ impl StepStats {
         }
     }
 
-    fn assert_within(&self, label: &str, tolerance: &Tolerance) {
+    pub(super) fn assert_within(&self, label: &str, tolerance: &Tolerance) {
         eprintln!(
             "{label}: {} steps, {}/{} decisive argmax agree, worst top-8 logit err {:.4}",
             self.steps, self.agreed, self.decisive, self.worst_logit
@@ -298,7 +304,7 @@ fn is_eos(token: u32) -> bool {
     matches!(token, 2 | 7)
 }
 
-fn prefill(
+pub(super) fn prefill(
     model: &Lfm2ChatModel,
     ids: &[u32],
     cache: PhysicalPagedKvCache,

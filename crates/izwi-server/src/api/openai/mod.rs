@@ -7,6 +7,7 @@ pub use izwi_gateway::api::openai::convert;
 pub mod models;
 pub mod responses;
 pub(crate) use izwi_gateway::api::openai::tool_calls;
+pub(crate) use izwi_gateway::api::openai::tool_response;
 
 use axum::Router;
 

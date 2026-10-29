@@ -225,22 +225,25 @@ Supported request fields:
 |-------|-------|
 | `model` | Required model variant. Must resolve to a chat-capable model. |
 | `messages` | Required array. Roles: `system`, `user`, `assistant`, `tool`. |
+| Audio input (LFM3-Audio) | A user message's content parts can carry speech: `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` (`format` is the file type, such as `wav`, `mp3` or `flac`; default `wav`), or an `audio_url` part holding a `data:audio/…;base64,` URL. The server never fetches audio URLs. LFM3-Audio hears each clip where the message places it, at most 8 clips per request and 120 s per clip, and answers in text. Other models refuse audio and LFM3-Audio refuses images and videos; audio in a system, assistant or tool message is a `400`. LFM3-Audio decodes greedily by default (its `generation_config.json`) and takes `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, the output budget, `truncation`, `tools` and `preserve_thinking`; `stop`, `logprobs`/`top_logprobs`, a non-zero `presence_penalty`, `skip_special_tokens: false`, `enable_thinking`, `reasoning_effort` and `response_format` are a `400` naming the field. Its template has no thinking switch, so the model sometimes thinks before it answers; `reasoning_format: "parsed"` moves that into `reasoning_content`. It answers on a local server only: the gateway does not send it to workers. |
+| `modalities`, `audio` | Chat completions answer in text. `modalities` other than `["text"]`, and any `audio` output object, are a `400` naming the field; spoken replies use the [voice realtime API](#voice-realtime). |
 | `max_tokens`, `max_completion_tokens` | Optional output budgets (`max_completion_tokens` wins). Unset, the reply may use the rest of the context. An explicit budget that does not fit beside the prompt is a `400` (as in vLLM) unless `truncation` is `auto`. |
 | `truncation` | Izwi extension, as in the Responses API. `disabled` (default): a prompt that does not fit the context is a `400` with `code: context_length_exceeded`, `param: messages` and the token counts. `auto`: the oldest complete turns are dropped (the system message and newest user message are kept) and an explicit budget is shortened to the remaining context. Through the gateway, workers on worker protocol minor 4 apply this exactly as the local server; older workers still truncate automatically. |
 | `stream` | `true` returns SSE chat chunks. The request is admitted before the stream starts, so a request that cannot run (for example `context_length_exceeded`) is a plain HTTP error, not a stream. |
 | `stream_options.include_usage` | Sends the usage in one more chunk after the finish chunk, with `choices: []`; every earlier chunk then carries `usage: null`, as in OpenAI. |
 | `logprobs`, `top_logprobs` | Per-token logprobs (`top_logprobs` 0–20 alternatives). Returned on `choices[].logprobs.content` in the completion and in each stream chunk. |
-| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. LFM3 1.7B defaults to its card and `generation_config.json`: temperature 0.1, top-k 50, repetition penalty 1.1. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `seed` | Optional signed 64-bit sampling seed. The same seed and parameters sample the same tokens on the same backend; without one, each request samples independently. |
 | `stop` | A string or an array of up to 4 non-empty strings (each at most 1024 bytes). Generation ends before the first match, the stop text is not returned, and `finish_reason` is `stop`. Streams hold back text that could still begin a stop string until it is settled. Requests with `stop` decode one token per scheduler step. |
 | `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
-| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8 and LFM2.5 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, LFM3 and LFM3-Audio have one (LFM3-Audio writes LFM3's XML calls and reads results in its own `tool` turns); tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
 | `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
-| `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 defaults to `true`. |
+| Deferred tools (LFM3, LFM3-Audio) | A tool with `"defer_loading": true` (on the tool or its `function`) stays out of the prompt's tool list until a tool result names it, as LFM3's template defines. A `tool` message's content can name tools with `{"type": "tool_reference", "name": …}` items, list definitions in `{"result": {"tools": [...]}}` items, or carry them in an `additional_tools` key (definitions, or `true` when the content holds them); the model then sees them in `<additional_tools>`. Send every tool, deferred ones included, on every request: a reference to an undefined tool is a `400`. Consecutive tool messages with the same `tool_call_id` are one result. LFM3-Audio's template takes deferred tools too, but not `tool_reference` items (a `400` pointing to `additional_tools`) and without merging results. Other models refuse `tool_reference` items and `additional_tools` with a `400`. Tool definitions are written with sorted keys. |
+| `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 and LFM3 default to `true`; LFM3 with `false` answers directly. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
-| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
+| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. LFM3 and LFM3-Audio default to `false` (their templates keep reasoning only for turns after the last user message). Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
 | `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`, including the `<think>` a Qwen prompt opens when thinking is on; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
@@ -253,8 +256,8 @@ server: the same sampling profiles, `seed`, `stop`, `top_k`, penalties,
 when none is ready it returns a `400` with `code: unsupported_parameter` and
 `param` naming the control, never dropping it. `tools` need a worker that
 advertises tool support; the gateway parses the calls in the worker's text
-exactly as the local server does. The reasoning controls are not yet
-supported through the gateway (400).
+exactly as the local server does. The reasoning controls and audio input are
+not yet supported through the gateway (400).
 
 Gateway limits and headers:
 
@@ -317,6 +320,13 @@ Tool behavior:
   `tool_calls`. The Qwen3.5 family uses Qwen's XML tool format.
 - LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
   cards, on every backend.
+- LFM3 uses the Qwen XML call format (`<tool_call>`, `<function=…>`,
+  `<parameter=…>`): tools are listed in the system turn inside `<tools>`, one
+  JSON object per line, `tool` messages become native tool turns wrapped in
+  `<tool_response>`, and calls are returned as `tool_calls`. Its context is
+  32,768 tokens by default on CPU and Metal and the checkpoint's 262,144 on
+  CUDA (capped by the memory the arena fits); the server's
+  `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend.
 
 Multimodal content parts:
 
@@ -357,7 +367,7 @@ Request fields:
 | `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
 | `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
 | `speed` | Optional model-dependent speed control. |
-| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox or Maya 2 Native model's languages in `speech_capabilities.languages`. |
+| `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. LFM3 Audio takes one of its 19 locales (`en-US` when unset, `en-GB`, `fr`, `ja`, …) and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox, Maya 2 Native or LFM3 Audio model's languages in `speech_capabilities.languages`. |
 | `temperature`, `top_k` | Optional sampling controls. |
 | `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
@@ -463,6 +473,27 @@ the request names: Arabic, Chinese, Danish, Dutch, English, Finnish, French, Ger
 `sw`, `sv`, `tr`). Without `language`, or with `Auto`, it speaks English.
 Japanese returns `400` until Izwi has its text processing.
 
+`LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` specifics:
+
+- Its voice is `female` (the default) or `male` (see
+  [Voice Presets](/models/voice-presets#lfm3-audio)). `language` names one of
+  19 locales: `en-US` (the default), `en-GB`, `ar`, `da`, `de`, `el`, `fi`,
+  `fr`, `he`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `es`, `sv`, `tr` or `zh`.
+- A reference voice (`reference_audio` or a saved voice), `instructions` and
+  `speed` each return `400`.
+- Sampling defaults follow Liquid AI's model card: `temperature` 1.0, top-k
+  128, and a repetition penalty of 1.1 over the last 4,096 frames. `seed`
+  makes a request reproducible.
+- `stream: true` streams 24 kHz audio as it is generated. Long text is split
+  into sentences automatically.
+- The same model transcribes speech (see
+  [Audio Transcriptions](#audio-transcriptions)) and answers spoken turns with
+  interleaved text and speech in the `unified` mode of
+  [Voice Realtime](#voice-realtime), where it can call tools. It also streams
+  transcription in its native LiveASR mode through
+  [Transcription Realtime](#transcription-realtime), and answers chat
+  completions about audio clips. Prefix reuse is not supported yet.
+
 Non-stream response:
 
 - Body is binary audio.
@@ -511,16 +542,20 @@ Multipart fields:
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
-| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. |
+| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. LFM3 Audio takes one of its 18 ISO 639-1 codes (en, ar, da, de, el, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh), or none or `auto` to let the model choose, and rejects any other code with `400`. |
 | `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
 | `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters); others return `400`. A long list shortens the audio one invocation can hold. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
 | `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. |
 | `max_tokens` | Optional ASR decoder token budget. |
 | `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
+
+`LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` produce no word timestamps
+of their own, so `timestamp_granularities[]` falls back to the forced aligner.
+They transcribe long audio in chunks of at most 30 seconds.
 
 `json` response:
 
@@ -655,7 +690,7 @@ Request fields:
 | Field | Notes |
 |-------|-------|
 | `model` | Required chat-capable model variant. |
-| `input` | Text, one input item, or an array of input items. |
+| `input` | Text, one input item, or an array of input items. Message content parts are as in chat completions, including LFM3-Audio's `input_audio` parts in user items. |
 | `instructions` | Optional system instruction. Required if `input` is empty. |
 | `max_output_tokens` | Optional output limit. |
 | `truncation` | `disabled` (default) or `auto`; same behavior as chat completions. |
@@ -663,8 +698,8 @@ Request fields:
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself. As in chat completions, `tool_choice` `required` and named functions are refused. |
-| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
+| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself; for LFM3, `output` may be a list with deferred-tool items and the item may carry `additional_tools`, as in chat completions. As in chat completions, `tool_choice` `required` and named functions are refused. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions (LFM3-Audio takes `preserve_thinking` only). Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
 
@@ -982,7 +1017,7 @@ Send-message request fields:
 |-------|-------|
 | `model` | Optional chat model. |
 | `content` | User text. |
-| `content_parts` | Multimodal content parts in OpenAI-like shape. |
+| `content_parts` | Multimodal content parts in OpenAI-like shape: images for Qwen3.5, `input_audio` clips for LFM3-Audio. A thread can switch models: earlier turns keep their media for a model that hears it (LFM3-Audio hears the newest 8 clips, the new message's included) and otherwise reach the model as their text, or as `[Image attachment]` / `[Audio attachment]` when a turn has none. |
 | `max_tokens` | Optional output limit. |
 | `stream` | `true` emits SSE events. |
 | `system_prompt` | Optional per-request system prompt. |
@@ -1335,7 +1370,8 @@ Constraints:
 
 Noise handling:
 
-- Models that stream natively (Voxtral Realtime, Nemotron) transcribe as audio arrives. Voxtral would otherwise turn background noise into made-up words, so its input passes a noise gate: audio is held for 500 ms, and anything that is not confirmed speech (300 ms of voiced speech, 6 dB above the stream's own noise floor) reaches the model as silence. Its transcripts therefore arrive about 500 ms later. Steady noise such as a fan, hum or pink noise produces no text; music and crowd babble can still pass. `IZWI_ASR_REALTIME_NOISE_GATE=0` turns the gate off.
+- Models that stream natively (Voxtral Realtime, Nemotron, LFM3-Audio) transcribe as audio arrives. Voxtral and LFM3-Audio would otherwise turn background noise into made-up words, so their input passes a noise gate: audio is held for 500 ms, and anything that is not confirmed speech (300 ms of voiced speech, 6 dB above the stream's own noise floor) reaches the model as silence. Their transcripts therefore arrive about 500 ms later. Steady noise such as a fan, hum or pink noise produces no text; music and crowd babble can still pass. `IZWI_ASR_REALTIME_NOISE_GATE=0` turns the gate off.
+- LFM3-Audio transcribes English only and takes no prompt. It writes the text of each 0.96 s of audio once that audio has arrived. Every 29 s (sooner at a pause after about 23 s) a stream continues in a fresh context that hears the last 2.88 s again; the transcript keeps the repeated words once.
 - Other models re-transcribe a rolling window of recent audio. A window that only grew by non-speech since the last pass is not transcribed again.
 
 ### Voice Realtime
@@ -1357,6 +1393,7 @@ Client JSON messages:
 | `input_stream_stop` | Stops listening and closes the current session. |
 | `interrupt` | Optional `reason`; interrupts active assistant turn. |
 | `conversation_item_truncate` | `utterance_seq` and `audio_end_ms`: the client played only that much of the reply's audio (also accepted as `conversation.item.truncate`, after OpenAI Realtime). The conversation remembers the reply only up to there. |
+| `function_call_output` | `call_id` and `output` (text, or any JSON): the result of a call the server sent as `function_call` to the client. A call that is unknown, already answered or timed out is an `error`. |
 | `ping` | Optional `timestamp_ms`. |
 
 `mode` values:
@@ -1371,7 +1408,7 @@ Client JSON messages:
 | Field | Notes |
 |-------|-------|
 | `asr_model_id`, `text_model_id`, `tts_model_id` | Modular model overrides. |
-| `s2s_model_id` | Unified audio-chat model override. |
+| `s2s_model_id` | Unified audio-chat model override (`LFM2.5-Audio-1.5B-GGUF` or `LFM3-Audio-2B-GGUF`). |
 | `speaker` | TTS speaker/voice. |
 | `asr_language` | Language hint. |
 | `max_output_tokens` | Reply token budget: default `384` in modular mode (a few spoken sentences), `1536` in unified mode. |
@@ -1384,6 +1421,9 @@ Client JSON messages:
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
+| `tools` | Unified mode on LFM3-Audio only: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
+| `builtin_tools` | Unified mode on LFM3-Audio: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
+| `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
 
 Client binary frame:
 
@@ -1425,6 +1465,8 @@ Server events:
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
 | `assistant_text_start`, `assistant_text_snapshot`, `assistant_text_final` | Assistant text events. A snapshot carries the whole reply so far; the final event also has `raw_text`. |
 | `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks; the start event names the `sample_rate` and `audio_format`. |
+| `function_call` | The reply calls a tool: `call_id`, `name`, `arguments` (a JSON object as text) and `executor`, `server` for a built-in tool (the server runs it) or `client` (answer with `function_call_output`); `null` for a tool the session does not offer. The typed v2 protocol sends it as `function_call`. |
+| `function_call_completed` | A call's `call_id`, `name`, `status` (`ok`, `error` or `timeout`) and the `output` the reply hears. The typed v2 protocol sends it as `function_call_completed`. |
 | `conversation_item_truncated` | Acknowledges a truncate with the `text` the conversation now remembers for that reply. |
 | `turn_done` | Terminal turn status: `ok`, `error`, `timeout`, `interrupted`, or `no_input`. |
 | `pong` | Ping response. |
@@ -1437,5 +1479,11 @@ How a modular turn runs:
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
 - The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+
+How a unified turn with tools runs (LFM3-Audio):
+
+- The reply is told the tools in its system prompt. A reply that calls them speaks nothing in that round; the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round hears their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
+- Each round takes its own request admission slot, so no slot is held while a tool runs. An interruption ends a call the client has not answered.
+- Text events and the remembered reply carry what the reply says, never its call markup. Audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.

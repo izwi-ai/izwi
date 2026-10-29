@@ -203,10 +203,20 @@ impl ModelFamily {
                     "default-on by operator decision ahead of CUDA evidence; the GPU pre-flight runs the qwen36moe device attach test (cuda_attached_prefill_matches_the_fresh_run); IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
-            Self::Lfm2Chat => excluded(
-                "hybrid state domains keep per-request KV; reuse is not proven for this family",
-            ),
-            Self::Lfm25Audio => not_enabled(
+            // Hybrid snapshots: attention publishes committed pages and the
+            // ShortConv ring a snapshot at each page, at the conversation's
+            // history boundary (before the final `<|im_start|>`).
+            Self::Lfm2Chat | Self::Lfm3Chat => match backend {
+                BackendKind::Cpu | BackendKind::Metal => supported(
+                    PrefixReuseEvidenceLevel::FixtureSuite,
+                    "LFM attach tests: an attached prefix (shared pages plus the forked ShortConv ring) prefills and decodes exactly as a fresh run split at the boundary; the manager publishes ring snapshots on aligned commits and forks them isolated from the publisher",
+                ),
+                BackendKind::Cuda => not_enabled(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "the contract declares committed pages and ShortConv ring snapshots; no CUDA GPU run yet",
+                ),
+            },
+            Self::Lfm25Audio | Self::Lfm3Audio => not_enabled(
                 PrefixReuseEvidenceLevel::NotRun,
                 "audio-chat reuse evidence not collected",
             ),
@@ -343,10 +353,7 @@ mod tests {
 
     #[test]
     fn hybrid_unproven_families_stay_excluded() {
-        for variant in [
-            ModelVariant::Qwen3508BGguf,
-            ModelVariant::Lfm2512BInstructGguf,
-        ] {
+        for variant in [ModelVariant::Qwen3508BGguf] {
             for backend in ALL_BACKENDS {
                 let cell = variant.prefix_reuse_support(backend);
                 assert!(!cell.engages(), "{variant:?} must stay off on {backend:?}");
@@ -380,5 +387,24 @@ mod tests {
             BackendKind::Cpu,
             PrefixReuseMode::Disabled
         ));
+    }
+
+    /// LFM chat shares prefixes where its attach is proven (CPU, Metal) and
+    /// declares the contract on CUDA without engaging it.
+    #[test]
+    fn lfm_chat_shares_prefixes_on_cpu_and_metal_only() {
+        for variant in [
+            ModelVariant::Lfm2512BInstructGguf,
+            ModelVariant::Lfm2512BThinkingGguf,
+            ModelVariant::Lfm317BGguf,
+            ModelVariant::Lfm317BQ8Gguf,
+        ] {
+            for backend in [BackendKind::Cpu, BackendKind::Metal] {
+                assert!(variant.prefix_reuse_support(backend).engages(), "{variant:?}");
+            }
+            let cuda = variant.prefix_reuse_support(BackendKind::Cuda);
+            assert!(!cuda.engages(), "{variant:?}");
+            assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::ContractDeclared);
+        }
     }
 }

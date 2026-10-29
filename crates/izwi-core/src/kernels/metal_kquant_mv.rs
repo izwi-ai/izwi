@@ -1,4 +1,4 @@
-//! Q4_K / Q5_K / Q6_K / Q8_0 mat-vec for Metal decode batches (2..=8
+//! Q4_K / Q5_K / Q6_K / Q8_0 / Q4_0 mat-vec for Metal decode batches (2..=8
 //! activation rows).
 //!
 //! Candle's Metal mat-vec issues one dispatch per activation row, and each
@@ -23,7 +23,11 @@
 //! In the LFM2.5 decode step (ms per step, Candle -> this): 2 rows 14.0 ->
 //! 12.8, 4 rows 23.9 -> 16.9; a single row was slower in the model (7.3 ->
 //! 7.9) despite the isolated timing, so one row stays on Candle.
-//! Results match Candle's to float rounding (sums regroup).
+//! Results match Candle's to float rounding (sums regroup). Q4_0 serves
+//! LFM3-1.7B's quantization-aware distilled checkpoint. A row sums in the
+//! same order however many rows share its dispatch, so
+//! [`MetalKQuantMatVec::forward_in_groups`] serves one row too for a decode
+//! that must be batch-invariant.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -63,7 +67,7 @@ pub(crate) fn serves(dtype: GgmlDType, cols: usize) -> bool {
 fn block_weights(dtype: GgmlDType) -> Option<usize> {
     match dtype {
         GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => Some(QK_K),
-        GgmlDType::Q8_0 => Some(32),
+        GgmlDType::Q8_0 | GgmlDType::Q4_0 => Some(32),
         _ => None,
     }
 }
@@ -102,11 +106,16 @@ impl MetalKQuantMatVec {
 
     /// Whether `x` (`[..., cols]`, F32, on Metal) has 2..=[`MAX_ROWS`] rows.
     pub(crate) fn accepts(&self, x: &Tensor) -> bool {
-        let rows = x.elem_count() / self.cols.max(1);
+        self.takes(x) && (2..=MAX_ROWS).contains(&(x.elem_count() / self.cols.max(1)))
+    }
+
+    /// Whether `x` (`[..., cols]`, F32, on Metal) has any rows at all, for
+    /// [`Self::forward_in_groups`].
+    pub(crate) fn takes(&self, x: &Tensor) -> bool {
         x.device().is_metal()
             && x.dtype() == DType::F32
             && x.dims().last() == Some(&self.cols)
-            && (2..=MAX_ROWS).contains(&rows)
+            && x.elem_count() >= self.cols
     }
 
     /// `x @ weightᵀ` for `x` of shape `[..., cols]`; the result is
@@ -120,9 +129,40 @@ impl MetalKQuantMatVec {
                 x.dtype()
             )
         }
+        self.matvec(x)
+    }
+
+    /// [`Self::forward`] for any number of rows, one included, in
+    /// dispatches of at most [`MAX_ROWS`]. Each row sums in the same order
+    /// whatever rows share its dispatch, so its bits do not depend on the
+    /// batch: what sampled decoding needs to be batch-invariant.
+    pub(crate) fn forward_in_groups(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        if !self.takes(x) {
+            bail!(
+                "izwi k-quant mat-vec needs F32 Metal rows of {}, got {:?} {:?}",
+                self.cols,
+                x.dims(),
+                x.dtype()
+            )
+        }
+        let batch = x.elem_count() / self.cols;
+        if batch <= MAX_ROWS {
+            return self.matvec(x);
+        }
+        let mut dims = x.dims().to_vec();
+        *dims.last_mut().expect("checked above") = self.rows;
+        let rows = x.contiguous()?.reshape((batch, self.cols))?;
+        let groups = (0..batch)
+            .step_by(MAX_ROWS)
+            .map(|start| self.matvec(&rows.narrow(0, start, MAX_ROWS.min(batch - start))?))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Tensor::cat(&groups, 0)?.reshape(dims)
+    }
+
+    fn matvec(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let mut dims = x.dims().to_vec();
         let batch = x.elem_count() / self.cols;
-        *dims.last_mut().expect("checked above") = self.rows;
+        *dims.last_mut().expect("checked by the callers") = self.rows;
         x.contiguous()?
             .reshape((batch, self.cols))?
             .apply_op1_no_bwd(self)?
@@ -130,7 +170,7 @@ impl MetalKQuantMatVec {
     }
 }
 
-/// Give a Metal Q4_K / Q5_K / Q6_K / Q8_0 `QMatMul` a small-batch mat-vec over the same
+/// Give a Metal Q4_K / Q5_K / Q6_K / Q8_0 / Q4_0 `QMatMul` a small-batch mat-vec over the same
 /// weight. Candle's `QTensor` does not expose its buffer, so the weight is
 /// read back once and uploaded into a buffer both share; `matmul` is
 /// rebuilt over it (the old buffer is freed). `None`, leaving `matmul`
@@ -187,14 +227,15 @@ impl CustomOp1 for MetalKQuantMatVec {
                 self.cols
             )
         }
-        if !(2..=MAX_ROWS).contains(&batch) {
-            bail!("izwi-kquant-mat-vec serves 2..={MAX_ROWS} rows, got {batch}")
+        if !(1..=MAX_ROWS).contains(&batch) {
+            bail!("izwi-kquant-mat-vec serves 1..={MAX_ROWS} rows, got {batch}")
         }
         let kind = match self.dtype {
             GgmlDType::Q4K => "q4_K",
             GgmlDType::Q5K => "q5_K",
             GgmlDType::Q6K => "q6_K",
             GgmlDType::Q8_0 => "q8_0",
+            GgmlDType::Q4_0 => "q4_0",
             dtype => bail!("izwi-kquant-mat-vec does not serve {dtype:?}"),
         };
         let vectors = vectors_per_group(batch);
@@ -311,6 +352,12 @@ typedef struct {
     int8_t qs[QK8_0];
 } block_q8_0;
 
+#define QK4_0 32
+typedef struct {
+    half d;
+    uint8_t qs[QK4_0 / 2];
+} block_q4_0;
+
 // llama.cpp's `mul_mv_ext` structure (ggml, MIT): NXPSG lanes share one
 // weight row, each lane dequantizes one 16-weight chunk per step into a
 // float4x4 and dots it with R activation vectors read straight from device
@@ -373,6 +420,17 @@ void izwi_dequantize_q8_0(device const block_q8_0 * xb, short il, thread float4x
     const float d = xb->d;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = qs[i + 16*il] * d;
+    }
+}
+
+// ggml's Q4_0 layout: a 32-weight block holds weights 0..15 in the low
+// nibbles of `qs` and 16..31 in the high nibbles, each `(q - 8) * d`; chunk
+// `il` (0 or 1) is one half.
+void izwi_dequantize_q4_0(device const block_q4_0 * xb, short il, thread float4x4 & reg) {
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i) {
+        const uchar q = xb->qs[i];
+        reg[i/4][i%4] = (float((il ? (q >> 4) : (q & 0xF))) - 8.0f) * d;
     }
 }
 
@@ -475,13 +533,15 @@ typedef decltype(izwi_kq_ext<block_q4_K, 2, 8, 16, izwi_dequantize_q4_K>) izwi_k
 
 constant constexpr short IZWI_KQ_NXPSG = 8;
 
-// NL: 16-weight chunks per block (16 for the K-quants, 2 for Q8_0).
+// NL: 16-weight chunks per block (16 for the K-quants, 2 for Q8_0 and Q4_0).
 #define IZWI_KQ_EXT(R) \
 template [[host_name("izwi_kq_ext_q4_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q4_K>; \
 template [[host_name("izwi_kq_ext_q5_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q5_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q5_K>; \
 template [[host_name("izwi_kq_ext_q6_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q6_K, R, IZWI_KQ_NXPSG, 16, izwi_dequantize_q6_K>; \
-template [[host_name("izwi_kq_ext_q8_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q8_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q8_0>;
+template [[host_name("izwi_kq_ext_q8_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q8_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q8_0>; \
+template [[host_name("izwi_kq_ext_q4_0_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_0, R, IZWI_KQ_NXPSG, 2, izwi_dequantize_q4_0>;
 
+IZWI_KQ_EXT(1)
 IZWI_KQ_EXT(2)
 IZWI_KQ_EXT(3)
 IZWI_KQ_EXT(4)
@@ -549,6 +609,8 @@ mod tests {
             (GgmlDType::Q6K, 6, 1024),
             (GgmlDType::Q8_0, 64, 512),
             (GgmlDType::Q8_0, 9, 96),
+            (GgmlDType::Q4_0, 64, 512),
+            (GgmlDType::Q4_0, 11, 96),
         ] {
             let (ext, matmul) = weight(&device, dtype, rows, cols);
             for batch in 2..=MAX_ROWS {
@@ -571,6 +633,51 @@ mod tests {
                     assert!(
                         (a - e).abs() <= 2e-6 * scale,
                         "{dtype:?} {rows}x{cols} batch {batch} [{index}]: {a} vs {e} (scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A row's result has the same bits alone and beside any number of
+    /// other rows, across the eight-row dispatch boundary too.
+    #[test]
+    fn a_row_has_the_same_bits_in_every_batch() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("a_row_has_the_same_bits_in_every_batch")
+        else {
+            return;
+        };
+        let batches = 11;
+        for (dtype, rows, cols) in [
+            (GgmlDType::Q4K, 12, 768),
+            (GgmlDType::Q6K, 6, 1024),
+            (GgmlDType::Q8_0, 9, 96),
+            (GgmlDType::Q4_0, 64, 512),
+        ] {
+            // The kernel reads the `QMatMul`'s buffer: keep its owner alive,
+            // or Candle's pool hands the memory to the next allocation.
+            let (ext, _matmul) = weight(&device, dtype, rows, cols);
+            let x = Tensor::from_vec(
+                xorshift(0x51ce, batches * cols, 4.0),
+                (batches, 1, cols),
+                &device,
+            )
+            .unwrap();
+            let bits = |x: &Tensor| {
+                let y = ext.forward_in_groups(x).unwrap();
+                y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            };
+            let alone = (0..batches)
+                .map(|row| bits(&x.narrow(0, row, 1).unwrap()))
+                .collect::<Vec<_>>();
+            for batch in 1..=batches {
+                let together = bits(&x.narrow(0, 0, batch).unwrap());
+                for (row, expected) in alone.iter().take(batch).enumerate() {
+                    assert_eq!(
+                        &together[row * rows..(row + 1) * rows],
+                        expected.as_slice(),
+                        "{dtype:?} {rows}x{cols}: row {row} of {batch}"
                     );
                 }
             }
@@ -622,11 +729,11 @@ mod tests {
         let mut tied = candle_core::quantized::QMatMul::from_arc(shared.clone()).unwrap();
         assert!(share_qmatmul_weight(&mut tied).unwrap().is_none());
         // Unsupported types keep Candle.
-        let mut q4_0 = candle_core::quantized::QMatMul::from_qtensor(
-            QTensor::quantize_onto(&values, GgmlDType::Q4_0, &device).unwrap(),
+        let mut q4_1 = candle_core::quantized::QMatMul::from_qtensor(
+            QTensor::quantize_onto(&values, GgmlDType::Q4_1, &device).unwrap(),
         )
         .unwrap();
-        assert!(share_qmatmul_weight(&mut q4_0).unwrap().is_none());
+        assert!(share_qmatmul_weight(&mut q4_1).unwrap().is_none());
     }
 
     /// Timing against Candle's per-row mat-vec on LFM2.5-sized weights.
@@ -643,6 +750,8 @@ mod tests {
             (GgmlDType::Q4K, 2048, 8192),
             (GgmlDType::Q6K, 2048, 8192),
             (GgmlDType::Q6K, 65536, 2048),
+            (GgmlDType::Q4_0, 7680, 2048),
+            (GgmlDType::Q4_0, 2048, 7680),
         ] {
             let (ext, matmul) = weight(&device, dtype, rows, cols);
             for batch in [2usize, 4, 8] {
@@ -686,7 +795,7 @@ mod tests {
             assert!(ext.forward(x).is_err());
         }
         let buffer = ext.buffer.clone();
-        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q4_0, 8, 256).is_none());
+        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q4_1, 8, 256).is_none());
         assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q8_0, 8, 48).is_none());
         assert!(MetalKQuantMatVec::new(buffer, GgmlDType::Q6K, 8, 300).is_none());
     }

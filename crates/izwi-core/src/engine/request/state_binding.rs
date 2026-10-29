@@ -534,6 +534,40 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Lfm3Audio(_)) {
+            // A row keeps its prompt and slot budget; a transcription keeps
+            // its decoded audio, and a long-form one has no row.
+            let transcribes = self.task_type == TaskType::ASR;
+            if transcribes && self.prepared_asr_audio_for_executor()?.is_none() {
+                return Err(Error::InvalidInput(format!(
+                    "LFM3-Audio ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            let consistent = match ready.lfm3_audio.as_ref() {
+                Some(prepared) => {
+                    self.prepared_sequence_input_tokens == Some(prepared.prompt_tokens)
+                        && self.params.max_tokens > 0
+                        && self.params.max_tokens <= prepared.request.max_slots
+                        && (!transcribes
+                            || self.prepared_asr_execution_shape
+                                == Some(PreparedAsrExecutionShape::RetainedSequence {
+                                    input_tokens: prepared.prompt_tokens,
+                                }))
+                }
+                None => {
+                    transcribes
+                        && self.uses_asr_long_form_atomic()
+                        && self.prepared_sequence_input_tokens.is_none()
+                }
+            };
+            if ready.model_variant.family() != ModelFamily::Lfm3Audio || !consistent {
+                return Err(Error::InvalidInput(format!(
+                    "LFM3-Audio request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::KokoroTts(_)) {
             let prepared = ready.kokoro_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -627,6 +661,18 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Lfm3Audio(_), TaskType::TTS | TaskType::SpeechToSpeech)
+                if ready.model_variant.family() == ModelFamily::Lfm3Audio
+                    && ready.lfm3_audio.is_some() =>
+            {
+                Ok(())
+            }
+            (PreparedIncrementalModel::Lfm3Audio(_), TaskType::ASR)
+                if ready.model_variant.family() == ModelFamily::Lfm3Audio
+                    && ready.qwen_tts.is_none() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::KokoroTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::KokoroTts
                     && ready.kokoro_tts.is_some() =>
@@ -700,6 +746,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
+                | PreparedIncrementalModel::Lfm3Audio(_)
                 | PreparedIncrementalModel::KokoroTts(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())

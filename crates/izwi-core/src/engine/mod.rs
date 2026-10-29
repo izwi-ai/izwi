@@ -54,6 +54,7 @@ pub(crate) use cache::invocation_tensor::{InvocationStaticAttentionLease, Invoca
 #[cfg(test)]
 pub(crate) use cache::{
     invocation::InvocationPagedKvPoolOwner, invocation_tensor::InvocationTensorPoolOwner,
+    tensor_snapshots::tensor_snapshot_prefix_policy,
 };
 
 pub(crate) use cache::composite::{
@@ -170,12 +171,12 @@ pub use metrics::{
     ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
-pub(crate) use request::KokoroPreparedText;
 pub use request::{
     AsrEngineInput, AsrTaskOptions, AudioChatEngineInput, ChatEngineInput, EngineAudioInput,
     EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
     RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
+pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings, SpeechReplyTurn};
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
     PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
@@ -1862,6 +1863,81 @@ impl Engine {
                     request.install_lfm25_audio_asr_execution_model(variant, model)?;
                 }
             }
+            TaskType::ASR if variant.family() == crate::catalog::ModelFamily::Lfm3Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+                    })?;
+                if request
+                    .prepared_lfm3_audio_model_lease_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = model.lfm3_audio()?.row_context(
+                        crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Asr,
+                    );
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM3-Audio ASR preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        let plan = executor::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &model.asr_route_capabilities(),
+                            request.streaming,
+                        );
+                        let artifact = if plan.requires_chunk_path() {
+                            request.install_prepared_asr_long_form_atomic(plan)?;
+                            None
+                        } else {
+                            Some(model.lfm3_audio()?.prepare_asr_row(
+                                &samples,
+                                sample_rate,
+                                request.lfm3_audio_asr_language(),
+                                request.lfm3_audio_asr_token_limit(),
+                            )?)
+                        };
+                        request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                        request.install_lfm3_audio_execution_model(
+                            variant,
+                            model,
+                            artifact,
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM3-Audio ASR request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
             TaskType::ASR if variant.family() != crate::catalog::ModelFamily::Voxtral => {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -2404,6 +2480,133 @@ impl Engine {
                     .map_err(|error| {
                         Error::InferenceError(format!(
                             "LFM2.5 Audio TTS request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
+            TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Lfm3Audio => {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+                    })?;
+                if request
+                    .prepared_lfm3_audio_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = model.lfm3_audio()?.row_context(
+                        crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts,
+                    );
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM3-Audio TTS preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let speech = request.lfm3_audio_tts_request()?;
+                        let artifact = model.lfm3_audio()?.prepare_row(speech)?;
+                        request.install_lfm3_audio_execution_model(
+                            variant,
+                            model,
+                            Some(artifact),
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM3-Audio TTS request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
+            TaskType::SpeechToSpeech
+                if variant.family() == crate::catalog::ModelFamily::Lfm3Audio =>
+            {
+                let model = registry
+                    .get_lfm25_audio_lease(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelNotFound(format!("LFM3-Audio model {variant} is not loaded"))
+                    })?;
+                if request
+                    .prepared_lfm3_audio_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = model.lfm3_audio()?.row_context(
+                        crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Conversation,
+                    );
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct LFM3-Audio voice-chat preparation queue is unavailable".into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        let clips = request.lfm3_audio_reply_clips()?;
+                        let reply = request.lfm3_audio_reply_settings();
+                        let artifact = model.lfm3_audio()?.prepare_reply_row(
+                            &clips,
+                            &reply.messages,
+                            &reply.tools,
+                            reply.output,
+                            reply.preserve_thinking,
+                            reply.max_slots,
+                            reply.text_sampling,
+                            reply.audio_sampling,
+                            reply.seed,
+                        )?;
+                        request.install_lfm3_audio_execution_model(
+                            variant,
+                            model,
+                            Some(artifact),
+                            context_limit,
+                        )?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "LFM3-Audio voice-chat request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
                 }
@@ -2991,7 +3194,9 @@ impl Engine {
         if request.task_type != TaskType::ASR
             || !matches!(
                 variant.family(),
-                crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::NemotronAsr
+                crate::catalog::ModelFamily::Voxtral
+                    | crate::catalog::ModelFamily::NemotronAsr
+                    | crate::catalog::ModelFamily::Lfm3Audio
             )
         {
             return Err(Error::InvalidInput(

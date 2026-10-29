@@ -18,6 +18,8 @@ export interface SpeechModelCapabilities {
   languages?: SpeechLanguage[];
   /** Whether `language` may be left out and is then read from the text's
    * script (Maya 2 Native). */
+  /** The `languages` code a request without `language` speaks. */
+  default_language?: string;
   language_auto_detect?: boolean;
   /** Whether a reference voice may name the language it is spoken in
    * (`reference_language`), as the model clones a voice into another

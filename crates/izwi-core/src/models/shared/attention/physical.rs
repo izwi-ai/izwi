@@ -1132,6 +1132,30 @@ pub(crate) fn test_physical_caches_with_dtype_on(
     capacity_tokens: usize,
     rows: usize,
 ) -> Vec<PhysicalPagedKvCache> {
+    let model_layers = (0..num_layers as u32).collect::<Vec<_>>();
+    test_physical_caches_for_model_layers_on(
+        device,
+        dtype,
+        &model_layers,
+        num_kv_heads,
+        head_dim,
+        capacity_tokens,
+        rows,
+    )
+}
+
+/// [`test_physical_caches_with_dtype_on`] for a hybrid model whose attention
+/// layers sit at `model_layers` (dense physical ordinals in that order).
+#[cfg(test)]
+pub(crate) fn test_physical_caches_for_model_layers_on(
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+    model_layers: &[u32],
+    num_kv_heads: usize,
+    head_dim: usize,
+    capacity_tokens: usize,
+    rows: usize,
+) -> Vec<PhysicalPagedKvCache> {
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
@@ -1153,10 +1177,12 @@ pub(crate) fn test_physical_caches_with_dtype_on(
         generation: 1,
     };
     let group = KvGroupId::new(1);
-    let bindings = (0..num_layers as u32)
-        .map(|layer| KvLayerBinding {
-            model_layer: layer,
-            physical_layer: layer,
+    let bindings = model_layers
+        .iter()
+        .enumerate()
+        .map(|(physical, &model_layer)| KvLayerBinding {
+            model_layer,
+            physical_layer: physical as u32,
         })
         .collect::<Vec<_>>();
     let config = KvArenaConfig {

@@ -227,7 +227,7 @@ const DIARIZATION_STACK_CAPABILITIES: Record<
     speech_to_text_jobs: true,
   },
   "Qwen3-ForcedAligner-0.6B": { forced_alignment: true },
-  "Qwen3.5-4B": { openai_chat_completions: true },
+  "Qwen3.5-4B": { openai_chat_completions: true, voice_realtime_text_model: true },
 };
 
 /** A diarization-stack fixture model in the given state. */
@@ -332,7 +332,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
-        route_capabilities: caps({ openai_chat_completions: true }),
+        route_capabilities: caps({ openai_chat_completions: true, voice_realtime_text_model: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,
@@ -893,7 +893,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
-        route_capabilities: caps({ openai_chat_completions: true }),
+        route_capabilities: caps({ openai_chat_completions: true, voice_realtime_text_model: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,
@@ -1811,7 +1811,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
-        route_capabilities: caps({ openai_chat_completions: true }),
+        route_capabilities: caps({ openai_chat_completions: true, voice_realtime_text_model: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,

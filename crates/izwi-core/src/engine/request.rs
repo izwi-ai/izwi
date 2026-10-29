@@ -32,6 +32,7 @@ use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
     tts_retained::Lfm25AudioPreparedTtsArtifact, Lfm25AudioGenerationConfig,
 };
+use crate::models::architectures::lfm3_audio::retained::Lfm3AudioPreparedArtifact;
 use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
 use crate::models::architectures::maya1::Maya1GenerationParams;
 use crate::models::architectures::maya2::retained::Maya2PreparedArtifact;
@@ -431,6 +432,8 @@ enum PreparedIncrementalModel {
     ChatterboxTts(ChatterboxTtsModelLease),
     Maya1Tts(Maya1TtsModelLease),
     Maya2Tts(Maya2TtsModelLease),
+    /// LFM3-Audio speech as a retained row (the audio-chat model's lease).
+    Lfm3Audio(Lfm25AudioModelLease),
     KokoroTts(KokoroTtsModelLease),
 }
 
@@ -447,6 +450,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
             Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
+            Self::Lfm3Audio(model) => write!(formatter, "Lfm3Audio({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
         }
     }
@@ -470,6 +474,7 @@ pub(super) struct IncrementalModelExecutionReady {
     maya1_tts_params: Option<Maya1GenerationParams>,
     maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
     maya2_tts_params: Option<Maya2GenerationParams>,
+    lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 
@@ -480,6 +485,33 @@ pub(crate) const TTS_SPEED_RANGE: (f32, f32) = crate::catalog::SpeechModelCapabi
 
 pub(crate) fn clamp_tts_speed(speed: f32) -> f32 {
     speed.clamp(TTS_SPEED_RANGE.0, TTS_SPEED_RANGE.1)
+}
+
+/// What an LFM3-Audio speech-to-speech request answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SpeechReplyTurn {
+    /// A spoken turn (the request's audio) after `chat_messages`' text
+    /// history, answered in interleaved text and speech.
+    #[default]
+    Voice,
+    /// A chat completion: `chat_messages`, an `<|audio|>` placeholder for each
+    /// of `chat_config.media_inputs`' clips, answered in text.
+    Chat,
+}
+
+/// What an LFM3-Audio reply is prepared from: its conversation (an
+/// `<|audio|>` placeholder per clip), the tools it may call, what it writes,
+/// its slot budget and sampling.
+#[derive(Debug, Clone)]
+pub(crate) struct Lfm3AudioReplySettings {
+    pub(crate) messages: Vec<crate::models::shared::chat::ChatMessage>,
+    pub(crate) tools: Vec<serde_json::Value>,
+    pub(crate) output: crate::models::architectures::lfm3_audio::prompts::Lfm3AudioReplyOutput,
+    pub(crate) preserve_thinking: bool,
+    pub(crate) max_slots: usize,
+    pub(crate) text_sampling: crate::models::architectures::lfm3_audio::config::Lfm3TextSampling,
+    pub(crate) audio_sampling: crate::models::architectures::lfm3_audio::config::Lfm3AudioSampling,
+    pub(crate) seed: u64,
 }
 
 /// A Kokoro request prepared for synthesis. The voice pack conditions at
@@ -1047,6 +1079,8 @@ pub struct EngineCoreRequest {
     pub voice_description: Option<String>,
     /// Optional system prompt (e.g. speech-to-speech system instruction).
     pub system_prompt: Option<String>,
+    /// What an LFM3-Audio speech-to-speech request answers.
+    pub(crate) speech_reply: SpeechReplyTurn,
     /// Generation parameters
     pub params: GenerationParams,
     /// Request priority
@@ -1093,6 +1127,12 @@ impl EngineCoreRequest {
         self.cancellation
             .as_ref()
             .is_some_and(|signal| signal.load(Ordering::Acquire))
+    }
+
+    /// Whether this request answers a chat completion: a chat row, or an
+    /// LFM3-Audio reply to a chat turn.
+    pub(crate) fn answers_chat(&self) -> bool {
+        self.task_type == TaskType::Chat || self.speech_reply == SpeechReplyTurn::Chat
     }
 
     /// Get number of prompt tokens.
@@ -1180,7 +1220,9 @@ impl RequestProcessor {
                 }
             }
             TaskType::SpeechToSpeech => {
-                if request.selected_audio_input().is_none() {
+                if request.selected_audio_input().is_none()
+                    && request.speech_reply != SpeechReplyTurn::Chat
+                {
                     return Err(Error::InvalidInput(
                         "Speech-to-speech request requires audio input".into(),
                     ));

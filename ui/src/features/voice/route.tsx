@@ -4,12 +4,12 @@ import { Mic, SlidersHorizontal } from "lucide-react";
 import { PageShell } from "@/components/PageShell";
 import {
   isVoiceEngineReady,
+  resolveCompactVoiceModel,
   resolveVoiceSpeaker,
   voiceEngineDownloadBytes,
   voiceEngineModels,
   voiceEngineSpeakers,
   voiceSessionEngine,
-  PREFERRED_SPEAKER,
 } from "@/features/voice/engine";
 import { VoiceControls } from "@/features/voice/components/VoiceControls";
 import { VoiceFailure } from "@/features/voice/components/VoiceFailure";
@@ -20,9 +20,10 @@ import {
 } from "@/features/voice/components/VoiceSettingsSheet";
 import { VoiceSetup } from "@/features/voice/components/VoiceSetup";
 import { VoiceTranscript } from "@/features/voice/components/VoiceTranscript";
-import type {
-  RuntimeStatus,
-  VoicePageProps,
+import {
+  formatModelVariantLabel,
+  type RuntimeStatus,
+  type VoicePageProps,
 } from "@/features/voice/realtime/support";
 import { useVoicePreferences } from "@/features/voice/useVoicePreferences";
 import { useVoiceSession } from "@/features/voice/useVoiceSession";
@@ -82,23 +83,29 @@ export function VoicePage({
     [onError],
   );
   const preferences = useVoicePreferences(reportError);
+  const compactModel = resolveCompactVoiceModel(
+    preferences.compactModel,
+    models,
+  );
   const engineRows = useMemo(
-    () => voiceEngineModels(preferences.engine, models),
-    [models, preferences.engine],
+    () => voiceEngineModels(preferences.engine, models, compactModel),
+    [compactModel, models, preferences.engine],
   );
   const isReady = isVoiceEngineReady(engineRows);
   const speakers = useMemo(
-    () => voiceEngineSpeakers(preferences.engine),
-    [preferences.engine],
+    () => voiceEngineSpeakers(preferences.engine, compactModel),
+    [compactModel, preferences.engine],
   );
   const speaker = resolveVoiceSpeaker(speakers, preferences.speaker);
   const sessionEngine = useMemo(
-    () => (isReady ? voiceSessionEngine(preferences.engine) : null),
-    [isReady, preferences.engine],
+    () =>
+      isReady ? voiceSessionEngine(preferences.engine, compactModel) : null,
+    [compactModel, isReady, preferences.engine],
   );
   const session = useVoiceSession({
     engine: sessionEngine,
-    speaker: speaker?.id ?? PREFERRED_SPEAKER,
+    // None when the engine picks its own voice (LFM3 Audio).
+    speaker: speaker?.id,
     systemPrompt: preferences.savedPrompt,
   });
 
@@ -248,6 +255,7 @@ export function VoicePage({
             ? () => preferences.setEngine("compact")
             : undefined
         }
+        compactLabel={formatModelVariantLabel(compactModel)}
       />
     );
   } else {
@@ -347,6 +355,7 @@ export function VoicePage({
         view={settingsView}
         onViewChange={setSettingsView}
         preferences={preferences}
+        compactModel={compactModel}
         speakers={speakers}
         speaker={speaker}
         models={models}

@@ -4,114 +4,6 @@
 use super::*;
 
 impl RuntimeService {
-    pub(super) async fn asr_transcribe_audio_chat<F>(
-        &self,
-        variant: ModelVariant,
-        audio_input: AsrAudioInput<'_>,
-        max_tokens: Option<usize>,
-        streaming_required: bool,
-        on_delta: F,
-        request_id: String,
-        runtime_context: RuntimeRequestContext,
-    ) -> Result<AsrTranscription>
-    where
-        F: FnMut(String) + Send + 'static,
-    {
-        let input_bytes = audio_input.input_bytes();
-        if input_bytes == 0 {
-            return Err(Error::InvalidInput(
-                "ASR request missing audio input".to_string(),
-            ));
-        }
-        audio_input.validate_retained_size()?;
-        let spec = self.coordinator_job_for_audio_input(
-            request_id,
-            CoordinatorLane::Atomic,
-            runtime_context,
-            input_bytes,
-        )?;
-        let job = self
-            .coordinator
-            .admit_observed(spec, host_input_observation(input_bytes)?)
-            .await?;
-
-        // Establish an owned packet only after admission. The caller-owned
-        // allocation remains live while this future runs, so both allocations
-        // are reconciled until the blocking decoder consumes the owned copy.
-        let audio_input = audio_input.into_owned_for_job(&job).await?;
-        job.record_materialized_usage(retained_host_observation(&[
-            input_bytes,
-            audio_input.retained_bytes(),
-        ])?)?;
-
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                &job,
-                variant,
-                CapabilityKind::Asr,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-        let model = self
-            .model_registry
-            .get_audio_chat(variant)
-            .await
-            .ok_or_else(|| {
-                Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
-            })?;
-        let observation_job = job.clone();
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                &job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: "asr.audio_chat".to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let retained_audio_bytes = audio_input.retained_bytes();
-                    let (samples, sample_rate) = audio_input.decode()?;
-                    let steady_usage = decoded_audio_observation(input_bytes, samples.capacity())?;
-                    observation_job.record_materialized_usage(add_retained_host_bytes(
-                        steady_usage,
-                        retained_audio_bytes,
-                    )?)?;
-                    observation_job.prepare_materialized_release(steady_usage)?;
-                    drop(audio_input);
-                    let duration_secs = if sample_rate > 0 {
-                        samples.len() as f32 / sample_rate as f32
-                    } else {
-                        0.0
-                    };
-                    let mut on_delta = on_delta;
-                    let mut delta_sink = |delta: &str| {
-                        if !delta.is_empty() {
-                            on_delta(delta.to_string());
-                        }
-                    };
-                    let output = model
-                        .transcribe_with_callback_and_max_tokens_from_invocation_workspace(
-                            &samples,
-                            sample_rate,
-                            max_tokens,
-                            leases,
-                            &mut delta_sink,
-                        )?;
-
-                    Ok(AsrTranscription {
-                        text: asr_transcript_text(&output.text),
-                        language: output.language,
-                        duration_secs,
-                        asr_diagnostics: output.diagnostics,
-                    })
-                },
-            )
-            .await
-    }
-
     pub(super) async fn build_asr_request(
         &self,
         variant: ModelVariant,
@@ -259,24 +151,6 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
-            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            let context = RuntimeRequestContext::default();
-            return self
-                .asr_transcribe_audio_chat(
-                    variant,
-                    AsrAudioInput::Base64(audio_base64),
-                    max_tokens,
-                    false,
-                    |_delta| {},
-                    correlation_id
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    context,
-                )
-                .await;
-        }
-
         let admitted = self
             .build_asr_request(
                 variant,
@@ -362,24 +236,6 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
-            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
-            let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
-            return self
-                .asr_transcribe_audio_chat(
-                    variant,
-                    AsrAudioInput::Base64(audio_base64),
-                    max_tokens,
-                    true,
-                    on_delta,
-                    correlation_id
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    context,
-                )
-                .await;
-        }
-
         let admitted = self
             .build_asr_request(
                 variant,
@@ -441,7 +297,7 @@ impl RuntimeService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
+    pub(crate) async fn asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
         &self,
         variant: ModelVariant,
         audio_bytes: &[u8],
@@ -453,24 +309,6 @@ impl RuntimeService {
         runtime_context: RuntimeRequestContext,
         native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
-        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
-            validate_asr_task(variant, language, prompt, &task)?;
-            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            return self
-                .asr_transcribe_audio_chat(
-                    variant,
-                    AsrAudioInput::Bytes(audio_bytes),
-                    max_tokens,
-                    false,
-                    |_delta| {},
-                    correlation_id
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    runtime_context,
-                )
-                .await;
-        }
-
         let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(
@@ -606,28 +444,6 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
-        if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
-            validate_asr_task(variant, language, prompt, &task)?;
-            self.observe_broker_capability_request(
-                CapabilityKind::Asr,
-                Some(variant),
-                broker_streaming_required,
-            )?;
-            return self
-                .asr_transcribe_audio_chat(
-                    variant,
-                    AsrAudioInput::Bytes(audio_bytes),
-                    max_tokens,
-                    broker_streaming_required,
-                    on_delta,
-                    correlation_id
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    runtime_context,
-                )
-                .await;
-        }
-
         let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(

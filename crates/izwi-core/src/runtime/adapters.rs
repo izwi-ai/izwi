@@ -347,7 +347,10 @@ mod tests {
         }
         if matches!(
             model_variant,
-            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
+            ModelVariant::Nemotron35AsrStreaming06B
+                | ModelVariant::VoxtralMini4BRealtime2602
+                | ModelVariant::Lfm3Audio2BGguf
+                | ModelVariant::Lfm3Audio2BQ8Gguf
         ) {
             expected.insert(CapabilityKind::RealtimeAsr);
         }

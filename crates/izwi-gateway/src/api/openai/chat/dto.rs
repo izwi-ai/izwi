@@ -73,6 +73,13 @@ pub struct ChatCompletionRequest {
     /// in the reply text. Absent or `true` skips them.
     #[serde(default)]
     pub skip_special_tokens: Option<bool>,
+    /// OpenAI's output modalities. Chat answers in text, so anything else is
+    /// refused rather than ignored.
+    #[serde(default)]
+    pub modalities: Option<Vec<String>>,
+    /// OpenAI's audio output settings, refused for the same reason.
+    #[serde(default)]
+    pub audio: Option<serde_json::Value>,
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
@@ -100,6 +107,10 @@ pub struct OpenAiInboundMessage {
     /// On a `tool` message: the id of the call it answers.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// On a `tool` message, for LFM3 models: deferred tools the result
+    /// reveals (their definitions, or a flag that the content holds them).
+    #[serde(default)]
+    pub additional_tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

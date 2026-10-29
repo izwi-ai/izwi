@@ -9,6 +9,7 @@ import {
   modelDescriptor,
   modelGroup,
   pageChoices,
+  readyTasks,
   taskSizeLabels,
   type TaskId,
 } from "@/app/onboarding/firstRunPlan";
@@ -195,6 +196,17 @@ describe("modelGroup", () => {
       "diar_streaming_sortformer_4spk-v2.1": "speakers",
       "Qwen3-TTS-Tokenizer-12Hz": null,
     });
+    // LFM3 Audio speaks too, but its task keeps it with the voice models.
+    expect(
+      modelGroup(
+        model("LFM3-Audio-2B-GGUF", "audio_chat", {
+          speech_capabilities: speech({
+            supports_builtin_voices: true,
+            built_in_voice_count: 2,
+          }),
+        }),
+      ),
+    ).toBe("voice");
   });
 
   it("falls back to route capabilities without a task", () => {
@@ -271,5 +283,34 @@ describe("pageChoices", () => {
       ["chat", "Qwen3.5-4B"],
       ["text-to-speech", "Kokoro-82M"],
     ]);
+  });
+});
+
+describe("readyTasks", () => {
+  const catalog = [
+    ...CATALOG,
+    model("LFM3-Audio-2B-GGUF", "audio_chat", {
+      speech_capabilities: speech({ supports_builtin_voices: true, built_in_voice_count: 2 }),
+    }),
+  ];
+  const rows = buildTaskRows(catalog);
+  const talkReadyWith = (variant: string) =>
+    readyTasks(
+      rows,
+      catalog.map((entry) =>
+        entry.variant === variant ? { ...entry, status: "downloaded" as const } : entry,
+      ),
+    ).some((row) => row.id === "talk");
+
+  it("counts Talk ready with only LFM3 Audio downloaded", () => {
+    expect(talkReadyWith("LFM3-Audio-2B-GGUF")).toBe(true);
+  });
+
+  it("counts Talk ready with only LFM2.5 Audio downloaded", () => {
+    expect(talkReadyWith("LFM2.5-Audio-1.5B-GGUF")).toBe(true);
+  });
+
+  it("leaves Talk out with neither engine's models downloaded", () => {
+    expect(talkReadyWith("Kokoro-82M")).toBe(false);
   });
 });

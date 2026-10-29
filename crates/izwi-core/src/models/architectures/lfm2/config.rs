@@ -18,6 +18,52 @@ pub struct Lfm2BackboneConfig {
     pub attention_sliding_window: Option<usize>,
     pub rope_freq_base: f64,
     pub shortconv_l_cache: usize,
+    /// LFM3's additions to the hybrid block. `None` for LFM2 and LFM2.5, whose
+    /// loading and forward passes stay exactly as they were.
+    pub lfm3: Option<Lfm3TrunkFeatures>,
+}
+
+/// What an LFM3 trunk adds to the LFM2 hybrid block.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lfm3TrunkFeatures {
+    /// Per model layer: the window of a sliding-window attention layer, `None`
+    /// for global attention and ShortConv layers. Empty when every attention
+    /// layer follows `attention_sliding_window`.
+    pub layer_sliding_windows: Vec<Option<usize>>,
+    /// RoPE base of the sliding-window layers (`lfm3.rope.freq_base_swa`).
+    /// `None` when they share `rope_freq_base`.
+    pub rope_freq_base_swa: Option<f64>,
+    /// Divisors of the global layers' RoPE frequencies (`rope_freqs.weight`).
+    /// LFM3 rotates only the highest-frequency half of each head: the other
+    /// half carries 1e30, which zeroes its angles.
+    pub rope_freq_factors: Option<Vec<f64>>,
+    /// Each attention head's output is scaled by `sigmoid(gate_proj(x))`
+    /// before the output projection.
+    pub attention_output_gate: bool,
+    /// An RMSNorm after each operator and after each FFN, before the residual
+    /// add (`post_attention_norm`, `post_ffw_norm`).
+    pub sandwich_norm: bool,
+}
+
+impl Lfm2BackboneConfig {
+    /// The sliding window of model layer `layer` if it is an attention layer
+    /// that attends locally.
+    pub fn layer_sliding_window(&self, layer: usize) -> Option<usize> {
+        match &self.lfm3 {
+            Some(features) if !features.layer_sliding_windows.is_empty() => {
+                features.layer_sliding_windows.get(layer).copied().flatten()
+            }
+            _ => self.attention_sliding_window,
+        }
+    }
+
+    /// Whether model layer `layer` takes the sliding-window RoPE base.
+    pub fn layer_uses_swa_rope(&self, layer: usize) -> bool {
+        self.lfm3
+            .as_ref()
+            .is_some_and(|features| features.rope_freq_base_swa.is_some())
+            && self.layer_sliding_window(layer).is_some()
+    }
 }
 
 pub(crate) fn parse_lfm2_backbone_config(loader: &GgufLoader) -> Result<Lfm2BackboneConfig> {
@@ -49,29 +95,34 @@ pub(crate) fn parse_lfm2_backbone_config(loader: &GgufLoader) -> Result<Lfm2Back
             .and_then(gguf_to_f64)
             .unwrap_or(1_000_000.0),
         shortconv_l_cache: required_usize(loader, "lfm2.shortconv.l_cache")?,
+        lfm3: None,
     })
 }
 
-fn required_usize(loader: &GgufLoader, key: &str) -> Result<usize> {
+pub(crate) fn required_usize(loader: &GgufLoader, key: &str) -> Result<usize> {
     optional_usize(loader, key)
         .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))
 }
 
-fn optional_usize(loader: &GgufLoader, key: &str) -> Option<usize> {
+pub(crate) fn optional_usize(loader: &GgufLoader, key: &str) -> Option<usize> {
     loader
         .metadata_value(key)
         .and_then(gguf_to_u64)
         .and_then(|value| usize::try_from(value).ok())
 }
 
-fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
+pub(crate) fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
     loader
         .metadata_value(key)
         .and_then(gguf_to_f64)
         .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))
 }
 
-fn required_usize_or_array(loader: &GgufLoader, key: &str, len: usize) -> Result<Vec<usize>> {
+pub(crate) fn required_usize_or_array(
+    loader: &GgufLoader,
+    key: &str,
+    len: usize,
+) -> Result<Vec<usize>> {
     let value = loader
         .metadata_value(key)
         .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
@@ -109,7 +160,7 @@ fn required_usize_or_array(loader: &GgufLoader, key: &str, len: usize) -> Result
     }
 }
 
-fn gguf_to_u64(value: &GgufValue) -> Option<u64> {
+pub(crate) fn gguf_to_u64(value: &GgufValue) -> Option<u64> {
     match value {
         GgufValue::U64(n) => Some(*n),
         GgufValue::I64(n) => Some(*n as u64),
@@ -125,7 +176,7 @@ fn gguf_to_u64(value: &GgufValue) -> Option<u64> {
     }
 }
 
-fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
+pub(crate) fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
     match value {
         GgufValue::F64(n) => Some(*n),
         GgufValue::F32(n) => Some(*n as f64),

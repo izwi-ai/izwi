@@ -39,7 +39,8 @@ mod realtime;
 mod sequence_asr;
 mod tts;
 use asr::{
-    ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, ParakeetAsrExecutionAdapter,
+    ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
+    ParakeetAsrExecutionAdapter,
 };
 use chat::ContinuousChatExecutionAdapter;
 use descriptor::loaded_execution_contracts;
@@ -50,14 +51,18 @@ use factories::{
     Lfm25AudioPhysicalAsrAdapterFactory, Lfm25AudioPhysicalTtsAdapterFactory,
     ScalarExecutionAdapterFactory,
 };
-use realtime::{NemotronRealtimeExecutionAdapter, VoxtralRealtimeExecutionAdapter};
+use realtime::{
+    Lfm3AudioRealtimeExecutionAdapter, NemotronRealtimeExecutionAdapter,
+    VoxtralRealtimeExecutionAdapter,
+};
 use sequence_asr::{
     GraniteSpeechAsrExecutionAdapter, VibeVoiceAsrExecutionAdapter, WhisperAsrExecutionAdapter,
 };
 use tts::{
     ChatterboxTtsExecutionAdapter, FishS2TtsExecutionAdapter, Lfm25AudioTtsExecutionAdapter,
-    Maya1TtsExecutionAdapter, Maya2TtsExecutionAdapter, PhysicalQwenTtsExecutionAdapter,
-    StaticTtsExecutionAdapter, VibeVoiceTtsExecutionAdapter, VoxtralTtsExecutionAdapter,
+    Lfm3AudioSpeechExecutionAdapter, Maya1TtsExecutionAdapter, Maya2TtsExecutionAdapter,
+    PhysicalQwenTtsExecutionAdapter, StaticTtsExecutionAdapter, VibeVoiceTtsExecutionAdapter,
+    VoxtralTtsExecutionAdapter,
 };
 
 const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
@@ -77,7 +82,13 @@ const VOXTRAL_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const CHATTERBOX_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA1_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const LFM3_AUDIO_CHAT_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
+const LFM3_AUDIO_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
+    crate::models::architectures::lfm3_audio::LFM3_AUDIO_REALTIME_EXECUTION_ABI,
+);
 pub(crate) const VOXTRAL_REALTIME_ADAPTER_ABI: AdapterAbiRevision =
     AdapterAbiRevision::new(crate::models::architectures::voxtral::VOXTRAL_REALTIME_EXECUTION_ABI);
 // Architecture ceiling: 8,192 codec frames, 1,920 output samples/frame,

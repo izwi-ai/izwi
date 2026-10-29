@@ -1,10 +1,11 @@
 # LFM CUDA implementation and qualification
 
 LFM uses Candle 0.11.0. The text backbone and audio depthformer retain quantized
-projections; audio encoder/detokenizer components are dense. Current backbone
-activations, recurrent rings and physical KV state are F32. A generic configured
-BF16 preference does not convert this model. CUDA support remains source-reviewed
-and unverified until device evidence is collected.
+projections; audio encoder/detokenizer components are dense. Backbone
+activations and recurrent rings are F32. Chat paged KV (LFM2.5 and LFM3) is F16
+on CUDA and Metal and F32 on the CPU; LFM2.5-Audio's KV is F32. A generic
+configured BF16 preference does not convert this model. CUDA support remains
+source-reviewed and unverified until device evidence is collected.
 
 The implementation fixes the text executor/sequence-adapter mismatch, uses
 Candle's native noninterleaved RoPE (including different positions per decode
@@ -61,15 +62,96 @@ scripts/bench/run-model-evidence.sh --backend cuda \
   --server http://127.0.0.1:8080 --output target/lfm-cuda-evidence
 ```
 
-The manifest covers both text variants and audio ASR/TTS at concurrency 1/2/4/8,
-with streaming and nonstreaming requests. Compare the baseline and changed builds
-on the same GPU, weights, inputs and limits. Retain TTFT, prefill/decode latency,
+The manifest covers the LFM2.5 Instruct, LFM2.5 Thinking and LFM3 chat models,
+and LFM2.5-Audio and LFM3-Audio ASR/TTS, at concurrency 1/2/4/8, with streaming
+and nonstreaming requests. Compare the baseline and changed builds on the same
+GPU, weights, inputs and limits. Retain TTFT, prefill/decode latency,
 tokens or audio seconds per second, peak VRAM, workspace, kernel launches and
 host synchronization counts. Check transcript quality, audio quality, finite
 outputs, cancellation, EOS and rollback. Include long prompts and unequal prompt
 lengths in a separate stress run. Audio-chat has no benchmark command: explicitly
 exercise its streaming and nonstreaming API, checking final transcript/audio and
 stream output boundaries. The manifest does not cover that route.
+
+## LFM3
+
+LFM3-1.7B chat and LFM3-Audio-2B build for CUDA and are compile-checked only:
+neither has run on an NVIDIA GPU. [LFM3 and LFM3-Audio](lfm3.md) describes the
+models; this section covers what CUDA adds.
+
+**Sliding windows.** LFM3's global and sliding-window attention layers share one
+page table (`lfm2/physical.rs`). A sliding layer's decode reads a narrowed block
+table that starts at its window's first page, with a first-page offset
+(`PhysicalPagedKvCache::sequence_table_with_window`). Its paged prefill passes
+`window_tokens` to the arena (`backends/kv/accelerator.rs`): with the
+`flash-attn` feature that is Candle's `flash_attn_varlen_paged_windowed` with a
+left window of `window - 1`, and the native paged prefill kernel takes the window
+itself. Stateless forwards (LFM3-Audio's speech encoder and LiquidCodec trunk)
+pass the same left window to CUDA flash attention, when it is requested, on
+masked prefill only (`lfm25_cuda_flash_attention_options`). Pages behind a
+window are not released, so the KV reservation covers every attention layer at
+the full context.
+
+**F16 KV.** LFM3 chat and LFM3-Audio store paged KV in F16 on CUDA
+(`lfm2_chat_kv_dtype`, `lfm3_audio_kv_dtype`). Queries and the attention output
+are cast at the call sites and scores accumulate in F32; activations and
+ShortConv rings stay F32. The LFM3 chat parity leg runs with the backend's KV
+dtype against the F32 reference, so on CUDA it checks F16 KV.
+
+**Context.** LFM3-1.7B is trained to 262,144 tokens. On CUDA LFM3 chat defaults
+to the checkpoint's whole context, and its one-context resident pool
+(`CudaResidentPool::OneContext`) is fitted to device memory at load, which caps
+the reach; CPU and Metal default to 32,768. `IZWI_LFM3_CONTEXT_TOKENS` sets it on
+any backend (see the support matrix's context table). The RoPE tables are built
+in F64; `rope_tables_match_f64_at_far_positions_on_cuda` checks them at positions
+up to 127,999, not across the whole 262,144. LFM3-Audio serves 32,768 tokens on
+every backend. Prefix reuse is off for LFM3 chat on CUDA: the contract declares
+committed pages and ring snapshots, but no GPU run has checked them.
+
+**Other paths.** With fused kernels on, a CUDA ShortConv ring kernel that
+declines is an error, not a silent fallback; `IZWI_FUSED_KERNELS=0` takes the
+op path. LFM3-Audio's depth decoder runs op-by-op on CUDA (its fused kernels
+are Metal only), and its mel features, sampling and inverse FFT run on the host.
+
+On an NVIDIA host, run the LFM `*_on_cuda` tests. The two backbone tests fail
+without a device. The model legs print `skipping: no CUDA device` and pass when
+the selected device is not CUDA, and the trunk test passes silently when
+`Device::new_cuda(0)` fails, so read their output. The real-weight legs read
+`IZWI_LFM25_MODELS_DIR`, else the default models directory, and skip when the
+model folder is missing.
+
+```bash
+# Shared backbone: RoPE tables at far positions, the op-path ShortConv ring.
+cargo test --locked -p izwi-core --lib --features cuda \
+  rope_tables_match_f64_at_far_positions_on_cuda -- --ignored
+cargo test --locked -p izwi-core --lib --features cuda \
+  unfused_shortconv_ring_falls_back_on_cuda -- --ignored
+# The LFM3 trunk against its F64 reference (synthetic weights).
+cargo test --locked -p izwi-core --lib --features cuda \
+  lfm3_trunk_matches_the_reference_on_cuda -- --nocapture
+# Real weights: LFM3 chat against the F32 reference, LFM3-Audio ASR and TTS.
+cargo test --locked -p izwi-core --lib --features cuda \
+  lfm3_chat_matches_the_f32_reference_on_cuda -- --ignored --nocapture
+cargo test --locked -p izwi-core --release --lib --features cuda \
+  lfm3_audio_transcribes_and_speaks_on_cuda -- --ignored --nocapture
+# LFM2.5 on the same backbone.
+cargo test --locked -p izwi-core --lib --features cuda \
+  lfm25_chat_matches_the_f32_reference_on_cuda -- --ignored --nocapture
+cargo test --locked -p izwi-core --lib --features cuda \
+  lfm25_f16_kv_tracks_f32_kv_on_cuda -- --ignored --nocapture
+```
+
+The runtime routes (ASR, TTS, voice chat, LiveASR, chat about audio) run on CUDA
+through `runtime/lfm3_audio_tests.rs` with `IZWI_LFM3_AUDIO_BACKEND=cuda`:
+
+```bash
+IZWI_LFM3_AUDIO_MODELS_DIR=/path/to/models IZWI_LFM3_AUDIO_BACKEND=cuda \
+  cargo test --locked -p izwi-core --features cuda --release --lib lfm3_audio_tests -- --nocapture
+```
+
+`lfm-cuda.toml` covers LFM3 chat and LFM3-Audio ASR/TTS at concurrency 1/2/4/8,
+`cuda-family-api.toml` has one LFM3 chat and one LFM3-Audio TTS case, and
+`cuda-family-load.txt` lists both models.
 
 ## Remaining evidence-dependent work
 

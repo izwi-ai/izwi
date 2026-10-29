@@ -3676,6 +3676,25 @@ async fn admin_models_expose_voice_app_capabilities() {
         .iter()
         .any(|modality| modality.as_str() == Some("audio_output")));
 
+    // LFM3-Audio runs speech-to-text jobs and the diarization pipeline's
+    // ASR; LFM2.5-Audio's retained ASR runs neither.
+    for (id, jobs) in [
+        ("LFM3-Audio-2B-GGUF", true),
+        ("LFM2.5-Audio-1.5B-GGUF", false),
+    ] {
+        let model = find_model(id);
+        assert_eq!(
+            model["route_capabilities"]["speech_to_text_jobs"].as_bool(),
+            Some(jobs),
+            "{id}"
+        );
+        assert_eq!(
+            model["route_capabilities"]["voice_realtime_unified"].as_bool(),
+            Some(true),
+            "{id}"
+        );
+    }
+
     drop(temp_dir);
 }
 

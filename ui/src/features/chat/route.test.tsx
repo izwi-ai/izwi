@@ -89,6 +89,35 @@ describe("ChatPage route model list", () => {
     ).toBeInTheDocument();
   });
 
+  it("offers audio clips for LFM3 Audio, which the catalog says hears audio", async () => {
+    renderChatPage([
+      {
+        ...routeModel("LFM3-Audio-2B-GGUF", "ready"),
+        modalities: ["text_input", "audio_input", "text_output", "audio_output"],
+      },
+    ]);
+    await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+
+    expect(screen.getByRole("combobox", { name: "Chat model" })).toHaveTextContent(
+      "LFM3 Audio 2B GGUF (Q4_K_M)",
+    );
+    expect(screen.getByRole("button", { name: "Attach audio" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Record audio" })).toBeInTheDocument();
+  });
+
+  it("offers no audio clips for a text chat model", async () => {
+    renderChatPage([
+      {
+        ...routeModel("LFM2.5-1.2B-Instruct-GGUF", "ready"),
+        modalities: ["text_input", "text_output"],
+      },
+    ]);
+    await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
+
+    expect(screen.queryByRole("button", { name: "Attach audio" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Record audio" })).not.toBeInTheDocument();
+  });
+
   it("offers the Qwen3.6-35B-A3B-FP8 model in the composer model dropdown", async () => {
     renderChatPage([routeModel("Qwen3.6-35B-A3B-FP8", "not_downloaded")]);
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());

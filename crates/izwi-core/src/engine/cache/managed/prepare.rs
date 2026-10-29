@@ -226,7 +226,7 @@ impl ManagedKvCacheManager {
             } => (
                 Some(*input),
                 Some(*phase),
-                auxiliary_state.as_ref(),
+                auxiliary_state.as_deref(),
                 None,
                 *phase == crate::engine::SequencePhase::Decode,
                 false,
@@ -239,15 +239,20 @@ impl ManagedKvCacheManager {
             } => (None, None, None, Some(*max_cache_append), true, false),
             WorkUnit::RealtimePreparation {
                 auxiliary_state, ..
-            } => (None, None, auxiliary_state.as_ref(), Some(0), true, false),
-            WorkUnit::RealtimeCompletion { .. } => (None, None, None, Some(0), true, false),
+            } => (None, None, auxiliary_state.as_deref(), Some(0), true, false),
+            // Prompt prefill and completion advance no retained tensor state:
+            // a family keeps any such state of those transactions in its own
+            // checkpointed host state.
+            WorkUnit::RealtimeCompletion { .. } => {
+                (None, None, Some(&[][..]), Some(0), true, false)
+            }
             WorkUnit::RealtimePromptPrefill { cache_append, .. } => {
                 if *cache_append == 0 {
                     return Err(Error::InvalidInput(
                         "realtime prompt prefill requires a positive exact cache append".into(),
                     ));
                 }
-                (None, None, None, Some(*cache_append), false, true)
+                (None, None, Some(&[][..]), Some(*cache_append), false, true)
             }
             WorkUnit::RealtimeDecodeContinuation {
                 max_cache_append,
@@ -259,7 +264,7 @@ impl ManagedKvCacheManager {
                         "realtime decode continuation requires exactly one cache append".into(),
                     ));
                 }
-                (None, None, auxiliary_state.as_ref(), Some(1), false, true)
+                (None, None, auxiliary_state.as_deref(), Some(1), false, true)
             }
             _ => return Ok(None),
         };
@@ -419,6 +424,10 @@ impl ManagedKvCacheManager {
                 (Some(input), None) => u32::try_from(input.end).map_err(|_| {
                     Error::InvalidInput("managed KV token position exceeds u32".to_string())
                 })?,
+                // A realtime target bounds what the row may append. It
+                // spans at least one page, which a paged view needs even
+                // before a session's first token (its first preparation
+                // appends nothing).
                 (None, Some(max_cache_append)) => snapshot
                     .committed_tokens
                     .checked_add(u32::try_from(max_cache_append).map_err(|_| {
@@ -428,7 +437,8 @@ impl ManagedKvCacheManager {
                     })?)
                     .ok_or_else(|| {
                         Error::InvalidInput("realtime managed KV target overflow".to_string())
-                    })?,
+                    })?
+                    .max(1),
                 _ => unreachable!("managed work target was authenticated above"),
             };
             if target_committed_tokens < snapshot.committed_tokens {

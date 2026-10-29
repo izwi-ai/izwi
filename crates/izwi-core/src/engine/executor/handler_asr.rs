@@ -61,6 +61,10 @@ mod granite;
 mod granite_speech5;
 #[path = "handler_asr/lfm25_audio.rs"]
 mod lfm25_audio;
+#[path = "handler_asr/lfm3_audio.rs"]
+mod lfm3_audio;
+#[path = "handler_asr/lfm3_live.rs"]
+mod lfm3_live;
 #[path = "handler_asr/parakeet.rs"]
 mod parakeet;
 #[path = "handler_asr/qwen3.rs"]
@@ -150,6 +154,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
+            | ModelFamily::Lfm3Audio
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
@@ -160,6 +165,7 @@ fn resolve_asr_execution_audio(
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::Lfm25Audio
+                | ModelFamily::Lfm3Audio
         ) {
             return Err(Error::InferenceError(format!(
                 "{} execution lost its prepared decoded-audio artifact",
@@ -168,6 +174,7 @@ fn resolve_asr_execution_audio(
                     ModelFamily::VibeVoiceAsr => "VibeVoice ASR",
                     ModelFamily::GraniteSpeechAsr => "Granite Speech ASR",
                     ModelFamily::Lfm25Audio => "LFM2.5 Audio ASR",
+                    ModelFamily::Lfm3Audio => "LFM3-Audio ASR",
                     _ => unreachable!("guarded prepared-audio family"),
                 }
             )));
@@ -188,6 +195,8 @@ fn resolve_asr_execution_audio(
 enum AtomicAsrRoute {
     /// The prepared LFM2.5 Audio lease chunks and decodes the audio itself.
     Lfm25AudioLongForm,
+    /// The prepared LFM3-Audio lease transcribes the planned chunks.
+    Lfm3AudioLongForm,
     /// The generic path, which resolves a `NativeAsrModel` (or Voxtral) lease.
     Generic,
 }
@@ -205,6 +214,9 @@ fn atomic_asr_route(
     }
     if variant.family() == ModelFamily::Lfm25Audio && request.uses_asr_long_form_atomic() {
         return Ok(AtomicAsrRoute::Lfm25AudioLongForm);
+    }
+    if variant.family() == ModelFamily::Lfm3Audio && request.uses_asr_long_form_atomic() {
+        return Ok(AtomicAsrRoute::Lfm3AudioLongForm);
     }
     Err(Error::InvalidInput(format!(
         "ASR request {} for audio-chat model {variant} has no retained or long-form route",
@@ -238,10 +250,11 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
-        // Voxtral and LFM2.5 Audio have their own executors; the forced
-        // aligner and the remaining families do not transcribe.
+        // Voxtral and the LFM audio models have their own executors; the
+        // forced aligner and the remaining families do not transcribe.
         ModelFamily::Voxtral
         | ModelFamily::Lfm25Audio
+        | ModelFamily::Lfm3Audio
         | ModelFamily::Qwen3ForcedAligner
         | ModelFamily::Qwen3Tts
         | ModelFamily::KokoroTts
@@ -258,6 +271,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::Qwen35MoeChat
         | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
+        | ModelFamily::Lfm3Chat
         | ModelFamily::Gemma3Chat
         | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
             "{family:?} has no physical ASR route on the generic executor path"
@@ -491,6 +505,12 @@ impl NativeExecutor {
             })?;
             return self.voxtral_realtime_request(request, scheduled, retained);
         }
+        if family == ModelFamily::Lfm3Audio && request.is_realtime_asr_session() {
+            let retained = managed_state.take().ok_or_else(|| {
+                Error::InferenceError("LFM3-Audio LiveASR lost retained paged state".into())
+            })?;
+            return self.lfm3_audio_realtime_request(request, scheduled, retained);
+        }
         if family == ModelFamily::Qwen3Asr && request.uses_asr_retained_sequence() {
             return self.qwen3_asr_sequence_request(request, scheduled, managed_state.take());
         }
@@ -509,6 +529,13 @@ impl NativeExecutor {
         }
         if family == ModelFamily::Lfm25Audio && request.uses_asr_retained_sequence() {
             return self.lfm25_audio_asr_sequence_request(request, scheduled, managed_state.take());
+        }
+        if family == ModelFamily::Lfm3Audio && request.uses_asr_retained_sequence() {
+            return self.lfm3_audio_request_with_managed_cache(
+                request,
+                scheduled,
+                managed_state.take(),
+            );
         }
         if family == ModelFamily::ParakeetAsr && request.uses_asr_retained_sequence() {
             let mut outputs = if scheduled.is_prefill {
@@ -536,6 +563,9 @@ impl NativeExecutor {
         match atomic_asr_route(request, variant)? {
             AtomicAsrRoute::Lfm25AudioLongForm => {
                 return self.lfm25_audio_asr_long_form_request(request, scheduled);
+            }
+            AtomicAsrRoute::Lfm3AudioLongForm => {
+                return self.lfm3_audio_asr_long_form_request(request, scheduled);
             }
             AtomicAsrRoute::Generic => {}
         }

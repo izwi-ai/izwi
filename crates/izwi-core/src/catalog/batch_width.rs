@@ -41,7 +41,7 @@ pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 pub(crate) const fn certified_decode_width(family: ModelFamily, backend: BackendKind) -> usize {
     match (backend, family) {
         (BackendKind::Cuda, _) => CUDA_MAX_WIDTH,
-        (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat)
+        (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
         | (BackendKind::Metal, ModelFamily::Qwen35Chat) => 8,
         _ => PORTABLE_BASELINE_WIDTH,
     }

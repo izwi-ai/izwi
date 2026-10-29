@@ -72,7 +72,10 @@ pub(super) fn checkpoint_resource_plan(
     if let Some(plan) = asr_memory::resource_plan(variant, model_path, device, granite)? {
         return Ok(Some(plan));
     }
-    if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
+    if matches!(
+        variant.family(),
+        crate::catalog::ModelFamily::Lfm2Chat | crate::catalog::ModelFamily::Lfm3Chat
+    ) {
         return asr_memory::lfm2_chat_resource_plan(
             variant,
             model_path,

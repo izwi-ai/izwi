@@ -5,6 +5,9 @@ use izwi_core::runtime_models::architectures::chatterbox::{
 use izwi_core::runtime_models::architectures::maya1::{
     maya1_auto_max_new_tokens, prompt::validate_inline_tags,
 };
+use izwi_core::runtime_models::architectures::lfm3_audio::{
+    lfm3_audio_tts_auto_max_frames, prompts::tts_locale as lfm3_audio_tts_locale,
+};
 use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
@@ -206,11 +209,25 @@ pub(crate) const MAYA2_SEGMENT_MAX_CHARS: usize = 280;
 /// Refuse a `language` the model cannot speak before it loads: the English
 /// Chatterbox takes English only, the multilingual one its supported codes,
 /// Maya 2 Native its 12 codes (or none / `auto`, read from the text's
-/// script). Other models read `language` as a hint.
+/// script), LFM3-Audio its 19 locales (none is American English). Other
+/// models read `language` as a hint.
 pub(crate) fn validate_speech_language(
     variant: ModelVariant,
     language: Option<&str>,
 ) -> Result<(), crate::error::ApiError> {
+    if variant.family() == ModelFamily::Lfm3Audio {
+        let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        return lfm3_audio_tts_locale(language)
+            .map(|_| ())
+            .map_err(|error| match error {
+                izwi_core::Error::InvalidInput(message) => {
+                    crate::error::ApiError::bad_request(message)
+                }
+                error => crate::error::core_api_error(error),
+            });
+    }
     if variant.family() == ModelFamily::Maya2Tts {
         return maya2_language(language, "")
             .map(|_| ())
@@ -400,6 +417,9 @@ pub(crate) fn resolve_tts_output_frames(
         Some(0) | None if variant.family() == ModelFamily::Maya1Tts => {
             Some(maya1_auto_max_new_tokens(text).min(model_max_frames))
         }
+        Some(0) | None if variant.family() == ModelFamily::Lfm3Audio => {
+            Some(lfm3_audio_tts_auto_max_frames(text).min(model_max_frames))
+        }
         Some(0) | None if variant.family() == ModelFamily::Qwen3Tts => {
             Some(qwen_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
@@ -428,6 +448,7 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
         // Upstream speaks long text in pieces of about 20 s; each piece's
         // budget comes from its own frame prior.
         ModelFamily::Maya2Tts => return text.trim().chars().count() > MAYA2_SEGMENT_MAX_CHARS,
+        ModelFamily::Lfm3Audio => ModelVariant::LFM3_AUDIO_MAX_OUTPUT_FRAMES,
         _ => return false,
     };
     resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)

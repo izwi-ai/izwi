@@ -627,6 +627,7 @@ mod tests {
             attention_sliding_window: Some(8),
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         }
     }
 

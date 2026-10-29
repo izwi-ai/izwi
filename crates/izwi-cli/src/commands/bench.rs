@@ -6596,12 +6596,15 @@ mod tests {
         ))
         .unwrap();
         let cases = expand_manifest_cases(&manifest).unwrap();
-        assert_eq!(cases.len(), 32);
+        assert_eq!(cases.len(), 56);
         for (model, command) in [
             ("LFM2.5-1.2B-Instruct-GGUF", "chat"),
             ("LFM2.5-1.2B-Thinking-GGUF", "chat"),
+            ("LFM3-1.7B-GGUF", "chat"),
             ("LFM2.5-Audio-1.5B-GGUF", "asr"),
             ("LFM2.5-Audio-1.5B-GGUF", "tts"),
+            ("LFM3-Audio-2B-GGUF", "asr"),
+            ("LFM3-Audio-2B-GGUF", "tts"),
         ] {
             for concurrent in [1, 2, 4, 8] {
                 for stream in [false, true] {
@@ -6666,7 +6669,7 @@ concurrent = [1, 2]
         let text = std::fs::read_to_string(path).expect("CUDA family manifest");
         let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
         let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
-        assert_eq!(cases.len(), 16);
+        assert_eq!(cases.len(), 18);
         assert!(cases.iter().all(|case| case.model.is_some()));
         assert!(cases
             .iter()
@@ -6690,9 +6693,22 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid chat performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique chat performance cases");
-            assert_eq!(cases.len(), 3, "{name}");
+            assert_eq!(cases.len(), 4, "{name}");
             assert!(cases.iter().all(|case| case.command == "chat"), "{name}");
-            assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+            let models: BTreeSet<_> = cases
+                .iter()
+                .map(|case| case.model.as_deref().expect("model"))
+                .collect();
+            assert_eq!(
+                models,
+                BTreeSet::from([
+                    "Qwen3.5-0.8B",
+                    "Qwen3.8-27B-FP8",
+                    "LFM2.5-1.2B-Instruct-GGUF",
+                    "LFM3-1.7B-GGUF",
+                ]),
+                "{name} family coverage"
+            );
         }
     }
 
@@ -6705,6 +6721,8 @@ concurrent = [1, 2]
             ("Kokoro-82M", "tts"),
             ("LFM2.5-Audio-1.5B-GGUF", "asr"),
             ("LFM2.5-Audio-1.5B-GGUF", "tts"),
+            ("LFM3-Audio-2B-GGUF", "asr"),
+            ("LFM3-Audio-2B-GGUF", "tts"),
             ("Nemotron-3.5-ASR-Streaming-0.6B", "asr"),
             ("Parakeet-TDT-0.6B-v3", "asr"),
             ("Qwen3-ASR-0.6B-GGUF", "asr"),
@@ -6729,7 +6747,7 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid audio performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
-            assert_eq!(cases.len(), 60, "{name}");
+            assert_eq!(cases.len(), 68, "{name}");
             assert!(
                 cases
                     .iter()
@@ -6758,7 +6776,7 @@ concurrent = [1, 2]
                         .iter()
                         .filter(|case| case.concurrent == Some(concurrency))
                         .count(),
-                    15,
+                    17,
                     "{name} c{concurrency}"
                 );
             }

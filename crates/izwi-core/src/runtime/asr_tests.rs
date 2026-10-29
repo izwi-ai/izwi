@@ -307,7 +307,7 @@ async fn nemotron_public_push_and_finish_select_the_direct_native_path() {
         job: None,
         session_lease: None,
         engine_session: None,
-        voxtral_model: None,
+        engine_model: None,
         absolute_deadline: now + Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         last_activity: now,
@@ -327,6 +327,7 @@ async fn nemotron_public_push_and_finish_select_the_direct_native_path() {
         engine_text: String::new(),
         engine_chunk_index: 0,
         segment: RealtimeEngineSegment::default(),
+        lfm3: None,
     };
 
     // Nemotron routes to the direct native streaming path: the fixture
@@ -373,7 +374,7 @@ fn fixture_realtime_stream(
         job: None,
         session_lease,
         engine_session: None,
-        voxtral_model: None,
+        engine_model: None,
         absolute_deadline: now + Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         last_activity: now,
@@ -393,6 +394,7 @@ fn fixture_realtime_stream(
         engine_text: String::new(),
         engine_chunk_index: 0,
         segment: RealtimeEngineSegment::new(Some("en"), None),
+        lfm3: None,
     }
 }
 
@@ -714,7 +716,7 @@ async fn realtime_watchdog_releases_idle_session_quota() {
         job: None,
         session_lease: Some(session_lease),
         engine_session: None,
-        voxtral_model: None,
+        engine_model: None,
         absolute_deadline: now + Duration::from_secs(60),
         idle_timeout: Duration::from_millis(1),
         last_activity: now - Duration::from_secs(1),
@@ -765,7 +767,7 @@ async fn realtime_stream_drop_releases_detached_session_quota() {
         job: None,
         session_lease: Some(session_lease),
         engine_session: None,
-        voxtral_model: None,
+        engine_model: None,
         absolute_deadline: now + Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         last_activity: now,
@@ -785,6 +787,7 @@ async fn realtime_stream_drop_releases_detached_session_quota() {
         engine_text: String::new(),
         engine_chunk_index: 0,
         segment: RealtimeEngineSegment::default(),
+        lfm3: None,
     };
 
     drop(stream);
@@ -815,7 +818,7 @@ async fn aborted_cleanup_task_retains_detached_authorities_fail_closed() {
         job: None,
         session_lease: Some(session_lease),
         engine_session: None,
-        voxtral_model: None,
+        engine_model: None,
     };
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {

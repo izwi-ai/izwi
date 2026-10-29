@@ -1024,7 +1024,7 @@ impl EngineCore {
                 if let Some(request) = self.requests.get(&request_id) {
                     engine_output.finish_reason = chat_budget_finish_reason(
                         engine_output.finish_reason,
-                        request.task_type,
+                        request.answers_chat(),
                         request.params.max_tokens,
                         engine_output.num_tokens,
                     );

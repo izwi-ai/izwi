@@ -338,6 +338,20 @@ fn direct_shortconv_ring(
     cursor: u64,
     valid: u64,
 ) -> Result<Tensor> {
+    if ring.device().is_cpu() {
+        return host_shortconv_ring(ring, input, weight, cursor, valid);
+    }
+    op_shortconv_ring(ring, input, weight, cursor, valid)
+}
+
+/// [`direct_shortconv_ring`] as Candle ops, one per tap and step.
+fn op_shortconv_ring(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    cursor: u64,
+    valid: u64,
+) -> Result<Tensor> {
     let (_, hidden, steps) = input.dims3()?;
     let capacity = ring.dim(0)?;
     let oldest = cursor.saturating_sub(valid);
@@ -382,6 +396,66 @@ fn direct_shortconv_ring(
     Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2).map_err(Error::from)
 }
 
+/// [`direct_shortconv_ring`] over host memory in one pass: each output sums
+/// the same taps in the same order, so it is bit-identical, without one
+/// Candle op per tap and step (LFM3's 7-tap convolution made a 1K-token CPU
+/// prefill issue about 100K of them per layer stack).
+fn host_shortconv_ring(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    cursor: u64,
+    valid: u64,
+) -> Result<Tensor> {
+    let (batch, hidden, steps) = input.dims3()?;
+    let capacity = ring.dim(0)?;
+    if batch != 1 || ring.elem_count() != capacity * hidden || weight.dims2()? != (hidden, capacity)
+    {
+        return Err(Error::InvalidInput(
+            "LFM2 ShortConv ring geometry mismatch".into(),
+        ));
+    }
+    let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+        Ok(tensor
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?)
+    };
+    let (ring_values, inputs, weights) = (host(ring)?, host(input)?, host(weight)?);
+    let oldest = cursor.saturating_sub(valid);
+    let mut output = vec![0f32; hidden * steps];
+    for channel in 0..hidden {
+        let taps = &weights[channel * capacity..][..capacity];
+        let row = &inputs[channel * steps..][..steps];
+        for step in 0..steps {
+            let window_start = (cursor + step as u64) as i128 + 1 - capacity as i128;
+            let mut sum = None::<f32>;
+            for (tap, weight) in taps.iter().enumerate() {
+                let source = window_start + tap as i128;
+                if source < 0 {
+                    continue;
+                }
+                let source = source as u64;
+                let value = if source < cursor {
+                    if source < oldest {
+                        continue;
+                    }
+                    ring_values[(source % capacity as u64) as usize * hidden + channel]
+                } else {
+                    row[(source - cursor) as usize]
+                };
+                let contribution = value * weight;
+                sum = Some(sum.map_or(contribution, |sum| sum + contribution));
+            }
+            output[channel * steps + step] = sum.ok_or_else(|| {
+                Error::InferenceError("LFM2 ShortConv produced no current contribution".into())
+            })?;
+        }
+    }
+    Tensor::from_vec(output, (1, hidden, steps), input.device()).map_err(Error::from)
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only switch that sends this thread's ShortConv decode steps down
@@ -392,6 +466,24 @@ thread_local! {
     /// `QMatMul`, for A/B timing against the small-batch mat-vec.
     pub(crate) static FORCE_CANDLE_MATVEC: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test-only switch that sends this thread's LFM3 sandwich norms and
+    /// attention output gates down the op-by-op path, for A/B timing
+    /// against `kernels::metal_lfm_norm`.
+    pub(crate) static FORCE_UNFUSED_LFM_NORM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether the LFM3 sandwich norm and output gate fusions run on `device`:
+/// Metal with fused kernels on and diagnostics off.
+#[cfg(feature = "metal")]
+fn lfm_norm_fusion_on(device: &Device) -> bool {
+    #[cfg(test)]
+    if FORCE_UNFUSED_LFM_NORM.with(std::cell::Cell::get) {
+        return false;
+    }
+    device.is_metal()
+        && crate::kernels::use_fused_kernels_for_device(device)
+        && !diagnostics::enabled()
 }
 
 /// One decode step's KV writes and next ShortConv states, not yet
@@ -503,6 +595,9 @@ struct AttentionLayer {
     neg_inf: Tensor,
     physical_layer: usize,
     model_layer: usize,
+    /// LFM3: `[hidden -> heads]`; each head's output is scaled by the sigmoid
+    /// of its gate before the output projection.
+    gate: Option<Lfm2Linear>,
 }
 
 #[derive(Debug)]
@@ -526,6 +621,83 @@ struct LayerWeights {
     ffn_norm: LfmRmsNorm,
     mlp: Mlp,
     kind: LayerKind,
+    /// LFM3 sandwich norms: applied to the operator and FFN outputs before
+    /// their residual adds.
+    post_operator_norm: Option<LfmRmsNorm>,
+    post_ffn_norm: Option<LfmRmsNorm>,
+}
+
+impl LayerWeights {
+    /// The operator output as the residual stream receives it.
+    fn operator_output(&self, hidden: Tensor) -> Result<Tensor> {
+        match &self.post_operator_norm {
+            Some(norm) => norm.forward(&hidden.contiguous()?),
+            None => Ok(hidden),
+        }
+    }
+
+    /// `residual` plus the operator output as the residual stream receives
+    /// it; `check` sees the output before the add when it is computed apart.
+    fn operator_residual(
+        &self,
+        hidden: Tensor,
+        residual: &Tensor,
+        check: impl Fn(&Tensor, &str) -> Result<()>,
+    ) -> Result<Tensor> {
+        let fused = fused_sandwich_add(self.post_operator_norm.as_ref(), &hidden, residual)?;
+        if let Some(sum) = fused {
+            return Ok(sum);
+        }
+        let hidden = self.operator_output(hidden)?;
+        check(&hidden, "operator output")?;
+        Ok((&hidden + residual)?)
+    }
+
+    /// `residual` plus the FFN of a normalized input, as
+    /// [`Self::operator_residual`] adds the operator output.
+    fn ffn_residual(
+        &self,
+        normalized: &Tensor,
+        residual: &Tensor,
+        check: impl Fn(&Tensor, &str) -> Result<()>,
+    ) -> Result<Tensor> {
+        let output = self.mlp.forward(normalized)?;
+        if let Some(sum) = fused_sandwich_add(self.post_ffn_norm.as_ref(), &output, residual)? {
+            return Ok(sum);
+        }
+        let output = match &self.post_ffn_norm {
+            Some(norm) => norm.forward(&output.contiguous()?)?,
+            None => output,
+        };
+        check(&output, "MLP output")?;
+        Ok((&output + residual)?)
+    }
+}
+
+/// `residual + norm(output)` in one Metal dispatch for an LFM3 sandwich
+/// norm, or `None` where the ops run apart: no sandwich norm, another
+/// device, or diagnostics on (they check the norm's output).
+fn fused_sandwich_add(
+    norm: Option<&LfmRmsNorm>,
+    output: &Tensor,
+    residual: &Tensor,
+) -> Result<Option<Tensor>> {
+    #[cfg(feature = "metal")]
+    if let Some(norm) = norm {
+        if lfm_norm_fusion_on(output.device()) {
+            let output = output.contiguous()?;
+            let residual = residual.contiguous()?;
+            return Ok(crate::kernels::metal_lfm_norm::try_rms_norm_add(
+                &output,
+                &residual,
+                norm.weight(),
+                norm.eps(),
+            ));
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    let _ = (norm, output, residual);
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -538,7 +710,9 @@ pub struct QuantizedLfm2Backbone {
     cfg: Lfm2BackboneConfig,
     /// `None` for a backbone that only runs on supplied embeddings.
     token_embeddings: Option<Arc<candle_core::quantized::QTensor>>,
-    output_head: ProjectionHead,
+    /// `None` for a trunk that only produces hidden states (LFM3-Audio's
+    /// encoder and codec decoder run their own heads).
+    output_head: Option<ProjectionHead>,
     layers: Vec<LayerWeights>,
     norm: LfmRmsNorm,
     vocab_size: usize,
@@ -643,9 +817,10 @@ fn rotary_decode_batch(
     RotaryDecodeRows::gather(cos, sin, positions, query.dim(0)?)?.rotate(query, key)
 }
 
-/// The rotary rows of one decode step. Every attention layer shares the same
-/// tables, so a step gathers them once (one position upload) instead of once
-/// per layer.
+/// The rotary rows of one decode step. Attention layers share their tables
+/// (LFM2 has one set, LFM3 one for global and one for sliding layers), so a
+/// step gathers each table once (one position upload) instead of once per
+/// layer.
 struct RotaryDecodeRows {
     table: candle_core::TensorId,
     cos: Tensor,
@@ -675,16 +850,20 @@ impl RotaryDecodeRows {
 
     /// This step's rows of `cos`/`sin`, gathered on first use.
     fn for_step<'a>(
-        rows: &'a mut Option<Self>,
+        rows: &'a mut Vec<Self>,
         cos: &Tensor,
         sin: &Tensor,
         positions: &[usize],
         batch: usize,
     ) -> Result<&'a Self> {
-        if rows.as_ref().is_some_and(|rows| rows.table == cos.id()) {
-            return Ok(rows.as_ref().expect("checked above"));
-        }
-        Ok(rows.insert(Self::gather(cos, sin, positions, batch)?))
+        let index = match rows.iter().position(|rows| rows.table == cos.id()) {
+            Some(index) => index,
+            None => {
+                rows.push(Self::gather(cos, sin, positions, batch)?);
+                rows.len() - 1
+            }
+        };
+        Ok(&rows[index])
     }
 
     fn rotate(&self, query: &Tensor, key: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -701,6 +880,34 @@ impl RotaryDecodeRows {
 }
 
 impl AttentionLayer {
+    /// The output projection of the attention heads `attn_output`
+    /// (`[.., heads * head_dim]`) for the layer input `input` (`[.., hidden]`),
+    /// after LFM3's per-head sigmoid gate when the layer has one.
+    fn project_output(&self, input: &Tensor, attn_output: &Tensor) -> Result<Tensor> {
+        let Some(gate) = &self.gate else {
+            return self.wo.forward(attn_output).map_err(Error::from);
+        };
+        let dims = attn_output.dims();
+        let lead = &dims[..dims.len() - 1];
+        let gate = gate.forward(input)?;
+        #[cfg(feature = "metal")]
+        if lfm_norm_fusion_on(attn_output.device()) {
+            let heads = attn_output.contiguous()?;
+            if let Some(gated) = crate::kernels::metal_lfm_norm::try_sigmoid_gate(
+                &heads,
+                &gate.contiguous()?,
+                self.head_dim,
+            ) {
+                return self.wo.forward(&gated).map_err(Error::from);
+            }
+        }
+        let gate = candle_nn::ops::sigmoid(&gate)?;
+        let heads = attn_output.reshape([lead, &[self.n_head, self.head_dim]].concat())?;
+        let gate = gate.reshape([lead, &[self.n_head, 1]].concat())?;
+        let gated = heads.broadcast_mul(&gate)?.reshape(dims)?;
+        self.wo.forward(&gated).map_err(Error::from)
+    }
+
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, _, seq_len, _) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
@@ -847,7 +1054,7 @@ impl AttentionLayer {
                     attn_output
                         .transpose(1, 2)?
                         .reshape((batch_size, seq_len, hidden_size))?;
-                return self.wo.forward(&attn_output).map_err(Error::from);
+                return self.project_output(hidden_states, &attn_output);
             }
         }
 
@@ -870,7 +1077,7 @@ impl AttentionLayer {
                     attn_output
                         .transpose(1, 2)?
                         .reshape((batch_size, seq_len, hidden_size))?;
-                return self.wo.forward(&attn_output).map_err(Error::from);
+                return self.project_output(hidden_states, &attn_output);
             }
         }
 
@@ -908,7 +1115,7 @@ impl AttentionLayer {
             attn_output
                 .transpose(1, 2)?
                 .reshape((batch_size, seq_len, hidden_size))?;
-        self.wo.forward(&attn_output).map_err(Error::from)
+        self.project_output(hidden_states, &attn_output)
     }
 
     fn forward_physical(
@@ -962,7 +1169,7 @@ impl AttentionLayer {
             index_pos,
         )?;
         let output = output.reshape((batch_size, seq_len, hidden_size))?;
-        self.wo.forward(&output).map_err(Error::from)
+        self.project_output(hidden_states, &output)
     }
 
     fn forward_retained_decode_batch(
@@ -972,7 +1179,7 @@ impl AttentionLayer {
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         completions: &mut KvWriteCompletionCollector,
-        rotary_rows: &mut Option<RotaryDecodeRows>,
+        rotary_rows: &mut Vec<RotaryDecodeRows>,
     ) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
         if batch == 0 || seq_len != 1 || positions.len() != batch || caches.len() != batch {
@@ -1096,9 +1303,7 @@ impl AttentionLayer {
             self.model_layer,
             positions,
         )?;
-        self.wo
-            .forward(&output.reshape((batch, 1, hidden_size))?)
-            .map_err(Error::from)
+        self.project_output(hidden_states, &output.reshape((batch, 1, hidden_size))?)
     }
 }
 
@@ -1164,7 +1369,7 @@ impl AttentionLayer {
         let output = output
             .to_dtype(hidden_states.dtype())?
             .reshape((1, tokens, hidden_size))?;
-        self.wo.forward(&output).map_err(Error::from)
+        self.project_output(hidden_states, &output)
     }
 }
 
@@ -1214,6 +1419,10 @@ impl ShortConvLayer {
 
             if let Some(out) = out {
                 out
+            } else if self.l_cache != 3 {
+                // LFM3's width-7 filters: Candle runs a grouped `Conv1d` as
+                // one convolution per channel, a dispatch each on a GPU.
+                depthwise_causal_conv(&bx, conv_weight)?
             } else {
                 let conv = Conv1d::new(
                     conv_weight
@@ -1452,7 +1661,7 @@ impl ProjectionHead {
 
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
-        Self::load_inner(loader, cfg, device, true)
+        Self::load_inner(loader, cfg, device, BackboneParts::Full)
     }
 
     /// A backbone that only ever runs on supplied embeddings, such as the
@@ -1463,19 +1672,46 @@ impl QuantizedLfm2Backbone {
         cfg: Lfm2BackboneConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::load_inner(loader, cfg, device, false)
+        Self::load_inner(loader, cfg, device, BackboneParts::ForEmbeds)
+    }
+
+    /// The layers and final norm alone, run on supplied embeddings and
+    /// returning hidden states: neither a token table nor an output head
+    /// (LFM3-Audio's encoder and LiquidCodec decoder).
+    pub fn load_trunk(
+        loader: &GgufLoader,
+        cfg: Lfm2BackboneConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(loader, cfg, device, BackboneParts::Trunk)
     }
 
     fn load_inner(
         loader: &GgufLoader,
         cfg: Lfm2BackboneConfig,
         device: &Device,
-        with_token_embeddings: bool,
+        parts: BackboneParts,
     ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (context_length, head_dim) = rope_table_geometry(&cfg)?;
-        let (cos, sin) = precompute_freqs(head_dim, cfg.rope_freq_base, context_length, device)?;
+        let lfm3 = cfg.lfm3.clone().unwrap_or_default();
+        let (cos, sin) = precompute_freqs_scaled(
+            head_dim,
+            cfg.rope_freq_base,
+            lfm3.rope_freq_factors.as_deref(),
+            context_length,
+            device,
+        )?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+        // LFM3's sliding-window layers rotate at their own base.
+        let swa_tables = lfm3
+            .rope_freq_base_swa
+            .map(|base| -> Result<(Tensor, Tensor, Tensor)> {
+                let (cos, sin) = precompute_freqs(head_dim, base, context_length, device)?;
+                let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+                Ok((cos, sin, cos_sin))
+            })
+            .transpose()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let embedding_names = [
@@ -1490,7 +1726,9 @@ impl QuantizedLfm2Backbone {
         // (`QTensor::embedding`, all backends), which a tied LM head shares:
         // no dequantized copy (512 MiB F32 for LFM2.5's 65,536 x 2,048
         // vocabulary) and no second quantized read for the head.
-        let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
+        let (token_embeddings, vocab_size, hidden_size) = if parts == BackboneParts::Trunk {
+            (None, 0, cfg.embedding_length)
+        } else if parts == BackboneParts::Full {
             let token_embedding_q = load_weight_any(loader, device, &embedding_names)?;
             let (vocab_size, hidden_size) = token_embedding_q.tensor.shape().dims2()?;
             (Some(token_embedding_q), vocab_size, hidden_size)
@@ -1529,7 +1767,9 @@ impl QuantizedLfm2Backbone {
             )?,
             cfg.attention_layer_norm_rms_epsilon,
         )?;
-        let output_head = ProjectionHead::load(loader, device, token_embeddings.as_ref())?;
+        let output_head = (parts != BackboneParts::Trunk)
+            .then(|| ProjectionHead::load(loader, device, token_embeddings.as_ref()))
+            .transpose()?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
@@ -1562,6 +1802,28 @@ impl QuantizedLfm2Backbone {
             )?;
             let mlp =
                 Mlp::load_with_prefixes(loader, device, &[prefix.clone(), legacy_prefix.clone()])?;
+            let (post_operator_norm, post_ffn_norm) = if lfm3.sandwich_norm {
+                let norm = |names: [String; 3]| -> Result<LfmRmsNorm> {
+                    LfmRmsNorm::from_qtensor(
+                        load_qtensor_any(loader, device, &names)?,
+                        cfg.attention_layer_norm_rms_epsilon,
+                    )
+                };
+                (
+                    Some(norm([
+                        format!("{prefix}.post_attention_norm.weight"),
+                        format!("{prefix}.post_operator_norm.weight"),
+                        format!("{legacy_prefix}.post_operator_norm.weight"),
+                    ])?),
+                    Some(norm([
+                        format!("{prefix}.post_ffw_norm.weight"),
+                        format!("{prefix}.post_ffn_norm.weight"),
+                        format!("{legacy_prefix}.post_ffn_norm.weight"),
+                    ])?),
+                )
+            } else {
+                (None, None)
+            };
 
             let is_attention = cfg
                 .attention_head_count_kv
@@ -1608,6 +1870,26 @@ impl QuantizedLfm2Backbone {
                 )?;
                 let qk_norm_weight =
                     Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
+                let (layer_cos, layer_sin, layer_cos_sin) = match &swa_tables {
+                    Some((cos, sin, cos_sin)) if cfg.layer_uses_swa_rope(layer_idx) => {
+                        (cos.clone(), sin.clone(), cos_sin.clone())
+                    }
+                    _ => (cos.clone(), sin.clone(), cos_sin.clone()),
+                };
+                let gate = lfm3
+                    .attention_output_gate
+                    .then(|| {
+                        load_linear_any(
+                            loader,
+                            device,
+                            &[
+                                format!("{prefix}.attn_gate.weight"),
+                                format!("{prefix}.self_attn.gate_proj.weight"),
+                                format!("{legacy_prefix}.self_attn.gate_proj.weight"),
+                            ],
+                        )
+                    })
+                    .transpose()?;
                 LayerKind::Attention(AttentionLayer {
                     wq: load_linear_any(
                         loader,
@@ -1651,13 +1933,14 @@ impl QuantizedLfm2Backbone {
                     n_head: cfg.attention_head_count,
                     n_kv_head,
                     head_dim: cfg.embedding_length / cfg.attention_head_count,
-                    sliding_window: cfg.attention_sliding_window,
-                    cos: cos.clone(),
-                    sin: sin.clone(),
-                    cos_sin: cos_sin.clone(),
+                    sliding_window: cfg.layer_sliding_window(layer_idx),
+                    cos: layer_cos,
+                    sin: layer_sin,
+                    cos_sin: layer_cos_sin,
                     neg_inf: neg_inf.clone(),
                     physical_layer,
                     model_layer: layer_idx,
+                    gate,
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {
@@ -1704,6 +1987,8 @@ impl QuantizedLfm2Backbone {
                 ffn_norm,
                 mlp,
                 kind,
+                post_operator_norm,
+                post_ffn_norm,
             });
         }
 
@@ -1740,14 +2025,20 @@ impl QuantizedLfm2Backbone {
             .map_err(Error::from)
     }
 
+    fn head(&self) -> Result<&ProjectionHead> {
+        self.output_head.as_ref().ok_or_else(|| {
+            Error::InferenceError("LFM2 trunk was loaded without an output head".into())
+        })
+    }
+
     pub fn project_hidden(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        self.output_head.forward(hidden_states)
+        self.head()?.forward(hidden_states)
     }
 
     pub fn project_last_hidden(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
         let last_hidden = hidden_states.i((.., seq_len - 1, ..))?;
-        self.output_head.forward(&last_hidden)
+        self.head()?.forward(&last_hidden)
     }
 
     pub(crate) fn forward_tokens_physical(
@@ -1902,7 +2193,7 @@ impl QuantizedLfm2Backbone {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Tensor> {
             let mut hidden_states = input_embeds.clone();
-            let mut rotary_rows = None;
+            let mut rotary_rows = Vec::new();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 diagnostics::check_batch_layer(&hidden_states, "input", layer_idx, positions)?;
                 let residual = hidden_states.clone();
@@ -1922,15 +2213,15 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_retained_decode_batch(&hidden, &mut refs)?
                     }
                 };
-                diagnostics::check_batch_layer(&hidden, "operator output", layer_idx, positions)?;
-                hidden_states = (&hidden + &residual)?;
+                let check = |tensor: &Tensor, stage: &str| {
+                    diagnostics::check_batch_layer(tensor, stage, layer_idx, positions)
+                };
+                hidden_states = layer.operator_residual(hidden, &residual, check)?;
                 diagnostics::check_batch_layer(&hidden_states, "residual", layer_idx, positions)?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
                 diagnostics::check_batch_layer(&hidden, "FFN norm", layer_idx, positions)?;
-                let mlp = layer.mlp.forward(&hidden)?;
-                diagnostics::check_batch_layer(&mlp, "MLP output", layer_idx, positions)?;
-                hidden_states = (&mlp + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
                 diagnostics::check_batch_layer(
                     &hidden_states,
                     "MLP residual",
@@ -2071,11 +2362,10 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_mixed(&hidden, &layout, &mut working)?
                     }
                 };
-                hidden_states = (&hidden + &residual)?;
+                hidden_states = layer.operator_residual(hidden, &residual, |_, _| Ok(()))?;
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let mlp = layer.mlp.forward(&hidden)?;
-                hidden_states = (&mlp + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, |_, _| Ok(()))?;
             }
             if sample_tokens.is_empty() {
                 return Ok(None);
@@ -2083,7 +2373,7 @@ impl QuantizedLfm2Backbone {
             let normalized = self.norm.forward(&hidden_states)?.squeeze(0)?;
             let sample_tokens =
                 Tensor::from_vec(sample_tokens, sample_rows.len(), normalized.device())?;
-            self.output_head
+            self.head()?
                 .forward(&normalized.index_select(&sample_tokens, 0)?)
                 .map(Some)
         })();
@@ -2239,15 +2529,15 @@ impl QuantizedLfm2Backbone {
                 }
                 LayerKind::ShortConv(layer) => layer.forward_retained(&hidden, &mut working)?,
             };
-            diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-            hidden_states = (&hidden + &residual)?;
+            let check = |tensor: &Tensor, stage: &str| {
+                diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+            };
+            hidden_states = layer.operator_residual(hidden, &residual, check)?;
             diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
             let residual = hidden_states.clone();
             let hidden = layer.ffn_norm.forward(&hidden_states)?;
             diagnostics::check_layer(&hidden, "FFN norm", layer_idx, index_pos)?;
-            let mlp = layer.mlp.forward(&hidden)?;
-            diagnostics::check_layer(&mlp, "MLP output", layer_idx, index_pos)?;
-            hidden_states = (&mlp + &residual)?;
+            hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
             diagnostics::check_layer(&hidden_states, "MLP residual", layer_idx, index_pos)?;
         }
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -2333,15 +2623,15 @@ impl QuantizedLfm2Backbone {
                         shortconv.forward_physical(&hidden, transaction)?
                     }
                 };
-                diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-                hidden_states = (&hidden + &residual)?;
+                let check = |tensor: &Tensor, stage: &str| {
+                    diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+                };
+                hidden_states = layer.operator_residual(hidden, &residual, check)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
                 let residual = hidden_states.clone();
                 let hidden = layer.ffn_norm.forward(&hidden_states)?;
-                let hidden = layer.mlp.forward(&hidden)?;
-                diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
-                hidden_states = (&hidden + &residual)?;
+                hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
                 diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
             }
             {
@@ -2416,15 +2706,15 @@ impl QuantizedLfm2Backbone {
             }
             LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
         };
-        diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
-        let hidden_states = (&hidden + &residual)?;
+        let check = |tensor: &Tensor, stage: &str| {
+            diagnostics::check_layer(tensor, stage, layer_idx, index_pos)
+        };
+        let hidden_states = layer.operator_residual(hidden, &residual, check)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
 
         let residual = hidden_states.clone();
         let hidden = layer.ffn_norm.forward(&hidden_states)?;
-        let hidden = layer.mlp.forward(&hidden)?;
-        diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
-        let hidden_states = (&hidden + &residual)?;
+        let hidden_states = layer.ffn_residual(&hidden, &residual, check)?;
         diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
         Ok(hidden_states)
     }
@@ -2499,6 +2789,32 @@ impl QuantizedLfm2Backbone {
     }
 }
 
+/// A causal depthwise convolution of `x` `[batch, channels, time]` with
+/// `weight` `[channels, width]`: `out[t] = sum_k weight[k] * x[t + k - (width
+/// - 1)]`, zero before the start, as one shifted multiply-add per tap.
+fn depthwise_causal_conv(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let (batch, channels, time) = x.dims3()?;
+    let width = weight.dim(1)?;
+    let padded = Tensor::cat(
+        &[
+            &Tensor::zeros((batch, channels, width - 1), x.dtype(), x.device())?,
+            x,
+        ],
+        2,
+    )?;
+    let mut out = None::<Tensor>;
+    for tap in 0..width {
+        let term = padded
+            .narrow(2, tap, time)?
+            .broadcast_mul(&weight.narrow(1, tap, 1)?.unsqueeze(0)?)?;
+        out = Some(match out {
+            Some(sum) => (sum + term)?,
+            None => term,
+        });
+    }
+    Ok(out.expect("a filter has at least one tap").contiguous()?)
+}
+
 /// Per-layer input tails of [`QuantizedLfm2Backbone::forward_embeds_stream`]:
 /// the positions consumed and, before each layer, the rows its operator can
 /// still reach. Tensors are immutable, so a clone is an exact checkpoint.
@@ -2512,6 +2828,17 @@ impl Lfm2StatelessStream {
     pub(crate) fn positions(&self) -> usize {
         self.positions
     }
+}
+
+/// What [`QuantizedLfm2Backbone::load_inner`] reads besides the layers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackboneParts {
+    /// Token table, layers and output head.
+    Full,
+    /// Layers and output head; the token table is never read.
+    ForEmbeds,
+    /// Layers and final norm only.
+    Trunk,
 }
 
 /// Attention masking for [`QuantizedLfm2Backbone::forward_embeds_stateless`].
@@ -2630,10 +2957,47 @@ fn precompute_freqs(
     ))
 }
 
+/// [`precompute_freqs`] with each inverse frequency divided by its factor
+/// (GGUF `rope_freqs.weight`, as llama.cpp applies it). LFM3's global layers
+/// carry 1e30 on their low-frequency half, which leaves it unrotated.
+fn precompute_freqs_scaled(
+    head_dim: usize,
+    freq_base: f64,
+    factors: Option<&[f64]>,
+    context_length: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    if factors.is_some_and(|factors| factors.len() != head_dim / 2) {
+        return Err(Error::ModelLoadError(format!(
+            "LFM RoPE frequency factors must cover {} frequencies",
+            head_dim / 2
+        )));
+    }
+    let (cos, sin) = rope_tables_f64_scaled(head_dim, freq_base, factors, context_length);
+    let half = head_dim / 2;
+    Ok((
+        Tensor::from_vec(cos, (context_length, half), device)?,
+        Tensor::from_vec(sin, (context_length, half), device)?,
+    ))
+}
+
 fn rope_tables_f64(head_dim: usize, freq_base: f64, context_length: usize) -> (Vec<f32>, Vec<f32>) {
+    rope_tables_f64_scaled(head_dim, freq_base, None, context_length)
+}
+
+fn rope_tables_f64_scaled(
+    head_dim: usize,
+    freq_base: f64,
+    factors: Option<&[f64]>,
+    context_length: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let inv_freq: Vec<f64> = (0..head_dim)
         .step_by(2)
-        .map(|index| 1.0 / freq_base.powf(index as f64 / head_dim as f64))
+        .enumerate()
+        .map(|(pair, index)| {
+            let factor = factors.map_or(1.0, |factors| factors[pair]);
+            1.0 / freq_base.powf(index as f64 / head_dim as f64) / factor
+        })
         .collect();
     let mut cos = Vec::with_capacity(context_length * inv_freq.len());
     let mut sin = Vec::with_capacity(context_length * inv_freq.len());
@@ -2665,6 +3029,9 @@ struct Lfm2QuantizedWeight {
 struct Lfm2Linear {
     matmul: QMatMul,
     small_batch: Option<SmallBatchMatVec>,
+    /// Every `[rows, 1, k]` input, one row included, takes the small-batch
+    /// mat-vec in groups (see [`QuantizedLfm2Backbone::make_decode_rows_invariant`]).
+    rows_invariant: bool,
 }
 
 impl Lfm2Linear {
@@ -2672,6 +3039,7 @@ impl Lfm2Linear {
         Ok(Self {
             matmul: QMatMul::from_weights(weight.tensor)?,
             small_batch: weight.small_batch,
+            rows_invariant: false,
         })
     }
 
@@ -2680,10 +3048,50 @@ impl Lfm2Linear {
         #[cfg(test)]
         let per_row_mat_vec = per_row_mat_vec && !FORCE_CANDLE_MATVEC.with(std::cell::Cell::get);
         match &self.small_batch {
+            Some(small_batch)
+                if per_row_mat_vec && self.rows_invariant && small_batch.takes(input) =>
+            {
+                small_batch.forward_in_groups(input)
+            }
             Some(small_batch) if per_row_mat_vec && small_batch.accepts(input) => {
                 small_batch.forward(input)
             }
             _ => self.matmul.forward(input),
+        }
+    }
+}
+
+impl QuantizedLfm2Backbone {
+    /// Give every decode row the same bits whatever rows decode beside it.
+    /// On Metal a lone row takes Candle's mat-vec and two to eight rows
+    /// izwi's k-quant mat-vec, which round differently; sampled audio drawn
+    /// from those logits would drift between a request served alone and the
+    /// same request under load. Here every `[rows, 1, k]` projection, the LM
+    /// head included, takes the k-quant mat-vec in groups of at most eight.
+    /// CPU's quantized matmul is already row-invariant. Chat keeps the
+    /// default: Candle's mat-vec is faster for a lone row.
+    pub(crate) fn make_decode_rows_invariant(&mut self) {
+        let head = self.output_head.iter_mut().map(|head| &mut head.weight);
+        let layers = self.layers.iter_mut().flat_map(|layer| {
+            let mut linears = vec![&mut layer.mlp.gate, &mut layer.mlp.down, &mut layer.mlp.up];
+            match &mut layer.kind {
+                LayerKind::Attention(attention) => {
+                    linears.extend([
+                        &mut attention.wq,
+                        &mut attention.wk,
+                        &mut attention.wv,
+                        &mut attention.wo,
+                    ]);
+                    linears.extend(attention.gate.as_mut());
+                }
+                LayerKind::ShortConv(shortconv) => {
+                    linears.extend([&mut shortconv.in_proj, &mut shortconv.out_proj]);
+                }
+            }
+            linears
+        });
+        for linear in head.chain(layers) {
+            linear.rows_invariant = true;
         }
     }
 }
@@ -2703,6 +3111,14 @@ impl SmallBatchMatVec {
     }
 
     fn forward(&self, _: &Tensor) -> candle_core::Result<Tensor> {
+        match *self {}
+    }
+
+    fn takes(&self, _: &Tensor) -> bool {
+        match *self {}
+    }
+
+    fn forward_in_groups(&self, _: &Tensor) -> candle_core::Result<Tensor> {
         match *self {}
     }
 }
@@ -3314,8 +3730,9 @@ pub(crate) mod tests {
             }
         }
 
-        // One gather serves every layer of a step; another table regathers.
-        let mut rows = None;
+        // One gather serves every layer of a step; another table gathers once
+        // more, and the first stays cached for the layers that alternate.
+        let mut rows = Vec::new();
         let first = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
             .unwrap()
             .cos
@@ -3329,6 +3746,16 @@ pub(crate) mod tests {
         let other =
             super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3).unwrap();
         assert_ne!(other.cos.id(), first);
+        let other_id = other.cos.id();
+        let again = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        assert_eq!(again, first);
+        assert_eq!(rows.len(), 2);
+        let other = super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3)
+            .unwrap();
+        assert_eq!(other.cos.id(), other_id);
         let (q2, k2) = other.rotate(&query, &key).unwrap();
         for (left, right) in [(&q, &q2), (&k, &k2)] {
             assert_eq!(
@@ -3484,6 +3911,60 @@ pub(crate) mod tests {
     #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
     fn unfused_shortconv_ring_falls_back_on_cuda() {
         assert_unfused_ring_matches_cpu(&Device::new_cuda(0).expect("CUDA device required"));
+    }
+
+    #[test]
+    fn depthwise_causal_conv_matches_a_grouped_conv1d() {
+        let device = Device::Cpu;
+        let (channels, width, time) = (5, 7, 11);
+        let x = Tensor::randn(0f32, 1.0, (2, channels, time), &device).unwrap();
+        let weight = Tensor::randn(0f32, 1.0, (channels, width), &device).unwrap();
+        let conv = candle_nn::Conv1d::new(
+            weight.reshape((channels, 1, width)).unwrap(),
+            None,
+            candle_nn::Conv1dConfig {
+                padding: width - 1,
+                groups: channels,
+                ..Default::default()
+            },
+        );
+        let expected = candle_nn::Module::forward(&conv, &x)
+            .unwrap()
+            .narrow(2, 0, time)
+            .unwrap();
+        let actual = super::depthwise_causal_conv(&x, &weight).unwrap();
+        let worst = (expected - actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(worst < 1e-5, "worst difference {worst}");
+    }
+
+    /// The host ring loop sums the same taps in the same order as the op
+    /// path: bit-identical, across a wrapped ring with a partial history.
+    #[test]
+    fn host_shortconv_ring_is_bit_identical_to_the_op_path() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = &Device::Cpu;
+        for (capacity, cursor, valid, steps) in [(7, 0, 0, 12), (7, 23, 7, 5), (7, 9, 4, 1), (3, 40, 3, 9)] {
+            let hidden = 6;
+            let ring = xorshift_tensor(&[capacity, 1, hidden], 11, 1.0, device).unwrap();
+            let input = xorshift_tensor(&[1, hidden, steps], 12, 1.0, device).unwrap();
+            let weight = xorshift_tensor(&[hidden, capacity], 13, 1.0, device).unwrap();
+            let host = super::host_shortconv_ring(&ring, &input, &weight, cursor, valid).unwrap();
+            let ops = super::op_shortconv_ring(&ring, &input, &weight, cursor, valid).unwrap();
+            assert_eq!(
+                host.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                ops.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "capacity {capacity}, cursor {cursor}, valid {valid}, steps {steps}"
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape,
     CheckpointPolicy, ComponentShapeInstantiation, DomainStepIntent,
     InferenceStateContract, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
-    PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
+    PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
     StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
     StateGroupSpec, StateScope, StateUpdateKind, TensorComponentSpec, TensorRole, CURRENT_INFERENCE_STATE_ABI,
 };
@@ -135,7 +135,18 @@ pub(crate) fn lfm2_main_invocation_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
-    lfm2_main_contract(config, layout, ids, invocation_header, StateDType::F32)
+    lfm2_main_invocation_contract_with_kv(config, layout, ids, StateDType::F32)
+}
+
+/// [`lfm2_main_invocation_contract`] with paged KV stored as `kv_dtype`
+/// (activations stay F32; the attention call sites cast to and from it).
+pub(crate) fn lfm2_main_invocation_contract_with_kv(
+    config: &Lfm2BackboneConfig,
+    layout: &Lfm2StateLayout,
+    ids: Lfm2StateIds,
+    kv_dtype: StateDType,
+) -> Result<InferenceStateContract> {
+    lfm2_main_contract(config, layout, ids, invocation_header, kv_dtype, false)
 }
 
 /// Scheduler-owned cache contract for incremental LFM2 chat.
@@ -149,6 +160,20 @@ pub(crate) fn lfm2_managed_cache_contract(
     config: &Lfm2BackboneConfig,
     kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
+    lfm2_managed_cache_contract_with_prefix(config, kv_dtype, false)
+}
+
+/// [`lfm2_managed_cache_contract`] that, with `share_prefixes`, shares
+/// conversation prefixes across requests: attention publishes committed
+/// pages and the ShortConv ring a snapshot at every page boundary, so a
+/// request attaches the pages of a shared prefix and restores the ring at
+/// its end. Sliding-window layers need nothing more: they share the one
+/// page table and narrow their own view.
+pub(crate) fn lfm2_managed_cache_contract_with_prefix(
+    config: &Lfm2BackboneConfig,
+    kv_dtype: StateDType,
+    share_prefixes: bool,
+) -> Result<InferenceStateContract> {
     let layout = Lfm2StateLayout::from_config(config)?;
     lfm2_main_contract(
         config,
@@ -156,6 +181,7 @@ pub(crate) fn lfm2_managed_cache_contract(
         Lfm2StateIds::CANONICAL,
         retained_header,
         kv_dtype,
+        share_prefixes,
     )
 }
 
@@ -165,24 +191,34 @@ fn lfm2_main_contract(
     ids: Lfm2StateIds,
     header: fn(StateDomainId, StateClock) -> StateDomainHeader,
     kv_dtype: StateDType,
+    share_prefixes: bool,
 ) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
         .map_err(|_| Error::ModelLoadError("LFM2 query-head count exceeds u32".into()))?;
     let head_dim = u32::try_from(head_dim)
         .map_err(|_| Error::ModelLoadError("LFM2 attention head dimension exceeds u32".into()))?;
-    let pattern = match config.attention_sliding_window {
-        Some(window_tokens) => AttentionPattern::SlidingWindow {
-            window_tokens: u32::try_from(window_tokens)
-                .map_err(|_| Error::ModelLoadError("LFM2 sliding window exceeds u32".into()))?,
-        },
-        None => AttentionPattern::Full,
+    // LFM3 mixes global and sliding-window layers; the mixed domain keeps one
+    // full page table and each local layer narrows its own view. A separate
+    // sliding domain would release the local layers' hidden pages, but a
+    // shared prefix attaches whole committed pages: an attached request needs
+    // the window behind its boundary, which a released sliding page no longer
+    // holds. Prefix reuse wins; the local layers keep every page.
+    let pattern = |model_layer: usize| -> Result<AttentionPattern> {
+        Ok(match config.layer_sliding_window(model_layer) {
+            Some(window_tokens) => AttentionPattern::SlidingWindow {
+                window_tokens: u32::try_from(window_tokens)
+                    .map_err(|_| Error::ModelLoadError("LFM2 sliding window exceeds u32".into()))?,
+            },
+            None => AttentionPattern::Full,
+        })
     };
     let layers = layout
         .attention_model_layers
         .iter()
         .map(|model_layer| {
             let kv_heads = config.attention_head_count_kv[*model_layer as usize];
+            let pattern = pattern(*model_layer as usize)?;
             Ok(PagedAttentionLayerSpec {
                 model_layer: *model_layer,
                 query_heads,
@@ -201,8 +237,18 @@ fn lfm2_main_contract(
         .collect::<Result<Vec<_>>>()?;
     let preferred_tokens = u32::try_from(default_kv_page_size())
         .map_err(|_| Error::ModelLoadError("LFM2 page size exceeds u32".into()))?;
+    let mut attention_header = header(ids.attention, StateClock::DecoderTokens);
+    let mut shortconv_header = header(ids.shortconv, StateClock::DecoderTokens);
+    if share_prefixes {
+        attention_header.prefix = PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        };
+        shortconv_header.prefix = PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred_tokens),
+        };
+    }
     let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: header(ids.attention, StateClock::DecoderTokens),
+        header: attention_header,
         layers,
         page_size: PageSizeConstraint {
             min_tokens: 1,
@@ -215,7 +261,7 @@ fn lfm2_main_contract(
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
     let shortconv = StateDomainSpec::Ring(RingStateDomainSpec {
-        header: header(ids.shortconv, StateClock::DecoderTokens),
+        header: shortconv_header,
         components_per_step: layout
             .shortconv_components
             .iter()
@@ -286,6 +332,7 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
         || config.attention_head_count_kv.len() != config.block_count
         || config.shortconv_l_cache == 0
         || config.attention_sliding_window == Some(0)
+        || (0..config.block_count).any(|layer| config.layer_sliding_window(layer) == Some(0))
         || config
             .attention_head_count_kv
             .iter()
@@ -299,6 +346,16 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
 }
 
 pub(crate) fn paged_f32_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+    paged_invocation_bytes(state, max_tokens, 4)
+}
+
+/// The bytes of a paged invocation domain holding `max_tokens` (rounded up
+/// to whole pages) at `element_bytes` per K/V element.
+pub(crate) fn paged_invocation_bytes(
+    state: &StateDomainSpec,
+    max_tokens: u64,
+    element_bytes: u64,
+) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 paged byte bound received non-paged state".into(),
@@ -327,7 +384,7 @@ pub(crate) fn paged_f32_invocation_bytes(state: &StateDomainSpec, max_tokens: u6
         .try_fold(0_u64, |total, layer| {
             let per_token = u64::from(layer.kv_heads)
                 .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
-                .and_then(|elements| elements.checked_mul(4))
+                .and_then(|elements| elements.checked_mul(element_bytes))
                 .ok_or_else(|| Error::ModelLoadError("LFM2 KV geometry overflow".into()))?;
             total
                 .checked_add(per_token)
@@ -380,6 +437,7 @@ mod tests {
             attention_sliding_window: Some(8),
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         }
     }
 
@@ -496,6 +554,7 @@ mod tests {
             attention_sliding_window: None,
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         };
         let layout = Lfm2StateLayout::from_config(&config).unwrap();
         let contract =
@@ -509,5 +568,22 @@ mod tests {
         assert_eq!(per_slot * 16, 50_424_053_760);
         assert!(per_slot + CONSERVATIVE_MODEL_BYTES < L40S_BYTES);
         assert!(per_slot * 16 + CONSERVATIVE_MODEL_BYTES > L40S_BYTES);
+    }
+
+    /// With prefix sharing the contract passes the hybrid snapshot gate:
+    /// committed pages for attention and a ring snapshot at every page.
+    /// Without it (LFM2.5-Audio, a backend the catalog does not enable) it
+    /// stays admission-inert.
+    #[test]
+    fn prefix_sharing_contract_passes_the_snapshot_gate_only_when_enabled() {
+        use crate::engine::tensor_snapshot_prefix_policy;
+        let shared =
+            lfm2_managed_cache_contract_with_prefix(&config(), StateDType::F16, true).unwrap();
+        let policy = tensor_snapshot_prefix_policy(&shared).expect("hybrid sharing policy");
+        assert_eq!(policy.paged_domain, LFM2_ATTENTION_STATE_DOMAIN);
+        assert_eq!(&*policy.tensor_domains, &[LFM2_SHORTCONV_STATE_DOMAIN]);
+        assert_eq!(policy.interval_steps, default_kv_page_size() as u64);
+        let plain = lfm2_managed_cache_contract(&config(), StateDType::F16).unwrap();
+        assert!(tensor_snapshot_prefix_policy(&plain).is_none());
     }
 }

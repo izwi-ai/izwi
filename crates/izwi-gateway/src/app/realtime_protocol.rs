@@ -271,6 +271,24 @@ pub enum RealtimeServerEvent {
     AssistantAudioCompleted {
         last_chunk_sequence: u64,
     },
+    /// The reply calls a tool: the server runs a built-in one, and the
+    /// client answers its own with `function_call_output`.
+    FunctionCall {
+        call_id: String,
+        name: String,
+        /// The arguments, a JSON object as text.
+        arguments: String,
+        /// Absent for a tool the session does not offer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        executor: Option<RealtimeFunctionExecutor>,
+    },
+    /// A call's result, which the reply's next round hears.
+    FunctionCallCompleted {
+        call_id: String,
+        name: String,
+        status: RealtimeFunctionCallStatus,
+        output: String,
+    },
     Interruption {
         reason: RealtimeInterruptionReason,
         cutoff_event_id: u64,
@@ -403,6 +421,23 @@ pub enum RealtimeInterruptionReason {
     PreemptedByNewTurn,
     Backpressure,
     SessionClosing,
+}
+
+/// Who runs a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeFunctionExecutor {
+    Server,
+    Client,
+}
+
+/// How a tool call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeFunctionCallStatus {
+    Ok,
+    Error,
+    Timeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

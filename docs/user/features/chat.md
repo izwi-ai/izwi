@@ -12,10 +12,10 @@ Have local conversations with chat models running on your own machine.
 Izwi chat provides:
 
 - **Local inference** — Model execution stays on-device
-- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, and LFM2.5
+- **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, LFM3, and LFM3-Audio
 - **System prompts** — Shape assistant behavior
 - **Streaming output** — Incremental response tokens
-- **Multimodal support (Qwen3.5 only)** — Image inputs in chat API requests
+- **Multimodal support** — Image inputs (Qwen3.5) and audio inputs (LFM3-Audio) in chat requests
 
 ---
 
@@ -71,6 +71,10 @@ izwi chat --model LFM2.5-1.2B-Instruct-GGUF
 3. Send and review streamed output
 4. Switch loaded models from the model selector
 
+With an LFM3-Audio model selected, attach audio files or record from your
+microphone in the composer: up to 8 clips of up to 120 s each per message.
+Each clip plays back in the conversation, and LFM3-Audio answers in text.
+
 ---
 
 ## Using the API
@@ -124,6 +128,30 @@ Image inputs are supported only on Qwen3.5 GGUF chat variants:
 }
 ```
 
+### Audio Input Example
+
+LFM3-Audio hears audio clips in user messages and answers in text. Send each
+clip inline as base64 `input_audio` (or an `audio_url` part with a `data:` URL);
+it is heard where the message places it:
+
+```json
+{
+  "model": "LFM3-Audio-2B-GGUF",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_audio", "input_audio": {"data": "<base64 WAV>", "format": "wav"}},
+        {"type": "text", "text": "Which animal does the speaker mention?"}
+      ]
+    }
+  ]
+}
+```
+
+A request carries at most 8 clips of at most 120 s each. Replies are text; for
+spoken replies use [Voice Mode](/features/voice).
+
 The API also supports SSE streaming, `stream_options.include_usage`, tool-call
 payloads, and strict/relaxed OpenAI compatibility profiles. See the
 [API Reference](/api#chat-completions) for the full request contract and
@@ -139,6 +167,8 @@ streaming sequence.
 | Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text only) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
+| LFM3 | `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF` (reasoning on by default, tool calling) |
+| LFM3-Audio | `LFM3-Audio-2B-GGUF`, `LFM3-Audio-2B-Q8_0-GGUF` (audio questions, text answers, tool calling; local server only) |
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
@@ -150,9 +180,10 @@ scale-aware Q8_0 fallback.
 
 ## Multimodal Limits
 
-- Multimodal media chat is currently limited to **Qwen3.5 GGUF** models.
+- Image chat is limited to **Qwen3.5 GGUF** models, and audio chat to **LFM3-Audio** (which hears audio only, not images).
 - **Video inputs are not yet implemented**.
-- Non-Qwen3.5 chat variants, including `Qwen3.8-27B-FP8`, currently support text-only requests.
+- Other chat variants, including `Qwen3.8-27B-FP8`, support text-only requests.
+- Audio clips are sent inline; the server does not fetch audio URLs.
 
 ---
 
@@ -160,7 +191,7 @@ scale-aware Q8_0 fallback.
 
 1. Use `izwi list` to pick a currently enabled model ID.
 2. Use stronger models (`Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory; check the [Qwen3.8 CUDA residency requirements](/support-matrix#qwen38-cuda-weight-residency) before deploying the 27B checkpoint.
-3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`) for low-latency usage.
+3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`, `LFM3-1.7B-GGUF`) for low-latency usage.
 
 ---
 
@@ -214,10 +245,17 @@ figures if they do not fit.
 
 ### Chat history reuse
 
-Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA and Qwen3.6 on
-CPU and CUDA do not recompute the history they already processed (Qwen3.8 on CPU and
-Metal too, once its MTP draft head is off with `IZWI_QWEN38_MTP=0`). A
-turn's prompt is split before its final assistant header (earlier answers are
+Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA, Qwen3.6 on
+CPU and CUDA, and LFM2.5 and LFM3 on CPU and Metal do not recompute the history they
+already processed (Qwen3.8 on CPU and Metal too, once its MTP draft head is off with
+`IZWI_QWEN38_MTP=0`). On CPU and Metal this needs resumable prefill, which is off by
+default there:
+
+```bash
+export IZWI_ENABLE_CHUNKED_PREFILL=1
+```
+
+A turn's prompt is split before its final assistant header (earlier answers are
 re-rendered, so only the history up to there repeats in the next turn); the server
 keeps the KV pages of that history and a snapshot of the recurrent state at its last
 full 64-token page. The next turn of the conversation attaches there and prefills only
@@ -226,7 +264,7 @@ conversations. A history shorter than one page has no snapshot, so after a very 
 first prompt the third turn is the first to reuse.
 
 Snapshots are bounded: `IZWI_MAX_PREFIX_SNAPSHOTS` (default 8) snapshots per model,
-about 157 MB each for Qwen3.8, reserved at load. The least recently used snapshot is
+about 157 MB each for Qwen3.8 and under 1 MB for LFM2.5 and LFM3, reserved at load. The least recently used snapshot is
 dropped first, so up to 8 conversations continue with their history reused at once;
 others prefill in full. History pages share the KV cache and are released when a
 request needs the room. A conversation's whole history must fit the prefix page

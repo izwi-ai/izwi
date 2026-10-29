@@ -22,9 +22,10 @@ use crate::error::{invocation_error_class, rejection_class, ApiError, ErrorClass
 use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
 use crate::ids::new_uuid;
 use izwi_model_catalog::{
-    parse_chat_model_variant, resolve_chat_max_tokens, resolve_chat_sampling, ChatGeneration,
-    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatSamplingRequest,
-    ChatTemplateKwargs, ChatTruncation, ModelVariant, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
+    parse_chat_request_model_variant, resolve_chat_max_tokens, resolve_chat_sampling,
+    ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig,
+    ChatSamplingRequest, ChatTemplateKwargs, ChatTruncation, ModelVariant, ResolvedChatSampling,
+    CHAT_MAX_TOKENS_UNSET,
 };
 
 #[derive(Debug, Clone)]
@@ -580,8 +581,11 @@ pub fn chat_top_k(top_k: Option<i64>) -> Result<Option<usize>, ApiError> {
     }
 }
 
+/// The model a chat route request names: a text chat model, or LFM3-Audio,
+/// which answers a conversation carrying audio clips in text.
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
-    parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
+    parse_chat_request_model_variant(Some(model_id))
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 /// The execution target behind the public chat completions route: the
@@ -1058,6 +1062,12 @@ async fn shutdown_requested(shutdown: Option<&mut tokio::sync::watch::Receiver<b
 }
 
 fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiError> {
+    if !request.variant.is_chat() {
+        return Err(ApiError::bad_request(format!(
+            "Remote chat execution serves text chat models; {} answers chat only on a local server",
+            request.variant.dir_name()
+        )));
+    }
     if !request.chat_config.media_inputs.is_empty() {
         return Err(ApiError::bad_request(
             "Remote chat execution currently supports text-only requests",
@@ -1529,6 +1539,14 @@ mod tests {
             "{}",
             error.message
         );
+        // LFM3-Audio answers chat on a local server only.
+        let audio = qwen_request(ModelVariant::Lfm3Audio2BGguf, None);
+        let error = validate_remote_chat_scope(&audio).expect_err("LFM3-Audio is local");
+        assert!(
+            error.message.contains("only on a local server"),
+            "{}",
+            error.message
+        );
     }
 
     /// The D8 policy carries the caller's own budget (none when unset) and
@@ -1596,7 +1614,7 @@ mod tests {
     #[test]
     fn every_chat_model_resolves_its_pinned_default_sampling() {
         type Sampling = (f32, f32, usize, f32, f32);
-        let profiled: [(ModelVariant, [Sampling; 3]); 8] = [
+        let profiled: [(ModelVariant, [Sampling; 3]); 10] = [
             (
                 ModelVariant::Qwen3827BFp8,
                 [
@@ -1653,6 +1671,8 @@ mod tests {
                 ModelVariant::Lfm2512BThinkingGguf,
                 [(0.05, 1.0, 50, 1.05, 0.0); 3],
             ),
+            (ModelVariant::Lfm317BGguf, [(0.1, 1.0, 50, 1.1, 0.0); 3]),
+            (ModelVariant::Lfm317BQ8Gguf, [(0.1, 1.0, 50, 1.1, 0.0); 3]),
         ];
         let engine_default = (0.7, 0.9, 0, 1.1, 0.0);
         let mut chat_models = 0;

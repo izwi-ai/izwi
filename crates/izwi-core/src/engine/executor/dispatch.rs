@@ -13,7 +13,7 @@ use super::{
     ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, NativeExecutor,
 };
 use crate::engine::ReadyQuantum;
-use crate::engine::{BatchDispatch, BatchDispatchKind};
+use crate::engine::{BatchDispatch, BatchDispatchKind, NativeBatchMode};
 
 /// A mixed batch's decode rows and prefill spans; decode rows come first.
 pub(super) fn split_mixed_rows(
@@ -71,6 +71,14 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         },
     },
     DispatchRoute {
+        name: "lfm3_audio_tts",
+        task: TaskType::TTS,
+        variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::Lfm3Audio),
+        handler: |executor, request, scheduled| {
+            executor.lfm3_audio_request_with_managed_cache(request, scheduled, None)
+        },
+    },
+    DispatchRoute {
         name: "tts",
         task: TaskType::TTS,
         variant_matcher: None,
@@ -81,6 +89,14 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         task: TaskType::ASR,
         variant_matcher: None,
         handler: NativeExecutor::transcribe_request,
+    },
+    DispatchRoute {
+        name: "lfm3_audio_speech_to_speech",
+        task: TaskType::SpeechToSpeech,
+        variant_matcher: Some(|variant| variant.family() == crate::catalog::ModelFamily::Lfm3Audio),
+        handler: |executor, request, scheduled| {
+            executor.lfm3_audio_request_with_managed_cache(request, scheduled, None)
+        },
     },
     DispatchRoute {
         name: "speech_to_speech",
@@ -420,6 +436,19 @@ impl NativeExecutor {
                         reservation,
                     )?;
                     self.maya2_tts_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if matches!(request.task_type, TaskType::TTS | TaskType::SpeechToSpeech)
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::Lfm3Audio
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.lfm3_audio_request_with_managed_cache(request, scheduled_req, Some(state))
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -1039,6 +1068,48 @@ impl NativeExecutor {
             scheduled,
             outputs,
             BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
+    /// One LFM3-Audio quantum over rows of any task: a static prefill or a
+    /// continuous decode, as `mode` says.
+    pub(super) fn execute_lfm3_audio_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+        mode: NativeBatchMode,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let kind = match mode {
+            NativeBatchMode::Continuous => BatchDispatchKind::TensorContinuous,
+            _ => BatchDispatchKind::TensorStatic,
+        };
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled)
+                    .ok_or_else(|| Error::InferenceError("LFM3-Audio row lost its request".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let managed = scheduled
+            .iter()
+            .zip(&ordered)
+            .map(|(scheduled, request)| {
+                rows.and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref())
+                    .map(|reservation| {
+                        super::retained_row_managed_state_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.lfm3_audio_batch_with_managed(&ordered, scheduled, managed)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(kind, scheduled.len()),
             rows,
         )
     }

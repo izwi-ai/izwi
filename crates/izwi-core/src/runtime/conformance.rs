@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 51;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 55;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 70;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 82;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -442,7 +442,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            57
+            69
         );
         assert_eq!(
             manifest
@@ -457,6 +457,12 @@ mod tests {
                 .retained_state,
             Managed
         );
+        for variant in [ModelVariant::Lfm317BGguf, ModelVariant::Lfm317BQ8Gguf] {
+            assert_eq!(
+                manifest_case(&manifest, variant, CapabilityKind::Chat).retained_state,
+                Managed
+            );
+        }
         assert_eq!(
             manifest_case(
                 &manifest,
@@ -488,6 +494,14 @@ mod tests {
             .retained_state,
             Stateless
         );
+        for variant in [
+            ModelVariant::Lfm3Audio2BGguf,
+            ModelVariant::Lfm3Audio2BQ8Gguf,
+        ] {
+            let lfm3_realtime = manifest_case(&manifest, variant, CapabilityKind::RealtimeAsr);
+            assert_eq!(lfm3_realtime.retained_state, Managed);
+            assert_eq!(lfm3_realtime.workspace, InvocationStateRequired);
+        }
         let voxtral_realtime = manifest_case(
             &manifest,
             ModelVariant::VoxtralMini4BRealtime2602,
@@ -534,6 +548,20 @@ mod tests {
             (ModelVariant::GraniteSpeech412B, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Tts),
+            (ModelVariant::Lfm3Audio2BGguf, CapabilityKind::Asr),
+            (ModelVariant::Lfm3Audio2BGguf, CapabilityKind::Tts),
+            (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::Asr),
+            (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::Tts),
+            (ModelVariant::Lfm3Audio2BGguf, CapabilityKind::AudioChat),
+            (
+                ModelVariant::Lfm3Audio2BGguf,
+                CapabilityKind::SpeechToSpeech,
+            ),
+            (ModelVariant::Lfm3Audio2BQ8Gguf, CapabilityKind::AudioChat),
+            (
+                ModelVariant::Lfm3Audio2BQ8Gguf,
+                CapabilityKind::SpeechToSpeech,
+            ),
         ] {
             let case = manifest_case(&manifest, variant, capability);
             assert_eq!(case.retained_state, Managed, "{variant} {capability:?}");

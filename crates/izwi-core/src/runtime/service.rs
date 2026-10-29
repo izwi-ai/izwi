@@ -74,6 +74,7 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparedPromptArtifact,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
+use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
 use crate::models::architectures::maya1::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
     MAYA1_DEFAULT_VOICE, MAYA1_VOICE_PRESETS,
@@ -474,6 +475,7 @@ pub(crate) fn retained_speech_to_speech_preparation_input_bytes(
     audio_input_bytes: usize,
     messages: &[ChatMessage],
     messages_capacity: usize,
+    tools: &[serde_json::Value],
     params: &GenerationParams,
     system_prompt: Option<&str>,
     correlation_id: Option<&str>,
@@ -486,6 +488,15 @@ pub(crate) fn retained_speech_to_speech_preparation_input_bytes(
         "speech-to-speech borrowed audio",
     )?;
     add_chat_messages_allocations(&mut total, messages, messages_capacity)?;
+    add_retained_allocation(
+        &mut total,
+        tools.len(),
+        std::mem::size_of::<serde_json::Value>(),
+        "speech-to-speech tools",
+    )?;
+    for tool in tools {
+        add_json_allocations(&mut total, tool, "speech-to-speech tool")?;
+    }
     add_generation_param_allocations(&mut total, params)?;
     add_retained_allocation(
         &mut total,
@@ -964,6 +975,7 @@ fn bind_request_to_residency(
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
+                | ModelFamily::Lfm3Audio
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1015,6 +1027,16 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "LFM2.5 Audio normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Lfm3Audio
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request.prepared_lfm3_audio_artifact_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "LFM3-Audio normal execution shape has no matching prepared artifact".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {

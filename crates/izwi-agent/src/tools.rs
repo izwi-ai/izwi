@@ -8,6 +8,10 @@ pub struct ToolContext {
     pub session_id: String,
     pub thread_id: String,
     pub user_text: String,
+    /// The arguments a model called the tool with (an object), or `null`
+    /// when the tool runs on its own.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +27,16 @@ pub trait Tool: Send + Sync {
 
     fn should_auto_run(&self, _user_text: &str) -> bool {
         false
+    }
+
+    /// The JSON Schema of the arguments a model calls the tool with.
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    /// Whether a model may call the tool.
+    fn model_callable(&self) -> bool {
+        true
     }
 
     async fn invoke(&self, ctx: ToolContext) -> Result<ToolOutput>;
@@ -52,6 +66,32 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// The model-callable tool named `name`.
+    pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .iter()
+            .find(|tool| tool.model_callable() && tool.name() == name)
+            .cloned()
+    }
+
+    /// The model-callable tools as OpenAI function tools.
+    pub fn function_definitions(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.model_callable())
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "parameters": tool.parameters(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn find_auto_tool(&self, user_text: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .iter()
@@ -71,6 +111,10 @@ impl Tool for NoopTool {
 
     fn description(&self) -> &'static str {
         "A no-op tool used for testing and scaffolding."
+    }
+
+    fn model_callable(&self) -> bool {
+        false
     }
 
     async fn invoke(&self, _ctx: ToolContext) -> Result<ToolOutput> {
@@ -139,6 +183,28 @@ mod word_tests {
         ] {
             assert!(!tool.should_auto_run(chat), "{chat}");
         }
+    }
+
+    /// A model can call `time` (with no arguments), never the scaffolding
+    /// `noop`.
+    #[test]
+    fn models_call_the_time_tool_but_not_noop() {
+        let mut tools = ToolRegistry::new();
+        tools.register(NoopTool);
+        tools.register(TimeTool);
+        assert!(tools.find("time").is_some());
+        assert!(tools.find("noop").is_none());
+        assert_eq!(
+            tools.function_definitions(),
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "time",
+                    "description": "Returns the current local date and time.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })]
+        );
     }
 
     #[test]

@@ -82,13 +82,14 @@ impl ModelLifecycleController {
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
             }
             ModelFamily::Voxtral => {
                 self.model_registry.unload_voxtral(variant).await;
             }
-            ModelFamily::Lfm25Audio => {
+            ModelFamily::Lfm25Audio | ModelFamily::Lfm3Audio => {
                 self.model_registry.unload_audio_chat(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }

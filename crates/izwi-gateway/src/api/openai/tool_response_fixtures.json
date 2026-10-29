@@ -1,0 +1,1914 @@
+{
+ "source": "chat_template.jinja of LiquidAI/LFM3-1.7B @ 40ebe0aa and LiquidAI/LFM3-Audio-2B @ 9d49701c, rendered by jinja2 as transformers does",
+ "cases": [
+  {
+   "dialect": "lfm3_chat",
+   "name": "string",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "21",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n21\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "string_with_tag",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "<tool_response>\nraw\n</tool_response>",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nraw\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "empty_string",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "one_reference",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "text": "Found 1 tool.",
+       "type": "text"
+      },
+      {
+       "name": "get_weather",
+       "type": "tool_reference"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nFound 1 tool.\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "reference_runs",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "name": "get_weather",
+       "type": "tool_reference"
+      },
+      {
+       "name": "get_time",
+       "type": "tool_reference"
+      },
+      {
+       "text": "and",
+       "type": "text"
+      },
+      {
+       "name": "get_weather",
+       "type": "tool_reference"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n{\"description\": \"The get_time tool.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\nand\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "result_tools_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "result": {
+        "tools": [
+         {
+          "function": {
+           "defer_loading": true,
+           "description": "The get_weather tool.",
+           "name": "get_weather",
+           "parameters": {
+            "properties": {
+             "city": {
+              "type": "string"
+             }
+            },
+            "type": "object"
+           }
+          },
+          "type": "function"
+         },
+         {
+          "function": {
+           "defer_loading": true,
+           "description": "The get_time tool.",
+           "name": "get_time",
+           "parameters": {
+            "properties": {
+             "city": {
+              "type": "string"
+             }
+            },
+            "type": "object"
+           }
+          },
+          "type": "function"
+         }
+        ]
+       }
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n{\"description\": \"The get_time tool.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "result_tools_one",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "result": {
+        "tools": {
+         "function": {
+          "defer_loading": true,
+          "description": "The get_weather tool.",
+          "name": "get_weather",
+          "parameters": {
+           "properties": {
+            "city": {
+             "type": "string"
+            }
+           },
+           "type": "object"
+          }
+         },
+         "type": "function"
+        }
+       }
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "result_tools_string",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "result": {
+        "tools": "{\"name\": \"x\"}"
+       }
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"name\": \"x\"}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "other_items",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "type": "json",
+       "value": {
+        "a": [
+         true,
+         null
+        ],
+        "b": 1
+       }
+      },
+      {
+       "type": "image"
+      },
+      {
+       "text": "tail",
+       "type": "text"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n{\"type\": \"json\", \"value\": {\"a\": [true, null], \"b\": 1}}\n<|vision_start|><|image|><|vision_end|>\ntail\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "additional_tools_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": [
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_weather tool.",
+        "name": "get_weather",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      },
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_time tool.",
+        "name": "get_time",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      }
+     ],
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n{\"description\": \"The get_time tool.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "additional_tools_one",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": {
+      "function": {
+       "defer_loading": true,
+       "description": "The get_weather tool.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     },
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "additional_tools_flag_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": true,
+     "content": [
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_weather tool.",
+        "name": "get_weather",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "additional_tools_flag_tagged",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": true,
+     "content": "<additional_tools>\nx\n</additional_tools>",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\nx\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "additional_tools_flag_empty",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": true,
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    ""
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "merged_same_call",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "first",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": [
+      {
+       "name": "get_weather",
+       "type": "tool_reference"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "other",
+     "role": "tool",
+     "tool_call_id": "call_2"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nfirst\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>",
+    "<tool_response>\nother\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "no_merge_without_ids",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "first",
+     "role": "tool"
+    },
+    {
+     "content": "second",
+     "role": "tool"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nfirst\n</tool_response>",
+    "<tool_response>\nsecond\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_chat",
+   "name": "no_merge_into_additional_tools",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "first",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "additional_tools": [
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_weather tool.",
+        "name": "get_weather",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      }
+     ],
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nfirst\n</tool_response>",
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "string",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "21",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n21\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "string_with_tag",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "<tool_response>\nraw\n</tool_response>",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nraw\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "empty_string",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    ""
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "items_as_json",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "text": "Found it.",
+       "type": "text"
+      },
+      {
+       "type": "json",
+       "value": 3
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n{\"text\": \"Found it.\", \"type\": \"text\"}\n{\"type\": \"json\", \"value\": 3}\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "result_tools_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": [
+      {
+       "result": {
+        "tools": [
+         {
+          "function": {
+           "defer_loading": true,
+           "description": "The get_weather tool.",
+           "name": "get_weather",
+           "parameters": {
+            "properties": {
+             "city": {
+              "type": "string"
+             }
+            },
+            "type": "object"
+           }
+          },
+          "type": "function"
+         },
+         {
+          "function": {
+           "defer_loading": true,
+           "description": "The get_time tool.",
+           "name": "get_time",
+           "parameters": {
+            "properties": {
+             "city": {
+              "type": "string"
+             }
+            },
+            "type": "object"
+           }
+          },
+          "type": "function"
+         }
+        ]
+       }
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n{\"description\": \"The get_time tool.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "additional_tools_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": [
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_weather tool.",
+        "name": "get_weather",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      },
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_time tool.",
+        "name": "get_time",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      }
+     ],
+     "content": "",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n{\"description\": \"The get_time tool.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "additional_tools_flag_list",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "additional_tools": true,
+     "content": [
+      {
+       "function": {
+        "defer_loading": true,
+        "description": "The get_weather tool.",
+        "name": "get_weather",
+        "parameters": {
+         "properties": {
+          "city": {
+           "type": "string"
+          }
+         },
+         "type": "object"
+        }
+       },
+       "type": "function"
+      }
+     ],
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\n<additional_tools>\n{\"description\": \"The get_weather tool.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</additional_tools>\n</tool_response>"
+   ]
+  },
+  {
+   "dialect": "lfm3_audio",
+   "name": "same_call_not_merged",
+   "tools": [
+    {
+     "function": {
+      "description": "The search_tools tool.",
+      "name": "search_tools",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_weather tool.",
+      "name": "get_weather",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "defer_loading": true,
+      "description": "The get_time tool.",
+      "name": "get_time",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "results": [
+    {
+     "content": "first",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "second",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "turns": [
+    "<tool_response>\nfirst\n</tool_response>",
+    "<tool_response>\nsecond\n</tool_response>"
+   ]
+  }
+ ]
+}

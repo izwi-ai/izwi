@@ -128,7 +128,10 @@ export interface ChatThreadContentPart {
     | "input_image"
     | "video"
     | "video_url"
-    | "input_video";
+    | "input_video"
+    | "input_audio"
+    | "audio_url"
+    | "audio";
   text?: string;
   input_text?: string;
   image_url?: unknown;
@@ -137,6 +140,9 @@ export interface ChatThreadContentPart {
   video?: unknown;
   video_url?: unknown;
   input_video?: unknown;
+  input_audio?: unknown;
+  audio_url?: unknown;
+  audio?: unknown;
 }
 
 export interface ChatThreadSendMessageRequest {

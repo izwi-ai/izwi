@@ -34,6 +34,10 @@ pub(crate) enum LoadedAdapterKind {
     ChatterboxTts,
     Maya1Tts,
     Maya2Tts,
+    Lfm3AudioTts,
+    Lfm3AudioAsr,
+    Lfm3AudioChat,
+    Lfm3AudioRealtime,
     KokoroStaticTts,
     Scalar,
 }
@@ -58,6 +62,10 @@ impl LoadedAdapterKind {
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
             Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
+            Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
+            Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
+            Self::Lfm3AudioChat => "builtin.lfm3_audio_chat.physical_sequence",
+            Self::Lfm3AudioRealtime => "builtin.lfm3_audio_realtime.physical_session",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -358,6 +366,48 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // Audio chat.
         row(F::Lfm25Audio, C::AudioChat, Loaded::Scalar, Invocation).chunked(),
         row(F::Lfm25Audio, C::SpeechToSpeech, Loaded::Scalar, Invocation).chunked(),
+        // LFM3-Audio speech, transcription and voice-chat replies run as
+        // retained rows that batch: the language model's pages and ring stay
+        // in the managed arena between quanta. Speech streams as the codec
+        // decodes it; a clip of at most 30 s transcribes as a row, longer
+        // audio in clips of at most 30 s, one atomic dispatch each. LiveASR
+        // sessions (English) run as engine realtime rows on the same arena.
+        row(
+            F::Lfm3Audio,
+            C::Tts,
+            Loaded::Lfm3AudioTts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::Lfm3Audio,
+            C::Asr,
+            Loaded::Lfm3AudioAsr,
+            RetainedAndInvocation,
+        )
+        .chunked()
+        .sequence(),
+        row(
+            F::Lfm3Audio,
+            C::AudioChat,
+            Loaded::Lfm3AudioChat,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::Lfm3Audio,
+            C::SpeechToSpeech,
+            Loaded::Lfm3AudioChat,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::Lfm3Audio,
+            C::RealtimeAsr,
+            Loaded::Lfm3AudioRealtime,
+            RetainedAndInvocation,
+        )
+        .realtime(RealtimeAsrPath::Engine),
         // Chat.
         chat(F::Qwen3Chat).only(QWEN3_RESUMABLE_CHAT).resumable(),
         chat(F::Qwen3Chat).only(QWEN3_ATOMIC_CHAT),
@@ -365,7 +415,11 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         chat(F::Qwen35Chat).resumable(),
         chat(F::Qwen35MoeChat),
         chat(F::Qwen38Chat).resumable(),
-        chat(F::Lfm2Chat),
+        // LFM2 and LFM3 prefill resumes at any span: one-shot equality and
+        // replay are proven across LFM3's sliding window
+        // (`lfm2::chat::lfm3_reference_tests`, `lfm3::tests`).
+        chat(F::Lfm2Chat).resumable(),
+        chat(F::Lfm3Chat).resumable(),
         chat(F::Gemma3Chat),
         // Pipelines and artifacts.
         row(

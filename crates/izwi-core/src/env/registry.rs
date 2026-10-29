@@ -907,6 +907,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables opt-in LFM2 activation finiteness checks and token diagnostics during forward passes and sampling.",
     ),
     CoreEnvVar::new(
+        "IZWI_LFM3_CONTEXT_TOKENS",
+        Int,
+        "32768 (CUDA: 262144)",
+        Load,
+        "Sets the LFM3 chat context in tokens, up to the checkpoint's 262,144; it sizes the RoPE tables and KV reservation. CUDA defaults to the whole context and fits its arena to device memory.",
+    ),
+    CoreEnvVar::new(
         "IZWI_LFM_CUDA_DEPTHWISE_CONV",
         Flag,
         "false",

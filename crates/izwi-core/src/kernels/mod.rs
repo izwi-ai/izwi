@@ -22,6 +22,8 @@ pub mod metal_fp8;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_kquant_mv;
 #[cfg(feature = "metal")]
+pub(crate) mod metal_lfm_norm;
+#[cfg(feature = "metal")]
 pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;

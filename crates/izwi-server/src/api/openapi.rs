@@ -2113,6 +2113,11 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<ChatReasoningEffort>,
     pub preserve_thinking: Option<bool>,
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Replies are text: only `["text"]` is accepted.
+    pub modalities: Option<Vec<String>>,
+    /// Spoken replies are not offered here (the voice realtime API speaks);
+    /// any value is a `400`.
+    pub audio: Option<serde_json::Value>,
 }
 
 #[allow(dead_code)]
@@ -2139,6 +2144,8 @@ pub struct ChatCompletionStreamOptions {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionMessage {
     pub role: String,
+    /// Text, or content parts: `text`, images for Qwen3.5, `input_audio`
+    /// clips for LFM3-Audio.
     pub content: Option<serde_json::Value>,
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }

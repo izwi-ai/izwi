@@ -55,7 +55,7 @@ pub struct ResponsesCreateRequest {
 #[serde(untagged)]
 pub enum ResponseInput {
     Text(String),
-    One(ResponseInputItem),
+    One(Box<ResponseInputItem>),
     Many(Vec<ResponseInputItem>),
 }
 
@@ -81,6 +81,10 @@ pub struct ResponseInputItem {
     /// A `function_call_output`'s result: a string, or content parts.
     #[serde(default)]
     pub output: Option<serde_json::Value>,
+    /// On a tool result, for LFM3 models: deferred tools it reveals (their
+    /// definitions, or a flag that the output holds them).
+    #[serde(default)]
+    pub additional_tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

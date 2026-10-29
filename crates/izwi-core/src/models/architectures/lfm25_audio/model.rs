@@ -3241,6 +3241,7 @@ mod tests {
                 attention_sliding_window: None,
                 rope_freq_base: 1_000_000.0,
                 shortconv_l_cache: 3,
+                lfm3: None,
             },
             Lfm25AudioDecoderConfig {
                 codebooks: 8,
@@ -3508,6 +3509,7 @@ mod tests {
             attention_sliding_window: Some(32),
             rope_freq_base: 10_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         };
         let without_logits = checked_asr_main_step_workspace(2, 11, 101, 0, &config).unwrap();
         let with_logits = checked_asr_main_step_workspace(2, 11, 101, 2, &config).unwrap();
@@ -3541,6 +3543,7 @@ mod tests {
             attention_sliding_window: None,
             rope_freq_base: 1_000_000.0,
             shortconv_l_cache: 3,
+            lfm3: None,
         };
         let visible = 400 + 2_048;
         let decode = checked_asr_main_step_workspace(1, visible, 65_536, 1, &config).unwrap();

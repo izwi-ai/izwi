@@ -926,6 +926,151 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
     }
 }
 
+/// LFM3-Audio speech and voice-chat replies as retained continuous rows: a
+/// scalar preparation (the prompt's embeddings, with a spoken turn's
+/// encoder embeddings), a static prefill of each row's prompt, and a
+/// continuous decode that steps every row one slot with the language model
+/// batched across rows. The codec decodes inside the decode quantum, so the
+/// graph has no separate audio stage.
+#[derive(Debug)]
+pub(super) struct Lfm3AudioSpeechExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) max_batch_size: usize,
+}
+
+impl Lfm3AudioSpeechExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for Lfm3AudioSpeechExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        match self.metadata.capability {
+            CapabilityKind::Tts => LFM3_AUDIO_TTS_ADAPTER_ABI,
+            _ => LFM3_AUDIO_CHAT_ADAPTER_ABI,
+        }
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        if streaming.model_native && self.metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming TTS contract",
+                self.metadata.model_variant
+            )));
+        }
+        // A voice-chat reply's prompt holds its history and the spoken turn,
+        // which preparation encodes.
+        let (task, prompt_tokens, preparation_bytes) = match self.metadata.capability {
+            CapabilityKind::Tts => ("tts", 4_096_u64, 64 * 1024 * 1024),
+            _ => ("s2s", 16_384, 512 * 1024 * 1024),
+        };
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:{task}:{}:lfm3-audio-state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        // A recomputed row would draw its frames again; it cannot rebuild
+        // the speech it already sent.
+        profile.recompute_safe = false;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.max_batch_size;
+        profile.resolved_from_loaded_model = true;
+        let rows = self.max_batch_size as u64;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            format!("{task}.prepare.lfm3_audio"),
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        // Tokenizing the prompt, encoding a spoken turn and gathering the
+        // prompt's embeddings.
+        preparation.max_workspace_bytes = preparation_bytes;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            format!("{task}.prefill.lfm3_audio.tensor_static"),
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = prompt_tokens.saturating_mul(rows);
+        // Each row's prompt prefills alone: one span's activations.
+        prefill.max_workspace_bytes = (256_u64 * 1024 * 1024).saturating_mul(rows);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            format!("{task}.decode.lfm3_audio.tensor_continuous"),
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = 64_u64.saturating_mul(rows);
+        // The depth decoder's passes and the codec's window, per row.
+        decode.max_workspace_bytes = (128_u64 * 1024 * 1024).saturating_mul(rows);
+        for stage in [&mut preparation, &mut prefill, &mut decode] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct FishS2TtsExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,

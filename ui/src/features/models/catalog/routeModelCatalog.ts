@@ -185,6 +185,18 @@ export function getChatRouteModelLabel(variant: string): string {
   if (variant === "LFM2.5-1.2B-Thinking-GGUF") {
     return "LFM2.5 1.2B Thinking GGUF (Q4_K_M)";
   }
+  if (variant === "LFM3-1.7B-GGUF") {
+    return "LFM3 1.7B GGUF (QAD Q4_0)";
+  }
+  if (variant === "LFM3-1.7B-Q8_0-GGUF") {
+    return "LFM3 1.7B GGUF (Q8_0)";
+  }
+  if (variant === "LFM3-Audio-2B-GGUF") {
+    return "LFM3 Audio 2B GGUF (Q4_K_M)";
+  }
+  if (variant === "LFM3-Audio-2B-Q8_0-GGUF") {
+    return "LFM3 Audio 2B GGUF (Q8_0)";
+  }
   if (variant === "Gemma-3-4b-it") {
     return "Gemma 3 4B Instruct";
   }

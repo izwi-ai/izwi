@@ -58,7 +58,9 @@ export function getModelProviderLabel(variant: string): string {
   ) {
     return "IBM";
   }
-  if (variant.startsWith("LFM2")) return "Liquid AI";
+  if (variant.startsWith("LFM2") || variant.startsWith("LFM3")) {
+    return "Liquid AI";
+  }
   if (variant.startsWith("Gemma-")) return "Google";
   if (
     variant.startsWith("Parakeet-") ||
@@ -375,6 +377,24 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Text Chat", "GGUF", "Q4_K_M", "Thinking"],
     size: "0.68 GB",
   },
+  "LFM3-1.7B-GGUF": {
+    shortName: "LFM3 1.7B",
+    fullName: "LFM3 1.7B (GGUF QAD Q4_0)",
+    description:
+      "Liquid AI's agentic on-device chat model: reasoning, tool calling and long context",
+    category: "chat",
+    capabilities: ["Text Chat", "Thinking", "Tools", "GGUF", "Q4_0"],
+    size: "1.07 GB",
+  },
+  "LFM3-1.7B-Q8_0-GGUF": {
+    shortName: "LFM3 1.7B Q8_0",
+    fullName: "LFM3 1.7B (GGUF Q8_0)",
+    description:
+      "Higher-precision LFM3 1.7B for machines with memory to spare",
+    category: "chat",
+    capabilities: ["Text Chat", "Thinking", "Tools", "GGUF", "Q8_0"],
+    size: "1.86 GB",
+  },
   "LFM2.5-Audio-1.5B-GGUF": {
     shortName: "LFM2.5 Audio 1.5B",
     fullName: "LFM2.5 Audio 1.5B (GGUF Q4_0 bundle)",
@@ -391,6 +411,44 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Unified Voice",
     ],
     size: "1.14 GB",
+  },
+  "LFM3-Audio-2B-GGUF": {
+    shortName: "LFM3 Audio 2B",
+    fullName: "LFM3 Audio 2B (GGUF Q4_K_M)",
+    description:
+      "Liquid AI's end-to-end speech model: transcription, text to speech with two built-in voices, and voice chat that replies in text and speech, in 18 languages",
+    category: "asr",
+    categories: ["asr", "tts"],
+    capabilities: [
+      "Speech-to-speech",
+      "Transcription",
+      "Text to Speech",
+      "18 Languages",
+      "Streaming",
+      "GGUF",
+      "Q4_K_M",
+      "Unified Voice",
+    ],
+    size: "1.46 GB",
+  },
+  "LFM3-Audio-2B-Q8_0-GGUF": {
+    shortName: "LFM3 Audio 2B Q8_0",
+    fullName: "LFM3 Audio 2B (GGUF Q8_0)",
+    description:
+      "Higher-precision LFM3 Audio 2B for machines with memory to spare",
+    category: "asr",
+    categories: ["asr", "tts"],
+    capabilities: [
+      "Speech-to-speech",
+      "Transcription",
+      "Text to Speech",
+      "18 Languages",
+      "Streaming",
+      "GGUF",
+      "Q8_0",
+      "Unified Voice",
+    ],
+    size: "2.20 GB",
   },
   "Gemma-3-4b-it": {
     shortName: "Gemma 3 4B",

@@ -96,6 +96,17 @@ export function ChatPage({
     [models],
   );
 
+  // ASR models hear audio too, but this page lists chat models only.
+  const modelSupportsAudio = useCallback(
+    (variant: string) => {
+      const model = models.find((candidate) => candidate.variant === variant);
+      return model?.modalities
+        ? model.modalities.includes("audio_input")
+        : undefined;
+    },
+    [models],
+  );
+
   // Read aloud uses a loaded Text to Speech model with a built-in voice:
   // the one picked in the speech model manager, else the preferred one.
   const speechModels = useMemo(
@@ -147,6 +158,7 @@ export function ChatPage({
         modelSupportsThinking={modelSupportsThinking}
         modelChatCapabilities={modelChatCapabilities}
         modelSupportsImages={modelSupportsImages}
+        modelSupportsAudio={modelSupportsAudio}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {

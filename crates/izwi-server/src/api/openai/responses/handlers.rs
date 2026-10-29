@@ -13,10 +13,13 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::api::openai::convert::{
-    append_assistant_tool_calls, flatten_content, tool_result_message,
+    append_assistant_tool_calls, flatten_content, inbound_content_value, tool_result_message,
 };
 use crate::api::openai::tool_calls::{
     parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallFormat, ToolCallParser,
+};
+use crate::api::openai::tool_response::{
+    reject_deferred_tool_results, ToolResponseDialect, ToolResponses, ToolResult,
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
@@ -29,7 +32,8 @@ use crate::ids::new_prefixed_id;
 use crate::state::{AppState, StoredFunctionCall, StoredResponseInputItem, StoredResponseRecord};
 use izwi_core::chat_reasoning::{reasoning_opened_in_prompt, PromptOpener};
 use izwi_core::{
-    parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelVariant,
+    parse_chat_request_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole,
+    ModelVariant,
 };
 
 use super::dto::{
@@ -54,6 +58,40 @@ fn response_stream_failure_payload(response_id: &str, message: impl Into<String>
 fn response_stream_interruption_payload(response_id: &str, saw_terminal: bool) -> Option<String> {
     (!saw_terminal)
         .then(|| response_stream_failure_payload(response_id, RESPONSE_STREAM_INTERRUPTED_ERROR))
+}
+
+/// LFM3-Audio answers through its own reply rows, which take the sampling
+/// controls, tools and `preserve_thinking` but not these; each is refused,
+/// never dropped.
+fn validate_lfm3_audio_response_controls(req: &ResponsesCreateRequest) -> Result<(), ApiError> {
+    let kwargs = req.chat_template_kwargs.as_ref();
+    let unsupported: [(&'static str, bool); 4] = [
+        (
+            "presence_penalty",
+            req.presence_penalty.is_some_and(|penalty| penalty != 0.0),
+        ),
+        (
+            "skip_special_tokens",
+            req.skip_special_tokens == Some(false),
+        ),
+        (
+            "enable_thinking",
+            req.enable_thinking.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.enable_thinking.is_some()),
+        ),
+        (
+            "reasoning_effort",
+            req.reasoning_effort.is_some()
+                || kwargs.is_some_and(|kwargs| kwargs.reasoning_effort.is_some()),
+        ),
+    ];
+    match unsupported.iter().find(|(_, requested)| *requested) {
+        Some((param, _)) => Err(ApiError::invalid_param(
+            param,
+            format!("`{param}` is not supported for LFM3-Audio"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Responses declares a function tool flat (`{"type": "function", "name",
@@ -83,13 +121,23 @@ pub async fn create_response(
     Extension(ctx): Extension<RequestContext>,
     ApiJson(req): ApiJson<ResponsesCreateRequest>,
 ) -> Result<Response<Body>, ApiError> {
-    let model_variant = parse_chat_model_variant(Some(&req.model))
+    let model_variant = parse_chat_request_model_variant(Some(&req.model))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if model_variant.family() == izwi_core::ModelFamily::Lfm3Audio {
+        validate_lfm3_audio_response_controls(&req)?;
+    }
 
+    let tools = req.tools.as_deref().map(|tools| {
+        tools
+            .iter()
+            .map(chat_completions_function)
+            .collect::<Vec<_>>()
+    });
     let (messages, input_items, media_inputs) = build_input_messages(
         model_variant,
         req.instructions.as_deref(),
         req.input.clone(),
+        tools.as_deref().unwrap_or_default(),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -99,12 +147,6 @@ pub async fn create_response(
         ));
     }
 
-    let tools = req.tools.as_deref().map(|tools| {
-        tools
-            .iter()
-            .map(chat_completions_function)
-            .collect::<Vec<_>>()
-    });
     let tool_choice = req.tool_choice.as_ref().map(chat_completions_function);
     let tool_policy = resolve_tool_policy(model_variant, tools.as_deref(), tool_choice.as_ref())?;
     let tool_format = tool_policy.format;
@@ -868,10 +910,14 @@ struct NormalizedInputItem {
     media_inputs: Vec<ChatMediaInput>,
 }
 
+/// The input's messages as the runtime's. `tools` are the request's tool
+/// definitions, deferred ones included, which an LFM3 tool result's
+/// `tool_reference` items name.
 fn build_input_messages(
     model_variant: ModelVariant,
     instructions: Option<&str>,
     input: Option<ResponseInput>,
+    tools: &[Value],
 ) -> Result<
     (
         Vec<ChatMessage>,
@@ -905,7 +951,7 @@ fn build_input_messages(
             content: Some(crate::api::openai::convert::InboundContent::Text(text)),
             ..Default::default()
         }],
-        Some(ResponseInput::One(item)) => vec![item],
+        Some(ResponseInput::One(item)) => vec![*item],
         Some(ResponseInput::Many(items)) => items,
     };
 
@@ -913,7 +959,21 @@ fn build_input_messages(
     // after the text of an assistant message right before them.
     let mut pending_calls = Vec::new();
     let mut previous_was_assistant_message = false;
-    for item in items {
+    // LFM3's templates render tool results themselves (deferred tools,
+    // merged results), so their turns are rendered here as the template does.
+    let mut tool_responses =
+        ToolResponseDialect::of(model_variant).map(|dialect| ToolResponses::new(dialect, tools));
+    let mut items = items.into_iter().peekable();
+    while let Some(item) = items.next() {
+        // Only the next result's id and `additional_tools` decide a merge.
+        let next_result = items
+            .peek()
+            .filter(|next| is_tool_result_item(next))
+            .map(|next| ToolResult {
+                content: None,
+                additional_tools: next.additional_tools.as_ref(),
+                tool_call_id: next.call_id.as_deref(),
+            });
         match item.item_type.as_deref() {
             Some("function_call") => {
                 let (call, raw) = function_call_input(&item)?;
@@ -934,7 +994,20 @@ fn build_input_messages(
                 )?;
                 previous_was_assistant_message = false;
                 let (output, raw) = function_call_output_input(&item)?;
-                messages.push(tool_result_message(model_variant, output.clone()));
+                let result = ToolResult {
+                    content: item.output.as_ref(),
+                    additional_tools: item.additional_tools.as_ref(),
+                    tool_call_id: item.call_id.as_deref(),
+                };
+                reject_deferred_tool_results(model_variant, result)?;
+                match tool_responses.as_mut() {
+                    Some(responses) => {
+                        if let Some(rendered) = responses.render(result, next_result)? {
+                            messages.push(tool_result_message(model_variant, rendered));
+                        }
+                    }
+                    None => messages.push(tool_result_message(model_variant, output.clone())),
+                }
                 stored.push(StoredResponseInputItem {
                     role: "tool".to_string(),
                     content: output,
@@ -956,6 +1029,28 @@ fn build_input_messages(
             &mut pending_calls,
             previous_was_assistant_message,
         )?;
+        if is_tool_result_item(&item) {
+            let content = inbound_content_value(item.content.as_ref())?;
+            let result = ToolResult {
+                content: content.as_ref(),
+                additional_tools: item.additional_tools.as_ref(),
+                tool_call_id: item.call_id.as_deref(),
+            };
+            reject_deferred_tool_results(model_variant, result)?;
+            if let Some(responses) = tool_responses.as_mut() {
+                previous_was_assistant_message = false;
+                let display = flatten_content(item.content.clone())?.display_text;
+                if let Some(rendered) = responses.render(result, next_result)? {
+                    messages.push(tool_result_message(model_variant, rendered));
+                }
+                stored.push(StoredResponseInputItem {
+                    role: "tool".to_string(),
+                    content: display,
+                    item: None,
+                });
+                continue;
+            }
+        }
         let item = normalize_input_item(model_variant, item)?;
         let role = item.role.clone();
         let parsed_role = parse_input_role(&role)?;
@@ -964,6 +1059,14 @@ fn build_input_messages(
                 "Response input item content cannot be empty",
             ));
         }
+        if parsed_role != ResponseInboundRole::User
+            && item
+                .media_inputs
+                .iter()
+                .any(|input| input.kind == izwi_core::ChatMediaKind::Audio)
+        {
+            return Err(ApiError::bad_request("Only user messages can carry audio"));
+        }
         media_inputs.extend(item.media_inputs.clone());
         previous_was_assistant_message = parsed_role == ResponseInboundRole::Assistant;
 
@@ -971,7 +1074,7 @@ fn build_input_messages(
             ResponseInboundRole::System => {
                 if !item.media_inputs.is_empty() {
                     return Err(ApiError::bad_request(
-                        "System response input items cannot contain images or videos",
+                        "System response input items cannot contain images, videos or audio",
                     ));
                 }
                 ChatMessage {
@@ -1066,6 +1169,19 @@ fn function_call_input(item: &super::dto::ResponseInputItem) -> Result<(Value, V
             "arguments": arguments,
         }),
     ))
+}
+
+/// Whether an input item is a tool result: a `function_call_output`, or a
+/// message in the `tool` role.
+fn is_tool_result_item(item: &super::dto::ResponseInputItem) -> bool {
+    match item.item_type.as_deref() {
+        Some("function_call_output") => true,
+        None | Some("message") => item
+            .role
+            .as_deref()
+            .is_some_and(|role| role.trim().eq_ignore_ascii_case("tool")),
+        _ => false,
+    }
 }
 
 /// A `function_call_output` input item's result text, and the item to
@@ -1270,6 +1386,7 @@ mod tests {
             ModelVariant::Qwen359BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
+            &[],
         )
         .expect("build input messages");
 
@@ -1278,6 +1395,43 @@ mod tests {
         assert_eq!(stored[0].role, "system");
         assert_eq!(stored[1].role, "user");
         assert!(media_inputs.is_empty());
+    }
+
+    /// LFM3-Audio hears `input_audio` parts in user items, each where the
+    /// item places it; other roles cannot carry audio.
+    #[test]
+    fn audio_input_items_reach_lfm3_audio_in_place() {
+        let input: ResponseInput = serde_json::from_value(json!([{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is said? "},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+            ]
+        }]))
+        .unwrap();
+        let (messages, _, media_inputs) =
+            build_input_messages(ModelVariant::Lfm3Audio2BGguf, None, Some(input), &[]).unwrap();
+        assert_eq!(
+            messages[0].content,
+            format!("What is said? {}", izwi_core::CHAT_AUDIO_PLACEHOLDER)
+        );
+        assert_eq!(media_inputs.len(), 1);
+        assert_eq!(media_inputs[0].source, "data:audio/wav;base64,UklGRg==");
+
+        let assistant: ResponseInput = serde_json::from_value(json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": [
+                {"type": "input_audio", "input_audio": {"data": "UklGRg=="}}
+            ]}
+        ]))
+        .unwrap();
+        let error = build_input_messages(ModelVariant::Lfm3Audio2BGguf, None, Some(assistant), &[])
+            .unwrap_err();
+        assert!(
+            error.message.contains("Only user messages"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -1344,6 +1498,7 @@ mod tests {
                 ),
                 item("tool", Some("{\"temperature_c\": 21}"), None),
             ])),
+            &[],
         )
         .expect("tool turns normalize");
         assert_eq!(
@@ -1371,9 +1526,11 @@ mod tests {
                     video: None,
                     video_url: None,
                     input_video: None,
+                    ..InboundContentPart::default()
                 }])),
                 ..Default::default()
             }])),
+            &[],
         )
         .expect("multimodal input should normalize");
 
@@ -1690,7 +1847,7 @@ mod tests {
         ]))
         .unwrap();
         let (messages, stored, _) =
-            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input)).unwrap();
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input), &[]).unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, ChatRole::Assistant);
         assert!(messages[1]
@@ -1719,7 +1876,7 @@ mod tests {
         ]))
         .unwrap();
         let (messages, _, _) =
-            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input)).unwrap();
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input), &[]).unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages[1].content.starts_with("<tool_call>"));
 
@@ -1727,7 +1884,43 @@ mod tests {
             {"type": "web_search_call", "id": "ws_1"}
         ]))
         .unwrap();
-        assert!(build_input_messages(ModelVariant::Qwen359BGguf, None, Some(unknown)).is_err());
+        assert!(
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(unknown), &[]).is_err()
+        );
+    }
+
+    #[test]
+    fn lfm3_function_call_outputs_name_deferred_tools() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "search_tools"}}),
+            json!({"type": "function", "defer_loading": true,
+                   "function": {"name": "get_weather", "parameters": {}}}),
+        ];
+        let input = serde_json::from_value::<ResponseInput>(json!([
+            {"role": "user", "content": "Weather?"},
+            {"type": "function_call", "call_id": "call_1", "name": "search_tools", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "Found 1 tool."},
+            {"type": "function_call_output", "call_id": "call_1",
+             "output": [{"type": "tool_reference", "name": "get_weather"}]},
+        ]))
+        .unwrap();
+        let (messages, stored, _) =
+            build_input_messages(ModelVariant::Lfm317BGguf, None, Some(input.clone()), &tools)
+                .unwrap();
+        // The two outputs answering one call are one tool turn.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, ChatRole::Tool);
+        assert_eq!(
+            messages[2].content,
+            "<tool_response>\nFound 1 tool.\n<additional_tools>\n\
+             {\"name\": \"get_weather\", \"parameters\": {}}\n</additional_tools>\n</tool_response>"
+        );
+        assert_eq!(stored.len(), 4);
+
+        // A model whose template has no deferred tools refuses the reference.
+        assert!(
+            build_input_messages(ModelVariant::Qwen359BGguf, None, Some(input), &tools).is_err()
+        );
     }
 
     /// Responses' flat function tools and named tool choice read like

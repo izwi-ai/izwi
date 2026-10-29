@@ -9,7 +9,7 @@ use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentTurnOptions, MemoryMessage,
     MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest,
-    NoopTool, TimeTool, ToolRegistry, TurnInput,
+    TurnInput,
 };
 use izwi_core::{
     parse_chat_model_variant, ChatMessage, ChatRole, RuntimeRequestContext, WorkloadClass,
@@ -175,9 +175,7 @@ pub async fn create_turn(
         runtime_context: permit.runtime_context(),
     };
     let planner = SimplePlanner;
-    let mut tools = ToolRegistry::new();
-    tools.register(NoopTool);
-    tools.register(TimeTool);
+    let tools = crate::app::voice_tools::builtin_tool_registry();
 
     let engine = AgentEngine;
     let result = engine
@@ -249,9 +247,23 @@ fn resolve_max_output_tokens_for_model(
         izwi_core::ModelVariant::Gemma34BIt => 4096,
         izwi_core::ModelVariant::Lfm2512BInstructGguf => 4096,
         izwi_core::ModelVariant::Lfm2512BThinkingGguf => 4096,
+        // LFM3 reasons before it answers: room for its thinking and the
+        // answer after it.
+        izwi_core::ModelVariant::Lfm317BGguf | izwi_core::ModelVariant::Lfm317BQ8Gguf => 8192,
         _ => 1536,
     };
-    Ok(requested.unwrap_or(default).clamp(1, 4096))
+    Ok(requested
+        .unwrap_or(default)
+        .clamp(1, max_output_token_ceiling(variant)))
+}
+
+/// The most tokens one agent turn may generate: 8,192 for LFM3, which
+/// thinks before it answers by default, 4,096 for every other model.
+fn max_output_token_ceiling(variant: izwi_core::ModelVariant) -> usize {
+    match variant {
+        izwi_core::ModelVariant::Lfm317BGguf | izwi_core::ModelVariant::Lfm317BQ8Gguf => 8192,
+        _ => 4096,
+    }
 }
 
 fn now_unix_millis() -> u64 {
@@ -366,7 +378,9 @@ impl ModelBackend for IzwiRuntimeBackend {
             .chat_generate_with_correlation_and_runtime_context(
                 variant,
                 runtime_messages,
-                request.max_output_tokens.clamp(1, 4096),
+                request
+                    .max_output_tokens
+                    .clamp(1, max_output_token_ceiling(variant)),
                 Some(&self.correlation_id),
                 self.runtime_context,
             )
@@ -378,5 +392,30 @@ impl ModelBackend for IzwiRuntimeBackend {
             tokens_generated: generation.tokens_generated,
             generation_time_ms: generation.generation_time_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lfm3_agent_turns_have_room_to_reason() {
+        assert_eq!(
+            resolve_max_output_tokens_for_model("LFM3-1.7B-GGUF", None).unwrap(),
+            8192
+        );
+        assert_eq!(
+            resolve_max_output_tokens_for_model("LFM3-1.7B-Q8_0-GGUF", Some(20_000)).unwrap(),
+            8192
+        );
+        assert_eq!(
+            resolve_max_output_tokens_for_model("LFM2.5-1.2B-Thinking-GGUF", Some(20_000)).unwrap(),
+            4096
+        );
+        assert_eq!(
+            resolve_max_output_tokens_for_model("Qwen3.5-4B", None).unwrap(),
+            1536
+        );
     }
 }

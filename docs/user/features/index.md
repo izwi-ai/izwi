@@ -66,14 +66,14 @@ Different features require different models:
 
 | Feature | Required Models |
 |---------|-----------------|
-| Voice | TTS + ASR + Chat model (or unified `LFM2.5-Audio-1.5B-GGUF`) |
-| Chat | Chat model (Qwen3.5, Qwen3.6, Qwen3.8, or LFM2.5) |
+| Voice | TTS + ASR + Chat model (or one unified model: `LFM3-Audio-2B-GGUF` by default, or `LFM2.5-Audio-1.5B-GGUF`) |
+| Chat | Chat model (Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, or LFM3) |
 | Speaker Attributed ASR | `Granite-Speech-4.1-2B-Plus` |
 | Voices | Built-in voice model for presets; Base, VibeVoice, `FishAudio-S2-Pro`, Chatterbox or Maya 2 Native model for cloning; VoiceDesign model for design |
 | Text-to-Speech | TTS model |
 | Studio | TTS model |
 | Settings | No model required |
-| Transcription | ASR model (`Parakeet-TDT-0.6B-v3` default; Qwen3/Whisper/Granite Speech/LFM2.5 also supported) |
+| Transcription | ASR model (`Parakeet-TDT-0.6B-v3` default; Qwen3/Whisper/Granite Speech/LFM2.5/LFM3 Audio also supported) |
 | Diarization | `diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization` (+ optional ASR and aligner models) |
 | Forced Alignment | `Qwen3-ForcedAligner-0.6B` |
 | Voice Cloning | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-1.7B-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B` |

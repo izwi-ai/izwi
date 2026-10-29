@@ -1513,6 +1513,7 @@ fn speech_to_speech_preparation_accounts_allocated_capacities() {
         4,
         &messages,
         messages.capacity(),
+        &[],
         &params,
         Some("system"),
         Some("correlation"),
@@ -3255,6 +3256,21 @@ fn direct_whisper_asr_job_accounts_prepared_audio_and_encoder_artifact_exactly()
 
 #[test]
 fn engine_requests_use_truthful_controller_lanes() {
+    for variant in [
+        ModelVariant::Lfm2512BInstructGguf,
+        ModelVariant::Lfm2512BThinkingGguf,
+        ModelVariant::Lfm317BGguf,
+        ModelVariant::Lfm317BQ8Gguf,
+    ] {
+        let mut chat = EngineCoreRequest::chat(Vec::new());
+        chat.model_variant = Some(variant);
+        assert_eq!(
+            coordinator_lane_for_request(&chat),
+            CoordinatorLane::Resumable,
+            "{variant}"
+        );
+    }
+
     let mut qwen_tts = EngineCoreRequest::tts("hello");
     qwen_tts.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
     assert_eq!(

@@ -4,6 +4,8 @@
 //! `decode_step_batch` (mask, finite check, selection) for one row.
 //!
 //! Run: `cargo test -p izwi-core --features metal --release --lib lfm2::chat::bench_tests -- --ignored --nocapture`
+//! (`IZWI_BENCH_LFM_MODEL=LFM3-1.7B-GGUF` times LFM3-1.7B in the decode-step
+//! bench instead).
 use super::reference_tests::{models_dir_for_bench, Sessions};
 use super::*;
 use crate::backends::DeviceProfile;
@@ -26,13 +28,26 @@ fn profile_rounds() -> usize {
         .unwrap_or(0)
 }
 
+/// The checkpoint the decode-step bench loads: LFM2.5-1.2B-Instruct, or the
+/// catalog GGUF `IZWI_BENCH_LFM_MODEL` names.
+fn bench_variant() -> ModelVariant {
+    std::env::var("IZWI_BENCH_LFM_MODEL")
+        .ok()
+        .map(|name| {
+            crate::catalog::parse_model_variant(&name)
+                .expect("IZWI_BENCH_LFM_MODEL names a catalog model")
+        })
+        .unwrap_or(ModelVariant::Lfm2512BInstructGguf)
+}
+
 fn bench(profile: DeviceProfile) {
-    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    let variant = bench_variant();
+    let dir = models_dir_for_bench().join(variant.dir_name());
     if !dir.exists() {
         eprintln!("skipping: {} is missing", dir.display());
         return;
     }
-    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let model = Lfm2ChatModel::load(&dir, variant, profile).unwrap();
     let backend = format!("{:?}", model.device_kind());
     let sessions = Sessions::new(&model);
     let device = model.device.device.clone();
@@ -558,6 +573,70 @@ fn lfm25_fused_vs_unfused_shortconv_metal() {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_fused_vs_unfused_shortconv_cpu() {
     fused_vs_unfused_shortconv(DeviceProfile::cpu());
+}
+
+/// LFM3's fused sandwich norm-add and attention output gate
+/// (`kernels::metal_lfm_norm`) against the op-by-op path, interleaved step
+/// by step on two rows of the same model, so machine noise hits both.
+fn fused_vs_unfused_lfm3_norm(profile: DeviceProfile) {
+    use super::super::backbone::FORCE_UNFUSED_LFM_NORM;
+    let variant = ModelVariant::Lfm317BGguf;
+    let dir = models_dir_for_bench().join(variant.dir_name());
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, variant, profile).unwrap();
+    let sessions = Sessions::new(&model);
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+    let config = ChatGenerationConfig::default();
+    let new_state = |index| {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(index))
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        model.decode_step(&mut state).unwrap();
+        state
+    };
+    let mut fused = new_state(0);
+    let mut unfused = new_state(1);
+    let (mut fused_time, mut unfused_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let steps = steps();
+    for step in 0..steps + 8 {
+        FORCE_UNFUSED_LFM_NORM.with(|flag| flag.set(true));
+        let started = Instant::now();
+        model.decode_step_batch(&mut [&mut unfused]).unwrap();
+        if step >= 8 {
+            unfused_time += started.elapsed();
+        }
+        FORCE_UNFUSED_LFM_NORM.with(|flag| flag.set(false));
+        let started = Instant::now();
+        model.decode_step_batch(&mut [&mut fused]).unwrap();
+        if step >= 8 {
+            fused_time += started.elapsed();
+        }
+    }
+    let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+    eprintln!(
+        "{:?}: op-by-op norm and gate {:.2} ms/token, fused {:.2} ms/token",
+        model.device_kind(),
+        per(unfused_time),
+        per(fused_time)
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-1.7B GGUF"]
+fn lfm3_fused_vs_unfused_norm_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm3_fused_vs_unfused_norm_metal");
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        fused_vs_unfused_lfm3_norm(profile);
+    }
 }
 
 /// B decode rows through one quantized projection, shaped `(B, 1, k)` (Candle
