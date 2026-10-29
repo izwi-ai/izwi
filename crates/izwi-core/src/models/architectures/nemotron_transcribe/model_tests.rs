@@ -58,6 +58,9 @@ fn the_synthetic_checkpoint_passes_the_census_and_loads_on_cpu() {
     // Mamba in/out, expert and shared up/down, attention q/k/v/o.
     assert_eq!(summary["projection_checks"].as_array().unwrap().len(), 10);
     assert!(summary["mamba2_scan_check"].is_null());
+    // The CPU routes on the host over Q8_0 experts.
+    assert_eq!(summary["moe_path"], "per_expert");
+    assert!(summary["moe_stacked_check"].is_null());
 }
 
 #[test]
@@ -235,12 +238,14 @@ fn metal_loads_the_synthetic_checkpoint_and_tracks_the_cpu_prefill() {
     let dir = temp_checkpoint();
     let cpu = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
     let metal = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
-    assert!(
-        metal.diagnostics_summary()["mamba2_scan_check"]
-            .as_f64()
-            .unwrap()
-            < 1e-4
-    );
+    let summary = metal.diagnostics_summary();
+    assert!(summary["mamba2_scan_check"].as_f64().unwrap() < 1e-4);
+    // Metal runs the device-routed MoE kernels over stacked experts, checked
+    // at load against the checkpoint's expert bytes; the shared expert's
+    // projections are still checked one by one.
+    assert_eq!(summary["moe_path"], "device_routed");
+    assert!(summary["moe_stacked_check"].as_f64().unwrap() < 1e-4);
+    assert_eq!(summary["projection_checks"].as_array().unwrap().len(), 8);
     let audio = test_audio(2.0, 8);
     let hidden = |model: &NemotronTranscribeModel, device: &Device| {
         let artifact = Arc::new(model.prepare(&audio, request(2)).unwrap());

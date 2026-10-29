@@ -126,7 +126,7 @@ impl NemotronDecoder {
             )?)
         };
         let mut layers = Vec::with_capacity(d.layers.len());
-        let (mut mamba, mut attention) = (0usize, 0usize);
+        let (mut mamba, mut attention, mut moe) = (0usize, 0usize, 0usize);
         for (index, kind) in d.layers.iter().enumerate() {
             let mixer = match kind {
                 NemotronLayerKind::Mamba => {
@@ -137,7 +137,16 @@ impl NemotronDecoder {
                     }
                 }
                 NemotronLayerKind::Moe => {
-                    Mixer::Moe(MoeMixer::load(checkpoint, config, index, device, mode)?)
+                    moe += 1;
+                    // The first MoE layer checks its stacked experts.
+                    Mixer::Moe(MoeMixer::load(
+                        checkpoint,
+                        config,
+                        index,
+                        device,
+                        mode,
+                        moe == 1,
+                    )?)
                 }
                 NemotronLayerKind::Attention => {
                     attention += 1;
@@ -212,6 +221,18 @@ impl NemotronDecoder {
         layers + self.lm_head.resident_bytes()
     }
 
+    /// Whether the MoE layers run on the device-routed kernels, and the
+    /// first one's stacked-expert check (relative L2) when they do.
+    pub fn moe_kernels(&self) -> (bool, Option<f64>) {
+        self.layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                Mixer::Moe(mixer) => Some((mixer.device_routed(), mixer.stacked_check())),
+                _ => None,
+            })
+            .unwrap_or((false, None))
+    }
+
     /// One projection of each kind (the first layer of each), for the
     /// load-time FP8 self-check: `(checkpoint module, rows, cols, layer)`.
     pub fn sample_projections(&self) -> Vec<(String, &NtLinear)> {
@@ -227,11 +248,9 @@ impl NemotronDecoder {
                 }
                 Mixer::Moe(mixer) if !moe => {
                     moe = true;
-                    let [up, down, shared_up, shared_down] = mixer.sample_projections();
-                    out.push((format!("{x}.experts.0.up_proj"), up));
-                    out.push((format!("{x}.experts.0.down_proj"), down));
-                    out.push((format!("{x}.shared_experts.up_proj"), shared_up));
-                    out.push((format!("{x}.shared_experts.down_proj"), shared_down));
+                    for (name, linear) in mixer.sample_projections() {
+                        out.push((format!("{x}.{name}"), linear));
+                    }
                 }
                 Mixer::Attention { mixer, .. } if !attention => {
                     attention = true;
@@ -298,7 +317,8 @@ impl NemotronDecoder {
                         out
                     }
                     Mixer::Moe(mixer) => {
-                        let (out, routes) = mixer.forward(&h, Pass::Span)?;
+                        let want_routes = trace.as_ref().is_some_and(|(request, _)| request.routes);
+                        let (out, routes) = mixer.forward(&h, Pass::Span, want_routes)?;
                         if let Some((request, trace)) = trace.as_mut() {
                             if request.routes {
                                 trace.routes.push(routes);
@@ -392,7 +412,7 @@ impl NemotronDecoder {
                         ssm[*index] = s;
                         out
                     }
-                    Mixer::Moe(mixer) => mixer.forward(&h, Pass::Step)?.0,
+                    Mixer::Moe(mixer) => mixer.forward(&h, Pass::Step, false)?.0,
                     Mixer::Attention { index, mixer } => {
                         let (q, k, v) = mixer.project(&h, Pass::Step)?;
                         let mut attended = Vec::with_capacity(count);

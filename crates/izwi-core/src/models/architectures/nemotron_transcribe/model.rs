@@ -686,6 +686,8 @@ impl NemotronTranscribeModel {
             "frontend_tables_checked": d.frontend_checked,
             "projection_checks": d.projection_checks.iter().map(|(m, e)| json!({"module": m, "relative_l2": e})).collect::<Vec<_>>(),
             "mamba2_scan_check": d.scan_check,
+            "moe_path": if self.decoder.moe_kernels().0 { "device_routed" } else { "per_expert" },
+            "moe_stacked_check": self.decoder.moe_kernels().1,
             "ctc_timestamp_head": self.ctc.is_some(),
             "prefill_spans": d.prefill_spans.load(Ordering::Relaxed),
             "decode_steps": d.decode_steps.load(Ordering::Relaxed),

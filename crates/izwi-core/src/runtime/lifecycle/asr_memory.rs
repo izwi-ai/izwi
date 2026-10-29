@@ -2402,7 +2402,10 @@ fn nemotron_transcribe_plan(
         BackendKind::Metal => ResidencyBackend::Metal,
         BackendKind::Cuda => ResidencyBackend::Cuda,
     };
-    let priced = residency(&config, ctc.as_ref(), target);
+    // An invalid FP8 mode fails the load itself; price the default here.
+    let mode = crate::models::architectures::nemotron_transcribe::precision::Fp8Mode::from_env()
+        .unwrap_or_default();
+    let priced = residency(&config, ctc.as_ref(), target, mode);
     let (resident, host_staging) = match backend {
         BackendKind::Cuda => (
             priced.device_bytes,

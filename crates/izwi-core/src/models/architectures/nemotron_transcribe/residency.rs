@@ -5,16 +5,19 @@
 //! | Weight | CPU | Metal | CUDA |
 //! |---|---|---|---|
 //! | FP8 linears | Q8_0 (34 B per 32) | E4M3 bytes + scale grid | E4M3 bytes padded to 64×128 + scale grid |
+//! | Routed experts (`w8a16`) | Q8_0 | E4M3 bytes stacked per layer, one scale | the same as Metal |
 //! | BF16 linears and tables | F32 | F32 | BF16 |
 //! | Router gates, norms, Mamba parameters | F32 | F32 | F32 |
 //! | Language-model head | Q8_0 | F16 | BF16 |
 //! | Embedding table | BF16, host | BF16, host | BF16, host |
 //!
 //! The MTP head is never loaded and the CTC head is priced only when its
-//! file is present.
+//! file is present. In the `vllm-fp8` parity mode the routed experts stay
+//! per-expert FP8 linears, padded on CUDA like the others.
 
 use super::checkpoint::{expected_census, CensusDtype, CtcGeometry};
 use super::config::NemotronTranscribeConfig;
+use super::precision::Fp8Mode;
 
 /// A load's resident bytes, by memory domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,13 +37,21 @@ pub enum ResidencyBackend {
     Cuda,
 }
 
-/// The resident weights of `config` on `backend`.
+/// Whether a load stacks each layer's routed experts for the device-routed
+/// kernels (`kernels::moe_relu2`): on Metal and CUDA in `w8a16`.
+pub fn stacks_routed_experts(backend: ResidencyBackend, mode: Fp8Mode) -> bool {
+    backend != ResidencyBackend::Cpu && mode == Fp8Mode::W8A16
+}
+
+/// The resident weights of `config` on `backend` in `mode`.
 pub fn residency(
     config: &NemotronTranscribeConfig,
     ctc: Option<&CtcGeometry>,
     backend: ResidencyBackend,
+    mode: Fp8Mode,
 ) -> NemotronResidency {
     let mut out = NemotronResidency::default();
+    let stacked = stacks_routed_experts(backend, mode);
     let census = expected_census(config, ctc);
     let dims = |name: &str| -> Option<(u64, u64)> {
         census
@@ -72,6 +83,12 @@ pub fn residency(
                 ResidencyBackend::Cpu => elements / 32 * 34,
                 ResidencyBackend::Metal | ResidencyBackend::Cuda => elements * 2,
             }
+        } else if entry.dtype == CensusDtype::F8E4M3 && stacked && name.contains(".mixer.experts.")
+        {
+            // One stacked projection per layer is staged on the host whole.
+            let staged = elements * config.decoder.moe.experts as u64;
+            out.largest_tensor_bytes = out.largest_tensor_bytes.max(staged);
+            elements + 4
         } else if entry.dtype == CensusDtype::F8E4M3 {
             let (rows, cols) = dims(name).unwrap_or((elements, 1));
             match backend {
@@ -112,9 +129,10 @@ mod tests {
     fn the_published_model_needs_about_32_gib_on_every_backend() {
         let config = super::super::config::tests::published();
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-        let cpu = residency(&config, None, ResidencyBackend::Cpu);
-        let metal = residency(&config, None, ResidencyBackend::Metal);
-        let cuda = residency(&config, None, ResidencyBackend::Cuda);
+        let mode = Fp8Mode::W8A16;
+        let cpu = residency(&config, None, ResidencyBackend::Cpu, mode);
+        let metal = residency(&config, None, ResidencyBackend::Metal, mode);
+        let cuda = residency(&config, None, ResidencyBackend::Cuda, mode);
         // Plan §4.1: about 33.6 GiB as CPU Q8_0 and 31.6 GiB as raw FP8
         // (without the MTP head, the CTC head priced separately).
         assert!(
@@ -132,8 +150,17 @@ mod tests {
             "{}",
             gib(cuda.device_bytes)
         );
-        // CUDA pads the experts' down projections (1856 -> 1920 columns).
-        assert!(cuda.device_bytes > metal.device_bytes);
+        // The stacked experts are unpadded on both devices, so CUDA's BF16
+        // dense matrices (F32 on Metal) outweigh its padded other linears.
+        assert!(cuda.device_bytes < metal.device_bytes);
+        // The parity mode keeps per-expert linears, their down projections
+        // padded on CUDA (1856 -> 1920 columns): 128 experts x 23 layers x
+        // 2688 x 64 bytes, about 0.47 GiB more.
+        let cuda_parity = residency(&config, None, ResidencyBackend::Cuda, Fp8Mode::VllmFp8);
+        let extra = gib(cuda_parity.device_bytes) - gib(cuda.device_bytes);
+        assert!((0.45..0.5).contains(&extra), "{extra}");
+        // A stacked projection (128 experts) is staged on the host at load.
+        assert!(cuda.largest_tensor_bytes >= 128 * 1856 * 2688);
         assert!((gib(metal.host_bytes) - 0.656).abs() < 0.01);
         assert_eq!(cpu.host_bytes, 0);
     }

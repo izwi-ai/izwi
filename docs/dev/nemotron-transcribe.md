@@ -164,6 +164,7 @@ admission (`validate_asr_language` and `validate_asr_task` in
 | Weight | CPU | Metal | CUDA |
 | --- | --- | --- | --- |
 | FP8 linears | Q8_0, re-quantized at load | E4M3 bytes + scale grid | E4M3 bytes padded to 64×128 + scale grid |
+| Routed experts (`w8a16`) | Q8_0, one linear pair per expert | E4M3 bytes stacked per layer, one scale per projection | the same as Metal (unpadded) |
 | BF16 linears and tables | F32 | F32 | BF16 |
 | Router gates, norms, Mamba parameters | F32 | F32 | F32 |
 | Language-model head | Q8_0 | F16 | BF16 |
@@ -172,9 +173,10 @@ admission (`validate_asr_language` and `validate_asr_task` in
 | Resident total | about 33.6 GiB | about 31.6 GiB | about 31.6 GiB |
 
 CUDA needs compute capability 8.0 or newer; an older GPU fails the load. CUDA's
-FP8 provider needs `rows % 64 == 0` and `cols % 128 == 0`, so CUDA pads both
-with zeros, which is exact. Metal keeps F32 activations so relu² expert
-intermediates never meet F16's range.
+FP8 provider needs `rows % 64 == 0` and `cols % 128 == 0`, so CUDA pads the
+other FP8 linears with zeros, which is exact; the stacked routed experts need
+no padding. Metal keeps F32 activations so relu² expert intermediates never
+meet F16's range.
 
 FP8 linears run W8A16 by default (`IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=w8a16`):
 the checkpoint's weights exactly (`decode(byte) * weight_scale`), unquantized
@@ -186,6 +188,45 @@ round-trip through E4M3 before the cache. It exists to tell an izwi bug from
 the W8A8/W8A16 difference when a transcript disagrees with a vLLM run; the
 activation rounding runs on the host, so it is slow. Any other value fails the
 load.
+
+### Mixture of experts
+
+On Metal and CUDA in `w8a16`, each MoE layer stacks its 128 routed experts
+(`up` `[128, 1856, 2688]`, `down` `[128, 2688, 1856]` E4M3 bytes, one F32
+scale per expert and projection) and runs them on the device-routed kernels
+of `kernels/moe_relu2.rs` and `kernels/cuda/moe_relu2.cu`. The router GEMV,
+the sigmoid + F32-bias top-6 and the experts never leave the device, so a
+decode step has no host synchronization inside the MoE block.
+
+- **Decode steps and short spans** run warp kernels: per routed (token, slot)
+  pair, or expert-major once a call has 32 or more pairs. Both sum each dot
+  product in the same order, so they agree bit for bit and a row's output does
+  not depend on how many rows share the step.
+- **Long prefill spans** (`uses_gemm`: at least 64 tokens and 16 routed pairs
+  per expert, so 342 or more tokens here) read the routing once and run each
+  touched expert as two dense GEMMs on its weights dequantized just for that
+  call (F32 on Metal, BF16 on CUDA). Warp kernels cannot match a tiled GEMM
+  once each expert has many tokens. CUDA's 2,048-token and Metal's 512-token
+  spans take this path; the crossover was measured on Metal only.
+- **CPU and `vllm-fp8`** keep the per-expert loop: routing read to the host
+  every layer, then each expert's tokens through its own FP8 linear pair.
+
+The load stacks the experts straight from the checkpoint's bytes. On the
+first MoE layer it then runs two probe tokens through the first, middle and
+last experts on the device and compares them with the reference built from
+those experts' own checkpoint bytes (`moe_stacked_check` in the diagnostics;
+above 1e-4 relative L2 fails the load). `moe_path` in the diagnostics says
+which path a load took.
+
+On an M-series GPU, in the published geometry with 32 experts (the ignored
+benchmark `device_routed_moe_versus_the_per_expert_loop_on_metal`), the
+device-routed path compared with the per-expert loop it replaces:
+
+| Tokens | Device-routed | Per-expert loop | Speed-up |
+| --- | --- | --- | --- |
+| 1 (decode) | 1.6 ms | 4.4 ms | 2.7× |
+| 8 (decode step) | 3.7 ms | 22.6 ms | 6.1× |
+| 512 (prefill span) | 53 ms | 67 ms | 1.3× |
 
 Load admission prices the residency from the config's census before any weight
 is read (`nemotron_transcribe_plan` in
@@ -469,12 +510,18 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - **Real weights**: not run on any backend. Real-weight parity (L2), the HTTP
   end-to-end matrix, load parity and WER against the card are what the kit
   collects.
-- **CUDA**: compile-checked only. No NVIDIA GPU has run it, including the
-  padded FP8 provider and BF16 activations.
+- **CUDA**: compile-checked only (`cargo check --features cuda`, and the
+  device code of `moe_relu2.cu` syntax-checked with clang). No NVIDIA GPU has
+  run it, including the padded FP8 provider, BF16 activations and the
+  device-routed MoE kernels, whose GEMM switch point is calibrated on Metal
+  only.
+- **MoE kernels**: on Metal, checked against the CPU reference, both warp
+  forms bit for bit against each other, and a row alone against the same
+  row in a batch.
 - **Memory**: the residency figures are computed from the published config,
   not measured on a loaded model.
 - **Word timestamps**: the host aligner is checked against upstream goldens
   (`ctc/golden_tests.rs`); the CTC head has not run on real weights.
-- **One-model diarization**: unit-tested on synthetic `ctc_timestamps`
-  only. The kit's `one_model_diarization` e2e case still skips (it predates
-  the request shape), so the kit does not exercise it yet.
+- **One-model diarization**: unit-tested on synthetic `ctc_timestamps` and run
+  through `RuntimeService` on the synthetic checkpoint. The kit's
+  `one_model_diarization` case exercises it on real weights.
