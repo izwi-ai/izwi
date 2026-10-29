@@ -21,7 +21,10 @@ pub mod checkpoint;
 pub mod config;
 pub mod frontend;
 pub mod linear;
+pub mod perception;
 pub mod precision;
+pub mod sortformer;
+pub mod speech_transformer;
 
 #[cfg(test)]
 mod isolation_tests {
