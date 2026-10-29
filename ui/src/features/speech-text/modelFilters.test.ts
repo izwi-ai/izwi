@@ -200,20 +200,22 @@ describe("isDiarizationPipelineAsrModel", () => {
     expect(isDiarizationPipelineAsrModel(plus)).toBe(true);
   });
 
-  it("runs summaries on text chat models, not on an audio chat model", () => {
+  it("runs summaries on chat models, which LFM3 Audio is not", () => {
     const textChat = withCapabilities("Qwen3.5-4B", {
       openai_chat_completions: true,
-      voice_realtime_text_model: true,
     });
-    // LFM3-Audio serves chat completions, but only as an audio chat model.
-    const audioChat = withCapabilities("LFM3-Audio-2B-GGUF", {
-      openai_chat_completions: true,
+    // LFM3-Audio transcribes, speaks and talks, but serves no chat completions.
+    const lfm3Audio = withCapabilities("LFM3-Audio-2B-GGUF", {
+      openai_audio_transcriptions: true,
+      openai_audio_speech: true,
+      speech_to_text_jobs: true,
+      text_to_speech_records: true,
       voice_realtime_unified: true,
     });
     expect(isTranscriptionSummaryModel(textChat)).toBe(true);
     expect(isDiarizationPipelineLlmModel(textChat)).toBe(true);
-    expect(isTranscriptionSummaryModel(audioChat)).toBe(false);
-    expect(isDiarizationPipelineLlmModel(audioChat)).toBe(false);
+    expect(isTranscriptionSummaryModel(lfm3Audio)).toBe(false);
+    expect(isDiarizationPipelineLlmModel(lfm3Audio)).toBe(false);
   });
 
   it("finds an installed Granite Speech 5.0 for the speaker-attribution hint", () => {

@@ -47,18 +47,8 @@ export function isDiarizationPipelineAlignerModel(model: ModelInfo): boolean {
   return hasCapability(model, "forced_alignment");
 }
 
-/** A text chat model: the server's own text generations (summaries, the
- * diarization pipeline's LLM) run on one. LFM3-Audio serves chat completions
- * too, but only as an audio chat model, so it is not one. */
-function isTextChatModel(model: ModelInfo): boolean {
-  return (
-    hasCapability(model, "openai_chat_completions") &&
-    hasCapability(model, "voice_realtime_text_model")
-  );
-}
-
 export function isDiarizationPipelineLlmModel(model: ModelInfo): boolean {
-  return isTextChatModel(model);
+  return hasCapability(model, "openai_chat_completions");
 }
 
 export function isTranscriptionAlignerModel(model: ModelInfo): boolean {
@@ -66,7 +56,7 @@ export function isTranscriptionAlignerModel(model: ModelInfo): boolean {
 }
 
 export function isTranscriptionSummaryModel(model: ModelInfo): boolean {
-  return isTextChatModel(model);
+  return hasCapability(model, "openai_chat_completions");
 }
 
 export function isSpeakerAttributedAsrModel(model: RouteCapabilityModel): boolean {

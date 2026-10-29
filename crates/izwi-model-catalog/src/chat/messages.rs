@@ -68,8 +68,9 @@ pub fn fold_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 pub enum ChatMediaKind {
     Image,
     Video,
-    /// A speech clip (LFM3-Audio), its `source` a `data:audio/...;base64,`
-    /// URL.
+    /// A speech clip, its `source` a `data:audio/...;base64,` URL. No chat
+    /// model hears audio; chat threads stored before LFM3-Audio left chat
+    /// still carry clips, which text models read as an attachment note.
     Audio,
 }
 
@@ -82,12 +83,6 @@ pub struct ChatMediaInput {
 /// Where a message's text holds each of its audio clips, in order: the
 /// token LFM3-Audio's template writes for an audio content part.
 pub const CHAT_AUDIO_PLACEHOLDER: &str = "<|audio|>";
-
-/// The most audio clips one chat request may carry.
-pub const CHAT_MAX_AUDIO_CLIPS: usize = 8;
-
-/// The longest audio clip a chat request may carry, in seconds.
-pub const CHAT_MAX_AUDIO_CLIP_SECONDS: u32 = 120;
 
 /// Hugging Face-compatible keyword arguments accepted alongside the direct
 /// chat request fields. Server adapters resolve these into `ChatRequestConfig`

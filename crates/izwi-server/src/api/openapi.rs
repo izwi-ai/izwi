@@ -2144,8 +2144,7 @@ pub struct ChatCompletionStreamOptions {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionMessage {
     pub role: String,
-    /// Text, or content parts: `text`, images for Qwen3.5, `input_audio`
-    /// clips for LFM3-Audio.
+    /// Text, or content parts: `text`, and images for Qwen3.5.
     pub content: Option<serde_json::Value>,
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }

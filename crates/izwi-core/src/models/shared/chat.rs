@@ -3,7 +3,7 @@
 pub use crate::catalog::ChatReasoningEffort;
 pub use izwi_model_catalog::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole, ChatTemplateKwargs,
-    ChatTruncation, CHAT_AUDIO_PLACEHOLDER, CHAT_MAX_AUDIO_CLIPS, CHAT_MAX_AUDIO_CLIP_SECONDS,
+    ChatTruncation, CHAT_AUDIO_PLACEHOLDER,
 };
 
 /// Model-agnostic chat generation controls used by native chat backends.

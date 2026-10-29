@@ -3677,7 +3677,7 @@ async fn admin_models_expose_voice_app_capabilities() {
         .any(|modality| modality.as_str() == Some("audio_output")));
 
     // LFM3-Audio runs speech-to-text jobs and the diarization pipeline's
-    // ASR; LFM2.5-Audio's retained ASR runs neither.
+    // ASR; LFM2.5-Audio's retained ASR runs neither. Neither is a chat model.
     for (id, jobs) in [
         ("LFM3-Audio-2B-GGUF", true),
         ("LFM2.5-Audio-1.5B-GGUF", false),
@@ -3693,6 +3693,13 @@ async fn admin_models_expose_voice_app_capabilities() {
             Some(true),
             "{id}"
         );
+        for route in ["openai_chat_completions", "openai_responses"] {
+            assert_eq!(
+                model["route_capabilities"][route].as_bool(),
+                Some(false),
+                "{id} {route}"
+            );
+        }
     }
 
     drop(temp_dir);

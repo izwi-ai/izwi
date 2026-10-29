@@ -34,8 +34,6 @@ export interface ChatPlaygroundProps {
   ) => ChatModelCapabilities | null | undefined;
   /** Catalog lookup for image input (`image_input` modality); undefined when unknown. */
   modelSupportsImages?: (variant: string) => boolean | undefined;
-  /** Catalog lookup for audio input (`audio_input` modality); undefined when unknown. */
-  modelSupportsAudio?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
@@ -95,23 +93,6 @@ export interface PendingImageAttachment {
   label: string;
   previewUrl?: string;
 }
-
-export interface PendingAudioAttachment {
-  id: string;
-  /** Base64 mono 16 kHz PCM16 WAV, without a `data:` prefix. */
-  data: string;
-  format: "wav";
-  label: string;
-  durationSecs: number;
-  previewUrl?: string;
-}
-
-/** The server's limits: CHAT_MAX_AUDIO_CLIPS clips per request, each at
- * most CHAT_MAX_AUDIO_CLIP_SECONDS long. */
-export const MAX_CHAT_AUDIO_CLIPS = 8;
-export const MAX_CHAT_AUDIO_CLIP_SECS = 120;
-/** The rate clips are sent at, which LFM3-Audio hears. */
-export const CHAT_AUDIO_SAMPLE_RATE = 16_000;
 
 export interface GenerateTitleArgs {
   threadId: string;
@@ -428,16 +409,6 @@ export function supportsImageAttachmentsForModel(
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
-/** Name-based fallback for models missing from the catalog. */
-export function supportsAudioAttachmentsForModel(
-  variant: string | null,
-): boolean {
-  if (!variant) {
-    return false;
-  }
-  return variant.trim().toLowerCase().startsWith("lfm3-audio-");
-}
-
 export function isLfm25ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -484,14 +455,12 @@ export function systemPromptForModel(supportsThinking: boolean): string {
 export function buildChatThreadMessagePayload(options: {
   text: string;
   images: PendingImageAttachment[];
-  audio?: PendingAudioAttachment[];
 }): {
   content: string;
   contentParts?: ChatThreadContentPart[];
 } {
   const trimmedText = options.text.trim();
-  const audio = options.audio ?? [];
-  if (options.images.length === 0 && audio.length === 0) {
+  if (options.images.length === 0) {
     return {
       content: trimmedText,
     };
@@ -515,39 +484,11 @@ export function buildChatThreadMessagePayload(options: {
     });
   }
 
-  // The server reads `data` and `format`; `name` labels the clip in history.
-  for (const clip of audio) {
-    contentParts.push({
-      type: "input_audio",
-      input_audio: {
-        data: clip.data,
-        format: clip.format,
-        name: clip.label,
-      },
-    });
-  }
-
   return {
     content:
-      trimmedText ||
-      [
-        summarizePendingImages(options.images.length, options.images),
-        summarizePendingAudio(audio),
-      ]
-        .filter(Boolean)
-        .join("; "),
+      trimmedText || summarizePendingImages(options.images.length, options.images),
     contentParts,
   };
-}
-
-/** A clip as a URL an `<audio>` element plays. */
-export function audioDataUrl(data: string, format: string): string {
-  const normalized = format.trim().toLowerCase() || "wav";
-  const mime =
-    normalized === "mp3" || normalized === "mpeg"
-      ? "audio/mpeg"
-      : `audio/${normalized}`;
-  return `data:${mime};base64,${data}`;
 }
 
 /** Image formats the server decodes. */
@@ -646,16 +587,6 @@ function summarizePendingImages(
     return `Attached image: ${images[0]?.label || "image"}`;
   }
   return `Attached ${imageCount} images`;
-}
-
-function summarizePendingAudio(clips: PendingAudioAttachment[]): string {
-  if (clips.length === 0) {
-    return "";
-  }
-  if (clips.length === 1) {
-    return `Attached audio: ${clips[0]?.label || "audio"}`;
-  }
-  return `Attached ${clips.length} audio clips`;
 }
 
 function extractMarkdownImageSource(value: string): string | null {
@@ -793,6 +724,16 @@ function extractMediaLabel(value: unknown, kind: AttachmentKind): string {
   }
 
   return fallbackAttachmentLabel(kind);
+}
+
+/** A clip as a URL an `<audio>` element plays. */
+function audioDataUrl(data: string, format: string): string {
+  const normalized = format.trim().toLowerCase() || "wav";
+  const mime =
+    normalized === "mp3" || normalized === "mpeg"
+      ? "audio/mpeg"
+      : `audio/${normalized}`;
+  return `data:${mime};base64,${data}`;
 }
 
 /**

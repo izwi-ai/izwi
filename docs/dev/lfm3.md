@@ -1,7 +1,8 @@
 # LFM3 and LFM3-Audio
 
 izwi serves Liquid AI's LFM3-1.7B as a text chat model and LFM3-Audio-2B as one
-model for speech recognition, speech synthesis and voice chat. Both are
+model for speech recognition, speech synthesis and voice chat. LFM3-Audio is not
+a chat model: the chat routes refuse it. Both are
 verified on real weights on CPU and Metal. CUDA builds and is compile-checked
 only; see [Known gaps](#known-gaps) and the LFM3 section of
 [LFM CUDA implementation and qualification](lfm-cuda.md#lfm3).
@@ -9,7 +10,7 @@ only; see [Known gaps](#known-gaps) and the LFM3 section of
 User-facing behaviour is documented in the
 [support matrix](../user/support-matrix.md), the
 [models guide](../user/models/index.md), the [API reference](../user/api.md)
-(deferred tools, audio content parts) and the
+(deferred tools) and the
 [voice guide](../user/features/voice.md) (spoken tool calls).
 
 | Variant | Files | Family |
@@ -126,8 +127,7 @@ rendered string is tokenized once, as `apply_chat_template` does.
   unknown name is a 400), with `{"result": {"tools": [...]}}` items, or with an
   `additional_tools` key on the tool message (definitions, or a flag when the
   content holds them). For LFM3 chat, consecutive results with the same
-  `tool_call_id` merge into one block. LFM3-Audio's dialect writes other items
-  as JSON, refuses `tool_reference` items and does not merge. Other models
+  `tool_call_id` merge into one block. Other models
   refuse both constructs (`reject_deferred_tool_results`). The chat
   completions handler and the Responses handler
   (`crates/izwi-server/src/api/openai/responses/handlers.rs`) both render
@@ -225,21 +225,6 @@ one; CUDA follows the engine's tensor width.
   transcribes as its own row beside the reply (`lfm3_audio_turn_transcript` in
   `runtime/speech_to_speech.rs`).
 
-### Chat completions with audio input
-
-A chat request that names LFM3-Audio is built by `runtime/lfm3_audio_chat.rs`
-as a reply row with `SpeechReplyTurn::Chat` (`engine/request.rs`): the
-conversation, with an `<|audio|>` placeholder for each clip, answered in text
-only (`Lfm3AudioReplyOutput::Text`; the reply never starts speech). The gateway
-reads `input_audio` parts, and `audio_url` or `audio` parts holding a `data:`
-URL (`crates/izwi-gateway/src/app/chat_content.rs`). Only user messages carry
-audio, at most 8 clips per request and 120 s per clip; images and video are
-refused. The request's sampling applies over LFM3-Audio's greedy text defaults,
-`preserve_thinking` is honoured, and tools render as described above. A chat
-invocation that carries a gateway's token ceiling (`max_tokens_ceiling`, which
-serving workers pass) is refused: LFM3-Audio answers chat only on a local
-server.
-
 ### Spoken tool rounds
 
 `RuntimeService::speech_to_speech_round_streaming_bytes`
@@ -289,8 +274,8 @@ run, or skip, when the files are missing; a pass without the weights proves
 nothing. Check the output for `not run` or `skipping`.
 
 **Runtime routes** (`crates/izwi-core/src/runtime/lfm3_audio_tests.rs`): ASR,
-TTS and voice chat, LiveASR on engine sessions, chat about audio clips with
-tool calls, and a four-language check. They run when
+TTS and voice chat, LiveASR on engine sessions, a spoken turn with tool calls,
+and a four-language check. They run when
 `IZWI_LFM3_AUDIO_MODELS_DIR` names the models directory, on the CPU unless
 `IZWI_LFM3_AUDIO_BACKEND=metal` (or `cuda`) selects a device.
 `IZWI_LFM3_AUDIO_BATCH=4` runs speech and transcription rows four wide. The
@@ -369,7 +354,7 @@ Shared knobs that reach LFM3, also in [`env/core.md`](env/core.md):
 - **CUDA** builds for both models and is compile-checked only: neither has run
   on an NVIDIA GPU. See [LFM CUDA](lfm-cuda.md#lfm3) for the tests to run on
   one.
-- **Prefix reuse** is not enabled for LFM3-Audio on any backend: no audio-chat
+- **Prefix reuse** is not enabled for LFM3-Audio on any backend: no voice-chat
   reuse evidence has been collected. For LFM3 chat it is off on CUDA.
 - **Benchmarks.** `LFM3-1.7B-GGUF` and `LFM3-Audio-2B-GGUF` are in the CPU,
   Metal and CUDA chat and audio-concurrency manifests, `lfm-cuda.toml` and the

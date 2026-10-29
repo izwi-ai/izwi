@@ -43,8 +43,8 @@ use super::depth::{FrameHistory, Lfm3DepthDecoder};
 use super::encoder::Lfm3AudioEncoder;
 use super::preprocessor::Lfm3AudioMel;
 use super::prompts::{
-    asr_prompt, audio_slots, live_asr_prompt, reply_prompt, tts_prompt, Lfm3AudioReplyOutput,
-    Lfm3AudioVoice, PromptPart,
+    asr_prompt, audio_slots, live_asr_prompt, reply_prompt, tts_prompt, Lfm3AudioVoice,
+    PromptPart,
 };
 use super::sampling::{apply_repetition_penalty, sample};
 use crate::models::shared::chat::ChatMessage;
@@ -303,23 +303,20 @@ pub(crate) fn tts_request(
     })
 }
 
-/// A reply to `messages` (see [`reply_prompt`]): text, or interleaved text
-/// and speech, the encoder embeddings `clips` filling the prompt's speech
-/// slots in order, at most `max_slots` slots. A reply that may call tools
-/// starts in text and moves to speech at `<|mixed_start|>`.
-#[allow(clippy::too_many_arguments)]
+/// A voice reply to `messages` (see [`reply_prompt`]): interleaved text and
+/// speech, the encoder embeddings `clips` filling the prompt's speech slots
+/// in order, at most `max_slots` slots. A reply that may call tools starts
+/// in text and moves to speech at `<|mixed_start|>`.
 pub(crate) fn reply_request(
     messages: &[ChatMessage],
     clips: Vec<Tensor>,
     tools: &[serde_json::Value],
-    output: Lfm3AudioReplyOutput,
-    preserve_thinking: bool,
     max_slots: usize,
     text_sampling: Lfm3TextSampling,
     audio_sampling: Lfm3AudioSampling,
     seed: u64,
 ) -> Result<Lfm3AudioRequest> {
-    let prompt = reply_prompt(messages, tools, output, preserve_thinking);
+    let prompt = reply_prompt(messages, tools);
     let slots = audio_slots(&prompt);
     if slots != clips.len() {
         return Err(Error::InvalidInput(format!(
@@ -327,16 +324,16 @@ pub(crate) fn reply_request(
             clips.len()
         )));
     }
-    let (mode, text_only) = match output {
-        Lfm3AudioReplyOutput::Text => (Lfm3AudioMode::Text, true),
-        Lfm3AudioReplyOutput::Interleaved if !tools.is_empty() => (Lfm3AudioMode::Text, false),
-        Lfm3AudioReplyOutput::Interleaved => (Lfm3AudioMode::Interleaved, false),
+    let mode = if tools.is_empty() {
+        Lfm3AudioMode::Interleaved
+    } else {
+        Lfm3AudioMode::Text
     };
     Ok(Lfm3AudioRequest {
         prompt,
         clips,
         mode,
-        text_only,
+        text_only: false,
         max_slots: max_slots.max(1),
         text_sampling,
         audio_sampling,
@@ -497,8 +494,6 @@ impl Lfm3AudioModel {
         clips: &[(Vec<f32>, u32)],
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
-        output: Lfm3AudioReplyOutput,
-        preserve_thinking: bool,
         max_slots: usize,
         text_sampling: Lfm3TextSampling,
         audio_sampling: Lfm3AudioSampling,
@@ -512,8 +507,6 @@ impl Lfm3AudioModel {
             messages,
             clips,
             tools,
-            output,
-            preserve_thinking,
             max_slots,
             text_sampling,
             audio_sampling,

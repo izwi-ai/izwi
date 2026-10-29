@@ -342,14 +342,6 @@ impl NativeExecutor {
             let mut lease = row.lease.take().expect("armed LFM3-Audio lease");
             let active = lease.require_state_mut()?;
             let finished = active.state.finished();
-            // A chat reply counts the tokens it wrote, not the token that
-            // stopped it, as every chat family does.
-            let stop_token = finished
-                && request.speech_reply == crate::engine::SpeechReplyTurn::Chat
-                && active
-                    .state
-                    .output()
-                    .is_some_and(|output| output.stop_reason == "eos");
             let (audio, text) = match (request.task_type, active.input_audio) {
                 (TaskType::ASR, Some((sample_rate, input_samples))) => {
                     let delta = active.state.take_text();
@@ -414,7 +406,7 @@ impl NativeExecutor {
                 } else {
                     append
                 },
-                tokens_generated: usize::from(!is_prefill && !stop_token),
+                tokens_generated: usize::from(!is_prefill),
                 finished,
                 phase_timing_override: None,
                 asr_diagnostics: None,
@@ -497,27 +489,6 @@ impl NativeExecutor {
         let delta = active.state.take_text();
         let samples = active.state.take_samples();
         let audio = match Self::stream_sender(request) {
-            // A chat reply is text alone.
-            Some(tx) if request.speech_reply == crate::engine::SpeechReplyTurn::Chat => {
-                if !delta.is_empty() {
-                    Self::stream_text_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active.stream_sequence,
-                        delta,
-                    )?;
-                }
-                if finished {
-                    Self::stream_final_marker_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active.stream_sequence,
-                    )?;
-                }
-                AudioOutput::new(Vec::new(), SAMPLE_RATE)
-            }
             Some(tx) => {
                 if !delta.is_empty() {
                     Self::stream_text_with_policy(
@@ -548,18 +519,15 @@ impl NativeExecutor {
                 }
             }
         };
-        // A chat reply's text matches its streamed deltas exactly; a voice
-        // turn's is trimmed for its transcript.
+        // The reply's text is trimmed for the voice turn's transcript.
         let text = finished.then(|| {
-            let text = active
+            active
                 .state
                 .output()
                 .map(|output| output.text.as_str())
-                .unwrap_or_default();
-            match request.speech_reply {
-                crate::engine::SpeechReplyTurn::Chat => text.to_string(),
-                crate::engine::SpeechReplyTurn::Voice => text.trim().to_string(),
-            }
+                .unwrap_or_default()
+                .trim()
+                .to_string()
         });
         Ok((audio, text))
     }

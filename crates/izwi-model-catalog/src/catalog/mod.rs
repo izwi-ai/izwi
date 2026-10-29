@@ -24,7 +24,7 @@ pub use prefix_reuse::{
     PrefixReuseSupportLevel,
 };
 pub use variant::{
-    normalize_stored_model_id, parse_chat_model_variant, parse_chat_request_model_variant,
+    normalize_stored_model_id, parse_chat_model_variant,
     parse_model_variant, parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
     resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,

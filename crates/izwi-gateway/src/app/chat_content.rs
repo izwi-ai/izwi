@@ -1,7 +1,4 @@
-use izwi_model_catalog::{
-    ChatMediaInput, ChatMediaKind, ModelFamily, ModelVariant, CHAT_AUDIO_PLACEHOLDER,
-    CHAT_MAX_AUDIO_CLIPS,
-};
+use izwi_model_catalog::{ChatMediaInput, ChatMediaKind, ModelVariant, CHAT_AUDIO_PLACEHOLDER};
 use serde_json::Value;
 
 pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -196,12 +193,12 @@ pub fn variant_accepts_image_input(variant: ModelVariant) -> bool {
     variant.is_qwen35_chat_gguf()
 }
 
-/// Whether `variant` hears chat media of `kind`: Qwen3.5 images and videos,
-/// LFM3-Audio audio clips.
+/// Whether `variant` hears chat media of `kind`: Qwen3.5 images and videos.
+/// No chat model hears audio clips; older threads may still carry them.
 pub fn variant_accepts_media(variant: ModelVariant, kind: ChatMediaKind) -> bool {
     match kind {
         ChatMediaKind::Image | ChatMediaKind::Video => variant_accepts_image_input(variant),
-        ChatMediaKind::Audio => variant.family() == ModelFamily::Lfm3Audio,
+        ChatMediaKind::Audio => false,
     }
 }
 
@@ -212,27 +209,13 @@ pub fn validate_media_inputs_for_variant(
     if media_inputs.is_empty() {
         return Ok(());
     }
-    let audio = media_inputs
+    if media_inputs
         .iter()
-        .filter(|input| input.kind == ChatMediaKind::Audio)
-        .count();
-    if variant.family() == ModelFamily::Lfm3Audio {
-        if audio < media_inputs.len() {
-            return Err(format!(
-                "{} reads audio clips, not images or videos",
-                variant.dir_name()
-            ));
-        }
-        if audio > CHAT_MAX_AUDIO_CLIPS {
-            return Err(format!(
-                "A chat request can carry at most {CHAT_MAX_AUDIO_CLIPS} audio clips, not {audio}"
-            ));
-        }
-        return Ok(());
-    }
-    if audio > 0 {
+        .any(|input| input.kind == ChatMediaKind::Audio)
+    {
         return Err(format!(
-            "Audio chat input needs LFM3-Audio; {} does not read audio",
+            "Chat models do not hear audio clips, and {} is no exception; for spoken \
+             conversations use the realtime voice API",
             variant.dir_name()
         ));
     }

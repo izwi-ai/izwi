@@ -464,18 +464,17 @@ fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
 ///
 /// The output processor maps every completed disposition to `StopToken`, so
 /// a reply cut off at `max_tokens` would read as a natural stop. Every chat
-/// family (and LFM3-Audio's chat replies) counts only emitted tokens (stop
-/// tokens are never counted), and the request's `max_tokens` is already
-/// bounded by the remaining context, so a row whose count reached the budget
-/// was cut off.
+/// family counts only emitted tokens (stop tokens are never counted), and the
+/// request's `max_tokens` is already bounded by the remaining context, so a
+/// row whose count reached the budget was cut off.
 fn chat_budget_finish_reason(
     reason: Option<OutputFinishReason>,
-    answers_chat: bool,
+    task_type: super::types::TaskType,
     max_tokens: usize,
     generated: usize,
 ) -> Option<OutputFinishReason> {
     if reason == Some(OutputFinishReason::StopToken)
-        && answers_chat
+        && task_type == super::types::TaskType::Chat
         && max_tokens > 0
         && generated >= max_tokens
     {

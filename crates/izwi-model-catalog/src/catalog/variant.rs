@@ -498,20 +498,6 @@ pub fn parse_chat_model_variant(
     }
 }
 
-/// The model a chat route request names: a text chat model, or LFM3-Audio
-/// (see [`ModelVariant::serves_chat_requests`]).
-pub fn parse_chat_request_model_variant(
-    input: Option<&str>,
-) -> Result<ModelVariant, ParseModelVariantError> {
-    let id = input.unwrap_or("Qwen3.5-4B");
-    let variant = parse_model_variant(id)?;
-    if variant.serves_chat_requests() {
-        Ok(variant)
-    } else {
-        Err(ParseModelVariantError::new(id))
-    }
-}
-
 /// Resolve the LLM variant that summarizes a diarization transcript. Any
 /// chat-capable catalog model is accepted: the summary prompt is
 /// model-agnostic. Defaults to Qwen3.5-4B. Legacy records may still
@@ -1529,6 +1515,14 @@ mod tests {
         assert!(parse_chat_model_variant(Some("Gemma-3-1b-it")).is_err());
         assert!(parse_chat_model_variant(Some("google/gemma-3-1b-it")).is_err());
         assert!(parse_model_variant("Gemma 3 1B Instruct").is_err());
+    }
+
+    #[test]
+    fn lfm3_audio_is_not_a_chat_model() {
+        // It transcribes, speaks and runs voice mode; the chat routes refuse it.
+        for id in ["LFM3-Audio-2B-GGUF", "LFM3-Audio-2B-Q8_0-GGUF"] {
+            assert!(parse_chat_model_variant(Some(id)).is_err(), "{id}");
+        }
     }
 
     #[test]

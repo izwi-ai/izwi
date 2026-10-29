@@ -87,8 +87,8 @@ pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
 }
 
 /// Whether a chat model's prompt renders `ChatRequestConfig::tools` with a
-/// tool-calling template (the Qwen3.5 family's, LFM3's and LFM3-Audio's XML
-/// calls, LFM2.5's marker list). Other chat models have no tool template.
+/// tool-calling template (the Qwen3.5 family's and LFM3's XML calls, LFM2.5's
+/// marker list). Other chat models have no tool template.
 pub fn chat_supports_tools(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
@@ -97,7 +97,6 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
-            | ModelFamily::Lfm3Audio
     )
 }
 
@@ -140,15 +139,6 @@ pub fn resolve_chat_sampling(
             top_p: 1.0,
             top_k: 50,
             repetition_penalty: 1.1,
-            presence_penalty: 0.0,
-        }
-    } else if variant.family() == ModelFamily::Lfm3Audio {
-        // LFM3-Audio-2B's `generation_config.json` decodes text greedily.
-        ResolvedChatSampling {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
             presence_penalty: 0.0,
         }
     } else {
@@ -304,18 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn lfm3_audio_chat_decodes_text_greedily_unless_asked_otherwise() {
-        for variant in [ModelVariant::Lfm3Audio2BGguf, ModelVariant::Lfm3Audio2BQ8Gguf] {
-            assert_eq!(
-                resolve_chat_sampling(variant, None, ChatSamplingRequest::default()),
-                sampling(0.0, 1.0, 0, 1.0, 0.0)
-            );
-            assert!(variant.serves_chat_requests() && !variant.is_chat());
-            assert!(!chat_supports_json_object(variant));
-        }
-    }
-
-    #[test]
     fn qwen_thinking_models_select_the_profile_for_the_requested_mode() {
         for variant in QWEN_THINKING_VARIANTS {
             for (enable_thinking, expected) in [
@@ -392,8 +370,6 @@ mod tests {
         assert!(!chat_supports_json_object(ModelVariant::Qwen3827BFp8));
         assert!(chat_supports_tools(ModelVariant::Qwen3827BFp8));
         assert!(chat_supports_tools(ModelVariant::Lfm2512BInstructGguf));
-        assert!(chat_supports_tools(ModelVariant::Lfm3Audio2BGguf));
-        assert!(!chat_supports_json_object(ModelVariant::Lfm3Audio2BGguf));
         assert!(!chat_supports_tools(ModelVariant::Qwen314BGguf));
         assert!(!chat_supports_tools(ModelVariant::Gemma34BIt));
     }

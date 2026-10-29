@@ -487,27 +487,13 @@ pub(crate) fn clamp_tts_speed(speed: f32) -> f32 {
     speed.clamp(TTS_SPEED_RANGE.0, TTS_SPEED_RANGE.1)
 }
 
-/// What an LFM3-Audio speech-to-speech request answers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum SpeechReplyTurn {
-    /// A spoken turn (the request's audio) after `chat_messages`' text
-    /// history, answered in interleaved text and speech.
-    #[default]
-    Voice,
-    /// A chat completion: `chat_messages`, an `<|audio|>` placeholder for each
-    /// of `chat_config.media_inputs`' clips, answered in text.
-    Chat,
-}
-
-/// What an LFM3-Audio reply is prepared from: its conversation (an
-/// `<|audio|>` placeholder per clip), the tools it may call, what it writes,
-/// its slot budget and sampling.
+/// What an LFM3-Audio voice reply is prepared from: its conversation (an
+/// `<|audio|>` placeholder for the spoken turn), the tools it may call, its
+/// slot budget and sampling.
 #[derive(Debug, Clone)]
 pub(crate) struct Lfm3AudioReplySettings {
     pub(crate) messages: Vec<crate::models::shared::chat::ChatMessage>,
     pub(crate) tools: Vec<serde_json::Value>,
-    pub(crate) output: crate::models::architectures::lfm3_audio::prompts::Lfm3AudioReplyOutput,
-    pub(crate) preserve_thinking: bool,
     pub(crate) max_slots: usize,
     pub(crate) text_sampling: crate::models::architectures::lfm3_audio::config::Lfm3TextSampling,
     pub(crate) audio_sampling: crate::models::architectures::lfm3_audio::config::Lfm3AudioSampling,
@@ -1079,8 +1065,6 @@ pub struct EngineCoreRequest {
     pub voice_description: Option<String>,
     /// Optional system prompt (e.g. speech-to-speech system instruction).
     pub system_prompt: Option<String>,
-    /// What an LFM3-Audio speech-to-speech request answers.
-    pub(crate) speech_reply: SpeechReplyTurn,
     /// Generation parameters
     pub params: GenerationParams,
     /// Request priority
@@ -1127,12 +1111,6 @@ impl EngineCoreRequest {
         self.cancellation
             .as_ref()
             .is_some_and(|signal| signal.load(Ordering::Acquire))
-    }
-
-    /// Whether this request answers a chat completion: a chat row, or an
-    /// LFM3-Audio reply to a chat turn.
-    pub(crate) fn answers_chat(&self) -> bool {
-        self.task_type == TaskType::Chat || self.speech_reply == SpeechReplyTurn::Chat
     }
 
     /// Get number of prompt tokens.
@@ -1220,9 +1198,7 @@ impl RequestProcessor {
                 }
             }
             TaskType::SpeechToSpeech => {
-                if request.selected_audio_input().is_none()
-                    && request.speech_reply != SpeechReplyTurn::Chat
-                {
+                if request.selected_audio_input().is_none() {
                     return Err(Error::InvalidInput(
                         "Speech-to-speech request requires audio input".into(),
                     ));

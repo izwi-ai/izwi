@@ -15,7 +15,6 @@ import {
   summarizeChatStats,
   supportsImageAttachmentsForModel,
   stripMarkdown,
-  supportsAudioAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
   systemPromptForModel,
   threadPreviewFromContent,
@@ -89,72 +88,6 @@ describe("chat playground support", () => {
   it("recognizes Qwen3.5 as the image-capable chat family", () => {
     expect(supportsImageAttachmentsForModel("Qwen3.5-4B")).toBe(true);
     expect(supportsImageAttachmentsForModel("Qwen3-14B-GGUF")).toBe(false);
-  });
-
-  it("recognizes LFM3 Audio as the audio-capable chat family", () => {
-    expect(supportsAudioAttachmentsForModel("LFM3-Audio-2B-GGUF")).toBe(true);
-    expect(supportsAudioAttachmentsForModel("LFM3-Audio-2B-Q8_0-GGUF")).toBe(
-      true,
-    );
-    expect(supportsAudioAttachmentsForModel("LFM3-1.7B-GGUF")).toBe(false);
-    expect(supportsAudioAttachmentsForModel("Qwen3.5-4B")).toBe(false);
-    expect(supportsAudioAttachmentsForModel(null)).toBe(false);
-  });
-
-  it("builds input_audio parts after the text, in the order attached", () => {
-    const clip = (id: string, label: string) => ({
-      id,
-      data: "UklGRg==",
-      format: "wav" as const,
-      label,
-      durationSecs: 4,
-    });
-
-    expect(
-      buildChatThreadMessagePayload({
-        text: "What is said?",
-        images: [],
-        audio: [clip("audio-1", "question.wav"), clip("audio-2", "answer.mp3")],
-      }),
-    ).toEqual({
-      content: "What is said?",
-      contentParts: [
-        { type: "text", text: "What is said?" },
-        {
-          type: "input_audio",
-          input_audio: { data: "UklGRg==", format: "wav", name: "question.wav" },
-        },
-        {
-          type: "input_audio",
-          input_audio: { data: "UklGRg==", format: "wav", name: "answer.mp3" },
-        },
-      ],
-    });
-  });
-
-  it("summarizes audio-only prompts for previews and titles", () => {
-    const clip = (label: string) => ({
-      id: label,
-      data: "UklGRg==",
-      format: "wav" as const,
-      label,
-      durationSecs: 4,
-    });
-
-    expect(
-      buildChatThreadMessagePayload({
-        text: " ",
-        images: [],
-        audio: [clip("memo.wav")],
-      }).content,
-    ).toBe("Attached audio: memo.wav");
-    expect(
-      buildChatThreadMessagePayload({
-        text: "",
-        images: [],
-        audio: [clip("a.wav"), clip("b.wav")],
-      }).content,
-    ).toBe("Attached 2 audio clips");
   });
 
   it("builds multimodal request content with image parts", () => {

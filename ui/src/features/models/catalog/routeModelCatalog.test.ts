@@ -195,15 +195,6 @@ describe("route model catalog", () => {
     );
   });
 
-  it("labels LFM3 Audio by its quantization on the chat route", () => {
-    expect(getChatRouteModelLabel("LFM3-Audio-2B-GGUF")).toBe(
-      "LFM3 Audio 2B GGUF (Q4_K_M)",
-    );
-    expect(getChatRouteModelLabel("LFM3-Audio-2B-Q8_0-GGUF")).toBe(
-      "LFM3 Audio 2B GGUF (Q8_0)",
-    );
-  });
-
   it("never prefers a removed or quantized Qwen3-TTS variant", () => {
     const preferred = [
       ...TEXT_TO_SPEECH_PREFERRED_MODELS,

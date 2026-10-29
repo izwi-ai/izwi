@@ -55,7 +55,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -125,7 +124,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -195,7 +193,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -262,7 +259,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -330,7 +326,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -398,7 +393,6 @@ impl EngineCoreRequest {
             reference_language: None,
             voice_description: None,
             system_prompt: None,
-            speech_reply: SpeechReplyTurn::Voice,
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
@@ -414,22 +408,6 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
-        }
-    }
-
-    /// Create an LFM3-Audio chat completion: `messages`, with an `<|audio|>`
-    /// placeholder for each audio clip in its chat config, answered in text
-    /// by a speech-to-speech reply row.
-    pub(crate) fn lfm3_audio_chat(messages: Vec<ChatMessage>) -> Self {
-        Self {
-            task: EngineTask::SpeechToSpeech(AudioChatEngineInput {
-                audio: EngineAudioInput::Base64(String::new()),
-                messages: Vec::new(),
-                system_prompt: None,
-            }),
-            task_type: TaskType::SpeechToSpeech,
-            speech_reply: SpeechReplyTurn::Chat,
-            ..Self::chat(messages)
         }
     }
 

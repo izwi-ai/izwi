@@ -618,91 +618,38 @@ impl EngineCoreRequest {
         }
     }
 
-    /// The LFM3-Audio reply this request asks for, at most its `max_tokens`
-    /// slots, with the tools of its chat config.
-    ///
-    /// * A voice turn: its text history and spoken turn, answered in
-    ///   interleaved text and speech; the text greedy (Liquid's
-    ///   `generation_config.json`; no voice route sets text sampling of its
-    ///   own), the speech sampled as [`Self::lfm3_audio_sampling`] with its
-    ///   seed (else one derived from its id).
-    /// * A chat turn: its messages, answered in text with the request's
-    ///   resolved chat sampling and seed, keeping earlier answers' thinking
-    ///   with `preserve_thinking`.
+    /// The LFM3-Audio reply this voice turn asks for: its text history and
+    /// spoken turn with the tools of its chat config, answered in interleaved
+    /// text and speech in at most its `max_tokens` slots. The text is greedy
+    /// (Liquid's `generation_config.json`; no voice route sets text sampling
+    /// of its own), the speech sampled as [`Self::lfm3_audio_sampling`] with
+    /// its seed (else one derived from its id).
     pub(crate) fn lfm3_audio_reply_settings(&self) -> super::Lfm3AudioReplySettings {
         use crate::models::architectures::lfm3_audio::config::Lfm3TextSampling;
-        use crate::models::architectures::lfm3_audio::prompts::{
-            voice_reply_messages, Lfm3AudioReplyOutput,
-        };
-        let (messages, output, text_sampling, seed) = match self.speech_reply {
-            super::SpeechReplyTurn::Voice => (
-                voice_reply_messages(
-                    self.speech_messages_for_execution(),
-                    self.speech_system_prompt_for_execution(),
-                ),
-                Lfm3AudioReplyOutput::Interleaved,
-                Lfm3TextSampling::default(),
-                self.params.speech.seed,
-            ),
-            super::SpeechReplyTurn::Chat => (
-                self.chat_messages.clone().unwrap_or_default(),
-                Lfm3AudioReplyOutput::Text,
-                Lfm3TextSampling {
-                    temperature: self.params.temperature.max(0.0),
-                    top_k: self.params.top_k,
-                    top_p: self.params.top_p,
-                    repetition_penalty: self.params.repetition_penalty,
-                    ..Lfm3TextSampling::default()
-                },
-                self.params.seed,
-            ),
-        };
+        use crate::models::architectures::lfm3_audio::prompts::voice_reply_messages;
         super::Lfm3AudioReplySettings {
-            messages,
+            messages: voice_reply_messages(
+                self.speech_messages_for_execution(),
+                self.speech_system_prompt_for_execution(),
+            ),
             tools: self.chat_config.tools.clone(),
-            output,
-            preserve_thinking: self.speech_reply == super::SpeechReplyTurn::Chat
-                && self.chat_config.preserve_thinking == Some(true),
             max_slots: self.params.max_tokens.max(1),
-            text_sampling,
+            text_sampling: Lfm3TextSampling::default(),
             audio_sampling: self.lfm3_audio_sampling(),
-            seed: seed.unwrap_or_else(|| Self::chat_request_seed(&self.id)),
+            seed: self
+                .params
+                .speech
+                .seed
+                .unwrap_or_else(|| Self::chat_request_seed(&self.id)),
         }
     }
 
-    /// The audio clips an LFM3-Audio reply hears, decoded, in order: a voice
-    /// turn's spoken audio, or a chat turn's audio inputs.
+    /// The audio an LFM3-Audio reply hears, decoded: the voice turn's spoken
+    /// audio.
     pub(crate) fn lfm3_audio_reply_clips(&self) -> Result<Vec<(Vec<f32>, u32)>> {
-        match self.speech_reply {
-            super::SpeechReplyTurn::Voice => Ok(vec![
-                super::super::executor::decode_request_audio_with_rate(self)?,
-            ]),
-            super::SpeechReplyTurn::Chat => self
-                .chat_config
-                .media_inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    use izwi_model_catalog::CHAT_MAX_AUDIO_CLIP_SECONDS;
-                    if input.kind != crate::models::shared::chat::ChatMediaKind::Audio {
-                        return Err(Error::InvalidInput(
-                            "LFM3-Audio chat reads audio clips, not images or videos".into(),
-                        ));
-                    }
-                    let (samples, rate) =
-                        super::super::executor::decode_audio_source_with_rate(&input.source)?;
-                    let seconds = samples.len() as f64 / f64::from(rate.max(1));
-                    if seconds > f64::from(CHAT_MAX_AUDIO_CLIP_SECONDS) {
-                        return Err(Error::InvalidInput(format!(
-                            "Audio clip {} lasts {seconds:.1} s; a chat clip lasts at most \
-                             {CHAT_MAX_AUDIO_CLIP_SECONDS} s",
-                            index + 1
-                        )));
-                    }
-                    Ok((samples, rate))
-                })
-                .collect(),
-        }
+        Ok(vec![
+            super::super::executor::decode_request_audio_with_rate(self)?,
+        ])
     }
 
     /// The LFM3-Audio speech this TTS request asks for: its text in its voice
@@ -758,19 +705,6 @@ impl EngineCoreRequest {
             (TaskType::ASR, None) => self.uses_asr_long_form_atomic(),
             _ => false,
         };
-        // A chat reply's budget follows the chat rule (D8) now that its
-        // prompt, audio included, is known.
-        let chat_budget = match (self.speech_reply, artifact.as_ref()) {
-            (super::SpeechReplyTurn::Chat, Some(artifact)) => {
-                Some(crate::runtime::chat::chat_completion_budget(
-                    artifact.prompt_tokens,
-                    self.params.max_tokens,
-                    max_sequence_tokens,
-                    self.chat_config.truncation,
-                )?)
-            }
-            _ => None,
-        };
         let fits = artifact.as_ref().is_none_or(|artifact| {
             artifact.prompt_tokens > 0
                 && artifact.request.max_slots > 0
@@ -789,7 +723,7 @@ impl EngineCoreRequest {
             self.params.max_tokens = artifact
                 .request
                 .max_slots
-                .min(chat_budget.unwrap_or(max_sequence_tokens - prompt));
+                .min(max_sequence_tokens - prompt);
             if self.task_type == TaskType::ASR {
                 self.prepared_asr_execution_shape =
                     Some(PreparedAsrExecutionShape::RetainedSequence {

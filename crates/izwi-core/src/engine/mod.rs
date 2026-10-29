@@ -176,7 +176,7 @@ pub use request::{
     EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
     RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
-pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings, SpeechReplyTurn};
+pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings};
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
     PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
@@ -2583,8 +2583,6 @@ impl Engine {
                             &clips,
                             &reply.messages,
                             &reply.tools,
-                            reply.output,
-                            reply.preserve_thinking,
                             reply.max_slots,
                             reply.text_sampling,
                             reply.audio_sampling,

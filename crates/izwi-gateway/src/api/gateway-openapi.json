@@ -910,7 +910,7 @@
       "ChatCompletionMessage": {
         "properties": {
           "content": {
-            "description": "Text, or content parts: `text`, images for Qwen3.5, `input_audio`\nclips for LFM3-Audio."
+            "description": "Text, or content parts: `text`, and images for Qwen3.5."
           },
           "role": {
             "type": "string"

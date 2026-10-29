@@ -31,7 +31,7 @@ use crate::state::AppState;
 use izwi_core::chat_reasoning::reasoning_opened_in_prompt;
 use izwi_core::{
     ChatFinishReason, ChatGeneration, ChatMediaInput, ChatMediaKind, ChatMessage,
-    ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation, CHAT_MAX_AUDIO_CLIPS,
+    ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -934,14 +934,14 @@ fn chat_finish_reason(generation: &ChatGeneration) -> Option<String> {
 }
 
 /// Placeholders for a past media turn when the target model does not hear
-/// its media and the turn has no text of its own.
+/// its media and the turn has no text of its own. No chat model hears audio,
+/// but threads stored before LFM3-Audio left chat may still carry clips.
 const OMITTED_IMAGE_TEXT: &str = "[Image attachment]";
 const OMITTED_AUDIO_TEXT: &str = "[Audio attachment]";
 
 /// The thread's conversation for the model, with the media it hears
 /// (`accepts`): a past turn keeps its media only when the model hears every
-/// kind in it, and audio only for the newest [`CHAT_MAX_AUDIO_CLIPS`] clips
-/// beside the new message's.
+/// kind in it.
 fn build_runtime_messages(
     existing: &[ChatThreadMessage],
     new_user_content: &FlattenedMultimodalContent,
@@ -961,7 +961,6 @@ fn build_runtime_messages(
         });
     }
 
-    let mut history = Vec::with_capacity(existing.len());
     for message in existing {
         let role = parse_stored_role(&message.role)?;
         let flattened = flatten_thread_content(&message.content, message.content_parts.as_deref())
@@ -978,37 +977,21 @@ fn build_runtime_messages(
             // model answer, so neither becomes an assistant prompt turn.
             continue;
         }
-        history.push((role, flattened));
-    }
-
-    let mut clips_left =
-        CHAT_MAX_AUDIO_CLIPS.saturating_sub(audio_clips(&new_user_content.media_inputs));
-    let mut heard = vec![false; history.len()];
-    for (index, (_, flattened)) in history.iter().enumerate().rev() {
-        if !flattened
+        let content = if flattened
             .media_inputs
             .iter()
             .all(|input| accepts(input.kind))
         {
-            continue;
-        }
-        let clips = audio_clips(&flattened.media_inputs);
-        if clips > clips_left {
-            clips_left = 0;
-            continue;
-        }
-        clips_left -= clips;
-        heard[index] = true;
-    }
-
-    for ((role, flattened), heard) in history.into_iter().zip(heard) {
-        let content = if heard {
             media_inputs.extend(flattened.media_inputs);
             flattened.runtime_text
         } else if flattened.display_text.trim().is_empty() {
             // runtime_text carries a placeholder per image or clip, which
             // must not reach the prompt without its media input.
-            if audio_clips(&flattened.media_inputs) > 0 {
+            if flattened
+                .media_inputs
+                .iter()
+                .any(|input| input.kind == ChatMediaKind::Audio)
+            {
                 OMITTED_AUDIO_TEXT.to_string()
             } else {
                 OMITTED_IMAGE_TEXT.to_string()
@@ -1027,13 +1010,6 @@ fn build_runtime_messages(
     );
 
     Ok((messages, media_inputs))
-}
-
-fn audio_clips(media_inputs: &[ChatMediaInput]) -> usize {
-    media_inputs
-        .iter()
-        .filter(|input| input.kind == ChatMediaKind::Audio)
-        .count()
 }
 
 /// A reply stopped before its reasoning closed: `<think>` with no `</think>`.
@@ -1400,43 +1376,11 @@ mod tests {
         }
     }
 
+    /// A thread stored before LFM3-Audio left chat continues on a text
+    /// model: a clip-only turn reads as a placeholder, a clip with text as
+    /// its text, and no clip reaches the model.
     #[test]
-    fn audio_models_hear_the_newest_clips_and_others_read_their_text() {
-        let hears_audio = |kind| kind == ChatMediaKind::Audio;
-        let next = FlattenedMultimodalContent {
-            display_text: "And this one?".to_string(),
-            runtime_text: format!("{}And this one?", izwi_core::CHAT_AUDIO_PLACEHOLDER),
-            media_inputs: vec![ChatMediaInput {
-                kind: ChatMediaKind::Audio,
-                source: "data:audio/wav;base64,UklGRg==".to_string(),
-            }],
-        };
-        let history = (0..9)
-            .flat_map(|turn| [audio_turn(&format!("clip {turn}")), reply("Heard.")])
-            .collect::<Vec<_>>();
-        let (messages, media_inputs) =
-            build_runtime_messages(&history, &next, None, hears_audio).expect("runtime messages");
-        // The newest seven past clips and the new one; the two oldest turns
-        // keep their text.
-        assert_eq!(media_inputs.len(), CHAT_MAX_AUDIO_CLIPS);
-        assert_eq!(messages[0].content, "clip 0");
-        assert_eq!(messages[2].content, "clip 1");
-        assert!(messages[4]
-            .content
-            .contains(izwi_core::CHAT_AUDIO_PLACEHOLDER));
-        let placed = messages
-            .iter()
-            .map(|message| {
-                message
-                    .content
-                    .matches(izwi_core::CHAT_AUDIO_PLACEHOLDER)
-                    .count()
-            })
-            .sum::<usize>();
-        assert_eq!(placed, media_inputs.len());
-
-        // A model that does not hear audio reads a clip-only turn as a
-        // placeholder, and an audio model reads a past image turn's text.
+    fn stored_audio_turns_reach_text_models_as_text() {
         let clip_only = ChatThreadMessage {
             content: String::new(),
             content_parts: Some(vec![audio_part()]),
@@ -1447,20 +1391,25 @@ mod tests {
             runtime_text: "Thanks".to_string(),
             media_inputs: Vec::new(),
         };
-        let (messages, media_inputs) =
-            build_runtime_messages(&[clip_only, reply("Heard.")], &text_next, None, |_| false)
-                .expect("runtime messages");
-        assert!(media_inputs.is_empty());
-        assert_eq!(messages[0].content, OMITTED_AUDIO_TEXT);
+        let accepts = |kind| variant_accepts_media(izwi_core::ModelVariant::Qwen354BGguf, kind);
         let (messages, media_inputs) = build_runtime_messages(
-            &[image_turn("What is in this chart?"), reply("Sales.")],
+            &[
+                clip_only,
+                reply("Heard."),
+                audio_turn("What is said here?"),
+                reply("A fox."),
+            ],
             &text_next,
             None,
-            hears_audio,
+            accepts,
         )
         .expect("runtime messages");
         assert!(media_inputs.is_empty());
-        assert_eq!(messages[0].content, "What is in this chart?");
+        assert_eq!(messages[0].content, OMITTED_AUDIO_TEXT);
+        assert_eq!(messages[2].content, "What is said here?");
+        assert!(messages
+            .iter()
+            .all(|message| !message.content.contains(izwi_core::CHAT_AUDIO_PLACEHOLDER)));
     }
 
     #[test]

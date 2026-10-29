@@ -141,7 +141,7 @@ cargo test --locked -p izwi-core --lib --features cuda \
   lfm25_f16_kv_tracks_f32_kv_on_cuda -- --ignored --nocapture
 ```
 
-The runtime routes (ASR, TTS, voice chat, LiveASR, chat about audio) run on CUDA
+The runtime routes (ASR, TTS, voice chat, LiveASR, spoken tool rounds) run on CUDA
 through `runtime/lfm3_audio_tests.rs` with `IZWI_LFM3_AUDIO_BACKEND=cuda`:
 
 ```bash
