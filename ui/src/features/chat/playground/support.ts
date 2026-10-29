@@ -34,6 +34,8 @@ export interface ChatPlaygroundProps {
   ) => ChatModelCapabilities | null | undefined;
   /** Catalog lookup for image input (`image_input` modality); undefined when unknown. */
   modelSupportsImages?: (variant: string) => boolean | undefined;
+  /** Catalog lookup for audio input (`audio_input` modality); undefined when unknown. */
+  modelSupportsAudio?: (variant: string) => boolean | undefined;
   onSelectModel: (variant: string) => void;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
@@ -69,8 +71,10 @@ interface ParseAssistantContentOptions {
   treatNoTagAsThinking?: boolean;
 }
 
+type AttachmentKind = "image" | "video" | "audio";
+
 interface ParsedUserAttachment {
-  kind: "image" | "video";
+  kind: AttachmentKind;
   source: string | null;
   label: string;
 }
@@ -91,6 +95,23 @@ export interface PendingImageAttachment {
   label: string;
   previewUrl?: string;
 }
+
+export interface PendingAudioAttachment {
+  id: string;
+  /** Base64 mono 16 kHz PCM16 WAV, without a `data:` prefix. */
+  data: string;
+  format: "wav";
+  label: string;
+  durationSecs: number;
+  previewUrl?: string;
+}
+
+/** The server's limits: CHAT_MAX_AUDIO_CLIPS clips per request, each at
+ * most CHAT_MAX_AUDIO_CLIP_SECONDS long. */
+export const MAX_CHAT_AUDIO_CLIPS = 8;
+export const MAX_CHAT_AUDIO_CLIP_SECS = 120;
+/** The rate clips are sent at, which LFM3-Audio hears. */
+export const CHAT_AUDIO_SAMPLE_RATE = 16_000;
 
 export interface GenerateTitleArgs {
   threadId: string;
@@ -407,6 +428,16 @@ export function supportsImageAttachmentsForModel(
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+/** Name-based fallback for models missing from the catalog. */
+export function supportsAudioAttachmentsForModel(
+  variant: string | null,
+): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("lfm3-audio-");
+}
+
 export function isLfm25ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -453,12 +484,14 @@ export function systemPromptForModel(supportsThinking: boolean): string {
 export function buildChatThreadMessagePayload(options: {
   text: string;
   images: PendingImageAttachment[];
+  audio?: PendingAudioAttachment[];
 }): {
   content: string;
   contentParts?: ChatThreadContentPart[];
 } {
   const trimmedText = options.text.trim();
-  if (options.images.length === 0) {
+  const audio = options.audio ?? [];
+  if (options.images.length === 0 && audio.length === 0) {
     return {
       content: trimmedText,
     };
@@ -482,11 +515,39 @@ export function buildChatThreadMessagePayload(options: {
     });
   }
 
+  // The server reads `data` and `format`; `name` labels the clip in history.
+  for (const clip of audio) {
+    contentParts.push({
+      type: "input_audio",
+      input_audio: {
+        data: clip.data,
+        format: clip.format,
+        name: clip.label,
+      },
+    });
+  }
+
   return {
     content:
-      trimmedText || summarizePendingImages(options.images.length, options.images),
+      trimmedText ||
+      [
+        summarizePendingImages(options.images.length, options.images),
+        summarizePendingAudio(audio),
+      ]
+        .filter(Boolean)
+        .join("; "),
     contentParts,
   };
+}
+
+/** A clip as a URL an `<audio>` element plays. */
+export function audioDataUrl(data: string, format: string): string {
+  const normalized = format.trim().toLowerCase() || "wav";
+  const mime =
+    normalized === "mp3" || normalized === "mpeg"
+      ? "audio/mpeg"
+      : `audio/${normalized}`;
+  return `data:${mime};base64,${data}`;
 }
 
 /** Image formats the server decodes. */
@@ -587,6 +648,16 @@ function summarizePendingImages(
   return `Attached ${imageCount} images`;
 }
 
+function summarizePendingAudio(clips: PendingAudioAttachment[]): string {
+  if (clips.length === 0) {
+    return "";
+  }
+  if (clips.length === 1) {
+    return `Attached audio: ${clips[0]?.label || "audio"}`;
+  }
+  return `Attached ${clips.length} audio clips`;
+}
+
 function extractMarkdownImageSource(value: string): string | null {
   const match = value.match(/^!\[[^\]]*\]\((.+)\)$/);
   if (!match) {
@@ -648,8 +719,12 @@ function resolveRelativeSourceToApiOrigin(source: string): string {
   }
 }
 
-function attachmentLabel(value: string, kind: "image" | "video"): string {
-  const fallback = kind === "image" ? "Attached image" : "Attached video";
+function fallbackAttachmentLabel(kind: AttachmentKind): string {
+  return `Attached ${kind}`;
+}
+
+function attachmentLabel(value: string, kind: AttachmentKind): string {
+  const fallback = fallbackAttachmentLabel(kind);
   const trimmed = value.trim();
   if (!trimmed) {
     return fallback;
@@ -698,7 +773,7 @@ function extractMediaSourceForDisplay(value: unknown): string | null {
   return readObjectField(value, ["url", "src", "uri", "source"]);
 }
 
-function extractMediaLabel(value: unknown, kind: "image" | "video"): string {
+function extractMediaLabel(value: unknown, kind: AttachmentKind): string {
   if (typeof value === "string" && value.trim()) {
     return attachmentLabel(value, kind);
   }
@@ -717,7 +792,28 @@ function extractMediaLabel(value: unknown, kind: "image" | "video"): string {
     return attachmentLabel(source, kind);
   }
 
-  return kind === "image" ? "Attached image" : "Attached video";
+  return fallbackAttachmentLabel(kind);
+}
+
+/**
+ * An audio part's clip as a playable `data:audio/` URL: base64 `data` with
+ * its `format` from `input_audio`, or a `data:` URL in `audio_url`/`audio`.
+ * The server never fetches audio, so other URLs are not played either.
+ */
+function extractAudioSourceForDisplay(
+  part: ChatThreadContentPart,
+): string | null {
+  const data = readObjectField(part.input_audio, ["data"]);
+  let source: string | null;
+  if (!data) {
+    source = extractMediaSourceForDisplay(part.audio_url ?? part.audio);
+  } else if (data.toLowerCase().startsWith("data:")) {
+    source = data;
+  } else {
+    const format = readObjectField(part.input_audio, ["format"]) ?? "wav";
+    source = audioDataUrl(data, format);
+  }
+  return source?.toLowerCase().startsWith("data:audio/") ? source : null;
 }
 
 export function parseUserMessageDisplayFromContentParts(
@@ -775,6 +871,24 @@ export function parseUserMessageDisplayFromContentParts(
         kind: "video",
         source: source ? resolveAttachmentSource(source, "video") : null,
         label: extractMediaLabel(payload, "video"),
+      });
+      continue;
+    }
+
+    if (
+      type === "input_audio" ||
+      type === "audio_url" ||
+      type === "audio" ||
+      part.input_audio ||
+      part.audio_url
+    ) {
+      attachments.push({
+        kind: "audio",
+        source: extractAudioSourceForDisplay(part),
+        label: extractMediaLabel(
+          part.input_audio ?? part.audio_url ?? part.audio ?? null,
+          "audio",
+        ),
       });
       continue;
     }

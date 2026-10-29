@@ -36,13 +36,18 @@ function measurePeaks(samples: Float32Array): number[] {
 /**
  * Decodes a file or microphone recording to mono WAV and measures it.
  * `maxSecs` cuts the audio to that length (a recording stopped at the limit
- * can run a few milliseconds over it).
+ * can run a few milliseconds over it). `sampleRate` resamples the audio to
+ * that rate; without it the clip keeps the device's rate.
  */
 export async function prepareReferenceClip(
   source: Blob,
-  { maxSecs }: { maxSecs?: number } = {},
+  { maxSecs, sampleRate }: { maxSecs?: number; sampleRate?: number } = {},
 ): Promise<ReferenceClip> {
-  const context = new AudioContext();
+  // Decoding resamples to the context's rate.
+  const context =
+    sampleRate === undefined
+      ? new AudioContext()
+      : new AudioContext({ sampleRate });
   try {
     const decoded = await context.decodeAudioData(await source.arrayBuffer());
     const frameCount =

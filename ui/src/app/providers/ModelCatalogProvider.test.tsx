@@ -379,6 +379,31 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-4B", expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
+  it("keeps the loaded chat model when LFM3-Audio loads", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-9B", status: "ready" },
+        {
+          ...model,
+          variant: "LFM3-Audio-2B-GGUF",
+          route_capabilities: caps({
+            openai_chat_completions: true,
+            openai_audio_transcriptions: true,
+          }),
+        },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+
+    renderChatSwitch("LFM3-Audio-2B-GGUF");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("LFM3-Audio-2B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    expect(apiMocks.unloadModel).not.toHaveBeenCalled();
+  });
+
   it("never evicts pinned models on a chat switch", async () => {
     apiMocks.listModels.mockResolvedValue({
       models: [

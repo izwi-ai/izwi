@@ -53,6 +53,25 @@ describe("prepareReferenceClip", () => {
     expect(clip.blob.size).toBe(44 + 30 * SAMPLE_RATE * 2);
   });
 
+  it("decodes at the requested sample rate, else the device's", async () => {
+    const options: unknown[] = [];
+    vi.stubGlobal(
+      "AudioContext",
+      class {
+        constructor(...args: unknown[]) {
+          options.push(args[0]);
+        }
+        decodeAudioData = vi.fn(async () => fakeBuffer());
+        close = close;
+      },
+    );
+
+    await prepareReferenceClip(source, { sampleRate: 16_000 });
+    await prepareReferenceClip(source);
+
+    expect(options).toEqual([{ sampleRate: 16_000 }, undefined]);
+  });
+
   it("keeps a small, normalised waveform", async () => {
     vi.stubGlobal(
       "AudioContext",

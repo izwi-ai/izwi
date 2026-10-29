@@ -71,6 +71,10 @@ izwi chat --model LFM2.5-1.2B-Instruct-GGUF
 3. Send and review streamed output
 4. Switch loaded models from the model selector
 
+With an LFM3-Audio model selected, attach audio files or record from your
+microphone in the composer: up to 8 clips of up to 120 s each per message.
+Each clip plays back in the conversation, and LFM3-Audio answers in text.
+
 ---
 
 ## Using the API

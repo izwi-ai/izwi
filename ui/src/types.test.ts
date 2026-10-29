@@ -21,14 +21,18 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3.8-27B-FP8")).toBe(true);
   });
 
+  it("includes LFM3 Audio, which answers audio clips in text", () => {
+    for (const variant of LFM3_AUDIO_VARIANTS) {
+      expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(true);
+    }
+  });
+
   it("continues to reject non-chat variants", () => {
     expect(VIEW_CONFIGS.chat.modelFilter("Parakeet-TDT-0.6B-v3")).toBe(false);
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3-TTS-12Hz-0.6B-Base")).toBe(
       false,
     );
-    for (const variant of LFM3_AUDIO_VARIANTS) {
-      expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(false);
-    }
+    expect(VIEW_CONFIGS.chat.modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(false);
   });
 });
 
