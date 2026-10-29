@@ -34,6 +34,8 @@ pub mod transcript;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
+mod reference_tests;
+#[cfg(test)]
 pub(crate) mod synthetic;
 
 pub use model::{
