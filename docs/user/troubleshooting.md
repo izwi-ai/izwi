@@ -219,6 +219,32 @@ izwi rm <model-name>
 izwi pull <model-name>
 ```
 
+### Nemotron 3.5 Transcribe refused at load: not enough memory
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 31.6 GiB on Metal and CUDA
+and about 33.6 GiB on CPU, plus about 48 MiB per request in flight and its
+attention KV. Izwi works this out from the model's config and refuses the load
+before reading any weights when the backend's memory budget cannot hold it, so
+the refusal is quick and leaves nothing half-loaded.
+
+- Unload other models and load it again. `izwi status --detailed` shows what
+  is loaded:
+  ```bash
+  izwi models unload <model-name>
+  izwi models load Nemotron-3.5-Transcribe-30B-A4B-FP8
+  ```
+- On a Mac, use one with 64 GB or more of unified memory. 48 GB is doubtful;
+  smaller Macs cannot hold it.
+- On NVIDIA, 24–32 GB GPUs cannot hold it; plan on 48 GB or more. The GPU
+  needs compute capability 8.0 or newer; an older one fails with "Nemotron 3.5
+  Transcribe needs a CUDA GPU of compute capability 8.0 or newer".
+- If you set `IZWI_CPU_MEMORY_BUDGET_BYTES`, `IZWI_METAL_MEMORY_BUDGET_BYTES` or
+  `IZWI_CUDA_MEMORY_BUDGET_BYTES`, make sure the budget leaves room for the
+  model.
+
+The model is experimental: these figures are computed from its published
+configuration and have not yet been measured on a loaded model.
+
 ### Model not detected after manual download
 
 1. Verify correct directory:
@@ -321,6 +347,25 @@ izwi transcribe audio.wav --model Qwen3-ASR-1.7B-GGUF
 ```bash
 izwi transcribe audio.wav --language en
 ```
+
+### Long recording refused as too large
+
+An upload over the limit returns `413`. The limits are 64 MiB for
+transcription jobs and the web UI, and 25 MiB by default for
+`/v1/audio/transcriptions` and `izwi transcribe` (set
+`IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server to raise it).
+
+Uncompressed WAV is large: one hour at 16 kHz, mono, 16-bit is about 115 MB.
+A one-hour WAV is therefore refused, even with
+`Nemotron-3.5-Transcribe-30B-A4B-FP8`, which transcribes an hour in one pass.
+Compress it first; mono MP3 at 48 kbit/s is about 22 MB an hour:
+
+```bash
+ffmpeg -i meeting.wav -ac 1 -ar 16000 -b:a 48k meeting.mp3
+```
+
+FLAC is lossless but compresses speech much less, so a full hour may still be
+near 64 MiB.
 
 ### Microphone not detected (Web UI)
 

@@ -93,6 +93,33 @@ and realtime route families. Detailed preview behavior is documented in the
 - `Maya1-3B` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. Its decoder runs in BF16 on CUDA devices with BF16 and F32 on CPU, each behind a load-time range probe that falls back to F32, and in F16 on Metal, where a failed probe refuses the load (F32 would need 13.2 GB of weights); SNAC runs in F32 everywhere. `Maya1-3B-GGUF` keeps its decoder's weights in Q8_0 and runs it in F32 on every backend, with no probe. Both are verified on Metal (16 GB M1 Pro): the decoder tracks upstream's BF16 logits, the release server passes its end-to-end checks (voices, tags, streaming, cancellation, reload, Whisper transcripts), and requests at four and eight in flight sound exactly as they do alone; CPU runs the unit and layer-truncated parity tests only.
 - `Maya2-Native-2.5B` has a CUDA path but has not yet run on an NVIDIA GPU. Its Qwen3 backbone runs in BF16 on CUDA devices with BF16, behind a load-time range probe that falls back to F32; in F16 on Metal, where a failed probe refuses the load (F32 would need 10 GB of weights); and in F32 on CPU. Its depth decoder runs in F16 on Metal and CUDA and in F32 on CPU or after an F32 fallback; Mimi runs in F32 everywhere, and the ECAPA speaker encoder for clones runs on the CPU in F32.
 - `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` build for CUDA but are compile-checked only: they have not yet run on an NVIDIA GPU. On CUDA the quantized language model, speech encoder, MaskGIT depth decoder and LiquidCodec decoder use Candle CUDA kernels, while mel features, sampling and the inverse FFT run on the host. LFM3 Audio is verified end to end on real weights on CPU and Metal.
+- `Nemotron-3.5-Transcribe-30B-A4B-FP8` builds for CUDA but is compile-checked only: it has not run on an NVIDIA GPU. It needs compute capability 8.0 or newer. See [Nemotron 3.5 Transcribe](#nemotron-35-transcribe).
+
+### Nemotron 3.5 Transcribe
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` is experimental and uncertified on every
+backend. It has run end to end only with a tiny synthetic checkpoint, on CPU
+and Metal; it has not yet run with its real weights on any backend.
+
+| Backend | Status | Resident weights | Activations |
+|---|---|---|---|
+| CPU | Experimental, uncertified | About 33.6 GiB: FP8 linears re-quantized to Q8_0 at load | F32 |
+| Metal | Experimental, uncertified | About 31.6 GiB: raw FP8 | F32 |
+| CUDA (compute capability 8.0+) | Experimental, uncertified; compile-checked only | About 31.6 GiB: raw FP8, padded for the FP8 kernels | BF16 |
+
+Each request adds about 48 MiB of decoder state plus its attention KV. A load
+that the backend's memory budget cannot hold is refused before any weights are
+read. `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=vllm-fp8` rounds activations to FP8
+as vLLM's W8A8 path does; it is a parity-testing mode, not a speed-up.
+
+| Capability | Status |
+|---|---|
+| Offline transcription, translation, context terms | Experimental, uncertified |
+| Speaker labels and speaker-attributed ASR jobs | Experimental, uncertified |
+| Word timestamps from its own CTC head | Experimental, uncertified |
+| [Single-model diarization](/features/diarization#single-model-diarization) (a diarization job that names it as `model`) | Experimental, uncertified |
+| ASR stage of a diarization pipeline | Not supported |
+| Live transcription, voice-mode ASR, audio chat | Not supported (offline model) |
 
 ### Qwen3.8 CUDA weight residency
 
@@ -253,6 +280,7 @@ The load path currently publishes ABI-v2 state as follows:
 | **LFM3 Audio** | Speech, transcription and voice-chat replies run as retained rows that batch: each request keeps the language model's attention pages and ShortConv ring in the managed arena between steps, and concurrent requests decode together (two rows at a time on CPU and Metal, the portable width, unless `IZWI_MAX_BATCH_SIZE` sets one), each producing exactly what it produces alone. Audio over 30 s transcribes in clips of at most 30 s, one engine dispatch each. A voice-chat turn's transcript runs as its own transcription row beside the reply. Beyond English, a real-weight check speaks one sentence in French, German, Spanish and Japanese: Whisper Large v3 Turbo transcribes LFM3 Audio's speech exactly in all four (error rate 0.00 on CPU and Metal), LFM3 Audio transcribes its own speech exactly, and it transcribes German, Spanish and Japanese spoken by Qwen3-TTS at 0.00–0.04. French is weaker: where Qwen3-TTS mispronounces a word, LFM3 Audio drifts into English (word error rate 0.50 on Metal). Realtime transcription (LiveASR) streams run as engine realtime sessions: each 0.96 s chunk prefills alone and its text decodes in batches across streams, and a stream continues in 29 s segments that hear the previous one's last 2.88 s again | Verified end to end on real weights on CPU and Metal; CUDA compile-checked only, unverified on hardware |
 | **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite Speech 4.1 publishes both ASR routes; Granite Speech 5.0 leases its 16k-token decoder pages per invocation | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
+| **Nemotron 3.5 Transcribe** | Each request is a retained row: paged KV for the 6 attention layers plus the Mamba2 recurrent and convolution state (about 48 MiB a row) in the managed arena. Prompts prefill in resumable spans (512 tokens on CPU and Metal, 2,048 on CUDA) whether or not chunked prefill is on, so a one-hour recording never holds the device for its whole prefill; decode runs in batches across rows. A single-model diarization job runs as one such row. No prefix reuse | Experimental, uncertified on every backend: verified end to end only with a tiny synthetic checkpoint on CPU and Metal; no real-weight run yet; CUDA compile-checked only |
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Chatterbox** | Retained paged T3 state (two guidance branches per request, decoded in batches across requests) plus bounded acoustic-stage scratch, run one step at a time so other requests interleave | Portable route validated on CPU and Metal; CUDA is compile-checked only until NVIDIA evidence is retained |
 | **Maya1** | Retained paged decoder state (decoded in batches across requests) plus bounded SNAC-window scratch, one window per step so other requests interleave | Portable route validated on Metal for both releases, with exact solo parity under load; CUDA is compile-checked only |

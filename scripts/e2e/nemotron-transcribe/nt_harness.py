@@ -642,8 +642,7 @@ def case_speaker_attributed(ctx):
     status, record, _ = ctx.server.submit_job(ctx.audio["two_speakers"], (),
                                               job_kind="speaker_attributed_asr")
     if status not in (200, 201, 202) or not isinstance(record, dict):
-        return "fail", {"http": status, "message": error_message(record),
-                        "note": "SAA is hard-wired to Granite 4.1 Plus until Phase 4b lands"}
+        return "fail", {"http": status, "message": error_message(record)}
     record = ctx.server.wait_job(record["id"], ctx.timeout)
     turns = record.get("speaker_turns") or []
     speakers = {str(t.get("speaker") or t.get("speaker_label") or t.get("speaker_id"))
@@ -656,8 +655,46 @@ def case_speaker_attributed(ctx):
 
 
 def case_one_model_diarization(ctx):
-    return "skip", {"reason": "Phase 4c (one-model diarization) has no request shape yet; "
-                              "extend this case when it lands"}
+    """A diarization job naming the model alone: no diarizer, ASR or aligner
+    loads; segments come from its embedded diarizer, words from its CTC head.
+    A pipeline ASR beside it is refused."""
+    refused, body, _ = ctx.server.submit_job(
+        ctx.audio["two_speakers"], [("asr_model", "parakeet-tdt-0.6b-v3")],
+        job_kind="diarization")
+    status, record, _ = ctx.server.submit_job(ctx.audio["two_speakers"], (),
+                                              job_kind="diarization")
+    if status not in (200, 201, 202) or not isinstance(record, dict):
+        return "fail", {"http": status, "message": error_message(record),
+                        "refused_with_asr_model": refused}
+    record_id = urllib.parse.quote(str(record["id"]))
+    deadline = time.time() + ctx.timeout
+    while True:
+        _, record, _ = ctx.server.get(
+            f"/v1/speech-to-text/jobs/{record_id}?job_kind=diarization")
+        state = record.get("processing_status") if isinstance(record, dict) else None
+        if state in ("ready", "failed") or time.time() > deadline:
+            break
+        time.sleep(2)
+    record = record if isinstance(record, dict) else {}
+    words = record.get("words") or []
+    speakers = {w.get("speaker") for w in words if isinstance(w, dict)} - {"UNKNOWN", None}
+    problems = []
+    if record.get("processing_status") != "ready":
+        problems.append(f"status {record.get('processing_status')}")
+    if refused != 400:
+        problems.append(f"asr_model beside the model returned {refused}, not 400")
+    if record.get("asr_model_id") or record.get("aligner_model_id"):
+        problems.append("the record names a pipeline ASR or aligner")
+    if not record.get("segments"):
+        problems.append("no diarization segments")
+    if len(speakers) < 2:
+        problems.append(f"{len(speakers)} attributed speaker(s) on a two-speaker clip")
+    return ("fail" if problems else "pass"), {
+        "problems": problems, "speaker_count": record.get("speaker_count"),
+        "speakers": sorted(speakers), "words": len(words),
+        "unattributed_words": record.get("unattributed_words"),
+        "warnings": record.get("warnings"), "utterances": (record.get("utterances") or [])[:6],
+        "error": record.get("processing_error")}
 
 
 def case_long(ctx):

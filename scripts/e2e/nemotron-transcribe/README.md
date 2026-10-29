@@ -151,7 +151,7 @@ E2E cases (`run-e2e.sh --only a,b` / `--skip a,b`): `load`, `format_json`,
 `language_refused`, `prompt_override`, `keywords`, `translate_en_de`,
 `translate_de_en` (needs `--de-clip`), `translate_refused`,
 `translate_with_timestamps_refused`, `word_timestamps`, `speaker_attributed`,
-`one_model_diarization` (skipped until Phase 4c), `cancel_mid_prefill`,
+`one_model_diarization` (a diarization job naming the model alone; a pipeline ASR beside it must be refused), `cancel_mid_prefill`,
 `cancel_mid_decode`, `cancel_by_disconnect`, `long_60min` (`--skip-long` on
 the CPU), `soak_untracked_memory`, `unload_reload`,
 `oom_refusal_undersized_budget` (a second server with an 8 GiB

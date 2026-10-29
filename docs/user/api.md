@@ -542,20 +542,30 @@ Multipart fields:
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
-| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. LFM3 Audio takes one of its 18 ISO 639-1 codes (en, ar, da, de, el, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh), or none or `auto` to let the model choose, and rejects any other code with `400`. |
-| `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
-| `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters); others return `400`. A long list shortens the audio one invocation can hold. |
+| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (4.1 base and 5.0: en, fr, de, es, pt, ja; 4.1 plus drops ja), names it in the instruction, and rejects other languages with `400`. LFM3 Audio takes one of its 18 ISO 639-1 codes (en, ar, da, de, el, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh), or none or `auto` to let the model choose, and rejects any other code with `400`. `Nemotron-3.5-Transcribe-30B-A4B-FP8` takes a code or English name of one of its 40 languages, or none or `auto` to let the model detect it, and rejects any other language (Norwegian included) with `400`. |
+| `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh; `Nemotron-3.5-Transcribe-30B-A4B-FP8`: to or from English for 31 of its languages, all but bn, id, mr, tl, ta, te, tr and vi); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). |
+| `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters; `Nemotron-3.5-Transcribe-30B-A4B-FP8`, up to 64 terms of at most 80 characters, given to the model as "Context terms" with tags removed; not with `target_language`, which returns `400`); others return `400`. A long Granite list shortens the audio one invocation can hold. |
+| `speaker_labels` | Izwi extension. `true` asks a model that tags speakers (`Nemotron-3.5-Transcribe-30B-A4B-FP8`) to label them; others return `400`. Multipart takes `true`/`false` (or `1`/`0`, `yes`/`no`, `on`/`off`), JSON a boolean. The speaker turns come back in `verbose_json` as `speaker_turns` (below); `text` stays untagged. It cannot be combined with `target_language`, and naming a language the model does not label speakers in returns `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; `Nemotron-3.5-Transcribe-30B-A4B-FP8` times words with its own CTC head; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. For `Nemotron-3.5-Transcribe-30B-A4B-FP8` it replaces the model's instruction entirely (tags removed, at most 4,000 characters), so combining it with `target_language`, `keywords` or `speaker_labels` returns `400`. |
 | `max_tokens` | Optional ASR decoder token budget. |
 | `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
 
 `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` produce no word timestamps
 of their own, so `timestamp_granularities[]` falls back to the forced aligner.
 They transcribe long audio in chunks of at most 30 seconds.
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` transcribes up to 60 minutes in one pass,
+without chunks. Its default instruction is the model card's readable-text form
+(punctuation, fillers left out). It times words with its own CTC head, so
+`timestamp_granularities[]=word` needs no aligner; a translation has no word
+timestamps. `izwi_asr_diagnostics.finish_reason` is `stop`, `length` or
+`repetition` (stopped after repeating itself). It is offline only: the realtime
+WebSocket APIs refuse it. It is experimental; see the
+[support matrix](/support-matrix#nemotron-35-transcribe).
 
 `json` response:
 
@@ -595,9 +605,23 @@ They transcribe long audio in chunks of at most 30 seconds.
 }
 ```
 
-Audio without speech returns an empty transcript without running the model, for the models that otherwise hallucinate a short phrase on silence or noise (Whisper, Qwen3-ASR, Granite Speech, VibeVoice, Voxtral, LFM2.5 Audio). An input counts as speech when some second of it holds 200 ms of frames the VAD scores as speech that are also 6 dB above the input's own noise floor. Silence and steady noise (hum, fan, pink or white noise) at any level are skipped this way; tonal music and crowd babble are not, and reach the model. `verbose_json` reports a skipped input as `izwi_asr_diagnostics.no_speech_gate`, with the speech evidence found (`evidence_ms`) and needed (`required_evidence_ms`). `IZWI_VAD_SNR_MARGIN_DB` sets the margin (default `6`); `0` turns the noise-floor check off.
+Audio without speech returns an empty transcript without running the model, for the models that otherwise hallucinate a short phrase on silence or noise (Whisper, Qwen3-ASR, Granite Speech, Nemotron 3.5 Transcribe, VibeVoice, Voxtral, LFM2.5 Audio). An input counts as speech when some second of it holds 200 ms of frames the VAD scores as speech that are also 6 dB above the input's own noise floor. Silence and steady noise (hum, fan, pink or white noise) at any level are skipped this way; tonal music and crowd babble are not, and reach the model. `verbose_json` reports a skipped input as `izwi_asr_diagnostics.no_speech_gate`, with the speech evidence found (`evidence_ms`) and needed (`required_evidence_ms`). `IZWI_VAD_SNR_MARGIN_DB` sets the margin (default `6`); `0` turns the noise-floor check off.
 
 `verbose_json` always includes `segments`. Without word or segment timestamps from the model or the aligner, each long-form chunk becomes one segment covering its time range, and a short file gets one segment spanning the whole audio. `words` appears only when `timestamp_granularities[]` includes `word`. If forced alignment fails, the transcript is still returned with segments, without `words`, and the failure is reported as `izwi_asr_diagnostics.alignment_error`.
+
+With `speaker_labels=true`, `verbose_json` also has `speaker_turns`, one entry
+per run of one speaker's text:
+
+```json
+"speaker_turns": [
+  { "speaker": 0, "text": "Good morning.", "start": 0.32, "end": 1.1 },
+  { "speaker": 1, "text": "Morning, shall we start?", "start": 1.6, "end": 3.04 }
+]
+```
+
+`speaker` is the model's speaker tag number, or `null` for text before the
+first tag. `start` and `end` (seconds) are present only when the model timed
+the turn's words. Other response formats carry no speaker turns.
 
 SSE events:
 
@@ -794,7 +818,7 @@ routes:
 
 The `job_kind` query parameter is important for shared IDs and for clients that
 want a specific record family. `speaker_attributed_asr` and `saa` select the
-Granite Speech speaker-turn transcript mode.
+speaker-turn transcript mode.
 
 For transcription job creation, JSON and multipart requests accept
 `generate_summary`. It defaults to `false`; set it to `true` to generate an AI
@@ -807,10 +831,18 @@ Transcription jobs also accept `target_language` and `keywords`, with the
 same meaning and limits as on `/v1/audio/transcriptions`: multipart repeats
 `keywords` or separates terms with commas or newlines; JSON takes an array.
 Models whose `route_capabilities` report `speech_translation` or
-`keyword_biasing` accept them (both Granite Speech 5.0 releases); others return `400`,
+`keyword_biasing` accept them (both Granite Speech 5.0 releases and
+`Nemotron-3.5-Transcribe-30B-A4B-FP8`); others return `400`,
 as does a translation with `include_timestamps` or in speaker-attributed mode.
 The record stores both as `target_language` and `keywords`, keeps the spoken
 `language` the job named, and a retry asks for the same translation.
+
+With `include_timestamps` (or `word_timestamps`), a model whose
+`route_capabilities` report `native_word_timestamps`
+(`Nemotron-3.5-Transcribe-30B-A4B-FP8`) times the words itself: no
+`aligner_model_id` is needed, and the record keeps none. When the model's
+alignment yields no words, the server times the transcript with the forced
+aligner instead.
 
 For speaker-attributed ASR, use:
 
@@ -818,8 +850,13 @@ For speaker-attributed ASR, use:
 POST /v1/speech-to-text/jobs?job_kind=speaker_attributed_asr
 ```
 
-SAA requests use the transcription store but require
-`Granite-Speech-4.1-2B-Plus`. JSON and multipart requests accept
+SAA requests use the transcription store and take a model whose
+`route_capabilities` report `speaker_attributed_asr`:
+`Granite-Speech-4.1-2B-Plus` (the default) or
+`Nemotron-3.5-Transcribe-30B-A4B-FP8`. The Nemotron model tags speakers in one
+transcription pass; its turns are labelled `Speaker 1`, `Speaker 2`, … and timed
+when its own word timestamps align, and `min_speakers`/`max_speakers` only add warnings.
+JSON and multipart requests accept
 `model_id`/`model`, `language`, `generate_summary`, `min_speakers`, and
 `max_speakers`. SAA does not support streaming, timestamp alignment, or
 `include_timestamps`; the server clears aligner/timestamp fields for this mode.
@@ -842,6 +879,43 @@ Persisted diarization routes:
 | `POST` | `/v1/diarizations/{record_id}/reruns` | Re-run diarization. |
 | `POST` | `/v1/diarizations/{record_id}/cancel` | Cancel in-flight diarization. |
 | `POST` | `/v1/diarizations/{record_id}/summary/regenerate` | Regenerate the LLM summary. |
+
+Diarization creates on both routes (`/v1/diarizations` and
+`/v1/speech-to-text/jobs?job_kind=diarization`) take `model` (alias
+`model_id`, `diarization_model`), `asr_model`, `aligner_model`, `llm_model`,
+`language`, `min_speakers`, `max_speakers`, `min_speech_duration_ms`,
+`min_silence_duration_ms`, `vad_gate` and `generate_summary`. The rules:
+
+- `model` is a diarization model (`diar_streaming_sortformer_4spk-v2.1`, the
+  default, or `Nemotron-3-Diarization`) or a model whose `route_capabilities`
+  report `one_model_diarization` (`Nemotron-3.5-Transcribe-30B-A4B-FP8`).
+  Other ids return `400`.
+- `min_speakers` and `max_speakers` may not exceed the model's speaker
+  channels (4 for Sortformer v2.1, 8 for the other two), and `min_speakers`
+  may not exceed `max_speakers`; otherwise `400`.
+- `asr_model` must be a model whose `route_capabilities` report
+  `diarization_pipeline_asr`; `Nemotron-3.5-Transcribe-30B-A4B-FP8` returns
+  `400` there.
+
+A one-model diarization `model` runs no pipeline: no diarizer, ASR or aligner
+is loaded. The server runs one transcription with speaker tags and word
+timestamps and builds the record from it:
+
+- `segments` are the embedded diarizer's segments (its 10 ms predictions
+  above 0.5), labelled `SPEAKER_NN` by diarizer channel.
+- `words` take the channel their `<spk:N>` tag was assigned to, or `UNKNOWN`
+  when the tag has no channel (counted in `unattributed_words`).
+- `utterances` and `transcript` are built as in the pipeline; `asr_text` is
+  the model's transcript.
+- `asr_model` or `aligner_model` with such a model returns `400` ("diarizes
+  on its own").
+- The model counts speakers itself: `min_speakers` and `max_speakers` (at most
+  8) only add a warning when the count falls outside them.
+- `min_speech_duration_ms`, `min_silence_duration_ms` and `vad_gate` are not
+  used.
+- If the transcript cannot be aligned (for example, a character the CTC
+  vocabulary lacks), the record still has the transcript and the diarizer's
+  segments, with a warning and no words.
 
 ### Speech History
 
@@ -1271,8 +1345,14 @@ Model records also expose route and batch capability flags so clients can discov
     "openai_audio_speech": true,
     "openai_audio_transcriptions": false,
     "speech_to_text_jobs": false,
+    "diarization_pipeline_asr": false,
     "speech_to_text_realtime": false,
+    "speech_translation": false,
+    "keyword_biasing": false,
+    "speaker_attributed_asr": false,
+    "native_word_timestamps": false,
     "diarization_records": false,
+    "one_model_diarization": false,
     "text_to_speech_records": true,
     "voice_design_records": false,
     "voice_clone_records": false,
@@ -1296,6 +1376,27 @@ Model records also expose route and batch capability flags so clients can discov
   }
 }
 ```
+
+Speech-to-text route flags:
+
+| Flag | Meaning |
+|------|---------|
+| `speech_to_text_jobs` | The model runs persisted speech-to-text jobs. |
+| `diarization_pipeline_asr` | The diarization pipeline may use the model as its ASR stage. `false` for `Nemotron-3.5-Transcribe-30B-A4B-FP8`, which labels speakers itself. |
+| `speech_to_text_realtime` | The model serves realtime transcription. `false` for `Nemotron-3.5-Transcribe-30B-A4B-FP8`, which is offline only. |
+| `speech_translation` | Transcription requests may ask for a translation (`target_language`). |
+| `keyword_biasing` | Transcription requests may pass `keywords`. |
+| `speaker_attributed_asr` | Speaker-attributed ASR jobs accept the model: it writes speaker turns itself. |
+| `native_word_timestamps` | Word timestamps come from the model itself, so no forced aligner is needed. |
+| `diarization_records` | The model is a diarizer that can drive a diarization pipeline. |
+| `one_model_diarization` | A diarization job may name the model alone as its `model`: it transcribes, tags speakers and times words itself, with no pipeline ASR or aligner. `true` only for `Nemotron-3.5-Transcribe-30B-A4B-FP8`. |
+| `voice_realtime_modular_asr` | Voice sessions may use the model as their ASR stage. `false` for `Nemotron-3.5-Transcribe-30B-A4B-FP8`. |
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` reports `speech_translation`,
+`keyword_biasing`, `speaker_attributed_asr`, `native_word_timestamps` and
+`one_model_diarization` as `true`, and `diarization_pipeline_asr`,
+`diarization_records`, `speech_to_text_realtime` and
+`voice_realtime_modular_asr` as `false`.
 
 Download progress SSE payload:
 
