@@ -9,9 +9,12 @@
 //! - The speaker anchor `fc2(GELU(fc1(e)))` of the clip's ECAPA embedding
 //!   (or the learned null input) is added at every `<|audio|>` sentinel.
 //!
-//! The audio norm is torch's `nn.RMSNorm` without an explicit eps, which
-//! uses the compute dtype's machine epsilon: 2⁻⁷ in the BF16 the model was
-//! trained and served in. That value is kept on every backend.
+//! The audio norm is torch's `nn.RMSNorm` without an explicit eps. Its docs
+//! say that means the input dtype's machine epsilon, but the kernel takes the
+//! epsilon of the F32 compute type for BF16 and F16 inputs too: 2⁻²³, not
+//! BF16's 2⁻⁷. A summed frame's mean square is near 2.5e-3, so 2⁻⁷ fed every
+//! frame back at about half its trained norm, which garbled words and
+//! flipped the voice mid-utterance.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -21,8 +24,9 @@ use super::config::{CB0_CLASSES, CODEBOOKS, CODEBOOK_SIZE};
 use super::prompt::{Maya2Prompt, PromptItem};
 use crate::error::{Error, Result};
 
-/// `torch.finfo(torch.bfloat16).eps`.
-pub const AUDIO_NORM_EPS: f32 = 0.007_812_5;
+/// The eps `nn.RMSNorm()` computes with in every dtype:
+/// `std::numeric_limits<opmath_t>::epsilon()`, opmath being F32.
+pub const AUDIO_NORM_EPS: f32 = f32::EPSILON;
 const ECAPA_DIM: usize = 192;
 const ANCHOR_HIDDEN: usize = 512;
 
