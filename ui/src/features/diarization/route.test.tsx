@@ -80,7 +80,11 @@ const baseModels: ModelInfo[] = [
   },
   {
     variant: "Whisper-Large-v3-Turbo",
-    route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+    route_capabilities: caps({
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      diarization_pipeline_asr: true,
+    }),
     status: "ready" as const,
     local_path: "/models/asr",
     size_bytes: null,
@@ -112,6 +116,7 @@ const graniteModel: ModelInfo = {
   route_capabilities: caps({
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    diarization_pipeline_asr: true,
     speaker_attributed_asr: true,
   }),
   status: "ready" as const,
@@ -455,6 +460,44 @@ describe("DiarizationPage record detail", () => {
       "Diarization,ASR,Forced Aligner,Summary",
     );
     expect(props.onError).not.toHaveBeenCalled();
+  });
+
+  it("lists a model that diarizes alone in its own section", async () => {
+    const transcribe: ModelInfo = {
+      variant: "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+      route_capabilities: caps({
+        openai_audio_transcriptions: true,
+        speech_to_text_jobs: true,
+        speaker_attributed_asr: true,
+        native_word_timestamps: true,
+        one_model_diarization: true,
+      }),
+      status: "downloaded" as const,
+      local_path: "/models/nemotron-transcribe",
+      size_bytes: null,
+      download_progress: null,
+      error_message: null,
+    };
+    const props = createRouteProps({ models: [...baseModels, transcribe] });
+
+    renderRoute(props);
+    await waitFor(() =>
+      expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
+    );
+    await openRecordMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Models" }));
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,Single model,ASR,Forced Aligner,Summary",
+    );
+    // Not an ASR stage: it appears once, as the single model.
+    expect(
+      modelModal
+        .getAttribute("data-models")
+        ?.split(",")
+        .filter((variant) => variant === transcribe.variant),
+    ).toHaveLength(1);
   });
 
   it("polls the selected record while its summary is pending", async () => {

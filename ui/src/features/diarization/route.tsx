@@ -20,6 +20,8 @@ import {
   isDiarizationPipelineAsrModel,
   isDiarizationPipelineLlmModel,
   isDiarizationModel,
+  isOneModelDiarizationModel,
+  SINGLE_MODEL_DIARIZATION_DESCRIPTION,
 } from "@/features/speech-text/modelFilters";
 import { useDiarizationRecord } from "@/features/diarization/hooks/useDiarizationRecord";
 import { Settings2 } from "lucide-react";
@@ -75,6 +77,11 @@ export function DiarizationPage({
     [models],
   );
 
+  const oneModelDiarizationModels = useMemo(
+    () => filterAndSortModels(models, isOneModelDiarizationModel),
+    [models],
+  );
+
   const asrPipelineModels = useMemo(
     () => filterAndSortModels(models, isDiarizationPipelineAsrModel),
     [models],
@@ -98,6 +105,16 @@ export function DiarizationPage({
         description: "Speaker segmentation model used by this route.",
         models: diarizationModels,
       },
+      ...(oneModelDiarizationModels.length > 0
+        ? [
+            {
+              key: "single-model",
+              title: "Single model",
+              description: SINGLE_MODEL_DIARIZATION_DESCRIPTION,
+              models: oneModelDiarizationModels,
+            },
+          ]
+        : []),
       {
         key: "asr",
         title: "ASR",
@@ -122,6 +139,7 @@ export function DiarizationPage({
       alignerPipelineModels,
       diarizationModels,
       llmPipelineModels,
+      oneModelDiarizationModels,
     ],
   );
 

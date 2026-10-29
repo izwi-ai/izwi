@@ -212,19 +212,34 @@ const DIARIZATION_STACK_CAPABILITIES: Record<
   "Whisper-Large-v3-Turbo": {
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    diarization_pipeline_asr: true,
   },
   "Granite-Speech-4.1-2B-Plus": {
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    diarization_pipeline_asr: true,
     speaker_attributed_asr: true,
   },
   "Granite-Speech-5.0-2B-GGUF": {
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    diarization_pipeline_asr: true,
   },
   "Parakeet-TDT-0.6B-v3": {
     openai_audio_transcriptions: true,
     speech_to_text_jobs: true,
+    diarization_pipeline_asr: true,
+  },
+  // Tags speakers and times words itself, so it diarizes alone; never the
+  // pipeline's ASR.
+  "Nemotron-3.5-Transcribe-30B-A4B-FP8": {
+    openai_audio_transcriptions: true,
+    speech_to_text_jobs: true,
+    speech_translation: true,
+    keyword_biasing: true,
+    speaker_attributed_asr: true,
+    native_word_timestamps: true,
+    one_model_diarization: true,
   },
   "Qwen3-ForcedAligner-0.6B": { forced_alignment: true },
   "Qwen3.5-4B": { openai_chat_completions: true, voice_realtime_text_model: true },
@@ -296,7 +311,11 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
         status: "ready",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -314,7 +333,11 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Whisper-Large-v3-Turbo",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
         status: "ready",
         local_path: "/models/whisper",
         size_bytes: null,
@@ -875,7 +898,11 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
         status: "loading",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -1775,7 +1802,11 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
         status: "ready",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -1793,7 +1824,11 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Whisper-Large-v3-Turbo",
-        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
+        route_capabilities: caps({
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
         status: "not_downloaded",
         local_path: "/models/whisper",
         size_bytes: null,
@@ -1823,6 +1858,7 @@ describe("TranscriptionPage detail route", () => {
         route_capabilities: caps({
           openai_audio_transcriptions: true,
           speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
           speaker_attributed_asr: true,
         }),
         status: "ready",
@@ -1913,6 +1949,315 @@ describe("TranscriptionPage detail route", () => {
     expect(modelModal.getAttribute("data-models")).not.toContain(
       "Granite-Speech-5.0-2B-GGUF",
     );
+  });
+
+  it("offers Nemotron 3.5 Transcribe for speaker attribution but not as the diarization ASR", async () => {
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "ready"),
+      stackModel("Granite-Speech-4.1-2B-Plus", "downloaded"),
+      stackModel("Nemotron-3.5-Transcribe-30B-A4B-FP8", "ready"),
+    ];
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+    const asrOptions = Array.from(
+      (screen.getByRole("combobox", { name: "ASR model" }) as HTMLSelectElement)
+        .options,
+    ).map((option) => option.value);
+    expect(asrOptions).toEqual([
+      "Granite-Speech-4.1-2B-Plus",
+      "Whisper-Large-v3-Turbo",
+    ]);
+
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Speaker Attributed ASR" }),
+    );
+    await screen.findByRole("heading", { name: "New speaker-attributed ASR" });
+    // Loaded, it is the pick over a Granite that is only downloaded.
+    expect(
+      screen.getByText(getModelDisplayName("Nemotron-3.5-Transcribe-30B-A4B-FP8")),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Change SAA model" }));
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Granite-Speech-4.1-2B-Plus",
+    );
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+    );
+  });
+
+  it("offers a single-model diarizer only by its capability, and never as the default", async () => {
+    const transcribe = "Nemotron-3.5-Transcribe-30B-A4B-FP8";
+    hookMocks.useRouteModelSelection.mockImplementation(
+      useOpenableRouteModelSelection,
+    );
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "downloaded"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "ready"),
+      stackModel("Granite-Speech-4.1-2B-Plus", "ready"),
+      stackModel(transcribe, "ready"),
+    ];
+    baseProps.onPickRoleModel = vi.fn();
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    const picker = screen.getByRole("combobox", {
+      name: "Diarization model",
+    }) as HTMLSelectElement;
+    // Loaded, the single model still waits to be picked: Sortformer, only
+    // on disk, stays the default.
+    expect(picker).toHaveValue("diar_streaming_sortformer_4spk-v2.1");
+    expect(Array.from(picker.options).map((option) => option.value)).toEqual([
+      "diar_streaming_sortformer_4spk-v2.1",
+      transcribe,
+    ]);
+    expect(
+      Array.from(picker.querySelectorAll("optgroup")).map((group) => group.label),
+    ).toEqual([
+      "Diarization pipeline",
+      "Single model (transcribes, tags speakers and times words itself)",
+    ]);
+    expect(screen.getByRole("combobox", { name: "ASR model" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Aligner" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Min speech (ms)")).toBeInTheDocument();
+
+    fireEvent.change(picker, { target: { value: transcribe } });
+    expect(baseProps.onPickRoleModel).toHaveBeenCalledWith("diarization", transcribe);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change diarization models" }),
+    );
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,Single model,ASR,Forced Aligner,Summary",
+    );
+  });
+
+  it("diarizes with a picked single model alone", async () => {
+    const transcribe = "Nemotron-3.5-Transcribe-30B-A4B-FP8";
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      // Not loaded: the pipeline would be blocked, the single model is not.
+      stackModel("Qwen3-ForcedAligner-0.6B", "downloaded"),
+      stackModel("Qwen3.5-4B", "ready"),
+      stackModel(transcribe, "ready"),
+    ];
+    baseProps.rolePickFor = (role) => (role === "diarization" ? transcribe : null);
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    expect(
+      screen.getByRole("combobox", { name: "Diarization model" }),
+    ).toHaveValue(transcribe);
+    expect(
+      screen.getByText(/^Transcribes, tags speakers and times words itself/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "ASR model" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Aligner" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Max speakers")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+
+    // The stack is the model (and the summary model) alone.
+    fireEvent.click(screen.getByRole("button", { name: "Unload Models" }));
+    expect(baseProps.onUnload).toHaveBeenCalledTimes(2);
+    expect(baseProps.onUnload).toHaveBeenCalledWith(transcribe);
+    expect(baseProps.onUnload).toHaveBeenCalledWith("Qwen3.5-4B");
+
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const fileInput = uploadButtons[uploadButtons.length - 1]?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
+    );
+    const request = apiMocks.createDiarizationRecord.mock.calls[0]?.[0];
+    expect(request).toEqual(
+      expect.objectContaining({
+        audio_filename: "meeting.wav",
+        model_id: transcribe,
+        llm_model_id: "Qwen3.5-4B",
+        min_speakers: 1,
+        max_speakers: 4,
+      }),
+    );
+    expect(request).not.toHaveProperty("asr_model_id");
+    expect(request).not.toHaveProperty("aligner_model_id");
+    expect(request).not.toHaveProperty("min_speech_duration_ms");
+    expect(request).not.toHaveProperty("min_silence_duration_ms");
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps the pipeline request when a single model is offered but not picked", async () => {
+    baseProps.models = [
+      stackModel("diar_streaming_sortformer_4spk-v2.1", "ready"),
+      stackModel("Whisper-Large-v3-Turbo", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "ready"),
+      stackModel("Qwen3.5-4B", "ready"),
+      stackModel("Nemotron-3.5-Transcribe-30B-A4B-FP8", "ready"),
+    ];
+
+    renderRoute("/transcription");
+    await openNewDiarization();
+
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const fileInput = uploadButtons[uploadButtons.length - 1]?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model_id: "diar_streaming_sortformer_4spk-v2.1",
+          asr_model_id: "Whisper-Large-v3-Turbo",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+          min_speech_duration_ms: 240,
+          min_silence_duration_ms: 200,
+        }),
+        expect.anything(),
+      ),
+    );
+  });
+
+  it("times words with a native-timestamp model without an aligner", async () => {
+    const transcribe = "Nemotron-3.5-Transcribe-30B-A4B-FP8";
+    baseProps.models = [
+      stackModel(transcribe, "ready"),
+      // On disk but not loaded: a model that times words never asks for it.
+      stackModel("Qwen3-ForcedAligner-0.6B", "downloaded"),
+      stackModel("Qwen3.5-4B", "ready"),
+    ];
+    baseProps.selectedModel = transcribe;
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: baseProps.models,
+      resolvedSelectedModel: transcribe,
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+    apiMocks.createTranscriptionRecord.mockResolvedValueOnce({
+      id: "txr-native-1",
+      created_at: 1,
+      model_id: transcribe,
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "pending",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "clip.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    await screen.findByRole("heading", { name: "New transcript" });
+
+    fireEvent.click(screen.getByRole("switch", { name: /Stream results/i }));
+    const timestampToggle = screen.getByRole("switch", {
+      name: /Include timestamps/i,
+    });
+    fireEvent.click(timestampToggle);
+
+    expect(timestampToggle).toBeChecked();
+    expect(screen.getByText(/This model times words itself/)).toBeInTheDocument();
+    expect(screen.queryByText("Timestamp aligner")).not.toBeInTheDocument();
+    expect(baseProps.onError).not.toHaveBeenCalled();
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "clip.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createTranscriptionRecord).toHaveBeenCalledTimes(1),
+    );
+    const request = apiMocks.createTranscriptionRecord.mock.calls[0]?.[0];
+    expect(request).toEqual(
+      expect.objectContaining({ model_id: transcribe, include_timestamps: true }),
+    );
+    expect(request.aligner_model_id).toBeUndefined();
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
+  it("still asks for a loaded aligner before timestamps from other models", async () => {
+    baseProps.models = [
+      stackModel("Parakeet-TDT-0.6B-v3", "ready"),
+      stackModel("Qwen3-ForcedAligner-0.6B", "downloaded"),
+      stackModel("Qwen3.5-4B", "ready"),
+    ];
+
+    renderRoute("/transcription");
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    await screen.findByRole("heading", { name: "New transcript" });
+
+    fireEvent.click(screen.getByRole("switch", { name: /Stream results/i }));
+    const timestampToggle = screen.getByRole("switch", {
+      name: /Include timestamps/i,
+    });
+    fireEvent.click(timestampToggle);
+
+    expect(timestampToggle).not.toBeChecked();
+    expect(baseProps.onError).toHaveBeenCalledWith(
+      "Load the timestamp aligner model to enable timestamps.",
+    );
+    expect(
+      screen.getByText("Load the timestamp aligner model to include timestamps."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/This model times words itself/)).not.toBeInTheDocument();
   });
 
   it("shows streamed transcript deltas on the detail page while processing", async () => {

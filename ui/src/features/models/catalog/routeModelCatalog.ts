@@ -52,18 +52,27 @@ export const DIARIZATION_PREFERRED_MODELS = [
 ] as const;
 
 /**
- * Highest speaker count a diarization checkpoint can resolve: v2.1 exposes
- * four channels, Nemotron-3-Diarization eight (its head is fixed at 8 and
- * extra channels emit near-zero probabilities when fewer speakers talk).
+ * Highest speaker count a diarization model can resolve: v2.1 exposes four
+ * channels, Nemotron-3-Diarization eight (its head is fixed at 8 and extra
+ * channels emit near-zero probabilities when fewer speakers talk), and
+ * Nemotron 3.5 Transcribe, diarizing alone, is capped at eight by the server.
  */
 export function diarizationSpeakerUpperBound(
   variant: string | null | undefined,
 ): number {
-  return variant === "Nemotron-3-Diarization" ? 8 : 4;
+  return variant === "Nemotron-3-Diarization" ||
+    variant === "Nemotron-3.5-Transcribe-30B-A4B-FP8"
+    ? 8
+    : 4;
 }
 
+/**
+ * Granite stays the default; Nemotron 3.5 Transcribe (about 32 GB of
+ * memory) is the pick when it is loaded and Granite is not.
+ */
 export const SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS = [
   "Granite-Speech-4.1-2B-Plus",
+  "Nemotron-3.5-Transcribe-30B-A4B-FP8",
 ] as const;
 
 export const DIARIZATION_PREFERRED_ASR_MODELS = [

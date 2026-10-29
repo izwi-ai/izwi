@@ -5,6 +5,7 @@ import {
   installedGraniteSpeech5Model,
   isDiarizationPipelineAsrModel,
   isDiarizationPipelineLlmModel,
+  isOneModelDiarizationModel,
   isSpeakerAttributedAsrModel,
   isTranscriptionSummaryModel,
   resolveDiarizationStackRole,
@@ -106,6 +107,31 @@ describe("resolveDiarizationStackRole", () => {
   it("reports no model when none is eligible", () => {
     expect(resolveAsr([], null)).toEqual({ variant: null, ready: false, missing: false });
   });
+
+  it("uses a pick-only model only when it is the user's pick", () => {
+    const sortformer = model("diar_streaming_sortformer_4spk-v2.1", "downloaded");
+    const transcribe = model("Nemotron-3.5-Transcribe-30B-A4B-FP8");
+    const resolveDiarizer = (pick: string | null) =>
+      resolveDiarizationStackRole({
+        models: [sortformer, transcribe],
+        eligibleModels: [sortformer],
+        pickOnlyModels: [transcribe],
+        pick,
+        preferredVariants: ["diar_streaming_sortformer_4spk-v2.1"],
+      });
+
+    // Loaded, it still never becomes the default diarizer.
+    expect(resolveDiarizer(null)).toEqual({
+      variant: "diar_streaming_sortformer_4spk-v2.1",
+      ready: false,
+      missing: false,
+    });
+    expect(resolveDiarizer("Nemotron-3.5-Transcribe-30B-A4B-FP8")).toEqual({
+      variant: "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+      ready: true,
+      missing: false,
+    });
+  });
 });
 
 describe("isDiarizationPipelineAsrModel", () => {
@@ -139,7 +165,21 @@ describe("isDiarizationPipelineAsrModel", () => {
     };
   }
 
-  it("offers ASR models that run speech-to-text jobs", () => {
+  it("offers ASR models the server marks as pipeline ASR", () => {
+    expect(
+      isDiarizationPipelineAsrModel(
+        withCapabilities("Parakeet-TDT-0.6B-v3", {
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+          diarization_pipeline_asr: true,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("selects by the server's capability, not by transcription routes", () => {
+    // Serving transcription jobs is not enough: only the server says
+    // whether the pipeline may use a model as its ASR stage.
     expect(
       isDiarizationPipelineAsrModel(
         withCapabilities("Parakeet-TDT-0.6B-v3", {
@@ -147,7 +187,7 @@ describe("isDiarizationPipelineAsrModel", () => {
           speech_to_text_jobs: true,
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("hides audio-chat models the pipeline cannot run", () => {
@@ -169,6 +209,7 @@ describe("isDiarizationPipelineAsrModel", () => {
             openai_audio_transcriptions: true,
             openai_audio_speech: true,
             speech_to_text_jobs: true,
+            diarization_pipeline_asr: true,
             text_to_speech_records: true,
             voice_realtime_unified: true,
           }),
@@ -184,20 +225,59 @@ describe("isDiarizationPipelineAsrModel", () => {
           withCapabilities(variant, {
             openai_audio_transcriptions: true,
             speech_to_text_jobs: true,
+            diarization_pipeline_asr: true,
           }),
         ),
       ).toBe(true);
     }
   });
 
-  it("offers speaker-attributed ASR models as the pipeline ASR too", () => {
+  it("offers speaker-attributed ASR models the server allows as the pipeline ASR", () => {
     const plus = withCapabilities("Granite-Speech-4.1-2B-Plus", {
       openai_audio_transcriptions: true,
       speech_to_text_jobs: true,
+      diarization_pipeline_asr: true,
       speaker_attributed_asr: true,
     });
     expect(isSpeakerAttributedAsrModel(plus)).toBe(true);
     expect(isDiarizationPipelineAsrModel(plus)).toBe(true);
+  });
+
+  it("keeps Nemotron 3.5 Transcribe out of the pipeline but in speaker-attributed ASR", () => {
+    // It tags speakers itself and the server refuses it as the pipeline ASR.
+    const transcribe = withCapabilities("Nemotron-3.5-Transcribe-30B-A4B-FP8", {
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      diarization_pipeline_asr: false,
+      speaker_attributed_asr: true,
+      speech_translation: true,
+      keyword_biasing: true,
+      native_word_timestamps: true,
+    });
+    expect(isDiarizationPipelineAsrModel(transcribe)).toBe(false);
+    expect(isSpeakerAttributedAsrModel(transcribe)).toBe(true);
+  });
+
+  it("offers one-model diarization only to models the server marks", () => {
+    const transcribe = withCapabilities("Nemotron-3.5-Transcribe-30B-A4B-FP8", {
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      speaker_attributed_asr: true,
+      native_word_timestamps: true,
+      one_model_diarization: true,
+    });
+    const plus = withCapabilities("Granite-Speech-4.1-2B-Plus", {
+      openai_audio_transcriptions: true,
+      speech_to_text_jobs: true,
+      diarization_pipeline_asr: true,
+      speaker_attributed_asr: true,
+    });
+    const sortformer = withCapabilities("diar_streaming_sortformer_4spk-v2.1", {
+      diarization_records: true,
+    });
+    expect(isOneModelDiarizationModel(transcribe)).toBe(true);
+    expect(isOneModelDiarizationModel(plus)).toBe(false);
+    expect(isOneModelDiarizationModel(sortformer)).toBe(false);
   });
 
   it("runs summaries on chat models, which LFM3 Audio is not", () => {

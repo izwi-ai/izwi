@@ -67,6 +67,8 @@ export interface ModelRouteCapabilities {
   openai_audio_speech: boolean;
   openai_audio_transcriptions: boolean;
   speech_to_text_jobs: boolean;
+  /** The diarization pipeline may use the model as its ASR stage. */
+  diarization_pipeline_asr?: boolean;
   speech_to_text_realtime: boolean;
   /** The model translates speech into another language on request. */
   speech_translation?: boolean;
@@ -74,7 +76,12 @@ export interface ModelRouteCapabilities {
   keyword_biasing?: boolean;
   /** The model writes speaker turns itself (speaker-attributed ASR jobs). */
   speaker_attributed_asr?: boolean;
+  /** The model times words itself: word timestamps need no aligner. */
+  native_word_timestamps?: boolean;
   diarization_records: boolean;
+  /** A diarization job may name the model alone: it transcribes, tags
+   * speakers and times words itself, with no pipeline ASR or aligner. */
+  one_model_diarization?: boolean;
   text_to_speech_records: boolean;
   voice_design_records: boolean;
   voice_clone_records: boolean;

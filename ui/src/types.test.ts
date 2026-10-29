@@ -71,6 +71,34 @@ describe("speech route model filters", () => {
     ).toBe(true);
   });
 
+  it("includes nemotron 3.5 transcribe on transcription routes", () => {
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+      ),
+    ).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8",
+      ),
+    ).toBe(true);
+    // Only this checkpoint: an unsupported quantization and the diarizer
+    // stay off, and the streaming ASR keeps its own entry.
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4",
+      ),
+    ).toBe(false);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("Nemotron-3-Diarization"),
+    ).toBe(false);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "Nemotron-3.5-ASR-Streaming-0.6B",
+      ),
+    ).toBe(true);
+  });
+
   it("includes granite speech on regular transcription routes", () => {
     expect(
       VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-4.1-2B"),

@@ -496,7 +496,8 @@ export function readyTasks(rows: TaskRow[], models: ModelInfo[]): TaskRow[] {
     transcribe: has("asr"),
     read: has("tts"),
     voices: has("clone") || has("design"),
-    // Granite Speech Plus labels speakers itself; otherwise the pipeline.
+    // A speaker-attributed ASR model (Granite Speech 4.1 Plus, Nemotron 3.5
+    // Transcribe) labels speakers itself; otherwise the pipeline.
     speakers:
       onDisk.some(
         (model) =>

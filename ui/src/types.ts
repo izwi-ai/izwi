@@ -126,6 +126,16 @@ function isNemotronAsrVariant(variant: string): boolean {
   );
 }
 
+/** Nemotron 3.5 Transcribe: offline only, with speaker tags and translation. */
+function isNemotronTranscribeVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "nemotron-3.5-transcribe-30b-a4b-fp8" ||
+    normalized === "nvidia/nvidia-nemotron-3.5-transcribe-30b-a4b-fp8" ||
+    normalized === "nemotron 3.5 transcribe 30b-a4b fp8"
+  );
+}
+
 function isGraniteSpeechAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -240,13 +250,14 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
+      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
       isGraniteSpeechAsrVariant(variant) ||
       isGraniteSpeech5AsrVariant(variant) ||
       isNemotronAsrVariant(variant) ||
+      isNemotronTranscribeVariant(variant) ||
       isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
@@ -255,7 +266,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfm3AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
   },
   chat: {
     id: "chat",
