@@ -943,3 +943,95 @@ fn lfm3_audio_tts_rows_are_batch_invariant_on_metal() {
     }
     tts_rows_are_batch_invariant(profile);
 }
+
+/// Metal's fused depth pass scores as the op-by-op pass does (to rounding),
+/// a row scores the same bit for bit alone and beside others, and the pass
+/// takes less time (indicative: the machine is shared).
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn depth_fusion_matches_the_op_by_op_pass_on_metal() {
+    use super::super::depth::FORCE_UNFUSED_DEPTH;
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "depth_fusion_matches_the_op_by_op_pass_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    let dir = models_dir().join(FOLDER);
+    if !matches!(profile.device, Device::Metal(_)) || !dir.exists() {
+        eprintln!("skipping: no Metal device or no {}", dir.display());
+        return;
+    }
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    let device = model.device().device.clone();
+    let rows = 4;
+    let hidden = Tensor::randn(0f32, 1f32, (rows, 2048), &device).unwrap();
+    let inputs = model.depth.frame_inputs(&hidden).unwrap();
+    let mut rng = SplitMix64::new(5);
+    let codes = (0..rows)
+        .map(|_| std::array::from_fn(|_| (rng.next_u64() % 2_016) as u32))
+        .collect::<Vec<[u32; CODEBOOKS]>>();
+    let revealed = (0..rows)
+        .map(|row| std::array::from_fn(|codebook| (row + codebook) % 3 == 0))
+        .collect::<Vec<[bool; CODEBOOKS]>>();
+    let heads = (0..rows)
+        .flat_map(|row| (0..CODEBOOKS).map(move |codebook| (row, codebook)))
+        .collect::<Vec<_>>();
+    let pass = |unfused: bool, rows: usize| {
+        FORCE_UNFUSED_DEPTH.with(|force| force.set(unfused));
+        let logits = model
+            .depth
+            .pass_logits(
+                &inputs.narrow(0, 0, rows).unwrap(),
+                &codes[..rows],
+                &revealed[..rows],
+                &heads[..rows * CODEBOOKS],
+            )
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        FORCE_UNFUSED_DEPTH.with(|force| force.set(false));
+        logits
+    };
+    let fused = pass(false, rows);
+    let plain = pass(true, rows);
+    let (mut largest, mut worst) = (0f32, 0f32);
+    for (fused, plain) in fused.iter().flatten().zip(plain.iter().flatten()) {
+        largest = largest.max(plain.abs());
+        worst = worst.max((fused - plain).abs());
+    }
+    eprintln!("fused vs op-by-op: max |diff| {worst:.2e} over logits up to {largest:.1}");
+    assert!(worst <= 1e-3 * largest.max(1.0), "max |diff| {worst}");
+    assert_eq!(pass(false, 1)[..CODEBOOKS], fused[..CODEBOOKS]);
+
+    let time = |unfused: bool| {
+        FORCE_UNFUSED_DEPTH.with(|force| force.set(unfused));
+        let run = || {
+            model
+                .depth
+                .pass_logits(
+                    &inputs.narrow(0, 0, 1).unwrap(),
+                    &codes[..1],
+                    &revealed[..1],
+                    &heads[..4],
+                )
+                .unwrap()
+        };
+        run();
+        device.synchronize().unwrap();
+        let started = Instant::now();
+        for _ in 0..48 {
+            run();
+        }
+        device.synchronize().unwrap();
+        FORCE_UNFUSED_DEPTH.with(|force| force.set(false));
+        started.elapsed().as_secs_f64() * 1000.0 / 48.0
+    };
+    // Interleaved, so the shared machine's load falls on both.
+    let (mut fused_ms, mut plain_ms) = (0.0, 0.0);
+    for _ in 0..3 {
+        fused_ms += time(false) / 3.0;
+        plain_ms += time(true) / 3.0;
+    }
+    eprintln!("one row, one pass (indicative): fused {fused_ms:.2} ms, op-by-op {plain_ms:.2} ms");
+}

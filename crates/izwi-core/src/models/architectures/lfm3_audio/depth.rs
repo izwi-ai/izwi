@@ -26,7 +26,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 use super::config::{
     Lfm3AudioSampling, AUDIO_EOS_CODE, CODEBOOKS, CODEBOOK_SIZE, MASKGIT_SCHEDULE,
 };
-use super::sampling::{apply_repetition_penalty, permutation, sample};
+use super::sampling::{penalize_distinct, permutation, sample};
 
 const HIDDEN: usize = 1_024;
 const HEADS: usize = 32;
@@ -46,6 +46,8 @@ struct DepthLayer {
     gate: QMatMul,
     q_norm: Tensor,
     k_norm: Tensor,
+    /// `[q_norm | k_norm]`, the fused q/k RMSNorm's weights.
+    qk_norm: Tensor,
     ffn_gate: QMatMul,
     ffn_up: QMatMul,
     ffn_down: QMatMul,
@@ -64,16 +66,47 @@ pub(crate) struct Lfm3DepthDecoder {
     head_norms: Tensor,
     layers: Vec<DepthLayer>,
     norm: Tensor,
+    /// `[HIDDEN]` ones: the heads' unit RMSNorm through the fused kernel.
+    ones: Tensor,
     cos: Tensor,
     sin: Tensor,
+    /// `[CODEBOOKS, HEAD_DIM]`: each slot's `[cos | sin]`, for the fused
+    /// RoPE kernel.
+    cos_sin: Tensor,
     offsets: Tensor,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch that sends this thread's depth passes down the
+    /// op-by-op path, for parity and A/B timing against the fused kernels.
+    pub(crate) static FORCE_UNFUSED_DEPTH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a depth pass runs the fused RMSNorm, q/k RMSNorm, RoPE and
+/// SiLU-gate kernels: on Metal with fused kernels on. CPU and CUDA run the
+/// op-by-op pass.
+fn depth_fusion_on(device: &Device) -> bool {
+    #[cfg(test)]
+    if FORCE_UNFUSED_DEPTH.with(std::cell::Cell::get) {
+        return false;
+    }
+    device.is_metal() && crate::kernels::use_fused_kernels_for_device(device)
+}
+
 /// The frames a request has generated, for the per-codebook repetition
-/// penalty (the last `window` frames).
+/// penalty (the last `window` frames). Each codebook's distinct codes are
+/// kept as frames come and go, so a head's penalty reads them directly
+/// instead of deduplicating up to `window` codes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FrameHistory {
     frames: VecDeque<[u32; CODEBOOKS]>,
+    /// How often each code is in each codebook's window,
+    /// `[CODEBOOKS * CODEBOOK_SIZE]` once a frame arrives.
+    counts: Vec<u32>,
+    /// Each codebook's distinct codes in the window.
+    distinct: [Vec<u32>; CODEBOOKS],
 }
 
 impl FrameHistory {
@@ -81,14 +114,48 @@ impl FrameHistory {
         if window == 0 {
             return;
         }
+        if self.counts.is_empty() {
+            self.counts = vec![0; CODEBOOKS * CODEBOOK_SIZE];
+        }
         while self.frames.len() >= window {
-            self.frames.pop_front();
+            let Some(old) = self.frames.pop_front() else {
+                break;
+            };
+            for (codebook, &code) in old.iter().enumerate() {
+                let Some(count) = self.count_mut(codebook, code) else {
+                    continue;
+                };
+                *count -= 1;
+                if *count == 0 {
+                    let distinct = &mut self.distinct[codebook];
+                    if let Some(index) = distinct.iter().position(|&seen| seen == code) {
+                        distinct.swap_remove(index);
+                    }
+                }
+            }
+        }
+        for (codebook, &code) in frame.iter().enumerate() {
+            let Some(count) = self.count_mut(codebook, code) else {
+                continue;
+            };
+            *count += 1;
+            if *count == 1 {
+                self.distinct[codebook].push(code);
+            }
         }
         self.frames.push_back(frame);
     }
 
+    /// `codebook`'s distinct codes in the window, in no particular order.
     fn codebook(&self, codebook: usize) -> impl Iterator<Item = u32> + '_ {
-        self.frames.iter().map(move |frame| frame[codebook])
+        self.distinct[codebook].iter().copied()
+    }
+
+    fn count_mut(&mut self, codebook: usize, code: u32) -> Option<&mut u32> {
+        let code = usize::try_from(code)
+            .ok()
+            .filter(|&code| code < CODEBOOK_SIZE)?;
+        self.counts.get_mut(codebook * CODEBOOK_SIZE + code)
     }
 }
 
@@ -105,6 +172,8 @@ impl Lfm3DepthDecoder {
         let layers = (0..3)
             .map(|layer| -> Result<DepthLayer> {
                 let p = |name: &str| format!("blk.{layer}.{name}.weight");
+                let q_norm = dense(&p("attn_q_norm"))?;
+                let k_norm = dense(&p("attn_k_norm"))?;
                 Ok(DepthLayer {
                     attn_norm: dense(&p("ln1"))?,
                     ffn_norm: dense(&p("ln2"))?,
@@ -113,8 +182,9 @@ impl Lfm3DepthDecoder {
                     v: qmatmul(&p("attn_v"))?,
                     o: qmatmul(&p("attn_out"))?,
                     gate: qmatmul(&p("attn_gate"))?,
-                    q_norm: dense(&p("attn_q_norm"))?,
-                    k_norm: dense(&p("attn_k_norm"))?,
+                    qk_norm: Tensor::cat(&[&q_norm, &k_norm], 0)?,
+                    q_norm,
+                    k_norm,
                     ffn_gate: qmatmul(&p("ffn_gate"))?,
                     ffn_up: qmatmul(&p("ffn_up"))?,
                     ffn_down: qmatmul(&p("ffn_down"))?,
@@ -149,6 +219,7 @@ impl Lfm3DepthDecoder {
             (CODEBOOKS * CODEBOOK_SIZE, HIDDEN),
         )?;
         let (cos, sin) = rope_tables(device)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?;
         let offsets = Tensor::from_vec(
             (0..CODEBOOKS as u32)
                 .map(|codebook| codebook * CODEBOOK_SIZE as u32)
@@ -165,8 +236,10 @@ impl Lfm3DepthDecoder {
             head_norms: dense("head_norm.weight")?.reshape((CODEBOOKS, HIDDEN))?,
             layers,
             norm: dense("output_norm.weight")?,
+            ones: Tensor::ones(HIDDEN, DType::F32, device)?,
             cos,
             sin,
+            cos_sin,
             offsets,
         })
     }
@@ -221,17 +294,49 @@ impl Lfm3DepthDecoder {
         let unknown = known.affine(-1.0, 1.0)?;
         let mut x = frame_inputs.add(&embeds.broadcast_mul(&known)?)?;
         x = x.add(&unknown.broadcast_mul(&self.mask_embedding)?)?;
+        let fused = depth_fusion_on(device);
+        let norm = |x: &Tensor, weight: &Tensor| -> Result<Tensor> {
+            match fused
+                .then(|| crate::kernels::try_fused_rms_norm(x, weight, EPS))
+                .flatten()
+            {
+                Some(normed) => Ok(normed),
+                None => rms(x, weight),
+            }
+        };
         for layer in &self.layers {
-            x = x.add(&self.attention(layer, &rms(&x, &layer.attn_norm)?)?)?;
-            let h = rms(&x, &layer.ffn_norm)?;
-            let gated = candle_nn::ops::silu(&layer.ffn_gate.forward(&h)?)?
-                .mul(&layer.ffn_up.forward(&h)?)?;
+            let h = norm(&x, &layer.attn_norm)?;
+            let attended = match fused
+                .then(|| self.fused_attention(layer, &h))
+                .transpose()?
+                .flatten()
+            {
+                Some(attended) => attended,
+                None => self.attention(layer, &h)?,
+            };
+            x = x.add(&attended)?;
+            let h = norm(&x, &layer.ffn_norm)?;
+            let (gate, up) = (layer.ffn_gate.forward(&h)?, layer.ffn_up.forward(&h)?);
+            let gated = match fused
+                .then(|| crate::kernels::try_fused_silu_mul(&gate, &up))
+                .flatten()
+            {
+                Some(gated) => gated,
+                None => candle_nn::ops::silu(&gate)?.mul(&up)?,
+            };
             x = x.add(&layer.ffn_down.forward(&gated)?)?;
         }
         // Each codebook's head: an RMSNorm then its tied embedding table.
-        let normed = unit_rms(&rms(&x, &self.norm)?)?
-            .broadcast_mul(&self.head_norms)?
-            .reshape((rows * CODEBOOKS, HIDDEN))?;
+        let normed = norm(&x, &self.norm)?;
+        let normed = match fused
+            .then(|| crate::kernels::try_fused_rms_norm(&normed, &self.ones, EPS))
+            .flatten()
+        {
+            Some(unit) => unit,
+            None => unit_rms(&normed)?,
+        }
+        .broadcast_mul(&self.head_norms)?
+        .reshape((rows * CODEBOOKS, HIDDEN))?;
         let slots = Tensor::from_vec(
             heads
                 .iter()
@@ -287,6 +392,61 @@ impl Lfm3DepthDecoder {
         Ok(layer.o.forward(&attended)?)
     }
 
+    /// [`Self::attention`] through the fused q/k RMSNorm and RoPE kernels,
+    /// each query head grouped with its key/value head instead of the keys
+    /// and values copied per query head; `None` when a kernel declines.
+    fn fused_attention(&self, layer: &DepthLayer, h: &Tensor) -> Result<Option<Tensor>> {
+        let (rows, slots, _) = h.dims3()?;
+        // The q/k kernel normalizes one position's heads per row.
+        let q = layer
+            .q
+            .forward(h)?
+            .reshape((rows * slots, 1, HEADS, HEAD_DIM))?;
+        let k = layer
+            .k
+            .forward(h)?
+            .reshape((rows * slots, 1, KV_HEADS, HEAD_DIM))?;
+        let Some((q, k)) = crate::kernels::try_fused_qk_rms_norm(&q, &k, &layer.qk_norm, EPS)
+        else {
+            return Ok(None);
+        };
+        let Some((q, k)) = crate::kernels::try_fused_rope_pair_bshd(
+            &q.reshape((rows, slots, HEADS, HEAD_DIM))?,
+            &k.reshape((rows, slots, KV_HEADS, HEAD_DIM))?,
+            &self.cos_sin,
+        ) else {
+            return Ok(None);
+        };
+        // Query head `h` reads key/value head `h / group`, so the queries
+        // of one key/value head are one contiguous run of `group * slots`.
+        let group = HEADS / KV_HEADS;
+        let q =
+            q.transpose(1, 2)?
+                .contiguous()?
+                .reshape((rows, KV_HEADS, group * slots, HEAD_DIM))?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = layer
+            .v
+            .forward(h)?
+            .reshape((rows, slots, KV_HEADS, HEAD_DIM))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let scores = q
+            .matmul(&k.t()?)?
+            .affine(1.0 / (HEAD_DIM as f64).sqrt(), 0.0)?;
+        let attended = candle_nn::ops::softmax_last_dim(&scores)?
+            .matmul(&v)?
+            .reshape((rows, HEADS, slots, HEAD_DIM))?;
+        let gate =
+            candle_nn::ops::sigmoid(&layer.gate.forward(h)?)?.reshape((rows, slots, HEADS, 1))?;
+        let attended = attended.transpose(1, 2)?.broadcast_mul(&gate)?.reshape((
+            rows,
+            slots,
+            HEADS * HEAD_DIM,
+        ))?;
+        Ok(Some(layer.o.forward(&attended)?))
+    }
+
     /// Sample one frame per row: a random reveal order, then four codebooks
     /// per pass, each drawn from its logits after the repetition penalty
     /// over that codebook's history. A row that draws the end-of-audio code
@@ -328,7 +488,7 @@ impl Lfm3DepthDecoder {
             for row in 0..rows {
                 for &codebook in &orders[row][start..start + count] {
                     let mut scores = logits.next().expect("one row of logits per head");
-                    apply_repetition_penalty(
+                    penalize_distinct(
                         &mut scores,
                         histories[row].codebook(codebook),
                         samplings[row].repetition_penalty,
@@ -381,4 +541,42 @@ fn rope_tables(device: &Device) -> Result<(Tensor, Tensor)> {
         Tensor::from_vec(cos, (CODEBOOKS, half), device)?,
         Tensor::from_vec(sin, (CODEBOOKS, half), device)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each codebook's distinct codes are those of the last `window` frames,
+    /// as the frames come and go.
+    #[test]
+    fn frame_history_keeps_each_codebooks_distinct_window_codes() {
+        let mut rng = SplitMix64::new(9);
+        let mut history = FrameHistory::default();
+        let mut frames = Vec::new();
+        for step in 0..400 {
+            let window = if step < 200 { 16 } else { 7 };
+            let frame = std::array::from_fn(|codebook| {
+                // Few codes, so they repeat; the end-of-audio code too.
+                (rng.next_u64() % (3 + codebook as u64)) as u32 * 1_000 % 2_017
+            });
+            history.push(frame, window);
+            frames.push(frame);
+            let start = frames.len().saturating_sub(window);
+            for codebook in 0..CODEBOOKS {
+                let mut expected = frames[start..]
+                    .iter()
+                    .map(|frame| frame[codebook])
+                    .collect::<Vec<_>>();
+                expected.sort_unstable();
+                expected.dedup();
+                let mut kept = history.codebook(codebook).collect::<Vec<_>>();
+                kept.sort_unstable();
+                assert_eq!(kept, expected, "step {step} codebook {codebook}");
+            }
+        }
+        let mut empty = FrameHistory::default();
+        empty.push([1; CODEBOOKS], 0);
+        assert_eq!(empty.codebook(0).count(), 0);
+    }
 }

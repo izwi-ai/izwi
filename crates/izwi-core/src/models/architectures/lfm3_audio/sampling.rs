@@ -17,10 +17,24 @@ pub(crate) fn apply_repetition_penalty(
         return;
     }
     let mut seen = std::collections::HashSet::new();
-    for token in history {
-        if !seen.insert(token) {
-            continue;
-        }
+    penalize_distinct(
+        scores,
+        history.into_iter().filter(|token| seen.insert(*token)),
+        penalty,
+    );
+}
+
+/// [`apply_repetition_penalty`] for a history whose tokens are already
+/// distinct.
+pub(crate) fn penalize_distinct(
+    scores: &mut [f32],
+    distinct: impl IntoIterator<Item = u32>,
+    penalty: f32,
+) {
+    if penalty == 1.0 {
+        return;
+    }
+    for token in distinct {
         if let Some(score) = scores.get_mut(token as usize) {
             *score = if *score < 0.0 {
                 *score * penalty
@@ -128,6 +142,15 @@ mod tests {
         let mut scores = vec![2.0, -2.0, 1.0];
         apply_repetition_penalty(&mut scores, [0, 0, 1], 2.0);
         assert_eq!(scores, vec![1.0, -4.0, 1.0]);
+    }
+
+    #[test]
+    fn penalizing_distinct_tokens_matches_the_deduplicating_penalty() {
+        let mut deduplicated = vec![2.0, -2.0, 0.5, 3.0];
+        let mut distinct = deduplicated.clone();
+        apply_repetition_penalty(&mut deduplicated, [1, 1, 3, 9, 3], 1.5);
+        penalize_distinct(&mut distinct, [3, 1, 9], 1.5);
+        assert_eq!(deduplicated, distinct);
     }
 
     #[test]
