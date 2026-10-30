@@ -1,11 +1,13 @@
 //! Minimal PyTorch zip/pickle tensor loading helpers.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use candle_core::pickle::{Object, Stack, TensorInfo};
 use candle_core::{DType, Device, Tensor};
+use zip::read::{ArchiveOffset, Config};
 use zip::ZipArchive;
 
 use crate::error::{Error, Result};
@@ -31,8 +33,9 @@ pub fn read_single_tensor_pth(
     dtype: DType,
     logical_name: &str,
 ) -> Result<Tensor> {
-    let (tensor_info, archive_member_path) = read_single_tensor_info(path, logical_name)?;
-    let tensor = read_tensor_from_zip(path, &tensor_info, &archive_member_path)?;
+    let mut zip = open_archive(path)?;
+    let (tensor_info, archive_member_path) = read_tensor_info(&mut zip, path, logical_name)?;
+    let tensor = read_tensor_from_zip(&mut zip, path, &tensor_info, &archive_member_path)?;
     let tensor = if tensor.dtype() != dtype {
         tensor.to_dtype(dtype)?
     } else {
@@ -46,16 +49,36 @@ pub fn read_single_tensor_pth(
 }
 
 pub fn read_single_tensor_info(path: &Path, logical_name: &str) -> Result<(TensorInfo, String)> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut zip = ZipArchive::new(reader).map_err(|err| {
+    read_tensor_info(&mut open_archive(path)?, path, logical_name)
+}
+
+type PthArchive = ZipArchive<BufReader<File>>;
+
+/// `torch.save` writes the archive from byte 0, so the offset is given rather
+/// than detected: zip 9's detection scans the whole file backwards, about 2 s
+/// per open on a 1.9 GB checkpoint. An archive with bytes in front of it fails
+/// the fixed offset and is reopened with detection.
+fn open_archive(path: &Path) -> Result<PthArchive> {
+    let at_start = Config {
+        archive_offset: ArchiveOffset::Known(0),
+    };
+    if let Ok(zip) = ZipArchive::with_config(at_start, BufReader::new(File::open(path)?)) {
+        return Ok(zip);
+    }
+    ZipArchive::new(BufReader::new(File::open(path)?)).map_err(|err| {
         Error::ModelLoadError(format!(
             "Failed to open PyTorch tensor archive {}: {}",
             path.display(),
             err
         ))
-    })?;
+    })
+}
 
+fn read_tensor_info(
+    zip: &mut PthArchive,
+    path: &Path,
+    logical_name: &str,
+) -> Result<(TensorInfo, String)> {
     let file_names = zip
         .file_names()
         .map(|name| name.map(|name| name.into_owned()))
@@ -106,16 +129,12 @@ pub fn read_single_tensor_info(path: &Path, logical_name: &str) -> Result<(Tenso
     )))
 }
 
-fn read_tensor_from_zip(path: &Path, info: &TensorInfo, member_path: &str) -> Result<Tensor> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut zip = ZipArchive::new(reader).map_err(|err| {
-        Error::ModelLoadError(format!(
-            "Failed to open PyTorch tensor archive {}: {}",
-            path.display(),
-            err
-        ))
-    })?;
+fn read_tensor_from_zip(
+    zip: &mut PthArchive,
+    path: &Path,
+    info: &TensorInfo,
+    member_path: &str,
+) -> Result<Tensor> {
     let mut reader = zip.by_name(member_path).map_err(|err| {
         Error::ModelLoadError(format!(
             "Missing tensor storage member {} in {}: {}",
@@ -236,7 +255,18 @@ impl PthTensorMap {
         let Some(info) = self.tensor_infos.get(name) else {
             return Ok(None);
         };
-        let mut tensor = read_tensor_from_zip(&self.path, info, &info.path)?;
+        self.read_from(&mut open_archive(&self.path)?, info, device, dtype)
+            .map(Some)
+    }
+
+    fn read_from(
+        &self,
+        zip: &mut PthArchive,
+        info: &TensorInfo,
+        device: &Device,
+        dtype: Option<DType>,
+    ) -> Result<Tensor> {
+        let mut tensor = read_tensor_from_zip(zip, &self.path, info, &info.path)?;
         if let Some(dtype) = dtype {
             if tensor.dtype() != dtype {
                 tensor = tensor.to_dtype(dtype)?;
@@ -245,7 +275,7 @@ impl PthTensorMap {
         if !tensor.device().same_device(device) {
             tensor = tensor.to_device(device)?;
         }
-        Ok(Some(tensor))
+        Ok(tensor)
     }
 
     pub fn read_all(
@@ -264,13 +294,10 @@ impl PthTensorMap {
         dtype: Option<DType>,
         keep: impl Fn(&str) -> bool,
     ) -> Result<BTreeMap<String, Tensor>> {
+        let mut zip = open_archive(&self.path)?;
         let mut tensors = BTreeMap::new();
-        for name in self.tensor_infos.keys().filter(|name| keep(name)) {
-            let tensor = self.get(name, device, dtype)?.ok_or_else(|| {
-                Error::ModelLoadError(format!(
-                    "PyTorch archive tensor disappeared while reading: {name}"
-                ))
-            })?;
+        for (name, info) in self.tensor_infos.iter().filter(|(name, _)| keep(name)) {
+            let tensor = self.read_from(&mut zip, info, device, dtype)?;
             tensors.insert(name.clone(), tensor);
         }
         Ok(tensors)
@@ -386,6 +413,45 @@ mod tests {
                 reference.to_vec3::<f32>().unwrap(),
                 "fortran={fortran}"
             );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archive_with_leading_bytes_still_loads() {
+        let dir = std::env::temp_dir().join(format!("izwi-pth-offset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reference = Tensor::arange(0f32, 12., &Device::Cpu)
+            .unwrap()
+            .reshape((3, 4))
+            .unwrap();
+        let plain = dir.join("plain.pth");
+        test_support::write_f32_state_dict(&plain, "w", &reference, false);
+        let shifted = dir.join("shifted.pth");
+        let mut bytes = vec![0x5a; 4099];
+        bytes.extend(std::fs::read(&plain).unwrap());
+        std::fs::write(&shifted, bytes).unwrap();
+        assert!(ZipArchive::with_config(
+            Config {
+                archive_offset: ArchiveOffset::Known(0)
+            },
+            BufReader::new(File::open(&shifted).unwrap())
+        )
+        .is_err());
+
+        for path in [&plain, &shifted] {
+            let map = PthTensorMap::open(path, None).unwrap();
+            let one = map.get("w", &Device::Cpu, None).unwrap().unwrap();
+            let all = map.read_all(&Device::Cpu, None).unwrap();
+            assert_eq!(all.len(), 1);
+            for tensor in [&one, &all["w"]] {
+                assert_eq!(
+                    tensor.to_vec2::<f32>().unwrap(),
+                    reference.to_vec2::<f32>().unwrap(),
+                    "{}",
+                    path.display()
+                );
+            }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
