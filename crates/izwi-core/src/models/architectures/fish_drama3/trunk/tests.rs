@@ -984,8 +984,25 @@ fn the_trunk_matches_f64_on_every_path() {
             .forward_span_traced(&embeds_tensor, 0, &mut traced_state, &mut cache)
             .unwrap();
         assert_eq!(host(&traced), span);
-        assert_eq!(trace.len(), config.trunk.layers.len());
-        assert!(trace.iter().all(|layer| layer.len() == n * hidden));
+        let depth = config.trunk.layers.len();
+        for part in [&trace.outputs, &trace.mixers, &trace.moes] {
+            assert_eq!(part.len(), depth);
+            assert!(part.iter().all(|layer| layer.len() == n * hidden));
+        }
+        assert_eq!(trace.router_logits.len(), depth);
+        assert!(trace
+            .router_logits
+            .iter()
+            .all(|layer| layer.len() == n * config.trunk.moe.experts));
+        // Each layer's output is its input plus its two parts.
+        let mut x = embeds.clone();
+        for layer in 0..depth {
+            for (i, value) in x.iter_mut().enumerate() {
+                *value += trace.mixers[layer][i];
+                *value += trace.moes[layer][i];
+            }
+            assert_eq!(x, trace.outputs[layer], "layer {layer}");
+        }
         // Split spans.
         let mut cache = caches(&layers, config, 1).remove(0);
         let mut split_state = trunk.new_state().unwrap();

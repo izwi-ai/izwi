@@ -194,8 +194,22 @@ impl std::fmt::Debug for FishDrama3Trunk {
     }
 }
 
-/// A forward's per-layer residual streams, for parity tests.
-pub(crate) type LayerTrace = Vec<Vec<f32>>;
+/// What a traced forward saw at each layer, for parity tests. Every entry is
+/// row-major over the forward's rows; a traced step of several rows holds
+/// each row's layers in turn.
+#[derive(Debug, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LayerTrace {
+    /// The residual stream after the layer, `[n, hidden]`.
+    pub(crate) outputs: Vec<Vec<f32>>,
+    /// The mixer's output (DeltaNet or attention) before its residual add.
+    pub(crate) mixers: Vec<Vec<f32>>,
+    /// The MoE block's output (routed plus gated shared expert) before its
+    /// residual add.
+    pub(crate) moes: Vec<Vec<f32>>,
+    /// The router's F32 logits, `[n, experts]`.
+    pub(crate) router_logits: Vec<Vec<f32>>,
+}
 
 impl FishDrama3Trunk {
     /// Loads the trunk on `device` (the CPU; Metal and CUDA are Phase 3),
@@ -435,7 +449,12 @@ impl FishDrama3Trunk {
             let moe = layer.moe.forward(&normed, n, phase)?;
             x.iter_mut().zip(&moe).for_each(|(x, m)| *x += m);
             if let Some(trace) = trace.as_deref_mut() {
-                trace.push(x.clone());
+                trace
+                    .router_logits
+                    .push(layer.moe.router_logits_rows(&normed, n));
+                trace.mixers.push(mixed);
+                trace.moes.push(moe);
+                trace.outputs.push(x.clone());
             }
         }
         Ok(rms_norm_rows(&x, h, &self.final_norm, self.eps))
@@ -497,8 +516,7 @@ impl FishDrama3Trunk {
         self.span(embeds, start_pos, state, cache, None)
     }
 
-    /// [`Self::forward_span`] recording the residual stream after every
-    /// layer.
+    /// [`Self::forward_span`] recording every layer ([`LayerTrace`]).
     #[cfg(test)]
     pub(crate) fn forward_span_traced(
         &self,
@@ -507,7 +525,7 @@ impl FishDrama3Trunk {
         state: &mut FishDrama3TrunkState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<(Tensor, LayerTrace)> {
-        let mut trace = Vec::new();
+        let mut trace = LayerTrace::default();
         let hidden = self.span(embeds, start_pos, state, cache, Some(&mut trace))?;
         Ok((hidden, trace))
     }
@@ -520,6 +538,28 @@ impl FishDrama3Trunk {
         &self,
         embeds: &Tensor,
         rows: &mut [FishDrama3StepRow<'_>],
+    ) -> Result<Tensor> {
+        self.steps(embeds, rows, None)
+    }
+
+    /// [`Self::forward_step`] recording every layer of every row, the rows
+    /// in turn.
+    #[cfg(test)]
+    pub(crate) fn forward_step_traced(
+        &self,
+        embeds: &Tensor,
+        rows: &mut [FishDrama3StepRow<'_>],
+    ) -> Result<(Tensor, LayerTrace)> {
+        let mut trace = LayerTrace::default();
+        let hidden = self.steps(embeds, rows, Some(&mut trace))?;
+        Ok((hidden, trace))
+    }
+
+    fn steps(
+        &self,
+        embeds: &Tensor,
+        rows: &mut [FishDrama3StepRow<'_>],
+        mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
         let (x, count) = self.host_rows(embeds, Some(rows.len()))?;
         if count == 0 {
@@ -551,7 +591,7 @@ impl FishDrama3Trunk {
                 row.cache,
                 &mut prepared,
                 FishDrama3KernelPhase::Step,
-                None,
+                trace.as_deref_mut(),
             ) {
                 Ok(hidden) => {
                     self.counters.step_rows.fetch_add(1, Ordering::Relaxed);

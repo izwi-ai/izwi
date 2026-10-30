@@ -37,6 +37,8 @@ pub mod model;
 pub mod precision;
 pub mod prompt;
 pub mod reference_cache;
+#[cfg(test)]
+mod reference_tests;
 pub mod residency;
 pub mod sampling;
 #[cfg(test)]

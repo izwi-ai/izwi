@@ -190,6 +190,15 @@ impl FishDrama3Moe {
         &self.shared
     }
 
+    /// The router's F32 logits `[n, experts]` of the `n` normed rows `h`
+    /// (traced forwards).
+    pub(crate) fn router_logits_rows(&self, h: &[f32], n: usize) -> Vec<f32> {
+        h.chunks_exact(self.hidden)
+            .take(n)
+            .flat_map(|x| router_logits(&self.router, x))
+            .collect()
+    }
+
     /// The routing of each of the `n` rows of `h`.
     pub(crate) fn routes(&self, h: &[f32], n: usize) -> Vec<FishDrama3Route> {
         h.chunks_exact(self.hidden)

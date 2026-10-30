@@ -864,6 +864,26 @@ impl FishDrama3Model {
         self.new_request(prompt, params, trunk, tower)
     }
 
+    /// [`Self::new_private_request`] whose sampler draws the recorded
+    /// exponentials `noise`, in order (parity replays of an upstream
+    /// rollout).
+    #[cfg(test)]
+    pub(crate) fn new_private_replay(
+        &self,
+        prompt: impl Into<Arc<FishDrama3Prompt>>,
+        params: FishDrama3GenerationParams,
+        noise: Vec<f32>,
+    ) -> Result<FishDrama3RequestState> {
+        let mut state = self.new_private_request(prompt, params)?;
+        state.sampler = FishDrama3RowSampler::with_recorded_noise(
+            params.sampling,
+            self.config.ids,
+            state.prompt.main_ids(),
+            noise,
+        )?;
+        Ok(state)
+    }
+
     /// Opens a quantum on `state`: every later step may be undone by
     /// [`Self::abort_quantum`] until [`Self::commit_quantum`].
     pub fn begin_quantum(

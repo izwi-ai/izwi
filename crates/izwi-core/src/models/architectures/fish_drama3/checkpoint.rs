@@ -537,6 +537,46 @@ fn safe_shard_name(name: &str) -> bool {
         )
 }
 
+/// Maps the safetensors file `path` (`name` in messages) as file `position`
+/// of a checkpoint: the mapping and where each of its tensors lies.
+fn map_file(
+    path: &Path,
+    name: &str,
+    position: usize,
+) -> Result<(MappedFile, Vec<(String, Located)>)> {
+    let file = File::open(path)
+        .map_err(|err| load_error(format!("cannot open {}: {err}", path.display())))?;
+    // SAFETY: the mapping is read-only and the file is not modified through
+    // this process while the checkpoint lives.
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|err| load_error(format!("cannot map {}: {err}", path.display())))?;
+    let (header, metadata) = SafeTensors::read_metadata(&mmap)
+        .map_err(|err| load_error(format!("invalid header in {name}: {err}")))?;
+    let data_start = 8 + header;
+    let held = metadata
+        .tensors()
+        .into_iter()
+        .map(|(tensor, info)| {
+            let (start, end) = info.data_offsets;
+            let located = Located {
+                file: position,
+                dtype: info.dtype,
+                shape: info.shape.clone(),
+                start: data_start + start,
+                end: data_start + end,
+            };
+            (tensor, located)
+        })
+        .collect();
+    Ok((
+        MappedFile {
+            name: name.to_string(),
+            mmap,
+        },
+        held,
+    ))
+}
+
 fn shape_text(shape: &[usize]) -> String {
     format!(
         "[{}]",
@@ -569,34 +609,13 @@ impl FishDrama3Checkpoint {
                     "{INDEX_FILE} names an unsafe shard {name:?}"
                 )));
             }
-            let path = model_dir.join(name);
-            let file = File::open(&path)
-                .map_err(|err| load_error(format!("cannot open {}: {err}", path.display())))?;
-            // SAFETY: the mapping is read-only and the file is not modified
-            // through this process while the checkpoint lives.
-            let mmap = unsafe { Mmap::map(&file) }
-                .map_err(|err| load_error(format!("cannot map {}: {err}", path.display())))?;
-            let (header, metadata) = SafeTensors::read_metadata(&mmap)
-                .map_err(|err| load_error(format!("invalid header in {name}: {err}")))?;
-            let data_start = 8 + header;
-            let position = files.len();
-            for (tensor, info) in metadata.tensors() {
-                let (start, end) = info.data_offsets;
-                let located = Located {
-                    file: position,
-                    dtype: info.dtype,
-                    shape: info.shape.clone(),
-                    start: data_start + start,
-                    end: data_start + end,
-                };
+            let (file, held) = map_file(&model_dir.join(name), name, files.len())?;
+            for (tensor, located) in held {
                 if tensors.insert(tensor.clone(), located).is_some() {
                     return Err(load_error(format!("{tensor} is held by two shards")));
                 }
             }
-            files.push(MappedFile {
-                name: name.clone(),
-                mmap,
-            });
+            files.push(file);
         }
         for (tensor, shard) in &index.weight_map {
             let held_by = tensors.get(tensor).map(|located| &files[located.file].name);
@@ -629,6 +648,42 @@ impl FishDrama3Checkpoint {
         }
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
+            files,
+            tensors,
+        })
+    }
+
+    /// A view over whole safetensors `paths` without an index (the parity
+    /// slices and their RED variants): every tensor `rename` names (`None`
+    /// leaves it out), a later file's tensor replacing an earlier one of the
+    /// same name. No census: the caller loads only what its config needs.
+    #[cfg(test)]
+    pub(crate) fn open_view(
+        paths: &[PathBuf],
+        rename: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let mut files = Vec::with_capacity(paths.len());
+        let mut tensors = BTreeMap::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| load_error(format!("{} names no file", path.display())))?;
+            let (file, held) = map_file(path, name, files.len())?;
+            for (tensor, located) in held {
+                if let Some(renamed) = rename(&tensor) {
+                    tensors.insert(renamed, located);
+                }
+            }
+            files.push(file);
+        }
+        let model_dir = paths
+            .first()
+            .and_then(|path| path.parent())
+            .ok_or_else(|| load_error("a checkpoint view needs a file"))?
+            .to_path_buf();
+        Ok(Self {
+            model_dir,
             files,
             tensors,
         })

@@ -357,6 +357,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_BACKEND",
+        Choice,
+        "cpu",
+        TestHarness,
+        "Backend of the ignored Fish Audio Drama 3 L2 parity test: cpu (F32 weights, about 140 GiB of RAM), cpu-q8_0 (the production Q8_0 form, about 40 GiB, looser bounds) or metal / cuda (refused until the family has those residencies).",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_CODEBOOK_FIXTURE",
         Path,
         "unset (test fails)",
@@ -369,6 +376,27 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "unset (test fails)",
         TestHarness,
         "The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_MODEL_DIR",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "The fishaudio/drama-3 checkpoint at 78e5ab79 (codec.pth included) for the ignored Fish Audio Drama 3 L2 parity tests.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_REFERENCE_DIR",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "The directory generate_fish_drama3_reference.py wrote (reference.json, reference.safetensors, audio/) for the ignored Fish Audio Drama 3 L2 parity tests.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_SLICE_DIR",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "The directory fetch_fish_drama3_slices.py and generate_fish_drama3_slices.py wrote (the real-weight slices and slice_expected.*) for the ignored Fish Audio Drama 3 L1.5 parity tests.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_TOKENIZER_PATH",

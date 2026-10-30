@@ -248,8 +248,13 @@ enum Codes<'a> {
     /// Each head's code from a working copy of the row's sampler, installed
     /// when the step commits.
     Sample(FishDrama3RowSampler),
-    /// The codes of a given frame; each head's logits are kept.
-    Forced { label: &'a [u32], logits: Vec<f32> },
+    /// The codes of a given frame; each head's logits and each layer's
+    /// output are kept.
+    Forced {
+        label: &'a [u32],
+        logits: Vec<f32>,
+        outputs: Vec<f32>,
+    },
 }
 
 /// One request's row in a decode step.
@@ -864,6 +869,9 @@ impl FishDrama3Tower {
                 prepared,
                 FishDrama3KernelPhase::Step,
             )?;
+            if let Codes::Forced { outputs, .. } = codes {
+                outputs.extend_from_slice(&x);
+            }
             if slot >= shared {
                 let head = slot - shared;
                 let logits = self.head_logits(head, &x, 1, FishDrama3KernelPhase::Step)?;
@@ -872,6 +880,7 @@ impl FishDrama3Tower {
                     Codes::Forced {
                         label,
                         logits: kept,
+                        ..
                     } => {
                         kept.extend(logits);
                         label[2 + head]
@@ -1003,6 +1012,28 @@ impl FishDrama3Tower {
         hidden: &Tensor,
         rows: &mut [FishDrama3TowerForcedRow<'_>],
     ) -> Result<Vec<f32>> {
+        Ok(self.steps_forced(embedding, hidden, rows)?.0)
+    }
+
+    /// [`Self::forward_step_forced`] also returning every layer's output per
+    /// row, row-major `[rows, layers, dim]`.
+    #[cfg(test)]
+    pub(crate) fn forward_step_forced_traced(
+        &self,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        rows: &mut [FishDrama3TowerForcedRow<'_>],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.steps_forced(embedding, hidden, rows)
+    }
+
+    /// The head logits and the layer outputs of a forced step.
+    fn steps_forced(
+        &self,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        rows: &mut [FishDrama3TowerForcedRow<'_>],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let jobs = rows
             .iter_mut()
             .map(|row| {
@@ -1013,17 +1044,24 @@ impl FishDrama3Tower {
                     Codes::Forced {
                         label: row.label,
                         logits: Vec::new(),
+                        outputs: Vec::new(),
                     },
                 )
             })
             .collect();
-        let mut logits = Vec::new();
+        let (mut logits, mut outputs) = (Vec::new(), Vec::new());
         for (_, codes) in self.steps(embedding, hidden, jobs)? {
-            if let Codes::Forced { logits: row, .. } = codes {
+            if let Codes::Forced {
+                logits: row,
+                outputs: layers,
+                ..
+            } = codes
+            {
                 logits.extend(row);
+                outputs.extend(layers);
             }
         }
-        Ok(logits)
+        Ok((logits, outputs))
     }
 
     /// Begins a quantum: a rollback point of `cache`, the request's tower
