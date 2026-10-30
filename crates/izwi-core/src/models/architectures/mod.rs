@@ -6,6 +6,7 @@
 //! 3. Wire loading in `crate::models::registry`.
 
 pub mod chatterbox;
+pub mod fish_drama3;
 pub mod fish_s2;
 pub mod gemma3;
 pub mod granite_speech;
