@@ -36,6 +36,7 @@ pub mod linear;
 pub mod precision;
 pub mod prompt;
 pub mod residency;
+pub mod sampling;
 #[cfg(test)]
 pub(crate) mod synthetic;
 pub mod tokenizer;
@@ -54,6 +55,10 @@ pub use linear::FishDrama3KernelPhase;
 pub use precision::FishDrama3PrecisionReport;
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
 pub use residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};
+pub use sampling::{
+    FishDrama3DrawPolicy, FishDrama3MainDraw, FishDrama3RowSampler, FishDrama3SamplerCheckpoint,
+    FishDrama3SamplingParams,
+};
 pub use tokenizer::FishDrama3Tokenizer;
 pub use trunk::{
     FishDrama3StepRow, FishDrama3Trunk, FishDrama3TrunkCheckpoint, FishDrama3TrunkOptions,
