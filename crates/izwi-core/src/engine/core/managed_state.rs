@@ -299,6 +299,25 @@ impl EngineCore {
         retained_state: &crate::kv::v2::InferenceStateContract,
         minimum_tokens: u64,
     ) -> Result<Option<u64>> {
+        self.portable_state_minimum_bytes_with_rows(
+            retained_state,
+            minimum_tokens,
+            (
+                self.config.max_retained_sequences,
+                self.config.max_staged_transactions,
+            ),
+        )
+    }
+
+    /// [`Self::portable_state_minimum_bytes`] on a model's own `(retained,
+    /// staged)` rows, for a model that seals its rows
+    /// ([`Self::load_managed_model_state_with_portable_copies_and_rows`]).
+    pub(crate) fn portable_state_minimum_bytes_with_rows(
+        &self,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        minimum_tokens: u64,
+        (retained_rows, staged_rows): (usize, usize),
+    ) -> Result<Option<u64>> {
         let rows = |rows: usize| {
             u32::try_from(rows)
                 .map_err(|_| Error::InvalidInput("managed state row limit exceeds u32".into()))
@@ -307,10 +326,7 @@ impl EngineCore {
             retained_state,
             minimum_tokens,
             self.config.block_size,
-            (
-                rows(self.config.max_retained_sequences)?,
-                rows(self.config.max_staged_transactions)?,
-            ),
+            (rows(retained_rows)?, rows(staged_rows)?),
             1,
         )
     }

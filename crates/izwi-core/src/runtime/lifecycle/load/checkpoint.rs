@@ -52,8 +52,9 @@ pub(super) fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimat
 }
 
 /// The residency plan first admission prices for a checkpoint-planned
-/// family (Fish, ASR, TTS, LFM2.5 chat), or `None` for one without a plan. The Metal OOM
-/// retry judges futility by the same plan.
+/// family (Fish S2, Fish Audio Drama 3, ASR, TTS, LFM2.5 chat), or `None`
+/// for one without a plan. The Metal OOM retry judges futility by the same
+/// plan.
 pub(super) fn checkpoint_resource_plan(
     variant: ModelVariant,
     model_path: &Path,
@@ -65,6 +66,11 @@ pub(super) fn checkpoint_resource_plan(
             model_path, device,
         )?;
         return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
+    }
+    if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
+        // Priced from the pinned census, before a weight is read.
+        return fish_drama3_memory::resource_plan(model_path, BackendKind::from(device.kind))
+            .map(Some);
     }
     // ASR, TTS, LFM2.5 chat and Qwen3.5 / Qwen3 chat (CPU and Metal) price what
     // their loader allocates; the catalog figure stays a display value for

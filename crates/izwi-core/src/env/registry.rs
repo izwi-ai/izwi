@@ -385,6 +385,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The fishaudio/drama-3 checkpoint at 78e5ab79 (codec.pth included) for the ignored Fish Audio Drama 3 L2 parity tests.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_NATIVE_BATCHING",
+        Flag,
+        "false",
+        Load,
+        "Lets a Fish Audio Drama 3 load on Metal decode two rows at once instead of one; CPU stays at one row and CUDA at eight.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_REFERENCE_DIR",
         Path,
         "unset (test fails)",

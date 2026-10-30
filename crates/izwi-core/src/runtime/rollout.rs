@@ -115,6 +115,10 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 ModelFamily::FishS2Tts,
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
+            | (
+                ModelFamily::FishDrama3Tts,
+                CapabilityKind::Tts | CapabilityKind::StreamingTts
+            )
             | (ModelFamily::ChatterboxTts, CapabilityKind::Tts)
             | (ModelFamily::Maya1Tts, CapabilityKind::Tts)
             | (ModelFamily::Maya2Tts, CapabilityKind::Tts)

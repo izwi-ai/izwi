@@ -3652,6 +3652,18 @@ impl Engine {
             .portable_state_minimum_bytes(retained_state, minimum_tokens)
     }
 
+    pub(crate) async fn portable_state_minimum_bytes_with_rows(
+        &self,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        minimum_tokens: u64,
+        rows: (usize, usize),
+    ) -> Result<Option<u64>> {
+        self.core
+            .read()
+            .await
+            .portable_state_minimum_bytes_with_rows(retained_state, minimum_tokens, rows)
+    }
+
     pub(crate) async fn price_tensor_rows_with_requests(
         &self,
         model_instance: ModelInstanceId,
@@ -3661,6 +3673,33 @@ impl Engine {
             .write()
             .await
             .price_tensor_rows_with_requests(model_instance)
+    }
+
+    /// [`Self::load_managed_model_state`] on the model's own sealed
+    /// `(retained, staged)` rows instead of the engine's: the same live fit
+    /// above `minimum_tokens` per row, keeping `reserve`.
+    pub(crate) async fn load_managed_model_state_with_rows(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_managed_model_state_with_portable_copies_and_rows(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                1,
+                rows,
+                minimum_tokens,
+                reserve,
+                0,
+            )
+        })
+        .await
     }
 
     pub(crate) async fn load_managed_model_state_with_row_limits(

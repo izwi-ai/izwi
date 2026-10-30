@@ -16,6 +16,7 @@ mod conformance;
 mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
+pub(crate) mod fish_drama3_capacity;
 mod forced_alignment;
 mod health;
 mod kokoro;

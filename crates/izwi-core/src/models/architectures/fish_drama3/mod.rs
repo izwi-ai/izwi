@@ -34,6 +34,7 @@ pub mod embed;
 pub mod head;
 pub mod linear;
 pub mod model;
+pub mod physical;
 pub mod precision;
 pub mod prompt;
 pub mod reference_cache;

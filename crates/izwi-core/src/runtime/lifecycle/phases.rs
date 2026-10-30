@@ -19,7 +19,8 @@ pub(super) struct AcquiredModelLoad {
 
 /// Why a load of a variant in the catalog without an engine route fails
 /// (`models::families::ENGINE_ROUTE_PENDING_FAMILIES`: Fish Audio Drama 3,
-/// which downloads but has no registry slot, state, adapter or executor).
+/// which downloads, prices, allocates its state and loads into the registry,
+/// but has no adapter, executor or publication yet).
 pub(super) fn route_pending_error(variant: ModelVariant) -> Error {
     Error::ModelLoadError(format!(
         "{variant} is not available on this build yet: its engine route has not landed"

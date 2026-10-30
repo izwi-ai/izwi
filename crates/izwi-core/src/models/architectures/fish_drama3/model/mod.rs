@@ -42,7 +42,7 @@ pub mod budget;
 pub mod session;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::ops::Range;
 use std::path::Path;
@@ -431,6 +431,12 @@ impl FishDrama3RequestState {
     /// arena between quanta).
     pub fn trunk_state(&self) -> &FishDrama3TrunkState {
         &self.trunk
+    }
+
+    /// The trunk's DeltaNet state, to bind, stage and restore against the
+    /// engine's tensor arena.
+    pub(crate) fn trunk_state_mut(&mut self) -> &mut FishDrama3TrunkState {
+        &mut self.trunk
     }
 
     /// Both views' sealed write receipts since the last call (the engine

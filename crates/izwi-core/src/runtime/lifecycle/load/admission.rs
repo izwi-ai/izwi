@@ -900,6 +900,7 @@ impl ModelLifecycleController {
                     | ModelFamily::ChatterboxTts
                     | ModelFamily::Maya1Tts
                     | ModelFamily::Maya2Tts
+                    | ModelFamily::FishDrama3Tts
             );
         if backend == BackendKind::Cuda || !fits_state {
             return Ok(0);
@@ -922,6 +923,22 @@ impl ModelLifecycleController {
                 )?;
             self.core_engine
                 .portable_state_minimum_bytes(&contract, tts_state_minimum_tokens(variant))
+                .await?
+                .unwrap_or(0)
+        } else if variant.family() == ModelFamily::FishDrama3Tts {
+            // Its own rows, not the engine's: the family's width, each row
+            // at the worst admitted request.
+            let contract = fish_drama3_memory::retained_state_contract(model_path, backend)?;
+            let width = crate::runtime::fish_drama3_capacity::decode_width(
+                backend,
+                crate::runtime::fish_drama3_capacity::native_batching_from_env()?,
+            );
+            self.core_engine
+                .portable_state_minimum_bytes_with_rows(
+                    &contract,
+                    tts_state_minimum_tokens(variant),
+                    (width, width),
+                )
                 .await?
                 .unwrap_or(0)
         } else {

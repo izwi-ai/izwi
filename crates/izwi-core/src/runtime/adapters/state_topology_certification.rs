@@ -15,6 +15,7 @@ enum CertifiedTopology {
     RetainedPagedRotatingAndInvocationScratch,
     RetainedPagedAndInvocationScratch,
     RetainedPagedPagedAndInvocationScratch,
+    RetainedPagedPagedTensorTensorAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedTensorAndInvocationTensor,
@@ -48,6 +49,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedPagedAndInvocationScratch
             | Self::RetainedPagedPagedAndInvocationScratch
+            | Self::RetainedPagedPagedTensorTensorAndInvocationScratch
             | Self::RetainedPagedTensorTensorAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
@@ -71,6 +73,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedPagedAndInvocationScratch
             | Self::RetainedPagedPagedAndInvocationScratch
+            | Self::RetainedPagedPagedTensorTensorAndInvocationScratch
             | Self::RetainedPagedTensorAndInvocationPaged
             | Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor
             | Self::RetainedPagedAndInvocationPagedTensor
@@ -87,6 +90,95 @@ impl CertifiedTopology {
             | Self::InvocationPagedRing
             | Self::InvocationTensor
             | Self::InvocationTensorStatic => false,
+        }
+    }
+}
+
+/// The kind of one state domain, as a topology names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainKind {
+    Paged,
+    StaticAttention,
+    Tensor,
+    Append,
+    Ring,
+    StaticTensor,
+    Scratch,
+}
+
+fn domain_kind(domain: &crate::kv::v2::StateDomainSpec) -> DomainKind {
+    use crate::kv::v2::StateDomainSpec;
+    match domain {
+        StateDomainSpec::PagedAttention(_) => DomainKind::Paged,
+        StateDomainSpec::StaticAttention(_) => DomainKind::StaticAttention,
+        StateDomainSpec::Tensor(_) => DomainKind::Tensor,
+        StateDomainSpec::Append(_) => DomainKind::Append,
+        StateDomainSpec::Ring(_) => DomainKind::Ring,
+        StateDomainSpec::StaticTensor(_) => DomainKind::StaticTensor,
+    }
+}
+
+/// What a descriptor holds: its retained domains' kinds in contract order,
+/// whether they form one transactional consistency group, and the kinds of
+/// every invocation domain of every stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DescriptorShape {
+    retained: Vec<DomainKind>,
+    one_transactional_group: bool,
+    invocation: Vec<DomainKind>,
+}
+
+fn descriptor_shape(descriptor: &crate::kv::v2::CapabilityStateDescriptorV2) -> DescriptorShape {
+    use crate::kv::v2::{
+        CheckpointPolicy, InvocationWorkspaceDomain, InvocationWorkspaceSet,
+        RetainedStateCapability, StateScope,
+    };
+    let (retained, one_transactional_group) = match &descriptor.retained {
+        RetainedStateCapability::Stateless => (Vec::new(), false),
+        RetainedStateCapability::Managed { contract } => (
+            contract.domains.iter().map(domain_kind).collect(),
+            contract.groups.len() == 1
+                && contract.groups[0].domains.len() == contract.domains.len()
+                && contract.domains.iter().all(|domain| {
+                    domain.scope() == StateScope::Retained
+                        && domain.header().checkpoint == CheckpointPolicy::Transactional
+                }),
+        ),
+    };
+    let invocation = match &descriptor.invocation {
+        InvocationWorkspaceSet::None { .. } => Vec::new(),
+        InvocationWorkspaceSet::Bounded { profiles } => profiles
+            .iter()
+            .flat_map(|profile| &profile.stages)
+            .flat_map(|stage| &stage.domains)
+            .map(|domain| match domain {
+                InvocationWorkspaceDomain::Scratch { .. } => DomainKind::Scratch,
+                InvocationWorkspaceDomain::State { state, .. } => domain_kind(state),
+            })
+            .collect(),
+    };
+    DescriptorShape {
+        retained,
+        one_transactional_group,
+        invocation,
+    }
+}
+
+impl CertifiedTopology {
+    /// Whether `descriptor` has exactly this topology's shape, for the
+    /// topologies certified by shape here (`None` for the others, which the
+    /// route matrix certifies by lifetime alone).
+    fn admits(self, descriptor: &crate::kv::v2::CapabilityStateDescriptorV2) -> Option<bool> {
+        use DomainKind::*;
+        let shape = descriptor_shape(descriptor);
+        match self {
+            Self::RetainedPagedPagedTensorTensorAndInvocationScratch => Some(
+                shape.retained == [Paged, Paged, Tensor, Tensor]
+                    && shape.one_transactional_group
+                    && !shape.invocation.is_empty()
+                    && shape.invocation.iter().all(|kind| *kind == Scratch),
+            ),
+            _ => None,
         }
     }
 }
@@ -136,6 +228,10 @@ fn certified_topology(
         (VoxtralTts, Tts) => RetainedPagedAndInvocationScratch,
         (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
+        // Fish Audio Drama 3 retains the trunk's and the tower's pages (the
+        // tower one row behind) with the DeltaNet's recurrent and conv
+        // tensors in one transaction; its stages lease scratch only.
+        (FishDrama3Tts, Tts | StreamingTts) => RetainedPagedPagedTensorTensorAndInvocationScratch,
         // Chatterbox retains one page domain per guidance branch (each its
         // own group and arena); the acoustic stage, whole or windowed,
         // leases scratch only.
@@ -290,6 +386,127 @@ fn every_checked_retained_page_route_passes_managed_provider_eligibility() {
     }
 
     assert!(checked_routes > 0, "no retained-page route was checked");
+}
+
+/// Drama 3's descriptor has exactly its topology's shape, and every
+/// mutation away from it is rejected.
+#[test]
+fn fish_drama3_certifies_two_paged_and_two_tensor_domains_with_scratch() {
+    use crate::kv::v2::{
+        CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
+        InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceSet,
+        RetainedStateCapability, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
+        WorkspaceFormula,
+    };
+    use crate::models::architectures::fish_drama3::physical::{
+        state_contract, state_descriptor, test_stage_graph, FishDrama3Workspace,
+    };
+    let topology = certified_topology(ModelVariant::FishAudioDrama3, CapabilityKind::Tts).unwrap();
+    assert_eq!(
+        topology,
+        CertifiedTopology::RetainedPagedPagedTensorTensorAndInvocationScratch
+    );
+    assert_eq!(
+        certified_topology(ModelVariant::FishAudioDrama3, CapabilityKind::StreamingTts),
+        Some(topology)
+    );
+    assert_eq!(
+        topology.lifetime(),
+        InferenceStateRequirement::RetainedAndInvocation
+    );
+    assert!(topology.retains_pages());
+
+    let config = crate::models::architectures::fish_drama3::config::FishDrama3Config::from_json(
+        include_str!("../../../tests/fixtures/fish_drama3/config.json"),
+        crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy::Published,
+    )
+    .unwrap();
+    let contract = state_contract(&config, candle_core::DType::F32, 16).unwrap();
+    let workspace = FishDrama3Workspace::of(&config, 256).unwrap();
+    let stages = test_stage_graph(&workspace);
+    let descriptor = state_descriptor(&contract, &workspace, &[&stages]).unwrap();
+    assert_eq!(topology.admits(&descriptor), Some(true));
+    // Shape certification is this topology's alone so far.
+    assert_eq!(
+        CertifiedTopology::RetainedPagedTensorTensorAndInvocationScratch.admits(&descriptor),
+        None
+    );
+
+    fn managed(descriptor: &mut CapabilityStateDescriptorV2) -> &mut InferenceStateContract {
+        match &mut descriptor.retained {
+            RetainedStateCapability::Managed { contract } => contract,
+            RetainedStateCapability::Stateless => unreachable!("a managed descriptor"),
+        }
+    }
+    let mutated = |edit: &dyn Fn(&mut CapabilityStateDescriptorV2)| {
+        let mut descriptor = descriptor.clone();
+        edit(&mut descriptor);
+        topology.admits(&descriptor).unwrap()
+    };
+    // Without the tower's paged domain.
+    assert!(!mutated(&|descriptor| {
+        let contract = managed(descriptor);
+        contract.domains.remove(1);
+        contract.groups[0].domains.remove(1);
+    }));
+    // The tower's pages leased per invocation instead of retained (rev 1's
+    // reading of the tower).
+    assert!(!mutated(&|descriptor| {
+        let contract = managed(descriptor);
+        let mut tower = contract.domains.remove(1);
+        contract.groups[0].domains.remove(1);
+        if let StateDomainSpec::PagedAttention(spec) = &mut tower {
+            spec.header.scope = StateScope::Invocation;
+            spec.header.checkpoint = CheckpointPolicy::None;
+        }
+        let InvocationWorkspaceSet::Bounded { profiles } = &mut descriptor.invocation else {
+            unreachable!("bounded invocation workspace")
+        };
+        profiles[0].stages[2]
+            .domains
+            .push(InvocationWorkspaceDomain::State {
+                placement: tower.header().placement,
+                state: tower,
+                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+                formula: WorkspaceFormula {
+                    fixed_bytes: 1,
+                    dimensions: vec![],
+                    terms: vec![],
+                },
+            });
+    }));
+    // The tensor domains in a group of their own.
+    assert!(!mutated(&|descriptor| {
+        let contract = managed(descriptor);
+        let tensors = contract.groups[0].domains.split_off(2);
+        contract.groups.push(StateGroupSpec {
+            id: StateGroupId::new(2),
+            domains: tensors,
+            prefix_shareable: false,
+        });
+    }));
+    // A domain that is not transactional.
+    assert!(!mutated(&|descriptor| {
+        if let StateDomainSpec::Tensor(spec) = &mut managed(descriptor).domains[3] {
+            spec.header.checkpoint = CheckpointPolicy::CopyOnWrite;
+        }
+    }));
+    // A third tensor domain.
+    assert!(!mutated(&|descriptor| {
+        let contract = managed(descriptor);
+        let extra = contract.domains[3].clone();
+        contract.domains.push(extra);
+    }));
+    // No invocation workspace at all.
+    assert!(!mutated(&|descriptor| {
+        descriptor.invocation = InvocationWorkspaceSet::None {
+            stage_graph_fingerprints: vec![],
+        };
+    }));
+    // Stateless.
+    assert!(!mutated(&|descriptor| {
+        descriptor.retained = RetainedStateCapability::Stateless;
+    }));
 }
 
 #[test]

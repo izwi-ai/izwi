@@ -62,7 +62,8 @@ impl ModelLifecycleController {
                     self.set_active_tts_variant(variant).await;
                 }
             }
-            // Never instantiated until its engine route lands.
+            // Never published until its engine route lands (the execution
+            // step adds its ready publication and the active-TTS arm).
             ModelFamily::FishDrama3Tts => {
                 return Err(route_pending_error(variant));
             }

@@ -18,7 +18,7 @@ use super::*;
 use crate::kernels::numeric_check::relative_l2;
 
 /// A stateless codec: each frame's 2,048 samples come from its codes alone.
-struct StubCodec;
+pub(crate) struct StubCodec;
 
 const STUB_SAMPLES: usize = 2048;
 
@@ -161,13 +161,20 @@ fn tokenizer_json() -> Value {
     })
 }
 
-fn load_synthetic(seed: u64, cell: usize) -> FishDrama3Model {
+/// The synthetic checkpoint with its tokenizer: a model directory the
+/// family loads with [`StubCodec`] (the engine's tests use it too).
+pub(crate) fn write_synthetic_model(seed: u64) -> SyntheticCheckpoint {
     let synthetic = SyntheticCheckpoint::write(seed);
     std::fs::write(
         synthetic.path().join("tokenizer.json"),
         tokenizer_json().to_string(),
     )
     .unwrap();
+    synthetic
+}
+
+fn load_synthetic(seed: u64, cell: usize) -> FishDrama3Model {
+    let synthetic = write_synthetic_model(seed);
     FishDrama3Model::load_with_codec(
         synthetic.path(),
         &Device::Cpu,

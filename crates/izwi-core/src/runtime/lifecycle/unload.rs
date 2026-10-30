@@ -126,9 +126,8 @@ impl ModelLifecycleController {
                 self.model_registry.unload_maya2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
-            // Its loads are refused until its engine route lands, so the
-            // registry holds nothing of it to release.
             ModelFamily::FishDrama3Tts => {
+                self.model_registry.unload_fish_drama3_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {
