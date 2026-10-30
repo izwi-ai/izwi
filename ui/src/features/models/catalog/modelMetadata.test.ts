@@ -54,4 +54,20 @@ describe("model display metadata", () => {
     expect(getModelProviderLabel("LFM2.5-Audio-1.5B-GGUF")).toBe("Liquid AI");
     expect(getModelProviderLabel("LFM3-1.7B-GGUF")).toBe("Liquid AI");
   });
+
+  it("lists Fish Audio Drama 3 as its own Fish Audio model with its licence", () => {
+    const detail = resolveModelDetail({
+      variant: "FishAudio-Drama-3",
+      task: "tts",
+    });
+    expect(detail.fullName).toBe("Fish Audio Drama 3");
+    expect(detail.category).toBe("tts");
+    expect(detail.description).toContain("Fish Audio Community License");
+    expect(detail.description).toContain("hosted service");
+    expect(detail).not.toEqual(
+      resolveModelDetail({ variant: "FishAudio-S2-Pro", task: "tts" }),
+    );
+    expect(getModelProviderLabel("FishAudio-Drama-3")).toBe("Fish Audio");
+    expect(getModelProviderLabel("fishaudio/drama-3")).toBe("Fish Audio");
+  });
 });

@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::kernels::numeric_check::PrecisionReloadGate;
 use crate::models::registry::ModelRegistry;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
-use crate::runtime::lifecycle::phases::AcquiredModelLoad;
+use crate::runtime::lifecycle::phases::{route_pending_error, AcquiredModelLoad};
 use crate::tokenizer::Tokenizer;
 
 pub(super) enum InstantiatedPayload {
@@ -136,6 +136,10 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
         ModelFamily::Maya2Tts => {
             registry.load_maya2_tts(variant, model_path).await?;
             InstantiatedPayload::None
+        }
+        // `resolve_model_load` refuses it first; no registry slot exists yet.
+        ModelFamily::FishDrama3Tts => {
+            return Err(route_pending_error(variant));
         }
         ModelFamily::Tokenizer => {
             let tokenizer = match Tokenizer::from_path(model_path) {

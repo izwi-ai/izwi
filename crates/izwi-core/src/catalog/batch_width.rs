@@ -10,7 +10,8 @@
 //! real-checkpoint tests named in the table and in
 //! `docs/dev/PRODUCTION_SERVING_SUPPORT_MATRIX.md` ("Certified decode batch
 //! widths"). Families without that evidence, and every capability other than
-//! chat, keep the portable width of two they have always been served at.
+//! chat, keep the portable width of two they have always been served at,
+//! except Fish Audio Drama 3, whose rows start at one on CPU and Metal.
 //!
 //! CUDA is not measured here: its ceiling is the kernel and metadata limit,
 //! and its automatic width stays the VRAM-tiered default of eight.
@@ -34,15 +35,20 @@ pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 /// | LFM2 / LFM2.5 | 8 | 8 | `lfm25_decode_matches_across_batch_widths_on_*`, `lfm25_batch_width_scaling_*` |
 /// | Qwen3.5 | 2 | 8 | `qwen35_decode_width_parity_and_throughput_*` |
 /// | Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | No checkpoint measured |
+/// | Fish Audio Drama 3 (TTS) | 1 | 1 | Defaults until its row-invariance and throughput evidence |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
 /// stays at two. Metal's LFM2 small-batch mat-vec serves 2..=8 rows, which
-/// bounds that family at eight.
+/// bounds that family at eight. Drama 3 reads about 6 GB of weights per
+/// frame and holds ~37 GiB resident, so it serves one row on CPU and Metal;
+/// Metal's second row is an opt-in its load takes from
+/// `IZWI_FISH_DRAMA3_NATIVE_BATCHING`, and CUDA keeps the automatic eight.
 pub(crate) const fn certified_decode_width(family: ModelFamily, backend: BackendKind) -> usize {
     match (backend, family) {
         (BackendKind::Cuda, _) => CUDA_MAX_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
         | (BackendKind::Metal, ModelFamily::Qwen35Chat) => 8,
+        (BackendKind::Cpu | BackendKind::Metal, ModelFamily::FishDrama3Tts) => 1,
         _ => PORTABLE_BASELINE_WIDTH,
     }
 }
@@ -140,6 +146,20 @@ mod tests {
         );
         assert_eq!(
             certified_decode_width(ModelFamily::Gemma3Chat, BackendKind::Cuda),
+            CUDA_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn fish_drama3_serves_one_row_on_cpu_and_metal() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(
+                certified_decode_width(ModelFamily::FishDrama3Tts, backend),
+                1
+            );
+        }
+        assert_eq!(
+            certified_decode_width(ModelFamily::FishDrama3Tts, BackendKind::Cuda),
             CUDA_MAX_WIDTH
         );
     }

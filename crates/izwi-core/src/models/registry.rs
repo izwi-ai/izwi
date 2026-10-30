@@ -7079,6 +7079,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Maya2Tts => "maya2_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
+        ModelFamily::FishDrama3Tts => "fish_drama3_tts",
         ModelFamily::ParakeetAsr => "parakeet_asr",
         ModelFamily::WhisperAsr => "whisper_asr",
         ModelFamily::Qwen3Asr => "qwen3_asr",

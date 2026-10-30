@@ -34,6 +34,15 @@ fn install_test_preparation_seals(
     }
 }
 
+/// Catalog variants with an engine route: a family still listed in
+/// `ENGINE_ROUTE_PENDING_FAMILIES` builds no bundle.
+fn routed_variants() -> impl Iterator<Item = ModelVariant> {
+    ModelVariant::all()
+        .iter()
+        .copied()
+        .filter(|variant| !crate::models::families::engine_route_pending(*variant))
+}
+
 #[test]
 fn stateful_chat_models_with_batch_paths_select_the_continuous_stage() {
     let continuous = ContinuousPhysicalChatAdapterFactory;
@@ -711,7 +720,7 @@ impl LoadedExecutionAdapterFactory for TestScalarFactory {
 fn every_supported_model_capability_authors_an_exact_width_one_contract() {
     let registry = RuntimeAdapterRegistry::built_in();
 
-    for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+    for (index, variant) in routed_variants().enumerate() {
         let instance = ModelInstanceId::new(index as u64 + 1);
         let draft = LoadedModelBundleDraft::build(
             &registry,
@@ -798,7 +807,7 @@ fn every_stateful_capability_fails_closed_without_physical_publication() {
     let backends = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
 
     for backend in backends {
-        for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+        for (index, variant) in routed_variants().enumerate() {
             let draft = LoadedModelBundleDraft::build(
                 &registry,
                 ExecutionGroupId::new(11),
@@ -844,7 +853,7 @@ fn loaded_launch_policy_matrix_is_group_exclusive_without_concurrency_evidence()
     let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-        for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+        for (index, variant) in routed_variants().enumerate() {
             let draft = LoadedModelBundleDraft::build(
                 &registry,
                 ExecutionGroupId::new(41),
@@ -1076,7 +1085,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
     };
 
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-        for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+        for (index, variant) in routed_variants().enumerate() {
             let draft = LoadedModelBundleDraft::build(
                 &registry,
                 ExecutionGroupId::new(46),
@@ -1354,7 +1363,7 @@ fn whisper_metadata_and_adapter_abi_cannot_manufacture_concurrent_decode_policy(
 fn scalar_adapters_remain_exact_width_one_without_concurrency_evidence() {
     let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
-    for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+    for (index, variant) in routed_variants().enumerate() {
         let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(9),

@@ -202,7 +202,7 @@ fn every_enabled_catalog_backend_route_has_an_explicit_state_topology() {
     let mut certified_cells = 0usize;
 
     for variant in ModelVariant::all().iter().copied() {
-        if !variant.is_enabled() {
+        if !variant.is_enabled() || crate::models::families::engine_route_pending(variant) {
             continue;
         }
         let capabilities = registry.capabilities_for(variant);

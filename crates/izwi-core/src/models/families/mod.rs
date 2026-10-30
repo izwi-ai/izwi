@@ -66,6 +66,7 @@ const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B, ModelVarian
 const MAYA2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya2Native25B];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
+const FISH_DRAMA3_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioDrama3];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
 const QWEN3_ASR_VARIANTS: &[ModelVariant] =
@@ -138,6 +139,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::FishS2Tts,
         module_path: "crate::models::architectures::fish_s2",
         variants: FISH_S2_TTS_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::FishDrama3Tts,
+        module_path: "crate::models::architectures::fish_drama3",
+        variants: FISH_DRAMA3_TTS_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::ChatterboxTts,
@@ -266,6 +272,18 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
     },
 ];
 
+/// Catalog families whose engine route (registry slot, state contract,
+/// capability rows, adapter and executor) has not landed: listed and
+/// downloadable, but every load is refused before admission prices it. The
+/// route's landing removes the family here, and every inventory test then
+/// demands its rows.
+pub const ENGINE_ROUTE_PENDING_FAMILIES: &[ModelFamily] = &[ModelFamily::FishDrama3Tts];
+
+/// Whether `variant` is in the catalog without an engine route yet.
+pub fn engine_route_pending(variant: ModelVariant) -> bool {
+    ENGINE_ROUTE_PENDING_FAMILIES.contains(&variant.family())
+}
+
 pub fn model_family_registrations() -> &'static [FamilyRegistration] {
     MODEL_FAMILY_REGISTRATIONS
 }
@@ -296,8 +314,15 @@ mod tests {
         for registration in model_family_registrations() {
             assert!(!registration.variants.is_empty());
             assert!(!registration.module_path.is_empty());
-            assert!(!registration.capabilities().is_empty());
-            assert!(!registration.fixture_ids().is_empty());
+            // A family has capability rows exactly when its route landed.
+            let pending = ENGINE_ROUTE_PENDING_FAMILIES.contains(&registration.family);
+            assert_eq!(
+                registration.capabilities().is_empty(),
+                pending,
+                "{:?}: capability rows disagree with the pending-route list",
+                registration.family
+            );
+            assert_eq!(registration.fixture_ids().is_empty(), pending);
 
             for variant in registration.variants {
                 assert_eq!(

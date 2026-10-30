@@ -30,6 +30,7 @@ use crate::models::architectures::chatterbox::chinese::{
     CANGJIE_FILE, PKUSEG_DICT_FILE, PKUSEG_MODEL_FILE,
 };
 use crate::models::architectures::chatterbox::perth::PERTH_CHECKPOINT_FILE;
+use crate::models::architectures::fish_drama3::artifacts as fish_drama3_artifacts;
 use crate::models::architectures::granite_speech5::asr::{
     GRANITE_SPEECH5_GGUF_LM_FILE, GRANITE_SPEECH5_GGUF_MMPROJ_FILE,
 };
@@ -440,6 +441,45 @@ fn nemotron_transcribe_bundle_is_complete(model_dir: &Path) -> bool {
             })
 }
 
+/// Fish Audio Drama 3's bundle: exactly the 24 files of its pinned manifest
+/// (15 FP8 shards, `codec.pth`, the index, configs, tokenizer, chat
+/// template, README and LICENSE). The load-time identity check wants all of
+/// them.
+fn fish_drama3_files() -> Vec<String> {
+    fish_drama3_artifacts::FISH_DRAMA3_FILES
+        .iter()
+        .map(|file| file.name.to_string())
+        .collect()
+}
+
+/// Every pinned file at its exact size, and the artifact manifest of this
+/// revision. The manifest is written only after the whole bundle hashed to
+/// its pins once ([`fish_drama3_artifacts::verify_full`]), so an interrupted
+/// or unverified download never reads as complete; loads then check sizes
+/// and `config.json` only, never the 41.5 GB again.
+fn fish_drama3_bundle_is_complete(model_dir: &Path) -> bool {
+    let files_present = fish_drama3_artifacts::FISH_DRAMA3_FILES.iter().all(|file| {
+        std::fs::metadata(model_dir.join(file.name))
+            .is_ok_and(|meta| meta.is_file() && meta.len() == file.bytes)
+    });
+    if !files_present {
+        return false;
+    }
+    let Ok(Some(manifest)) = read_artifact_manifest(model_dir) else {
+        return false;
+    };
+    let mut recorded = manifest.files;
+    recorded.sort();
+    recorded.dedup();
+    let mut pinned = fish_drama3_files();
+    pinned.sort();
+    manifest.schema_version == 1
+        && manifest.variant == ModelVariant::FishAudioDrama3
+        && manifest.repo_id == fish_drama3_artifacts::FISH_DRAMA3_REPO
+        && manifest.revision == fish_drama3_artifacts::FISH_DRAMA3_REVISION
+        && recorded == pinned
+}
+
 fn granite_speech_required_files(variant: ModelVariant) -> &'static [&'static str] {
     if variant.is_granite_speech5_gguf() {
         return GRANITE_SPEECH_5_GGUF_FILES;
@@ -727,6 +767,37 @@ fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+/// Logs a download's start, with what the weights' licence permits when the
+/// catalog carries a notice for it (informational: nothing is gated on it).
+fn announce_download(variant: ModelVariant, local_dir: &Path) {
+    info!("Downloading {} to {:?}", variant.repo_id(), local_dir);
+    if let (Some(label), Some(notice)) = (variant.license_label(), variant.license_notice()) {
+        info!("{variant} is licensed under the {label}: {notice}");
+    }
+}
+
+/// Hashes a bundle whose manifest pins every file's SHA-256, once, after its
+/// last file landed and before its artifact manifest marks it downloaded:
+/// Fish Audio Drama 3's 41.5 GB is never re-hashed at load. A mismatch
+/// leaves no manifest, so the bundle does not read as downloaded.
+async fn verify_downloaded_bundle(variant: ModelVariant, model_dir: &Path) -> Result<()> {
+    if variant.family() != ModelFamily::FishDrama3Tts {
+        return Ok(());
+    }
+    info!("Verifying the SHA-256 of every {variant} file once");
+    let dir = model_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || fish_drama3_artifacts::verify_full(&dir)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(Error::DownloadError(problems))) => Err(Error::DownloadError(format!(
+            "{problems}. Delete the files named and download {variant} again."
+        ))),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(Error::DownloadError(format!(
+            "verifying {variant} failed: {error}"
+        ))),
+    }
 }
 
 /// A file served outside the Hub from a fixed URL, checked against its size
@@ -1877,6 +1948,7 @@ impl ModelDownloader {
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::FishDrama3Tts => fish_drama3_bundle_is_complete(&path),
             // The watermarker is needed only while the watermark is on.
             ModelFamily::ChatterboxTts => chatterbox_files(variant).iter().all(|file| {
                 (*file == PERTH_CHECKPOINT_FILE
@@ -1929,7 +2001,7 @@ impl ModelDownloader {
         let local_dir = self.model_path(variant);
 
         tokio::fs::create_dir_all(&local_dir).await?;
-        info!("Downloading {} to {:?}", variant.repo_id(), local_dir);
+        announce_download(variant, &local_dir);
 
         // Create overall progress bar
         let file_plans = self.get_file_download_plans(variant).await?;
@@ -2026,6 +2098,7 @@ impl ModelDownloader {
             self.multi_progress.remove(&file_pb);
         }
 
+        verify_downloaded_bundle(variant, &local_dir).await?;
         self.write_pinned_artifact_manifest(variant, &local_dir, &file_plans)
             .await?;
 
@@ -2172,7 +2245,7 @@ impl ModelDownloader {
 
         tokio::fs::create_dir_all(&local_dir).await?;
 
-        info!("Downloading {} to {:?}", variant.repo_id(), local_dir);
+        announce_download(variant, &local_dir);
 
         let file_plans = self.get_file_download_plans(variant).await?;
         self.ensure_download_disk_space(variant, &local_dir, &file_plans)?;
@@ -2291,6 +2364,7 @@ impl ModelDownloader {
             self.multi_progress.remove(&file_pb);
         }
 
+        verify_downloaded_bundle(variant, &local_dir).await?;
         self.write_pinned_artifact_manifest(variant, &local_dir, &file_plans)
             .await?;
 
@@ -2580,6 +2654,7 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
+            ModelFamily::FishDrama3Tts => fish_drama3_files(),
             ModelFamily::ChatterboxTts => chatterbox_files(variant)
                 .iter()
                 .map(|file| (*file).to_string())
@@ -2938,7 +3013,8 @@ impl ModelDownloader {
         let local_dir = self.model_path(variant);
         let require_exact_bundle = variant.is_qwen38_fp8()
             || variant.is_qwen35_moe_fp8()
-            || variant.family() == ModelFamily::NemotronTranscribeAsr;
+            || variant.family() == ModelFamily::NemotronTranscribeAsr
+            || variant.family() == ModelFamily::FishDrama3Tts;
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         let mut repo_tree_planning_available = true;
@@ -3209,6 +3285,11 @@ impl ModelDownloader {
             .flatten()
         {
             size
+        } else if let Some(pinned) = (variant.family() == ModelFamily::FishDrama3Tts)
+            .then(|| fish_drama3_artifacts::pinned_file(file))
+            .flatten()
+        {
+            pinned.bytes
         } else if variant.family() == ModelFamily::GraniteSpeech5Asr && file == "model.safetensors"
         {
             GRANITE_SPEECH_5_MODEL_BYTES
@@ -4769,6 +4850,169 @@ mod tests {
             .expect("last fish s2 asset");
         assert!(downloader.is_downloaded(variant));
 
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// Drama 3's bundle is its pinned manifest: the 24 files the load-time
+    /// identity check wants, fetched at the catalog's revision and priced
+    /// exactly offline.
+    #[test]
+    fn fish_drama3_downloads_exactly_its_pinned_manifest_at_the_pin() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::FishAudioDrama3;
+        let files = downloader.get_model_files(variant);
+        let pinned = fish_drama3_artifacts::FISH_DRAMA3_FILES
+            .iter()
+            .map(|file| file.name)
+            .collect::<Vec<_>>();
+        assert_eq!(files, pinned);
+        assert_eq!(files.len(), 24);
+        for file in [
+            "README.md",
+            "LICENSE",
+            "chat_template.jinja",
+            "codec.pth",
+            "config.json",
+            "model.safetensors.index.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "model-00001-of-00015.safetensors",
+            "model-00015-of-00015.safetensors",
+        ] {
+            assert!(files.iter().any(|f| f == file), "{file}");
+        }
+        assert_eq!(
+            files.iter().filter(|f| f.ends_with(".safetensors")).count(),
+            15
+        );
+
+        // The catalog's pin and the family's manifest are one revision.
+        assert_eq!(variant.repo_id(), fish_drama3_artifacts::FISH_DRAMA3_REPO);
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(fish_drama3_artifacts::FISH_DRAMA3_REVISION)
+        );
+        let specs = downloader.get_model_file_specs(variant);
+        assert_eq!(specs.len(), 24);
+        assert!(specs.iter().all(|spec| {
+            spec.source_repo == "fishaudio/drama-3"
+                && spec.source_revision == fish_drama3_artifacts::FISH_DRAMA3_REVISION
+                && spec.source_file == spec.local_file
+        }));
+
+        // Every file is priced at its pinned size, 41.5 GB in all, not at
+        // the generic per-shard guesses.
+        let estimate = files
+            .iter()
+            .map(|file| downloader.get_single_file_size_estimate(variant, file))
+            .sum::<u64>();
+        assert_eq!(estimate, fish_drama3_artifacts::FISH_DRAMA3_BUNDLE_BYTES);
+        assert_eq!(
+            variant.estimated_size(),
+            fish_drama3_artifacts::FISH_DRAMA3_BUNDLE_BYTES
+        );
+        assert_eq!(
+            downloader.get_single_file_size_estimate(variant, "model-00014-of-00015.safetensors"),
+            3_749_111_392
+        );
+        assert_eq!(
+            download_disk_required_bytes(variant, variant.estimated_size()),
+            41_502_569_692
+        );
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// Drama 3 reads as downloaded only with every pinned file at its exact
+    /// size and the manifest a verified download writes for this revision.
+    #[tokio::test]
+    async fn fish_drama3_is_downloaded_only_when_complete_and_verified_at_the_pin() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::FishAudioDrama3;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        // Sparse files at their pinned sizes: no disk is used.
+        let set_len = |name: &str, bytes: u64| {
+            std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(model_dir.join(name))
+                .expect("bundle file")
+                .set_len(bytes)
+                .expect("sparse length");
+        };
+        for file in fish_drama3_artifacts::FISH_DRAMA3_FILES {
+            set_len(file.name, file.bytes);
+        }
+        // Every byte is there, but no download verified it.
+        assert!(!downloader.is_downloaded(variant));
+
+        let plans = downloader
+            .get_model_file_specs(variant)
+            .iter()
+            .map(|spec| FileDownloadPlan {
+                source_repo: spec.source_repo.clone(),
+                source_revision: spec.source_revision.clone(),
+                source_file: spec.source_file.clone(),
+                local_file: spec.local_file.clone(),
+                expected_size: fish_drama3_artifacts::pinned_file(&spec.local_file)
+                    .expect("pinned file")
+                    .bytes,
+                strict_size_check: true,
+                pinned: None,
+            })
+            .collect::<Vec<_>>();
+        downloader
+            .write_pinned_artifact_manifest(variant, &model_dir, &plans)
+            .await
+            .expect("manifest");
+        assert!(downloader.is_downloaded(variant));
+
+        // A short shard is an interrupted download, manifest or not.
+        let shard = "model-00007-of-00015.safetensors";
+        set_len(shard, 1);
+        assert!(!downloader.is_downloaded(variant));
+        set_len(shard, 2_628_614_880);
+        assert!(downloader.is_downloaded(variant));
+
+        // A manifest of another revision does not describe this bundle.
+        let mut manifest = read_artifact_manifest(&model_dir)
+            .expect("manifest read")
+            .expect("manifest");
+        manifest.revision = "0".repeat(40);
+        std::fs::write(
+            model_dir.join(ARTIFACT_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// Only Drama 3's download is hashed against its pins, and a failed
+    /// check says how to recover.
+    #[tokio::test]
+    async fn only_fish_drama3_downloads_are_hashed_against_their_pins() {
+        let (_downloader, temp_dir) = test_downloader();
+        let dir = temp_dir.join("bundle");
+        std::fs::create_dir_all(&dir).expect("bundle dir");
+        verify_downloaded_bundle(ModelVariant::FishAudioS2Pro, &dir)
+            .await
+            .expect("S2 is not hashed here");
+        // An empty directory fails the identity check before any hashing.
+        let error = verify_downloaded_bundle(ModelVariant::FishAudioDrama3, &dir)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::DownloadError(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("codec.pth is missing"), "{message}");
+        assert!(
+            message.contains("download Fish Audio Drama 3 again"),
+            "{message}"
+        );
         std::fs::remove_dir_all(temp_dir).ok();
     }
 }

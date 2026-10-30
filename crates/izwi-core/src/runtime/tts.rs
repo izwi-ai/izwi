@@ -799,11 +799,11 @@ mod tests {
     fn advertised_streaming_mode_is_what_the_route_does() {
         use crate::runtime::adapters::{RuntimeAdapterRegistry, StreamingMode};
         let registry = RuntimeAdapterRegistry::built_in();
-        for variant in ModelVariant::all()
-            .iter()
-            .copied()
-            .filter(|variant| variant.is_enabled() && variant.speech_capabilities().is_some())
-        {
+        for variant in ModelVariant::all().iter().copied().filter(|variant| {
+            variant.is_enabled()
+                && variant.speech_capabilities().is_some()
+                && !crate::models::families::engine_route_pending(*variant)
+        }) {
             // A stream runs on a streaming capability, or on the TTS
             // capability's own native-streaming graph, which the loader
             // seals only for a TTS adapter that streams in chunks.
@@ -997,7 +997,10 @@ mod tests {
         let flood = "word ".repeat(20_000);
         let mut checked = 0;
         for variant in ModelVariant::all().iter().copied() {
-            if !variant.is_enabled() || !variant.is_tts() {
+            if !variant.is_enabled()
+                || !variant.is_tts()
+                || crate::models::families::engine_route_pending(variant)
+            {
                 continue;
             }
             checked += 1;

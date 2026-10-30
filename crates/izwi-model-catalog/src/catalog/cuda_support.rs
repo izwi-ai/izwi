@@ -331,6 +331,11 @@ impl ModelVariant {
                 Provider::CandleCudnnEligible,
                 "convolution uses Candle tensor operators and is eligible for cuDNN only when build, layout, dtype, and grouping constraints match",
             ),
+            ModelFamily::FishDrama3Tts => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Fish Audio Drama 3's Gated DeltaNet causal convolutions run on Izwi's CUDA causal-convolution provider with a Candle fallback; the Fish DAC codec's convolutions are Candle tensor operators; evidence for this family is collected at its certification, not inherited",
+            ),
             ModelFamily::NemotronTranscribeAsr => CudaOperatorCapability::source_reviewed(
                 Operator::Convolution,
                 Provider::CandleTensor,
@@ -380,6 +385,7 @@ impl ModelVariant {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
@@ -534,6 +540,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Nemotron 3.5 Transcribe runs on Candle CUDA tensor kernels: its ModelOpt FP8 projections stay resident as raw E4M3 on the compact FP8 kernels (BF16 activations, W8A16, SM80+), runs the Mamba2 selective scan in an Izwi CUDA kernel with F32 state, routes the sigmoid MoE in F32 on the host and attends over paged KV; the mel front end, window plan and Sortformer cache bookkeeping run on the host; source review is not runtime validation",
             ),
+            ModelFamily::FishDrama3Tts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Fish Audio Drama 3 needs SM80 or newer and is refused on older GPUs: its routed experts stay resident as raw block-scaled FP8 on the fused MoE kernels (BF16 activations, W8A16), its trunk, codebook tower and heads run BF16 on Candle CUDA tensor kernels with Izwi's Gated DeltaNet kernels and paged KV for both attention stacks, and the Fish DAC codec decodes in F32; source review is not runtime validation",
+            ),
             ModelFamily::Lfm3Audio => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "LFM3-Audio uses Candle CUDA tensor kernels for the quantized LFM3 language model (paged KV with sliding-window layers), the speech encoder, the MaskGIT depth decoder and the LiquidCodec decoder; the mel features, sampling and the inverse FFT run on the host",
@@ -599,6 +609,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
                 "Nemotron 3.5 Transcribe stores ModelOpt FP8 linears with one F32 scale per tensor; CUDA keeps them as raw E4M3 with the scalar broadcast to the kernels' 128x128 scale grid (exact), zero-padded to the provider's 64x128 alignment, and computes W8A16; embeddings stay BF16 on the host and the head is BF16",
+            );
+        }
+
+        if self.family() == ModelFamily::FishDrama3Tts {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Fish Audio Drama 3 stores its routed experts as FP8 with an F32 scale per 128x128 block; CUDA keeps them resident as raw E4M3 for the fused MoE kernels and computes W8A16 on SM80 or newer, with no dequantized fallback; the dense trunk, tower and heads load as BF16 and the codec as F32",
             );
         }
 
@@ -873,6 +890,32 @@ mod tests {
         assert_eq!(convolution.provider, CudaProviderClass::IzwiCudaEligible);
         assert!(convolution.reason.contains("Qwen3.8"));
         assert!(convolution.reason.contains("not inherited"));
+    }
+
+    #[test]
+    fn fish_drama3_cuda_metadata_requires_sm80_and_raw_fp8_experts() {
+        let variant = ModelVariant::FishAudioDrama3;
+        let support = variant.cuda_support();
+        assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
+        assert!(
+            support.reason.contains("SM80 or newer"),
+            "{}",
+            support.reason
+        );
+        assert!(support.reason.contains("refused on older GPUs"));
+        let quantization = variant.cuda_quantization();
+        assert_eq!(
+            quantization.level,
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
+        );
+        assert!(!quantization.uses_dense_dequantized_fallback());
+        assert!(quantization.reason.contains("raw E4M3"));
+        let convolution = variant
+            .cuda_operator_capabilities()
+            .into_iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Convolution)
+            .expect("Drama 3 convolution capability");
+        assert_eq!(convolution.provider, CudaProviderClass::IzwiCudaEligible);
     }
 
     /// ADM-9: the forced aligner and the diarizers keep no paged cache.

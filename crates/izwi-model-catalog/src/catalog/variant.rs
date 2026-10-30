@@ -11,6 +11,10 @@ pub enum ModelFamily {
     VoxtralTts,
     VibeVoiceTts,
     FishS2Tts,
+    /// Fish Audio Drama 3: a Qwen3.5-MoE trunk with FP8 experts, a
+    /// codebook-MTP tower and the Fish S2 DAC codec; reference-bracket
+    /// prompts with speaker tags. Its own family, not a Fish S2 checkpoint.
+    FishDrama3Tts,
     ChatterboxTts,
     /// Maya1: a Llama decoder sampling SNAC codes from a voice description.
     Maya1Tts,
@@ -73,6 +77,7 @@ impl ModelFamily {
             | Self::VoxtralTts
             | Self::VibeVoiceTts
             | Self::FishS2Tts
+            | Self::FishDrama3Tts
             | Self::ChatterboxTts
             | Self::Maya1Tts
             | Self::Maya2Tts
@@ -402,6 +407,7 @@ impl ModelVariant {
             Voxtral4BTts2603 => ModelFamily::VoxtralTts,
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             FishAudioS2Pro => ModelFamily::FishS2Tts,
+            FishAudioDrama3 => ModelFamily::FishDrama3Tts,
             Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
             Maya13B | Maya13BGguf => ModelFamily::Maya1Tts,
             Maya2Native25B => ModelFamily::Maya2Tts,
@@ -441,6 +447,7 @@ impl ModelVariant {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => ModelTask::Tts,
@@ -704,6 +711,20 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
             return Some(ChatterboxMultilingual500M);
         }
         return Some(Chatterbox500M);
+    }
+
+    // Drama 3 before the rule below, which takes any "fishaudio" id for S2
+    // Pro. Its int4 sibling is another artifact the catalog does not carry.
+    if normalized.contains("drama3")
+        || (normalized.contains("fish") && normalized.contains("drama"))
+    {
+        if ["int4", "4bit"]
+            .iter()
+            .any(|quant| normalized.contains(quant))
+        {
+            return None;
+        }
+        return Some(FishAudioDrama3);
     }
 
     if normalized.contains("fishaudio")
@@ -1338,6 +1359,50 @@ mod tests {
             assert_eq!(parsed, ModelVariant::FishAudioS2Pro);
             assert_eq!(parsed.family(), ModelFamily::FishS2Tts);
         }
+    }
+
+    #[test]
+    fn parse_tts_accepts_fish_drama3_aliases() {
+        for alias in [
+            "FishAudio-Drama-3",
+            "fishaudio/drama-3",
+            "fish-audio-drama-3",
+            "fish audio drama 3",
+            "Fish Audio Drama 3",
+            "drama-3",
+            "drama3",
+        ] {
+            let parsed =
+                parse_tts_model_variant(alias).expect("Fish Audio Drama 3 should parse for tts");
+            assert_eq!(parsed, ModelVariant::FishAudioDrama3, "{alias}");
+            assert_eq!(parsed.family(), ModelFamily::FishDrama3Tts);
+        }
+    }
+
+    /// The Fish heuristic sends any "fishaudio" id to S2 Pro; a Drama 3 id
+    /// must not follow it, and S2's ids must keep resolving to S2.
+    #[test]
+    fn fish_heuristic_tells_drama3_from_s2() {
+        for input in [
+            "fishaudio/drama-3",
+            "Fish Audio Drama 3",
+            "fishaudio-drama3-35b",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::FishAudioDrama3,
+                "{input}"
+            );
+        }
+        for input in ["fishaudio/s2-pro", "fish s2 pro"] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::FishAudioS2Pro,
+                "{input}"
+            );
+        }
+        // The int4 sibling is not carried, and is not S2 Pro either.
+        assert!(parse_model_variant("fishaudio/drama-3-int4").is_err());
     }
 
     #[test]

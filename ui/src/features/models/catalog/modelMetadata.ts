@@ -224,6 +224,24 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Text to Speech", "Voice Cloning", "Reference Voice"],
     size: "10.7 GB",
   },
+  "FishAudio-Drama-3": {
+    shortName: "Fish Drama 3",
+    fullName: "Fish Audio Drama 3",
+    description:
+      "Expressive multilingual text-to-speech that needs about 40 GB of GPU or unified memory: voice cloning from reference clips and their transcripts, multi-speaker dialogue, and performance tags such as [sighs], [laughs] and <whisper>. Fish Audio Community License v1.0: free for research and non-commercial use; commercial use only below USD 500k annual revenue; offering it as a hosted service requires a licence from Fish Audio.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Cloning",
+      "Dialogue",
+      "Performance Tags",
+      "Streaming",
+      "44.1 kHz",
+      "MoE",
+      "FP8",
+    ],
+    size: "41.5 GB",
+  },
   "Chatterbox-500M": {
     shortName: "Chatterbox",
     fullName: "Chatterbox by Resemble AI",

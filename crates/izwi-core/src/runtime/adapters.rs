@@ -328,6 +328,10 @@ mod tests {
 
     fn expected_capabilities(model_variant: ModelVariant) -> BTreeSet<CapabilityKind> {
         let mut expected = BTreeSet::new();
+        // A family whose engine route has not landed has no rows yet.
+        if crate::models::families::engine_route_pending(model_variant) {
+            return expected;
+        }
 
         if model_variant.speech_capabilities().is_some() {
             expected.insert(CapabilityKind::Tts);
