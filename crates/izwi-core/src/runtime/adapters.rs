@@ -342,7 +342,7 @@ mod tests {
         if model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat() {
             expected.insert(CapabilityKind::Asr);
         }
-        if model_variant.supports_speaker_attributed_asr() {
+        if model_variant.runs_speaker_attributed_asr_capability() {
             expected.insert(CapabilityKind::SpeakerAttributedAsr);
         }
         if matches!(

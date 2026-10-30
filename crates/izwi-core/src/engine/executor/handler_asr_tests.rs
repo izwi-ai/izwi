@@ -545,10 +545,12 @@ fn streaming_qwen_asr_runs_the_same_route_as_non_streaming() {
         super::PhysicalAsrRoute::Qwen3
     );
     // Every family loaded as a `NativeAsrModel` has a physical route, so
-    // no ASR request can reach a workspace-less model call.
+    // no ASR request can reach a workspace-less model call. Nemotron 3.5
+    // Transcribe runs as retained engine rows, routed before this.
     for variant in ModelVariant::all()
         .iter()
         .filter(|variant| variant.is_asr())
+        .filter(|variant| variant.family() != ModelFamily::NemotronTranscribeAsr)
     {
         assert!(
             super::physical_asr_route(variant.family()).is_ok(),
@@ -557,6 +559,7 @@ fn streaming_qwen_asr_runs_the_same_route_as_non_streaming() {
     }
     for family in [
         ModelFamily::Voxtral,
+        ModelFamily::NemotronTranscribeAsr,
         ModelFamily::Lfm25Audio,
         ModelFamily::Qwen3ForcedAligner,
         ModelFamily::Qwen3Chat,

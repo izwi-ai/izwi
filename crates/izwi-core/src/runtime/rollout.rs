@@ -124,6 +124,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             | (ModelFamily::Lfm3Audio, CapabilityKind::SpeechToSpeech)
             | (ModelFamily::Lfm3Audio, CapabilityKind::RealtimeAsr)
             | (ModelFamily::GraniteSpeechAsr, CapabilityKind::Asr)
+            | (ModelFamily::NemotronTranscribeAsr, CapabilityKind::Asr)
     );
     if !route_validated {
         return Err(Error::ModelLoadError(format!(

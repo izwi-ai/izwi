@@ -207,6 +207,8 @@ pub struct AdminModelRouteCapabilities {
     pub openai_audio_speech: bool,
     pub openai_audio_transcriptions: bool,
     pub speech_to_text_jobs: bool,
+    /// The diarization pipeline may use the model as its ASR stage.
+    pub diarization_pipeline_asr: bool,
     pub speech_to_text_realtime: bool,
     /// Transcription requests may ask for a translation (`target_language`).
     pub speech_translation: bool,
@@ -214,7 +216,12 @@ pub struct AdminModelRouteCapabilities {
     pub keyword_biasing: bool,
     /// Speaker-attributed ASR jobs: the model writes speaker turns itself.
     pub speaker_attributed_asr: bool,
+    /// Word timestamps come from the model itself (no forced aligner).
+    pub native_word_timestamps: bool,
     pub diarization_records: bool,
+    /// Diarization jobs may name the model alone: it transcribes, tags
+    /// speakers and times words itself, with no pipeline ASR or aligner.
+    pub one_model_diarization: bool,
     pub text_to_speech_records: bool,
     pub voice_design_records: bool,
     pub voice_clone_records: bool,
@@ -476,18 +483,21 @@ impl AdminModelRouteCapabilities {
                 || variant.is_audio_chat(),
             speech_to_text_jobs: variant.runs_speech_to_text_jobs()
                 || variant.supports_diarization_records(),
-            speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
+            diarization_pipeline_asr: variant.serves_diarization_pipeline_asr(),
+            speech_to_text_realtime: variant.serves_live_asr() || variant.is_audio_chat(),
             speech_translation: variant.supports_asr_translation(),
             keyword_biasing: variant.supports_asr_keyword_biasing(),
             speaker_attributed_asr: variant.supports_speaker_attributed_asr(),
+            native_word_timestamps: variant.supports_native_word_timestamps(),
             diarization_records: variant.supports_diarization_records(),
+            one_model_diarization: variant.diarizes_in_one_model(),
             text_to_speech_records: supports_tts,
             voice_design_records: supports_voice_description,
             voice_clone_records: supports_reference_voice,
             saved_voice_reuse: supports_reference_voice,
             studio_projects: supports_tts,
             voice_realtime_text_model: variant.is_chat(),
-            voice_realtime_modular_asr: variant.is_asr(),
+            voice_realtime_modular_asr: variant.serves_live_asr(),
             voice_realtime_modular_tts: crate::app::voice_realtime::validate_realtime_tts_model(
                 variant,
             )

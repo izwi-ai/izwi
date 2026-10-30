@@ -679,6 +679,9 @@ struct RequestCachePolicy {
     /// Phase 3a: prefill spans run in the same mixed dispatch as decode rows
     /// (always resumable), sharing its rows and one token budget.
     mixed_step: bool,
+    /// The family's prompts always prefill in spans (see
+    /// `ExecutionProfile::prefill_spans_required`).
+    prefill_spans_required: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -698,6 +701,7 @@ impl Default for RequestCachePolicy {
             preferred_prefill_tokens: 0,
             decode_dispatch_rows: None,
             mixed_step: false,
+            prefill_spans_required: false,
         }
     }
 }
@@ -1083,6 +1087,8 @@ impl Scheduler {
             preferred_prefill_tokens: profile.preferred_prefill_tokens,
             decode_dispatch_rows: Some(decode_dispatch_rows.max(1)),
             mixed_step: profile.mixed_step && profile.prefill == PrefillMode::Incremental,
+            prefill_spans_required: profile.prefill_spans_required
+                && profile.prefill == PrefillMode::Incremental,
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -1862,7 +1868,9 @@ impl Scheduler {
                 remaining_prefill_budget,
             );
             if !full_prefill
-                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
+                && (self.config.enable_chunked_prefill
+                    || metadata.cache_policy.mixed_step
+                    || metadata.cache_policy.prefill_spans_required)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
@@ -2012,7 +2020,9 @@ impl Scheduler {
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
-                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
+                && (self.config.enable_chunked_prefill
+                    || metadata.cache_policy.mixed_step
+                    || metadata.cache_policy.prefill_spans_required)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
@@ -4284,6 +4294,7 @@ mod tests {
                 preferred_prefill_tokens: 0,
                 decode_dispatch_rows: None,
                 mixed_step: false,
+                prefill_spans_required: false,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,

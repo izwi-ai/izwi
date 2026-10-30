@@ -187,7 +187,9 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
             | ModelVariant::Lfm25Audio15BGguf
     ) || matches!(
         variant.family(),
-        ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+        ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::NemotronTranscribeAsr
     )
 }
 
@@ -243,6 +245,9 @@ pub(super) fn residency_plan(
             granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
         }
         ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
+        _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
+            nemotron_transcribe_plan(model_path, backend)
+        }
         ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
         // Priced here, but not an ASR variant: the aligner is stateless and
@@ -2373,6 +2378,53 @@ fn granite_plan(
 
 /// Granite Speech 5.0 (`granite_speech5/asr/runtime.rs`): 4.1's load shape
 /// over one unsharded checkpoint, with 5.0's own switches.
+/// Nemotron 3.5 Transcribe, priced from its config's census before a weight
+/// is read (`nemotron_transcribe::residency`): about 31 GiB as raw FP8 on
+/// Metal and CUDA, 33 GiB as CPU Q8_0. The embedding table stays in host
+/// memory (unified on Metal); a load converts one tensor at a time.
+fn nemotron_transcribe_plan(
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    use crate::models::architectures::nemotron_transcribe::checkpoint::NemotronCheckpoint;
+    use crate::models::architectures::nemotron_transcribe::config::NemotronTranscribeConfig;
+    use crate::models::architectures::nemotron_transcribe::residency::{
+        residency, ResidencyBackend,
+    };
+    let Ok(config) = NemotronTranscribeConfig::load(model_path) else {
+        return Ok(None);
+    };
+    let ctc = NemotronCheckpoint::open(model_path)
+        .ok()
+        .and_then(|checkpoint| checkpoint.ctc_geometry().ok().flatten());
+    let target = match backend {
+        BackendKind::Cpu => ResidencyBackend::Cpu,
+        BackendKind::Metal => ResidencyBackend::Metal,
+        BackendKind::Cuda => ResidencyBackend::Cuda,
+    };
+    // An invalid FP8 mode fails the load itself; price the default here.
+    let mode = crate::models::architectures::nemotron_transcribe::precision::Fp8Mode::from_env()
+        .unwrap_or_default();
+    let priced = residency(&config, ctc.as_ref(), target, mode);
+    let (resident, host_staging) = match backend {
+        BackendKind::Cuda => (
+            priced.device_bytes,
+            sum(&[priced.host_bytes, priced.largest_tensor_bytes])?,
+        ),
+        BackendKind::Cpu | BackendKind::Metal => {
+            (sum(&[priced.device_bytes, priced.host_bytes])?, 0)
+        }
+    };
+    Ok(Some(AsrResidencyPlan {
+        backend,
+        logical_resident_bytes: resident,
+        resident_bytes: resident,
+        memo_bytes: 0,
+        load_peak_bytes: sum(&[resident, priced.largest_tensor_bytes])?,
+        host_staging_bytes: host_staging,
+    }))
+}
+
 fn granite_speech5_plan(
     variant: ModelVariant,
     model_path: &Path,

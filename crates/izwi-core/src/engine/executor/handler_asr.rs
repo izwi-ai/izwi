@@ -250,9 +250,11 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
-        // Voxtral and the LFM audio models have their own executors; the
-        // forced aligner and the remaining families do not transcribe.
+        // Voxtral, the LFM audio models and Nemotron 3.5 Transcribe (retained
+        // rows) have their own executors; the forced aligner and the
+        // remaining families do not transcribe.
         ModelFamily::Voxtral
+        | ModelFamily::NemotronTranscribeAsr
         | ModelFamily::Lfm25Audio
         | ModelFamily::Lfm3Audio
         | ModelFamily::Qwen3ForcedAligner
@@ -532,6 +534,13 @@ impl NativeExecutor {
         }
         if family == ModelFamily::Lfm3Audio && request.uses_asr_retained_sequence() {
             return self.lfm3_audio_request_with_managed_cache(
+                request,
+                scheduled,
+                managed_state.take(),
+            );
+        }
+        if family == ModelFamily::NemotronTranscribeAsr {
+            return self.nemotron_transcribe_request_with_managed_cache(
                 request,
                 scheduled,
                 managed_state.take(),

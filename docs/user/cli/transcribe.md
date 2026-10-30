@@ -36,14 +36,17 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 | `-m, --model <MODEL>` | ASR model to use | `parakeet-tdt-0.6b-v3` |
 | `-l, --language <LANG>` | Language hint (e.g., `en`, `es`) | Auto-detect |
 | `--prompt <TEXT>` | Initial ASR prompt or keyword guidance | — |
-| `--translate-to <LANGUAGE>` | Translate the speech into this language instead of transcribing it (models with speech translation, such as `Granite-Speech-5.0-2B`) | — |
-| `--keyword <TERM>` | A term to bias recognition toward; repeat for more (models with keyword biasing, such as `Granite-Speech-5.0-2B`) | — |
+| `--translate-to <LANGUAGE>` | Translate the speech into this language instead of transcribing it (models with speech translation, such as `Granite-Speech-5.0-2B` and `Nemotron-3.5-Transcribe-30B-A4B-FP8`) | — |
+| `--keyword <TERM>` | A term to bias recognition toward; repeat for more (models with keyword biasing, such as `Granite-Speech-5.0-2B` and `Nemotron-3.5-Transcribe-30B-A4B-FP8`) | — |
 | `--max-tokens <N>` | Maximum number of ASR decoder tokens to generate | Model default |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
 | `--word-timestamps` | Request word-level timestamps; automatically uses `verbose_json` response format | — |
+| `--speaker-labels` | Tag speakers in the transcript and return the speaker turns (models that tag speakers, such as `Nemotron-3.5-Transcribe-30B-A4B-FP8`); automatically uses `verbose_json` response format | — |
 
 The CLI uploads the audio file as multipart form data. The server accepts up to 25 MiB per file by default; raise it with `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server.
+
+The CLI waits at most 5 minutes for the transcript. For long recordings on a slower machine, use a transcription job in the web UI or `/v1/speech-to-text/jobs` instead.
 
 ---
 
@@ -93,8 +96,34 @@ izwi transcribe standup.wav \
 ```
 
 `--translate-to` and `--keyword` need a model with speech translation or
-keyword biasing (`Granite-Speech-5.0-2B` and its GGUF release); the server
-rejects them for other models.
+keyword biasing (`Granite-Speech-5.0-2B`, its GGUF release and
+`Nemotron-3.5-Transcribe-30B-A4B-FP8`); the server rejects them for other
+models.
+
+### Nemotron 3.5 Transcribe
+
+```bash
+# Speaker labels, word timestamps from the model itself, and context terms
+izwi transcribe meeting.mp3 \
+  --model Nemotron-3.5-Transcribe-30B-A4B-FP8 \
+  --speaker-labels --word-timestamps \
+  --keyword Izwi --keyword Nemotron
+
+# Translate Spanish speech into English
+izwi transcribe entrevista.mp3 \
+  --model Nemotron-3.5-Transcribe-30B-A4B-FP8 \
+  --language es --translate-to en
+```
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 32 GiB of memory. It transcribes up to 60 minutes in one pass in 40 languages; without
+`--language`, or with `auto`, the model detects the language. It times words
+with its own CTC head, so `--word-timestamps` needs no aligner.
+`--speaker-labels` and `--keyword` cannot be combined with `--translate-to`,
+and a translation has no word timestamps. `--prompt` replaces the model's
+whole instruction, so it cannot be combined with `--translate-to`,
+`--keyword` or `--speaker-labels`; the server refuses those requests.
+A one-hour WAV is larger than the upload limit; send long recordings as MP3 or
+M4A. See [Transcription](/features/transcription#nemotron-35-transcribe).
 
 ### LFM3 Audio transcription
 
@@ -180,6 +209,11 @@ Hello, this is a transcription test.
 `--word-timestamps` requests `verbose_json` output with a `words` array when the
 selected model or forced aligner can provide word timing metadata.
 
+`--speaker-labels` requests `verbose_json` output with a `speaker_turns` array:
+one entry per run of one speaker's text, with the model's `speaker` tag number
+(`null` before the first tag) and `start`/`end` seconds when the model timed
+the words. The `text` field stays untagged.
+
 ---
 
 ## Supported Audio Formats
@@ -207,6 +241,7 @@ selected model or forced aligner can provide word timing metadata.
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with speaker turns and native word timestamps; unpunctuated |
 | `Granite-Speech-5.0-2B` | 4.6 GB | Medium | IBM ASR with punctuated transcripts, speech translation (`--translate-to`) and keyword biasing (`--keyword`) |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Fast | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | Not yet measured | NVIDIA 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; needs about 32 GiB of memory |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
 | `LFM3-Audio-2B-GGUF` | 1.46 GB | Not yet measured | Unified audio model with transcription in 18 languages; `LFM3-Audio-2B-Q8_0-GGUF` (2.20 GB) has a Q8_0 language model |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |

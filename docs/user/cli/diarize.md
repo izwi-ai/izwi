@@ -33,12 +33,12 @@ Analyzes audio to identify different speakers and when they spoke. The output in
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-m, --model <MODEL>` | Diarization model | `diar_streaming_sortformer_4spk-v2.1` |
+| `-m, --model <MODEL>` | Diarization model, or `Nemotron-3.5-Transcribe-30B-A4B-FP8` to diarize with that model alone | `diar_streaming_sortformer_4spk-v2.1` |
 | `-n, --num-speakers <N>` | Expected number of speakers | Auto-detect |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
 | `--transcribe` | Compatibility flag (transcript output is included by default) | — |
-| `--asr-model <MODEL>` | ASR model used for transcript generation | `parakeet-tdt-0.6b-v3` |
+| `--asr-model <MODEL>` | ASR model of the pipeline (optional; omit it with a single-model `--model`) | The server's default, `parakeet-tdt-0.6b-v3` |
 
 ---
 
@@ -67,6 +67,19 @@ izwi diarize meeting.wav --num-speakers 2
 ```bash
 izwi diarize meeting.wav --format json --output diarization.json
 ```
+
+### Single-model diarization
+
+```bash
+izwi diarize call.wav --model Nemotron-3.5-Transcribe-30B-A4B-FP8
+```
+
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` transcribes, labels speakers and times
+words itself, so no diarizer, ASR or aligner model is loaded. Do not pass
+`--asr-model` with it: the server returns `400`. `--num-speakers` can be at
+most 8, and only adds a warning when the model counts a different number. The
+model needs about 32 GiB of memory; see
+[Single-Model Diarization](/features/diarization#single-model-diarization).
 
 ### Full pipeline with custom models
 
@@ -139,6 +152,7 @@ SPEAKER_00 [12.30s - 20.00s]: Let's start with the agenda.
 | `sortformer-4spk` | Alias for `diar_streaming_sortformer_4spk-v2.1` |
 | `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID (default), up to 4 speakers |
 | `Nemotron-3-Diarization` | NVIDIA Nemotron 3 diarization, up to 8 speakers |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | Diarizes on its own, with no pipeline ASR or aligner; up to 8 speakers |
 
 ---
 

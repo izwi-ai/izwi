@@ -150,6 +150,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             format,
             output,
             word_timestamps,
+            speaker_labels,
         } => {
             commands::transcribe::execute(
                 commands::transcribe::TranscribeArgs {
@@ -163,6 +164,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     format,
                     output,
                     word_timestamps,
+                    speaker_labels,
                 },
                 &server()?,
             )

@@ -239,6 +239,11 @@ impl ModelFamily {
             | Self::Qwen3ForcedAligner => excluded(
                 "managed prefix reuse is gated to chat task requests",
             ),
+            // Prompts share about 15 tokens before the audio, and vLLM serves
+            // this model without prefix or Mamba caching too.
+            Self::NemotronTranscribeAsr => excluded(
+                "Nemotron 3.5 Transcribe rows share no useful prefix; its state contract declares every domain private",
+            ),
             Self::Tokenizer => excluded("tokenizer artifacts carry no inference state"),
         }
     }

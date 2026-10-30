@@ -22,6 +22,8 @@ mod kokoro;
 #[cfg(test)]
 mod lfm3_audio_tests;
 mod lifecycle;
+#[cfg(test)]
+mod nemotron_transcribe_tests;
 mod pipeline;
 mod request;
 pub(crate) mod rollout;

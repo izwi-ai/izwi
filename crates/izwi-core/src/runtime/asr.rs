@@ -111,7 +111,7 @@ use speaker_attribution::{
 };
 
 #[derive(Clone, Copy)]
-enum AsrAudioInput<'a> {
+pub(super) enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
 }
@@ -421,6 +421,26 @@ pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> R
         ModelFamily::GraniteSpeech5Asr => {
             resolve_granite_speech5_source_language(language).map(|_| ())
         }
+        // The card's support matrix: 40 languages transcribe (Norwegian
+        // is listed without ASR); `auto` and none let the model pick.
+        ModelFamily::NemotronTranscribeAsr => match language
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+        {
+            Some(language) => {
+                crate::models::architectures::nemotron_transcribe::prompt::resolve_language(
+                    language,
+                )
+                .filter(|resolved| resolved.asr)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Nemotron 3.5 Transcribe does not transcribe {language:?}"
+                    ))
+                })
+            }
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -445,6 +465,11 @@ pub fn validate_asr_task(
             "{variant} does not take keywords; pass them in the prompt instead"
         )));
     }
+    if task.speaker_attribution && !variant.supports_asr_speaker_tags() {
+        return Err(Error::InvalidInput(format!(
+            "{variant} does not tag speakers in a transcript"
+        )));
+    }
     match variant.family() {
         ModelFamily::GraniteSpeech5Asr => {
             validate_granite_speech5_request(&GraniteSpeech5RequestOptions {
@@ -453,6 +478,29 @@ pub fn validate_asr_task(
                 translate_to: task.translate_to.clone(),
                 keywords: task.keywords.clone(),
             })
+        }
+        // The instruction the request would render: languages, the
+        // translation pair (to or from English), the context terms and a
+        // custom prompt are all checked before admission.
+        ModelFamily::NemotronTranscribeAsr => {
+            use crate::models::architectures::nemotron_transcribe::prompt::{
+                render_instruction, NemotronPromptOptions,
+            };
+            render_instruction(&NemotronPromptOptions {
+                language: language
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+                    .map(str::to_string),
+                context_terms: task.keywords.clone(),
+                translate_to: task.translate_to.clone(),
+                speaker_attribution: task.speaker_attribution,
+                verbatim: false,
+                instruction_override: prompt
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            })
+            .map(|_| ())
         }
         // An unknown language fails before the model loads; `auto` and none
         // let the model pick.
@@ -612,9 +660,18 @@ fn apply_asr_max_tokens(
     request.asr_auto_max_tokens = true;
     if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant)
         .or_else(|| vibevoice_auto_asr_token_ceiling(variant))
+        .or_else(|| nemotron_transcribe_auto_asr_token_ceiling(variant))
     {
         request.params.max_tokens = auto_max_tokens;
     }
+}
+
+/// Nemotron 3.5 Transcribe decodes until its stop token, at most the card's
+/// 16,384 completion tokens (an hour of dense speech is 13-16k); KV for it
+/// costs 6 KiB of 16-bit storage per token, so a row books the whole budget.
+fn nemotron_transcribe_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
+    (variant.family() == ModelFamily::NemotronTranscribeAsr)
+        .then_some(crate::models::architectures::nemotron_transcribe::MAX_NEW_TOKENS)
 }
 
 /// VibeVoice-ASR's automatic budget is admitted at the reference ceiling and

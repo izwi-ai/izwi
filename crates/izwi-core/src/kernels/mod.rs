@@ -15,6 +15,7 @@ pub mod cuda;
 pub mod depthwise_conv;
 pub mod f16_weight_linear;
 pub(crate) mod lfm_shortconv_step;
+pub mod mamba2;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
@@ -27,6 +28,7 @@ pub(crate) mod metal_lfm_norm;
 pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
+pub mod moe_relu2;
 pub mod numeric_check;
 
 use crate::error::Error;

@@ -80,6 +80,8 @@ const GRANITE_SPEECH5_ASR_VARIANTS: &[ModelVariant] = &[
     ModelVariant::GraniteSpeech502B,
     ModelVariant::GraniteSpeech502BGguf,
 ];
+const NEMOTRON_TRANSCRIBE_ASR_VARIANTS: &[ModelVariant] =
+    &[ModelVariant::Nemotron35Transcribe30BA4BFp8];
 const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
     &[ModelVariant::DiarStreamingSortformer4SpkV21, ModelVariant::Nemotron3Diarization];
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[
@@ -186,6 +188,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::GraniteSpeech5Asr,
         module_path: "crate::models::architectures::granite_speech5::asr",
         variants: GRANITE_SPEECH5_ASR_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::NemotronTranscribeAsr,
+        module_path: "crate::models::architectures::nemotron_transcribe",
+        variants: NEMOTRON_TRANSCRIBE_ASR_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::SortformerDiarization,

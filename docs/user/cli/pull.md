@@ -84,6 +84,7 @@ Common models:
 | `Granite-Speech-4.1-2B-Plus` | ASR (IBM rich transcription) | ~4.2 GB |
 | `Granite-Speech-5.0-2B` | ASR and speech translation (IBM) | ~4.6 GB |
 | `Granite-Speech-5.0-2B-GGUF` | ASR and speech translation (IBM, Q8_0 language model) | ~3.1 GB |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | ASR, speech translation, speaker labels, word timestamps and single-model diarization (NVIDIA; needs about 32 GiB of memory) | ~34.7 GB |
 | `Voxtral-Mini-4B-Realtime-2602` | ASR (offline transcription; realtime planned) | ~8 GB |
 | `LFM3-Audio-2B-GGUF` | TTS, ASR and voice chat (two voices, 19 TTS locales, 18 ASR languages); downloads the language model and mmproj | ~1.46 GB |
 | `LFM3-Audio-2B-Q8_0-GGUF` | LFM3 Audio with a Q8_0 language model | ~2.20 GB |

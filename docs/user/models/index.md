@@ -131,6 +131,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
 | `VibeVoice-ASR` | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | NVIDIA's 30B speech language model in FP8: one pass of up to 60 minutes in 40 languages, translation to or from English, context terms, speaker labels and its own word timestamps; offline only; needs about 32 GiB of memory |
 | `Granite-Speech-4.1-2B` | IBM Granite Speech ASR with punctuated, capitalized transcripts (en, fr, de, es, pt, ja); the default Granite Speech model |
 | `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with speaker-attributed output and native word timestamps; unpunctuated by design (en, fr, de, es, pt) |
 | `Granite-Speech-5.0-2B` | IBM Granite Speech 5.0: punctuated transcripts (en, fr, de, es, pt, ja), speech translation to and from English (plus English to Italian and Mandarin), and keyword lists of up to 2,000 terms; the recommended Granite Speech model |
@@ -139,11 +140,26 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `LFM3-Audio-2B-GGUF` | Unified audio model (ASR in 18 languages, speech generation and voice chat); `LFM3-Audio-2B-Q8_0-GGUF` has a Q8_0 language model |
 | `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
+> `Nemotron-3.5-Transcribe-30B-A4B-FP8` is NVIDIA's Nemotron 3.5 Transcribe
+> (OpenMDW-1.1): a speech encoder and the Nemotron-3-Diarization speaker
+> encoder feeding a 30B mixture-of-experts language model, with a CTC head
+> that times words. It transcribes a recording of up to 60 minutes in one
+> pass, in 40 languages (or detects the language), translates to or from
+> English, takes context terms, labels speakers and times words without a
+> forced aligner (see [Transcription](/features/transcription#nemotron-35-transcribe)).
+> The download is 34.7 GB. It needs about 31 GiB of memory on Metal and
+> CUDA and about 33 GiB on CPU, plus about 48 MiB per request in flight;
+> machines that cannot hold it are refused when it loads, before any weights
+> are read. CUDA needs compute capability 8.0 or newer. It is offline only:
+> live transcription and voice mode do not use it. It can diarize on its own
+> (see [Diarization](/features/diarization#single-model-diarization)), but it
+> cannot be the ASR model of a diarization pipeline.
+
 ### Diarization and Alignment
 
 | Task | Model |
 |------|-------|
-| Speaker diarization | `diar_streaming_sortformer_4spk-v2.1`, `Nemotron-3-Diarization` (8 speakers) |
+| Speaker diarization | `diar_streaming_sortformer_4spk-v2.1`, `Nemotron-3-Diarization` (8 speakers); `Nemotron-3.5-Transcribe-30B-A4B-FP8` diarizes on its own, with no pipeline (8 speakers) |
 | Forced alignment | `Qwen3-ForcedAligner-0.6B` |
 
 ### Chat
@@ -212,6 +228,9 @@ izwi pull Qwen3-ASR-0.6B-GGUF
 
 # Download NVIDIA Nemotron 3.5 ASR
 izwi pull Nemotron-3.5-ASR-Streaming-0.6B
+
+# Download NVIDIA Nemotron 3.5 Transcribe (34.7 GB; needs about 32 GiB of memory)
+izwi pull Nemotron-3.5-Transcribe-30B-A4B-FP8
 
 # Download IBM Granite Speech (punctuated ASR, and rich ASR with speaker turns)
 izwi pull Granite-Speech-4.1-2B

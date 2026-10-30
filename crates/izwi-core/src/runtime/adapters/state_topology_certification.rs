@@ -24,6 +24,7 @@ enum CertifiedTopology {
     RetainedPagedRingAndInvocationScratch,
     RetainedPagedStaticAndInvocationPagedStatic,
     RetainedPagedTensorTensor,
+    RetainedPagedTensorTensorAndInvocationScratch,
     RetainedAppendRingTensor,
     InvocationPaged,
     InvocationPagedRing,
@@ -47,6 +48,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedRotatingAndInvocationScratch
             | Self::RetainedPagedAndInvocationScratch
             | Self::RetainedPagedPagedAndInvocationScratch
+            | Self::RetainedPagedTensorTensorAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
@@ -76,7 +78,8 @@ impl CertifiedTopology {
             | Self::RetainedPagedRingAndInvocationPagedRing
             | Self::RetainedPagedRingAndInvocationScratch
             | Self::RetainedPagedStaticAndInvocationPagedStatic
-            | Self::RetainedPagedTensorTensor => true,
+            | Self::RetainedPagedTensorTensor
+            | Self::RetainedPagedTensorTensorAndInvocationScratch => true,
             Self::Stateless
             | Self::RetainedTensorAndInvocationTensor
             | Self::RetainedAppendRingTensor
@@ -161,6 +164,10 @@ fn certified_topology(
         (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
         // Granite Speech 5.0 runs one atomic invocation on leased pages.
         (GraniteSpeech5Asr, Asr) => InvocationPaged,
+        // Nemotron 3.5 Transcribe rows commit attention pages, the Mamba SSM
+        // state and the convolution history as one transaction; each stage
+        // leases its activations as per-row scratch.
+        (NemotronTranscribeAsr, Asr) => RetainedPagedTensorTensorAndInvocationScratch,
         (NemotronAsr, Asr) => InvocationTensorStatic,
         // Realtime Nemotron retains append/ring/tensor streaming state and
         // uses invocation-scoped workspace for the exact graph.

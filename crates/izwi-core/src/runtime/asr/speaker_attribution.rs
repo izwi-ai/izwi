@@ -1,5 +1,6 @@
-//! Speaker-attributed ASR (Granite Speech plus): single-pass and long-form
-//! transcription, chunk recovery and turn assembly.
+//! Speaker-attributed ASR: Granite Speech Plus's single-pass and long-form
+//! transcription, chunk recovery and turn assembly, and models that tag
+//! speakers on their ASR rows (Nemotron 3.5 Transcribe).
 
 use super::*;
 
@@ -13,7 +14,7 @@ pub(super) fn resolve_speaker_attributed_asr_variant(model_id: Option<&str>) -> 
 
     if !variant.supports_speaker_attributed_asr() {
         return Err(Error::InvalidInput(format!(
-            "{variant} does not support speaker attributed ASR; use Granite-Speech-4.1-2B-Plus, or a diarization run with {variant} as its ASR model"
+            "{variant} does not support speaker attributed ASR; use Granite-Speech-4.1-2B-Plus or Nemotron-3.5-Transcribe-30B-A4B-FP8, or a diarization run with {variant} as its ASR model"
         )));
     }
 
@@ -897,7 +898,160 @@ pub(super) fn append_with_spacing(target: &mut String, text: &str) {
     target.push_str(text);
 }
 
+/// The turns a speaker-tagging model's transcription reports
+/// (`asr_diagnostics["speaker_turns"]`: `speaker` is the `<spk:N>` tag or
+/// null before the first tag, `start` and `end` in seconds when its CTC
+/// stage timed them), tag N as "Speaker N+1", consecutive turns of one
+/// speaker merged.
+pub(super) fn speaker_tagged_turns(
+    diagnostics: Option<&serde_json::Value>,
+) -> Vec<SpeakerAttributedAsrTurn> {
+    let turns = diagnostics
+        .and_then(|diagnostics| diagnostics.get("speaker_turns"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let secs = |turn: &serde_json::Value, key: &str| {
+        turn.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value as f32)
+    };
+    let mut out: Vec<SpeakerAttributedAsrTurn> = Vec::new();
+    for turn in turns {
+        let text = turn
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let speaker = turn
+            .get("speaker")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(
+                || UNKNOWN_SAA_SPEAKER.to_string(),
+                |tag| format!("Speaker {}", tag + 1),
+            );
+        let (start_secs, end_secs) = (secs(turn, "start"), secs(turn, "end"));
+        if let Some(last) = out.last_mut().filter(|last| last.speaker == speaker) {
+            append_with_spacing(&mut last.text, text);
+            last.end_secs = end_secs.or(last.end_secs);
+            continue;
+        }
+        out.push(SpeakerAttributedAsrTurn {
+            speaker,
+            text: text.to_string(),
+            start_secs,
+            end_secs,
+        });
+    }
+    out
+}
+
 impl RuntimeService {
+    /// One background transcription by a speaker-tagging model with speaker
+    /// tags and word timestamps: its `asr_diagnostics` carry `speaker_turns`
+    /// and the CTC stage's `ctc_timestamps` (speaker-attributed ASR and
+    /// one-model diarization).
+    pub(in crate::runtime) async fn speaker_tagged_asr_output(
+        &self,
+        audio_input: AsrAudioInput<'_>,
+        variant: ModelVariant,
+        language: Option<&str>,
+    ) -> Result<EngineOutput> {
+        let admitted = self
+            .build_asr_request(
+                variant,
+                audio_input,
+                language,
+                None,
+                AsrTaskOptions::default().with_speaker_attribution(true),
+                None,
+                None,
+                RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
+                false,
+                true,
+            )
+            .await?;
+        self.run_admitted_request(admitted).await
+    }
+
+    /// Speaker-attributed ASR on a model that tags speakers on its own ASR
+    /// rows (Nemotron 3.5 Transcribe): one transcription request with the
+    /// card's speaker-tag instruction and word timestamps, whose speaker
+    /// turns (timed when its CTC stage aligned them) are the result.
+    async fn speaker_tagged_asr_input_with_progress<P>(
+        &self,
+        audio_input: AsrAudioInput<'_>,
+        variant: ModelVariant,
+        language: Option<&str>,
+        min_speakers: Option<usize>,
+        max_speakers: Option<usize>,
+        mut on_progress: P,
+    ) -> Result<SpeakerAttributedAsrResult>
+    where
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        let progress = |phase, percent| AsrProgress {
+            phase,
+            current_chunk: None,
+            total_chunks: Some(1),
+            processed_audio_secs: None,
+            total_audio_secs: None,
+            percent: Some(percent),
+        };
+        on_progress(progress(AsrProgressPhase::Processing, 0.0));
+        let output = self
+            .speaker_tagged_asr_output(audio_input, variant, language)
+            .await?;
+        let duration_secs = asr_transcription_duration_secs(&output);
+        let text = asr_transcript_text(&output.text.unwrap_or_default());
+        let turns = speaker_tagged_turns(output.asr_diagnostics.as_ref());
+        let speaker_count = turns
+            .iter()
+            .filter(|turn| turn.speaker != UNKNOWN_SAA_SPEAKER)
+            .map(|turn| turn.speaker.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let mut warnings = Vec::new();
+        if min_speakers.is_some_and(|min| speaker_count < min) {
+            warnings.push(format!(
+                "{variant} tagged {speaker_count} speaker(s), below the requested minimum {}.",
+                min_speakers.unwrap_or_default()
+            ));
+        }
+        if max_speakers.is_some_and(|max| speaker_count > max) {
+            warnings.push(format!(
+                "{variant} tagged {speaker_count} speaker(s), above the requested maximum {}.",
+                max_speakers.unwrap_or_default()
+            ));
+        }
+        if text.trim().is_empty() {
+            warnings.push(format!("{variant} returned an empty transcript."));
+        }
+        if !turns.is_empty() && turns.iter().all(|turn| turn.start_secs.is_none()) {
+            warnings.push(format!(
+                "{variant} could not time its speaker turns; they are untimed."
+            ));
+        }
+        on_progress(progress(AsrProgressPhase::Complete, 100.0));
+        Ok(SpeakerAttributedAsrResult {
+            text,
+            language: language.map(str::to_string),
+            duration_secs,
+            speaker_turns: turns,
+            speaker_count,
+            status: if warnings.is_empty() {
+                SpeakerAttributedAsrStatus::Ready
+            } else {
+                SpeakerAttributedAsrStatus::Warning
+            },
+            warnings,
+        })
+    }
+
     pub async fn speaker_attributed_asr(
         &self,
         audio_base64: &str,
@@ -972,6 +1126,18 @@ impl RuntimeService {
         P: FnMut(AsrProgress) + Send + 'static,
     {
         let variant = resolve_speaker_attributed_asr_variant(model_id)?;
+        if variant.supports_asr_speaker_tags() {
+            return self
+                .speaker_tagged_asr_input_with_progress(
+                    audio_input,
+                    variant,
+                    language,
+                    min_speakers,
+                    max_speakers,
+                    on_progress,
+                )
+                .await;
+        }
         validate_asr_language(variant, language)?;
         let audio_bytes = audio_input.input_bytes();
         if audio_bytes == 0 {

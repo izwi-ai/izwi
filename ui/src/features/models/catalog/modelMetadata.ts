@@ -514,6 +514,25 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "2.37 GB",
   },
+  "Nemotron-3.5-Transcribe-30B-A4B-FP8": {
+    shortName: "Nemotron 3.5 Transcribe",
+    fullName: "NVIDIA Nemotron 3.5 Transcribe 30B-A4B (FP8)",
+    description:
+      "Large offline NVIDIA ASR that needs about 32 GB of GPU or unified memory, more than most laptops have: up to 60 minutes in one pass across 40 languages, with speaker-attributed transcripts, its own word timestamps, speech translation to and from English, and keyword biasing",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "Speaker attribution",
+      "Word timestamps",
+      "Translation",
+      "Keyword biasing",
+      "40 languages",
+      "Offline",
+      "MoE",
+      "FP8",
+    ],
+    size: "34.7 GB",
+  },
   "Granite-Speech-4.1-2B": {
     shortName: "Granite Speech 4.1",
     fullName: "IBM Granite Speech 4.1 2B",

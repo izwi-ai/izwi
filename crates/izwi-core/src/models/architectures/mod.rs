@@ -18,6 +18,7 @@ pub mod lfm3_audio;
 pub mod maya1;
 pub mod maya2;
 pub mod nemotron;
+pub mod nemotron_transcribe;
 pub mod parakeet;
 pub mod qwen3;
 pub mod qwen35;

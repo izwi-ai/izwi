@@ -15,7 +15,7 @@ pub struct DiarizeArgs {
     pub format: TranscriptFormat,
     pub output: Option<PathBuf>,
     pub transcribe: bool,
-    pub asr_model: String,
+    pub asr_model: Option<String>,
 }
 
 const DIARIZATION_POLL_INTERVAL_MS: u64 = 500;
@@ -132,8 +132,12 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
     let mut request_body = serde_json::json!({
         "model": model,
         "audio_base64": audio_base64,
-        "asr_model": asr_model,
     });
+    // Omitted, the server picks its pipeline ASR (and a model that
+    // diarizes on its own needs none).
+    if let Some(asr_model) = asr_model {
+        request_body["asr_model"] = serde_json::Value::String(asr_model);
+    }
     if let Some(filename) = audio_filename_from_path(&file) {
         request_body["audio_filename"] = serde_json::Value::String(filename);
     }
@@ -350,7 +354,7 @@ mod tests {
                 format: TranscriptFormat::Json,
                 output: Some(output_path.clone()),
                 transcribe: false,
-                asr_model: "distil-whisper".to_string(),
+                asr_model: Some("distil-whisper".to_string()),
             },
             &format!("{server}/"),
         )

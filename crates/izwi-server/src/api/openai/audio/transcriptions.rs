@@ -163,6 +163,8 @@ struct TranscriptionRequest {
     target_language: Option<String>,
     /// Terms to bias recognition toward (models that take keywords).
     keywords: Vec<String>,
+    /// Tag speakers in the transcript (models that do).
+    speaker_labels: bool,
     max_tokens: Option<usize>,
     _temperature: Option<f32>,
     timestamp_granularities: Option<Vec<String>>,
@@ -171,7 +173,28 @@ struct TranscriptionRequest {
 impl TranscriptionRequest {
     fn task(&self) -> AsrTaskOptions {
         AsrTaskOptions::new(self.target_language.clone(), self.keywords.clone())
+            .with_speaker_attribution(self.speaker_labels)
     }
+}
+
+/// One speaker turn of a speaker-labelled transcript: `speaker` is the
+/// model's tag (null before the first), times in seconds when the model
+/// timed its words.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TranscriptionSpeakerTurn {
+    speaker: Option<u32>,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<f32>,
+}
+
+/// The speaker turns a speaker-tagging model reported.
+fn extract_speaker_turns(
+    diagnostics: Option<&serde_json::Value>,
+) -> Option<Vec<TranscriptionSpeakerTurn>> {
+    serde_json::from_value(diagnostics?.get("speaker_turns")?.clone()).ok()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -188,6 +211,8 @@ struct VerboseJsonTranscriptionResponse {
     words: Option<Vec<TranscriptionTimestampWord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     segments: Option<Vec<TranscriptionTimestampSegment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_turns: Option<Vec<TranscriptionSpeakerTurn>>,
     processing_time_ms: f64,
     rtf: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,10 +220,10 @@ struct VerboseJsonTranscriptionResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct TranscriptionTimestampWord {
-    word: String,
-    start: f32,
-    end: f32,
+pub(crate) struct TranscriptionTimestampWord {
+    pub(crate) word: String,
+    pub(crate) start: f32,
+    pub(crate) end: f32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -417,6 +442,10 @@ pub async fn transcriptions(
             &chunk_boundaries,
         ));
     }
+    let speaker_turns = req
+        .speaker_labels
+        .then(|| extract_speaker_turns(output.asr_diagnostics.as_ref()))
+        .flatten();
     let asr_diagnostics = with_alignment_report(
         with_alignment_error(output.asr_diagnostics, alignment_error),
         alignment_report,
@@ -447,6 +476,7 @@ pub async fn transcriptions(
                     duration: output.duration_secs,
                     words,
                     segments,
+                    speaker_turns,
                     processing_time_ms: elapsed_ms,
                     rtf,
                     izwi_asr_diagnostics: asr_diagnostics,
@@ -635,6 +665,8 @@ struct JsonRequestBody {
     #[serde(default)]
     keywords: Option<KeywordsField>,
     #[serde(default)]
+    speaker_labels: Option<bool>,
+    #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -671,6 +703,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                 .keywords
                 .map(KeywordsField::into_keywords)
                 .unwrap_or_default(),
+            speaker_labels: payload.speaker_labels.unwrap_or(false),
             max_tokens: payload.max_tokens,
             _temperature: payload.temperature,
             timestamp_granularities: payload.timestamp_granularities,
@@ -792,6 +825,21 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         ))
                     })?;
                     out.keywords.extend(split_keywords(&text));
+                }
+                "speaker_labels" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'speaker_labels' field: {e}"
+                        ))
+                    })?;
+                    out.speaker_labels =
+                        match text.trim().to_ascii_lowercase().as_str() {
+                            "" | "false" | "0" | "no" | "off" => false,
+                            "true" | "1" | "yes" | "on" => true,
+                            _ => return Err(ApiError::bad_request(
+                                "Invalid multipart 'speaker_labels' field: expected true or false",
+                            )),
+                        };
                 }
                 "max_tokens" => {
                     let text = field.text().await.map_err(|e| {
@@ -1146,7 +1194,7 @@ fn extract_chunk_segment_boundaries(diagnostics: Option<&serde_json::Value>) -> 
     starts
 }
 
-fn extract_model_timestamp_words(
+pub(crate) fn extract_model_timestamp_words(
     diagnostics: Option<&serde_json::Value>,
 ) -> Vec<TranscriptionTimestampWord> {
     let Some(diagnostics) = diagnostics else {

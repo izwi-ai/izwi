@@ -56,7 +56,7 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, AsrTaskOptions,
-    ModelVariant, RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
+    RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -458,7 +458,8 @@ fn retry_create_request(
         language: source.language.clone(),
         target_language: source.target_language.clone(),
         keywords: source.keywords.clone(),
-        include_timestamps: source.aligner_model_id.is_some(),
+        // Timed by an aligner, or by the model itself (no aligner id).
+        include_timestamps: source.aligner_model_id.is_some() || !source.words.is_empty(),
         stream: false,
         generate_summary: source.summary_status != TranscriptionSummaryStatus::NotRequested,
         min_speakers: None,
@@ -1517,6 +1518,10 @@ where
     let progress_callback = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
     let runtime_progress_callback = progress_callback.clone();
     let translates = task.translate_to.is_some();
+    // A model that times words itself (Nemotron 3.5 Transcribe's CTC head)
+    // is asked to; its words replace the forced aligner's below.
+    let native_word_timestamps = include_timestamps
+        && izwi_core::resolve_asr_model_variant(model_id).supports_native_word_timestamps();
     let output = runtime
         .asr_transcribe_bytes_with_progress_and_runtime_context(
             audio_bytes,
@@ -1525,6 +1530,7 @@ where
             task,
             correlation_id,
             runtime_context,
+            native_word_timestamps,
             on_delta,
             move |progress| {
                 if let Ok(mut callback) = runtime_progress_callback.lock() {
@@ -1546,41 +1552,57 @@ where
             .or_else(|| requested_language.map(|value| value.to_string()))
     };
 
-    let (aligner_model_id, words, segments, alignment_warnings) =
-        if include_timestamps && !output.text.trim().is_empty() {
-            if let Ok(mut callback) = progress_callback.lock() {
-                callback(transcription_aligning_progress(input_duration_secs));
-            }
-            let resolved_aligner_model_id =
-                aligner_model_id.unwrap_or(DEFAULT_TRANSCRIPTION_ALIGNER_MODEL);
-            // Each long-form chunk's text is aligned against its own range.
-            // The transcript already succeeded: an aligner failure costs the
-            // word timings and is reported as a warning, not a job failure.
-            let alignment = align_transcript(
-                output.text.as_str(),
-                output.duration_secs,
-                output.asr_diagnostics.as_ref(),
-                |windows| {
-                    runtime.force_align_windows_bytes_with_model_and_language(
-                        audio_bytes,
-                        windows,
-                        resolved_language.as_deref(),
-                        Some(resolved_aligner_model_id),
-                    )
-                },
-            )
-            .await;
-            let (words, segments, warnings) =
-                transcription_alignment_artifacts(output.text.as_str(), alignment);
-            (
-                Some(resolved_aligner_model_id.to_string()),
-                words,
-                segments,
-                warnings,
-            )
-        } else {
-            (None, Vec::new(), Vec::new(), Vec::new())
-        };
+    let model_words = if native_word_timestamps {
+        crate::api::openai::audio::transcriptions::extract_model_timestamp_words(
+            output.asr_diagnostics.as_ref(),
+        )
+        .into_iter()
+        .map(|word| TranscriptionWordRecord {
+            word: word.word,
+            start: word.start,
+            end: word.end,
+        })
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let (aligner_model_id, words, segments, alignment_warnings) = if !model_words.is_empty() {
+        let segments = build_segment_records(output.text.as_str(), &model_words);
+        (None, model_words, segments, Vec::new())
+    } else if include_timestamps && !output.text.trim().is_empty() {
+        if let Ok(mut callback) = progress_callback.lock() {
+            callback(transcription_aligning_progress(input_duration_secs));
+        }
+        let resolved_aligner_model_id =
+            aligner_model_id.unwrap_or(DEFAULT_TRANSCRIPTION_ALIGNER_MODEL);
+        // Each long-form chunk's text is aligned against its own range.
+        // The transcript already succeeded: an aligner failure costs the
+        // word timings and is reported as a warning, not a job failure.
+        let alignment = align_transcript(
+            output.text.as_str(),
+            output.duration_secs,
+            output.asr_diagnostics.as_ref(),
+            |windows| {
+                runtime.force_align_windows_bytes_with_model_and_language(
+                    audio_bytes,
+                    windows,
+                    resolved_language.as_deref(),
+                    Some(resolved_aligner_model_id),
+                )
+            },
+        )
+        .await;
+        let (words, segments, warnings) =
+            transcription_alignment_artifacts(output.text.as_str(), alignment);
+        (
+            Some(resolved_aligner_model_id.to_string()),
+            words,
+            segments,
+            warnings,
+        )
+    } else {
+        (None, Vec::new(), Vec::new(), Vec::new())
+    };
 
     Ok(GeneratedTranscriptionArtifacts {
         transcription_mode: TranscriptionRecordMode::Transcription,
@@ -1997,9 +2019,9 @@ fn validate_speaker_attributed_asr_model(model_id: Option<&str>) -> Result<(), A
     let variant = parse_model_variant(raw_model_id).map_err(|err| {
         ApiError::bad_request(format!("Invalid speaker-attributed ASR model: {err}"))
     })?;
-    if variant != ModelVariant::GraniteSpeech412BPlus {
+    if !variant.supports_speaker_attributed_asr() {
         return Err(ApiError::bad_request(format!(
-            "Speaker-attributed ASR currently requires {DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL}.",
+            "{variant} does not attribute speakers; use {DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL} or Nemotron-3.5-Transcribe-30B-A4B-FP8.",
         )));
     }
     Ok(())
@@ -2285,6 +2307,63 @@ mod tests {
     };
     use izwi_core::RuntimeService;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn a_retry_keeps_timestamps_the_model_timed_itself() {
+        let record = |aligner_model_id: Option<&str>, words: Vec<TranscriptionWordRecord>| {
+            crate::transcription_store::TranscriptionRecord {
+                id: "record".into(),
+                created_at: 0,
+                transcription_mode: TranscriptionRecordMode::Transcription,
+                model_id: Some("Nemotron-3.5-Transcribe-30B-A4B-FP8".into()),
+                aligner_model_id: aligner_model_id.map(str::to_string),
+                language: None,
+                target_language: None,
+                keywords: Vec::new(),
+                processing_status: Default::default(),
+                processing_error: None,
+                processing_progress: None,
+                duration_secs: Some(1.0),
+                processing_time_ms: 0.0,
+                rtf: None,
+                audio_mime_type: "audio/wav".into(),
+                audio_filename: None,
+                transcription: "hello".into(),
+                segments: Vec::new(),
+                words,
+                speaker_attributed_text: None,
+                speaker_turns: Vec::new(),
+                saa_status: Default::default(),
+                saa_warnings: Vec::new(),
+                alignment_warnings: Vec::new(),
+                summary_status: TranscriptionSummaryStatus::NotRequested,
+                summary_model_id: None,
+                summary_text: None,
+                summary_error: None,
+                summary_updated_at: None,
+            }
+        };
+        let word = TranscriptionWordRecord {
+            word: "hello".into(),
+            start: 0.1,
+            end: 0.4,
+        };
+        // Native word timestamps leave no aligner id on the record.
+        assert!(
+            super::retry_create_request(&record(None, vec![word.clone()]), Vec::new())
+                .include_timestamps
+        );
+        assert!(
+            super::retry_create_request(
+                &record(Some("Qwen3-ForcedAligner-0.6B"), Vec::new()),
+                Vec::new()
+            )
+            .include_timestamps
+        );
+        assert!(
+            !super::retry_create_request(&record(None, Vec::new()), Vec::new()).include_timestamps
+        );
+    }
 
     #[tokio::test]
     async fn long_transcripts_get_timestamps_per_chunk_window() {

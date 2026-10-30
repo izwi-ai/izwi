@@ -181,6 +181,12 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_NEMOTRON_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Nemotron ASR. |
 | `IZWI_NEMOTRON_METAL_DEPTHWISE_CONV2D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv2d kernel for Nemotron ASR. |
 | `IZWI_NEMOTRON_REALTIME_MAX_SECONDS` | integer | `3600` | first use | Caps a Nemotron realtime ASR session length in seconds and sizes its reservation; a non-integer value is a config error. |
+| `IZWI_NEMOTRON_TRANSCRIBE_AUDIO_DIR` | path | `tests/fixtures/nemotron_transcribe/reference-audio` | test harness | Directory of the converted f32 clips the Nemotron 3.5 Transcribe L2 parity test reads (scripts/e2e/nemotron-transcribe). |
+| `IZWI_NEMOTRON_TRANSCRIBE_BACKEND` | choice | `cpu` | test harness | Backend for the Nemotron 3.5 Transcribe L2 parity test: cpu, metal or cuda (the build must have that feature). |
+| `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` | choice | `w8a16` | model load | Nemotron 3.5 Transcribe FP8 linears: w8a16 (FP8 weights, wide activations) or vllm-fp8 (activations rounded to E4M3 per token, as vLLM's W8A8 path); anything else fails the load. |
+| `IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR` | path | unset (test fails) | test harness | Checkpoint directory of NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8 for the ignored real-checkpoint tests. |
+| `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` | integer | 2048 on CUDA, 512 on CPU and Metal | model load | Most prompt tokens one Nemotron 3.5 Transcribe row prefills per engine step (16 to 16384); values outside that range are ignored. |
+| `IZWI_NEMOTRON_TRANSCRIBE_REFERENCE` | path | `tests/fixtures/nemotron_transcribe/reference.json` | test harness | The L2 reference JSON generate_nemotron_transcribe_reference.py wrote, for the Nemotron 3.5 Transcribe parity test. |
 | `IZWI_NO_UI` | flag | false (UI enabled) | startup | Disables serving the web UI when true (inverted into ui_enabled). |
 | `IZWI_NUM_THREADS` | integer | min(available cores, 8) (4 if unknown) | startup | Number of compute threads (0 or invalid ignored; floor 1). |
 | `IZWI_OFFLINE` | flag | `false` | startup | Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates. |

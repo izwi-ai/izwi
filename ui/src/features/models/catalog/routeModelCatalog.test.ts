@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ModelInfo } from "@/api";
 import {
   CHAT_PREFERRED_MODELS,
   DIARIZATION_PREFERRED_ASR_MODELS,
@@ -98,6 +99,10 @@ describe("route model catalog", () => {
   it("bounds the speaker draft by the selected checkpoint's channel count", () => {
     expect(diarizationSpeakerUpperBound("diar_streaming_sortformer_4spk-v2.1")).toBe(4);
     expect(diarizationSpeakerUpperBound("Nemotron-3-Diarization")).toBe(8);
+    // Diarizing alone, Nemotron 3.5 Transcribe is capped at 8 by the server.
+    expect(
+      diarizationSpeakerUpperBound("Nemotron-3.5-Transcribe-30B-A4B-FP8"),
+    ).toBe(8);
     expect(diarizationSpeakerUpperBound(null)).toBe(4);
     expect(diarizationSpeakerUpperBound(undefined)).toBe(4);
     // The Nemotron-3 metadata row carries the 8-speaker capability pin.
@@ -177,10 +182,50 @@ describe("route model catalog", () => {
   it("keeps Granite as the preferred speaker-attributed ASR model", () => {
     expect(SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS).toEqual([
       "Granite-Speech-4.1-2B-Plus",
+      "Nemotron-3.5-Transcribe-30B-A4B-FP8",
     ]);
     expect(DIARIZATION_PREFERRED_MODELS).not.toContain(
       "Granite-Speech-4.1-2B-Plus",
     );
+  });
+
+  it("offers Nemotron 3.5 Transcribe for speaker attribution without making it a default", () => {
+    const transcribe = "Nemotron-3.5-Transcribe-30B-A4B-FP8";
+    // About 32 GB of memory: never a default transcription pick, and the
+    // server refuses it as the diarization pipeline's ASR.
+    expect(TRANSCRIPTION_PREFERRED_MODELS).not.toContain(transcribe);
+    expect(DIARIZATION_PREFERRED_ASR_MODELS).not.toContain(transcribe);
+    expect(getModelProviderLabel(transcribe)).toBe("NVIDIA");
+    expect(MODEL_DETAILS[transcribe]?.category).toBe("asr");
+    expect(MODEL_DETAILS[transcribe]?.capabilities).toEqual(
+      expect.arrayContaining(["Speaker attribution", "Word timestamps"]),
+    );
+    expect(MODEL_DETAILS[transcribe]?.description).toContain(
+      "about 32 GB of GPU or unified memory",
+    );
+
+    // Granite stays the default unless only Nemotron is loaded.
+    const pick = (
+      models: Array<{ variant: string; status: ModelInfo["status"] }>,
+    ) =>
+      resolvePreferredRouteModel({
+        models,
+        selectedModel: null,
+        preferredVariants: SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      });
+    expect(
+      pick([
+        { variant: "Granite-Speech-4.1-2B-Plus", status: "downloaded" },
+        { variant: transcribe, status: "downloaded" },
+      ]),
+    ).toBe("Granite-Speech-4.1-2B-Plus");
+    expect(
+      pick([
+        { variant: "Granite-Speech-4.1-2B-Plus", status: "not_downloaded" },
+        { variant: transcribe, status: "ready" },
+      ]),
+    ).toBe(transcribe);
   });
 
   it("uses Qwen chat-route labels without injecting chat into the model name", () => {

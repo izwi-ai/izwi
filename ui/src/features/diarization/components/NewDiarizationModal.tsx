@@ -32,6 +32,7 @@ import { isAbortError } from "@/shared/api/http";
 import { AUDIO_FILE_ACCEPT, AUDIO_FILE_HINT } from "@/shared/audioFileAccept";
 import { diarizationSpeakerUpperBound, getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { SINGLE_MODEL_DIARIZATION_DESCRIPTION } from "@/features/speech-text/modelFilters";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import {
@@ -58,6 +59,10 @@ interface NewDiarizationModalProps {
   selectedModel: string | null;
   selectedModelReady: boolean;
   diarizationModels: ModelInfo[];
+  /** Models that diarize alone (they transcribe, tag speakers and time
+   * words): picked as the diarization model, the run needs no ASR or
+   * aligner. */
+  singleModelDiarizationModels?: ModelInfo[];
   onSelectModel: (variant: string) => void;
   /** Models eligible as the stack's ASR and aligner, for their pickers. */
   asrModels?: ModelInfo[];
@@ -139,6 +144,7 @@ export function NewDiarizationModal({
   selectedModel,
   selectedModelReady,
   diarizationModels,
+  singleModelDiarizationModels = [],
   onSelectModel,
   asrModels = [],
   alignerModels = [],
@@ -176,6 +182,11 @@ export function NewDiarizationModal({
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
   const isGranitePipeline = pipelineMode === "granite";
+  const diarizesInOneModel = singleModelDiarizationModels.some(
+    (model) => model.variant === selectedModel,
+  );
+  // Only the classic pipeline runs a separate ASR and aligner.
+  const usesPipelineModels = !isGranitePipeline && !diarizesInOneModel;
   useEffect(() => {
     onBusyChange?.(isSubmitting || isRecording);
   }, [isRecording, isSubmitting, onBusyChange]);
@@ -270,7 +281,7 @@ export function NewDiarizationModal({
   }, [onModelRequired, selectedModel, selectedModelReady]);
 
   const requireReadyPipelineModels = useCallback(() => {
-    if (isGranitePipeline) {
+    if (!usesPipelineModels) {
       return true;
     }
     if (
@@ -284,11 +295,11 @@ export function NewDiarizationModal({
     }
     return true;
   }, [
-    isGranitePipeline,
     onPipelineModelsRequired,
     pipelineAlignerModelId,
     pipelineAsrModelId,
     pipelineModelsReady,
+    usesPipelineModels,
   ]);
 
   useEffect(() => {
@@ -301,13 +312,13 @@ export function NewDiarizationModal({
       }
       if (
         current === CLASSIC_PIPELINE_REQUIRED_ERROR &&
-        (isGranitePipeline || pipelineModelsReady)
+        (!usesPipelineModels || pipelineModelsReady)
       ) {
         return null;
       }
       return current;
     });
-  }, [isGranitePipeline, pipelineModelsReady, selectedModelReady]);
+  }, [pipelineModelsReady, selectedModelReady, usesPipelineModels]);
 
   const normalizeSettings = useCallback(() => {
     const speakerUpperBound = diarizationSpeakerUpperBound(selectedModel);
@@ -381,30 +392,33 @@ export function NewDiarizationModal({
           createSpeechTextUploadState(uploadedBlob, uploadFilename, "uploading"),
         );
 
+        const request = {
+          audio_file: uploadedBlob,
+          audio_filename: uploadFilename,
+          model_id: selectedModel || undefined,
+          llm_model_id: pipelineLlmModelId || undefined,
+          generate_summary: generateSummary,
+          language: languageHint(selectedLanguage),
+        };
+        const speakerBounds = {
+          min_speakers: captureSettings.minSpeakers,
+          max_speakers: captureSettings.maxSpeakers,
+        };
         const record = await api.createDiarizationRecord(
           isGranitePipeline
-            ? {
-                audio_file: uploadedBlob,
-                audio_filename: uploadFilename,
-                model_id: selectedModel || undefined,
-                llm_model_id: pipelineLlmModelId || undefined,
-                generate_summary: generateSummary,
-                language: languageHint(selectedLanguage),
-              }
-            : {
-                audio_file: uploadedBlob,
-                audio_filename: uploadFilename,
-                model_id: selectedModel || undefined,
-                asr_model_id: pipelineAsrModelId || undefined,
-                aligner_model_id: pipelineAlignerModelId || undefined,
-                llm_model_id: pipelineLlmModelId || undefined,
-                generate_summary: generateSummary,
-                language: languageHint(selectedLanguage),
-                min_speakers: captureSettings.minSpeakers,
-                max_speakers: captureSettings.maxSpeakers,
-                min_speech_duration_ms: captureSettings.minSpeechMs,
-                min_silence_duration_ms: captureSettings.minSilenceMs,
-              },
+            ? request
+            : diarizesInOneModel
+              ? // A model that diarizes alone takes no ASR or aligner (the
+                // server refuses them) and no speech/silence timings.
+                { ...request, ...speakerBounds }
+              : {
+                  ...request,
+                  ...speakerBounds,
+                  asr_model_id: pipelineAsrModelId || undefined,
+                  aligner_model_id: pipelineAlignerModelId || undefined,
+                  min_speech_duration_ms: captureSettings.minSpeechMs,
+                  min_silence_duration_ms: captureSettings.minSilenceMs,
+                },
           {
             signal: uploadController.signal,
             onUploadProgress: updateUploadProgress,
@@ -467,6 +481,7 @@ export function NewDiarizationModal({
       normalizeSettings,
       onClose,
       onCreated,
+      diarizesInOneModel,
       isGranitePipeline,
       pipelineAlignerModelId,
       pipelineAsrModelId,
@@ -620,7 +635,7 @@ export function NewDiarizationModal({
   const allManagedModelsReady =
     selectedModel != null &&
     selectedModelReady &&
-    (isGranitePipeline ||
+    (!usesPipelineModels ||
       (pipelineAsrModelId != null &&
         pipelineAlignerModelId != null &&
         pipelineModelsReady)) &&
@@ -632,7 +647,14 @@ export function NewDiarizationModal({
       : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
   const readinessLabel = "Diarization stack";
-  const pickerOptions = modelPickerOptions(diarizationModels, selectedModel);
+  const pickerOptions = modelPickerOptions(
+    diarizationModels,
+    diarizesInOneModel ? null : selectedModel,
+  );
+  const singleModelPickerOptions = modelPickerOptions(
+    singleModelDiarizationModels,
+    null,
+  );
   const asrPickerOptions = modelPickerOptions(asrModels, pipelineAsrModelId);
   const alignerPickerOptions = modelPickerOptions(
     alignerModels,
@@ -749,7 +771,11 @@ export function NewDiarizationModal({
       }
       side={
         <>
-          <CreationField label="Diarization model" htmlFor="diarization-model">
+          <CreationField
+            label="Diarization model"
+            htmlFor="diarization-model"
+            hint={diarizesInOneModel ? SINGLE_MODEL_DIARIZATION_DESCRIPTION : null}
+          >
             <select
               id="diarization-model"
               aria-label="Diarization model"
@@ -758,15 +784,34 @@ export function NewDiarizationModal({
               disabled={isSubmitting || isRecording}
               className={pickerClassName}
             >
-              {pickerOptions.map((option) => (
-                <option key={option.variant} value={option.variant}>
-                  {option.label}
-                </option>
-              ))}
+              {singleModelPickerOptions.length > 0 ? (
+                <>
+                  <optgroup label="Diarization pipeline">
+                    {pickerOptions.map((option) => (
+                      <option key={option.variant} value={option.variant}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Single model (transcribes, tags speakers and times words itself)">
+                    {singleModelPickerOptions.map((option) => (
+                      <option key={option.variant} value={option.variant}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                </>
+              ) : (
+                pickerOptions.map((option) => (
+                  <option key={option.variant} value={option.variant}>
+                    {option.label}
+                  </option>
+                ))
+              )}
             </select>
           </CreationField>
 
-          {!isGranitePipeline ? (
+          {usesPipelineModels ? (
             <>
               <CreationField label="ASR model" htmlFor="diarization-asr-model">
                 <select
@@ -851,64 +896,72 @@ export function NewDiarizationModal({
           />
 
           {!isGranitePipeline ? (
-            <>
-              <CreationField label="Speakers">
-                <div className="grid grid-cols-2 gap-2">
-                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
-                  Min speakers
-                  <input
-                    aria-label="Min speakers"
-                    type="text"
-                    inputMode="numeric"
-                    value={minSpeakers}
-                    onChange={(event) => setMinSpeakers(event.target.value)}
-                    onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
-                  />
-                </label>
-                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
-                  Max speakers
-                  <input
-                    aria-label="Max speakers"
-                    type="text"
-                    inputMode="numeric"
-                    value={maxSpeakers}
-                    onChange={(event) => setMaxSpeakers(event.target.value)}
-                    onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
-                  />
-                </label>
-                </div>
-              </CreationField>
-              <CreationField label="Timing">
-                <div className="grid grid-cols-2 gap-2">
-                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
-                  Min speech (ms)
-                  <input
-                    aria-label="Min speech (ms)"
-                    type="text"
-                    inputMode="numeric"
-                    value={minSpeechMs}
-                    onChange={(event) => setMinSpeechMs(event.target.value)}
-                    onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
-                  />
-                </label>
-                <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
-                  Min silence (ms)
-                  <input
-                    aria-label="Min silence (ms)"
-                    type="text"
-                    inputMode="numeric"
-                    value={minSilenceMs}
-                    onChange={(event) => setMinSilenceMs(event.target.value)}
-                    onBlur={normalizeSettings}
-                    className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
-                  />
-                </label>
-                </div>
-              </CreationField>
-            </>
+            <CreationField
+              label="Speakers"
+              hint={
+                diarizesInOneModel
+                  ? "The model counts speakers itself; a count outside these bounds is flagged."
+                  : null
+              }
+            >
+              <div className="grid grid-cols-2 gap-2">
+              <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
+                Min speakers
+                <input
+                  aria-label="Min speakers"
+                  type="text"
+                  inputMode="numeric"
+                  value={minSpeakers}
+                  onChange={(event) => setMinSpeakers(event.target.value)}
+                  onBlur={normalizeSettings}
+                  className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
+                Max speakers
+                <input
+                  aria-label="Max speakers"
+                  type="text"
+                  inputMode="numeric"
+                  value={maxSpeakers}
+                  onChange={(event) => setMaxSpeakers(event.target.value)}
+                  onBlur={normalizeSettings}
+                  className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
+                />
+              </label>
+              </div>
+            </CreationField>
+          ) : null}
+
+          {usesPipelineModels ? (
+            <CreationField label="Timing">
+              <div className="grid grid-cols-2 gap-2">
+              <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
+                Min speech (ms)
+                <input
+                  aria-label="Min speech (ms)"
+                  type="text"
+                  inputMode="numeric"
+                  value={minSpeechMs}
+                  onChange={(event) => setMinSpeechMs(event.target.value)}
+                  onBlur={normalizeSettings}
+                  className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-(--text-subtle)">
+                Min silence (ms)
+                <input
+                  aria-label="Min silence (ms)"
+                  type="text"
+                  inputMode="numeric"
+                  value={minSilenceMs}
+                  onChange={(event) => setMinSilenceMs(event.target.value)}
+                  onBlur={normalizeSettings}
+                  className="flex h-9 w-full rounded-[10px] border border-(--border-default) bg-(--surface-panel) px-3 text-[13.5px] text-(--text-primary)"
+                />
+              </label>
+              </div>
+            </CreationField>
           ) : null}
 
           <GenerateSummaryOption

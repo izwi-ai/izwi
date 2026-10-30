@@ -37,10 +37,12 @@ import {
   isDiarizationPipelineLlmModel,
   isDiarizationModel,
   installedGraniteSpeech5Model,
+  isOneModelDiarizationModel,
   isSpeakerAttributedAsrModel,
   isTranscriptionAlignerModel,
   isTranscriptionSummaryModel,
   resolveDiarizationStackRole,
+  SINGLE_MODEL_DIARIZATION_DESCRIPTION,
 } from "@/features/speech-text/modelFilters";
 import type { PipelineRoleKey } from "@/app/providers/ModelCatalogProvider";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
@@ -141,6 +143,10 @@ export function TranscriptionPage({
   );
   const diarizationModels = useMemo(
     () => filterAndSortModels(models, isDiarizationModel),
+    [models],
+  );
+  const oneModelDiarizationModels = useMemo(
+    () => filterAndSortModels(models, isOneModelDiarizationModel),
     [models],
   );
   const speakerAttributedAsrModels = useMemo(
@@ -254,16 +260,19 @@ export function TranscriptionPage({
     [resolvedSpeakerAttributedAsrModel, speakerAttributedAsrModels],
   );
   // The diarization stack is one diarizer, one ASR and one aligner: each the
-  // user's pick for its role, else a loaded model, else the default.
+  // user's pick for its role, else a loaded model, else the default. A model
+  // that diarizes alone is the diarizer only when the user picks it, and
+  // then the stack is that model by itself.
   const diarizerRole = useMemo(
     () =>
       resolveDiarizationStackRole({
         models,
         eligibleModels: diarizationModels,
+        pickOnlyModels: oneModelDiarizationModels,
         pick: rolePickFor("diarization"),
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
       }),
-    [diarizationModels, models, rolePickFor],
+    [diarizationModels, models, oneModelDiarizationModels, rolePickFor],
   );
   const diarizationAsrRole = useMemo(
     () =>
@@ -287,6 +296,9 @@ export function TranscriptionPage({
   );
   const resolvedDiarizationModel = diarizerRole.variant;
   const diarizationModelReady = diarizerRole.ready;
+  const diarizesInOneModel = oneModelDiarizationModels.some(
+    (model) => model.variant === resolvedDiarizationModel,
+  );
   const resolvedDiarizationAsrModel = diarizationAsrRole.variant;
   const resolvedDiarizationAlignerModel = diarizationAlignerRole.variant;
   const resolvedDiarizationLlmModel = useMemo(
@@ -305,6 +317,7 @@ export function TranscriptionPage({
   const baseDiarizationPipelineModels = useMemo(
     () => [
       ...diarizationModels,
+      ...oneModelDiarizationModels,
       ...diarizationAsrPipelineModels,
       ...diarizationAlignerPipelineModels,
       ...diarizationLlmPipelineModels,
@@ -314,6 +327,7 @@ export function TranscriptionPage({
       diarizationAsrPipelineModels,
       diarizationLlmPipelineModels,
       diarizationModels,
+      oneModelDiarizationModels,
     ],
   );
   const diarizationPipelineModels = baseDiarizationPipelineModels;
@@ -321,15 +335,19 @@ export function TranscriptionPage({
     () =>
       collectManagedModels({
         availableModels: diarizationPipelineModels,
-        managedVariants: [
-          resolvedDiarizationModel,
-          resolvedDiarizationAsrModel,
-          resolvedDiarizationAlignerModel,
-          resolvedDiarizationLlmModel,
-        ],
+        // A model that diarizes alone runs no ASR or aligner.
+        managedVariants: diarizesInOneModel
+          ? [resolvedDiarizationModel, resolvedDiarizationLlmModel]
+          : [
+              resolvedDiarizationModel,
+              resolvedDiarizationAsrModel,
+              resolvedDiarizationAlignerModel,
+              resolvedDiarizationLlmModel,
+            ],
       }),
     [
       diarizationPipelineModels,
+      diarizesInOneModel,
       resolvedDiarizationAlignerModel,
       resolvedDiarizationAsrModel,
       resolvedDiarizationLlmModel,
@@ -378,7 +396,7 @@ export function TranscriptionPage({
       {
         key: "speaker_attributed_asr",
         title: "Speaker Attributed ASR",
-        description: "Granite Speech models that return speaker-turn transcripts.",
+        description: "ASR models that write speaker-turn transcripts themselves.",
         models: speakerAttributedAsrModels,
       },
       {
@@ -399,6 +417,16 @@ export function TranscriptionPage({
         description: "Speaker segmentation model used by this route.",
         models: diarizationModels,
       },
+      ...(oneModelDiarizationModels.length > 0
+        ? [
+            {
+              key: "single-model",
+              title: "Single model",
+              description: SINGLE_MODEL_DIARIZATION_DESCRIPTION,
+              models: oneModelDiarizationModels,
+            },
+          ]
+        : []),
       {
         key: "asr",
         title: "ASR",
@@ -423,6 +451,7 @@ export function TranscriptionPage({
       diarizationAsrPipelineModels,
       diarizationLlmPipelineModels,
       diarizationModels,
+      oneModelDiarizationModels,
     ],
   );
   const diarizationModelSections = baseDiarizationModelSections;
@@ -552,7 +581,7 @@ export function TranscriptionPage({
       const model = models.find((candidate) => candidate.variant === variant);
       const role: PipelineRoleKey | null = !model
         ? null
-        : isDiarizationModel(model)
+        : isDiarizationModel(model) || isOneModelDiarizationModel(model)
           ? "diarization"
           : isDiarizationPipelineAlignerModel(model)
             ? "diarization-aligner"
@@ -992,6 +1021,10 @@ export function TranscriptionPage({
                       selectedModelSupportsKeywords={
                         newTranscriptionRouteCapabilities?.keyword_biasing === true
                       }
+                      selectedModelHasNativeWordTimestamps={
+                        newTranscriptionRouteCapabilities?.native_word_timestamps ===
+                        true
+                      }
                       speakerAttributionHint={speakerAttributionHint}
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
@@ -1000,7 +1033,9 @@ export function TranscriptionPage({
                       onModelRequired={() => {
                         if (isNewSpeakerAttributedAsrMode) {
                           openSpeakerAttributedAsrModelManager();
-                          onError("Select and load Granite Speech to start SAA.");
+                          onError(
+                            "Select and load a speaker-attributed ASR model to start SAA.",
+                          );
                           return;
                         }
                         setModelModalContext("transcription");
@@ -1084,6 +1119,7 @@ export function TranscriptionPage({
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
                       diarizationModels={diarizationModels}
+                      singleModelDiarizationModels={oneModelDiarizationModels}
                       onSelectModel={(variant) =>
                         onPickRoleModel?.("diarization", variant)
                       }
@@ -1144,7 +1180,7 @@ export function TranscriptionPage({
           isDiarizationModelModal
             ? "Manage diarization pipeline models for /v1/diarizations."
             : isSpeakerAttributedAsrModelModal
-              ? "Manage Granite Speech and summary models for speaker-attributed ASR."
+              ? "Manage speaker-attributed ASR and summary models."
               : "Manage ASR models, the optional timestamp aligner, and the summary model for this route."
         }
         models={

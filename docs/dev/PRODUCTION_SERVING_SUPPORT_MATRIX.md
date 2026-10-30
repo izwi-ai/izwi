@@ -141,6 +141,20 @@ was fixed in `9d9bae87`: the KV coordinator's terminal mark now covers only
 transactions evicted from its exact window (Metal 9/24 → 24/24 requests,
 CPU 9/16 → 16/16).
 
+A family whose prompts must never prefill whole sets
+`ModelFamily::requires_prefill_spans`; the scheduler then prefills it in
+resumable spans whatever the chunked-prefill switch says
+(`ExecutionProfile::prefill_spans_required`). Only Nemotron 3.5 Transcribe
+sets it today: a one-hour recording is a prompt of about 45,000 tokens.
+
+| Family | CPU | Metal | CUDA |
+|---|---|---|---|
+| Nemotron 3.5 Transcribe (ASR rows) | 512-token spans | 512-token spans | 2,048-token spans |
+
+`IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` sets the span (16 to 16,384) on any
+backend. Its decode rows batch continuously at the engine's speech width, and
+it reuses no prefixes. See [Nemotron 3.5 Transcribe](nemotron-transcribe.md).
+
 ## Mixed prefill+decode steps by family and backend (Phase 3a)
 
 A chat family certified in `crates/izwi-core/src/catalog/mixed_step.rs`

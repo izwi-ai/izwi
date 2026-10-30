@@ -31,16 +31,27 @@ export function isDiarizationModel(model: ModelInfo): boolean {
   return hasCapability(model, "diarization_records");
 }
 
+/**
+ * A model a diarization job may name on its own (Nemotron 3.5 Transcribe):
+ * it transcribes, tags speakers and times words itself, so the job runs no
+ * pipeline ASR or aligner. Opt-in only: never a default diarizer.
+ */
+export function isOneModelDiarizationModel(model: ModelInfo): boolean {
+  return hasCapability(model, "one_model_diarization");
+}
+
+/** How the diarization dialogs describe a model that diarizes alone. */
+export const SINGLE_MODEL_DIARIZATION_DESCRIPTION =
+  "Transcribes, tags speakers and times words itself: no ASR or aligner.";
+
 export function isDiarizationPipelineAsrModel(model: ModelInfo): boolean {
-  // A speaker-attributed model (Granite Speech 4.1 Plus) belongs here too:
-  // the pipeline asks it for a plain transcript, and the diarizer supplies
-  // the speakers. The pipeline transcribes as a speech-to-text job:
-  // audio-chat models serve /audio/transcriptions but cannot run one, and
-  // the server rejects them as the pipeline ASR.
-  return (
-    hasCapability(model, "openai_audio_transcriptions") &&
-    hasCapability(model, "speech_to_text_jobs")
-  );
+  // The server decides which models the pipeline may transcribe with. A
+  // speaker-attributed model may be one (Granite Speech 4.1 Plus: the
+  // pipeline asks it for a plain transcript, and the diarizer supplies the
+  // speakers) or not (Nemotron 3.5 Transcribe, which the server refuses
+  // there). Audio-chat models serve /audio/transcriptions but cannot run a
+  // speech-to-text job, so the server never marks them either.
+  return hasCapability(model, "diarization_pipeline_asr");
 }
 
 export function isDiarizationPipelineAlignerModel(model: ModelInfo): boolean {
@@ -144,19 +155,30 @@ export interface DiarizationStackRole {
  * role is ignored. Without a usable pick, a loaded model wins over a
  * not-loaded default; the preferred list orders defaults and never gates
  * readiness: loaded preferred, then any loaded eligible model, then the
- * preferred default, then the first eligible model.
+ * preferred default, then the first eligible model. Pick-only models fill
+ * the role only as the user's pick, never as a default.
  */
 export function resolveDiarizationStackRole(options: {
   /** The whole catalog, to tell a deleted pick from an ineligible one. */
   models: ModelInfo[];
   /** The models eligible for this role. */
   eligibleModels: ModelInfo[];
+  /** Models the role may use only when the user picks one (opt-in). */
+  pickOnlyModels?: ModelInfo[];
   pick: string | null;
   preferredVariants: readonly string[];
 }): DiarizationStackRole {
-  const { models, eligibleModels, pick, preferredVariants } = options;
+  const {
+    models,
+    eligibleModels,
+    pickOnlyModels = [],
+    pick,
+    preferredVariants,
+  } = options;
   if (pick) {
-    const picked = eligibleModels.find((model) => model.variant === pick);
+    const picked = [...eligibleModels, ...pickOnlyModels].find(
+      (model) => model.variant === pick,
+    );
     if (picked) {
       return { variant: pick, ready: picked.status === "ready", missing: false };
     }

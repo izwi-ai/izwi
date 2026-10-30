@@ -345,6 +345,12 @@ const PLANNED_CHUNK_SECS: f32 = 30.0 / 0.95;
 /// `None` for families without an LLM decoder context (Parakeet, Nemotron).
 pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
     use crate::runtime::{asr_sequence_ceiling, ASR_TEXT_PROMPT_TOKEN_RESERVE as PROMPT};
+    // One row of the model's whole context: an hour of audio (45,000 tokens)
+    // and its completion budget. KV costs 6 KiB per 16-bit token here, so
+    // the floor is about 384 MiB beside 32 GiB of weights.
+    if variant.family() == ModelFamily::NemotronTranscribeAsr {
+        return Some(crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS as u64);
+    }
     let geometry = envelope_geometry(variant)?;
     let rate = geometry.audio_tokens_per_sec;
     let tokens = match variant {

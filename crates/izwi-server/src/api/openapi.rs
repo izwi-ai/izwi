@@ -2266,6 +2266,10 @@ pub struct TranscriptionMultipartRequest {
     /// separate terms with commas or newlines. Models without keyword
     /// biasing reject it (400).
     pub keywords: Option<Vec<String>>,
+    /// Izwi extension: tag speakers in the transcript (models that do, such
+    /// as Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).
+    /// verbose_json then carries `speaker_turns`.
+    pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2290,6 +2294,10 @@ pub struct TranscriptionJsonRequest {
     /// one comma- or newline-separated string). Models without keyword
     /// biasing reject it (400).
     pub keywords: Option<Vec<String>>,
+    /// Izwi extension: tag speakers in the transcript (models that do, such
+    /// as Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).
+    /// verbose_json then carries `speaker_turns`.
+    pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
@@ -2307,6 +2315,9 @@ pub struct VerboseTranscriptionResponse {
     pub duration: f32,
     pub words: Option<Vec<TranscriptionTimestampWord>>,
     pub segments: Option<Vec<TranscriptionTimestampSegment>>,
+    /// With `speaker_labels`: the model's speaker turns (`speaker` is its
+    /// tag, null before the first; `start` and `end` when it timed them).
+    pub speaker_turns: Option<Vec<serde_json::Value>>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
     /// ASR diagnostics. With word or segment timestamps it also carries

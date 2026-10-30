@@ -216,6 +216,9 @@ pub struct AsrTaskOptions {
     pub translate_to: Option<String>,
     /// Terms to bias recognition toward.
     pub keywords: Vec<String>,
+    /// Tag the transcript with speakers
+    /// (`ModelVariant::supports_asr_speaker_tags`).
+    pub speaker_attribution: bool,
 }
 
 impl AsrTaskOptions {
@@ -230,7 +233,14 @@ impl AsrTaskOptions {
                 .map(|keyword| keyword.trim().to_string())
                 .filter(|keyword| !keyword.is_empty())
                 .collect(),
+            speaker_attribution: false,
         }
+    }
+
+    /// The same options with speaker tags on or off.
+    pub fn with_speaker_attribution(mut self, speaker_attribution: bool) -> Self {
+        self.speaker_attribution = speaker_attribution;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -475,6 +485,10 @@ pub(super) struct IncrementalModelExecutionReady {
     maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
     maya2_tts_params: Option<Maya2GenerationParams>,
     lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
+    /// A Nemotron 3.5 Transcribe row's host preparation (the model is the
+    /// `Asr` lease).
+    nemotron_transcribe:
+        Option<Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

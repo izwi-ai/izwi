@@ -66,6 +66,8 @@ interface NewTranscriptionModalProps {
   selectedModelSupportsTranslation?: boolean;
   /** The selected model accepts a keyword list. */
   selectedModelSupportsKeywords?: boolean;
+  /** The selected model times words itself: timestamps need no aligner. */
+  selectedModelHasNativeWordTimestamps?: boolean;
   /** Shown under the SAA model: why an installed model is not offered. */
   speakerAttributionHint?: string | null;
   timestampAlignerModelId: string | null;
@@ -92,7 +94,7 @@ interface SubmitAudioOptions {
 const ASR_MODEL_REQUIRED_ERROR =
   "Select and load an ASR model before creating a transcription.";
 const SAA_MODEL_REQUIRED_ERROR =
-  "Select and load Granite Speech before creating speaker-attributed ASR.";
+  "Select and load a speaker-attributed ASR model (Granite Speech 4.1 Plus or Nemotron 3.5 Transcribe) before creating speaker-attributed ASR.";
 const ALIGNER_MODEL_REQUIRED_ERROR =
   "Load the timestamp aligner model to include timestamps.";
 /** Leave the speech in its own language. */
@@ -128,6 +130,7 @@ export function NewTranscriptionModal({
   selectedModelStatus = null,
   selectedModelSupportsTranslation = false,
   selectedModelSupportsKeywords = false,
+  selectedModelHasNativeWordTimestamps = false,
   speakerAttributionHint = null,
   timestampAlignerModelId,
   timestampAlignerReady,
@@ -213,6 +216,9 @@ export function NewTranscriptionModal({
     setIsSubmitting(false);
   }, []);
 
+  // A model that times words itself needs no aligner for timestamps.
+  const timestampsNeedAligner = !selectedModelHasNativeWordTimestamps;
+
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
@@ -229,7 +235,10 @@ export function NewTranscriptionModal({
         return;
       }
 
-      if (timestampAlignerModelId && timestampAlignerReady) {
+      if (
+        !timestampsNeedAligner ||
+        (timestampAlignerModelId && timestampAlignerReady)
+      ) {
         setIncludeTimestamps(true);
         return;
       }
@@ -241,6 +250,7 @@ export function NewTranscriptionModal({
       onTimestampAlignerRequired,
       timestampAlignerModelId,
       timestampAlignerReady,
+      timestampsNeedAligner,
     ],
   );
 
@@ -253,8 +263,8 @@ export function NewTranscriptionModal({
   const streamingUnavailableReason = includeTimestamps
     ? "Streaming is unavailable while timestamps are enabled. Turn timestamps off to stream."
     : null;
-  // A translation's words are not the audio's, so the aligner cannot time
-  // them; the server refuses the combination.
+  // A translation's words are not the audio's, so neither the aligner nor
+  // the model can time them; the server refuses the combination.
   const timestampsUnavailableReason = translating
     ? "Timestamps are unavailable for a translation. Turn translation off to add timestamps."
     : streamingEnabled
@@ -268,7 +278,7 @@ export function NewTranscriptionModal({
     if (isSpeakerAttributedAsrMode) {
       return true;
     }
-    if (!includeTimestamps) {
+    if (!includeTimestamps || !timestampsNeedAligner) {
       return true;
     }
     if (timestampAlignerModelId && timestampAlignerReady) {
@@ -283,6 +293,7 @@ export function NewTranscriptionModal({
     onTimestampAlignerRequired,
     timestampAlignerModelId,
     timestampAlignerReady,
+    timestampsNeedAligner,
   ]);
 
   useEffect(() => {
@@ -333,9 +344,10 @@ export function NewTranscriptionModal({
           audio_file: uploadedBlob,
           audio_filename: uploadFilename,
           model_id: selectedModel || undefined,
-          aligner_model_id: includeTimestamps
-            ? timestampAlignerModelId || undefined
-            : undefined,
+          aligner_model_id:
+            includeTimestamps && timestampsNeedAligner
+              ? timestampAlignerModelId || undefined
+              : undefined,
           language: languageHint(selectedLanguage),
           target_language: translating ? translationTarget : undefined,
           keywords: keywords.length > 0 ? keywords : undefined,
@@ -519,6 +531,7 @@ export function NewTranscriptionModal({
       speakerExpectation,
       streamingEnabled,
       timestampAlignerModelId,
+      timestampsNeedAligner,
       updateUploadProgress,
     ],
   );
@@ -561,6 +574,7 @@ export function NewTranscriptionModal({
   const isAlignerModelLoading =
     !isSpeakerAttributedAsrMode &&
     includeTimestamps &&
+    timestampsNeedAligner &&
     (timestampAlignerModelStatus === "loading" ||
       timestampAlignerModelStatus === "downloading");
   const readinessActionHandler = onOpenModelManager;
@@ -579,7 +593,9 @@ export function NewTranscriptionModal({
       }
       if (
         current === ALIGNER_MODEL_REQUIRED_ERROR &&
-        (!includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady))
+        (!includeTimestamps ||
+          !timestampsNeedAligner ||
+          (!!timestampAlignerModelId && timestampAlignerReady))
       ) {
         return null;
       }
@@ -591,6 +607,7 @@ export function NewTranscriptionModal({
     selectedModelReady,
     timestampAlignerModelId,
     timestampAlignerReady,
+    timestampsNeedAligner,
   ]);
 
   const submissionStatusLabel =
@@ -783,13 +800,15 @@ export function NewTranscriptionModal({
                 title="Include timestamps"
                 description={
                   timestampsUnavailableReason ??
-                  "Segment and word times for review and subtitles."
+                  (timestampsNeedAligner
+                    ? "Segment and word times for review and subtitles."
+                    : "Segment and word times. This model times words itself, so no aligner is needed.")
                 }
                 checked={includeTimestamps}
                 onCheckedChange={handleIncludeTimestampsChange}
                 disabled={isSubmitting || streamingEnabled || translating}
               />
-              {includeTimestamps ? (
+              {includeTimestamps && timestampsNeedAligner ? (
                 <CreationField label="Timestamp aligner">
                   <ModelRow
                     name={

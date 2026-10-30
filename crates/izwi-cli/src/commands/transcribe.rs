@@ -16,6 +16,7 @@ pub struct TranscribeArgs {
     pub format: TranscriptFormat,
     pub output: Option<PathBuf>,
     pub word_timestamps: bool,
+    pub speaker_labels: bool,
 }
 
 pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
@@ -30,6 +31,7 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         format,
         output,
         word_timestamps,
+        speaker_labels,
     } = args;
 
     // Verify file exists
@@ -52,6 +54,7 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         max_tokens,
         format,
         word_timestamps,
+        speaker_labels,
     };
     for (name, value) in fields.into_form_fields() {
         form = form.text(name, value);
@@ -93,12 +96,14 @@ struct TranscriptionFormFields {
     max_tokens: Option<usize>,
     format: TranscriptFormat,
     word_timestamps: bool,
+    speaker_labels: bool,
 }
 
 impl TranscriptionFormFields {
     /// The text fields of the multipart transcription request.
     fn into_form_fields(self) -> Vec<(&'static str, String)> {
-        let format_str = if self.word_timestamps {
+        // Word timestamps and speaker turns come back in verbose_json only.
+        let format_str = if self.word_timestamps || self.speaker_labels {
             "verbose_json"
         } else {
             match self.format {
@@ -141,6 +146,10 @@ impl TranscriptionFormFields {
             fields.push(("timestamp_granularities[]", "word".to_string()));
         }
 
+        if self.speaker_labels {
+            fields.push(("speaker_labels", "true".to_string()));
+        }
+
         fields
     }
 }
@@ -156,6 +165,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn speaker_labels_ask_for_verbose_json_and_the_extension_field() {
+        let fields = TranscriptionFormFields {
+            model: "Nemotron-3.5-Transcribe-30B-A4B-FP8".to_string(),
+            language: None,
+            prompt: None,
+            translate_to: None,
+            keywords: Vec::new(),
+            max_tokens: None,
+            format: TranscriptFormat::Text,
+            word_timestamps: false,
+            speaker_labels: true,
+        }
+        .into_form_fields();
+        assert!(fields.contains(&("response_format", "verbose_json".to_string())));
+        assert!(fields.contains(&("speaker_labels", "true".to_string())));
+        assert!(!fields
+            .iter()
+            .any(|(name, _)| *name == "timestamp_granularities[]"));
+    }
+
+    #[test]
     fn form_fields_include_prompt_max_tokens_and_word_timestamps() {
         let fields = TranscriptionFormFields {
             model: "Granite-Speech-4.1-2B-Plus".to_string(),
@@ -166,6 +196,7 @@ mod tests {
             max_tokens: Some(64),
             format: TranscriptFormat::Text,
             word_timestamps: true,
+            speaker_labels: false,
         }
         .into_form_fields();
         let field = |name: &str| {
@@ -201,6 +232,7 @@ mod tests {
             max_tokens: None,
             format: TranscriptFormat::Text,
             word_timestamps: false,
+            speaker_labels: false,
         }
         .into_form_fields();
 

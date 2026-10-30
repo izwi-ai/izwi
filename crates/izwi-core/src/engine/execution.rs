@@ -1315,6 +1315,11 @@ pub struct ExecutionProfile {
     /// that keeps co-scheduled decode responsive.
     #[serde(default)]
     pub preferred_prefill_tokens: usize,
+    /// The loaded family's prompts must prefill in resumable spans even when
+    /// the engine's chunked-prefill switch is off
+    /// (`ModelFamily::requires_prefill_spans`).
+    #[serde(default)]
+    pub prefill_spans_required: bool,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -1364,6 +1369,7 @@ impl ExecutionProfile {
             speculative_decode_batch: false,
             mixed_step: false,
             preferred_prefill_tokens: 0,
+            prefill_spans_required: false,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),

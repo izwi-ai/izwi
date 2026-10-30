@@ -217,6 +217,16 @@ pub(super) struct ActiveLfm3AudioDecode {
     pub(super) input_audio: Option<(u32, usize)>,
 }
 
+/// One Nemotron 3.5 Transcribe row between quanta: its retained state
+/// (Mamba state, perception stream, decode loop) and stream position.
+pub(super) struct ActiveNemotronTranscribeDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: AsrModelLease,
+    pub(super) state: crate::models::architectures::nemotron_transcribe::NemotronRetainedState,
+    /// A streamed request's next chunk sequence.
+    pub(super) stream_sequence: usize,
+}
+
 /// One LFM3-Audio LiveASR session between quanta: its segment's host
 /// state, the language model's ShortConv ring (kept here, never in the
 /// arena) and the paged-KV authority, and what the next quantum feeds.

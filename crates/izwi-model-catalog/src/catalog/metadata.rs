@@ -186,6 +186,20 @@ pub enum ModelVariant {
         alias = "Granite Speech 5.0 2B GGUF"
     )]
     GraniteSpeech502BGguf,
+    /// NVIDIA Nemotron 3.5 Transcribe 30B-A4B in ModelOpt FP8: a speech
+    /// language model (a Parallel Expert Encoder with a Sortformer speaker
+    /// encoder over a Nemotron-H Mamba2/MoE decoder) that transcribes up to
+    /// an hour in one pass, with speaker tags, translation and context
+    /// terms. Not the 0.6B streaming RNNT.
+    #[serde(
+        rename = "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+        alias = "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8",
+        alias = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8",
+        alias = "nemotron-3.5-transcribe-30b-a4b-fp8",
+        alias = "nemotron-3.5-transcribe",
+        alias = "Nemotron 3.5 Transcribe"
+    )]
+    Nemotron35Transcribe30BA4BFp8,
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
@@ -475,6 +489,10 @@ impl ModelVariant {
     /// Granite Speech 5.0 2B as published 2026-10-23. The weights are from
     /// 818a37c6 (2026-10-07); later commits changed only the card and the
     /// config's `_name_or_path`.
+    /// NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8 as of 2026-10-29: the repo
+    /// was still being edited the day after release, so the pin matters.
+    pub const NEMOTRON_3_5_TRANSCRIBE_FP8_ARTIFACT_REVISION: &'static str =
+        "006d73cd8385237ed5603fc6c7e76200e50abbd2";
     pub const GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION: &'static str =
         "0555e70346a8992da6b5df98ae26ec50c43958b8";
     /// The GGUF release as published 2026-10-15 (`granite-speech-5.0-2b-GGUF`).
@@ -528,6 +546,9 @@ impl ModelVariant {
             Self::GraniteSpeech412B => Some(Self::GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION),
             Self::GraniteSpeech412BPlus => Some(Self::GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION),
             Self::GraniteSpeech502B => Some(Self::GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION),
+            Self::Nemotron35Transcribe30BA4BFp8 => {
+                Some(Self::NEMOTRON_3_5_TRANSCRIBE_FP8_ARTIFACT_REVISION)
+            }
             Self::GraniteSpeech502BGguf => Some(Self::GRANITE_SPEECH_5_0_2B_GGUF_ARTIFACT_REVISION),
             _ => None,
         }
@@ -571,6 +592,9 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
             Self::GraniteSpeech502B => "ibm-granite/granite-speech-5.0-2b",
             Self::GraniteSpeech502BGguf => "ibm-granite/granite-speech-5.0-2b-GGUF",
+            Self::Nemotron35Transcribe30BA4BFp8 => {
+                "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8"
+            }
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
@@ -631,6 +655,7 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
             Self::GraniteSpeech502B => "Granite Speech 5.0 2B",
             Self::GraniteSpeech502BGguf => "Granite Speech 5.0 2B GGUF",
+            Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron 3.5 Transcribe 30B-A4B FP8",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Nemotron3Diarization => "Nemotron 3 Diarization",
             Self::Qwen306B => "Qwen3 0.6B",
@@ -692,6 +717,7 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
             Self::GraniteSpeech502B => "Granite-Speech-5.0-2B",
             Self::GraniteSpeech502BGguf => "Granite-Speech-5.0-2B-GGUF",
+            Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron-3.5-Transcribe-30B-A4B-FP8",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen3-0.6B",
@@ -758,6 +784,9 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::GraniteSpeech502B => 4_626_414_392,   // model.safetensors tensor bytes
             Self::GraniteSpeech502BGguf => 3_122_684_382, // Q8_0 + mmproj GGUFs and companions
+            // The seven weight files, the index, configs and tokenizer at the
+            // pinned revision (the MTP head is downloaded, never loaded).
+            Self::Nemotron35Transcribe30BA4BFp8 => 34_689_132_519,
             Self::DiarStreamingSortformer4SpkV21 => 471_367_680, // .nemo bytes, HF tree, Oct 2026
             Self::Nemotron3Diarization => 198_676_480,  // .nemo bytes, HF tree, Oct 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
@@ -831,6 +860,9 @@ impl ModelVariant {
             // The same weights as 4.1 with a 16k-token decoder context.
             Self::GraniteSpeech502B => 12.0,
             Self::GraniteSpeech502BGguf => 8.0,
+            // About 31 GiB resident as raw FP8 on Metal and CUDA, 33 GiB as
+            // CPU Q8_0, before rows.
+            Self::Nemotron35Transcribe30BA4BFp8 => 36.0,
             // The diarizers and the forced aligner are priced by their
             // residency plans (`asr_memory`); these figures cover the largest
             // plan resident on any backend. Sortformer loads F32 weights:
@@ -903,6 +935,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::NemotronAsr
                 | crate::catalog::ModelFamily::GraniteSpeechAsr
                 | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                | crate::catalog::ModelFamily::NemotronTranscribeAsr
         )
     }
 
@@ -920,6 +953,8 @@ impl ModelVariant {
         match self {
             Self::DiarStreamingSortformer4SpkV21 => Some(4),
             Self::Nemotron3Diarization => Some(8),
+            // Its embedded Nemotron-3-Diarization head.
+            Self::Nemotron35Transcribe30BA4BFp8 => Some(8),
             _ => None,
         }
     }
@@ -931,19 +966,70 @@ impl ModelVariant {
 
     /// Whether this model can produce model-native speaker-attributed ASR text.
     pub fn supports_speaker_attributed_asr(&self) -> bool {
+        self.runs_speaker_attributed_asr_capability() || self.supports_asr_speaker_tags()
+    }
+
+    /// Whether speaker-attributed ASR runs as an execution capability of its
+    /// own (Granite Speech Plus's chunked pipeline).
+    pub fn runs_speaker_attributed_asr_capability(&self) -> bool {
         matches!(self, Self::GraniteSpeech412BPlus)
+    }
+
+    /// Whether a transcription request may ask this model to tag speakers in
+    /// its transcript (Nemotron 3.5 Transcribe's `<spk:N>`): speaker
+    /// attribution on its ordinary ASR route, timed by its CTC head.
+    pub fn supports_asr_speaker_tags(&self) -> bool {
+        matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
     }
 
     /// Whether a transcription request may ask this model to translate the
     /// speech into another language instead of transcribing it.
     pub fn supports_asr_translation(&self) -> bool {
-        matches!(self, Self::GraniteSpeech502B | Self::GraniteSpeech502BGguf)
+        matches!(
+            self,
+            Self::GraniteSpeech502B
+                | Self::GraniteSpeech502BGguf
+                | Self::Nemotron35Transcribe30BA4BFp8
+        )
     }
 
     /// Whether a transcription request may bias this model toward a list of
     /// keywords (names, product terms, acronyms).
     pub fn supports_asr_keyword_biasing(&self) -> bool {
-        matches!(self, Self::GraniteSpeech502B | Self::GraniteSpeech502BGguf)
+        matches!(
+            self,
+            Self::GraniteSpeech502B
+                | Self::GraniteSpeech502BGguf
+                | Self::Nemotron35Transcribe30BA4BFp8
+        )
+    }
+
+    /// Whether this model diarizes a recording on its own (speaker tags,
+    /// its diarizer's segments and CTC word times from one transcription),
+    /// so a diarization job naming it loads no diarizer, ASR or aligner.
+    pub fn diarizes_in_one_model(&self) -> bool {
+        self.supports_asr_speaker_tags() && self.supports_native_word_timestamps()
+    }
+
+    /// Whether the diarization pipeline may use this model as its ASR stage:
+    /// every speech-to-text model but Nemotron 3.5 Transcribe, whose
+    /// transcripts run only as resumable engine rows (never the one blocking
+    /// stage the pipeline needs) and which tags speakers itself.
+    pub fn serves_diarization_pipeline_asr(&self) -> bool {
+        self.runs_speech_to_text_jobs() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
+    }
+
+    /// Whether this ASR model may serve live transcription and voice turns:
+    /// every ASR model but Nemotron 3.5 Transcribe, whose card says offline
+    /// (a 30B decoder over 40 s perception windows).
+    pub fn serves_live_asr(&self) -> bool {
+        self.is_asr() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
+    }
+
+    /// Whether this model times words itself (a CTC timestamp head), so a
+    /// word-timestamp request needs no forced aligner.
+    pub fn supports_native_word_timestamps(&self) -> bool {
+        matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
     }
 
     /// Whether this is a forced aligner model
@@ -1011,7 +1097,9 @@ impl ModelVariant {
             | Self::Chatterbox500M
             | Self::ChatterboxMultilingual500M => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
-            Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
+            Self::Nemotron35AsrStreaming06B
+            | Self::Nemotron3Diarization
+            | Self::Nemotron35Transcribe30BA4BFp8 => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412B
             | Self::GraniteSpeech412BPlus
             | Self::GraniteSpeech502B
@@ -1356,6 +1444,7 @@ impl ModelVariant {
                 | Self::Qwen359BGguf
                 | Self::Qwen3827BFp8
                 | Self::Qwen36Moe35BA3BFp8
+                | Self::Nemotron35Transcribe30BA4BFp8
         )
     }
 
@@ -1503,6 +1592,10 @@ impl ModelVariant {
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => true,
             Self::Maya13B | Self::Maya13BGguf => true,
             Self::Maya2Native25B => true,
+            // D13: visible by default. Admission refuses a machine that
+            // cannot hold its ~32 GiB before it reads a weight; certification
+            // claims wait for real-hardware evidence.
+            Self::Nemotron35Transcribe30BA4BFp8 => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1540,6 +1633,7 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus,
             Self::GraniteSpeech502B,
             Self::GraniteSpeech502BGguf,
+            Self::Nemotron35Transcribe30BA4BFp8,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Nemotron3Diarization,
             Self::Qwen306B,

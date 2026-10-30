@@ -362,6 +362,84 @@ const GRANITE_SPEECH_5_GGUF_FILES: &[&str] = &[
 const GRANITE_SPEECH_5_GGUF_LM_BYTES: u64 = 1_956_155_104;
 const GRANITE_SPEECH_5_GGUF_MMPROJ_BYTES: u64 = 1_159_354_752;
 
+/// Nemotron 3.5 Transcribe at its pinned revision: the configs and tokenizer
+/// the loader reads, and every weight file of the index. The MTP head is
+/// small next to the rest and is downloaded, though not loaded yet.
+const NEMOTRON_TRANSCRIBE_METADATA_FILES: &[&str] = &[
+    "config.json",
+    "hf_quant_config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "model.safetensors.index.json",
+];
+
+/// Exact sizes of the weight files at the pinned revision (HF tree).
+const NEMOTRON_TRANSCRIBE_WEIGHT_FILES: &[(&str, u64)] = &[
+    ("model-00001-of-00004.safetensors", 9_997_859_176),
+    ("model-00002-of-00004.safetensors", 10_000_407_944),
+    ("model-00003-of-00004.safetensors", 9_998_941_520),
+    ("model-00004-of-00004.safetensors", 2_296_485_296),
+    ("perception.safetensors", 838_256_800),
+    ("model-ctc-bf16.safetensors", 201_897_998),
+    ("model-mtp-fp8.safetensors", 1_335_778_712),
+];
+
+/// Marks a test's synthetic checkpoint (see `nemotron_transcribe::synthetic`).
+#[cfg(test)]
+pub(crate) const NEMOTRON_TRANSCRIBE_SYNTHETIC_MARKER: &str = ".izwi-synthetic-checkpoint";
+
+fn nemotron_transcribe_files() -> Vec<String> {
+    NEMOTRON_TRANSCRIBE_METADATA_FILES
+        .iter()
+        .copied()
+        .chain(
+            NEMOTRON_TRANSCRIBE_WEIGHT_FILES
+                .iter()
+                .map(|(file, _)| *file),
+        )
+        .map(str::to_string)
+        .collect()
+}
+
+fn nemotron_transcribe_file_bytes(file: &str) -> Option<u64> {
+    NEMOTRON_TRANSCRIBE_WEIGHT_FILES
+        .iter()
+        .find(|(name, _)| *name == file)
+        .map(|(_, bytes)| *bytes)
+}
+
+/// Every file present, and every weight file at its exact pinned size, so
+/// an interrupted download never reads as complete.
+fn nemotron_transcribe_bundle_is_complete(model_dir: &Path) -> bool {
+    // Tests load a tiny checkpoint in the published layout through the real
+    // runtime; it holds the files the loader needs, at their own sizes.
+    #[cfg(test)]
+    if model_dir
+        .join(NEMOTRON_TRANSCRIBE_SYNTHETIC_MARKER)
+        .is_file()
+    {
+        return NEMOTRON_TRANSCRIBE_METADATA_FILES
+            .iter()
+            .copied()
+            .chain(
+                NEMOTRON_TRANSCRIBE_WEIGHT_FILES[..5]
+                    .iter()
+                    .map(|(file, _)| *file),
+            )
+            .all(|file| model_dir.join(file).is_file());
+    }
+    NEMOTRON_TRANSCRIBE_METADATA_FILES
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+        && NEMOTRON_TRANSCRIBE_WEIGHT_FILES
+            .iter()
+            .all(|(file, bytes)| {
+                std::fs::metadata(model_dir.join(file)).is_ok_and(|meta| meta.len() == *bytes)
+            })
+}
+
 fn granite_speech_required_files(variant: ModelVariant) -> &'static [&'static str] {
     if variant.is_granite_speech5_gguf() {
         return GRANITE_SPEECH_5_GGUF_FILES;
@@ -1710,6 +1788,7 @@ impl ModelDownloader {
                     .iter()
                     .all(|file| path.join(file).exists())
             }
+            ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_bundle_is_complete(&path),
             ModelFamily::SortformerDiarization => {
                 let nemo_file = match variant {
                     ModelVariant::DiarStreamingSortformer4SpkV21 => {
@@ -2351,6 +2430,7 @@ impl ModelDownloader {
             ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
                 granite_speech_files(variant)
             }
+            ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_files(),
             ModelFamily::SortformerDiarization => match variant {
                 ModelVariant::Nemotron3Diarization => {
                     vec!["Nemotron-3-Diarization.nemo".to_string()]
@@ -2856,7 +2936,9 @@ impl ModelDownloader {
             self.get_model_file_specs(variant)
         };
         let local_dir = self.model_path(variant);
-        let require_exact_bundle = variant.is_qwen38_fp8() || variant.is_qwen35_moe_fp8();
+        let require_exact_bundle = variant.is_qwen38_fp8()
+            || variant.is_qwen35_moe_fp8()
+            || variant.family() == ModelFamily::NemotronTranscribeAsr;
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         let mut repo_tree_planning_available = true;
@@ -3121,6 +3203,11 @@ impl ModelDownloader {
                 _ => 8_000_000_000,
             }
         } else if let Some(size) = granite_speech_shard_size(variant, file) {
+            size
+        } else if let Some(size) = (variant.family() == ModelFamily::NemotronTranscribeAsr)
+            .then(|| nemotron_transcribe_file_bytes(file))
+            .flatten()
+        {
             size
         } else if variant.family() == ModelFamily::GraniteSpeech5Asr && file == "model.safetensors"
         {
@@ -4187,6 +4274,44 @@ mod tests {
             .sum::<u64>();
         assert_eq!(shard_bytes, 4_626_527_776);
         std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron_transcribe_downloads_every_weight_file_at_its_pinned_size() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "izwi-nemotron-transcribe-download-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let downloader = ModelDownloader::new(temp_dir.clone()).unwrap();
+        let variant = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+        let files = downloader.get_model_files(variant);
+        for file in [
+            "config.json",
+            "hf_quant_config.json",
+            "tokenizer.json",
+            "model.safetensors.index.json",
+            "perception.safetensors",
+            "model-ctc-bf16.safetensors",
+            "model-mtp-fp8.safetensors",
+            "model-00004-of-00004.safetensors",
+        ] {
+            assert!(files.iter().any(|f| f == file), "{file}");
+        }
+        assert_eq!(files.len(), 14);
+        let weights = NEMOTRON_TRANSCRIBE_WEIGHT_FILES
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
+        assert!(variant.estimated_size() > weights);
+        // Present but short weight files are not a download.
+        let dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &files {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        assert!(!downloader.is_downloaded(variant));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
