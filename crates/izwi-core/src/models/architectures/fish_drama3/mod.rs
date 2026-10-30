@@ -30,8 +30,16 @@ pub mod checkpoint;
 pub mod chunking;
 pub mod codec;
 pub mod config;
+pub mod embed;
+pub mod head;
+pub mod linear;
+pub mod precision;
 pub mod prompt;
+pub mod residency;
+#[cfg(test)]
+pub(crate) mod synthetic;
 pub mod tokenizer;
+pub mod trunk;
 
 pub use artifacts::{FISH_DRAMA3_REPO, FISH_DRAMA3_REVISION};
 pub use checkpoint::FishDrama3Checkpoint;
@@ -40,8 +48,17 @@ pub use codec::{
     FishDrama3CodecArtifact, FishDrama3CodecSupport, FishDrama3DacConfig, FishDrama3DacDecoder,
 };
 pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
+pub use embed::FishDrama3Embedding;
+pub use head::FishDrama3CompactHead;
+pub use linear::FishDrama3KernelPhase;
+pub use precision::FishDrama3PrecisionReport;
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
+pub use residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};
 pub use tokenizer::FishDrama3Tokenizer;
+pub use trunk::{
+    FishDrama3StepRow, FishDrama3Trunk, FishDrama3TrunkCheckpoint, FishDrama3TrunkOptions,
+    FishDrama3TrunkState,
+};
 
 #[cfg(test)]
 mod isolation_tests {

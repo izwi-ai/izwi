@@ -910,8 +910,8 @@ fn bf16_bytes_to_tensor(
 #[cfg(test)]
 mod tests {
     use super::super::config::tests::{published, synthetic, synthetic_json};
+    use super::super::synthetic::{pattern_tensors, temp_dir, write_checkpoint, TempDir, Written};
     use super::*;
-    use safetensors::tensor::TensorView;
     use sha2::{Digest, Sha256};
 
     const CENSUS: &str = include_str!("../../../../tests/fixtures/fish_drama3/tensor_census.txt");
@@ -1000,107 +1000,12 @@ mod tests {
         assert_eq!(decode_e4m3fn(0x01), 2f32.powi(-9));
     }
 
-    /// A tensor to write: name, dtype, shape, bytes.
-    type Written = (String, Dtype, Vec<usize>, Vec<u8>);
-
-    /// Deterministic bytes for every census entry: BF16 values in
-    /// [-0.5, 0.5), positive F32 scales, E4M3 codes without the NaN.
-    fn census_tensors(config: &FishDrama3Config) -> Vec<Written> {
-        expected_census(config)
-            .into_iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let n = e.shape.iter().product::<usize>();
-                let bytes = match e.dtype {
-                    CensusDtype::Bf16 => (0..n)
-                        .flat_map(|k| {
-                            let v = ((i * 131 + k * 17) % 251) as f32 / 251.0 - 0.5;
-                            bf16::from_f32(v).to_le_bytes()
-                        })
-                        .collect(),
-                    CensusDtype::F32 => (0..n)
-                        .flat_map(|k| (1e-3 * (1 + (i + k) % 7) as f32).to_le_bytes())
-                        .collect(),
-                    CensusDtype::F8E4M3 => (0..n)
-                        .map(|k| {
-                            let code = ((i * 31 + k * 7) % 256) as u8;
-                            if code & 0x7f == 0x7f {
-                                code ^ 1
-                            } else {
-                                code
-                            }
-                        })
-                        .collect(),
-                };
-                (e.name, e.dtype.safetensors(), e.shape, bytes)
-            })
-            .collect()
-    }
-
-    /// A directory removed when dropped.
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("izwi-fish-drama3-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-
-    /// Two shards: the trunk in the first, the head and the tower in the
-    /// second; the index, the config and the companion files beside them.
-    fn write_checkpoint(dir: &Path, tensors: &[Written]) {
-        let mut shards = BTreeMap::<&str, Vec<&Written>>::new();
-        for tensor in tensors {
-            let shard = if tensor.0.starts_with(TRUNK_PREFIX) {
-                "model-00001-of-00002.safetensors"
-            } else {
-                "model-00002-of-00002.safetensors"
-            };
-            shards.entry(shard).or_default().push(tensor);
-        }
-        let mut weight_map = BTreeMap::new();
-        let mut total = 0usize;
-        for (shard, tensors) in &shards {
-            let views = tensors
-                .iter()
-                .map(|(name, dtype, shape, bytes)| {
-                    weight_map.insert(name.clone(), shard.to_string());
-                    total += bytes.len();
-                    (
-                        name.clone(),
-                        TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            safetensors::serialize_to_file(views, None, &dir.join(shard)).unwrap();
-        }
-        std::fs::write(
-            dir.join(INDEX_FILE),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "metadata": {"total_size": total},
-                "weight_map": weight_map
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(dir.join("config.json"), synthetic_json().to_string()).unwrap();
-        for name in COMPANION_FILES {
-            std::fs::write(dir.join(name), b"synthetic").unwrap();
-        }
-    }
-
     /// The synthetic checkpoint with one edit to its tensor list.
     fn written(edit: impl FnOnce(&mut Vec<Written>)) -> TempDir {
-        let mut tensors = census_tensors(&synthetic());
+        let mut tensors = pattern_tensors(&synthetic());
         edit(&mut tensors);
         let dir = temp_dir();
-        write_checkpoint(&dir.0, &tensors);
+        write_checkpoint(&dir.0, &tensors, &synthetic_json());
         dir
     }
 
@@ -1124,9 +1029,9 @@ mod tests {
     #[test]
     fn a_synthetic_two_shard_checkpoint_round_trips() {
         let config = synthetic();
-        let tensors = census_tensors(&config);
+        let tensors = pattern_tensors(&config);
         let dir = temp_dir();
-        write_checkpoint(&dir.0, &tensors);
+        write_checkpoint(&dir.0, &tensors, &synthetic_json());
         let checkpoint = FishDrama3Checkpoint::open(&dir.0).unwrap();
         checkpoint.validate_census(&config).unwrap();
         check_companion_files(&dir.0).unwrap();
