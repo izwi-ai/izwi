@@ -615,7 +615,9 @@ fn tiny_fixture_matches_upstream_on_cpu() {
 #[cfg(feature = "metal")]
 #[test]
 fn tiny_fixture_matches_upstream_on_metal() {
-    let Ok(device) = Device::new_metal(0) else {
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("tiny_fixture_matches_upstream_on_metal")
+    else {
         return;
     };
     run_tiny_fixture(device, "metal");
@@ -637,7 +639,8 @@ fn real_checkpoint_matches_the_reference() {
     let device = match backend.as_str() {
         "cpu" => Device::Cpu,
         #[cfg(feature = "metal")]
-        "metal" => Device::new_metal(0).unwrap(),
+        "metal" => crate::backends::metal_device_if_available(0)
+            .expect("IZWI_NEMOTRON_TRANSCRIBE_BACKEND=metal on a machine without Metal"),
         #[cfg(feature = "cuda")]
         "cuda" => Device::new_cuda(0).unwrap(),
         other => panic!("{BACKEND_ENV}={other}: this build has no such backend"),

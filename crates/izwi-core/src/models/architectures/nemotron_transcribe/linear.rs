@@ -518,7 +518,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_fp8_matches_the_exact_dequantization_on_both_passes() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_fp8_matches_the_exact_dequantization_on_both_passes",
+        ) else {
             return;
         };
         let (rows, cols) = (96, 1856);

@@ -1113,7 +1113,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_scan_matches_the_cpu_scan_at_both_column_widths() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_scan_matches_the_cpu_scan_at_both_column_widths",
+        ) else {
             return;
         };
         for state in [8, 32, 128] {

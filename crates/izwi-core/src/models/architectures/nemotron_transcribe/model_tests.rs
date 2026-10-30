@@ -232,7 +232,9 @@ fn prompts_too_long_for_the_row_are_refused() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_loads_the_synthetic_checkpoint_and_tracks_the_cpu_prefill() {
-    let Ok(device) = Device::new_metal(0) else {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_loads_the_synthetic_checkpoint_and_tracks_the_cpu_prefill",
+    ) else {
         return;
     };
     let dir = temp_checkpoint();
@@ -278,8 +280,12 @@ fn word_timestamps_run_the_ctc_stage_and_time_the_turns() {
     #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
     let mut devices = vec![Device::Cpu];
     #[cfg(feature = "metal")]
-    if let Ok(device) = Device::new_metal(0) {
-        devices.push(device);
+    let metal = crate::backends::metal_test_device_or_skip(
+        "word_timestamps_run_the_ctc_stage_and_time_the_turns",
+    );
+    #[cfg(feature = "metal")]
+    if let Some((device, _)) = &metal {
+        devices.push(device.clone());
     }
     for device in devices {
         let model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
