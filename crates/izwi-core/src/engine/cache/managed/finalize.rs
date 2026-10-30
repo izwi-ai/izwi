@@ -66,10 +66,10 @@ impl ManagedKvCacheManager {
         if state
             .exact_target_transactions
             .contains(&reservation.txn_id)
-            && reservation.domains.iter().any(|domain| {
-                accepted_prefix.unwrap_or(domain.target_committed_tokens)
-                    != domain.target_committed_tokens
-            })
+            && reservation
+                .domains
+                .iter()
+                .any(|domain| receipt.committed_tokens(domain) != domain.target_committed_tokens)
         {
             abort_reservation(state, reservation);
             return Err(Error::InferenceError(
@@ -112,7 +112,7 @@ impl ManagedKvCacheManager {
                     return Err(error);
                 }
             };
-            let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+            let committed_tokens = receipt.committed_tokens(domain);
             if committed_tokens < domain.execution_start_tokens
                 || committed_tokens > domain.target_committed_tokens
             {
@@ -208,7 +208,7 @@ impl ManagedKvCacheManager {
                 .position(|publication| publication.arena == domain.arena)
             {
                 let mut publication = pending.swap_remove(index);
-                let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+                let committed_tokens = receipt.committed_tokens(domain);
                 publication.publications.retain(|candidate| {
                     candidate
                         .key
@@ -295,25 +295,19 @@ impl ManagedKvCacheManager {
                         .completion();
                     return arena.commit_selected(transaction, completion);
                 }
-                let target_cursor = reservation
-                    .domains
-                    .first()
-                    .map(|domain| {
-                        u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
-                    })
-                    .ok_or_else(|| {
-                        Error::InferenceError(
-                            "legacy tensor transaction requires a paged cursor".into(),
-                        )
-                    })?;
-                if reservation.domains.iter().any(|domain| {
-                    u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
-                        != target_cursor
-                }) {
-                    return Err(Error::InferenceError(
-                        "one managed state transaction resolved divergent domain cursors".into(),
-                    ));
-                }
+                // The tensor domains advance with the decoder clock. A paged
+                // domain the request projects behind the clock (Fish Audio
+                // Drama 3's tower, one row behind its trunk) commits short of
+                // it; every other domain commits at it.
+                let target_cursor =
+                    receipt
+                        .clock_committed_tokens()
+                        .map(u64::from)
+                        .ok_or_else(|| {
+                            Error::InferenceError(
+                                "legacy tensor transaction requires a paged cursor".into(),
+                            )
+                        })?;
                 arena.commit(transaction, target_cursor)
             })();
             let retired = match committed {
@@ -330,9 +324,7 @@ impl ManagedKvCacheManager {
                 // domain at one cursor; record it for the snapshot publication
                 // below. Clocked completions publish only selected groups and
                 // never share.
-                tensor_commit_cursor = reservation.domains.first().map(|domain| {
-                    u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
-                });
+                tensor_commit_cursor = receipt.clock_committed_tokens().map(u64::from);
             }
         }
         // Every fallible operation has succeeded. Applying these plans cannot

@@ -1345,21 +1345,19 @@ impl NativeExecutor {
                             .is_some_and(|state| state.selections().is_some());
                         let receipt = if let Some(appended) = result.managed_cache_append {
                             reservation
-                                .domains
-                                .first()
+                                .clock_span_tokens()
                                 .ok_or_else(|| {
                                     Error::InferenceError(
                                         "managed-cache reservation has no domains".into(),
                                     )
                                 })
-                                .and_then(|domain| {
+                                .and_then(|(clock_start, _)| {
                                     let appended = u32::try_from(appended).map_err(|_| {
                                         Error::InferenceError(
                                             "managed-cache append exceeds u32".into(),
                                         )
                                     })?;
-                                    let committed = domain
-                                        .execution_start_tokens
+                                    let committed = clock_start
                                         .checked_add(appended)
                                         .ok_or_else(|| {
                                             Error::InferenceError(
@@ -1396,22 +1394,20 @@ impl NativeExecutor {
                             ))
                         } else {
                             reservation
-                                .domains
-                                .first()
+                                .clock_span_tokens()
                                 .ok_or_else(|| {
                                     Error::InferenceError(
                                         "managed-cache reservation has no domains".into(),
                                     )
                                 })
-                                .and_then(|domain| {
+                                .and_then(|(clock_start, _)| {
                                     let accepted = u32::try_from(result.output.tokens_processed)
                                         .map_err(|_| {
                                             Error::InferenceError(
                                                 "accepted cache prefix exceeds u32".into(),
                                             )
                                         })?;
-                                    let committed = domain
-                                        .execution_start_tokens
+                                    let committed = clock_start
                                         .checked_add(accepted)
                                         .ok_or_else(|| {
                                             Error::InferenceError(

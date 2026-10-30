@@ -682,6 +682,8 @@ struct RequestCachePolicy {
     /// The family's prompts always prefill in spans (see
     /// `ExecutionProfile::prefill_spans_required`).
     prefill_spans_required: bool,
+    /// The family's own prefill grid (`ExecutionProfile::prefill_grid_tokens`).
+    prefill_grid_tokens: usize,
 }
 
 impl Default for RequestCachePolicy {
@@ -702,6 +704,7 @@ impl Default for RequestCachePolicy {
             decode_dispatch_rows: None,
             mixed_step: false,
             prefill_spans_required: false,
+            prefill_grid_tokens: 0,
         }
     }
 }
@@ -1089,9 +1092,29 @@ impl Scheduler {
             mixed_step: profile.mixed_step && profile.prefill == PrefillMode::Incremental,
             prefill_spans_required: profile.prefill_spans_required
                 && profile.prefill == PrefillMode::Incremental,
+            prefill_grid_tokens: if profile.prefill == PrefillMode::Incremental {
+                profile.prefill_grid_tokens
+            } else {
+                0
+            },
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
+    }
+
+    /// The next cell of the family's own prefill grid from `start`, rows
+    /// `[start, min(next boundary, prompt))`, when the family has one. Such a
+    /// span is exact: it is never cut to the step's chunk or budget, since a
+    /// shorter span has no exact cut in the family's model.
+    fn prefill_grid_cell(metadata: &RequestMetadata, start: usize) -> Option<usize> {
+        let grid = metadata.cache_policy.prefill_grid_tokens;
+        (grid > 0 && metadata.cache_policy.prefill == PrefillMode::Incremental).then(|| {
+            (start / grid)
+                .saturating_add(1)
+                .saturating_mul(grid)
+                .min(metadata.prefill_tokens())
+                .saturating_sub(start)
+        })
     }
 
     /// DS1.2b: align the first prefill chunk of a snapshot-sharing contract to
@@ -1906,6 +1929,8 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, num_computed, target_tokens);
+            let target_tokens =
+                Self::prefill_grid_cell(&metadata, num_computed).unwrap_or(target_tokens);
             let num_tokens = target_tokens;
 
             if let Some(running) = self.running.get_mut(&request_id) {
@@ -2065,6 +2090,8 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, prefix_start, target_tokens);
+            let target_tokens =
+                Self::prefill_grid_cell(&metadata, prefix_start).unwrap_or(target_tokens);
             let num_tokens = target_tokens;
             let span_end = prefix_start.saturating_add(num_tokens);
 
@@ -4295,6 +4322,7 @@ mod tests {
                 decode_dispatch_rows: None,
                 mixed_step: false,
                 prefill_spans_required: false,
+                prefill_grid_tokens: 0,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
@@ -4307,6 +4335,23 @@ mod tests {
             managed_prefix_cursor: None,
             managed_prefix_cursor_losses: 0,
         }
+    }
+
+    /// A family-owned grid hands over exactly the next cell, the last one
+    /// short, and only to a resumable prefill.
+    #[test]
+    fn prefill_grid_cells_are_exact_and_resumable_only() {
+        let mut metadata = snapshot_metadata(None, PrefillMode::Incremental);
+        metadata.total_prompt_tokens = 600;
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 0), None);
+        metadata.cache_policy.prefill_grid_tokens = 256;
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 0), Some(256));
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 256), Some(256));
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 512), Some(88));
+        // Off the grid (a lost cursor), a span still ends on a boundary.
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 300), Some(212));
+        metadata.cache_policy.prefill = PrefillMode::Full;
+        assert_eq!(Scheduler::prefill_grid_cell(&metadata, 0), None);
     }
 
     #[test]
