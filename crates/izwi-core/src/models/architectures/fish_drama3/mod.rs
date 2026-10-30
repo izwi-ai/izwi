@@ -35,6 +35,7 @@ pub mod head;
 pub mod linear;
 pub mod precision;
 pub mod prompt;
+pub mod reference_cache;
 pub mod residency;
 pub mod sampling;
 #[cfg(test)]
@@ -55,6 +56,7 @@ pub use head::FishDrama3CompactHead;
 pub use linear::FishDrama3KernelPhase;
 pub use precision::FishDrama3PrecisionReport;
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
+pub use reference_cache::FishDrama3ReferenceAudio;
 pub use residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};
 pub use sampling::{
     FishDrama3DrawPolicy, FishDrama3MainDraw, FishDrama3RowSampler, FishDrama3SamplerCheckpoint,
