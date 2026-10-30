@@ -33,6 +33,7 @@ pub mod config;
 pub mod embed;
 pub mod head;
 pub mod linear;
+pub mod model;
 pub mod precision;
 pub mod prompt;
 pub mod reference_cache;
@@ -54,6 +55,13 @@ pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
 pub use embed::FishDrama3Embedding;
 pub use head::FishDrama3CompactHead;
 pub use linear::FishDrama3KernelPhase;
+pub use model::{
+    FishDrama3AudioCandidate, FishDrama3AudioStream, FishDrama3CancelCheck, FishDrama3ChunkPlan,
+    FishDrama3ChunkResult, FishDrama3ChunkSession, FishDrama3ChunkSessionOptions,
+    FishDrama3FrameCodec, FishDrama3GenerationParams, FishDrama3Model, FishDrama3ModelOptions,
+    FishDrama3PagedDomain, FishDrama3QuantumCheckpoint, FishDrama3RequestState,
+    FishDrama3StateGeometry, FishDrama3Step, FishDrama3StopReason, FishDrama3Synthesis,
+};
 pub use precision::FishDrama3PrecisionReport;
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
 pub use reference_cache::FishDrama3ReferenceAudio;

@@ -14,10 +14,12 @@
 //! Candle's row-wise Q8_0 kernel (its activations are quantized to Q8_0
 //! too), so a row's arithmetic never depends on how many rows share its
 //! step. A span (one request's prefill) always runs the tile kernel: weights
-//! expanded to F32 a tile at a time, F32 activations. Choosing it by phase
-//! rather than by row count keeps a span's numerics the same however its
-//! rows split, at the price of expanding a whole weight for a span of one
-//! row.
+//! expanded to F32 a tile at a time, F32 activations, multiplied by Candle's
+//! F32 matmul, even for a span of one row. That matmul takes its
+//! matrix-vector path for a single row (a one-row span, or an expert group
+//! of one row) and blocks the rest by shape, so a span's bits depend on how
+//! its rows split: split invariance is not promised. The model loop pins
+//! the prefill grid instead (`model/mod.rs`).
 
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
