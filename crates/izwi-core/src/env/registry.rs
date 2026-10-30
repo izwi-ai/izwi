@@ -357,6 +357,20 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_CODEBOOK_FIXTURE",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "A JSON array of real generated codebook rows (more than 128 frames) for the ignored CUDA Fish Audio Drama 3 codec streaming test.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_CODEC_PATH",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_TOKENIZER_PATH",
         Path,
         "unset (test fails)",

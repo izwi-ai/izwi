@@ -60,6 +60,8 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_DIARIZATION_CAPACITY_WAIT_SECS` | duration | `120` | first use | Sets how long a diarization job waits for memory other admitted work holds (at admission and per stage) before failing; 0 fails at once. |
 | `IZWI_ENABLE_CHUNKED_PREFILL` | flag | `false` | startup | Enables chunked prefill in the scheduler. |
 | `IZWI_ENABLE_PREFIX_CACHING` | flag | false (catalog auto prefix reuse applies) | startup | Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse. |
+| `IZWI_FISH_DRAMA3_CODEBOOK_FIXTURE` | path | unset (test fails) | test harness | A JSON array of real generated codebook rows (more than 128 frames) for the ignored CUDA Fish Audio Drama 3 codec streaming test. |
+| `IZWI_FISH_DRAMA3_CODEC_PATH` | path | unset (test fails) | test harness | The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test. |
 | `IZWI_FISH_DRAMA3_TOKENIZER_PATH` | path | unset (test fails) | test harness | The published Fish Audio Drama 3 tokenizer.json (fishaudio/drama-3@78e5ab79) for the ignored golden-id tests. |
 | `IZWI_FISH_NATIVE_BATCHING` | flag | `false` | model load | Enables native batched decoding for Fish S2 TTS when the model loads. |
 | `IZWI_FISH_S2_BACKEND` | choice | auto (smoke.rs); required in streaming_smoke.rs | test harness | Backend for Fish S2 smoke tests: auto, cpu, metal, cuda (streaming smoke rejects auto). |

@@ -28,6 +28,7 @@
 pub mod artifacts;
 pub mod checkpoint;
 pub mod chunking;
+pub mod codec;
 pub mod config;
 pub mod prompt;
 pub mod tokenizer;
@@ -35,6 +36,9 @@ pub mod tokenizer;
 pub use artifacts::{FISH_DRAMA3_REPO, FISH_DRAMA3_REVISION};
 pub use checkpoint::FishDrama3Checkpoint;
 pub use chunking::FishDrama3History;
+pub use codec::{
+    FishDrama3CodecArtifact, FishDrama3CodecSupport, FishDrama3DacConfig, FishDrama3DacDecoder,
+};
 pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
 pub use tokenizer::FishDrama3Tokenizer;
