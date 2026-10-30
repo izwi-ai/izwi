@@ -27,11 +27,17 @@
 
 pub mod artifacts;
 pub mod checkpoint;
+pub mod chunking;
 pub mod config;
+pub mod prompt;
+pub mod tokenizer;
 
 pub use artifacts::{FISH_DRAMA3_REPO, FISH_DRAMA3_REVISION};
 pub use checkpoint::FishDrama3Checkpoint;
+pub use chunking::FishDrama3History;
 pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
+pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
+pub use tokenizer::FishDrama3Tokenizer;
 
 #[cfg(test)]
 mod isolation_tests {

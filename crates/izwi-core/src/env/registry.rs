@@ -357,6 +357,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_TOKENIZER_PATH",
+        Path,
+        "unset (test fails)",
+        TestHarness,
+        "The published Fish Audio Drama 3 tokenizer.json (fishaudio/drama-3@78e5ab79) for the ignored golden-id tests.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_NATIVE_BATCHING",
         Flag,
         "false",
